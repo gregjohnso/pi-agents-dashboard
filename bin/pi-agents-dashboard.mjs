@@ -4,5 +4,5 @@ import { initializeRuntimePermissions } from "../runtime/permissions.mjs";
 
 initializeRuntimePermissions();
 
-const cliEntryPoint = new URL("../cli/main.mjs", import.meta.url);
-await import(cliEntryPoint.href);
+const { runCli } = await import(new URL("../cli/main.mjs", import.meta.url).href);
+process.exitCode = await runCli();

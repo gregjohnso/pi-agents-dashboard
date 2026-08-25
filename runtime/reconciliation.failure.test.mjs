@@ -1,0 +1,121 @@
+import { appendFile, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { afterEach, expect, it } from "vitest";
+
+import { createCommandJournal } from "./command-journal.mjs";
+import { createEventStore } from "./event-store.mjs";
+import { RegistryStore } from "./registry-store.mjs";
+import { reconcileRuntime } from "./reconciliation.mjs";
+
+/** @type {string[]} */
+const roots = [];
+afterEach(async () => {
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+/** @param {string} sessionId @param {import("../shared/contracts.js").ProcessIdentity} identity @returns {import("../shared/contracts.js").SessionRecord} */
+function record(sessionId, identity) {
+  const now = "2026-08-25T12:00:00.000Z";
+  return {
+    schemaVersion: 1,
+    revision: 0,
+    sessionId,
+    sessionFile: `/sessions/${sessionId}.jsonl`,
+    canonicalSessionFile: `/sessions/${sessionId}.jsonl`,
+    cwd: "/repo",
+    taskState: "WORKING",
+    processState: "LIVE",
+    outcome: "NONE",
+    activity: { kind: "worker", summary: "running", updatedAt: now },
+    ownership: { kind: "managed", runId: `run-${sessionId}`, process: identity, acquiredAt: now, heartbeatAt: now },
+    latestRunId: `run-${sessionId}`,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+async function fixture() {
+  const root = await mkdtemp(join(tmpdir(), "dashboard-recovery-"));
+  roots.push(root);
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(root, name), { mode: 0o700 });
+  return root;
+}
+
+it("reopens truncated stores and converts unresolved delivery to DELIVERY_UNKNOWN", async () => {
+  const root = await fixture();
+  const journalPath = join(root, "queue", "commands.jsonl");
+  const journal = await createCommandJournal({ path: journalPath });
+  const command = /** @type {import("../shared/contracts.js").ClientRequest} */ ({ version: 1, clientId: "client", requestId: "request", op: "prompt", payload: { sessionId: "one", text: "hello" } });
+  await journal.accept(command);
+  await journal.transition(command, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
+  await journal.close();
+  await writeFile(join(root, "runs", "worker-replay.jsonl"), `${JSON.stringify({ clientId: "client", requestId: "request", op: "prompt", stage: "RECEIVED", at: "2026-08-25T12:00:00.000Z" })}\n`, { mode: 0o600 });
+  await appendFile(journalPath, "{\"torn\":");
+
+  const eventPath = join(root, "index", "events.jsonl");
+  const events = await createEventStore({ path: eventPath, daemonEpoch: "epoch" });
+  const persisted = await events.append({ kind: "attachment_changed", payload: { sessionId: "one", clientId: "client", role: "observer", attached: true } });
+  await events.close();
+  await appendFile(eventPath, "{\"torn\":");
+
+  const recovered = await reconcileRuntime({ root, daemonEpoch: "epoch", inspect: async () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); }, waitForReconnect: async () => [] });
+  expect(await recovered.journal.get(command)).toMatchObject({ stage: "DELIVERY_UNKNOWN" });
+  expect(recovered.recoveryActions).toContainEqual(expect.objectContaining({ clientId: "client", requestId: "request", sessionId: "one", action: "DELIVERY_AMBIGUOUS" }));
+  expect(await recovered.events.replay()).toEqual([persisted]);
+  await recovered.close();
+  const secondRecovery = await reconcileRuntime({ root, daemonEpoch: "epoch", inspect: async () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); } });
+  expect(await secondRecovery.journal.get(command)).toMatchObject({ stage: "DELIVERY_UNKNOWN" });
+  expect(await secondRecovery.events.replay()).toEqual([persisted]);
+  await secondRecovery.close();
+});
+
+it("redelivers only ACCEPTED commands and never acknowledged or worker-local RECEIVED attempts", async () => {
+  const root = await fixture();
+  const journal = await createCommandJournal({ path: join(root, "queue", "commands.jsonl") });
+  const accepted = /** @type {import("../shared/contracts.js").ClientRequest} */ ({ version: 1, clientId: "client", requestId: "accepted", op: "prompt", payload: { sessionId: "one", text: "safe" } });
+  const acknowledged = /** @type {import("../shared/contracts.js").ClientRequest} */ ({ ...accepted, requestId: "acknowledged", payload: { ...accepted.payload, text: "done" } });
+  await journal.accept(accepted);
+  await journal.accept(acknowledged);
+  await journal.transition(acknowledged, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
+  await journal.transition(acknowledged, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
+  await journal.close();
+  const recovered = await reconcileRuntime({ root, daemonEpoch: "epoch", inspect: async () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); } });
+  expect(recovered.recoveryActions.map(({ clientId, requestId, sessionId, action }) => ({ clientId, requestId, sessionId, action }))).toEqual([
+    { clientId: "client", requestId: "accepted", sessionId: "one", action: "SAFE_REDELIVERY" },
+    { clientId: "client", requestId: "acknowledged", sessionId: "one", action: "NO_REDELIVERY" },
+  ]);
+  await recovered.close();
+});
+
+it("retains exact ownership conflicts fail-closed for live matches, dead workers, and PID reuse", async () => {
+  const root = await fixture();
+  const registry = new RegistryStore(join(root, "sessions"));
+  const alive = { pid: 101, startIdentity: "alive", processGroupId: 101 };
+  const reused = { pid: 102, startIdentity: "old", processGroupId: 102 };
+  const dead = { pid: 103, startIdentity: "dead", processGroupId: 103 };
+  await registry.create(record("alive", alive));
+  await registry.create(record("reused", reused));
+  await registry.create(record("dead", dead));
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "alive", runId: "run-alive", leaseId: "lease-alive", generation: 1, identity: alive, piChildIdentity: alive }] })}\n`, { mode: 0o600 });
+
+  const recovered = await reconcileRuntime({
+    root,
+    daemonEpoch: "epoch",
+    inspect: async (pid) => {
+      if (pid === 101) return alive;
+      if (pid === 102) return { ...reused, startIdentity: "new" };
+      throw Object.assign(new Error("gone"), { code: "ENOENT" });
+    },
+    waitForReconnect: async (workers) => workers.filter((worker) => worker.sessionId === "alive").map((worker) => worker.sessionId),
+  });
+
+  expect(recovered.liveWorkers.map(({ sessionId }) => sessionId)).toEqual(["alive"]);
+  expect(recovered.conflicts.map(({ sessionId, reason }) => [sessionId, reason])).toEqual([
+    ["dead", "WORKER_EXITED"],
+    ["reused", "PROCESS_IDENTITY_MISMATCH"],
+  ]);
+  expect((await registry.get("dead"))?.ownership).toBeDefined();
+  expect((await registry.get("reused"))?.ownership).toBeDefined();
+  await recovered.close();
+});

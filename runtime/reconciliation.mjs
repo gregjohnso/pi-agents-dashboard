@@ -1,0 +1,213 @@
+import * as fs from "node:fs/promises";
+import { join } from "node:path";
+
+import { atomicWriteJson } from "./atomic-file.mjs";
+import { createCommandJournal } from "./command-journal.mjs";
+import { createEventStore } from "./event-store.mjs";
+import { RegistryStore } from "./registry-store.mjs";
+
+/** @param {any} left @param {any} right */
+function sameIdentity(left, right) {
+  return left?.pid === right?.pid && left?.startIdentity === right?.startIdentity && left?.processGroupId === right?.processGroupId;
+}
+
+/** @param {any} value */
+function validIdentity(value) {
+  return Number.isSafeInteger(value?.pid) && value.pid > 0 && typeof value.startIdentity === "string" && value.startIdentity.length > 0 && Number.isSafeInteger(value.processGroupId) && value.processGroupId > 0;
+}
+
+/** @param {any} worker */
+function validateWorkerMetadata(worker) {
+  const allowed = ["sessionId", "runId", "leaseId", "generation", "identity", "piChildIdentity", "token"];
+  if (typeof worker !== "object" || worker === null || Array.isArray(worker) || Object.keys(worker).some((key) => !allowed.includes(key)) || [worker.sessionId, worker.runId, worker.leaseId].some((value) => typeof value !== "string" || value.length === 0) || !Number.isSafeInteger(worker.generation) || worker.generation <= 0 || !validIdentity(worker.identity) || !validIdentity(worker.piChildIdentity) || (worker.token !== undefined && (typeof worker.token !== "string" || worker.token.length === 0))) throw new TypeError("Worker recovery metadata record is invalid");
+  return worker;
+}
+
+/** @param {unknown} error */
+function exited(error) {
+  return error instanceof Error && ["ENOENT", "ESRCH"].includes(/** @type {NodeJS.ErrnoException} */ (error).code ?? "");
+}
+
+/** @param {string} path @returns {Promise<any[]>} */
+async function latestJournalRecords(path) {
+  let text;
+  try {
+    text = await fs.readFile(path, "utf8");
+  } catch (error) {
+    if (error instanceof Error && /** @type {NodeJS.ErrnoException} */ (error).code === "ENOENT") return [];
+    throw error;
+  }
+  const latest = new Map();
+  for (const line of text.trimEnd().split("\n")) {
+    if (line.length === 0) continue;
+    const record = JSON.parse(line);
+    if (record?.status?.clientId !== undefined && record?.status?.requestId !== undefined) latest.set(`${record.status.clientId}\0${record.status.requestId}`, record);
+  }
+  return [...latest.values()];
+}
+
+export class RecoveredWorkerRouter {
+  #registry;
+  #inspect;
+  #metadataPath;
+  #workers = new Map();
+  #connections = new Map();
+  #loaded = false;
+
+  /** @param {{ registry: RegistryStore, inspect(pid: number): Promise<any>, metadataPath: string }} options */
+  constructor({ registry, inspect, metadataPath }) {
+    this.#registry = registry;
+    this.#inspect = inspect;
+    this.#metadataPath = metadataPath;
+  }
+
+  async load() {
+    if (this.#loaded) return;
+    try {
+      const metadata = await fs.lstat(this.#metadataPath);
+      if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.uid !== process.getuid?.() || (metadata.mode & 0o777) !== 0o600) throw new TypeError("Worker recovery metadata must be a private owned file");
+      const value = JSON.parse(await fs.readFile(this.#metadataPath, "utf8"));
+      if (value?.schemaVersion !== 1 || !Array.isArray(value.workers) || Object.keys(value).some((key) => !["schemaVersion", "workers"].includes(key))) throw new TypeError("Worker recovery metadata is invalid");
+      for (const candidate of value.workers) {
+        const worker = validateWorkerMetadata(candidate);
+        if (this.#workers.has(worker.sessionId)) throw new TypeError("Worker recovery metadata contains duplicate sessions");
+        this.#workers.set(worker.sessionId, worker);
+      }
+    } catch (error) {
+      if (!(error instanceof Error) || /** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT") throw error;
+    }
+    this.#loaded = true;
+  }
+
+  async #persist() {
+    await atomicWriteJson(this.#metadataPath, { schemaVersion: 1, workers: [...this.#workers.values()].sort((a, b) => a.sessionId.localeCompare(b.sessionId)) });
+  }
+
+  /** @param {any} handle */
+  async register(handle) {
+    const record = await this.#registry.get(handle.sessionId);
+    if (record?.ownership === undefined || record.ownership.runId !== handle.runId || !sameIdentity(record.ownership.process, handle.identity)) throw Object.assign(new Error("Launched worker does not own the durable registry record"), { code: "OWNERSHIP_CONFLICT" });
+    this.#workers.set(handle.sessionId, {
+      sessionId: handle.sessionId,
+      runId: handle.runId,
+      leaseId: handle.leaseId,
+      generation: handle.generation,
+      identity: handle.identity,
+      piChildIdentity: handle.piChildIdentity,
+    });
+    await this.#persist();
+  }
+
+  /** @param {string} sessionId */
+  metadata(sessionId) {
+    return this.#workers.get(sessionId);
+  }
+
+  connectedSessionIds() {
+    return [...this.#connections.keys()];
+  }
+
+  /** @param {any} frame @param {any} connection */
+  async adopt(frame, connection) {
+    const allowed = ["version", "type", "token", "sessionId", "runId", "leaseId", "generation", "worker", "piChild"];
+    if (typeof frame !== "object" || frame === null || Array.isArray(frame) || Object.keys(frame).some((key) => !allowed.includes(key)) || frame.version !== 1 || frame.type !== "worker_ready") throw Object.assign(new Error("Invalid worker ready frame"), { code: "INVALID_WORKER_FRAME" });
+    const expected = this.#workers.get(frame.sessionId);
+    const record = await this.#registry.get(frame.sessionId);
+    if (expected === undefined || record?.ownership === undefined || expected.runId !== frame.runId || expected.leaseId !== frame.leaseId || expected.generation !== frame.generation || !sameIdentity(expected.identity, frame.worker) || !sameIdentity(expected.piChildIdentity, frame.piChild) || record.ownership.runId !== frame.runId || !sameIdentity(record.ownership.process, frame.worker)) throw Object.assign(new Error("Worker ownership or generation conflicts with durable state"), { code: "OWNERSHIP_CONFLICT" });
+    const actual = await this.#inspect(frame.worker.pid);
+    if (!sameIdentity(actual, frame.worker)) throw Object.assign(new Error("Worker process identity changed"), { code: "PROCESS_IDENTITY_CONFLICT" });
+    if (expected.token !== undefined && expected.token !== frame.token) throw Object.assign(new Error("Worker authentication failed"), { code: "WORKER_AUTHENTICATION_FAILED" });
+    if (expected.token === undefined) {
+      if (typeof frame.token !== "string" || frame.token.length === 0) throw Object.assign(new Error("Worker authentication token is missing"), { code: "WORKER_AUTHENTICATION_FAILED" });
+      expected.token = frame.token;
+      await this.#persist();
+    }
+    this.#connections.get(frame.sessionId)?.close?.();
+    this.#connections.set(frame.sessionId, connection);
+    connection.closed.finally(() => {
+      if (this.#connections.get(frame.sessionId) === connection) this.#connections.delete(frame.sessionId);
+    }).catch(() => {});
+    return expected;
+  }
+
+  /** @param {string} sessionId */
+  connection(sessionId) {
+    return this.#connections.get(sessionId);
+  }
+
+  async close() {
+    for (const connection of this.#connections.values()) connection.close?.();
+    this.#connections.clear();
+  }
+}
+
+/** @param {{ root: string, daemonEpoch: string, inspect(pid: number): Promise<any>, waitForReconnect?: (workers: any[], router: RecoveredWorkerRouter) => Promise<string[]>, router?: RecoveredWorkerRouter }} options */
+export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReconnect = async () => [], router: suppliedRouter }) {
+  const registry = new RegistryStore(join(root, "sessions"));
+  const journalPath = join(root, "queue", "commands.jsonl");
+  const eventPath = join(root, "index", "events.jsonl");
+  const journal = await createCommandJournal({ path: journalPath });
+  let events;
+  try {
+    events = await createEventStore({ path: eventPath, daemonEpoch });
+  } catch (error) {
+    await journal.close();
+    throw error;
+  }
+  const router = suppliedRouter ?? new RecoveredWorkerRouter({ registry, inspect, metadataPath: join(root, "daemon", "workers.json") });
+  await router.load();
+  /** @type {any[]} */
+  const liveWorkers = [];
+  /** @type {any[]} */
+  const conflicts = [];
+  for (const record of await registry.list()) {
+    if (record.ownership === undefined) continue;
+    let actual;
+    try {
+      actual = await inspect(record.ownership.process.pid);
+    } catch (error) {
+      conflicts.push({ sessionId: record.sessionId, reason: exited(error) ? "WORKER_EXITED" : "PROCESS_IDENTITY_AMBIGUOUS", ownership: record.ownership });
+      continue;
+    }
+    if (!sameIdentity(actual, record.ownership.process)) {
+      conflicts.push({ sessionId: record.sessionId, reason: "PROCESS_IDENTITY_MISMATCH", ownership: record.ownership, actual });
+      continue;
+    }
+    const metadata = router.metadata(record.sessionId);
+    if (metadata === undefined) {
+      conflicts.push({ sessionId: record.sessionId, reason: "OWNERSHIP_METADATA_MISSING", ownership: record.ownership });
+      continue;
+    }
+    if (metadata.runId !== record.ownership.runId || !sameIdentity(metadata.identity, actual)) {
+      conflicts.push({ sessionId: record.sessionId, reason: "OWNERSHIP_METADATA_CONFLICT", ownership: record.ownership, metadata });
+      continue;
+    }
+    liveWorkers.push({ sessionId: record.sessionId, runId: record.ownership.runId, identity: actual, metadata });
+  }
+  const reconnected = new Set(await waitForReconnect(liveWorkers, router));
+  for (const worker of liveWorkers) {
+    if (worker.metadata !== undefined && !reconnected.has(worker.sessionId) && !router.connectedSessionIds().includes(worker.sessionId)) conflicts.push({ sessionId: worker.sessionId, reason: "WORKER_RECONNECT_TIMEOUT", ownership: worker });
+  }
+  const commands = await latestJournalRecords(journalPath);
+  const recoveryActions = commands.map((record) => ({
+    clientId: record.status.clientId,
+    requestId: record.status.requestId,
+    sessionId: record.command?.payload?.sessionId,
+    command: record.command,
+    action: record.status.stage === "ACCEPTED" ? "SAFE_REDELIVERY" : record.status.stage === "DELIVERY_UNKNOWN" ? "DELIVERY_AMBIGUOUS" : "NO_REDELIVERY",
+  }));
+  await atomicWriteJson(join(root, "daemon", "reconciliation.json"), { schemaVersion: 1, daemonEpoch, completedAt: new Date().toISOString(), conflicts, recoveryActions });
+  return {
+    registry,
+    journal,
+    events,
+    router,
+    liveWorkers,
+    conflicts,
+    recoveryActions,
+    async close() {
+      await router.close();
+      await Promise.all([journal.close(), events.close()]);
+    },
+  };
+}

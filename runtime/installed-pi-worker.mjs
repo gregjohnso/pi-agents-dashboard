@@ -7,6 +7,8 @@ import { PiRpcAdapter } from "./pi-rpc-adapter.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { openRotatingDiagnostics } from "./rotating-diagnostics.mjs";
 
+const MAX_PENDING_PARENT_MESSAGES = 256;
+
 /** @param {unknown} supplied @param {string} expected */
 function matchesToken(supplied, expected) {
   const digest = (/** @type {string} */ value) => createHash("sha256").update(value, "utf8").digest();
@@ -66,6 +68,30 @@ export async function runInstalledPiWorker(runtimeProcess, dependencies) {
   const options = parseArgs(runtimeProcess.argv.slice(2));
   const token = runtimeProcess.env.PI_DASHBOARD_WORKER_TOKEN;
   if (typeof token !== "string" || token.length === 0 || typeof runtimeProcess.send !== "function") throw new Error("Worker requires an authenticated IPC launch channel");
+  /** @type {((message: any) => Promise<unknown>) | undefined} */
+  let sendToDaemon;
+  /** @param {any} message */
+  const sendWorkerMessage = (message) => runtimeProcess.connected ? runtimeProcess.send?.(message) : void sendToDaemon?.(message).catch(() => {});
+  /** @type {{ message: any, send: (message: any) => unknown }[]} */
+  const pendingParentMessages = [];
+  /** @type {((message: any, send: (message: any) => unknown) => void) | undefined} */
+  let transportMessageHandler;
+  /** @param {any} message */
+  const onParentMessage = (message) => {
+    if (!matchesToken(message?.token, token) || !["command", "shutdown"].includes(message.type)) return;
+    const send = (/** @type {any} */ response) => runtimeProcess.send?.(response);
+    if (transportMessageHandler !== undefined) {
+      transportMessageHandler(message, send);
+    } else if (pendingParentMessages.length < MAX_PENDING_PARENT_MESSAGES) {
+      pendingParentMessages.push({ message, send });
+    } else if (message.type === "shutdown") {
+      pendingParentMessages.shift();
+      pendingParentMessages.push({ message, send });
+    } else {
+      void send({ version: 1, type: "command_result", token, id: message.id, ok: false, error: { code: "WORKER_NOT_READY", message: "Worker parent queue is full", deliveryUnknown: false } });
+    }
+  };
+  runtimeProcess.on("message", onParentMessage);
   const supervisorIdentity = await inspectProcessIdentity(runtimeProcess.pid);
   runtimeProcess.send({ version: 1, type: "worker_hello", token, sessionId: options.sessionId, runId: options.runId, leaseId: options.leaseId, generation: options.generation, worker: supervisorIdentity });
 
@@ -94,6 +120,11 @@ export async function runInstalledPiWorker(runtimeProcess, dependencies) {
   if (piChild.stdin === null || piChild.stdout === null || piChild.stderr === null || !Number.isSafeInteger(piChild.pid)) throw Object.assign(new Error("Pi child did not expose owned pipes"), { code: "RPC_PROCESS_FAILED" });
   piChild.stderr.on("data", (chunk) => { void diagnostics.stderr.append(chunk).catch(() => {}); });
   const adapter = PiRpcAdapter.connect({ input: piChild.stdin, output: piChild.stdout, diagnostics: diagnostics.rpc, process: piChild, maxRecordBytes: 16 * 1024 * 1024 });
+  adapter.onFrame((frame) => sendWorkerMessage({ version: 1, type: "pi_frame", token, sessionId: options.sessionId, frame }));
+  adapter.onEvent((event) => {
+    const stateEvent = sessionEventForRpc(event);
+    if (stateEvent !== undefined) sendWorkerMessage({ version: 1, type: "worker_event", token, sessionId: options.sessionId, event: stateEvent });
+  });
   const piChildPid = /** @type {number} */ (piChild.pid);
   const piChildIdentity = await inspectProcessIdentity(piChildPid);
   if (piChildIdentity.pid === supervisorIdentity.pid || piChildIdentity.processGroupId !== supervisorIdentity.processGroupId) throw Object.assign(new Error("Pi child process identity did not inherit the supervisor group"), { code: "WORKER_IDENTITY_MISMATCH" });
@@ -108,15 +139,6 @@ export async function runInstalledPiWorker(runtimeProcess, dependencies) {
     runtimeProcess.once("disconnect", onDisconnect);
   });
 
-  /** @type {((message: any) => Promise<unknown>) | undefined} */
-  let sendToDaemon;
-  /** @param {any} message */
-  const sendWorkerMessage = (message) => runtimeProcess.connected ? runtimeProcess.send?.(message) : void sendToDaemon?.(message).catch(() => {});
-  adapter.onFrame((frame) => sendWorkerMessage({ version: 1, type: "pi_frame", token, sessionId: options.sessionId, frame }));
-  adapter.onEvent((event) => {
-    const stateEvent = sessionEventForRpc(event);
-    if (stateEvent !== undefined) sendWorkerMessage({ version: 1, type: "worker_event", token, sessionId: options.sessionId, event: stateEvent });
-  });
   await adapter.getState();
   const replay = await dependencies.createWorkerReplayStore({ path: options.replayPath });
   const dispatcher = dependencies.createWorkerCommandDispatcher({ replay, adapter });
@@ -142,7 +164,9 @@ export async function runInstalledPiWorker(runtimeProcess, dependencies) {
       (/** @type {any} */ error) => send({ version: 1, type: "command_result", token, id: message.id, ok: false, error: { code: error?.code ?? "RPC_FAILED", message: error instanceof Error ? error.message : "RPC failed", deliveryUnknown: error?.deliveryUnknown === true || dependencies.replayDeliveryIsAmbiguous(replay, message.command) } }),
     ).catch(() => {});
   };
-  runtimeProcess.on("message", (message) => onTransportMessage(message, (/** @type {any} */ response) => runtimeProcess.send?.(response)));
+  transportMessageHandler = onTransportMessage;
+  for (const pending of pendingParentMessages.splice(0)) onTransportMessage(pending.message, pending.send);
+  if (shuttingDown) return;
   const ready = { version: 1, type: "worker_ready", token, sessionId: options.sessionId, runId: options.runId, leaseId: options.leaseId, generation: options.generation, worker: supervisorIdentity, piChild: piChildIdentity };
   runtimeProcess.send(ready);
 

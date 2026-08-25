@@ -4,8 +4,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { createJsonlDecoder } from "./jsonl.mjs";
 import { assertPiExecutableIdentity, piExecutableCacheKey } from "./pi-executable.mjs";
 
+const PROBE_MAX_RECORD_BYTES = 65_536;
+const UNKNOWN_COMMAND = "__pi_dashboard_unknown_command__";
 /** @type {readonly ("get_state"|"prompt"|"follow_up"|"steer"|"abort"|"extension_ui_response")[]} */
 const REQUIRED_COMMANDS = ["get_state", "prompt", "follow_up", "steer", "abort", "extension_ui_response"];
 
@@ -32,9 +35,22 @@ function boundedChild(child, timeoutMs, start) {
 async function probeHelp(executable, spawnImpl, timeoutMs, env) {
   const child = spawnImpl(executable, ["--help"], { env, shell: false, stdio: ["ignore", "pipe", "pipe"] });
   return boundedChild(child, timeoutMs, (finish) => {
-    let stdout = "";
-    child.stdout?.on("data", (/** @type {Buffer} */ chunk) => { stdout += chunk.toString("utf8"); });
-    child.once("exit", (/** @type {number | null} */ code) => finish(code === 0 ? undefined : Object.assign(new Error("Pi --help failed"), { code: "PI_PROBE_HELP_FAILED" }), stdout));
+    /** @type {Buffer[]} */
+    const chunks = [];
+    let bytes = 0;
+    child.stdout?.on("data", (/** @type {Buffer} */ chunk) => {
+      bytes += chunk.byteLength;
+      if (bytes > PROBE_MAX_RECORD_BYTES) return finish(Object.assign(new Error("Pi --help exceeded the probe byte limit"), { code: "PI_PROBE_HELP_FAILED" }));
+      chunks.push(Buffer.from(chunk));
+    });
+    child.once("exit", (/** @type {number | null} */ code) => {
+      if (code !== 0) return finish(Object.assign(new Error("Pi --help failed"), { code: "PI_PROBE_HELP_FAILED" }));
+      try {
+        finish(undefined, new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)));
+      } catch (cause) {
+        finish(Object.assign(new Error("Pi --help was not valid UTF-8", { cause }), { code: "PI_PROBE_HELP_FAILED" }));
+      }
+    });
   });
 }
 
@@ -42,12 +58,14 @@ async function probeHelp(executable, spawnImpl, timeoutMs, env) {
 async function probeRpc(executable, sessionFile, spawnImpl, timeoutMs, env) {
   const child = spawnImpl(executable, ["--mode", "rpc", "--session", sessionFile], { env, shell: false, stdio: ["pipe", "pipe", "pipe"] });
   return boundedChild(child, timeoutMs, (finish) => {
+    const decoder = createJsonlDecoder({ maxBytes: PROBE_MAX_RECORD_BYTES });
     const ids = new Map();
     const responses = new Map();
     /** @type {string[]} */
     const events = [];
-    let buffer = "";
-    let malformed = false;
+    let responseCount = 0;
+    let correlationValid = true;
+    let framingValid = true;
     const commands = [
       { type: "get_state" },
       { type: "prompt" },
@@ -55,30 +73,42 @@ async function probeRpc(executable, sessionFile, spawnImpl, timeoutMs, env) {
       { type: "steer" },
       { type: "abort" },
       { type: "extension_ui_response" },
+      { type: UNKNOWN_COMMAND },
     ].map((command) => {
       const id = randomUUID();
       ids.set(id, command.type);
       return { id, ...command };
     });
-    const complete = () => {
-      if (malformed) return finish(undefined, { jsonl: false, responses, events });
-      if (responses.size === commands.length) finish(undefined, { jsonl: true, responses, events });
-    };
+    const result = () => ({ jsonl: framingValid && responseCount > 0, correlationValid, responses, events });
     child.stdout?.on("data", (/** @type {Buffer} */ chunk) => {
-      buffer += chunk.toString("utf8");
-      for (;;) {
-        const newline = buffer.indexOf("\n");
-        if (newline === -1) break;
-        const line = buffer.slice(0, newline);
-        buffer = buffer.slice(newline + 1);
-        let frame;
-        try { frame = JSON.parse(line); } catch { malformed = true; complete(); return; }
-        if (frame?.type === "response" && typeof frame.id === "string" && ids.has(frame.id)) responses.set(ids.get(frame.id), frame);
-        else if (typeof frame?.type === "string") events.push(frame.type);
+      let frames;
+      try {
+        frames = decoder.push(chunk);
+      } catch {
+        framingValid = false;
+        finish(undefined, result());
+        return;
       }
-      complete();
+      for (const frame of frames) {
+        const candidate = /** @type {any} */ (frame);
+        if (candidate?.type === "response") {
+          responseCount += 1;
+          const expectedCommand = typeof candidate.id === "string" ? ids.get(candidate.id) : undefined;
+          if (expectedCommand === undefined || candidate.command !== expectedCommand || responses.has(expectedCommand)) {
+            correlationValid = false;
+          } else {
+            responses.set(expectedCommand, candidate);
+          }
+        } else if (typeof candidate?.type === "string") {
+          events.push(candidate.type);
+        }
+      }
+      if (responseCount >= commands.length) finish(undefined, result());
     });
-    child.once("exit", () => finish(undefined, { jsonl: !malformed && responses.size > 0, responses, events }));
+    child.once("exit", () => {
+      try { decoder.end(); } catch { framingValid = false; }
+      finish(undefined, result());
+    });
     for (const command of commands) child.stdin?.write(`${JSON.stringify(command)}\n`);
   });
 }
@@ -96,19 +126,26 @@ export async function probePiCapabilities({ executable, spawnImpl = spawn, cache
   const help = /** @type {string} */ (await probeHelp(executable.realpath, spawnImpl, timeoutMs, env));
   const directory = await mkdtemp(join(tmpdir(), "pi-dashboard-probe-"));
   try {
-    const rpc = await probeRpc(executable.realpath, join(directory, "non-canonical-session.jsonl"), spawnImpl, timeoutMs, env);
+    const temporarySessionFile = join(directory, "non-canonical-session.jsonl");
+    const rpc = await probeRpc(executable.realpath, temporarySessionFile, spawnImpl, timeoutMs, env);
     const commands = REQUIRED_COMMANDS.filter((command) => {
       const response = rpc.responses.get(command);
       if (response === undefined) return false;
-      if (command === "get_state") return response.success === true && typeof response.data === "object" && response.data !== null && typeof response.data.sessionId === "string" && typeof response.data.sessionFile === "string";
-      if (response.success === true) return true;
-      return typeof response.error === "string" && !/unknown command/iu.test(response.error);
+      if (command === "get_state") return response.success === true && typeof response.data === "object" && response.data !== null && typeof response.data.sessionId === "string" && response.data.sessionFile === temporarySessionFile;
+      if (command === "abort") return response.success === true;
+      return response.success === false && typeof response.error === "string" && response.error.length > 0 && !/unknown command/iu.test(response.error);
     });
+    const unknownResponse = rpc.responses.get(UNKNOWN_COMMAND);
+    const unknownCommandValid = unknownResponse?.success === false && typeof unknownResponse.error === "string" && /unknown command/iu.test(unknownResponse.error);
+    const temporarySessionValid = commands.includes("get_state");
     const rpcMode = /--mode\s+rpc/iu.test(help);
     const reportedVersion = /^pi\s+(.+)$/imu.exec(help)?.[1]?.trim() ?? null;
     const missingRequired = [
       ...(!rpcMode ? ["rpcMode"] : []),
       ...(!rpc.jsonl ? ["jsonl"] : []),
+      ...(!rpc.correlationValid ? ["response_correlation"] : []),
+      ...(!unknownCommandValid ? ["unknown_command_validation"] : []),
+      ...(!temporarySessionValid ? ["temporary_session_isolation"] : []),
       ...REQUIRED_COMMANDS.filter((command) => !commands.includes(command)),
     ];
     const report = /** @type {import("../shared/contracts.mjs").PiCapabilityReport} */ ({

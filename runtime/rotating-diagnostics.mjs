@@ -110,8 +110,19 @@ export async function openRotatingWriter({ directory, prefix, segmentBytes, segm
       const removed = await removeOldest();
       segment = await createSegment();
       if (removed.removedBytes > 0) {
-        const marker = Buffer.from(`${JSON.stringify({ type: "diagnostic_truncation", ...removed })}\n`);
-        if (marker.length + bytes.length <= segmentBytes) await write(segment, marker);
+        const markerRecord = { type: "diagnostic_truncation", ...removed };
+        const marker = Buffer.from(`${JSON.stringify(markerRecord)}\n`);
+        if (marker.length + bytes.length > segmentBytes) {
+          const boundedMarker = Buffer.from(`${JSON.stringify({
+            ...markerRecord,
+            droppedIncomingBytes: bytes.length,
+            droppedIncomingSha256: createHash("sha256").update(bytes).digest("hex"),
+          })}\n`);
+          if (marker.length > segmentBytes) throw new RangeError("Diagnostic segment limit is too small for truncation metadata");
+          await write(segment, boundedMarker.length <= segmentBytes ? boundedMarker : marker);
+          return;
+        }
+        await write(segment, marker);
       }
     }
     await write(segment, bytes);

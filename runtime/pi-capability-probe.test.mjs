@@ -48,6 +48,41 @@ it("probes recognized validation errors without a valid prompt or canonical sess
   expect(entries.filter((entry) => entry.kind === "start")).toHaveLength(2);
 });
 
+it.each([
+  ["invalid UTF-8", { FAKE_PI_INVALID_UTF8: "1" }],
+  ["an oversized frame", { FAKE_PI_OVERSIZED_FRAME: "1" }],
+])("rejects %s through fatal bounded JSONL without inference", async (_label, behavior) => {
+  const { log, executable } = await setup();
+  const report = await probePiCapabilities({ executable, cache: new Map(), timeoutMs: 1_000, env: { ...process.env, FAKE_PI_LOG: log, ...behavior } });
+  expect(report.jsonl).toBe(false);
+  expect(report.missingRequired).toContain("jsonl");
+  const entries = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  expect(entries.some((entry) => entry.providerInvocation === true)).toBe(false);
+});
+
+it("requires correlated response IDs and an explicit unknown-command control response", async () => {
+  const wrongId = await setup();
+  const wrongIdReport = await probePiCapabilities({ executable: wrongId.executable, cache: new Map(), timeoutMs: 1_000, env: { ...process.env, FAKE_PI_LOG: wrongId.log, FAKE_PI_WRONG_RESPONSE_ID: "steer" } });
+  expect(wrongIdReport.missingRequired).toContain("response_correlation");
+  expect(wrongIdReport.commands).not.toContain("steer");
+
+  const unknownAccepted = await setup();
+  const unknownReport = await probePiCapabilities({ executable: unknownAccepted.executable, cache: new Map(), timeoutMs: 1_000, env: { ...process.env, FAKE_PI_LOG: unknownAccepted.log, FAKE_PI_UNKNOWN_SUCCESS: "1" } });
+  expect(unknownReport.missingRequired).toContain("unknown_command_validation");
+});
+
+it("requires get_state to report the exact temporary non-canonical session", async () => {
+  const { root, log, executable } = await setup();
+  const canonicalSession = join(root, "canonical-session.jsonl");
+  const report = await probePiCapabilities({ executable, cache: new Map(), timeoutMs: 1_000, env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_STATE_SESSION_PATH: canonicalSession } });
+  expect(report.missingRequired).toContain("temporary_session_isolation");
+  expect(report.commands).not.toContain("get_state");
+  const starts = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line)).filter((entry) => entry.kind === "start");
+  expect(starts.some((entry) => entry.argv.includes(canonicalSession))).toBe(false);
+  expect(starts.find((entry) => entry.argv.includes("--session")).argv.join(" ")).toContain("pi-dashboard-probe-");
+  expect(starts.some((entry) => entry.providerInvocation === true)).toBe(false);
+});
+
 it("caches by complete executable identity and invalidates after replacement", async () => {
   const { log, executable } = await setup();
   const cache = new Map();

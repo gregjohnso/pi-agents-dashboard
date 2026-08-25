@@ -37,6 +37,27 @@ it("rolls segments, removes the oldest complete segment, and records truncation 
   expect((await Promise.all(paths.map((path) => stat(path)))).every((metadata) => metadata.size <= 300)).toBe(true);
 });
 
+it("always retains a bounded truncation marker when the incoming record cannot share its rollover segment", async () => {
+  const directory = await root();
+  const writer = await openRotatingWriter({ directory, prefix: "rpc", segmentBytes: 300, segments: 2 });
+  await writer.append({ id: "old-1", payload: "x".repeat(210) });
+  await writer.append({ id: "old-2", payload: "x".repeat(210) });
+  await writer.append({ id: "incoming", payload: "x".repeat(210) });
+  await writer.close();
+
+  const paths = await files(directory, "rpc");
+  const records = (await Promise.all(paths.map((path) => readFile(path, "utf8")))).join("").trim().split("\n").map((line) => JSON.parse(line));
+  const marker = records.find((record) => record.type === "diagnostic_truncation");
+  expect(marker).toMatchObject({
+    removedBytes: expect.any(Number),
+    removedRecords: expect.any(Number),
+    droppedIncomingBytes: expect.any(Number),
+    droppedIncomingSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+  });
+  expect(paths).toHaveLength(2);
+  expect((await Promise.all(paths.map((path) => stat(path)))).every((metadata) => metadata.size <= 300)).toBe(true);
+});
+
 it("replaces an oversized record with bounded byte count and SHA-256 metadata", async () => {
   const directory = await root();
   const writer = await openRotatingWriter({ directory, prefix: "stderr", segmentBytes: 512, segments: 1 });

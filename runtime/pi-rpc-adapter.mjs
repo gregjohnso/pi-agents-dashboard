@@ -5,6 +5,7 @@ import { createJsonlDecoder, createJsonlEncoder } from "./jsonl.mjs";
 
 const MAX_RPC_FRAME_BYTES = 16 * 1024 * 1024;
 const MAX_STDERR_BYTES = 256 * 1024;
+const MAX_PRELISTENER_FRAME_BYTES = 1024 * 1024;
 
 /** @typedef {(command: string, argv: string[], options: any) => any} SpawnLike */
 /** @typedef {{ command: string, resolve(value: unknown): void, reject(error: unknown): void }} PendingRequest */
@@ -59,6 +60,12 @@ export class PiRpcAdapter {
   #frameListeners = new Set();
   /** @type {Set<(event: Record<string, unknown>) => void>} */
   #eventListeners = new Set();
+  /** @type {{ frame: Record<string, unknown>, bytes: number }[]} */
+  #bufferedFrames = [];
+  #bufferedFrameBytes = 0;
+  /** @type {{ event: Record<string, unknown>, bytes: number }[]} */
+  #bufferedEvents = [];
+  #bufferedEventBytes = 0;
   #stderr = "";
   /** @type {PiRpcError | undefined} */
   #failed;
@@ -67,7 +74,7 @@ export class PiRpcAdapter {
   #diagnostics;
   #diagnosticBytes = Buffer.alloc(0);
 
-  /** @param {{ input: NodeJS.WritableStream, output: NodeJS.ReadableStream, process?: import("node:child_process").ChildProcess, ownedProcess?: boolean, diagnostics?: { append(record: string): Promise<unknown> | unknown }, maxRecordBytes?: number }} options */
+  /** @param {{ input: NodeJS.WritableStream, output: NodeJS.ReadableStream, process?: import("node:child_process").ChildProcess, ownedProcess?: boolean, diagnostics?: { append(record: Uint8Array): Promise<unknown> | unknown }, maxRecordBytes?: number }} options */
   constructor({ input, output, process: child, ownedProcess = false, diagnostics, maxRecordBytes = MAX_RPC_FRAME_BYTES }) {
     if (typeof input?.write !== "function" || typeof output?.on !== "function") {
       throw new TypeError("Pi RPC requires writable input and readable output streams");
@@ -85,7 +92,7 @@ export class PiRpcAdapter {
     output.on("data", (chunk) => this.#consume(chunk));
     output.on("end", () => {
       if (this.#diagnosticBytes.length > 0) {
-        void Promise.resolve(this.#diagnostics?.append(this.#diagnosticBytes.toString("utf8"))).catch(() => {});
+        void Promise.resolve(this.#diagnostics?.append(Buffer.from(this.#diagnosticBytes))).catch(() => {});
         this.#diagnosticBytes = Buffer.alloc(0);
       }
       try {
@@ -126,7 +133,7 @@ export class PiRpcAdapter {
   }
 
   /** Connect the adapter to one installed Pi child's owned pipes. */
-  /** @param {{ input: NodeJS.WritableStream, output: NodeJS.ReadableStream, diagnostics?: { append(record: string): Promise<unknown> | unknown }, maxRecordBytes?: number, process?: import("node:child_process").ChildProcess }} options */
+  /** @param {{ input: NodeJS.WritableStream, output: NodeJS.ReadableStream, diagnostics?: { append(record: Uint8Array): Promise<unknown> | unknown }, maxRecordBytes?: number, process?: import("node:child_process").ChildProcess }} options */
   static connect({ input, output, diagnostics, maxRecordBytes, process: child }) {
     return new PiRpcAdapter({ input, output, diagnostics, maxRecordBytes, process: child });
   }
@@ -140,7 +147,7 @@ export class PiRpcAdapter {
       if (newline === -1) break;
       const record = this.#diagnosticBytes.subarray(0, newline + 1);
       this.#diagnosticBytes = this.#diagnosticBytes.subarray(newline + 1);
-      void Promise.resolve(this.#diagnostics?.append(record.toString("utf8"))).catch(() => {});
+      void Promise.resolve(this.#diagnostics?.append(Buffer.from(record))).catch(() => {});
     }
     let frames;
     try {
@@ -154,8 +161,21 @@ export class PiRpcAdapter {
         this.#fail(new PiRpcError("MALFORMED_RPC_OUTPUT", "Pi emitted an invalid RPC frame"));
         return;
       }
-      for (const listener of this.#frameListeners) {
-        try { listener(frame); } catch {}
+      if (this.#frameListeners.size === 0) {
+        let bytes;
+        try { bytes = Buffer.byteLength(JSON.stringify(frame)); } catch { bytes = MAX_PRELISTENER_FRAME_BYTES + 1; }
+        if (bytes <= MAX_PRELISTENER_FRAME_BYTES) {
+          while (this.#bufferedFrameBytes + bytes > MAX_PRELISTENER_FRAME_BYTES && this.#bufferedFrames.length > 0) {
+            const removed = this.#bufferedFrames.shift();
+            if (removed !== undefined) this.#bufferedFrameBytes -= removed.bytes;
+          }
+          this.#bufferedFrames.push({ frame, bytes });
+          this.#bufferedFrameBytes += bytes;
+        }
+      } else {
+        for (const listener of this.#frameListeners) {
+          try { listener(frame); } catch {}
+        }
       }
       if (frame.type === "response") {
         if (typeof frame.id !== "string") {
@@ -176,8 +196,21 @@ export class PiRpcAdapter {
         }
         continue;
       }
-      for (const listener of this.#eventListeners) {
-        try { listener(frame); } catch {}
+      if (this.#eventListeners.size === 0) {
+        let bytes;
+        try { bytes = Buffer.byteLength(JSON.stringify(frame)); } catch { bytes = MAX_PRELISTENER_FRAME_BYTES + 1; }
+        if (bytes <= MAX_PRELISTENER_FRAME_BYTES) {
+          while (this.#bufferedEventBytes + bytes > MAX_PRELISTENER_FRAME_BYTES && this.#bufferedEvents.length > 0) {
+            const removed = this.#bufferedEvents.shift();
+            if (removed !== undefined) this.#bufferedEventBytes -= removed.bytes;
+          }
+          this.#bufferedEvents.push({ event: frame, bytes });
+          this.#bufferedEventBytes += bytes;
+        }
+      } else {
+        for (const listener of this.#eventListeners) {
+          try { listener(frame); } catch {}
+        }
       }
     }
   }
@@ -222,6 +255,10 @@ export class PiRpcAdapter {
   onFrame(listener) {
     if (typeof listener !== "function") throw new TypeError("RPC frame listener must be a function");
     this.#frameListeners.add(listener);
+    for (const buffered of this.#bufferedFrames.splice(0)) {
+      this.#bufferedFrameBytes -= buffered.bytes;
+      try { listener(buffered.frame); } catch {}
+    }
     return () => this.#frameListeners.delete(listener);
   }
 
@@ -229,6 +266,10 @@ export class PiRpcAdapter {
   onEvent(listener) {
     if (typeof listener !== "function") throw new TypeError("RPC event listener must be a function");
     this.#eventListeners.add(listener);
+    for (const buffered of this.#bufferedEvents.splice(0)) {
+      this.#bufferedEventBytes -= buffered.bytes;
+      try { listener(buffered.event); } catch {}
+    }
     return () => this.#eventListeners.delete(listener);
   }
 

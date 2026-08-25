@@ -217,7 +217,16 @@ it("retains the raw malformed record before closing the protocol stream", async 
   const diagnostics = { append: vi.fn(async () => {}) };
   const adapter = PiRpcAdapter.connect({ input: child.stdin, output: child.stdout, diagnostics });
   await expect(adapter.getState()).rejects.toMatchObject({ code: "MALFORMED_RPC_OUTPUT" });
-  expect(diagnostics.append).toHaveBeenCalledWith("{malformed}\n");
+  expect(diagnostics.append).toHaveBeenCalledWith(Buffer.from("{malformed}\n"));
+  await adapter.close();
+});
+
+it("persists exact invalid RPC bytes before fatal decoding", async () => {
+  const child = fakeRpcProcess((_command, process) => process.stdout.write(Buffer.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xff, 0x22, 0x7d, 0x0a])));
+  const diagnostics = { append: vi.fn(async () => {}) };
+  const adapter = PiRpcAdapter.connect({ input: child.stdin, output: child.stdout, diagnostics });
+  await expect(adapter.getState()).rejects.toMatchObject({ code: "MALFORMED_RPC_OUTPUT" });
+  expect(diagnostics.append).toHaveBeenCalledWith(Buffer.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xff, 0x22, 0x7d, 0x0a]));
   await adapter.close();
 });
 

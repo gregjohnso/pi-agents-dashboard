@@ -49,6 +49,17 @@ it("rejects malformed RPC, releases ownership, and stops the exact child group",
   await expect(inspectProcessIdentity(childStart.pid)).rejects.toMatchObject({ code: expect.stringMatching(/ENOENT|ESRCH/u) });
 });
 
+it("buffers startup frames until worker and parent listeners are ready", async () => {
+  const { root, runs, registry, executable, sessionFile } = await setup();
+  const supervisor = new WorkerSupervisor({ registry, runsDirectory: runs, configuredPiPath: executable, env: { ...process.env, FAKE_PI_EVENT: "startup_notice", FAKE_PI_EXIT_MS: "700" }, startTimeoutMs: 2_000 });
+  const handle = await supervisor.launch({ sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-startup-frame" });
+  /** @type {Record<string, unknown>[]} */
+  const frames = [];
+  handle.onFrame((frame) => frames.push(frame));
+  expect(frames).toContainEqual({ type: "startup_notice" });
+  await supervisor.close();
+});
+
 it("launches a distinct installed Pi child with exact structured argv and persisted runtime identity", async () => {
   const { root, runs, registry, executable, sessionFile, log } = await setup();
   const supervisor = new WorkerSupervisor({

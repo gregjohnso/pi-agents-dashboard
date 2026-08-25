@@ -86,9 +86,12 @@ process.stdin.on("data", (chunk) => {
     if (newline === -1) break;
     const command = JSON.parse(input.slice(0, newline));
     input = input.slice(newline + 1);
-    const response = command.type === "get_state"
-      ? { id: command.id, type: "response", command: "get_state", success: true, data: { sessionId: "fake", sessionFile } }
-      : { id: command.id, type: "response", command: command.type, success: true };
+    let response;
+    if (command.type === "get_state") response = { id: command.id, type: "response", command: "get_state", success: true, data: { sessionId: "fake", sessionFile } };
+    else if (command.type === "__pi_dashboard_unknown_command__") response = { id: command.id, type: "response", command: command.type, success: false, error: "unknown command" };
+    else if (["prompt", "follow_up", "steer"].includes(command.type) && typeof command.message !== "string") response = { id: command.id, type: "response", command: command.type, success: false, error: "message is required" };
+    else if (command.type === "extension_ui_response" && typeof command.requestId !== "string") response = { id: command.id, type: "response", command: command.type, success: false, error: "requestId is required" };
+    else response = { id: command.id, type: "response", command: command.type, success: true };
     process.stdout.write(JSON.stringify(response) + "\\n");
   }
 });

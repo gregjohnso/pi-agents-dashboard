@@ -14,6 +14,8 @@ import { reduceSessionState } from "./state-reducer.mjs";
 
 const DEFAULT_WORKER_PATH = fileURLToPath(new URL("./worker.mjs", import.meta.url));
 const admissionStates = new WeakMap();
+const MAX_BUFFERED_STARTUP_FRAME_BYTES = 1024 * 1024;
+const MAX_BUFFERED_STARTUP_EVENTS = 256;
 const DEFAULT_LAUNCH_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateMs: 5_000 });
 
 /** @typedef {(command: string, argv: string[], options: any) => any} SpawnLike */
@@ -217,6 +219,7 @@ export class WorkerSupervisor {
     const handle = supervision.handle;
     handle?.terminal();
     supervision.exit.detach();
+    supervision.child.off("message", supervision.launchReceiver);
     supervision.handle = undefined;
     if (handle !== undefined) this.#handles.delete(handle);
     await this.#ownership.release(supervision.sessionId, supervision.lease.leaseId, supervision.lease.generation);
@@ -355,7 +358,25 @@ export class WorkerSupervisor {
         shell: false,
         stdio: ["ignore", stdoutHandle.fd, stderrHandle.fd, "ipc"],
       });
-      supervision = { child, token, sessionId, lease, exit: undefined, identity: undefined, handle: undefined, lifecycle: "launching" };
+      supervision = { child, token, sessionId, lease, exit: undefined, identity: undefined, handle: undefined, lifecycle: "launching", startupFrames: [], startupFrameBytes: 0, startupEvents: [] };
+      supervision.launchReceiver = (/** @type {any} */ message) => {
+        if (!authenticated(message?.token, token) || message.sessionId !== sessionId) return;
+        if (message.type === "pi_frame" && typeof message.frame === "object" && message.frame !== null) {
+          let bytes;
+          try { bytes = Buffer.byteLength(JSON.stringify(message.frame)); } catch { return; }
+          if (bytes > MAX_BUFFERED_STARTUP_FRAME_BYTES) return;
+          while (supervision.startupFrameBytes + bytes > MAX_BUFFERED_STARTUP_FRAME_BYTES && supervision.startupFrames.length > 0) {
+            const removed = supervision.startupFrames.shift();
+            if (removed !== undefined) supervision.startupFrameBytes -= removed.bytes;
+          }
+          supervision.startupFrames.push({ frame: message.frame, bytes });
+          supervision.startupFrameBytes += bytes;
+        } else if (message.type === "worker_event") {
+          if (supervision.startupEvents.length >= MAX_BUFFERED_STARTUP_EVENTS) supervision.startupEvents.shift();
+          supervision.startupEvents.push(message.event);
+        }
+      };
+      child.on("message", supervision.launchReceiver);
       const exit = observeExit(child, () => {
         if (supervision.lifecycle === "reconciled") return;
         supervision.lifecycle = "terminal";
@@ -422,6 +443,7 @@ export class WorkerSupervisor {
       const handle = this.#createHandle(supervision);
       supervision.handle = handle;
       this.#handles.add(handle);
+      for (const event of supervision.startupEvents.splice(0)) void this.#applyWorkerEvent(supervision, event).catch(() => {});
       child.unref?.();
       return handle;
     } catch (error) {
@@ -512,6 +534,7 @@ export class WorkerSupervisor {
     };
     child.on("message", onMessage);
     child.once("disconnect", onDisconnect);
+    child.off("message", supervision.launchReceiver);
 
     const handle = {
       ready: true,
@@ -555,6 +578,10 @@ export class WorkerSupervisor {
       onFrame(listener) {
         if (typeof listener !== "function") throw new TypeError("Frame listener must be a function");
         frameListeners.add(listener);
+        for (const buffered of supervision.startupFrames.splice(0)) {
+          supervision.startupFrameBytes -= buffered.bytes;
+          try { listener(buffered.frame); } catch {}
+        }
         return () => frameListeners.delete(listener);
       },
       terminal() {

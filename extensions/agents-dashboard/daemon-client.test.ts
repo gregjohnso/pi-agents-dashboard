@@ -51,6 +51,13 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   }
 }
 
+async function within<T>(promise: Promise<T>): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Timed out waiting for protocol recovery")), 2_000)),
+  ]);
+}
+
 const request = { version: 1 as const, clientId: "client-1", requestId: "exact-request-id", op: "get_state" as const, payload: {} };
 
 describe("daemon client", () => {
@@ -164,5 +171,126 @@ describe("daemon client", () => {
     cleanups.push(() => client.close());
     await client.request(request);
     await expect(client.request({ ...request, payload: { changed: true } } as never)).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
+  });
+
+  it("retains a request when a malformed response arrives and accepts a valid retry", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "client-malformed-response-"));
+    const socketPath = join(directory, "control.sock");
+    let connections = 0;
+    const server = net.createServer((socket) => {
+      connections += 1;
+      const connection = connections;
+      const decoder = createJsonlDecoder({ maxBytes: 1024 });
+      let authed = false;
+      socket.on("data", (chunk) => {
+        for (const value of decoder.push(chunk)) {
+          if (!authed) {
+            authed = true;
+            socket.write(encodeJsonl({ version: 1, kind: "authenticated" }));
+            continue;
+          }
+          const incoming = value as { requestId: string };
+          if (connection === 1) {
+            socket.write(encodeJsonl({ version: 1, requestId: incoming.requestId, ok: true, result: { kind: "state", sessions: "invalid" } }), () => socket.destroy());
+          } else {
+            socket.write(encodeJsonl({ version: 1, requestId: incoming.requestId, ok: true, result: { kind: "state", sessions: [] } }));
+          }
+        }
+      });
+    });
+    await new Promise<void>((resolve, reject) => server.listen(socketPath, resolve).once("error", reject));
+    const client = createDaemonClient({ socketPath, token: "secret", maxBytes: 1024, reconnectDelayMs: 1, clientId: "client-1" });
+    cleanups.push(async () => {
+      await client.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
+    });
+    await expect(within(client.request(request))).resolves.toMatchObject({ ok: true, result: { kind: "state", sessions: [] } });
+    expect(connections).toBe(2);
+  });
+
+  it("retains a pending acknowledgement after a malformed ack without throwing from the listener", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "client-malformed-ack-"));
+    const socketPath = join(directory, "control.sock");
+    let connections = 0;
+    const server = net.createServer((socket) => {
+      connections += 1;
+      const connection = connections;
+      const decoder = createJsonlDecoder({ maxBytes: 1024 });
+      let authed = false;
+      socket.on("data", (chunk) => {
+        for (const value of decoder.push(chunk)) {
+          if (!authed) {
+            authed = true;
+            socket.write(encodeJsonl({ version: 1, kind: "authenticated" }));
+            continue;
+          }
+          const incoming = value as { requestId: string; payload: { cursor: unknown } };
+          if (connection === 1) {
+            socket.write(encodeJsonl({ version: 1, requestId: incoming.requestId, ok: true }), () => socket.destroy());
+          } else {
+            socket.write(encodeJsonl({ version: 1, requestId: incoming.requestId, ok: true, result: { kind: "acknowledged", cursor: incoming.payload.cursor } }));
+          }
+        }
+      });
+    });
+    await new Promise<void>((resolve, reject) => server.listen(socketPath, resolve).once("error", reject));
+    const client = createDaemonClient({ socketPath, token: "secret", maxBytes: 1024, reconnectDelayMs: 1, clientId: "client-1" });
+    cleanups.push(async () => {
+      await client.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
+    });
+    const cursor = { daemonEpoch: "epoch-1", sequence: "1" };
+    const ack = { version: 1 as const, clientId: "client-1", requestId: "ack-malformed", op: "ack" as const, payload: { cursor } };
+    await expect(within(client.request(ack))).resolves.toMatchObject({ ok: true, result: { kind: "acknowledged", cursor } });
+    expect(connections).toBe(2);
+  });
+
+  it("drops a malformed event and reconnects before dispatching a valid event", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "client-malformed-event-"));
+    const socketPath = join(directory, "control.sock");
+    let connections = 0;
+    const validEvent = { version: 1, cursor: { daemonEpoch: "epoch-1", sequence: "1" }, occurredAt: "2026-01-01T00:00:00.000Z", kind: "attachment_changed", payload: { sessionId: "s", clientId: "client-1", role: "observer", attached: true } };
+    const server = net.createServer((socket) => {
+      connections += 1;
+      const connection = connections;
+      const decoder = createJsonlDecoder({ maxBytes: 1024 });
+      let authed = false;
+      socket.on("data", (chunk) => {
+        for (const value of decoder.push(chunk)) {
+          if (!authed) {
+            authed = true;
+            socket.write(encodeJsonl({ version: 1, kind: "authenticated" }));
+            continue;
+          }
+          const incoming = value as { requestId: string };
+          socket.write(encodeJsonl({ version: 1, requestId: incoming.requestId, ok: true, result: { kind: "subscribed", cursor: { daemonEpoch: "epoch-1", sequence: "0" } } }));
+          if (connection === 1) {
+            socket.write(encodeJsonl({ ...validEvent, cursor: { daemonEpoch: "epoch-1", sequence: 1 } }), () => socket.destroy());
+          } else {
+            socket.write(encodeJsonl(validEvent));
+          }
+        }
+      });
+    });
+    await new Promise<void>((resolve, reject) => server.listen(socketPath, resolve).once("error", reject));
+    const client = createDaemonClient({ socketPath, token: "secret", maxBytes: 1024, reconnectDelayMs: 1, clientId: "client-1" });
+    cleanups.push(async () => {
+      await client.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
+    });
+    const iterator = client.subscribe({ daemonEpoch: "epoch-1", sequence: "0" })[Symbol.asyncIterator]();
+    await expect(within(iterator.next())).resolves.toMatchObject({ value: validEvent, done: false });
+    expect(connections).toBe(2);
+    await iterator.return?.();
+  });
+
+  it("finishes subscriptions created after the client closes", async () => {
+    const client = createDaemonClient({ socketPath: "/unused", token: "secret", maxBytes: 1024, clientId: "client-1" });
+    await client.close();
+    const iterator = client.subscribe()[Symbol.asyncIterator]();
+    await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
   });
 });

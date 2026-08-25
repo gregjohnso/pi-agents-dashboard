@@ -1,7 +1,7 @@
-import { appendFile, chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdtemp, open, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { EventStoreError, createEventStore } from "./event-store.mjs";
 
 /** @type {string[]} */
@@ -53,6 +53,54 @@ describe("event store", () => {
     const pending = subscriber.next();
     await store.close();
     await expect(pending).resolves.toEqual({ value: undefined, done: true });
+  });
+
+  it("finishes subscriptions created after the store closes", async () => {
+    const store = await createEventStore({ path: await path(), daemonEpoch: "epoch-1" });
+    await store.close();
+    await expect(store.subscribe().next()).resolves.toEqual({ value: undefined, done: true });
+  });
+
+  it("persists complete records across deterministic short writes", async () => {
+    const storePath = await path();
+    const probe = await open(storePath, "a", 0o600);
+    const prototype = Object.getPrototypeOf(probe);
+    await probe.close();
+    const originalWrite = prototype.write;
+    const write = vi.spyOn(prototype, "write").mockImplementation(function (buffer) {
+      const bytes = /** @type {Buffer} */ (buffer);
+      return originalWrite.call(this, bytes.subarray(0, Math.min(7, bytes.length)));
+    });
+    try {
+      const store = await createEventStore({ path: storePath, daemonEpoch: "epoch-1" });
+      await store.append(change);
+      await store.close();
+      expect(write.mock.calls.length).toBeGreaterThan(1);
+    } finally {
+      write.mockRestore();
+    }
+    const reopened = await createEventStore({ path: storePath, daemonEpoch: "epoch-1" });
+    await expect(reopened.replay()).resolves.toHaveLength(1);
+    await reopened.close();
+  });
+
+  it("rejects a zero-progress write before syncing or acknowledging", async () => {
+    const storePath = await path();
+    const probe = await open(storePath, "a", 0o600);
+    const prototype = Object.getPrototypeOf(probe);
+    await probe.close();
+    const write = vi.spyOn(prototype, "write").mockImplementation(async (buffer) => ({ bytesWritten: 0, buffer }));
+    const sync = vi.spyOn(prototype, "sync");
+    const store = await createEventStore({ path: storePath, daemonEpoch: "epoch-1" });
+    sync.mockClear();
+    try {
+      await expect(store.append(change)).rejects.toThrow(/progress/i);
+      expect(sync).not.toHaveBeenCalled();
+    } finally {
+      write.mockRestore();
+      sync.mockRestore();
+      await store.close();
+    }
   });
 
   it("rejects symlinks and existing stores with unsafe modes", async () => {

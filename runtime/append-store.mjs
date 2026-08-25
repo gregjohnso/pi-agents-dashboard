@@ -129,7 +129,12 @@ export async function openDurableAppendStore({ path, maxRecordBytes }) {
       if (json === undefined) throw new TypeError("Append store record must be JSON serializable");
       const line = Buffer.from(`${json}\n`, "utf8");
       if (line.length - 1 > maxRecordBytes) throw new AppendStoreError("RECORD_TOO_LARGE", "Append store record exceeds its byte limit");
-      await handle.write(line);
+      let offset = 0;
+      while (offset < line.length) {
+        const { bytesWritten } = await handle.write(line.subarray(offset));
+        if (bytesWritten === 0) throw new AppendStoreError("WRITE_STALLED", "Durable append store write made no progress");
+        offset += bytesWritten;
+      }
     },
     async sync() {
       if (handle === undefined) throw new AppendStoreError("STORE_CLOSED", "Durable append store is closed");

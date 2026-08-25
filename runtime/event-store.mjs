@@ -107,13 +107,13 @@ export async function createEventStore({ path, daemonEpoch, now = () => new Date
     },
     /** @param {EventCursor} [after] @returns {AsyncIterableIterator<PersistedEvent>} */
     subscribe(after) {
-      const initialSequence = validateCursor(after);
+      const initialSequence = closed ? BigInt(events.length) : validateCursor(after);
       const replayLength = events.length - Number(initialSequence);
       if (replayLength > subscriberLimit) throw new EventStoreError("SUBSCRIBER_OVERFLOW", "Initial event replay exceeds the bounded subscriber queue");
       /** @type {Subscriber} */
       const subscriber = {
-        queue: events.slice(Number(initialSequence)),
-        ended: false,
+        queue: closed ? [] : events.slice(Number(initialSequence)),
+        ended: closed,
         push(event) {
           if (subscriber.ended) return;
           if (subscriber.waiter !== undefined) {
@@ -129,7 +129,7 @@ export async function createEventStore({ path, daemonEpoch, now = () => new Date
           }
         },
       };
-      subscribers.add(subscriber);
+      if (!closed) subscribers.add(subscriber);
       return {
         [Symbol.asyncIterator]() { return this; },
         async next() {

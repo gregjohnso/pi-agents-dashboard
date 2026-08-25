@@ -15,6 +15,7 @@ import {
 } from "./worktree.mjs";
 
 const execFileAsync = promisify(execFile);
+const noLiveOwnershipOptions = { readLiveOwnership: async () => null };
 /** @type {string[]} */
 const temporaryPaths = [];
 afterEach(async () => {
@@ -79,6 +80,26 @@ async function commit(isolation, name, contents) {
   await git(isolation.worktreePath, "commit", "-m", name);
 }
 
+it("fails closed when the authoritative ownership reader is omitted", async () => {
+  const { isolation } = await fixture();
+
+  // @ts-expect-error Exercise runtime validation for omitted required options.
+  await expect(cleanupOwnedWorktree(isolation)).rejects.toThrow(
+    "readLiveOwnership must be a function",
+  );
+  await expect(access(isolation.worktreePath)).resolves.toBeUndefined();
+});
+
+it("does not accept a live ownership snapshot as an authoritative reader", async () => {
+  const { isolation } = await fixture();
+
+  await expect(
+    // @ts-expect-error Exercise runtime rejection of the removed snapshot option.
+    cleanupOwnedWorktree(isolation, { liveOwnership: null }),
+  ).rejects.toThrow("readLiveOwnership must be a function");
+  await expect(access(isolation.worktreePath)).resolves.toBeUndefined();
+});
+
 it("removes a clean dashboard-owned worktree still at its base without an upstream", async () => {
   const { isolation } = await fixture();
 
@@ -87,9 +108,9 @@ it("removes a clean dashboard-owned worktree still at its base without an upstre
     worktreePath: isolation.worktreePath,
     branch: isolation.branch,
   };
-  await expect(cleanupOwnedWorktree(frozenIsolationRecord)).resolves.toEqual({
-    disposition: "REMOVED",
-  });
+  await expect(
+    cleanupOwnedWorktree(frozenIsolationRecord, { readLiveOwnership: async () => null }),
+  ).resolves.toEqual({ disposition: "REMOVED" });
   await expect(access(isolation.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
@@ -97,7 +118,9 @@ it("refuses cleanup while the session has live ownership", async () => {
   const { isolation } = await fixture();
 
   await expect(
-    cleanupOwnedWorktree(isolation, { liveOwnership: { runId: "run-live" } }),
+    cleanupOwnedWorktree(isolation, {
+      readLiveOwnership: async () => ({ runId: "run-live" }),
+    }),
   ).rejects.toMatchObject({ code: "LIVE_OWNERSHIP" });
   await expect(access(isolation.worktreePath)).resolves.toBeUndefined();
 });
@@ -106,7 +129,9 @@ it("refuses modified tracked files", async () => {
   const { isolation } = await fixture();
   await writeFile(join(isolation.worktreePath, "tracked.txt"), "dirty\n");
 
-  await expect(cleanupOwnedWorktree(isolation)).rejects.toMatchObject({
+  await expect(
+    cleanupOwnedWorktree(isolation, noLiveOwnershipOptions),
+  ).rejects.toMatchObject({
     code: "DIRTY_WORKTREE",
   });
 });
@@ -115,7 +140,9 @@ it("refuses untracked files", async () => {
   const { isolation } = await fixture();
   await writeFile(join(isolation.worktreePath, "untracked.txt"), "keep\n");
 
-  await expect(cleanupOwnedWorktree(isolation)).rejects.toMatchObject({
+  await expect(
+    cleanupOwnedWorktree(isolation, noLiveOwnershipOptions),
+  ).rejects.toMatchObject({
     code: "UNTRACKED_FILES",
   });
 });
@@ -127,7 +154,9 @@ it("classifies ignored untracked files as UNTRACKED_FILES", async () => {
   await git(isolation.worktreePath, "commit", "-m", "ignore test artifact");
   await writeFile(join(isolation.worktreePath, "ignored.txt"), "keep\n");
 
-  await expect(cleanupOwnedWorktree(isolation)).rejects.toMatchObject({
+  await expect(
+    cleanupOwnedWorktree(isolation, noLiveOwnershipOptions),
+  ).rejects.toMatchObject({
     code: "UNTRACKED_FILES",
   });
   await expect(access(join(isolation.worktreePath, "ignored.txt"))).resolves.toBeUndefined();
@@ -151,11 +180,15 @@ it("holds the authoritative ownership lock throughout cleanup", async () => {
   const { isolation } = await fixture();
   const lock = await acquireWorktreeOwnershipLock(isolation.worktreePath);
 
-  await expect(cleanupOwnedWorktree(isolation)).rejects.toMatchObject({
+  await expect(
+    cleanupOwnedWorktree(isolation, noLiveOwnershipOptions),
+  ).rejects.toMatchObject({
     code: "WORKTREE_OWNERSHIP_LOCKED",
   });
   await lock.release();
-  await expect(cleanupOwnedWorktree(isolation)).resolves.toEqual({ disposition: "REMOVED" });
+  await expect(
+    cleanupOwnedWorktree(isolation, noLiveOwnershipOptions),
+  ).resolves.toEqual({ disposition: "REMOVED" });
 });
 
 it("rechecks the ownership marker and repository immediately before worktree removal", async () => {
@@ -214,7 +247,9 @@ it("refuses unpushed commits against a local bare remote", async () => {
   await git(isolation.worktreePath, "push", "-u", "origin", isolation.branch);
   await commit(isolation, "local.txt", "unpushed\n");
 
-  await expect(cleanupOwnedWorktree(isolation)).rejects.toMatchObject({
+  await expect(
+    cleanupOwnedWorktree(isolation, noLiveOwnershipOptions),
+  ).rejects.toMatchObject({
     code: "UNPUSHED_COMMITS",
   });
 });
@@ -223,7 +258,9 @@ it("refuses a changed HEAD with no upstream", async () => {
   const { isolation } = await fixture();
   await commit(isolation, "local.txt", "no upstream\n");
 
-  await expect(cleanupOwnedWorktree(isolation)).rejects.toMatchObject({
+  await expect(
+    cleanupOwnedWorktree(isolation, noLiveOwnershipOptions),
+  ).rejects.toMatchObject({
     code: "MISSING_UPSTREAM",
   });
 });
@@ -246,7 +283,9 @@ it("refuses divergent local and upstream history", async () => {
   await git(other, "push", "origin", isolation.branch);
   await git(isolation.worktreePath, "fetch", "origin");
 
-  await expect(cleanupOwnedWorktree(isolation)).rejects.toMatchObject({
+  await expect(
+    cleanupOwnedWorktree(isolation, noLiveOwnershipOptions),
+  ).rejects.toMatchObject({
     code: "DIVERGENT_HISTORY",
   });
 });
@@ -258,7 +297,9 @@ it("refuses cleanup when the dashboard ownership identity is malformed", async (
   const marker = JSON.parse(await readFile(markerPath, "utf8"));
   await writeFile(markerPath, `${JSON.stringify({ ...marker, ownershipId: "wrong" })}\n`);
 
-  await expect(cleanupOwnedWorktree(isolation)).rejects.toMatchObject({
+  await expect(
+    cleanupOwnedWorktree(isolation, noLiveOwnershipOptions),
+  ).rejects.toMatchObject({
     code: "IDENTITY_MISMATCH",
   });
 });
@@ -276,7 +317,9 @@ it("refuses a non-dashboard-owned linked worktree", async () => {
     ownershipId: isolation.ownershipId,
   };
 
-  await expect(cleanupOwnedWorktree(unmanaged)).rejects.toMatchObject({
+  await expect(
+    cleanupOwnedWorktree(unmanaged, noLiveOwnershipOptions),
+  ).rejects.toMatchObject({
     code: "NOT_DASHBOARD_OWNED",
   });
 });
@@ -285,7 +328,10 @@ it("refuses a record whose branch identity no longer matches", async () => {
   const { isolation } = await fixture();
 
   await expect(
-    cleanupOwnedWorktree({ ...isolation, branch: `${basename(isolation.branch)}-other` }),
+    cleanupOwnedWorktree(
+      { ...isolation, branch: `${basename(isolation.branch)}-other` },
+      noLiveOwnershipOptions,
+    ),
   ).rejects.toMatchObject({ code: "IDENTITY_MISMATCH" });
 });
 
@@ -295,5 +341,7 @@ it("allows cleanup after changed commits are pushed to the configured upstream",
   await commit(isolation, "pushed.txt", "pushed\n");
   await git(isolation.worktreePath, "push");
 
-  await expect(cleanupOwnedWorktree(isolation)).resolves.toEqual({ disposition: "REMOVED" });
+  await expect(
+    cleanupOwnedWorktree(isolation, noLiveOwnershipOptions),
+  ).resolves.toEqual({ disposition: "REMOVED" });
 });

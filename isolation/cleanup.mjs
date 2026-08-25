@@ -206,18 +206,18 @@ async function assertClean(worktreePath) {
 /**
  * Remove only an inactive, clean, pushed worktree with exact dashboard ownership.
  *
+ * The reader must query the authoritative current ownership source. Cleanup invokes it only
+ * while holding the worktree ownership lock, including immediately before removal.
+ *
  * @param {any} record
- * @param {{ liveOwnership?: unknown, readLiveOwnership?: () => unknown | Promise<unknown> }} [options]
+ * @param {{ readLiveOwnership: () => unknown | Promise<unknown> }} options
  */
-export async function cleanupOwnedWorktree(record, options = {}) {
+export async function cleanupOwnedWorktree(record, options) {
   validateRecord(record);
-  if (
-    options.readLiveOwnership !== undefined &&
-    typeof options.readLiveOwnership !== "function"
-  ) {
+  if (typeof options?.readLiveOwnership !== "function") {
     throw new TypeError("readLiveOwnership must be a function");
   }
-  const readLiveOwnership = options.readLiveOwnership ?? (() => options.liveOwnership);
+  const { readLiveOwnership } = options;
   const assertNoLiveOwnership = async () => {
     const liveOwnership = await readLiveOwnership();
     if (liveOwnership !== undefined && liveOwnership !== null) {

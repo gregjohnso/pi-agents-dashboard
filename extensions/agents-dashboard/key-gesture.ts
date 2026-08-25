@@ -161,7 +161,7 @@ export class DashboardGestureEditor {
       at: this.now(),
       editorText: this.base.getText(),
       cursorAtStart: cursor.line === 0 && cursor.col === 0,
-      mainEditorFocused: true,
+      mainEditorFocused: this.base.focused,
       modified: matchesKey(data, Key.left) && parsed !== "left",
       phase: isKeyRelease(data) ? "release" : isKeyRepeat(data) ? "repeat" : "press",
     });

@@ -18,6 +18,7 @@ import { parseClientRequest } from "../shared/contracts.js";
 initializeRuntimePermissions();
 
 const DEFAULT_MAX_BYTES = 1024 * 1024;
+const MAX_ATTACHMENT_REQUESTS = 4096;
 const DURABLE_COMMANDS = new Set(["prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response"]);
 const CONNECTOR_PATH = fileURLToPath(new URL("./daemon-connector.mjs", import.meta.url));
 
@@ -226,7 +227,7 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
     socket.on("close", () => {
       sockets.delete(socket);
       subscribers.delete(socket);
-      const attachmentRelease = context.releaseAttachments?.(socket);
+      const attachmentRelease = context.releaseAttachments?.(socket, frontendClientId);
       if (attachmentRelease !== undefined) {
         chains.add(attachmentRelease);
         void attachmentRelease.finally(() => chains.delete(attachmentRelease)).catch(() => {});
@@ -371,6 +372,7 @@ export async function createDaemonRuntime({
   randomId = randomUUID,
   responseWriter = async (/** @type {any} */ { value, write }) => write(value),
   closeFailpoint = async () => {},
+  broadcastEvent,
 } = {}) {
   if (typeof root !== "string" || resolve(root) !== root) throw new TypeError("Daemon runtime root must be an absolute canonical path");
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 128) throw new TypeError("maxBytes must be at least 128");
@@ -401,8 +403,8 @@ export async function createDaemonRuntime({
     const usedCommandIds = new Set();
     /** @type {Map<string, Map<net.Socket, { clientId: string, role: "composer" | "observer" }>>} */
     const attachmentClaims = new Map();
-    /** @type {WeakMap<net.Socket, Map<string, { serialized: string, result: any }>>} */
-    const attachmentRequests = new WeakMap();
+    /** @type {Map<string, { serialized: string, promise: Promise<any>, settled: boolean }>} */
+    const attachmentRequests = new Map();
     /** @type {Map<string, Promise<unknown>>} */
     const attachmentTails = new Map();
     /** @type {any} */
@@ -432,64 +434,88 @@ export async function createDaemonRuntime({
         return result;
       },
       /** @param {string} sessionId @param {string} clientId @param {"composer" | "observer"} role @param {boolean} attached */
-      async publishAttachment(sessionId, clientId, role, attached) {
-        if (context.recovery?.events === undefined) return;
-        const event = await context.recovery.events.append({ kind: "attachment_changed", payload: { sessionId, clientId, role, attached } });
-        context.broadcast(event);
+      async appendAttachment(sessionId, clientId, role, attached) {
+        if (context.recovery?.events === undefined) throw Object.assign(new Error("Attachment event store is unavailable"), { code: "RECOVERING" });
+        return context.recovery.events.append({ kind: "attachment_changed", payload: { sessionId, clientId, role, attached } });
       },
-      /** @param {any} request @param {net.Socket} socket */
-      async arbitrateAttachment(request, socket) {
-        let cache = attachmentRequests.get(socket);
-        if (cache === undefined) {
-          cache = new Map();
-          attachmentRequests.set(socket, cache);
-        }
-        const cacheKey = `${request.clientId}\u0000${request.requestId}`;
-        const serialized = JSON.stringify(request);
-        const cached = cache.get(cacheKey);
+      /** @param {any} request @param {net.Socket} socket @param {string} authenticatedClientId */
+      arbitrateAttachment(request, socket, authenticatedClientId) {
+        if (request.clientId !== authenticatedClientId) throw Object.assign(new Error("Attachment client identity changed"), { code: "CLIENT_IDENTITY_CONFLICT" });
+        const cacheKey = JSON.stringify([authenticatedClientId, request.requestId]);
+        const serialized = JSON.stringify({ op: request.op, payload: request.payload });
+        const cached = attachmentRequests.get(cacheKey);
         if (cached !== undefined) {
           if (cached.serialized !== serialized) throw Object.assign(new Error("Attachment request ID was reused with changed content"), { code: "IDEMPOTENCY_CONFLICT" });
-          return cached.result;
+          return cached.promise;
         }
+        while (attachmentRequests.size >= MAX_ATTACHMENT_REQUESTS) {
+          const oldestSettled = [...attachmentRequests].find(([, entry]) => entry.settled)?.[0];
+          if (oldestSettled === undefined) throw Object.assign(new Error("Too many attachment requests are in flight"), { code: "ATTACHMENT_REQUEST_LIMIT", retryable: true });
+          attachmentRequests.delete(oldestSettled);
+        }
+        /** @type {(value: any) => void} */
+        let resolveReservation = () => {};
+        /** @type {(reason?: unknown) => void} */
+        let rejectReservation = () => {};
+        const promise = new Promise((resolve, reject) => {
+          resolveReservation = resolve;
+          rejectReservation = reject;
+        });
+        const reservation = { serialized, promise, settled: false };
+        attachmentRequests.set(cacheKey, reservation);
         const sessionId = request.payload.sessionId;
-        const result = await context.serializeAttachment(sessionId, async () => {
-          let claims = attachmentClaims.get(sessionId);
-          if (claims === undefined) {
-            claims = new Map();
-            attachmentClaims.set(sessionId, claims);
-          }
+        const operation = context.serializeAttachment(sessionId, async () => {
+          const existingClaims = attachmentClaims.get(sessionId);
+          const claims = existingClaims ?? new Map();
           const prior = claims.get(socket);
+          if (prior !== undefined && prior.clientId !== authenticatedClientId) throw Object.assign(new Error("Attachment claim identity changed"), { code: "CLIENT_IDENTITY_CONFLICT" });
           if (request.op === "detach") {
-            if (prior !== undefined) {
-              await context.publishAttachment(sessionId, prior.clientId, prior.role, false);
+            if (prior !== undefined && prior.clientId === authenticatedClientId) {
+              const event = await context.appendAttachment(sessionId, authenticatedClientId, prior.role, false);
               claims.delete(socket);
+              if (claims.size === 0) attachmentClaims.delete(sessionId);
+              context.broadcast(event);
             }
-            if (claims.size === 0) attachmentClaims.delete(sessionId);
             return { kind: "detached", sessionId };
           }
-          const composerSocket = [...claims].find(([, claim]) => claim.role === "composer")?.[0];
-          const grantedRole = request.payload.role === "composer" && (composerSocket === undefined || composerSocket === socket)
+          const composerClaim = [...claims.values()].find((claim) => claim.role === "composer");
+          const grantedRole = request.payload.role === "composer" && (composerClaim === undefined || (prior?.clientId === authenticatedClientId && prior.role === "composer"))
             ? "composer"
             : "observer";
-          if (prior !== undefined && prior.clientId === request.clientId && prior.role === grantedRole) return { kind: "attached", sessionId, role: grantedRole };
-          await context.publishAttachment(sessionId, request.clientId, grantedRole, true);
-          claims.set(socket, { clientId: request.clientId, role: grantedRole });
+          if (prior !== undefined && prior.clientId === authenticatedClientId && prior.role === grantedRole) return { kind: "attached", sessionId, role: grantedRole };
+          const event = await context.appendAttachment(sessionId, authenticatedClientId, grantedRole, true);
+          if (existingClaims === undefined) attachmentClaims.set(sessionId, claims);
+          claims.set(socket, { clientId: authenticatedClientId, role: grantedRole });
+          context.broadcast(event);
           return { kind: "attached", sessionId, role: grantedRole };
         });
-        cache.set(cacheKey, { serialized, result });
-        return result;
+        void operation.then(
+          (/** @type {any} */ result) => {
+            reservation.settled = true;
+            resolveReservation(result);
+          },
+          (/** @type {unknown} */ error) => {
+            reservation.settled = true;
+            rejectReservation(error);
+          },
+        );
+        return promise;
       },
-      /** @param {net.Socket} socket */
-      async releaseAttachments(socket) {
-        const sessionIds = [...attachmentClaims].filter(([, claims]) => claims.has(socket)).map(([sessionId]) => sessionId);
+      /** @param {net.Socket} socket @param {string | undefined} authenticatedClientId */
+      async releaseAttachments(socket, authenticatedClientId) {
+        if (authenticatedClientId === undefined) return;
+        const sessionIds = [...attachmentClaims]
+          .filter(([, claims]) => claims.get(socket)?.clientId === authenticatedClientId)
+          .map(([sessionId]) => sessionId);
         await Promise.all(sessionIds.map((sessionId) => context.serializeAttachment(sessionId, async () => {
           const claims = attachmentClaims.get(sessionId);
           if (claims === undefined) return;
           const prior = claims.get(socket);
-          if (prior === undefined) return;
-          await context.publishAttachment(sessionId, prior.clientId, prior.role, false);
+          if (prior === undefined || prior.clientId !== authenticatedClientId) return;
+          const event = await context.appendAttachment(sessionId, authenticatedClientId, prior.role, false);
           claims.delete(socket);
           if (claims.size === 0) attachmentClaims.delete(sessionId);
+          context.broadcast(event);
         })));
       },
       /** @param {any} frame @param {any} connection @param {any} metadata @param {number} routeGeneration */
@@ -574,7 +600,7 @@ export async function createDaemonRuntime({
         }
         if (request.op === "attach" || request.op === "detach") {
           if (socket === undefined) throw new TypeError("Attachment requires a live socket");
-          return context.arbitrateAttachment(request, socket);
+          return context.arbitrateAttachment(request, socket, authenticatedClientId);
         }
         if (!DURABLE_COMMANDS.has(request.op)) throw Object.assign(new Error(`Unsupported daemon operation: ${request.op}`), { code: "UNSUPPORTED_OPERATION" });
         const accepted = await context.recovery.journal.accept(request);
@@ -618,7 +644,10 @@ export async function createDaemonRuntime({
     socketServer = createSocketServer({ socketPath, token, maxBytes, context });
     await socketServer.listen();
     socketOwned = true;
-    context.broadcast = (/** @type {any} */ event) => socketServer.broadcast(event);
+    context.broadcast = (/** @type {any} */ event) => {
+      if (broadcastEvent !== undefined) return broadcastEvent(event, () => socketServer.broadcast(event));
+      return socketServer.broadcast(event);
+    };
     context.state = "RECONCILING";
     await updateDaemonLifecycleState(claim, "RECONCILING");
     const defaultReconcile = () => reconcileRuntime({

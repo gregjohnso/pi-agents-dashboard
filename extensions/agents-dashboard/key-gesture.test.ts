@@ -85,6 +85,28 @@ describe("Left dashboard gesture", () => {
     expect(delegate.mock.calls).toEqual([["left"], ["a"]]);
   });
 
+  it("delegates an empty unfocused Left and opens only after public focus is restored", () => {
+    const tui = { requestRender: vi.fn() } as unknown as TUI;
+    const theme: EditorTheme = {
+      borderColor: (text) => text,
+      selectList: { selectedPrefix: () => "", selectedText: (text) => text, description: (text) => text, scrollInfo: (text) => text, noMatch: (text) => text },
+    };
+    const base = new CustomEditor(tui, theme, getKeybindings() as never);
+    const delegated = vi.spyOn(base, "handleInput");
+    const open = vi.fn();
+    const editor = new DashboardGestureEditor(base, open);
+
+    base.focused = false;
+    editor.handleInput("\x1b[D");
+    expect(delegated).toHaveBeenCalledOnce();
+    expect(open).not.toHaveBeenCalled();
+
+    base.focused = true;
+    editor.handleInput("\x1b[D");
+    expect(open).toHaveBeenCalledOnce();
+    editor.dispose();
+  });
+
   it("uses the real public CustomEditor cursor, history, and keybindings", () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
@@ -94,6 +116,7 @@ describe("Left dashboard gesture", () => {
       selectList: { selectedPrefix: () => "", selectedText: (text) => text, description: (text) => text, scrollInfo: (text) => text, noMatch: (text) => text },
     };
     const base = new CustomEditor(tui, theme, getKeybindings() as never);
+    base.focused = true;
     const open = vi.fn();
     const editor = new DashboardGestureEditor(base, open, Date.now);
 

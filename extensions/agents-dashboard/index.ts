@@ -116,14 +116,13 @@ function parsePersistedState(value: unknown): PersistedDashboardState {
   }
   if (state.launchDraft !== undefined) {
     const draft = record(state.launchDraft, "frontend state.launchDraft");
-    exactKeys(draft, ["prompt", "cwd", "sourceSessionId", "isolationMode", "model", "thinkingLevel", "name"], "frontend state.launchDraft");
+    exactKeys(draft, ["prompt", "cwd", "isolationMode", "model", "thinkingLevel", "name"], "frontend state.launchDraft");
     const model = record(draft.model, "frontend state.launchDraft.model");
     exactKeys(model, ["provider", "id"], "frontend state.launchDraft.model");
     if (!["worktree", "shared_directory"].includes(String(draft.isolationMode))) throw persistenceError("frontend state.launchDraft.isolationMode is invalid");
     parsed.launchDraft = {
       prompt: text(draft.prompt, "frontend state.launchDraft.prompt", { empty: true, max: 100_000 }),
       cwd: text(draft.cwd, "frontend state.launchDraft.cwd"),
-      sourceSessionId: text(draft.sourceSessionId, "frontend state.launchDraft.sourceSessionId", { max: 256 }),
       isolationMode: draft.isolationMode as "worktree" | "shared_directory",
       model: { provider: text(model.provider, "frontend state.launchDraft.model.provider", { max: 256 }), id: text(model.id, "frontend state.launchDraft.model.id", { max: 256 }) },
       thinkingLevel: text(draft.thinkingLevel, "frontend state.launchDraft.thinkingLevel", { max: 256 }),
@@ -222,7 +221,7 @@ async function openDashboardWithPublicUi(ctx: ExtensionContext): Promise<void> {
           tui.requestRender();
         },
         invalidate() {},
-        dispose() { void dashboard.close(); },
+        dispose() { return dashboard.close(); },
       };
     });
   } finally {
@@ -261,6 +260,13 @@ export function registerAgentsDashboard(
 
   pi.on("session_start", async (_event, ctx) => {
     if (ctx.mode !== "tui") return;
+    const priorInstallation = installations.get(ctx.ui);
+    if (priorInstallation !== undefined) {
+      installations.delete(ctx.ui);
+      for (const editor of priorInstallation.editors) editor.dispose();
+      priorInstallation.editors.clear();
+      if (ctx.ui.getEditorComponent() === priorInstallation.wrapper) ctx.ui.setEditorComponent(priorInstallation.previous);
+    }
     const report = await dependencies.checkCapabilities();
     if (!report.composableLeftGesture) return;
     const previous = ctx.ui.getEditorComponent();
@@ -284,11 +290,9 @@ export function registerAgentsDashboard(
     const installation = installations.get(ctx.ui);
     if (installation === undefined) return;
     installations.delete(ctx.ui);
-    if (ctx.ui.getEditorComponent() === installation.wrapper) {
-      for (const editor of installation.editors) editor.dispose();
-      installation.editors.clear();
-      ctx.ui.setEditorComponent(installation.previous);
-    }
+    for (const editor of installation.editors) editor.dispose();
+    installation.editors.clear();
+    if (ctx.ui.getEditorComponent() === installation.wrapper) ctx.ui.setEditorComponent(installation.previous);
   });
 }
 

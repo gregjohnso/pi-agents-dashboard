@@ -254,6 +254,112 @@ it("binds composer ownership to the exact authenticated connection even for the 
   reconnect.close();
 });
 
+it("rejects wrong-client detach on one connection and releases only the exact authenticated claim", async () => {
+  const runtime = await createDaemonRuntime({ root: await root() });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const owner = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  const contender = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await Promise.all([owner.ready, contender.ready]);
+  owner.send({ version: 1, clientId: "owner", requestId: "attach", op: "attach", payload: { sessionId: "session", role: "composer" } });
+  expect(await owner.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+  owner.send({ version: 1, clientId: "wrong", requestId: "wrong-detach", op: "detach", payload: { sessionId: "session" } });
+  expect(await owner.next()).toMatchObject({ ok: false, error: { code: "CLIENT_IDENTITY_CONFLICT" } });
+  contender.send({ version: 1, clientId: "contender", requestId: "attach-before", op: "attach", payload: { sessionId: "session", role: "composer" } });
+  expect(await contender.next()).toMatchObject({ ok: true, result: { role: "observer" } });
+  owner.send({ version: 1, clientId: "owner", requestId: "exact-detach", op: "detach", payload: { sessionId: "session" } });
+  expect(await owner.next()).toMatchObject({ ok: true, result: { kind: "detached" } });
+  contender.send({ version: 1, clientId: "contender", requestId: "attach-after", op: "attach", payload: { sessionId: "session", role: "composer" } });
+  expect(await contender.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+  owner.close();
+  contender.close();
+});
+
+it("installs an in-flight attachment reservation across sockets before arbitration", async () => {
+  /** @type {((value?: unknown) => void) | undefined} */
+  let releaseAppend;
+  /** @type {((value?: unknown) => void) | undefined} */
+  let appendReached;
+  const appendGate = new Promise((resolve) => { releaseAppend = resolve; });
+  const reached = new Promise((resolve) => { appendReached = resolve; });
+  let appendCount = 0;
+  const runtime = await createDaemonRuntime({
+    root: await root(),
+    reconcile: async (/** @type {any} */ options) => {
+      const recovery = await options.defaultReconcile();
+      const append = recovery.events.append.bind(recovery.events);
+      recovery.events.append = async (/** @type {any} */ event) => {
+        if (event.kind === "attachment_changed" && event.payload.attached === true) {
+          appendCount += 1;
+          appendReached?.();
+          await appendGate;
+        }
+        return append(event);
+      };
+      return recovery;
+    },
+  });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const first = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  const duplicate = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  const conflict = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await Promise.all([first.ready, duplicate.ready, conflict.ready]);
+  const attach = { version: 1, clientId: "stable", requestId: "same", op: "attach", payload: { sessionId: "session", role: "composer" } };
+  first.send(attach);
+  await reached;
+  duplicate.send(attach);
+  conflict.send({ ...attach, op: "detach", payload: { sessionId: "session" } });
+  expect(await conflict.next()).toMatchObject({ ok: false, error: { code: "IDEMPOTENCY_CONFLICT" } });
+  releaseAppend?.();
+  const [firstResult, duplicateResult] = await Promise.all([first.next(), duplicate.next()]);
+  expect(firstResult).toMatchObject({ ok: true, result: { role: "composer" } });
+  expect(duplicateResult).toEqual(firstResult);
+  expect(appendCount).toBe(1);
+  first.close();
+  duplicate.close();
+  conflict.close();
+});
+
+it("mutates a durable claim before broadcast and retains it when broadcast fails", async () => {
+  /** @type {string[]} */
+  const order = [];
+  let rejectBroadcast = true;
+  const runtime = await createDaemonRuntime({
+    root: await root(),
+    /** @param {any} event @param {() => void} broadcast */
+    broadcastEvent(event, broadcast) {
+      if (event.kind === "attachment_changed") order.push("broadcast");
+      if (rejectBroadcast && event.kind === "attachment_changed") {
+        rejectBroadcast = false;
+        throw Object.assign(new Error("injected broadcast failure"), { code: "BROADCAST_FAILED" });
+      }
+      broadcast();
+    },
+    reconcile: async (/** @type {any} */ options) => {
+      const recovery = await options.defaultReconcile();
+      const append = recovery.events.append.bind(recovery.events);
+      recovery.events.append = async (/** @type {any} */ event) => {
+        if (event.kind === "attachment_changed") order.push("append");
+        return append(event);
+      };
+      return recovery;
+    },
+  });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const first = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  const second = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await Promise.all([first.ready, second.ready]);
+  first.send({ version: 1, clientId: "first", requestId: "attach-first", op: "attach", payload: { sessionId: "session", role: "composer" } });
+  expect(await first.next()).toMatchObject({ ok: false, error: { code: "BROADCAST_FAILED" } });
+  second.send({ version: 1, clientId: "second", requestId: "attach-second", op: "attach", payload: { sessionId: "session", role: "composer" } });
+  expect(await second.next()).toMatchObject({ ok: true, result: { role: "observer" } });
+  expect(order.slice(0, 2)).toEqual(["append", "broadcast"]);
+  first.close();
+  second.close();
+});
+
 it("leaves an attachment claim unchanged when durable attachment event append fails", async () => {
   let rejectNextAttachment = false;
   const runtime = await createDaemonRuntime({

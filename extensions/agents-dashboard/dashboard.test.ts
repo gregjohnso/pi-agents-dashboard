@@ -87,8 +87,15 @@ function controller(backend: FakeBackend, overrides: Partial<ConstructorParamete
     clientId: "stable-client",
     sourceSessionId: "source",
     launchDefaults: { cwd: "/repo", model: { provider: "anthropic", id: "claude" }, thinkingLevel: "high", name: "new task" },
+    requestRender: vi.fn(),
     ...overrides,
   });
+}
+
+async function processRenderedEvent(dashboard: DashboardController, backend: FakeBackend, update: DashboardUpdate): Promise<void> {
+  const processing = Promise.resolve(backend.listener?.(update));
+  dashboard.render();
+  await processing;
 }
 
 describe("dashboard controller", () => {
@@ -99,7 +106,7 @@ describe("dashboard controller", () => {
     dashboard.handleInput("\x1b[B");
     expect(dashboard.selectedSessionId).toBe("b");
 
-    await backend.listener?.({ snapshot: { sessions: [session("c"), session("a"), session("b", { revision: 2 })] }, cursor: { daemonEpoch: "epoch", sequence: "1" } });
+    await processRenderedEvent(dashboard, backend, { snapshot: { sessions: [session("c"), session("a"), session("b", { revision: 2 })] }, cursor: { daemonEpoch: "epoch", sequence: "1" } });
     dashboard.resize(40, 8);
     expect(dashboard.selectedSessionId).toBe("b");
     expect(dashboard.render(40, 8).every((line) => visibleWidth(line) <= 40)).toBe(true);
@@ -235,7 +242,7 @@ describe("dashboard controller", () => {
     await dashboard.open();
     backend.errorListener?.({ code: "MALFORMED_FRAME", message: "invalid event" });
     expect(dashboard.status).toMatchObject({ kind: "error", code: "MALFORMED_FRAME" });
-    expect(onClose).toHaveBeenCalledWith({ kind: "error", code: "MALFORMED_FRAME", message: "invalid event" });
+    await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith({ kind: "error", code: "MALFORMED_FRAME", message: "invalid event" }));
     expect(backend.stop).not.toHaveBeenCalled();
   });
 
@@ -255,7 +262,7 @@ describe("dashboard controller", () => {
     expect(saved.saved.length).toBeGreaterThan(0);
   });
 
-  it("renders and persists an event before the backend may acknowledge it", async () => {
+  it("awaits the actual host component render before persisting an event", async () => {
     const order: string[] = [];
     const backend = new FakeBackend([session("a")]);
     const saved = persistence();
@@ -263,23 +270,44 @@ describe("dashboard controller", () => {
     const dashboard = controller(backend, { persistence: saved, requestRender: () => order.push("request-render") });
     await dashboard.open();
     order.length = 0;
-    const render = vi.spyOn(dashboard, "render").mockImplementation(() => { order.push("render"); return []; });
-    await backend.listener?.({ snapshot: { sessions: [session("a", { revision: 2 })] }, cursor: { daemonEpoch: "epoch", sequence: "1" } });
-    expect(order).toEqual(["render", "persist", "request-render"]);
-    render.mockRestore();
+
+    const processing = Promise.resolve(backend.listener?.({ snapshot: { sessions: [session("a", { revision: 2 })] }, cursor: { daemonEpoch: "epoch", sequence: "1" } }));
+    expect(order).toEqual(["request-render"]);
+    await Promise.resolve();
+    expect(order).toEqual(["request-render"]);
+    order.push("host-render");
+    dashboard.render();
+    await processing;
+    expect(order).toEqual(["request-render", "host-render", "persist"]);
   });
 
-  it.each(["render", "persistence"])("closes on %s failure so the backend sends no acknowledgement", async (failure) => {
+  it.each(["render", "request", "persistence", "disposed"])("closes on %s failure so the backend sends no acknowledgement", async (failure) => {
     const backend = new FakeBackend([session("a")]);
     const onClose = vi.fn();
     const saved = persistence();
+    let renderRequests = 0;
     if (failure === "persistence") saved.save = vi.fn(async () => { throw Object.assign(new Error("disk failed"), { code: "PERSIST_FAILED" }); });
-    const dashboard = controller(backend, { persistence: saved, onClose });
+    const dashboard = controller(backend, {
+      persistence: saved,
+      onClose,
+      requestRender: () => {
+        renderRequests += 1;
+        if (failure === "request" && renderRequests > 1) throw new Error("request render failed");
+      },
+    });
     await dashboard.open();
-    if (failure === "render") vi.spyOn(dashboard, "render").mockImplementation(() => { throw new Error("render failed"); });
-    await expect(backend.listener?.({ snapshot: { sessions: [session("a", { revision: 2 })] }, cursor: { daemonEpoch: "epoch", sequence: "1" } })).rejects.toThrow();
-    expect(onClose).toHaveBeenCalledWith(expect.objectContaining({ kind: "error" }));
+    if (failure === "render") {
+      const internals = dashboard as unknown as { list: { renderViewport: () => never } };
+      internals.list.renderViewport = () => { throw new Error("render failed"); };
+    }
+    const processing = Promise.resolve(backend.listener?.({ snapshot: { sessions: [session("a", { revision: 2 })] }, cursor: { daemonEpoch: "epoch", sequence: "1" } }));
+    if (failure === "disposed") await dashboard.close();
+    else if (failure === "render") expect(() => dashboard.render()).toThrowError("render failed");
+    else if (failure !== "request") dashboard.render();
+    await expect(processing).rejects.toThrow();
+    await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith(expect.objectContaining({ kind: failure === "disposed" ? "closed" : "error" })));
     expect(backend.unsubscribed).toBe(1);
+    expect(saved.saved.some((state) => (state as { cursor?: EventCursor }).cursor?.sequence === "1")).toBe(false);
   });
 
   it("disposes a subscription that resolves after close and installs nothing", async () => {
@@ -329,6 +357,83 @@ describe("dashboard controller", () => {
     expect(rendered).toContain("model:");
     expect(rendered).toContain("thinking:");
     expect(rendered).toContain("name:");
+  });
+
+  it("serializes delayed UI and final close saves and admits no writes after close resolves", async () => {
+    let releaseFirst: (() => void) | undefined;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const starts: string[] = [];
+    let active = 0;
+    let maximumActive = 0;
+    const saved = persistence();
+    saved.save = vi.fn(async (state) => {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      starts.push(state.viewState?.query.search ?? "final");
+      if (starts.length === 1) await firstGate;
+      active -= 1;
+    });
+    const dashboard = controller(new FakeBackend([session("a")]), { persistence: saved });
+    await dashboard.open();
+    dashboard.setSearch("queued");
+    await vi.waitFor(() => expect(starts).toEqual(["queued"]));
+
+    let closed = false;
+    const closing = dashboard.close().then(() => { closed = true; });
+    await Promise.resolve();
+    expect(closed).toBe(false);
+    releaseFirst?.();
+    await closing;
+    expect(maximumActive).toBe(1);
+    expect(starts).toEqual(["queued", "queued"]);
+
+    dashboard.setSearch("late");
+    await Promise.resolve();
+    expect(starts).toEqual(["queued", "queued"]);
+  });
+
+  it("awaits native detach failure before signaling close exactly once", async () => {
+    let releaseDetach: (() => void) | undefined;
+    const detachGate = new Promise<void>((resolve) => { releaseDetach = resolve; });
+    const onClose = vi.fn();
+    const nativeAttach: NativeAttachSeam = {
+      async attach() { return { kind: "attached", role: "composer", controls: { left: "detach_to_dashboard", escape: "detach_to_dashboard", ctrlC: "native_pi" } }; },
+      async detach() {
+        await detachGate;
+        return { kind: "failed", error: { code: "DETACH_FAILED", message: "detach failed" } };
+      },
+    };
+    const dashboard = controller(new FakeBackend([session("a")]), { nativeAttach, onClose });
+    await dashboard.open();
+    await dashboard.activateSelection();
+    const first = dashboard.close();
+    const second = dashboard.close();
+    await Promise.resolve();
+    expect(onClose).not.toHaveBeenCalled();
+    releaseDetach?.();
+    await Promise.all([first, second]);
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(onClose).toHaveBeenCalledWith({ kind: "error", code: "DETACH_FAILED", message: "detach failed" });
+  });
+
+  it("never persists source ownership and derives it from each current Pi session", async () => {
+    let current: Awaited<ReturnType<DashboardPersistence["load"]>>;
+    const shared: DashboardPersistence = {
+      async load() { return current; },
+      async save(state) { current = structuredClone(state); },
+    };
+    const firstBackend = new FakeBackend([]);
+    const first = controller(firstBackend, { persistence: shared, sourceSessionId: "session-a" });
+    await first.open();
+    first.setComposerPrompt("from A");
+    await first.close();
+    expect(current?.launchDraft).not.toHaveProperty("sourceSessionId");
+
+    const secondBackend = new FakeBackend([]);
+    const second = controller(secondBackend, { persistence: shared, sourceSessionId: "session-b" });
+    await second.open();
+    await second.submitComposer();
+    expect(secondBackend.requests[0]).toMatchObject({ sourceSessionId: "session-b", prompt: "from A" });
   });
 
   it("blocks observer composer and control focus and detaches native attachment on close", async () => {

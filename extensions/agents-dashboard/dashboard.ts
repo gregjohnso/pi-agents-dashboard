@@ -94,7 +94,7 @@ export interface PersistedDashboardState {
     query: Omit<DashboardQuery, "historyPolicy">;
     selectedSessionId?: string;
   };
-  launchDraft?: LaunchDraft;
+  launchDraft?: Omit<LaunchDraft, "sourceSessionId">;
 }
 
 export interface DashboardPersistence {
@@ -288,6 +288,7 @@ export class DashboardController {
   private readonly persistence: DashboardPersistence;
   private readonly nativeAttach: NativeAttachSeam;
   private readonly clientId: string;
+  private readonly sourceSessionId: string;
   private readonly requestId: () => string;
   private readonly onClose?: (result: DashboardCloseResult) => void;
   private readonly onSessionIntent?: (intent: SessionIntent) => void;
@@ -306,6 +307,13 @@ export class DashboardController {
   private openController?: AbortController;
   private attachedSessionId?: string;
   private confirmationText = "";
+  private closePromise?: Promise<void>;
+  private readonly eventOperations = new Set<Promise<void>>();
+  private saveTail: Promise<void> = Promise.resolve();
+  private saveFailure?: unknown;
+  private saveAdmissionGeneration = 0;
+  private renderRequestGeneration = 0;
+  private readonly renderWaiters = new Map<number, { resolve(): void; reject(error: unknown): void }>();
 
   query: DashboardQuery = defaultQuery();
   focus: "list" | "search" | "composer" | "confirmation" = "list";
@@ -320,6 +328,7 @@ export class DashboardController {
     this.persistence = options.persistence;
     this.nativeAttach = options.nativeAttach;
     this.clientId = options.clientId;
+    this.sourceSessionId = options.sourceSessionId;
     this.requestId = options.requestId ?? randomUUID;
     this.onClose = options.onClose;
     this.onSessionIntent = options.onSessionIntent;
@@ -337,6 +346,8 @@ export class DashboardController {
   async open(): Promise<void> {
     if (!this.closed) return;
     this.closed = false;
+    this.closePromise = undefined;
+    this.saveFailure = undefined;
     const generation = ++this.openGeneration;
     const controller = new AbortController();
     this.openController = controller;
@@ -348,29 +359,20 @@ export class DashboardController {
         this.cursor = persisted.cursor;
         this.query = safeQuery(persisted.viewState?.query);
         this.preferredSelectionId = persisted.viewState?.selectedSessionId;
-        if (persisted.launchDraft !== undefined) this.composerDraft = { ...persisted.launchDraft, model: { ...persisted.launchDraft.model } };
+        if (persisted.launchDraft !== undefined) {
+          this.composerDraft = {
+            ...persisted.launchDraft,
+            sourceSessionId: this.sourceSessionId,
+            model: { ...persisted.launchDraft.model },
+          };
+        }
       }
       const snapshot = await this.backend.getSnapshot(controller.signal);
       if (!this.isCurrentOpen(generation)) return;
       this.applySnapshot(snapshot);
-      this.render(this.width, this.height);
       const unsubscribe = await this.backend.subscribe(
         this.cursor,
-        async (update) => {
-          if (!this.isCurrentOpen(generation)) return;
-          try {
-            this.applySnapshot(update.snapshot);
-            this.render(this.width, this.height);
-            await this.persist(update.cursor);
-            if (!this.isCurrentOpen(generation)) throw Object.assign(new Error("Dashboard closed during event persistence"), { code: "DASHBOARD_CLOSED" });
-            this.cursor = update.cursor;
-            this.requestRender?.();
-          } catch (error) {
-            const typed = this.typedError(error, "EVENT_PROCESSING_FAILED");
-            this.fail(typed);
-            throw Object.assign(new Error(typed.message), { code: typed.code });
-          }
-        },
+        (update) => this.trackEvent(update, generation),
         (error) => { if (this.isCurrentOpen(generation)) this.fail(error); },
       );
       if (!this.isCurrentOpen(generation)) {
@@ -379,34 +381,15 @@ export class DashboardController {
       }
       this.unsubscribe = unsubscribe;
       this.status = { kind: "ready" };
+      this.requestRender?.();
     } catch (error) {
       if (!this.isCurrentOpen(generation)) return;
       this.fail(this.typedError(error, "DASHBOARD_OPEN_FAILED"));
     }
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
-    this.closed = true;
-    this.openGeneration += 1;
-    this.openController?.abort();
-    this.openController = undefined;
-    const unsubscribe = this.unsubscribe;
-    this.unsubscribe = undefined;
-    unsubscribe?.();
-    this.overlay = undefined;
-    this.pendingShared = undefined;
-    this.confirmationText = "";
-    let result: DashboardCloseResult = { kind: "closed" };
-    try {
-      await this.detachNative();
-      await this.persist();
-    } catch (error) {
-      const typed = this.typedError(error, "DASHBOARD_CLOSE_FAILED");
-      this.status = { kind: "error", ...typed };
-      result = { kind: "error", ...typed };
-    }
-    this.onClose?.(result);
+  close(): Promise<void> {
+    return this.beginClose();
   }
 
   resize(width: number, height: number): void {
@@ -419,6 +402,7 @@ export class DashboardController {
     this.preferredSelectionId = sessionId;
     const selected = this.list.selectSession(sessionId);
     this.ensureSelectionVisible();
+    if (selected) this.scheduleUiSave();
     return selected;
   }
 
@@ -481,10 +465,12 @@ export class DashboardController {
 
   setComposerPrompt(prompt: string): void {
     this.composerDraft = { ...this.composerDraft, prompt };
+    this.scheduleUiSave();
   }
 
   setIsolationMode(isolationMode: LaunchIsolationMode): void {
     this.composerDraft = { ...this.composerDraft, isolationMode };
+    this.scheduleUiSave();
   }
 
   async submitComposer(): Promise<void> {
@@ -681,31 +667,35 @@ export class DashboardController {
   }
 
   render(width = this.width, height = this.height): string[] {
+    const renderedGeneration = this.renderRequestGeneration;
     try {
       this.resize(width, height);
       const layout = createDashboardLayout(this.width, this.height);
-    const counts = countDashboardSessions(this.sessions);
-    const lines = Array.from({ length: this.height }, () => "");
-    if (lines.length > 0) lines[0] = " pi agents";
-    if (lines.length > 1) lines[1] = ` Working ${counts.working}  Ready ${counts.ready}  Failed ${counts.failed}  Sessions ${counts.sessions}  Processes ${counts.processes}`;
-    if (lines.length > 2) lines[2] = ` ${this.controlSegments().join(" ")}`;
-    if (lines.length > 3) lines[3] = renderColumnHeader(layout);
-    const rendered = this.list.renderViewport({ offset: this.viewportOffset, height: layout.listHeight, width: this.width });
-    for (let index = 0; index < rendered.length; index += 1) {
-      const target = layout.listTop + index;
-      if (target < lines.length) lines[target] = rendered[index].line;
-    }
-    if (lines.length >= 3) {
-      const composerMarker = this.focus === "composer" ? `[${this.composerField}]` : "";
-      lines[lines.length - 3] = `❯${composerMarker} ${this.composerDraft.prompt || "describe a task for a new session"}`;
-      const form = `cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
-      lines[lines.length - 2] = this.status.kind === "error" ? `${this.status.code}: ${this.status.message}  ${form}` : form;
-      lines[lines.length - 1] = " ↑↓ nav Enter/→ open / search t/p/o/a/j filters s sort g group n form Tab fields ^X intent ? help";
-    }
+      const counts = countDashboardSessions(this.sessions);
+      const lines = Array.from({ length: this.height }, () => "");
+      if (lines.length > 0) lines[0] = " pi agents";
+      if (lines.length > 1) lines[1] = ` Working ${counts.working}  Ready ${counts.ready}  Failed ${counts.failed}  Sessions ${counts.sessions}  Processes ${counts.processes}`;
+      if (lines.length > 2) lines[2] = ` ${this.controlSegments().join(" ")}`;
+      if (lines.length > 3) lines[3] = renderColumnHeader(layout);
+      const rendered = this.list.renderViewport({ offset: this.viewportOffset, height: layout.listHeight, width: this.width });
+      for (let index = 0; index < rendered.length; index += 1) {
+        const target = layout.listTop + index;
+        if (target < lines.length) lines[target] = rendered[index].line;
+      }
+      if (lines.length >= 3) {
+        const composerMarker = this.focus === "composer" ? `[${this.composerField}]` : "";
+        lines[lines.length - 3] = `❯${composerMarker} ${this.composerDraft.prompt || "describe a task for a new session"}`;
+        const form = `cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
+        lines[lines.length - 2] = this.status.kind === "error" ? `${this.status.code}: ${this.status.message}  ${form}` : form;
+        lines[lines.length - 1] = " ↑↓ nav Enter/→ open / search t/p/o/a/j filters s sort g group n form Tab fields ^X intent ? help";
+      }
       this.renderOverlay(lines);
-      return lines.map((line) => fitLine(line, this.width));
+      const result = lines.map((line) => fitLine(line, this.width));
+      this.completeHostRender(renderedGeneration);
+      return result;
     } catch (error) {
       const typed = this.typedError(error, "RENDER_FAILED");
+      this.rejectHostRenders(Object.assign(new Error(typed.message), { code: typed.code }));
       this.fail(typed);
       throw Object.assign(new Error(typed.message), { code: typed.code });
     }
@@ -714,6 +704,7 @@ export class DashboardController {
   private setQuery(query: DashboardQuery): void {
     this.query = query;
     this.rebuildList();
+    this.scheduleUiSave();
   }
 
   private applySnapshot(snapshot: DashboardSnapshot): void {
@@ -741,6 +732,7 @@ export class DashboardController {
     this.list.moveSelection(delta);
     this.preferredSelectionId = this.list.selectedSessionId;
     this.ensureSelectionVisible();
+    this.scheduleUiSave();
   }
 
   private selectBoundary(last: boolean): void {
@@ -833,8 +825,9 @@ export class DashboardController {
       case "modelId": this.composerDraft = { ...this.composerDraft, model: { ...this.composerDraft.model, id: edit(this.composerDraft.model.id) } }; break;
       case "thinkingLevel": this.composerDraft = { ...this.composerDraft, thinkingLevel: edit(this.composerDraft.thinkingLevel) }; break;
       case "name": this.composerDraft = { ...this.composerDraft, name: edit(this.composerDraft.name) }; break;
-      case "isolationMode": break;
+      case "isolationMode": return;
     }
+    this.scheduleUiSave();
   }
 
   private printable(data: string): string | undefined {
@@ -848,6 +841,7 @@ export class DashboardController {
       this.focus = "list";
       this.composerDraft = { ...this.composerDraft, prompt: "" };
       this.status = { kind: "ready" };
+      this.scheduleUiSave();
       return;
     }
     if (outcome.kind === "delivery_unknown") {
@@ -870,8 +864,61 @@ export class DashboardController {
     details.forEach((detail, index) => { if (start + index < lines.length) lines[start + index] = detail; });
   }
 
-  private async persist(cursor = this.cursor): Promise<void> {
-    await this.persistence.save({
+  private trackEvent(update: DashboardUpdate, generation: number): Promise<void> {
+    const operation = this.processEvent(update, generation);
+    this.eventOperations.add(operation);
+    void operation.finally(() => this.eventOperations.delete(operation)).catch(() => {});
+    return operation;
+  }
+
+  private async processEvent(update: DashboardUpdate, generation: number): Promise<void> {
+    if (!this.isCurrentOpen(generation)) throw Object.assign(new Error("Dashboard is closed"), { code: "DASHBOARD_CLOSED" });
+    try {
+      this.applySnapshot(update.snapshot);
+      await this.awaitHostRender();
+      await this.enqueueSave(this.persistedState(update.cursor));
+      this.cursor = update.cursor;
+    } catch (error) {
+      const typed = this.typedError(error, "EVENT_PROCESSING_FAILED");
+      this.fail(typed);
+      throw Object.assign(new Error(typed.message), { code: typed.code });
+    }
+  }
+
+  private awaitHostRender(): Promise<void> {
+    if (this.requestRender === undefined) return Promise.reject(Object.assign(new Error("Dashboard host cannot request rendering"), { code: "UNSUPPORTED_HOST" }));
+    const generation = ++this.renderRequestGeneration;
+    const rendered = new Promise<void>((resolve, reject) => {
+      this.renderWaiters.set(generation, { resolve, reject });
+    });
+    try {
+      this.requestRender();
+    } catch (error) {
+      const waiter = this.renderWaiters.get(generation);
+      this.renderWaiters.delete(generation);
+      const waiterError = Object.assign(new Error("Dashboard host render request failed"), { code: "RENDER_FAILED", cause: error });
+      waiter?.reject(waiterError);
+      return rendered;
+    }
+    return rendered;
+  }
+
+  private completeHostRender(generation: number): void {
+    for (const [requested, waiter] of this.renderWaiters) {
+      if (requested > generation) continue;
+      this.renderWaiters.delete(requested);
+      waiter.resolve();
+    }
+  }
+
+  private rejectHostRenders(error: unknown): void {
+    for (const waiter of this.renderWaiters.values()) waiter.reject(error);
+    this.renderWaiters.clear();
+  }
+
+  private persistedState(cursor = this.cursor): PersistedDashboardState {
+    const { sourceSessionId: _sourceSessionId, ...launchDraft } = this.composerDraft;
+    return {
       schemaVersion: 1,
       clientId: this.clientId,
       cursor,
@@ -879,8 +926,68 @@ export class DashboardController {
         query: (({ historyPolicy: _historyPolicy, ...query }) => query)(this.query),
         selectedSessionId: this.preferredSelectionId ?? this.selectedSessionId,
       },
-      launchDraft: { ...this.composerDraft, model: { ...this.composerDraft.model } },
-    });
+      launchDraft: { ...launchDraft, model: { ...launchDraft.model } },
+    };
+  }
+
+  private enqueueSave(state: PersistedDashboardState): Promise<void> {
+    const operation = this.saveTail.then(() => this.persistence.save(state));
+    this.saveTail = operation.then(
+      () => {},
+      (error) => { this.saveFailure ??= error; },
+    );
+    return operation;
+  }
+
+  private scheduleUiSave(): void {
+    if (this.closed) return;
+    const admission = this.saveAdmissionGeneration;
+    const state = this.persistedState();
+    if (this.closed || admission !== this.saveAdmissionGeneration) return;
+    const operation = this.enqueueSave(state);
+    void operation.catch((error) => this.fail(this.typedError(error, "PERSIST_FAILED")));
+  }
+
+  private beginClose(initialError?: DashboardTransportError): Promise<void> {
+    if (this.closePromise !== undefined) return this.closePromise;
+    this.closed = true;
+    this.openGeneration += 1;
+    this.saveAdmissionGeneration += 1;
+    this.openController?.abort();
+    this.openController = undefined;
+    const unsubscribe = this.unsubscribe;
+    this.unsubscribe = undefined;
+    unsubscribe?.();
+    this.overlay = undefined;
+    this.pendingShared = undefined;
+    this.confirmationText = "";
+    const closedError = initialError ?? { code: "DASHBOARD_CLOSED", message: "Dashboard closed before host render" };
+    this.rejectHostRenders(Object.assign(new Error(closedError.message), { code: closedError.code }));
+    this.closePromise = this.finishClose(initialError);
+    return this.closePromise;
+  }
+
+  private async finishClose(initialError?: DashboardTransportError): Promise<void> {
+    let error = initialError;
+    await Promise.allSettled([...this.eventOperations]);
+    await this.saveTail;
+    if (error === undefined && this.saveFailure !== undefined) error = this.typedError(this.saveFailure, "PERSIST_FAILED");
+    try {
+      await this.detachNative();
+    } catch (detachError) {
+      error ??= this.typedError(detachError, "DASHBOARD_CLOSE_FAILED");
+    }
+    try {
+      await this.enqueueSave(this.persistedState());
+    } catch (saveError) {
+      error ??= this.typedError(saveError, "DASHBOARD_CLOSE_FAILED");
+    }
+    await this.saveTail;
+    const result: DashboardCloseResult = error === undefined
+      ? { kind: "closed" }
+      : { kind: "error", code: error.code, message: error.message };
+    if (error !== undefined) this.status = { kind: "error", code: error.code, message: error.message };
+    this.onClose?.(result);
   }
 
   private isCurrentOpen(generation: number): boolean {
@@ -903,20 +1010,7 @@ export class DashboardController {
 
   private fail(error: DashboardTransportError): void {
     this.status = { kind: "error", code: error.code, message: error.message };
-    if (!this.closed) {
-      this.closed = true;
-      this.openGeneration += 1;
-      this.openController?.abort();
-      this.openController = undefined;
-      const unsubscribe = this.unsubscribe;
-      this.unsubscribe = undefined;
-      unsubscribe?.();
-      this.overlay = undefined;
-      this.pendingShared = undefined;
-      this.confirmationText = "";
-      void this.detachNative().catch(() => {});
-      this.onClose?.({ kind: "error", code: error.code, message: error.message });
-    }
+    this.beginClose(error).catch(() => {});
   }
 
   private setError(error: unknown, fallbackCode: string): void {

@@ -14,7 +14,6 @@ import { reduceSessionState } from "./state-reducer.mjs";
 
 const DEFAULT_WORKER_PATH = fileURLToPath(new URL("./worker.mjs", import.meta.url));
 const admissionStates = new WeakMap();
-const MAX_BUFFERED_STARTUP_FRAME_BYTES = 1024 * 1024;
 const MAX_BUFFERED_STARTUP_EVENTS = 256;
 const DEFAULT_LAUNCH_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateMs: 5_000 });
 
@@ -219,7 +218,7 @@ export class WorkerSupervisor {
     const handle = supervision.handle;
     handle?.terminal();
     supervision.exit.detach();
-    supervision.child.off("message", supervision.launchReceiver);
+    supervision.child.off("message", supervision.messageReceiver);
     supervision.handle = undefined;
     if (handle !== undefined) this.#handles.delete(handle);
     await this.#ownership.release(supervision.sessionId, supervision.lease.leaseId, supervision.lease.generation);
@@ -358,25 +357,29 @@ export class WorkerSupervisor {
         shell: false,
         stdio: ["ignore", stdoutHandle.fd, stderrHandle.fd, "ipc"],
       });
-      supervision = { child, token, sessionId, lease, exit: undefined, identity: undefined, handle: undefined, lifecycle: "launching", startupFrames: [], startupFrameBytes: 0, startupEvents: [] };
-      supervision.launchReceiver = (/** @type {any} */ message) => {
-        if (!authenticated(message?.token, token) || message.sessionId !== sessionId) return;
-        if (message.type === "pi_frame" && typeof message.frame === "object" && message.frame !== null) {
-          let bytes;
-          try { bytes = Buffer.byteLength(JSON.stringify(message.frame)); } catch { return; }
-          if (bytes > MAX_BUFFERED_STARTUP_FRAME_BYTES) return;
-          while (supervision.startupFrameBytes + bytes > MAX_BUFFERED_STARTUP_FRAME_BYTES && supervision.startupFrames.length > 0) {
-            const removed = supervision.startupFrames.shift();
-            if (removed !== undefined) supervision.startupFrameBytes -= removed.bytes;
+      supervision = { child, token, sessionId, lease, exit: undefined, identity: undefined, handle: undefined, lifecycle: "launching", queuedFrames: [], startupEvents: [], frameListeners: new Set(), commandResultHandler: undefined };
+      supervision.messageReceiver = (/** @type {any} */ message) => {
+        if (!authenticated(message?.token, token)) return;
+        if (message.type === "pi_frame" && message.sessionId === sessionId && typeof message.frame === "object" && message.frame !== null) {
+          if (supervision.frameListeners.size > 0) {
+            for (const listener of supervision.frameListeners) {
+              try { listener(message.frame); } catch {}
+            }
+            return;
           }
-          supervision.startupFrames.push({ frame: message.frame, bytes });
-          supervision.startupFrameBytes += bytes;
-        } else if (message.type === "worker_event") {
-          if (supervision.startupEvents.length >= MAX_BUFFERED_STARTUP_EVENTS) supervision.startupEvents.shift();
-          supervision.startupEvents.push(message.event);
+          supervision.queuedFrames.push(message.frame);
+        } else if (message.type === "worker_event" && message.sessionId === sessionId) {
+          if (supervision.lifecycle === "active") {
+            void this.#applyWorkerEvent(supervision, message.event).catch(() => {});
+          } else if (supervision.lifecycle === "launching") {
+            if (supervision.startupEvents.length >= MAX_BUFFERED_STARTUP_EVENTS) supervision.startupEvents.shift();
+            supervision.startupEvents.push(message.event);
+          }
+        } else if (message.type === "command_result") {
+          supervision.commandResultHandler?.(message);
         }
       };
-      child.on("message", supervision.launchReceiver);
+      child.on("message", supervision.messageReceiver);
       const exit = observeExit(child, () => {
         if (supervision.lifecycle === "reconciled") return;
         supervision.lifecycle = "terminal";
@@ -508,33 +511,20 @@ export class WorkerSupervisor {
     /** @type {Map<string, { resolve(value: unknown): void, reject(error: unknown): void }>} */
     const pending = new Map();
     /** @type {Set<(frame: Record<string, unknown>) => void>} */
-    const frameListeners = new Set();
+    const frameListeners = supervision.frameListeners;
     /** @param {any} message */
-    const onMessage = (message) => {
-      if (!authenticated(message?.token, token)) return;
-      if (message?.type === "worker_event" && message.sessionId === sessionId) {
-        void this.#applyWorkerEvent(supervision, message.event).catch(() => {});
-        return;
-      }
-      if (message?.type === "pi_frame" && message.sessionId === sessionId && typeof message.frame === "object" && message.frame !== null) {
-        for (const listener of frameListeners) {
-          try { listener(message.frame); } catch {}
-        }
-        return;
-      }
-      if (message?.type !== "command_result") return;
+    const onCommandResult = (message) => {
       const request = pending.get(message.id);
       if (request === undefined) return;
       pending.delete(message.id);
       message.ok ? request.resolve(message.record) : request.reject(Object.assign(new Error(message.error?.message ?? "Worker command failed"), { code: message.error?.code ?? "RPC_FAILED", delivered: message.error?.deliveryUnknown !== true }));
     };
+    supervision.commandResultHandler = onCommandResult;
     const onDisconnect = () => {
       for (const request of pending.values()) request.reject(Object.assign(new Error("Worker delivery became ambiguous"), { code: "DELIVERY_UNKNOWN" }));
       pending.clear();
     };
-    child.on("message", onMessage);
     child.once("disconnect", onDisconnect);
-    child.off("message", supervision.launchReceiver);
 
     const handle = {
       ready: true,
@@ -578,21 +568,22 @@ export class WorkerSupervisor {
       onFrame(listener) {
         if (typeof listener !== "function") throw new TypeError("Frame listener must be a function");
         frameListeners.add(listener);
-        for (const buffered of supervision.startupFrames.splice(0)) {
-          supervision.startupFrameBytes -= buffered.bytes;
-          try { listener(buffered.frame); } catch {}
+        for (const buffered of supervision.queuedFrames.splice(0)) {
+          try { listener(buffered); } catch {}
         }
         return () => frameListeners.delete(listener);
       },
       terminal() {
         onDisconnect();
         frameListeners.clear();
-        child.off("message", onMessage);
+        supervision.commandResultHandler = undefined;
+        child.off("message", supervision.messageReceiver);
         child.off("disconnect", onDisconnect);
       },
       detach() {
         frameListeners.clear();
-        child.off("message", onMessage);
+        supervision.commandResultHandler = undefined;
+        child.off("message", supervision.messageReceiver);
         if (child.connected !== false) child.disconnect?.();
       },
     };

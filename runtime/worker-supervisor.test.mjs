@@ -236,6 +236,20 @@ it("creates and binds the registry before activation and reports ready after aut
   });
 });
 
+it("queues complete frames continuously after launch and before the first handle listener", async () => {
+  const { runs, registry, ownership } = await setup();
+  const workers = fakeWorkerFactory();
+  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "continuous-frame-token" });
+  const handle = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "continuous-frame" });
+  const frame = { type: "gap_frame", sequence: 1 };
+  workers.children[0].emit("message", { version: 1, type: "pi_frame", token: "continuous-frame-token", sessionId: "one", frame });
+  /** @type {Record<string, unknown>[]} */
+  const received = [];
+  handle.onFrame((/** @type {Record<string, unknown>} */ nextFrame) => received.push(nextFrame));
+  expect(received).toEqual([frame]);
+  await supervisor.close();
+});
+
 it("refuses missing capabilities before ownership or run artifacts exist", async () => {
   const { runs, registry, ownership } = await setup();
   const executable = { realpath: "/fake/pi", device: "1", inode: "2", size: 3, modifiedTimeNs: "4" };

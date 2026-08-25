@@ -21,6 +21,24 @@ async function files(directory, prefix) {
   return (await readdir(directory)).filter((name) => name.startsWith(`${prefix}.`)).sort().map((name) => join(directory, name));
 }
 
+it("rejects a segment limit too small for mandatory metadata before creating or evicting files", async () => {
+  const directory = await root();
+  await expect(openRotatingWriter({ directory, prefix: "rpc", segmentBytes: 64, segments: 1 })).rejects.toThrow(/metadata/iu);
+  expect(await files(directory, "rpc")).toEqual([]);
+});
+
+it("retains a marker at the smallest accepted rollover limits", async () => {
+  const directory = await root();
+  const writer = await openRotatingWriter({ directory, prefix: "rpc", segmentBytes: 160, segments: 1 });
+  await writer.append({ id: "old", payload: "x".repeat(80) });
+  await writer.append({ id: "incoming", payload: "x".repeat(80) });
+  await writer.close();
+  const paths = await files(directory, "rpc");
+  const records = (await readFile(paths[0], "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  expect(records).toEqual([expect.objectContaining({ type: "diagnostic_truncation", removedBytes: expect.any(Number), removedRecords: expect.any(Number) })]);
+  expect((await stat(paths[0])).size).toBeLessThanOrEqual(160);
+});
+
 it("rolls segments, removes the oldest complete segment, and records truncation counts", async () => {
   const directory = await root();
   const writer = await openRotatingWriter({ directory, prefix: "rpc", segmentBytes: 300, segments: 2 });

@@ -5,6 +5,11 @@ import { join } from "node:path";
 const DEFAULT_RPC_SEGMENT_BYTES = 8_388_608;
 const DEFAULT_RPC_SEGMENTS = 4;
 const DEFAULT_STDERR_BYTES = 8_388_608;
+const HASH_PLACEHOLDER = "0".repeat(64);
+const MIN_DIAGNOSTIC_SEGMENT_BYTES = Math.max(
+  Buffer.byteLength(`${JSON.stringify({ type: "diagnostic_oversized_record", originalBytes: Number.MAX_SAFE_INTEGER, sha256: HASH_PLACEHOLDER })}\n`),
+  Buffer.byteLength(`${JSON.stringify({ type: "diagnostic_truncation", removedBytes: Number.MAX_SAFE_INTEGER, removedRecords: Number.MAX_SAFE_INTEGER })}\n`),
+);
 
 /** @param {string | Uint8Array | Record<string, unknown>} record */
 function encodeRecord(record) {
@@ -43,6 +48,7 @@ async function recoverCompleteRecords(path) {
 export async function openRotatingWriter({ directory, prefix, segmentBytes, segments }) {
   if (typeof directory !== "string" || typeof prefix !== "string" || prefix.length === 0) throw new TypeError("Diagnostic directory and prefix are required");
   if (!Number.isSafeInteger(segmentBytes) || segmentBytes <= 0 || !Number.isSafeInteger(segments) || segments <= 0) throw new TypeError("Diagnostic limits must be positive integers");
+  if (segmentBytes < MIN_DIAGNOSTIC_SEGMENT_BYTES || segmentBytes * segments > Number.MAX_SAFE_INTEGER) throw new RangeError("Diagnostic limits cannot retain bounded metadata");
   await mkdir(directory, { recursive: true, mode: 0o700 });
   await chmod(directory, 0o700);
   const expression = new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}\\.(\\d+)\\.jsonl$`, "u");

@@ -1,0 +1,204 @@
+import { execFile } from "node:child_process";
+import { readFile, realpath } from "node:fs/promises";
+import { isAbsolute, join } from "node:path";
+import { promisify } from "node:util";
+
+import { IsolationError } from "./launch-preflight.mjs";
+import { WORKTREE_OWNERSHIP_FILE } from "./worktree.mjs";
+
+const execFileAsync = promisify(execFile);
+
+/** @param {string} cwd @param {string[]} args */
+async function git(cwd, args) {
+  return execFileAsync("git", ["-C", cwd, ...args], {
+    encoding: "utf8",
+    shell: false,
+  });
+}
+
+/** @param {any} record */
+function validateRecord(record) {
+  if (
+    record === null ||
+    typeof record !== "object" ||
+    record.mode !== "worktree" ||
+    typeof record.worktreePath !== "string" ||
+    typeof record.branch !== "string"
+  ) {
+    throw new IsolationError("INVALID_WORKTREE_RECORD", "A worktree isolation record is required");
+  }
+}
+
+/** @param {any} marker @param {{ worktreePath: string, branch: string }} record */
+function markerMatches(marker, record) {
+  return (
+    marker !== null &&
+    typeof marker === "object" &&
+    marker.schemaVersion === 1 &&
+    typeof marker.ownershipId === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
+      marker.ownershipId,
+    ) &&
+    typeof marker.repositoryRoot === "string" &&
+    marker.worktreePath === record.worktreePath &&
+    marker.branch === record.branch &&
+    typeof marker.baseCommit === "string" &&
+    /^[0-9a-f]{40,64}$/u.test(marker.baseCommit) &&
+    typeof marker.sourceSessionId === "string" &&
+    marker.sourceSessionId !== ""
+  );
+}
+
+/**
+ * Remove only an inactive, clean, pushed worktree with exact dashboard ownership.
+ *
+ * @param {any} record
+ * @param {{ liveOwnership?: unknown }} [options]
+ */
+export async function cleanupOwnedWorktree(record, options = {}) {
+  validateRecord(record);
+  if (options.liveOwnership !== undefined && options.liveOwnership !== null) {
+    throw new IsolationError("LIVE_OWNERSHIP", "A live session still owns this worktree");
+  }
+
+  let worktreePath;
+  try {
+    worktreePath = await realpath(record.worktreePath);
+  } catch (cause) {
+    throw new IsolationError("WORKTREE_MISSING", "The recorded worktree is missing", { cause });
+  }
+  if (worktreePath !== record.worktreePath) {
+    throw new IsolationError("IDENTITY_MISMATCH", "Canonical worktree identity does not match");
+  }
+
+  let marker;
+  try {
+    const { stdout } = await git(worktreePath, ["rev-parse", "--git-dir"]);
+    const gitDirectoryText = stdout.trim();
+    const gitDirectory = await realpath(
+      isAbsolute(gitDirectoryText) ? gitDirectoryText : join(worktreePath, gitDirectoryText),
+    );
+    marker = JSON.parse(await readFile(join(gitDirectory, WORKTREE_OWNERSHIP_FILE), "utf8"));
+  } catch (cause) {
+    const code = /** @type {NodeJS.ErrnoException} */ (cause).code;
+    if (code === "ENOENT") {
+      throw new IsolationError(
+        "NOT_DASHBOARD_OWNED",
+        "The linked worktree has no dashboard ownership marker",
+        { cause },
+      );
+    }
+    throw new IsolationError(
+      "NOT_DASHBOARD_OWNED",
+      "The linked worktree ownership marker cannot be verified",
+      { cause },
+    );
+  }
+  if (!markerMatches(marker, { worktreePath, branch: record.branch })) {
+    throw new IsolationError("IDENTITY_MISMATCH", "Dashboard worktree ownership does not match");
+  }
+
+  let repositoryRoot;
+  try {
+    repositoryRoot = await realpath(marker.repositoryRoot);
+    const [{ stdout: worktreeCommonOutput }, { stdout: repositoryCommonOutput }] =
+      await Promise.all([
+        git(worktreePath, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+        git(repositoryRoot, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+      ]);
+    const [worktreeCommon, repositoryCommon] = await Promise.all([
+      realpath(worktreeCommonOutput.trim()),
+      realpath(repositoryCommonOutput.trim()),
+    ]);
+    if (
+      repositoryRoot !== marker.repositoryRoot ||
+      worktreeCommon !== repositoryCommon
+    ) {
+      throw new Error("Git common directories differ");
+    }
+  } catch (cause) {
+    throw new IsolationError("IDENTITY_MISMATCH", "Dashboard repository identity does not match", {
+      cause,
+    });
+  }
+
+  let branch;
+  let head;
+  try {
+    const [{ stdout: branchOutput }, { stdout: headOutput }] = await Promise.all([
+      git(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]),
+      git(worktreePath, ["rev-parse", "--verify", "HEAD^{commit}"]),
+    ]);
+    branch = branchOutput.trim();
+    head = headOutput.trim();
+  } catch (cause) {
+    throw new IsolationError("IDENTITY_MISMATCH", "Worktree branch identity cannot be verified", {
+      cause,
+    });
+  }
+  if (branch !== record.branch) {
+    throw new IsolationError("IDENTITY_MISMATCH", "Worktree branch identity does not match");
+  }
+
+  const { stdout: statusOutput } = await git(worktreePath, [
+    "status",
+    "--porcelain=v1",
+    "--untracked-files=all",
+  ]);
+  const statusLines = statusOutput.split("\n").filter(Boolean);
+  if (statusLines.some((line) => line.startsWith("??"))) {
+    throw new IsolationError("UNTRACKED_FILES", "Worktree contains untracked files");
+  }
+  if (statusLines.length > 0) {
+    throw new IsolationError("DIRTY_WORKTREE", "Worktree contains uncommitted changes");
+  }
+
+  if (head !== marker.baseCommit) {
+    let upstream;
+    try {
+      const { stdout } = await git(worktreePath, [
+        "rev-parse",
+        "--verify",
+        "@{upstream}^{commit}",
+      ]);
+      upstream = stdout.trim();
+    } catch (cause) {
+      throw new IsolationError(
+        "MISSING_UPSTREAM",
+        "Changed worktree HEAD has no configured upstream",
+        { cause },
+      );
+    }
+
+    const { stdout: countsOutput } = await git(worktreePath, [
+      "rev-list",
+      "--left-right",
+      "--count",
+      `HEAD...${upstream}`,
+    ]);
+    const [aheadText, behindText] = countsOutput.trim().split(/\s+/u);
+    const ahead = Number(aheadText);
+    const behind = Number(behindText);
+    if (!Number.isSafeInteger(ahead) || !Number.isSafeInteger(behind)) {
+      throw new IsolationError("GIT_HISTORY_AMBIGUOUS", "Git history comparison was ambiguous");
+    }
+    if (ahead > 0 && behind > 0) {
+      throw new IsolationError("DIVERGENT_HISTORY", "Local and upstream histories have diverged");
+    }
+    if (ahead > 0) {
+      throw new IsolationError("UNPUSHED_COMMITS", "Worktree contains unpushed commits");
+    }
+    if (behind > 0) {
+      throw new IsolationError("DIVERGENT_HISTORY", "Worktree HEAD is behind its upstream");
+    }
+  }
+
+  try {
+    await git(repositoryRoot, ["worktree", "remove", worktreePath]);
+  } catch (cause) {
+    throw new IsolationError("WORKTREE_REMOVE_FAILED", "Git refused to remove the worktree", {
+      cause,
+    });
+  }
+  return { disposition: "REMOVED" };
+}

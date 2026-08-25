@@ -15,6 +15,7 @@
   "include": [
     "bin/**/*.mjs",
     "extensions/**/*.ts",
+    "isolation/**/*.mjs",
     "runtime/**/*.mjs",
     "shared/**/*.ts",
     "vitest.config.ts"

@@ -468,12 +468,27 @@ export async function createDaemonRuntime({
         }
         if (attachmentRequests.size >= MAX_ATTACHMENT_REQUESTS) throw Object.assign(new Error("Too many attachment requests are in flight"), { code: "ATTACHMENT_REQUEST_LIMIT", retryable: true });
         const operation = context.serializeAttachment(sessionId, async () => {
-          await context.recovery.journal.tombstone(request);
+          let accepted = await context.recovery.journal.accept(request);
+          const phase = context.attachmentResults.phase(request);
           const stored = context.attachmentResults.get(request);
           if (stored !== undefined) {
             if (stored.ok) return stored.result;
             throw Object.assign(new Error(stored.error.message), stored.error);
           }
+          if (phase === "PREPARED" && accepted.stage !== "ACCEPTED") accepted = await context.recovery.journal.reconcileAttachment(request, phase);
+          if (accepted.stage !== "ACCEPTED") return { kind: "command", status: accepted };
+          await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
+          /** @type {unknown} */
+          let failpointFailure;
+          /** @param {string} phase */
+          const checkpoint = async (phase) => {
+            try {
+              await attachmentFailpoint(phase, request);
+            } catch (error) {
+              failpointFailure = error;
+              throw error;
+            }
+          };
           /** @type {{ ok: true, result: any } | { ok: false, error: { code: string, message: string, retryable: boolean } }} */
           let outcome;
           try {
@@ -483,36 +498,53 @@ export async function createDaemonRuntime({
             const prior = claims.get(socket);
             if (prior !== undefined && prior.clientId !== authenticatedClientId) throw Object.assign(new Error("Attachment claim identity changed"), { code: "CLIENT_IDENTITY_CONFLICT" });
             if (request.op === "detach") {
+              outcome = { ok: true, result: { kind: "detached", sessionId } };
+              await context.attachmentResults.prepare(request, outcome);
+              await checkpoint("after_prepared");
               if (prior !== undefined && prior.clientId === authenticatedClientId) {
-                const prepared = { ok: true, result: { kind: "detached", sessionId } };
-                await context.attachmentResults.prepare(request, prepared);
                 const event = await context.appendAttachment(sessionId, authenticatedClientId, prior.role, false);
+                await checkpoint("after_event_append");
                 claims.delete(socket);
                 if (claims.size === 0) attachmentClaims.delete(sessionId);
+                await checkpoint("after_claim_mutation");
                 context.broadcast(event);
+                await checkpoint("after_broadcast");
               }
-              outcome = { ok: true, result: { kind: "detached", sessionId } };
             } else {
               const composerClaim = [...claims.values()].find((claim) => claim.role === "composer");
               const grantedRole = request.payload.role === "composer" && (composerClaim === undefined || (prior?.clientId === authenticatedClientId && prior.role === "composer"))
                 ? "composer"
                 : "observer";
-              if (prior !== undefined && prior.clientId === authenticatedClientId && prior.role === grantedRole) outcome = { ok: true, result: { kind: "attached", sessionId, role: grantedRole } };
-              else {
-                const prepared = { ok: true, result: { kind: "attached", sessionId, role: grantedRole } };
-                await context.attachmentResults.prepare(request, prepared);
+              outcome = { ok: true, result: { kind: "attached", sessionId, role: grantedRole } };
+              await context.attachmentResults.prepare(request, outcome);
+              await checkpoint("after_prepared");
+              if (prior === undefined || prior.clientId !== authenticatedClientId || prior.role !== grantedRole) {
                 const event = await context.appendAttachment(sessionId, authenticatedClientId, grantedRole, true);
+                await checkpoint("after_event_append");
                 if (existingClaims === undefined) attachmentClaims.set(sessionId, claims);
                 claims.set(socket, { clientId: authenticatedClientId, role: grantedRole });
+                await checkpoint("after_claim_mutation");
                 context.broadcast(event);
-                outcome = { ok: true, result: { kind: "attached", sessionId, role: grantedRole } };
+                await checkpoint("after_broadcast");
               }
             }
           } catch (error) {
+            if (error === failpointFailure) throw error;
             const attachmentError = /** @type {any} */ (error);
             outcome = { ok: false, error: dashboardError(attachmentError?.code ?? "REQUEST_FAILED", error instanceof Error ? error.message : "Request failed", attachmentError?.retryable === true) };
           }
-          const durable = await context.attachmentResults.put(request, outcome);
+          await checkpoint("before_result_completion");
+          let durable;
+          try {
+            durable = await context.attachmentResults.put(request, outcome);
+          } catch (error) {
+            const current = await context.recovery.journal.get(request);
+            if (current?.stage === "DELIVERY_ATTEMPTED") await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
+            throw error;
+          }
+          await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
+          await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
+          await checkpoint("after_result_completion");
           if (durable.ok) return durable.result;
           throw Object.assign(new Error(durable.error.message), durable.error);
         });
@@ -697,7 +729,10 @@ export async function createDaemonRuntime({
         context.cursorStore = await createCursorStore(join(daemonDirectory, "event-acks.json"), daemonEpoch);
         context.launchResults = await createLaunchResultStore(join(daemonDirectory, "launch-results.json"));
         context.attachmentResults = await createAttachmentResultStore({ path: join(daemonDirectory, "attachment-results.jsonl") });
-        for (const action of context.recovery.recoveryActions) if (action.action === "SAFE_REDELIVERY") await context.handleRequest(action.command, undefined, new Set(), action.command.clientId, true);
+        for (const entry of context.attachmentResults.entries()) await context.recovery.journal.reconcileAttachment(entry.request, entry.phase);
+        for (const action of context.recovery.recoveryActions) {
+          if (action.action === "SAFE_REDELIVERY" && !["attach", "detach"].includes(action.command.op)) await context.handleRequest(action.command, undefined, new Set(), action.command.clientId, true);
+        }
         context.state = "READY";
         await updateDaemonLifecycleState(claim, "READY");
         return context.recovery;

@@ -36,19 +36,24 @@ describe("attachment result store", () => {
     expect((await readFile(path, "utf8")).endsWith("\n")).toBe(true);
   });
 
-  it("recovers a prepared response and permits one append-only failure completion", async () => {
+  it("recovers PREPARED as intent and serves only a strict COMPLETED outcome", async () => {
     const path = await storePath();
     const first = await createAttachmentResultStore({ path });
     await first.prepare(attach, attached);
     await first.close();
 
     const recovered = await createAttachmentResultStore({ path });
-    expect(recovered.get(attach)).toEqual(attached);
+    expect(recovered.get(attach)).toBeUndefined();
+    expect(recovered.phase(attach)).toBe("PREPARED");
+    expect(recovered.entries()).toEqual([{ phase: "PREPARED", request: attach }]);
     const failed = { ok: false, error: { code: "BROADCAST_FAILED", message: "broadcast failed", retryable: false } };
     await recovered.put(attach, failed);
     await recovered.close();
+
     const completed = await createAttachmentResultStore({ path });
     expect(completed.get(attach)).toEqual(failed);
+    expect(completed.phase(attach)).toBe("COMPLETED");
+    expect(completed.entries()).toEqual([{ phase: "COMPLETED", request: attach }]);
     await completed.close();
   });
 

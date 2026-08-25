@@ -86,12 +86,23 @@ export async function createAttachmentResultStore(/** @type {{ path: string }} *
       const existing = outcomes.get(key(request));
       if (existing === undefined) return undefined;
       if (existing.requestCanonical !== canonical(request)) throw new AttachmentResultStoreError("IDEMPOTENCY_CONFLICT", "Request IDs were already used with a different attachment request");
-      return structuredClone(existing.outcome);
+      return existing.phase === "COMPLETED" ? structuredClone(existing.outcome) : undefined;
+    },
+    /** @param {any} request */
+    phase(request) {
+      if (!validRequest(request)) throw new TypeError("Attachment result lookup requires a strict attachment request");
+      const existing = outcomes.get(key(request));
+      if (existing === undefined) return undefined;
+      if (existing.requestCanonical !== canonical(request)) throw new AttachmentResultStoreError("IDEMPOTENCY_CONFLICT", "Request IDs were already used with a different attachment request");
+      return existing.phase;
+    },
+    entries() {
+      return [...outcomes.values()].map((record) => ({ phase: record.phase, request: structuredClone(record.request) }));
     },
     /** @param {"PREPARED" | "COMPLETED"} phase @param {any} request @param {any} outcome */
     append(phase, request, outcome) {
       const operation = tail.then(async () => {
-        if (!validRequest(request) || !validOutcome(outcome, request)) throw new TypeError("Attachment result record is invalid");
+        if (!["PREPARED", "COMPLETED"].includes(phase) || !validRequest(request) || !validOutcome(outcome, request)) throw new TypeError("Attachment result record is invalid");
         const requestCanonical = canonical(request);
         const existing = outcomes.get(key(request));
         if (existing !== undefined && existing.requestCanonical !== requestCanonical) throw new AttachmentResultStoreError("IDEMPOTENCY_CONFLICT", "Attachment result conflicts with the durable request");

@@ -30,17 +30,19 @@ describe("command journal", () => {
     await reopened.close();
   });
 
-  it("persists a terminal attachment fingerprint without recovery redelivery", async () => {
+  it("reconciles attachment result phases without weakening exact request identity", async () => {
     const journalPath = await path();
     /** @type {ClientRequest} */
     const attachment = { version: 1, clientId: "client-1", requestId: "attach-1", op: "attach", payload: { sessionId: "session-1", role: "composer" } };
     const journal = await createCommandJournal({ path: journalPath });
-    expect(await journal.tombstone(attachment)).toMatchObject({ created: true, status: { stage: "COMPLETED" } });
+    await journal.accept(attachment);
+    await journal.transition(attachment, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
+    expect((await journal.reconcileAttachment(attachment, "PREPARED")).stage).toBe("DELIVERY_UNKNOWN");
+    await expect(journal.reconcileAttachment({ ...attachment, payload: { ...attachment.payload, role: "observer" } }, "PREPARED")).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
     await journal.close();
 
     const reopened = await createCommandJournal({ path: journalPath });
-    expect(await reopened.tombstone(attachment)).toMatchObject({ created: false, status: { stage: "COMPLETED" } });
-    await expect(reopened.tombstone({ ...attachment, payload: { ...attachment.payload, role: "observer" } })).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
+    expect((await reopened.reconcileAttachment(attachment, "COMPLETED")).stage).toBe("COMPLETED");
     await reopened.close();
   });
 

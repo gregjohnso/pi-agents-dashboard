@@ -27,6 +27,11 @@ async function root() {
   return value;
 }
 
+/** @param {string} text */
+function attachmentEvents(text) {
+  return text.trim().length === 0 ? [] : text.trim().split("\n").map((line) => JSON.parse(line)).filter((event) => event.kind === "attachment_changed");
+}
+
 /** @param {any} options @returns {any} */
 function connect({ socketPath, token, role, maxBytes = 1024, onFrame }) {
   const decoder = createJsonlDecoder({ maxBytes });
@@ -459,12 +464,109 @@ it("replays durable attachment outcomes across request pressure and daemon resta
   replay.close();
 });
 
-it("mutates a durable claim before broadcast and retains it when broadcast fails", async () => {
+it.each([
+  ["after_prepared", "abandon"],
+  ["after_event_append", "retry_at_risk"],
+  ["after_claim_mutation", "abandon"],
+  ["after_broadcast", "retry_at_risk"],
+  ["before_result_completion", "abandon"],
+])("recovers attachment crash phase %s as durable ambiguity until %s", async (crashPhase, resolution) => {
+  const stateRoot = await root();
+  let crash = true;
+  const original = { version: 1, clientId: "crash-client", requestId: `attach-${crashPhase}`, op: "attach", payload: { sessionId: `session-${crashPhase}`, role: "composer" } };
+  const firstRuntime = await createDaemonRuntime({
+    root: stateRoot,
+    async attachmentFailpoint(/** @type {string} */ phase) {
+      if (crash && phase === crashPhase) {
+        crash = false;
+        throw new Error(`crash at ${phase}`);
+      }
+    },
+  });
+  runtimes.push(firstRuntime);
+  await firstRuntime.ready;
+  const first = connect({ socketPath: firstRuntime.socketPath, token: firstRuntime.token });
+  await first.ready;
+  first.send(original);
+  expect(await first.next()).toMatchObject({ ok: false });
+  expect(await firstRuntime.commandStatus(original)).toMatchObject({ stage: "DELIVERY_ATTEMPTED" });
+  first.close();
+  await first.closed;
+  await firstRuntime.close();
+  runtimes.splice(runtimes.indexOf(firstRuntime), 1);
+
+  const eventPath = join(stateRoot, "index", "events.jsonl");
+  const beforeRecovery = await readFile(eventPath, "utf8");
+  const secondRuntime = await createDaemonRuntime({ root: stateRoot });
+  runtimes.push(secondRuntime);
+  await secondRuntime.ready;
+  expect(await secondRuntime.commandStatus(original)).toMatchObject({ stage: "DELIVERY_UNKNOWN" });
+  expect(await readFile(eventPath, "utf8")).toBe(beforeRecovery);
+
+  const second = connect({ socketPath: secondRuntime.socketPath, token: secondRuntime.token });
+  await second.ready;
+  second.send(original);
+  expect(await second.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "DELIVERY_UNKNOWN" } } });
+  second.send({ ...original, payload: { ...original.payload, role: "observer" } });
+  expect(await second.next()).toMatchObject({ ok: false, error: { code: "IDEMPOTENCY_CONFLICT" } });
+  expect(await readFile(eventPath, "utf8")).toBe(beforeRecovery);
+
+  second.send({ version: 1, clientId: original.clientId, requestId: `resolve-${crashPhase}`, op: "resolve_delivery", payload: { targetClientId: original.clientId, targetRequestId: original.requestId, resolution } });
+  expect(await second.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: resolution === "abandon" ? "FAILED" : "ACCEPTED" } } });
+  second.send(original);
+  if (resolution === "abandon") {
+    expect(await second.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "FAILED", error: { code: "DELIVERY_ABANDONED" } } } });
+    expect(attachmentEvents(await readFile(eventPath, "utf8"))).toEqual(attachmentEvents(beforeRecovery));
+  } else {
+    expect(await second.next()).toMatchObject({ ok: true, result: { kind: "attached", sessionId: original.payload.sessionId } });
+    expect(await secondRuntime.commandStatus(original)).toMatchObject({ stage: "COMPLETED" });
+    expect(attachmentEvents(await readFile(eventPath, "utf8"))).not.toEqual(attachmentEvents(beforeRecovery));
+  }
+  second.close();
+});
+
+it("replays strict completion after a post-completion crash without attachment side effects", async () => {
+  const stateRoot = await root();
+  const original = { version: 1, clientId: "completed-client", requestId: "completed-attach", op: "attach", payload: { sessionId: "completed-session", role: "composer" } };
+  const firstRuntime = await createDaemonRuntime({
+    root: stateRoot,
+    attachmentFailpoint(/** @type {string} */ phase) {
+      if (phase === "after_result_completion") throw new Error("post-completion crash");
+    },
+  });
+  runtimes.push(firstRuntime);
+  await firstRuntime.ready;
+  const first = connect({ socketPath: firstRuntime.socketPath, token: firstRuntime.token });
+  await first.ready;
+  first.send(original);
+  expect(await first.next()).toMatchObject({ ok: false });
+  expect(await firstRuntime.commandStatus(original)).toMatchObject({ stage: "COMPLETED" });
+  first.close();
+  await first.closed;
+  await firstRuntime.close();
+  runtimes.splice(runtimes.indexOf(firstRuntime), 1);
+  const eventPath = join(stateRoot, "index", "events.jsonl");
+  const beforeReplay = await readFile(eventPath, "utf8");
+
+  const restarted = await createDaemonRuntime({ root: stateRoot });
+  runtimes.push(restarted);
+  await restarted.ready;
+  const replay = connect({ socketPath: restarted.socketPath, token: restarted.token });
+  await replay.ready;
+  replay.send(original);
+  expect(await replay.next()).toMatchObject({ ok: true, result: { kind: "attached", sessionId: original.payload.sessionId, role: "composer" } });
+  expect(await restarted.commandStatus(original)).toMatchObject({ stage: "COMPLETED" });
+  expect(await readFile(eventPath, "utf8")).toBe(beforeReplay);
+  replay.close();
+});
+
+it("replays a completed broadcast failure after restart without attachment side effects", async () => {
   /** @type {string[]} */
   const order = [];
   let rejectBroadcast = true;
+  const stateRoot = await root();
   const runtime = await createDaemonRuntime({
-    root: await root(),
+    root: stateRoot,
     /** @param {any} event @param {() => void} broadcast */
     broadcastEvent(event, broadcast) {
       if (event.kind === "attachment_changed") order.push("broadcast");
@@ -489,7 +591,8 @@ it("mutates a durable claim before broadcast and retains it when broadcast fails
   const first = connect({ socketPath: runtime.socketPath, token: runtime.token });
   const second = connect({ socketPath: runtime.socketPath, token: runtime.token });
   await Promise.all([first.ready, second.ready]);
-  first.send({ version: 1, clientId: "first", requestId: "attach-first", op: "attach", payload: { sessionId: "session", role: "composer" } });
+  const original = { version: 1, clientId: "first", requestId: "attach-first", op: "attach", payload: { sessionId: "session", role: "composer" } };
+  first.send(original);
   const failed = await first.next();
   expect(failed).toMatchObject({ ok: false, error: { code: "BROADCAST_FAILED" } });
   const orderAfterFailure = [...order];
@@ -501,6 +604,22 @@ it("mutates a durable claim before broadcast and retains it when broadcast fails
   expect(order.slice(0, 2)).toEqual(["append", "broadcast"]);
   first.close();
   second.close();
+  await Promise.all([first.closed, second.closed]);
+  await runtime.close();
+  runtimes.splice(runtimes.indexOf(runtime), 1);
+  const eventPath = join(stateRoot, "index", "events.jsonl");
+  const beforeRestartReplay = await readFile(eventPath, "utf8");
+
+  const restarted = await createDaemonRuntime({ root: stateRoot });
+  runtimes.push(restarted);
+  await restarted.ready;
+  const replay = connect({ socketPath: restarted.socketPath, token: restarted.token });
+  await replay.ready;
+  replay.send(original);
+  expect(await replay.next()).toEqual(failed);
+  expect(await readFile(eventPath, "utf8")).toBe(beforeRestartReplay);
+  expect(await restarted.commandStatus(original)).toMatchObject({ stage: "COMPLETED" });
+  replay.close();
 });
 
 it("leaves an attachment claim unchanged when durable attachment event append fails", async () => {

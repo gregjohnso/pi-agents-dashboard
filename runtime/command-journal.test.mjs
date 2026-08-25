@@ -30,6 +30,20 @@ describe("command journal", () => {
     await reopened.close();
   });
 
+  it("persists a terminal attachment fingerprint without recovery redelivery", async () => {
+    const journalPath = await path();
+    /** @type {ClientRequest} */
+    const attachment = { version: 1, clientId: "client-1", requestId: "attach-1", op: "attach", payload: { sessionId: "session-1", role: "composer" } };
+    const journal = await createCommandJournal({ path: journalPath });
+    expect(await journal.tombstone(attachment)).toMatchObject({ created: true, status: { stage: "COMPLETED" } });
+    await journal.close();
+
+    const reopened = await createCommandJournal({ path: journalPath });
+    expect(await reopened.tombstone(attachment)).toMatchObject({ created: false, status: { stage: "COMPLETED" } });
+    await expect(reopened.tombstone({ ...attachment, payload: { ...attachment.payload, role: "observer" } })).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
+    await reopened.close();
+  });
+
   it("rejects a changed payload under the same exact IDs", async () => {
     const journal = await createCommandJournal({ path: await path() });
     await journal.accept(command);

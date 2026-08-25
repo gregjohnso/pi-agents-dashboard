@@ -309,6 +309,7 @@ export class DashboardController {
   private confirmationText = "";
   private closePromise?: Promise<void>;
   private readonly eventOperations = new Set<Promise<void>>();
+  private eventTail: Promise<void> = Promise.resolve();
   private saveTail: Promise<void> = Promise.resolve();
   private saveFailure?: unknown;
   private saveAdmissionGeneration = 0;
@@ -348,6 +349,7 @@ export class DashboardController {
     this.closed = false;
     this.closePromise = undefined;
     this.saveFailure = undefined;
+    this.eventTail = Promise.resolve();
     const generation = ++this.openGeneration;
     const controller = new AbortController();
     this.openController = controller;
@@ -865,7 +867,10 @@ export class DashboardController {
   }
 
   private trackEvent(update: DashboardUpdate, generation: number): Promise<void> {
-    const operation = this.processEvent(update, generation);
+    const operation = this.eventOperations.size === 0
+      ? this.processEvent(update, generation)
+      : this.eventTail.then(() => this.processEvent(update, generation));
+    this.eventTail = operation;
     this.eventOperations.add(operation);
     void operation.finally(() => this.eventOperations.delete(operation)).catch(() => {});
     return operation;
@@ -876,7 +881,9 @@ export class DashboardController {
     try {
       this.applySnapshot(update.snapshot);
       await this.awaitHostRender();
+      if (!this.isCurrentOpen(generation)) throw Object.assign(new Error("Dashboard is closed"), { code: "DASHBOARD_CLOSED" });
       await this.enqueueSave(this.persistedState(update.cursor));
+      if (!this.isCurrentOpen(generation)) throw Object.assign(new Error("Dashboard is closed"), { code: "DASHBOARD_CLOSED" });
       this.cursor = update.cursor;
     } catch (error) {
       const typed = this.typedError(error, "EVENT_PROCESSING_FAILED");
@@ -904,11 +911,10 @@ export class DashboardController {
   }
 
   private completeHostRender(generation: number): void {
-    for (const [requested, waiter] of this.renderWaiters) {
-      if (requested > generation) continue;
-      this.renderWaiters.delete(requested);
-      waiter.resolve();
-    }
+    const waiter = this.renderWaiters.get(generation);
+    if (waiter === undefined) return;
+    this.renderWaiters.delete(generation);
+    waiter.resolve();
   }
 
   private rejectHostRenders(error: unknown): void {

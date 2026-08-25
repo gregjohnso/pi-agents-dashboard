@@ -92,7 +92,7 @@ describe("agents extension registration", () => {
     expect(setEditorComponent).toHaveBeenLastCalledWith(previous);
   });
 
-  it("disposes every created wrapper after a later factory replacement without overwriting later callbacks", async () => {
+  it("disposes repeated wrappers in LIFO order after a later factory replacement", async () => {
     let sessionStart: ((event: unknown, ctx: any) => Promise<void>) | undefined;
     let sessionShutdown: ((event: unknown, ctx: any) => Promise<void>) | undefined;
     const pi = {
@@ -126,6 +126,7 @@ describe("agents extension registration", () => {
     await sessionStart?.({}, ctx);
     const ownedFactory = current as (tui: TUI, theme: EditorTheme, keybindings: unknown) => unknown;
     ownedFactory(tui, theme, getKeybindings());
+    ownedFactory(tui, theme, getKeybindings());
     const laterChange = vi.fn();
     base.onChange = laterChange;
     const laterFactory = vi.fn();
@@ -136,6 +137,49 @@ describe("agents extension registration", () => {
     expect(base.onChange).toBe(laterChange);
     expect(current).toBe(laterFactory);
     expect(setEditorComponent).not.toHaveBeenCalledWith(previous);
+    await sessionShutdown?.({}, ctx);
+    expect(base.onSubmit).toBe(priorSubmit);
+    expect(base.onChange).toBe(laterChange);
+  });
+
+  it("restores original callbacks when the same CustomEditor is wrapped twice", async () => {
+    let sessionStart: ((event: unknown, ctx: any) => Promise<void>) | undefined;
+    let sessionShutdown: ((event: unknown, ctx: any) => Promise<void>) | undefined;
+    const pi = {
+      registerCommand: vi.fn(),
+      on(name: string, handler: typeof sessionStart) {
+        if (name === "session_start") sessionStart = handler;
+        if (name === "session_shutdown") sessionShutdown = handler;
+      },
+    };
+    const tui = { requestRender: vi.fn() } as unknown as TUI;
+    const theme: EditorTheme = {
+      borderColor: (text) => text,
+      selectList: { selectedPrefix: () => "", selectedText: (text) => text, description: (text) => text, scrollInfo: (text) => text, noMatch: (text) => text },
+    };
+    const base = new CustomEditor(tui, theme, getKeybindings() as never);
+    const originalSubmit = vi.fn();
+    const originalChange = vi.fn();
+    base.onSubmit = originalSubmit;
+    base.onChange = originalChange;
+    let current: unknown = vi.fn(() => base);
+    const setEditorComponent = vi.fn((factory) => { current = factory; });
+    registerAgentsDashboard(pi as never, {
+      checkCapabilities: async () => ({
+        piVersion: "supported", globalPackage: true, rpcWorker: true, daemonOwnedStartup: true,
+        nativeAttach: true, composableLeftGesture: true, fullscreenCustomUi: true, blockers: [],
+      }),
+      openDashboard: vi.fn(),
+    });
+    const ctx = { mode: "tui", ui: { getEditorComponent: () => current, setEditorComponent, notify: vi.fn() } };
+    await sessionStart?.({}, ctx);
+    const ownedFactory = current as (tui: TUI, theme: EditorTheme, keybindings: unknown) => unknown;
+    ownedFactory(tui, theme, getKeybindings());
+    ownedFactory(tui, theme, getKeybindings());
+
+    await sessionShutdown?.({}, ctx);
+    expect(base.onSubmit).toBe(originalSubmit);
+    expect(base.onChange).toBe(originalChange);
   });
 
   it("strictly validates every persisted section and writes an atomic private schema", async () => {

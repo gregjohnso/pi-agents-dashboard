@@ -281,6 +281,60 @@ describe("dashboard controller", () => {
     expect(order).toEqual(["request-render", "host-render", "persist"]);
   });
 
+  it("serializes concurrent events through distinct rendered states and acknowledgements", async () => {
+    const backend = new FakeBackend([session("initial")]);
+    const saved = persistence();
+    const renders: string[][] = [];
+    const acknowledgements: string[] = [];
+    let dashboard: DashboardController;
+    dashboard = controller(backend, {
+      persistence: {
+        load: saved.load,
+        async save(state) {
+          await saved.save(state);
+          if (state.cursor !== undefined) acknowledgements.push(state.cursor.sequence);
+        },
+      },
+      requestRender: () => { renders.push(dashboard.render(80, 12)); },
+    });
+    await dashboard.open();
+    renders.length = 0;
+
+    const first = Promise.resolve(backend.listener?.({ snapshot: { sessions: [session("state-1")] }, cursor: { daemonEpoch: "epoch", sequence: "1" } }));
+    const second = Promise.resolve(backend.listener?.({ snapshot: { sessions: [session("state-2")] }, cursor: { daemonEpoch: "epoch", sequence: "2" } }));
+    await first;
+    expect(renders).toHaveLength(2);
+    expect(renders[0]?.join("\n")).toContain("state-1");
+    expect(renders[0]?.join("\n")).not.toContain("state-2");
+    expect(acknowledgements).toEqual(["1"]);
+    await second;
+    expect(renders[1]?.join("\n")).toContain("state-2");
+    expect(acknowledgements).toEqual(["1", "2"]);
+  });
+
+  it("leaves concurrent events unacknowledged when the first host render fails", async () => {
+    const backend = new FakeBackend([session("initial")]);
+    const saved = persistence();
+    let renderRequests = 0;
+    const dashboard = controller(backend, {
+      persistence: saved,
+      requestRender: () => {
+        renderRequests += 1;
+        if (renderRequests === 1) return;
+        const internals = dashboard as unknown as { list: { renderViewport: () => never } };
+        internals.list.renderViewport = () => { throw new Error("render failed"); };
+        dashboard.render();
+      },
+    });
+    await dashboard.open();
+
+    const first = Promise.resolve(backend.listener?.({ snapshot: { sessions: [session("state-1")] }, cursor: { daemonEpoch: "epoch", sequence: "1" } }));
+    const second = Promise.resolve(backend.listener?.({ snapshot: { sessions: [session("state-2")] }, cursor: { daemonEpoch: "epoch", sequence: "2" } }));
+    await expect(first).rejects.toThrow("render failed");
+    await expect(second).rejects.toThrow();
+    expect(saved.saved.some((state) => (state as { cursor?: EventCursor }).cursor?.sequence === "1" || (state as { cursor?: EventCursor }).cursor?.sequence === "2")).toBe(false);
+  });
+
   it.each(["render", "request", "persistence", "disposed"])("closes on %s failure so the backend sends no acknowledgement", async (failure) => {
     const backend = new FakeBackend([session("a")]);
     const onClose = vi.fn();

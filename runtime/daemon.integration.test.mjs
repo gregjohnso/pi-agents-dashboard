@@ -321,6 +321,144 @@ it("installs an in-flight attachment reservation across sockets before arbitrati
   conflict.close();
 });
 
+it("serializes disconnect behind an attach whose durable append is in flight", async () => {
+  /** @type {((value?: unknown) => void) | undefined} */
+  let releaseAppend;
+  /** @type {((value?: unknown) => void) | undefined} */
+  let appendReached;
+  const appendGate = new Promise((resolve) => { releaseAppend = resolve; });
+  const reached = new Promise((resolve) => { appendReached = resolve; });
+  const runtime = await createDaemonRuntime({
+    root: await root(),
+    reconcile: async (/** @type {any} */ options) => {
+      const recovery = await options.defaultReconcile();
+      const append = recovery.events.append.bind(recovery.events);
+      recovery.events.append = async (/** @type {any} */ event) => {
+        if (event.kind === "attachment_changed" && event.payload.clientId === "closing" && event.payload.attached) {
+          appendReached?.();
+          await appendGate;
+        }
+        return append(event);
+      };
+      return recovery;
+    },
+  });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  const observer = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await Promise.all([client.ready, observer.ready]);
+  observer.send({ version: 1, clientId: "watcher", requestId: "subscribe", op: "subscribe", payload: {} });
+  await observer.next();
+  client.send({ version: 1, clientId: "closing", requestId: "attach", op: "attach", payload: { sessionId: "session", role: "composer" } });
+  await reached;
+  client.close();
+  /** @type {(value?: unknown) => void} */ (releaseAppend)();
+  expect(await observer.next()).toMatchObject({ payload: { clientId: "closing", attached: true } });
+  expect(await observer.next()).toMatchObject({ payload: { clientId: "closing", attached: false } });
+
+  const next = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await next.ready;
+  next.send({ version: 1, clientId: "next", requestId: "attach", op: "attach", payload: { sessionId: "session", role: "composer" } });
+  expect(await next.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+  next.close();
+  observer.close();
+});
+
+it("registers a pending session before its serializer lock and rejects it after close", async () => {
+  /** @type {((value?: unknown) => void) | undefined} */
+  let releaseAppend;
+  /** @type {((value?: unknown) => void) | undefined} */
+  let appendReached;
+  /** @type {((value?: unknown) => void) | undefined} */
+  let pendingRegistered;
+  const appendGate = new Promise((resolve) => { releaseAppend = resolve; });
+  const reached = new Promise((resolve) => { appendReached = resolve; });
+  const registered = new Promise((resolve) => { pendingRegistered = resolve; });
+  const runtime = await createDaemonRuntime({
+    root: await root(),
+    attachmentFailpoint(/** @type {string} */ stage, /** @type {any} */ request) {
+      if (stage === "registered" && request.clientId === "closing") pendingRegistered?.();
+    },
+    reconcile: async (/** @type {any} */ options) => {
+      const recovery = await options.defaultReconcile();
+      const append = recovery.events.append.bind(recovery.events);
+      recovery.events.append = async (/** @type {any} */ event) => {
+        if (event.kind === "attachment_changed" && event.payload.clientId === "blocker" && event.payload.attached) {
+          appendReached?.();
+          await appendGate;
+        }
+        return append(event);
+      };
+      return recovery;
+    },
+  });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const blocker = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  const closing = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  const observer = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await Promise.all([blocker.ready, closing.ready, observer.ready]);
+  observer.send({ version: 1, clientId: "watcher", requestId: "subscribe", op: "subscribe", payload: {} });
+  await observer.next();
+  blocker.send({ version: 1, clientId: "blocker", requestId: "attach", op: "attach", payload: { sessionId: "session", role: "composer" } });
+  await reached;
+  closing.send({ version: 1, clientId: "closing", requestId: "attach", op: "attach", payload: { sessionId: "session", role: "composer" } });
+  await registered;
+  closing.close();
+  /** @type {(value?: unknown) => void} */ (releaseAppend)();
+  await blocker.next();
+  expect(await observer.next()).toMatchObject({ payload: { clientId: "blocker", attached: true } });
+  blocker.close();
+  expect(await observer.next()).toMatchObject({ payload: { clientId: "blocker", attached: false } });
+
+  const next = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await next.ready;
+  next.send({ version: 1, clientId: "next", requestId: "attach", op: "attach", payload: { sessionId: "session", role: "composer" } });
+  expect(await next.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+  next.close();
+  observer.close();
+});
+
+it("replays durable attachment outcomes across request pressure and daemon restart", async () => {
+  const stateRoot = await root();
+  const firstRuntime = await createDaemonRuntime({ root: stateRoot });
+  runtimes.push(firstRuntime);
+  await firstRuntime.ready;
+  const first = connect({ socketPath: firstRuntime.socketPath, token: firstRuntime.token });
+  await first.ready;
+  const original = { version: 1, clientId: "stable", requestId: "original", op: "attach", payload: { sessionId: "session", role: "composer" } };
+  first.send(original);
+  const originalResponse = await first.next();
+  expect(originalResponse).toMatchObject({ ok: true, result: { kind: "attached", role: "composer" } });
+  first.close();
+  await first.closed;
+
+  const pressure = connect({ socketPath: firstRuntime.socketPath, token: firstRuntime.token });
+  await pressure.ready;
+  const pressureRequests = Array.from({ length: 20 }, (_, index) => ({ version: 1, clientId: "pressure", requestId: `detach-${index}`, op: "detach", payload: { sessionId: `other-${index}` } }));
+  pressureRequests.forEach(pressure.send);
+  const pressureResponses = await Promise.all(pressureRequests.map(() => pressure.next()));
+  expect(pressureResponses.every((value) => value.ok === true && value.result?.kind === "detached")).toBe(true);
+  pressure.close();
+  await firstRuntime.close();
+
+  const eventPath = join(stateRoot, "index", "events.jsonl");
+  const beforeReplay = await readFile(eventPath, "utf8");
+  const secondRuntime = await createDaemonRuntime({ root: stateRoot });
+  runtimes.push(secondRuntime);
+  await secondRuntime.ready;
+  const replay = connect({ socketPath: secondRuntime.socketPath, token: secondRuntime.token });
+  await replay.ready;
+  replay.send(original);
+  expect(await replay.next()).toEqual(originalResponse);
+  expect(await readFile(eventPath, "utf8")).toBe(beforeReplay);
+  replay.send({ ...original, payload: { sessionId: "session", role: "observer" } });
+  expect(await replay.next()).toMatchObject({ ok: false, error: { code: "IDEMPOTENCY_CONFLICT" } });
+  expect(await readFile(eventPath, "utf8")).toBe(beforeReplay);
+  replay.close();
+});
+
 it("mutates a durable claim before broadcast and retains it when broadcast fails", async () => {
   /** @type {string[]} */
   const order = [];
@@ -352,7 +490,12 @@ it("mutates a durable claim before broadcast and retains it when broadcast fails
   const second = connect({ socketPath: runtime.socketPath, token: runtime.token });
   await Promise.all([first.ready, second.ready]);
   first.send({ version: 1, clientId: "first", requestId: "attach-first", op: "attach", payload: { sessionId: "session", role: "composer" } });
-  expect(await first.next()).toMatchObject({ ok: false, error: { code: "BROADCAST_FAILED" } });
+  const failed = await first.next();
+  expect(failed).toMatchObject({ ok: false, error: { code: "BROADCAST_FAILED" } });
+  const orderAfterFailure = [...order];
+  first.send({ version: 1, clientId: "first", requestId: "attach-first", op: "attach", payload: { sessionId: "session", role: "composer" } });
+  expect(await first.next()).toEqual(failed);
+  expect(order).toEqual(orderAfterFailure);
   second.send({ version: 1, clientId: "second", requestId: "attach-second", op: "attach", payload: { sessionId: "session", role: "composer" } });
   expect(await second.next()).toMatchObject({ ok: true, result: { role: "observer" } });
   expect(order.slice(0, 2)).toEqual(["append", "broadcast"]);
@@ -687,9 +830,9 @@ it("shares close state, reports every staged failure after releasing lifecycle o
   const firstClose = runtime.close();
   const secondClose = runtime.close();
   expect(secondClose).toBe(firstClose);
-  await expect(firstClose).rejects.toMatchObject({ code: "DAEMON_CLOSE_FAILED", errors: { length: 8 } });
+  await expect(firstClose).rejects.toMatchObject({ code: "DAEMON_CLOSE_FAILED", errors: { length: 9 } });
   expect(runtime.status().closeState).toBe("FAILED_CLOSED");
-  expect(failedStages).toEqual(["request_admission", "reconciliation", "request_chains", "supervisor", "cursor_store", "launch_result_store", "recovery_stores", "lifecycle"]);
+  expect(failedStages).toEqual(["request_admission", "reconciliation", "request_chains", "supervisor", "cursor_store", "launch_result_store", "attachment_result_store", "recovery_stores", "lifecycle"]);
   await expect(access(join(stateRoot, "daemon", "pid.json"))).rejects.toMatchObject({ code: "ENOENT" });
   await expect(access(runtime.socketPath)).rejects.toMatchObject({ code: "ENOENT" });
 

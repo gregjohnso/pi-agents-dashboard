@@ -139,6 +139,24 @@ export async function createCommandJournal({ path, now = () => new Date().toISOS
   }
 
   return {
+    /** Persist a terminal command fingerprint without scheduling command delivery. @param {DurableCommand} command @returns {Promise<{ status: CommandStatus, created: boolean }>} */
+    tombstone(command) {
+      return serialize(async () => {
+        assertKey(command);
+        const existing = current(command);
+        if (existing !== undefined) {
+          if (existing.commandCanonical !== canonical(command)) throw new CommandJournalError("IDEMPOTENCY_CONFLICT", "Request IDs were already used with a different command");
+          return { status: existing.status, created: false };
+        }
+        const timestamp = now();
+        const status = await append({
+          commandCanonical: canonical(command),
+          command,
+          status: { clientId: command.clientId, requestId: command.requestId, operation: command.op, stage: "COMPLETED", acceptedAt: timestamp, updatedAt: timestamp },
+        });
+        return { status, created: true };
+      });
+    },
     /** @param {DurableCommand} command @returns {Promise<CommandStatus>} */
     accept(command) {
       return serialize(async () => {

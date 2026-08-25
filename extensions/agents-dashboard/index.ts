@@ -256,21 +256,21 @@ export function registerAgentsDashboard(
     handler: async (_args, ctx) => activate(ctx),
   });
 
-  const installations = new Map<ExtensionContext["ui"], { previous: EditorFactory | undefined; wrapper: EditorFactory; editors: Set<DashboardGestureEditor> }>();
+  const installations = new Map<ExtensionContext["ui"], { previous: EditorFactory | undefined; wrapper: EditorFactory; editors: DashboardGestureEditor[] }>();
 
   pi.on("session_start", async (_event, ctx) => {
     if (ctx.mode !== "tui") return;
     const priorInstallation = installations.get(ctx.ui);
     if (priorInstallation !== undefined) {
       installations.delete(ctx.ui);
-      for (const editor of priorInstallation.editors) editor.dispose();
-      priorInstallation.editors.clear();
+      priorInstallation.editors.reverse().forEach((editor) => editor.dispose());
+      priorInstallation.editors.length = 0;
       if (ctx.ui.getEditorComponent() === priorInstallation.wrapper) ctx.ui.setEditorComponent(priorInstallation.previous);
     }
     const report = await dependencies.checkCapabilities();
     if (!report.composableLeftGesture) return;
     const previous = ctx.ui.getEditorComponent();
-    const editors = new Set<DashboardGestureEditor>();
+    const editors: DashboardGestureEditor[] = [];
     const wrapper: EditorFactory = (tui, theme, keybindings) => {
       const base = previous?.(tui, theme, keybindings)
         ?? new CustomEditor(tui, theme, keybindings);
@@ -279,7 +279,7 @@ export function registerAgentsDashboard(
         return base;
       }
       const editor = new DashboardGestureEditor(base, () => { void activate(ctx); });
-      editors.add(editor);
+      editors.push(editor);
       return editor;
     };
     installations.set(ctx.ui, { previous, wrapper, editors });
@@ -290,8 +290,8 @@ export function registerAgentsDashboard(
     const installation = installations.get(ctx.ui);
     if (installation === undefined) return;
     installations.delete(ctx.ui);
-    for (const editor of installation.editors) editor.dispose();
-    installation.editors.clear();
+    installation.editors.reverse().forEach((editor) => editor.dispose());
+    installation.editors.length = 0;
     if (ctx.ui.getEditorComponent() === installation.wrapper) ctx.ui.setEditorComponent(installation.previous);
   });
 }

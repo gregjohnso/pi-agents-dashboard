@@ -9,7 +9,7 @@ import { cleanupStaleDaemon, inspectDaemonEndpoint } from "../runtime/daemon-lif
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
 import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "../runtime/process-signaler.mjs";
-import { createDaemonRequester } from "./session-commands.mjs";
+import { createDaemonRequester, loadCliClientIdentity } from "./session-commands.mjs";
 
 const STATUS_CODES = { HEALTHY: 0, UNHEALTHY: 1, STALE: 1, ABSENT: 3, CONFLICT: 5 };
 const DEFAULT_STOP_POLICY = Object.freeze({ gracefulMs: 500, terminateMs: 500 });
@@ -128,7 +128,7 @@ export async function runDaemonCommand(command, options = {}) {
     const current = await inspectEndpoint(common);
     if (current.status === "ABSENT") return { code: 3, error: { code: "DAEMON_ABSENT", message: "Daemon is not running" } };
     if (current.status !== "HEALTHY") return { code: current.status === "CONFLICT" ? 5 : 1, error: { code: "STOP_REFUSED", message: "Daemon identity is not healthy and exact" } };
-    const request = options.request ?? createDaemonRequester({ root });
+    const request = options.request ?? createDaemonRequester({ root, clientId: await loadCliClientIdentity({ root, randomId: options.randomId }), timeoutMs: options.timeoutMs });
     const state = await request("get_state", {});
     const liveSessions = state.sessions.filter((record) => record.ownership !== undefined || ["LIVE", "SLEEPING"].includes(record.processState));
     if (liveSessions.length > 0 && options.allowLiveWorkers !== true && (options.stopWorkers !== true || options.yes !== true)) {

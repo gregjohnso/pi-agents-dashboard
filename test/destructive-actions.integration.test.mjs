@@ -168,50 +168,215 @@ it("refuses observer, live, and symlink-replaced Delete targets without invoking
   frontend.close();
 });
 
-it("keeps Delete response-loss safe, preserves shared cwd/worktree, and retries only after explicit resolution", async () => {
+it("does not redeliver a PREPARED Delete until explicit retry_at_risk", async () => {
   const root = await fixtureRoot();
-  const sharedCwd = join(root, "shared-cwd");
-  const worktree = join(root, "managed-worktree");
-  await mkdir(sharedCwd);
-  await mkdir(worktree);
-  await writeFile(join(sharedCwd, "keep.txt"), "shared\n");
-  await writeFile(join(worktree, "keep.txt"), "worktree\n");
   const registry = new RegistryStore(join(root, "sessions"));
-  const session = record(root, "delete-target", { cwd: sharedCwd, isolation: { mode: "worktree", worktreePath: worktree, branch: "agent/delete" } });
+  const session = record(root, "delete-prepared");
+  await writeFile(session.canonicalSessionFile, "session\n");
+  await registry.create(session);
+  let throwBeforeEffect = true;
+  const trash = vi.fn(async (path) => {
+    if (throwBeforeEffect) throw new Error("trash delivery threw before effect");
+    await rename(path, `${path}.trash`);
+  });
+  let runtime = await createDaemonRuntime({ root, trashSessionFile: trash });
+  runtimes.push(runtime);
+  await runtime.ready;
+  let frontend = connect(runtime);
+  await frontend.next();
+  const deletion = request("client", "delete-prepared-request", "delete", { sessionId: session.sessionId, revision: 0 });
+
+  frontend.send(deletion);
+  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "DELIVERY_UNKNOWN" } } });
+  frontend.send(deletion);
+  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "DELIVERY_UNKNOWN" } } });
+  expect(trash).toHaveBeenCalledTimes(1);
+  frontend.close();
+  await runtime.close();
+  runtimes.splice(runtimes.indexOf(runtime), 1);
+
+  runtime = await createDaemonRuntime({ root, trashSessionFile: trash });
+  runtimes.push(runtime);
+  await runtime.ready;
+  frontend = connect(runtime);
+  await frontend.next();
+  frontend.send(deletion);
+  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "DELIVERY_UNKNOWN" } } });
+  expect(trash).toHaveBeenCalledTimes(1);
+
+  throwBeforeEffect = false;
+  frontend.send(request("client", "resolve-delete-prepared", "resolve_delivery", { targetClientId: "client", targetRequestId: "delete-prepared-request", resolution: "retry_at_risk" }));
+  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "ACCEPTED" } } });
+  frontend.send(deletion);
+  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "COMPLETED" } } });
+  expect(trash).toHaveBeenCalledTimes(2);
+  expect(await registry.get(session.sessionId)).toBeUndefined();
+  frontend.close();
+});
+
+it("reopens a crash-window PREPARED Delete as DELIVERY_UNKNOWN without trash redelivery", async () => {
+  const root = await fixtureRoot();
+  const registry = new RegistryStore(join(root, "sessions"));
+  const session = record(root, "delete-reopened-prepared");
   await writeFile(session.canonicalSessionFile, "session\n");
   await registry.create(session);
   const trash = vi.fn(async (path) => rename(path, `${path}.trash`));
-  let failOnce = true;
-  const runtime = await createDaemonRuntime({
+  let failPrepare = true;
+  let runtime = await createDaemonRuntime({
     root,
     trashSessionFile: trash,
     destructiveFailpoint(stage) {
-      if (stage === "delete_after_trash" && failOnce) {
-        failOnce = false;
-        throw new Error("lost after trash");
-      }
+      if (stage === "delete_after_prepare" && failPrepare) throw new Error("crash after durable prepare");
     },
   });
   runtimes.push(runtime);
   await runtime.ready;
+  let frontend = connect(runtime);
+  await frontend.next();
+  const deletion = request("client", "delete-reopened-prepared-request", "delete", { sessionId: session.sessionId, revision: 0 });
+  frontend.send(deletion);
+  expect(await frontend.next()).toMatchObject({ ok: false, error: { code: "REQUEST_FAILED" } });
+  expect(trash).not.toHaveBeenCalled();
+  frontend.close();
+  await runtime.close();
+  runtimes.splice(runtimes.indexOf(runtime), 1);
+
+  failPrepare = false;
+  runtime = await createDaemonRuntime({ root, trashSessionFile: trash });
+  runtimes.push(runtime);
+  await runtime.ready;
+  expect(await runtime.commandStatus({ clientId: "client", requestId: "delete-reopened-prepared-request" })).toMatchObject({ stage: "DELIVERY_UNKNOWN" });
+  expect(trash).not.toHaveBeenCalled();
+  frontend = connect(runtime);
+  await frontend.next();
+  frontend.send(request("client", "resolve-delete-reopened", "resolve_delivery", { targetClientId: "client", targetRequestId: "delete-reopened-prepared-request", resolution: "retry_at_risk" }));
+  await frontend.next();
+  frontend.send(deletion);
+  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "COMPLETED" } } });
+  expect(trash).toHaveBeenCalledTimes(1);
+  frontend.close();
+});
+
+it("reconciles throw-after-effect Delete delivery without invoking trash twice", async () => {
+  const root = await fixtureRoot();
+  const registry = new RegistryStore(join(root, "sessions"));
+  const session = record(root, "delete-after-effect");
+  await writeFile(session.canonicalSessionFile, "session\n");
+  await registry.create(session);
+  const trash = vi.fn(async (path) => {
+    await rename(path, `${path}.trash`);
+    throw new Error("trash delivery threw after effect");
+  });
+  const runtime = await createDaemonRuntime({ root, trashSessionFile: trash });
+  runtimes.push(runtime);
+  await runtime.ready;
   const frontend = connect(runtime);
   await frontend.next();
-  const deletion = request("client", "delete-request", "delete", { sessionId: session.sessionId, revision: 0 });
+  const deletion = request("client", "delete-after-effect-request", "delete", { sessionId: session.sessionId, revision: 0 });
   frontend.send(deletion);
   expect(await frontend.next()).toMatchObject({ result: { status: { stage: "DELIVERY_UNKNOWN" } } });
   frontend.send(deletion);
   expect(await frontend.next()).toMatchObject({ result: { status: { stage: "DELIVERY_UNKNOWN" } } });
   expect(trash).toHaveBeenCalledTimes(1);
-  const afterTrash = await registry.get(session.sessionId);
-  await registry.update(session.sessionId, afterTrash.revision, { updatedAt: "2026-08-25T12:00:01.000Z" });
-
-  frontend.send(request("client", "resolve-delete", "resolve_delivery", { targetClientId: "client", targetRequestId: "delete-request", resolution: "retry_at_risk" }));
-  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "ACCEPTED" } } });
+  frontend.send(request("client", "resolve-delete-after-effect", "resolve_delivery", { targetClientId: "client", targetRequestId: "delete-after-effect-request", resolution: "retry_at_risk" }));
+  await frontend.next();
   frontend.send(deletion);
   expect(await frontend.next()).toMatchObject({ result: { status: { stage: "COMPLETED" } } });
   expect(trash).toHaveBeenCalledTimes(1);
   expect(await registry.get(session.sessionId)).toBeUndefined();
-  expect(await readFile(join(sharedCwd, "keep.txt"), "utf8")).toBe("shared\n");
-  expect(await readFile(join(worktree, "keep.txt"), "utf8")).toBe("worktree\n");
+  frontend.close();
+});
+
+it("reconciles an exact missing PREPARED Delete without another trash attempt", async () => {
+  const root = await fixtureRoot();
+  const registry = new RegistryStore(join(root, "sessions"));
+  const session = record(root, "delete-missing");
+  await writeFile(session.canonicalSessionFile, "session\n");
+  await registry.create(session);
+  const trash = vi.fn(async () => { throw new Error("trash delivery threw before effect"); });
+  const runtime = await createDaemonRuntime({ root, trashSessionFile: trash });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const frontend = connect(runtime);
+  await frontend.next();
+  const deletion = request("client", "delete-missing-request", "delete", { sessionId: session.sessionId, revision: 0 });
+  frontend.send(deletion);
+  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "DELIVERY_UNKNOWN" } } });
+  await rename(session.canonicalSessionFile, `${session.canonicalSessionFile}.trash`);
+  frontend.send(request("client", "resolve-delete-missing", "resolve_delivery", { targetClientId: "client", targetRequestId: "delete-missing-request", resolution: "retry_at_risk" }));
+  await frontend.next();
+  frontend.send(deletion);
+  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "COMPLETED" } } });
+  expect(trash).toHaveBeenCalledTimes(1);
+  expect(await registry.get(session.sessionId)).toBeUndefined();
+  frontend.close();
+});
+
+it.each([
+  ["revision", async (root, registry, session) => registry.update(session.sessionId, 0, { updatedAt: "2026-08-25T12:00:01.000Z" })],
+  ["field", async (root, _registry, session) => writeFile(join(root, "sessions", `${session.sessionId}.json`), `${JSON.stringify({ ...session, taskState: "FAILED" })}\n`, { mode: 0o600 })],
+  ["ownership", async (root, _registry, session) => writeFile(join(root, "sessions", `${session.sessionId}.json`), `${JSON.stringify({ ...session, processState: "STALE", ownership: { kind: "managed", runId: "changed", process: { pid: 444, startIdentity: "4440", processGroupId: 444 }, acquiredAt: session.createdAt, heartbeatAt: session.createdAt } })}\n`, { mode: 0o600 })],
+])("refuses missing-file Delete reconciliation after a %s change", async (_name, changeRecord) => {
+  const root = await fixtureRoot();
+  const registry = new RegistryStore(join(root, "sessions"));
+  const session = record(root, `delete-changed-${_name}`);
+  await writeFile(session.canonicalSessionFile, "session\n");
+  await registry.create(session);
+  const trash = vi.fn(async (path) => {
+    await rename(path, `${path}.trash`);
+    throw new Error("trash delivery threw after effect");
+  });
+  const runtime = await createDaemonRuntime({ root, trashSessionFile: trash });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const frontend = connect(runtime);
+  await frontend.next();
+  const deletion = request("client", `delete-changed-request-${_name}`, "delete", { sessionId: session.sessionId, revision: 0 });
+  frontend.send(deletion);
+  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "DELIVERY_UNKNOWN" } } });
+  await changeRecord(root, registry, session);
+  frontend.send(request("client", `resolve-delete-changed-${_name}`, "resolve_delivery", { targetClientId: "client", targetRequestId: `delete-changed-request-${_name}`, resolution: "retry_at_risk" }));
+  await frontend.next();
+  frontend.send(deletion);
+  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "FAILED", error: { code: "DELETE_RECONCILIATION_REFUSED" } } } });
+  expect(trash).toHaveBeenCalledTimes(1);
+  expect(await registry.get(session.sessionId)).toBeDefined();
+  frontend.close();
+});
+
+it("refuses a replacement PREPARED target and never retries after abandon", async () => {
+  const root = await fixtureRoot();
+  const registry = new RegistryStore(join(root, "sessions"));
+  const session = record(root, "delete-replaced-prepared");
+  await writeFile(session.canonicalSessionFile, "original\n");
+  await registry.create(session);
+  const trash = vi.fn(async () => { throw new Error("trash delivery threw before effect"); });
+  const runtime = await createDaemonRuntime({ root, trashSessionFile: trash });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const frontend = connect(runtime);
+  await frontend.next();
+  const deletion = request("client", "delete-replaced-prepared-request", "delete", { sessionId: session.sessionId, revision: 0 });
+  frontend.send(deletion);
+  await frontend.next();
+  await rename(session.canonicalSessionFile, `${session.canonicalSessionFile}.original`);
+  await writeFile(session.canonicalSessionFile, "replacement\n");
+  frontend.send(request("client", "resolve-delete-replaced", "resolve_delivery", { targetClientId: "client", targetRequestId: "delete-replaced-prepared-request", resolution: "retry_at_risk" }));
+  await frontend.next();
+  frontend.send(deletion);
+  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "FAILED", error: { code: "DELETE_RECONCILIATION_REFUSED" } } } });
+  expect(trash).toHaveBeenCalledTimes(1);
+
+  const second = record(root, "delete-abandoned");
+  await writeFile(second.canonicalSessionFile, "session\n");
+  await registry.create(second);
+  const abandoned = request("client", "delete-abandoned-request", "delete", { sessionId: second.sessionId, revision: 0 });
+  frontend.send(abandoned);
+  await frontend.next();
+  frontend.send(request("client", "resolve-delete-abandoned", "resolve_delivery", { targetClientId: "client", targetRequestId: "delete-abandoned-request", resolution: "abandon" }));
+  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "FAILED" } } });
+  frontend.send(abandoned);
+  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "FAILED" } } });
+  expect(trash).toHaveBeenCalledTimes(2);
   frontend.close();
 });

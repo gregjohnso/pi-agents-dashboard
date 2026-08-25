@@ -5,8 +5,8 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { cleanupManagedWorktree as defaultCleanupManagedWorktree } from "../isolation/cleanup.mjs";
-import { atomicWriteJson } from "../runtime/atomic-file.mjs";
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
+import { parseDaemonResponse } from "../shared/contracts.js";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
 const DESTRUCTIVE_COMMANDS = new Set(["stop", "delete", "cleanup"]);
@@ -67,6 +67,39 @@ export async function loadCliClientIdentity({ root = runtimeRoot(), randomId = r
   }
 }
 
+/** @param {unknown} value */
+function validateAuthentication(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw Object.assign(new Error("Daemon authentication frame is invalid"), { code: "INVALID_DAEMON_AUTHENTICATION" });
+  const frame = /** @type {Record<string, any>} */ (value);
+  const allowed = new Set(["version", "kind", "state", "recovering", "error", "daemonEpoch", "pid"]);
+  if (frame.version !== 1 || frame.kind !== "authenticated" || typeof frame.state !== "string" || typeof frame.recovering !== "boolean" || !exactId(frame.daemonEpoch) || !Number.isSafeInteger(frame.pid) || Object.keys(frame).some((key) => !allowed.has(key))) {
+    throw Object.assign(new Error("Daemon authentication frame is invalid"), { code: "INVALID_DAEMON_AUTHENTICATION" });
+  }
+}
+
+/** @param {string} op @param {any} payload @param {string} clientId @param {string} requestId @param {any} result */
+function validateExpectedResult(op, payload, clientId, requestId, result) {
+  const unexpected = (message) => Object.assign(new Error(message), { code: "UNEXPECTED_DAEMON_RESPONSE" });
+  if (op === "get_state") {
+    if (result.kind !== "state") throw unexpected("Daemon returned the wrong result kind for get_state");
+    return;
+  }
+  if (op === "stop" || op === "delete") {
+    const status = result.kind === "command" ? result.status : undefined;
+    if (status?.clientId !== clientId || status.requestId !== requestId || status.operation !== op || !["COMPLETED", "DELIVERY_UNKNOWN", "FAILED"].includes(status.stage)) {
+      throw unexpected(`Daemon returned an unexpected ${op} command status`);
+    }
+    return;
+  }
+  if (op === "resolve_delivery") {
+    const status = result.kind === "command" ? result.status : undefined;
+    const expectedStage = payload.resolution === "retry_at_risk" ? "ACCEPTED" : "FAILED";
+    if (status?.clientId !== payload.targetClientId || status.requestId !== payload.targetRequestId || status.stage !== expectedStage) {
+      throw unexpected("Daemon returned an unexpected delivery-resolution status");
+    }
+  }
+}
+
 /** Create one bounded authenticated requester; transport closure never signals workers. */
 export function createDaemonRequester({ root = runtimeRoot(), clientId, maxBytes = 1024 * 1024, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, createConnection = net.createConnection } = {}) {
   if (!exactId(clientId)) throw new TypeError("A stable CLI clientId is required");
@@ -79,13 +112,19 @@ export function createDaemonRequester({ root = runtimeRoot(), clientId, maxBytes
       const socket = createConnection(join(root, "daemon", "control.sock"));
       let settled = false;
       let submitted = false;
+      /** @type {any} */
+      let validatedResponse;
+      /** @type {NodeJS.Immediate | undefined} */
+      let responseCheck;
       const deliveryUnknown = () => Object.assign(new Error("Daemon response was lost after submission"), { code: "DELIVERY_UNKNOWN", clientId, requestId });
+      const protocolError = (code, message, cause) => Object.assign(new Error(message, cause === undefined ? undefined : { cause }), { code });
       const timer = setTimeout(() => finish(submitted ? deliveryUnknown() : Object.assign(new Error("Daemon request timed out"), { code: "DAEMON_REQUEST_TIMEOUT" })), timeoutMs);
       /** @param {unknown} error @param {unknown} [value] */
       const finish = (error, value) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (responseCheck !== undefined) clearImmediate(responseCheck);
         socket.destroy();
         if (error !== undefined) rejectRequest(error);
         else resolveRequest(value);
@@ -95,15 +134,34 @@ export function createDaemonRequester({ root = runtimeRoot(), clientId, maxBytes
       socket.on("error", transportClosed);
       socket.on("data", (chunk) => {
         try {
-          for (const frame of decoder.push(chunk)) {
-            if (frame?.kind === "authenticated") {
-              submitted = true;
-              socket.write(encoder.encode({ version: 1, clientId, requestId, op, payload }), (error) => { if (error) transportClosed(error); });
-            } else if (frame?.requestId === requestId) {
-              if (!frame.ok) finish(Object.assign(new Error(frame.error?.message ?? "Daemon request failed"), frame.error));
-              else finish(undefined, frame.result);
-            }
+          const frames = decoder.push(chunk);
+          if (!submitted) {
+            if (frames.length === 0) return;
+            validateAuthentication(frames[0]);
+            if (frames.length !== 1) throw protocolError("UNEXPECTED_DAEMON_FRAME", "Daemon sent trailing data with authentication");
+            submitted = true;
+            socket.write(encoder.encode({ version: 1, clientId, requestId, op, payload }), (error) => { if (error) transportClosed(error); });
+            return;
           }
+          if (frames.length === 0) return;
+          if (validatedResponse !== undefined) throw protocolError("DUPLICATE_DAEMON_RESPONSE", "Daemon sent data after its validated response");
+          if (frames.some((frame) => typeof frame !== "object" || frame === null || !Object.hasOwn(frame, "requestId"))) throw protocolError("UNEXPECTED_DAEMON_FRAME", "Daemon sent an event or trailing frame where a response was required");
+          /** @type {any[]} */
+          const responses = [];
+          for (const frame of frames) {
+            let parsed;
+            try { parsed = parseDaemonResponse(frame); } catch (error) { throw protocolError("INVALID_DAEMON_RESPONSE", "Daemon response failed strict validation", error); }
+            if (parsed.requestId !== requestId) throw protocolError("UNEXPECTED_DAEMON_RESPONSE", "Daemon response requestId does not match the submitted request");
+            responses.push(parsed);
+          }
+          if (responses.length !== 1) throw protocolError("DUPLICATE_DAEMON_RESPONSE", "Daemon sent more than one response for one request");
+          const parsed = responses[0];
+          if (parsed.ok) validateExpectedResult(op, payload, clientId, requestId, parsed.result);
+          validatedResponse = parsed;
+          responseCheck = setImmediate(() => {
+            if (!parsed.ok) finish(Object.assign(new Error(parsed.error.message || "Daemon request failed"), parsed.error));
+            else finish(undefined, parsed.result);
+          });
         } catch (error) {
           finish(error);
         }
@@ -174,7 +232,8 @@ async function readPending(root, action, sessionId, revision) {
   try {
     const metadata = await fs.lstat(path);
     if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.uid !== process.getuid?.() || (metadata.mode & 0o777) !== 0o600) throw Object.assign(new Error("Pending CLI request is unsafe"), { code: "CLI_STATE_UNSAFE" });
-    const entry = JSON.parse(await fs.readFile(path, "utf8"));
+    let entry;
+    try { entry = JSON.parse(await fs.readFile(path, "utf8")); } catch (error) { throw Object.assign(new Error("Pending CLI request is corrupt", { cause: error }), { code: "CLI_STATE_CORRUPT" }); }
     if (entry?.schemaVersion !== 1 || entry.action !== action || entry.sessionId !== sessionId || entry.revision !== revision || !exactId(entry.clientId) || !exactId(entry.requestId) || Object.keys(entry).some((key) => !["schemaVersion", "action", "sessionId", "revision", "clientId", "requestId"].includes(key))) throw Object.assign(new Error("Pending CLI request is corrupt"), { code: "CLI_STATE_CORRUPT" });
     return { path, entry };
   } catch (error) {
@@ -185,15 +244,36 @@ async function readPending(root, action, sessionId, revision) {
 
 /** @param {string} root @param {any} entry */
 async function putPending(root, entry) {
-  const current = await readPending(root, entry.action, entry.sessionId, entry.revision);
-  if (current.entry !== undefined) return current;
-  await atomicWriteJson(current.path, { schemaVersion: 1, ...entry });
-  return { path: current.path, entry: { schemaVersion: 1, ...entry } };
+  const directory = await pendingDirectory(root);
+  const path = join(directory, `${pendingKey(entry.action, entry.sessionId, entry.revision)}.json`);
+  const candidate = { schemaVersion: 1, ...entry };
+  try {
+    const handle = await fs.open(path, "wx", 0o600);
+    try {
+      await handle.chmod(0o600);
+      await handle.writeFile(`${JSON.stringify(candidate)}\n`, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    const directoryHandle = await fs.open(directory, "r");
+    try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
+    return { path, entry: candidate };
+  } catch (error) {
+    if (error instanceof Error && /** @type {NodeJS.ErrnoException} */ (error).code === "EEXIST") {
+      const winner = await readPending(root, entry.action, entry.sessionId, entry.revision);
+      if (winner.entry === undefined) throw Object.assign(new Error("Pending CLI request winner disappeared"), { code: "CLI_STATE_UNSAFE" });
+      return winner;
+    }
+    throw error;
+  }
 }
 
-/** @param {string | undefined} path */
-async function clearPending(path) {
+/** @param {string} root @param {string | undefined} path @param {any} expected */
+async function clearPending(root, path, expected) {
   if (path === undefined) return;
+  const current = await readPending(root, expected.action, expected.sessionId, expected.revision);
+  if (current.path !== path || current.entry === undefined || JSON.stringify(current.entry) !== JSON.stringify(expected)) return;
   await fs.unlink(path).catch((error) => { if (error?.code !== "ENOENT") throw error; });
   const directory = await fs.open(resolve(path, ".."), "r");
   try { await directory.sync(); } finally { await directory.close(); }
@@ -205,13 +285,21 @@ async function clearPendingIdentity(root, clientId, requestId) {
   for (const name of await fs.readdir(directory)) {
     if (!name.endsWith(".json")) continue;
     const path = join(directory, name);
-    const entry = JSON.parse(await fs.readFile(path, "utf8"));
-    if (entry?.clientId === clientId && entry?.requestId === requestId) await clearPending(path);
+    const metadata = await fs.lstat(path);
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.uid !== process.getuid?.() || (metadata.mode & 0o777) !== 0o600) throw Object.assign(new Error("Pending CLI request is unsafe"), { code: "CLI_STATE_UNSAFE" });
+    let entry;
+    try { entry = JSON.parse(await fs.readFile(path, "utf8")); } catch (error) { throw Object.assign(new Error("Pending CLI request is corrupt", { cause: error }), { code: "CLI_STATE_CORRUPT" }); }
+    if (entry?.clientId !== clientId || entry?.requestId !== requestId) continue;
+    const current = await readPending(root, entry.action, entry.sessionId, entry.revision);
+    if (current.path === path && current.entry !== undefined) await clearPending(root, path, current.entry);
   }
 }
 
 /** @param {any} result */
 function classifyCommandResult(result) {
+  if (result?.kind !== "command" || !["COMPLETED", "DELIVERY_UNKNOWN", "FAILED"].includes(result.status?.stage)) {
+    return { code: 1, error: { code: "INVALID_RESPONSE", message: "Daemon returned an unexpected command result" } };
+  }
   if (result?.kind === "command" && result.status?.stage === "DELIVERY_UNKNOWN") {
     return { code: 1, error: { code: "DELIVERY_UNKNOWN", message: "Delivery is ambiguous; use session resolve-delivery with the exact clientId/requestId", clientId: result.status.clientId, requestId: result.status.requestId }, result };
   }
@@ -255,7 +343,7 @@ export async function runSessionCommand(argv, options = {}) {
       : existing;
     try {
       const result = await request(parsed.command, { sessionId: parsed.sessionId, revision: parsed.revision }, pending.entry.requestId);
-      if (result?.kind === "command" && ["COMPLETED", "FAILED"].includes(result.status?.stage)) await clearPending(pending.path);
+      if (result?.kind === "command" && ["COMPLETED", "FAILED"].includes(result.status?.stage)) await clearPending(root, pending.path, pending.entry);
       return classifyCommandResult(result);
     } catch (error) {
       if (error?.code === "DELIVERY_UNKNOWN") return { code: 1, error: { code: "DELIVERY_UNKNOWN", message: error.message, clientId: pending.entry.clientId, requestId: pending.entry.requestId } };

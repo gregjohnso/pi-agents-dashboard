@@ -1,5 +1,11 @@
+import net from "node:net";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { expect, it } from "vitest";
 
+import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
 import { daemonEntryPoint, resolveRuntimeRoot, runDaemonCommand } from "./daemon-commands.mjs";
 
 it("uses one per-user state root regardless of effective Pi config root", () => {
@@ -35,6 +41,44 @@ it("stops only through the verified daemon process-group boundary", async () => 
     { ownership: { pid: 321, startIdentity: "987654321", processGroupId: 654 }, policy: { gracefulMs: 500, terminateMs: 500 } },
     { graceful: { pid: 321, startIdentity: "987654321", processGroupId: 654 } },
   ]);
+});
+
+it("wires daemon live-worker checks through the persistent private CLI identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dashboard-daemon-cli-"));
+  const daemon = join(root, "daemon");
+  await mkdir(daemon, { recursive: true, mode: 0o700 });
+  await writeFile(join(daemon, "control.token"), "secret\n", { mode: 0o600 });
+  const received = [];
+  const server = net.createServer((socket) => {
+    const decoder = createJsonlDecoder({ maxBytes: 4096 });
+    const encoder = createJsonlEncoder({ maxBytes: 4096 });
+    let authenticated = false;
+    socket.on("data", (chunk) => {
+      for (const frame of decoder.push(chunk)) {
+        if (!authenticated) {
+          authenticated = true;
+          socket.write(encoder.encode({ version: 1, kind: "authenticated", state: "READY", recovering: false, daemonEpoch: "epoch", pid: 321 }));
+        } else {
+          received.push(frame);
+          socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "state", sessions: [] } }));
+        }
+      }
+    });
+  });
+  await new Promise((resolve, reject) => server.listen(join(daemon, "control.sock"), resolve).once("error", reject));
+  const publication = { pid: 321, startIdentity: "987654321", processGroupId: 654, tokenPath: join(daemon, "control.token") };
+  const endpoints = [{ status: "HEALTHY", daemonState: "READY", publication }, { status: "ABSENT" }];
+  const result = await runDaemonCommand("stop", {
+    root,
+    randomId: () => "persistent-daemon-cli",
+    inspectEndpoint: async () => endpoints.shift() ?? { status: "ABSENT" },
+    stopProcessGroup: async () => ({ disposition: "GRACEFUL" }),
+  });
+  expect(result.code).toBe(0);
+  expect(received).toHaveLength(1);
+  expect(received[0]).toMatchObject({ clientId: "cli-persistent-daemon-cli", op: "get_state" });
+  await new Promise((resolve) => server.close(resolve));
+  await rm(root, { recursive: true, force: true });
 });
 
 it("refuses daemon --stop-workers shutdown when any exact worker stop is not observed terminal", async () => {

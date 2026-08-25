@@ -1,6 +1,7 @@
 import net from "node:net";
 import { randomUUID } from "node:crypto";
 import { createJsonlDecoder, createJsonlEncoder } from "../../runtime/jsonl.mjs";
+import { parseDaemonResponse } from "../../shared/contracts.js";
 import type { ClientRequest, DaemonResponse, EventCursor, PersistedEvent } from "../../shared/contracts.js";
 
 export class DaemonClientError extends Error {
@@ -137,46 +138,6 @@ function validateCommandStatus(value: unknown, path: string): void {
   readString(status, "acceptedAt", path);
   readString(status, "updatedAt", path);
   if (Object.hasOwn(status, "error")) validateDashboardError(status.error, `${path}.error`);
-}
-
-function parseDaemonResponse(value: unknown): DaemonResponse {
-  const response = readRecord(value, "Daemon response");
-  if (response.version !== 1 || typeof response.requestId !== "string" || response.requestId.length === 0 || typeof response.ok !== "boolean") throw new TypeError("Daemon response envelope is invalid");
-  if (!response.ok) {
-    requireKeys(response, ["version", "requestId", "ok", "error"], [], "daemon response");
-    validateDashboardError(response.error, "daemon response.error");
-    return value as DaemonResponse;
-  }
-  requireKeys(response, ["version", "requestId", "ok", "result"], [], "daemon response");
-  const result = readRecord(response.result, "daemon response.result");
-  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "subscribed", "acknowledged"] as const, "daemon response.result");
-  switch (kind) {
-    case "state":
-      requireKeys(result, ["kind", "sessions"], [], "daemon response.result");
-      if (!Array.isArray(result.sessions)) throw new TypeError("daemon response.result.sessions must be an array");
-      result.sessions.forEach((session, index) => validateSession(session, `daemon response.result.sessions[${index}]`));
-      break;
-    case "launched":
-    case "detached":
-      requireKeys(result, ["kind", "sessionId"], [], "daemon response.result");
-      readString(result, "sessionId", "daemon response.result");
-      break;
-    case "attached":
-      requireKeys(result, ["kind", "sessionId", "role"], [], "daemon response.result");
-      readString(result, "sessionId", "daemon response.result");
-      readEnum(result, "role", ["composer", "observer"] as const, "daemon response.result");
-      break;
-    case "command":
-      requireKeys(result, ["kind", "status"], [], "daemon response.result");
-      validateCommandStatus(result.status, "daemon response.result.status");
-      break;
-    case "subscribed":
-    case "acknowledged":
-      requireKeys(result, ["kind", "cursor"], [], "daemon response.result");
-      validateCursor(result.cursor, "daemon response.result.cursor");
-      break;
-  }
-  return value as DaemonResponse;
 }
 
 function parsePersistedEvent(value: unknown): PersistedEvent {

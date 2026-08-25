@@ -461,3 +461,114 @@ export function parseClientRequest(value: unknown): ClientRequest {
     }
   }
 }
+
+function requireResponseKeys(record: UnknownRecord, required: readonly string[], optional: readonly string[], path: string): void {
+  for (const key of required) if (!Object.hasOwn(record, key)) throw new TypeError(`${path}.${key} is required`);
+  rejectUnknownKeys(record, [...required, ...optional], path);
+}
+
+function validateResponseError(value: unknown, path: string): void {
+  const error = readRecord(value, path);
+  requireResponseKeys(error, ["code", "message", "retryable"], [], path);
+  readIdentifier(error, "code", `${path}.code`);
+  if (typeof error.message !== "string") throw new TypeError(`${path}.message must be a string`);
+  if (typeof error.retryable !== "boolean") throw new TypeError(`${path}.retryable must be a boolean`);
+}
+
+function validateResponseProcess(value: unknown, path: string): void {
+  const process = readRecord(value, path);
+  requireResponseKeys(process, ["pid", "startIdentity", "processGroupId"], [], path);
+  if (!Number.isSafeInteger(process.pid) || !Number.isSafeInteger(process.processGroupId)) throw new TypeError(`${path} process IDs must be safe integers`);
+  readIdentifier(process, "startIdentity", `${path}.startIdentity`);
+}
+
+function validateResponseSession(value: unknown, path: string): void {
+  const session = readRecord(value, path);
+  requireResponseKeys(session, ["schemaVersion", "revision", "sessionId", "sessionFile", "canonicalSessionFile", "cwd", "taskState", "processState", "outcome", "activity", "createdAt", "updatedAt"], ["name", "model", "thinkingLevel", "ownership", "isolation", "latestRunId"], path);
+  if (session.schemaVersion !== 1 || !Number.isSafeInteger(session.revision) || Number(session.revision) < 0) throw new TypeError(`${path} schema version or revision is invalid`);
+  for (const key of ["sessionId", "sessionFile", "canonicalSessionFile", "cwd", "createdAt", "updatedAt"] as const) readIdentifier(session, key, `${path}.${key}`);
+  readEnum(session, "taskState", ["WORKING", "WAITING", "READY", "FAILED", "STOPPED"] as const, `${path}.taskState`);
+  readEnum(session, "processState", ["LIVE", "SLEEPING", "EXITED", "STALE"] as const, `${path}.processState`);
+  readEnum(session, "outcome", ["NONE", "COMPLETED", "READY_FOR_REVIEW"] as const, `${path}.outcome`);
+  const activity = readRecord(session.activity, `${path}.activity`);
+  requireResponseKeys(activity, ["kind", "summary", "updatedAt"], [], `${path}.activity`);
+  readIdentifier(activity, "kind", `${path}.activity.kind`);
+  if (typeof activity.summary !== "string") throw new TypeError(`${path}.activity.summary must be a string`);
+  readIdentifier(activity, "updatedAt", `${path}.activity.updatedAt`);
+  for (const key of ["name", "thinkingLevel", "latestRunId"] as const) if (Object.hasOwn(session, key)) readIdentifier(session, key, `${path}.${key}`);
+  if (Object.hasOwn(session, "model")) {
+    const model = readRecord(session.model, `${path}.model`);
+    requireResponseKeys(model, ["provider", "id"], [], `${path}.model`);
+    readIdentifier(model, "provider", `${path}.model.provider`);
+    readIdentifier(model, "id", `${path}.model.id`);
+  }
+  if (Object.hasOwn(session, "ownership")) {
+    const ownership = readRecord(session.ownership, `${path}.ownership`);
+    requireResponseKeys(ownership, ["kind", "runId", "process", "acquiredAt", "heartbeatAt"], [], `${path}.ownership`);
+    if (ownership.kind !== "managed") throw new TypeError(`${path}.ownership.kind is invalid`);
+    for (const key of ["runId", "acquiredAt", "heartbeatAt"] as const) readIdentifier(ownership, key, `${path}.ownership.${key}`);
+    validateResponseProcess(ownership.process, `${path}.ownership.process`);
+  }
+  if (Object.hasOwn(session, "isolation")) {
+    const isolation = readRecord(session.isolation, `${path}.isolation`);
+    const mode = readEnum(isolation, "mode", ["worktree", "shared_directory"] as const, `${path}.isolation.mode`);
+    if (mode === "worktree") {
+      requireResponseKeys(isolation, ["mode", "worktreePath", "branch"], [], `${path}.isolation`);
+      readIdentifier(isolation, "worktreePath", `${path}.isolation.worktreePath`);
+      readIdentifier(isolation, "branch", `${path}.isolation.branch`);
+    } else {
+      requireResponseKeys(isolation, ["mode", "canonicalCwd"], [], `${path}.isolation`);
+      readIdentifier(isolation, "canonicalCwd", `${path}.isolation.canonicalCwd`);
+    }
+  }
+}
+
+function validateResponseCursor(value: unknown, path: string): void {
+  const cursor = readRecord(value, path);
+  requireResponseKeys(cursor, ["daemonEpoch", "sequence"], [], path);
+  readIdentifier(cursor, "daemonEpoch", `${path}.daemonEpoch`);
+  const sequence = readIdentifier(cursor, "sequence", `${path}.sequence`);
+  if (!/^(0|[1-9]\d*)$/u.test(sequence)) throw new TypeError(`${path}.sequence must be a canonical unsigned integer string`);
+}
+
+function validateResponseCommandStatus(value: unknown, path: string): void {
+  const status = readRecord(value, path);
+  requireResponseKeys(status, ["clientId", "requestId", "operation", "stage", "acceptedAt", "updatedAt"], ["error"], path);
+  for (const key of ["clientId", "requestId", "acceptedAt", "updatedAt"] as const) readIdentifier(status, key, `${path}.${key}`);
+  readEnum(status, "operation", OPERATIONS, `${path}.operation`);
+  readEnum(status, "stage", ["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED", "DELIVERY_UNKNOWN", "FAILED"] as const, `${path}.stage`);
+  if (Object.hasOwn(status, "error")) validateResponseError(status.error, `${path}.error`);
+}
+
+/** Parse one strict version-1 daemon response envelope and its frozen result union. */
+export function parseDaemonResponse(value: unknown): DaemonResponse {
+  const response = readRecord(value, "daemon response");
+  if (response.version !== 1 || typeof response.requestId !== "string" || response.requestId.length === 0 || typeof response.ok !== "boolean") throw new TypeError("Daemon response envelope is invalid");
+  if (!response.ok) {
+    requireResponseKeys(response, ["version", "requestId", "ok", "error"], [], "daemon response");
+    validateResponseError(response.error, "daemon response.error");
+    return value as DaemonResponse;
+  }
+  requireResponseKeys(response, ["version", "requestId", "ok", "result"], [], "daemon response");
+  const result = readRecord(response.result, "daemon response.result");
+  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "subscribed", "acknowledged"] as const, "daemon response.result.kind");
+  if (kind === "state") {
+    requireResponseKeys(result, ["kind", "sessions"], [], "daemon response.result");
+    if (!Array.isArray(result.sessions)) throw new TypeError("daemon response.result.sessions must be an array");
+    result.sessions.forEach((session, index) => validateResponseSession(session, `daemon response.result.sessions[${index}]`));
+  } else if (kind === "launched" || kind === "detached") {
+    requireResponseKeys(result, ["kind", "sessionId"], [], "daemon response.result");
+    readIdentifier(result, "sessionId", "daemon response.result.sessionId");
+  } else if (kind === "attached") {
+    requireResponseKeys(result, ["kind", "sessionId", "role"], [], "daemon response.result");
+    readIdentifier(result, "sessionId", "daemon response.result.sessionId");
+    readEnum(result, "role", ["composer", "observer"] as const, "daemon response.result.role");
+  } else if (kind === "command") {
+    requireResponseKeys(result, ["kind", "status"], [], "daemon response.result");
+    validateResponseCommandStatus(result.status, "daemon response.result.status");
+  } else {
+    requireResponseKeys(result, ["kind", "cursor"], [], "daemon response.result");
+    validateResponseCursor(result.cursor, "daemon response.result.cursor");
+  }
+  return value as DaemonResponse;
+}

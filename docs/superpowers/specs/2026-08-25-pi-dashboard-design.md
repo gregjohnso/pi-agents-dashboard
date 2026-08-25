@@ -155,7 +155,7 @@ At most one frontend holds the composer role for a session. Other frontends can 
 | Visual tokens | Public `Theme` and Pi message, tool, markdown, status, and thinking color tokens mapped to the dashboard palette |
 | Help text | Public keybinding hint helpers where the active binding is available |
 
-Each reused component sits behind a thin dashboard adapter so the bundled UI dependency and the installed Pi child can have different versions. The adapter converts normalized records into the dashboard's pinned public component types. If a record cannot safely satisfy a high-level component contract, the viewer composes the public primitives above rather than importing private Pi code or copying Pi source.
+Each reused component sits behind a thin data adapter so the bundled UI dependency and the installed Pi child can have different versions. The adapter converts normalized records into the dashboard's pinned public component types without replacing the component's rendering or input behavior. If a record cannot safely satisfy a high-level component contract, the viewer composes the public primitives above rather than importing private Pi code or copying Pi source.
 
 The dashboard owns only the Jobwatch list, standalone viewer controller, normalized protocol, session roles, activity model, placeholders, and dashboard-specific status/footer layout. It does not import deep `dist/` paths, private `InteractiveMode` components, or objects that require an in-process `AgentSession`.
 
@@ -190,10 +190,10 @@ Ambiguous Stop or Delete delivery becomes `DELIVERY_UNKNOWN`. Only explicit `ret
 │ Working 3   Ready 2   Failed 1   Sessions 48   Processes 5              │
 ╰──────────────────────────────────────────────────────────────────────────╯
  [Live] 6/48 sessions | sort:age↓ | no filters
-  ID        STATE    AGE     MODEL         PROJECT              ACTIVITY
-▶ a31f92c1  WORKING  3m      gpt-5.6       evolutionaryscale    bash: pytest …
-▶ 3b10ed87  READY    12m     claude-opus   es-notebooks         Which run …
-▶ f21a7740  FAILED   1h      gpt-5.6       projects             provider 429 …
+  ID        STATE    PROJECT              ACTIVITY                         AGE
+▶ a31f92c1  WORKING  evolutionaryscale    bash: pytest …                    3m
+▶ 3b10ed87  READY    es-notebooks         Which run …                       12m
+▶ f21a7740  FAILED   projects             provider 429 …                    1h
 
 ────────────────────────────────────────────────────────────────────────────
 ❯ describe a task for a new session
@@ -201,34 +201,24 @@ Ambiguous Stop or Delete delivery becomes `DELIVERY_UNKNOWN`. Only explicit `ret
  ↑↓ nav  Enter/→ open  i info  n new  / search  v view  ^X stop/delete  ? help
 ```
 
-The list shows ID, task state, age, model, project, and activity. A liveness glyph distinguishes process state. The metadata panel shows task state, process state, outcome, activity, full working directory, process identities, isolation, and run paths.
+The list shows ID, task state, project, activity, and age in that order. Model remains available in search and metadata but is not a list column. A liveness glyph distinguishes process state. The metadata panel shows model, thinking level, task state, process state, outcome, activity, full working directory, process identities, isolation, and run paths.
 
 ### Viewer layout
 
-The viewer uses Pi's chat rhythm inside the dashboard palette: distinct user cards, assistant markdown, inline thinking and tool blocks, a working indicator, a bordered editor, and a compact footer.
+The viewer follows Pi's fullscreen chat composition and uses Pi's public high-level components with their native spacing, borders, markdown treatment, thinking treatment, tool states, editor shape, key hints, and theme tokens. It does not redraw approximations of components that Pi exports publicly.
 
-```text
- pi-dashboard · a31f92c1 · WORKING · gpt-5.6 · high · composer
-────────────────────────────────────────────────────────────────────────────
- You
- Run the focused tests and explain any failures.
+From top to bottom, the screen contains:
 
- Assistant
- I will inspect the test configuration first.
+1. a thin dashboard session header with session name, task and process state, composer role, and the return-to-list hint;
+2. a `TuiAltScreen` transcript using Pi `UserMessageComponent`, `AssistantMessageComponent`, and `ToolExecutionComponent` instances in chronological order;
+3. Pi-style lifecycle and pending-request components composed from public `Box`, `Text`, `DynamicBorder`, and overlay primitives when no higher-level public component fits;
+4. the current Pi-style working indicator when the agent is active;
+5. Pi's public `CustomEditor`, including its thinking-level border and editor keybindings;
+6. a compact dashboard footer for model, thinking level, working directory, and connection state.
 
-╭ bash · RUNNING · 12s ────────────────────────────────────────────────────╮
-│ pytest -s -n 0 --no-cov --cache-clear -v test/viewer.test.ts            │
-│ collected 18 items ...                                                   │
-╰──────────────────────────────────────────────────────────────────────────╯
+The dashboard palette is supplied through Pi's public theme tokens. Message, tool, markdown, thinking, and editor components keep Pi's own visual hierarchy rather than being restyled to look like the Jobwatch list.
 
- ● Running bash · collected 18 items · 12s
-────────────────────────────────────────────────────────────────────────────
-❯ send a follow-up
-────────────────────────────────────────────────────────────────────────────
- high · 18k context · /worktrees/a31f92c1 · Left twice to return
-```
-
-The one-line header shows name, task state, process state, model, thinking level, working directory, and composer role. The virtualized transcript keeps conversation order and follows new output only while the viewer is at the bottom. Scrolling up pauses follow mode and shows a new-activity marker. Focused overlays appear above the chat. Tool blocks default to collapsed after completion and remain expanded while active or failed.
+The virtualized transcript follows new output only while the viewer is at the bottom. Scrolling up pauses follow mode and shows a new-activity marker. Focused Pi TUI overlays appear above the chat. Tool blocks retain Pi's expansion behavior, with active and failed work visible and completed output collapsible.
 
 Rendering truncates every line to terminal width. Narrow layouts hide optional metadata before clipping the message role, active phase, composer, or required state.
 
@@ -537,6 +527,7 @@ Command protocol version and normalized viewer protocol version are independent 
 ### Terminal acceptance
 
 - Snapshot tests cover the Jobwatch-style list and Pi-style chat viewer at `160x40`, `120x32`, `80x24`, `55x16`, and `40x10`.
+- List snapshots pin the visible column order as ID, State, Project, Activity, Age and contain no Model column.
 - Chat snapshots cover user and assistant messages, streaming markdown, hidden and visible thinking, each tool state, retry, compaction, pending UI, errors, active status, paused follow mode, and observer mode.
 - Enter and Right open the viewer. Left and Escape follow the clean and 500 ms dirty/history return table.
 - Ctrl+C closes the list and interrupts a viewed session.

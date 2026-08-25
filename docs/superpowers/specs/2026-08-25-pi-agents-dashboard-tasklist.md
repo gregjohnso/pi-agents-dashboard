@@ -98,7 +98,7 @@ T02 + T14 + T15 ─────────────────────�
   - Deliverables: atomic registry, compare-and-swap revisions, canonical writer leases, keyed coordinator.
   - Gate: simultaneous resume yields one owner and one visible conflict.
 
-- [ ] **T08 Implement durable commands, events, and frontend protocol**
+- [x] **T08 Implement durable commands, events, and frontend protocol**
   - Owner: isolated Lane D.
   - Depends on: T04, T06.
   - Can run in parallel with: T07, T09, T12.

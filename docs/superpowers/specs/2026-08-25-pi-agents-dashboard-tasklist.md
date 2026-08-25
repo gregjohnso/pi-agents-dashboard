@@ -75,7 +75,7 @@ T02 + T14 + T15 ─────────────────────�
   - Deliverables: session, launch, ownership, command, event, error, cursor, and config types; strict bounded JSONL codec.
   - Gate: split UTF-8, coalesced frames, malformed input, unknown operation, and size-limit tests pass.
 
-- [ ] **T05 Implement state reduction and session indexing**
+- [x] **T05 Implement state reduction and session indexing**
   - Owner: isolated Lane A.
   - Depends on: T04.
   - Can run in parallel with: T06.

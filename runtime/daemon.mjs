@@ -192,6 +192,8 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
     let workerConnection;
     /** @type {any} */
     let workerMetadata;
+    /** @type {number | undefined} */
+    let workerRouteGeneration;
     /** @type {Promise<void>} */
     let chain = Promise.resolve();
     const decoder = createJsonlDecoder({ maxBytes });
@@ -213,8 +215,10 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
     /** @param {any} message @param {any} expected */
     const requestWorker = (message, expected) => new Promise((resolveRequest, rejectRequest) => {
       const id = message.id;
-      context.workerPending.set(id, { ...expected, resolve: resolveRequest, reject: rejectRequest, connection: workerConnection });
+      const pending = { ...expected, resolve: resolveRequest, reject: rejectRequest, connection: workerConnection };
+      context.workerPending.set(id, pending);
       send(message).catch((error) => {
+        if (context.workerPending.get(id) !== pending) return;
         context.workerPending.delete(id);
         rejectRequest(error);
       });
@@ -224,7 +228,7 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
       subscribers.delete(socket);
       resolveClosed(undefined);
       for (const [id, pending] of context.workerPending) {
-        if (pending.connection === workerConnection) {
+        if (pending.connection === workerConnection && context.workerPending.get(id) === pending) {
           context.workerPending.delete(id);
           pending.reject(Object.assign(new Error("Worker delivery became ambiguous"), { code: "DELIVERY_UNKNOWN" }));
         }
@@ -264,10 +268,12 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
           if (role === "worker") {
             if (workerConnection === undefined) {
               workerConnection = { closed, close, send, request: requestWorker };
-              workerMetadata = await context.router.adopt(frame, workerConnection);
+              const route = await context.router.adopt(frame, workerConnection);
+              workerMetadata = route.metadata;
+              workerRouteGeneration = route.routeGeneration;
               return;
             }
-            await context.handleWorkerFrame(frame, workerConnection, workerMetadata);
+            await context.handleWorkerFrame(frame, workerConnection, workerMetadata, workerRouteGeneration);
             return;
           }
           let request;
@@ -284,7 +290,7 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
           }
           try {
             const result = await context.handleRequest(request, socket, subscribers, frontendClientId);
-            await send(response(request.requestId, result));
+            await context.writeResponse({ request, value: response(request.requestId, result), write: send, close });
             if (request.op === "subscribe") {
               const replay = await context.recovery.events.replay(request.payload.after);
               for (const event of replay) await send(event);
@@ -357,10 +363,13 @@ export async function createDaemonRuntime({
   workerSupervisor,
   resolveLaunchRequest,
   randomId = randomUUID,
+  responseWriter = async (/** @type {any} */ { value, write }) => write(value),
+  closeFailpoint = async () => {},
 } = {}) {
   if (typeof root !== "string" || resolve(root) !== root) throw new TypeError("Daemon runtime root must be an absolute canonical path");
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 128) throw new TypeError("maxBytes must be at least 128");
   if (typeof randomId !== "function") throw new TypeError("randomId must be a function");
+  if (typeof responseWriter !== "function" || typeof closeFailpoint !== "function") throw new TypeError("Daemon runtime seams must be functions");
   await ensureLayout(root);
   const daemonDirectory = join(root, "daemon");
   const tokenPath = join(daemonDirectory, "control.token");
@@ -396,28 +405,31 @@ export async function createDaemonRuntime({
       workerPending: new Map(),
       hostReport: undefined,
       broadcast: () => {},
+      writeResponse: responseWriter,
       requestStop: () => resolveStopRequested(undefined),
       publicStatus() { return { state: context.state, recovering: ["STARTING", "RECONCILING"].includes(context.state), error: context.stateError, daemonEpoch, pid: identity.pid }; },
-      /** @param {any} frame @param {any} connection @param {any} metadata */
-      async handleWorkerFrame(frame, connection, metadata) {
+      /** @param {any} frame @param {any} connection @param {any} metadata @param {number} routeGeneration */
+      async handleWorkerFrame(frame, connection, metadata, routeGeneration) {
         if (!context.admissionOpen) throw Object.assign(new Error("Daemon is shutting down"), { code: "SHUTTING_DOWN", retryable: true });
         if (metadata === undefined || frame?.token !== metadata.token) throw Object.assign(new Error("Unauthenticated worker frame"), { code: "WORKER_AUTHENTICATION_FAILED" });
         if (frame.type === "command_result") {
           const allowed = frame.ok === true ? ["version", "type", "token", "id", "ok", "record"] : ["version", "type", "token", "id", "ok", "error"];
           if (frame.version !== 1 || typeof frame.id !== "string" || typeof frame.ok !== "boolean" || Object.keys(frame).some((key) => !allowed.includes(key))) throw Object.assign(new Error("Invalid worker command-result frame"), { code: "INVALID_WORKER_FRAME" });
-          await router.assertCurrent(metadata, connection);
-          const pending = context.workerPending.get(frame.id);
-          if (pending === undefined || pending.connection !== connection || pending.metadata !== metadata) return;
-          if (frame.ok) validateWorkerSuccess(frame.record, pending);
-          else validateWorkerFailure(frame.error);
-          context.workerPending.delete(frame.id);
-          frame.ok ? pending.resolve(frame.record) : pending.reject(Object.assign(new Error(frame.error.message), { code: frame.error.deliveryUnknown ? "DELIVERY_UNKNOWN" : frame.error.code, delivered: frame.error.deliveryUnknown !== true }));
+          await router.runCurrent(metadata, connection, routeGeneration, async () => {
+            const pending = context.workerPending.get(frame.id);
+            if (pending === undefined || pending.connection !== connection || pending.metadata !== metadata || pending.routeGeneration !== routeGeneration || pending.sessionId !== metadata.sessionId || pending.runId !== metadata.runId || pending.leaseId !== metadata.leaseId || pending.generation !== metadata.generation || pending.durableRequest?.clientId !== pending.clientId || pending.durableRequest?.requestId !== pending.requestId || pending.durableRequest?.op !== pending.op || pending.durableRequest?.payload?.sessionId !== pending.sessionId) return;
+            if (frame.ok) validateWorkerSuccess(frame.record, pending);
+            else validateWorkerFailure(frame.error);
+            if (context.workerPending.get(frame.id) !== pending) return;
+            context.workerPending.delete(frame.id);
+            frame.ok ? pending.resolve(frame.record) : pending.reject(Object.assign(new Error(frame.error.message), { code: frame.error.deliveryUnknown ? "DELIVERY_UNKNOWN" : frame.error.code, delivered: frame.error.deliveryUnknown !== true }));
+          });
           return;
         }
         if (context.state !== "READY") throw Object.assign(new Error("Daemon recovery is still in progress"), { code: "RECOVERING", retryable: true });
         const eventKeys = ["version", "type", "token", "sessionId", "event"];
         if (frame.type !== "worker_event" || frame.version !== 1 || frame.sessionId !== metadata.sessionId || Object.keys(frame).some((key) => !eventKeys.includes(key)) || typeof frame.event !== "object" || frame.event === null || Array.isArray(frame.event)) throw Object.assign(new Error("Invalid worker frame"), { code: "INVALID_WORKER_FRAME" });
-        await router.runCurrent(metadata, connection, async () => {
+        await router.runCurrent(metadata, connection, routeGeneration, async () => {
           const record = await registry.get(frame.sessionId);
           if (record?.ownership === undefined || record.ownership.runId !== metadata.runId) throw Object.assign(new Error("Worker event ownership conflict"), { code: "OWNERSHIP_CONFLICT" });
           const next = reduceSessionState(record, frame.event);
@@ -482,20 +494,19 @@ export async function createDaemonRuntime({
         let status = accepted;
         const changed = accepted.stage === "ACCEPTED";
         if (accepted.stage === "ACCEPTED") {
-          const connection = router.connection(request.payload.sessionId);
-          const metadata = router.metadata(request.payload.sessionId);
+          const route = router.route(request.payload.sessionId);
+          const connection = route?.connection;
+          const metadata = route?.metadata;
           if (connection === undefined || metadata?.token === undefined) {
             status = await context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("WORKER_UNAVAILABLE", "No exact recovered worker owns this session"));
           } else if (["prompt", "steer", "follow_up", "interrupt"].includes(request.op)) {
-            await router.assertCurrent(metadata, connection);
             const id = randomId();
             if (typeof id !== "string" || id.length < 16 || usedCommandIds.has(id)) throw Object.assign(new Error("Command ID generator did not provide a unique restart-safe ID"), { code: "COMMAND_ID_COLLISION" });
             usedCommandIds.add(id);
             await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
             const retryAtRisk = (await context.recovery.journal.history(request)).some((/** @type {any} */ prior) => prior.stage === "DELIVERY_UNKNOWN");
             try {
-              await connection.request({ version: 1, type: "command", token: metadata.token, id, command: { clientId: request.clientId, requestId: request.requestId, op: request.op, text: request.payload.text, retryAtRisk } }, { clientId: request.clientId, requestId: request.requestId, op: request.op, metadata });
-              await router.assertCurrent(metadata, connection);
+              await connection.request({ version: 1, type: "command", token: metadata.token, id, command: { clientId: request.clientId, requestId: request.requestId, op: request.op, text: request.payload.text, retryAtRisk } }, { clientId: request.clientId, requestId: request.requestId, op: request.op, durableRequest: request, metadata, routeGeneration: route.routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
               await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
               status = await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
             } catch (error) {
@@ -559,7 +570,9 @@ export async function createDaemonRuntime({
         throw error;
       }
     })();
-    let closed = false;
+    let closeState = "OPEN";
+    /** @type {Promise<void> | undefined} */
+    let closePromise;
     return {
       root,
       socketPath,
@@ -568,21 +581,46 @@ export async function createDaemonRuntime({
       daemonEpoch,
       ready,
       stopRequested,
-      status() { return { ...context.publicStatus(), connectedWorkers: router.connectedSessionIds() }; },
+      status() { return { ...context.publicStatus(), connectedWorkers: router.connectedSessionIds(), closeState }; },
       /** @param {any} key */
       async commandStatus(key) { await ready; return context.recovery.journal.get(key); },
-      async close() {
-        if (closed) return;
-        closed = true;
-        context.admissionOpen = false;
-        recoveryController.abort();
-        socketServer.beginShutdown();
-        await Promise.allSettled([ready]);
-        await socketServer.drainAndClose();
-        await workerSupervisor?.close?.();
-        await Promise.allSettled([context.cursorStore?.close(), context.launchResults?.close()]);
-        if (context.recovery !== undefined) await context.recovery.close();
-        await releaseDaemonLifecycle(claim);
+      close() {
+        if (closePromise !== undefined) return closePromise;
+        closeState = "CLOSING";
+        closePromise = (async () => {
+          /** @type {unknown[]} */
+          const errors = [];
+          /** @param {string} stage @param {() => unknown | Promise<unknown>} action */
+          const cleanup = async (stage, action) => {
+            try {
+              await closeFailpoint(stage);
+            } catch (error) {
+              errors.push(error);
+            }
+            try {
+              await action();
+            } catch (error) {
+              errors.push(error);
+            }
+          };
+          context.admissionOpen = false;
+          recoveryController.abort();
+          await cleanup("request_admission", () => socketServer.beginShutdown());
+          await cleanup("reconciliation", async () => { await Promise.allSettled([ready]); });
+          await cleanup("request_chains", () => socketServer.drainAndClose());
+          await cleanup("supervisor", async () => workerSupervisor?.close?.());
+          await cleanup("cursor_store", async () => context.cursorStore?.close());
+          await cleanup("launch_result_store", async () => context.launchResults?.close());
+          await cleanup("recovery_stores", async () => context.recovery?.close());
+          await cleanup("lifecycle", () => releaseDaemonLifecycle(claim));
+          closeState = errors.length === 0 ? "CLOSED" : "FAILED_CLOSED";
+          if (errors.length > 0) {
+            const failure = new AggregateError(errors, "Daemon close completed with cleanup errors");
+            Object.assign(failure, { code: "DAEMON_CLOSE_FAILED" });
+            throw failure;
+          }
+        })();
+        return closePromise;
       },
     };
   } catch (error) {

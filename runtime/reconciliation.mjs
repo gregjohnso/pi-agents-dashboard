@@ -51,7 +51,8 @@ export class RecoveredWorkerRouter {
   #inspect;
   #metadataPath;
   #workers = new Map();
-  #connections = new Map();
+  #routes = new Map();
+  #routeGenerations = new Map();
   #routeTails = new Map();
   #loaded = false;
 
@@ -86,17 +87,26 @@ export class RecoveredWorkerRouter {
 
   /** @param {any} handle */
   async register(handle) {
-    const record = await this.#registry.get(handle.sessionId);
-    if (record?.ownership === undefined || record.ownership.runId !== handle.runId || !sameIdentity(record.ownership.process, handle.identity)) throw Object.assign(new Error("Launched worker does not own the durable registry record"), { code: "OWNERSHIP_CONFLICT" });
-    this.#workers.set(handle.sessionId, {
-      sessionId: handle.sessionId,
-      runId: handle.runId,
-      leaseId: handle.leaseId,
-      generation: handle.generation,
-      identity: handle.identity,
-      piChildIdentity: handle.piChildIdentity,
+    const routeGeneration = (this.#routeGenerations.get(handle.sessionId) ?? 0) + 1;
+    this.#routeGenerations.set(handle.sessionId, routeGeneration);
+    return this.#serializeRoute(handle.sessionId, async () => {
+      const record = await this.#registry.get(handle.sessionId);
+      if (record?.ownership === undefined || record.ownership.runId !== handle.runId || !sameIdentity(record.ownership.process, handle.identity)) throw Object.assign(new Error("Launched worker does not own the durable registry record"), { code: "OWNERSHIP_CONFLICT" });
+      this.#workers.set(handle.sessionId, {
+        sessionId: handle.sessionId,
+        runId: handle.runId,
+        leaseId: handle.leaseId,
+        generation: handle.generation,
+        identity: handle.identity,
+        piChildIdentity: handle.piChildIdentity,
+      });
+      await this.#persist();
+      const previous = this.#routes.get(handle.sessionId);
+      if (previous !== undefined && previous.routeGeneration < routeGeneration) {
+        this.#routes.delete(handle.sessionId);
+        previous.connection.close?.();
+      }
     });
-    await this.#persist();
   }
 
   /** @param {string} sessionId */
@@ -105,7 +115,7 @@ export class RecoveredWorkerRouter {
   }
 
   connectedSessionIds() {
-    return [...this.#connections.keys()];
+    return [...this.#routes.keys()];
   }
 
   /** @template T @param {string} sessionId @param {() => Promise<T>} action */
@@ -122,63 +132,83 @@ export class RecoveredWorkerRouter {
   async adopt(frame, connection) {
     const allowed = ["version", "type", "token", "sessionId", "runId", "leaseId", "generation", "worker", "piChild"];
     if (typeof frame !== "object" || frame === null || Array.isArray(frame) || Object.keys(frame).some((key) => !allowed.includes(key)) || frame.version !== 1 || frame.type !== "worker_ready") throw Object.assign(new Error("Invalid worker ready frame"), { code: "INVALID_WORKER_FRAME" });
-    return this.#serializeRoute(frame.sessionId, async () => {
     const expected = this.#workers.get(frame.sessionId);
-    const record = await this.#registry.get(frame.sessionId);
-    if (expected === undefined || record?.ownership === undefined || expected.runId !== frame.runId || expected.leaseId !== frame.leaseId || expected.generation !== frame.generation || !sameIdentity(expected.identity, frame.worker) || !sameIdentity(expected.piChildIdentity, frame.piChild) || record.ownership.runId !== frame.runId || !sameIdentity(record.ownership.process, frame.worker)) throw Object.assign(new Error("Worker ownership or generation conflicts with durable state"), { code: "OWNERSHIP_CONFLICT" });
-    const [actualWorker, actualPiChild] = await Promise.all([
-      this.#inspect(frame.worker.pid),
-      frame.piChild.pid === frame.worker.pid ? Promise.resolve(undefined) : this.#inspect(frame.piChild.pid),
-    ]);
-    if (!sameIdentity(actualWorker, frame.worker) || (actualPiChild !== undefined && !sameIdentity(actualPiChild, frame.piChild))) throw Object.assign(new Error("Worker or Pi-child process identity changed"), { code: "PROCESS_IDENTITY_CONFLICT" });
+    if (expected === undefined || expected.runId !== frame.runId || expected.leaseId !== frame.leaseId || expected.generation !== frame.generation || !sameIdentity(expected.identity, frame.worker) || !sameIdentity(expected.piChildIdentity, frame.piChild)) throw Object.assign(new Error("Worker ownership or generation conflicts with durable state"), { code: "OWNERSHIP_CONFLICT" });
     if (expected.token !== undefined && expected.token !== frame.token) throw Object.assign(new Error("Worker authentication failed"), { code: "WORKER_AUTHENTICATION_FAILED" });
-    if (expected.token === undefined) {
-      if (typeof frame.token !== "string" || frame.token.length === 0) throw Object.assign(new Error("Worker authentication token is missing"), { code: "WORKER_AUTHENTICATION_FAILED" });
-      expected.token = frame.token;
-      await this.#persist();
-    }
-    this.#connections.get(frame.sessionId)?.close?.();
-    this.#connections.set(frame.sessionId, connection);
-    connection.closed.finally(() => {
-      if (this.#connections.get(frame.sessionId) === connection) this.#connections.delete(frame.sessionId);
-    }).catch(() => {});
-    return expected;
+    const routeGeneration = (this.#routeGenerations.get(frame.sessionId) ?? 0) + 1;
+    this.#routeGenerations.set(frame.sessionId, routeGeneration);
+    return this.#serializeRoute(frame.sessionId, async () => {
+      const record = await this.#registry.get(frame.sessionId);
+      if (this.#routeGenerations.get(frame.sessionId) !== routeGeneration) throw Object.assign(new Error("Worker connection was superseded during registration"), { code: "STALE_WORKER_CONNECTION" });
+      if (record?.ownership === undefined || record.ownership.runId !== frame.runId || !sameIdentity(record.ownership.process, frame.worker)) throw Object.assign(new Error("Worker ownership or generation conflicts with durable state"), { code: "OWNERSHIP_CONFLICT" });
+      const [actualWorker, actualPiChild] = await Promise.all([
+        this.#inspect(frame.worker.pid),
+        frame.piChild.pid === frame.worker.pid ? Promise.resolve(undefined) : this.#inspect(frame.piChild.pid),
+      ]);
+      if (this.#routeGenerations.get(frame.sessionId) !== routeGeneration) throw Object.assign(new Error("Worker connection was superseded during identity validation"), { code: "STALE_WORKER_CONNECTION" });
+      if (!sameIdentity(actualWorker, frame.worker) || (actualPiChild !== undefined && !sameIdentity(actualPiChild, frame.piChild))) throw Object.assign(new Error("Worker or Pi-child process identity changed"), { code: "PROCESS_IDENTITY_CONFLICT" });
+      if (expected.token === undefined) {
+        if (typeof frame.token !== "string" || frame.token.length === 0) throw Object.assign(new Error("Worker authentication token is missing"), { code: "WORKER_AUTHENTICATION_FAILED" });
+        expected.token = frame.token;
+        await this.#persist();
+      }
+      const previous = this.#routes.get(frame.sessionId);
+      const route = { connection, metadata: expected, routeGeneration };
+      this.#routes.set(frame.sessionId, route);
+      previous?.connection.close?.();
+      connection.closed.finally(() => {
+        if (this.#routes.get(frame.sessionId) === route) this.#routes.delete(frame.sessionId);
+      }).catch(() => {});
+      return route;
     });
   }
 
-  /** Verify the current route and both live process identities before one frame boundary. @param {any} metadata @param {any} connection */
-  async assertCurrent(metadata, connection) {
-    const expected = this.#workers.get(metadata?.sessionId);
-    if (expected !== metadata || this.#connections.get(metadata?.sessionId) !== connection) throw Object.assign(new Error("Worker connection was replaced"), { code: "STALE_WORKER_CONNECTION" });
+  /** @param {string} sessionId */
+  route(sessionId) {
+    return this.#routes.get(sessionId);
+  }
+
+  /** @param {any} metadata @param {any} connection @param {number} routeGeneration */
+  #assertRoute(metadata, connection, routeGeneration) {
+    const route = this.#routes.get(metadata?.sessionId);
+    if (this.#workers.get(metadata?.sessionId) !== metadata || this.#routeGenerations.get(metadata?.sessionId) !== routeGeneration || route?.metadata !== metadata || route?.connection !== connection || route?.routeGeneration !== routeGeneration) throw Object.assign(new Error("Worker connection was replaced"), { code: "STALE_WORKER_CONNECTION" });
+  }
+
+  /** Verify the current route and both live process identities before one frame boundary. @param {any} metadata @param {any} connection @param {number} routeGeneration */
+  async #assertCurrent(metadata, connection, routeGeneration) {
+    this.#assertRoute(metadata, connection, routeGeneration);
     const record = await this.#registry.get(metadata.sessionId);
+    this.#assertRoute(metadata, connection, routeGeneration);
     if (record?.ownership === undefined || record.ownership.runId !== metadata.runId || !sameIdentity(record.ownership.process, metadata.identity)) throw Object.assign(new Error("Worker no longer owns the durable session"), { code: "OWNERSHIP_CONFLICT" });
     const [actualWorker, actualPiChild] = await Promise.all([
       this.#inspect(metadata.identity.pid),
       metadata.piChildIdentity.pid === metadata.identity.pid ? Promise.resolve(undefined) : this.#inspect(metadata.piChildIdentity.pid),
     ]);
+    this.#assertRoute(metadata, connection, routeGeneration);
     if (!sameIdentity(actualWorker, metadata.identity) || (actualPiChild !== undefined && !sameIdentity(actualPiChild, metadata.piChildIdentity))) throw Object.assign(new Error("Worker or Pi-child process identity changed"), { code: "PROCESS_IDENTITY_CONFLICT" });
     if (this.#workers.get(metadata.sessionId)?.leaseId !== metadata.leaseId || this.#workers.get(metadata.sessionId)?.generation !== metadata.generation) throw Object.assign(new Error("Worker lease or generation changed"), { code: "OWNERSHIP_CONFLICT" });
-    return true;
   }
 
-  /** Serialize one worker mutation against connection replacement. @param {any} metadata @param {any} connection @param {() => Promise<any>} action */
-  runCurrent(metadata, connection, action) {
+  /** Serialize one worker frame against connection replacement. @param {any} metadata @param {any} connection @param {number} routeGeneration @param {() => Promise<any>} action */
+  runCurrent(metadata, connection, routeGeneration, action) {
     return this.#serializeRoute(metadata.sessionId, async () => {
-      await this.assertCurrent(metadata, connection);
+      await this.#assertCurrent(metadata, connection, routeGeneration);
       const result = await action();
-      await this.assertCurrent(metadata, connection);
+      await this.#assertCurrent(metadata, connection, routeGeneration);
       return result;
     });
   }
 
   /** @param {string} sessionId */
   connection(sessionId) {
-    return this.#connections.get(sessionId);
+    return this.#routes.get(sessionId)?.connection;
   }
 
   async close() {
-    for (const connection of this.#connections.values()) connection.close?.();
-    this.#connections.clear();
+    const routes = [...this.#routes.values()];
+    this.#routes.clear();
+    for (const route of routes) route.connection.close?.();
+    await Promise.allSettled([...this.#routeTails.values()]);
   }
 }
 
@@ -266,8 +296,9 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReco
       conflicts,
       recoveryActions,
       async close() {
-        await router.close();
-        await Promise.all([journal.close(), events.close()]);
+        const results = await Promise.allSettled([router.close(), journal.close(), events.close()]);
+        const errors = results.filter((result) => result.status === "rejected").map((result) => result.reason);
+        if (errors.length > 0) throw new AggregateError(errors, "Reconciliation stores closed with errors");
       },
     };
   } catch (error) {

@@ -70,6 +70,27 @@ it("keeps a lifecycle transaction held through publication cleanup", async () =>
   await releaseDaemonLifecycle(claim);
 });
 
+it("releases both lifecycle locks once when publication cleanup rejects", async () => {
+  const root = await fixture();
+  const publication = { schemaVersion: 1, pid: 81, startIdentity: "800", processGroupId: 81, daemonEpoch: "epoch", tokenPath: join(root, "daemon", "control.token"), startedAt: "2026-08-25T12:00:00.000Z", state: "READY" };
+  let lockReleases = 0;
+  let transactionReleases = 0;
+  const claim = {
+    root,
+    publication,
+    lock: { async release() { lockReleases += 1; } },
+    transaction: { async release() { transactionReleases += 1; } },
+  };
+  const fsOps = {
+    async lstat() { return { isFile: () => true, isSymbolicLink: () => false, uid: process.getuid?.(), mode: 0o600 }; },
+    async readFile() { return JSON.stringify(publication); },
+    async rm() { throw new Error("injected publication cleanup failure"); },
+  };
+  await expect(releaseDaemonLifecycle(claim, { fsOps })).rejects.toBeInstanceOf(AggregateError);
+  expect(lockReleases).toBe(1);
+  expect(transactionReleases).toBe(1);
+});
+
 it("refuses an unowned socket instead of unlinking a possibly live daemon", async () => {
   const root = await fixture();
   const socketPath = join(root, "daemon", "control.sock");

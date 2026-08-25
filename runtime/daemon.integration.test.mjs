@@ -34,6 +34,7 @@ function connect({ socketPath, token, role, maxBytes = 1024, onFrame }) {
   /** @type {any[]} */
   const received = [];
   const socket = net.createConnection(socketPath);
+  const closed = new Promise((resolve) => socket.once("close", resolve));
   /** @type {Array<(value: any) => void>} */
   const waiters = [];
   socket.on("data", (chunk) => {
@@ -56,7 +57,7 @@ function connect({ socketPath, token, role, maxBytes = 1024, onFrame }) {
   }).then(next);
   /** @param {any} value */
   const send = (value) => { socket.write(encoder.encode(value)); };
-  return { socket, ready, next, send, close() { socket.destroy(); } };
+  return { socket, ready, closed, next, send, close() { socket.destroy(); } };
 }
 
 /** @param {{ socketPath: string, tokenPath: string }} config @param {any} worker */
@@ -199,6 +200,63 @@ it("authenticates every connection and applies strict framing limits", async () 
   expect(oversized).toMatchObject({ error: { code: "FRAME_TOO_LARGE" } });
 });
 
+it("settles connector authentication on silent close, auth-close race, and normal post-auth close", async () => {
+  const stateRoot = await root();
+  const tokenPath = join(stateRoot, "connector-close.token");
+  await writeFile(tokenPath, "private-token\n", { mode: 0o600 });
+
+  const silentPath = join(stateRoot, "silent-close.sock");
+  /** @type {net.Socket | undefined} */
+  let silentSocket;
+  const silentServer = net.createServer((socket) => {
+    silentSocket = socket;
+    socket.end();
+  });
+  await new Promise((resolve, reject) => {
+    silentServer.once("error", reject);
+    silentServer.listen(silentPath, () => resolve(undefined));
+  });
+  await expect(connectDaemon({ config: { socketPath: silentPath, tokenPath, maxBytes: 1024 } })).rejects.toMatchObject({ code: "DAEMON_AUTHENTICATION_CLOSED" });
+  silentSocket?.destroy();
+  await new Promise((resolve) => silentServer.close(() => resolve(undefined)));
+
+  const racingPath = join(stateRoot, "racing-close.sock");
+  const racingServer = net.createServer((socket) => {
+    const decoder = createJsonlDecoder({ maxBytes: 1024 });
+    const encoder = createJsonlEncoder({ maxBytes: 1024 });
+    socket.on("data", (chunk) => {
+      if (decoder.push(chunk).length > 0) socket.end(encoder.encode({ version: 1, kind: "authenticated" }));
+    });
+  });
+  await new Promise((resolve, reject) => {
+    racingServer.once("error", reject);
+    racingServer.listen(racingPath, () => resolve(undefined));
+  });
+  const racingConnection = await connectDaemon({ config: { socketPath: racingPath, tokenPath, maxBytes: 1024 } });
+  await racingConnection.closed;
+  await new Promise((resolve) => racingServer.close(() => resolve(undefined)));
+
+  const normalPath = join(stateRoot, "normal-close.sock");
+  /** @type {net.Socket | undefined} */
+  let serverSocket;
+  const normalServer = net.createServer((socket) => {
+    serverSocket = socket;
+    const decoder = createJsonlDecoder({ maxBytes: 1024 });
+    const encoder = createJsonlEncoder({ maxBytes: 1024 });
+    socket.on("data", (chunk) => {
+      if (decoder.push(chunk).length > 0) socket.write(encoder.encode({ version: 1, kind: "authenticated" }));
+    });
+  });
+  await new Promise((resolve, reject) => {
+    normalServer.once("error", reject);
+    normalServer.listen(normalPath, () => resolve(undefined));
+  });
+  const normalConnection = await connectDaemon({ config: { socketPath: normalPath, tokenPath, maxBytes: 1024 } });
+  serverSocket?.end();
+  await normalConnection.closed;
+  await new Promise((resolve) => normalServer.close(() => resolve(undefined)));
+});
+
 it("contains connector listener exceptions and keeps an error handler after authentication", async () => {
   const stateRoot = await root();
   const socketPath = join(stateRoot, "connector.sock");
@@ -264,6 +322,32 @@ it("cancels and drains reconciliation before releasing lifecycle ownership", asy
   await expect(access(join(stateRoot, "daemon", "pid.json"))).rejects.toMatchObject({ code: "ENOENT" });
 });
 
+it("shares close state, reports every staged failure after releasing lifecycle ownership", async () => {
+  const stateRoot = await root();
+  /** @type {string[]} */
+  const failedStages = [];
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    closeFailpoint: async (/** @type {string} */ stage) => {
+      failedStages.push(stage);
+      throw new Error(`injected ${stage} close failure`);
+    },
+  });
+  await runtime.ready;
+  const firstClose = runtime.close();
+  const secondClose = runtime.close();
+  expect(secondClose).toBe(firstClose);
+  await expect(firstClose).rejects.toMatchObject({ code: "DAEMON_CLOSE_FAILED", errors: { length: 8 } });
+  expect(runtime.status().closeState).toBe("FAILED_CLOSED");
+  expect(failedStages).toEqual(["request_admission", "reconciliation", "request_chains", "supervisor", "cursor_store", "launch_result_store", "recovery_stores", "lifecycle"]);
+  await expect(access(join(stateRoot, "daemon", "pid.json"))).rejects.toMatchObject({ code: "ENOENT" });
+  await expect(access(runtime.socketPath)).rejects.toMatchObject({ code: "ENOENT" });
+
+  const replacement = await createDaemonRuntime({ root: stateRoot });
+  await replacement.ready;
+  await replacement.close();
+});
+
 it("serializes monotonic event acknowledgements by stable socket client identity", async () => {
   const stateRoot = await root();
   const runtime = await createDaemonRuntime({ root: stateRoot });
@@ -313,6 +397,68 @@ it("journals launch before the irreversible call and refuses ambiguous duplicate
   client.close();
 });
 
+it("replays a durably terminal launch after deterministic response loss without relaunching", async () => {
+  const stateRoot = await root();
+  let launches = 0;
+  let loseFirstResponse = true;
+  /** @type {((value?: unknown) => void) | undefined} */
+  let responseReached;
+  /** @type {((value?: unknown) => void) | undefined} */
+  let releaseResponse;
+  const responseReachedPromise = new Promise((resolve) => { responseReached = resolve; });
+  const responseGate = new Promise((resolve) => { releaseResponse = resolve; });
+  const workerIdentity = { pid: 701, startIdentity: "worker-701", processGroupId: 701 };
+  const now = "2026-08-25T12:00:00.000Z";
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    inspect: async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : workerIdentity,
+    hostProbe: async () => ({ blockers: [] }),
+    resolveLaunchRequest: async () => {
+      const registry = new RegistryStore(join(stateRoot, "sessions"));
+      if (await registry.get("launch-once") === undefined) {
+        await registry.create({ schemaVersion: 1, revision: 0, sessionId: "launch-once", sessionFile: "/sessions/launch-once.jsonl", canonicalSessionFile: "/sessions/launch-once.jsonl", cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-launch-once", process: workerIdentity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-launch-once", createdAt: now, updatedAt: now });
+      }
+      return { sessionId: "launch-once" };
+    },
+    workerSupervisor: {
+      async launch() {
+        launches += 1;
+        return { sessionId: "launch-once", runId: "run-launch-once", leaseId: "lease-launch-once", generation: 1, identity: workerIdentity, piChildIdentity: workerIdentity };
+      },
+      async close() {},
+    },
+    responseWriter: async (/** @type {any} */ { request, value, write, close }) => {
+      if (request.requestId !== "lost-launch-response" || !loseFirstResponse) return write(value);
+      loseFirstResponse = false;
+      responseReached?.();
+      await responseGate;
+      close();
+      throw Object.assign(new Error("injected response loss"), { code: "SOCKET_CLOSED" });
+    },
+  });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const launch = { version: 1, clientId: "launcher", requestId: "lost-launch-response", op: "launch", payload: { prompt: "go", cwd: "/repo", sourceSessionId: "source", isolation: { mode: "worktree" } } };
+  const firstClient = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await firstClient.ready;
+  firstClient.send(launch);
+  await responseReachedPromise;
+  const journalStages = (await readFile(join(stateRoot, "queue", "commands.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line).status.stage);
+  expect(journalStages).toEqual(["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED"]);
+  expect(await runtime.commandStatus(launch)).toMatchObject({ stage: "COMPLETED" });
+  expect(JSON.parse(await readFile(join(stateRoot, "daemon", "launch-results.json"), "utf8"))).toMatchObject({ results: { "launcher\u0000lost-launch-response": { sessionId: "launch-once" } } });
+  expect(launches).toBe(1);
+  /** @type {(value?: unknown) => void} */ (releaseResponse)();
+  await firstClient.closed;
+
+  const retry = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await retry.ready;
+  retry.send(launch);
+  expect(await retry.next()).toMatchObject({ ok: true, result: { kind: "launched", sessionId: "launch-once" } });
+  expect(launches).toBe(1);
+  retry.close();
+});
+
 it("waits for an admitted launch chain before lifecycle release", async () => {
   const stateRoot = await root();
   /** @type {((value?: unknown) => void) | undefined} */
@@ -339,6 +485,11 @@ it("waits for an admitted launch chain before lifecycle release", async () => {
   /** @type {(value?: unknown) => void} */ (releaseLaunch)();
   await closing;
   expect(closed).toBe(true);
+  const journalAfterClose = await readFile(join(stateRoot, "queue", "commands.jsonl"), "utf8");
+  const replacement = await createDaemonRuntime({ root: stateRoot });
+  await replacement.ready;
+  await replacement.close();
+  expect(await readFile(join(stateRoot, "queue", "commands.jsonl"), "utf8")).toBe(journalAfterClose);
   client.close();
 });
 

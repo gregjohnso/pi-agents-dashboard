@@ -113,11 +113,77 @@ it("validates the authoritative Pi child and invalidates frames from replaced ro
   reusedPiChild = false;
   const oldConnection = connection();
   const currentConnection = connection();
-  const metadata = await router.adopt(frame, oldConnection);
+  const oldRoute = await router.adopt(frame, oldConnection);
   await router.adopt(frame, currentConnection);
   let mutated = false;
-  await expect(router.runCurrent(metadata, oldConnection, async () => { mutated = true; })).rejects.toMatchObject({ code: "STALE_WORKER_CONNECTION" });
+  await expect(router.runCurrent(oldRoute.metadata, oldConnection, oldRoute.routeGeneration, async () => { mutated = true; })).rejects.toMatchObject({ code: "STALE_WORKER_CONNECTION" });
   expect(mutated).toBe(false);
+  await router.close();
+});
+
+it("refuses an old command result during identity await without removing the replacement pending entry", async () => {
+  const root = await fixture();
+  const registry = new RegistryStore(join(root, "sessions"));
+  const worker = { pid: 401, startIdentity: "worker", processGroupId: 401 };
+  const piChild = { pid: 402, startIdentity: "pi-child", processGroupId: 401 };
+  await registry.create(record("barrier", worker));
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "barrier", runId: "run-barrier", leaseId: "lease-barrier", generation: 7, identity: worker, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  /** @type {((value?: unknown) => void) | undefined} */
+  let releaseIdentity;
+  /** @type {((value?: unknown) => void) | undefined} */
+  let identityStarted;
+  let blockIdentity = false;
+  const identityStartedPromise = new Promise((resolve) => { identityStarted = resolve; });
+  const identityGate = new Promise((resolve) => { releaseIdentity = resolve; });
+  const router = new RecoveredWorkerRouter({
+    registry,
+    metadataPath: join(root, "daemon", "workers.json"),
+    inspect: async (pid) => {
+      if (blockIdentity) {
+        identityStarted?.();
+        await identityGate;
+      }
+      return pid === worker.pid ? worker : piChild;
+    },
+  });
+  await router.load();
+  const frame = { version: 1, type: "worker_ready", token: "worker-token", sessionId: "barrier", runId: "run-barrier", leaseId: "lease-barrier", generation: 7, worker, piChild };
+  const connection = () => {
+    /** @type {(value?: unknown) => void} */
+    let resolveClosed = () => {};
+    const closed = new Promise((resolve) => { resolveClosed = resolve; });
+    return { closed, close: () => resolveClosed(undefined) };
+  };
+  const oldConnection = connection();
+  const oldRoute = await router.adopt(frame, oldConnection);
+  blockIdentity = true;
+  const pending = new Map();
+  const oldPending = { connection: oldConnection, routeGeneration: oldRoute.routeGeneration, sessionId: "barrier", runId: "run-barrier", leaseId: "lease-barrier", generation: 7, clientId: "client", requestId: "old", op: "prompt" };
+  pending.set("shared-result-id", oldPending);
+  let oldResultResolved = false;
+  const oldResult = router.runCurrent(oldRoute.metadata, oldConnection, oldRoute.routeGeneration, async () => {
+    pending.delete("shared-result-id");
+    oldResultResolved = true;
+  });
+  await identityStartedPromise;
+  const currentConnection = connection();
+  const replacement = router.adopt(frame, currentConnection);
+  const newPending = { ...oldPending, connection: currentConnection, routeGeneration: oldRoute.routeGeneration + 1, requestId: "current" };
+  pending.set("shared-result-id", newPending);
+  /** @type {(value?: unknown) => void} */ (releaseIdentity)();
+  await expect(oldResult).rejects.toMatchObject({ code: "STALE_WORKER_CONNECTION" });
+  const currentRoute = await replacement;
+  expect(oldResultResolved).toBe(false);
+  expect(pending.get("shared-result-id")).toBe(newPending);
+  let currentResultResolved = false;
+  await expect(router.runCurrent(currentRoute.metadata, currentConnection, currentRoute.routeGeneration, async () => {
+    expect(pending.get("shared-result-id")).toBe(newPending);
+    pending.delete("shared-result-id");
+    currentResultResolved = true;
+    return "accepted";
+  })).resolves.toBe("accepted");
+  expect(currentResultResolved).toBe(true);
+  expect(pending.has("shared-result-id")).toBe(false);
   await router.close();
 });
 

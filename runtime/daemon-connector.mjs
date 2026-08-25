@@ -29,7 +29,14 @@ export async function connectDaemon({ config, signal }) {
       settled = true;
       reject(error);
     };
+    const failClosed = () => {
+      if (authenticated) return;
+      fail(Object.assign(new Error("Daemon connection closed before worker authentication"), { code: "DAEMON_AUTHENTICATION_CLOSED" }));
+      socket.destroy();
+    };
     socket.once("error", fail);
+    socket.once("end", failClosed);
+    socket.once("close", failClosed);
     socket.once("connect", () => {
       try {
         socket.write(encoder.encode({ version: 1, token, role: "worker" }));
@@ -52,8 +59,10 @@ export async function connectDaemon({ config, signal }) {
         if (!authenticated) {
           if (frame?.version === 1 && frame?.kind === "authenticated") {
             authenticated = true;
-            settled = true;
-            resolve(undefined);
+            if (!settled) {
+              settled = true;
+              resolve(undefined);
+            }
           } else {
             fail(Object.assign(new Error("Daemon rejected worker authentication"), { code: frame?.error?.code ?? "AUTHENTICATION_FAILED" }));
             socket.destroy();

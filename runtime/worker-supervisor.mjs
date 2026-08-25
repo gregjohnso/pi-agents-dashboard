@@ -524,7 +524,10 @@ export class WorkerSupervisor {
 
   /** Detach daemon IPC from workers without signaling their process groups. */
   async close() {
-    for (const handle of this.#handles) handle.detach();
+    const handles = [...this.#handles];
     this.#handles.clear();
+    const results = await Promise.allSettled(handles.map(async (handle) => handle.detach()));
+    const errors = results.filter((result) => result.status === "rejected").map((result) => result.reason);
+    if (errors.length > 0) throw new AggregateError(errors, "Worker supervisor detached with errors");
   }
 }

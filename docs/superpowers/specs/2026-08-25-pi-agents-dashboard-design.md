@@ -272,6 +272,7 @@ A Pi process started before package installation may appear as an imported saved
 The daemon control socket uses JSON Lines with client-generated request IDs and daemon-generated event sequence IDs. Supported operations are:
 
 - `get_state`
+- `launch`
 - `attach`
 - `detach`
 - `prompt`
@@ -283,8 +284,11 @@ The daemon control socket uses JSON Lines with client-generated request IDs and 
 - `ui_response`
 - `subscribe`
 - `ack`
+- `resolve_delivery`
 
-Prompt, follow-up, steer, stop, delete, and UI-response requests are durably journaled before acceptance is acknowledged. Repeated request IDs are idempotent. Reconnecting clients resume from their last acknowledged event sequence. The protocol records accepted, delivery-attempted, worker-acknowledged, and completed states separately. An accepted request remains recoverable after a daemon crash. If delivery is ambiguous, the daemon marks it `DELIVERY_UNKNOWN` and exposes explicit Retry at risk and Abandon actions. It never retries automatically.
+Every request uses the strict envelope `{ version: 1, clientId, requestId, op, payload }`. Operations reject missing or unknown payload fields. Attachment requests explicitly select `composer` or `observer`; at most one client receives the composing role. Launch requests identify a trusted `sourceSessionId`; clients cannot supply a Pi configuration root. Shared-directory launches include the exact confirmed working directory.
+
+Prompt, follow-up, steer, stop, delete, and UI-response requests are durably journaled before acceptance is acknowledged. Repeated request IDs are idempotent. Reconnecting clients resume from their last acknowledged event sequence. The protocol records accepted, delivery-attempted, worker-acknowledged, and completed states separately. An accepted request remains recoverable after a daemon crash. If delivery is ambiguous, the daemon marks it `DELIVERY_UNKNOWN`. Only `resolve_delivery` may resolve it, using the exact original client and request IDs with either `retry_at_risk` or `abandon`; it never retries automatically.
 
 The protocol is local-user only. The server validates message size, command shape, session identity, and peer ownership where the platform exposes peer credentials. Unknown commands fail closed.
 

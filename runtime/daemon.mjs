@@ -183,7 +183,8 @@ async function createDeleteResultStore(path) {
     for (const entry of Object.values(value.entries)) {
       const allowed = ["request", "sessionId", "revision", "canonicalSessionFile", "recordCanonical", "identity", "phase"];
       const identity = /** @type {any} */ (entry)?.identity;
-      if (typeof entry !== "object" || entry === null || Array.isArray(entry) || Object.keys(entry).some((key) => !allowed.includes(key)) || typeof entry.request !== "string" || (typeof entry.sessionId !== "string" || entry.sessionId.length === 0) || !Number.isSafeInteger(entry.revision) || entry.revision < 0 || typeof entry.canonicalSessionFile !== "string" || resolve(entry.canonicalSessionFile) !== entry.canonicalSessionFile || typeof entry.recordCanonical !== "string" || !["PREPARED", "TRASHED"].includes(entry.phase) || typeof identity !== "object" || identity === null || Object.keys(identity).some((key) => !["path", "realpath", "type", "dev", "ino", "size", "mtimeMs"].includes(key)) || identity.path !== entry.canonicalSessionFile || identity.realpath !== entry.canonicalSessionFile || identity.type !== "file" || !Number.isSafeInteger(identity.dev) || !Number.isSafeInteger(identity.ino)) throw new TypeError("Delete recovery store is invalid");
+      const identityKeys = ["path", "realpath", "type", "dev", "ino", "size", "mtimeMs"];
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry) || Object.keys(entry).length !== allowed.length || Object.keys(entry).some((key) => !allowed.includes(key)) || typeof entry.request !== "string" || (typeof entry.sessionId !== "string" || entry.sessionId.length === 0) || !Number.isSafeInteger(entry.revision) || entry.revision < 0 || typeof entry.canonicalSessionFile !== "string" || resolve(entry.canonicalSessionFile) !== entry.canonicalSessionFile || typeof entry.recordCanonical !== "string" || !["PREPARED", "TRASHED"].includes(entry.phase) || typeof identity !== "object" || identity === null || Array.isArray(identity) || Object.keys(identity).length !== identityKeys.length || Object.keys(identity).some((key) => !identityKeys.includes(key)) || identity.path !== entry.canonicalSessionFile || identity.realpath !== entry.canonicalSessionFile || identity.type !== "file" || !Number.isSafeInteger(identity.dev) || identity.dev < 0 || !Number.isSafeInteger(identity.ino) || identity.ino < 0 || !Number.isSafeInteger(identity.size) || identity.size < 0 || typeof identity.mtimeMs !== "number" || !Number.isFinite(identity.mtimeMs) || identity.mtimeMs < 0) throw new TypeError("Delete recovery store is invalid");
     }
     entries = value.entries;
   } catch (error) {
@@ -768,7 +769,8 @@ export async function createDaemonRuntime({
         const accepted = await context.recovery.journal.accept(request);
         let status = accepted;
         const changed = accepted.stage === "ACCEPTED";
-        if (accepted.stage === "ACCEPTED") {
+        const unresolvedDeleteRecovery = request.op === "delete" && accepted.stage === "DELIVERY_UNKNOWN" && context.deleteResults.get(request)?.phase === "PREPARED";
+        if (accepted.stage === "ACCEPTED" || unresolvedDeleteRecovery) {
           const route = router.route(request.payload.sessionId);
           const connection = route?.connection;
           const metadata = route?.metadata;
@@ -854,6 +856,7 @@ export async function createDaemonRuntime({
           } else if (request.op === "delete") {
             const history = await context.recovery.journal.history(request);
             const retryAtRisk = history.some((/** @type {any} */ prior, /** @type {number} */ index) => prior.stage === "DELIVERY_UNKNOWN" && history[index + 1]?.stage === "ACCEPTED");
+            const reconciliationOnly = accepted.stage === "DELIVERY_UNKNOWN";
             status = await router.runSession(request.payload.sessionId, async (/** @type {any} */ { metadata: lockedMetadata, route: lockedRoute }) => {
               const complete = async () => {
                 await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
@@ -861,7 +864,7 @@ export async function createDaemonRuntime({
                 return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
               };
               /** @param {string} code @param {string} message */
-              const refuse = (code, message) => context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError(code, message));
+              const refuse = (code, message) => reconciliationOnly ? accepted : context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError(code, message));
               const record = await registry.get(request.payload.sessionId);
               const recovery = context.deleteResults.get(request);
               const routeSafe = (/** @type {any} */ current) => current.ownership === undefined &&
@@ -878,19 +881,19 @@ export async function createDaemonRuntime({
 
               if (recovery !== undefined) {
                 if (record === undefined) {
-                  if (recovery.phase !== "TRASHED") return refuse("DELETE_RECONCILIATION_REFUSED", "Prepared Delete registry state is missing");
                   try {
                     await inspectSessionFile(recovery.canonicalSessionFile);
-                    return refuse("DELETE_RECONCILIATION_REFUSED", "A trashed Delete path is present again");
+                    return refuse("DELETE_RECONCILIATION_REFUSED", recovery.phase === "TRASHED" ? "A trashed Delete path is present again" : "Prepared Delete registry state is missing while its file remains present");
                   } catch (error) {
-                    if (/** @type {any} */ (error)?.code !== "ENOENT") return refuse("DELETE_RECONCILIATION_REFUSED", "Post-trash file identity is ambiguous");
-                    return complete();
+                    if (/** @type {any} */ (error)?.code !== "ENOENT") return refuse("DELETE_RECONCILIATION_REFUSED", "Recovered Delete file identity is ambiguous");
+                    return reconciliationOnly ? accepted : complete();
                   }
                 }
                 if (!exactRecoveryRecord(record) || !routeSafe(record)) return refuse("DELETE_RECONCILIATION_REFUSED", "Delete state no longer matches the complete prepared record fingerprint and inactive safety boundary");
                 try {
                   const currentIdentity = await inspectSessionFile(recovery.canonicalSessionFile);
                   if (canonicalJson(currentIdentity) !== canonicalJson(recovery.identity) || recovery.phase !== "PREPARED") return refuse("DELETE_RECONCILIATION_REFUSED", "Prepared Delete file identity was replaced or restored");
+                  if (reconciliationOnly) return accepted;
                   if (!retryAtRisk) {
                     await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
                     return context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
@@ -898,7 +901,7 @@ export async function createDaemonRuntime({
                 } catch (error) {
                   if (/** @type {any} */ (error)?.code !== "ENOENT") return refuse("DELETE_RECONCILIATION_REFUSED", "Prepared Delete file identity is ambiguous");
                   await registry.remove(record.sessionId, recovery.revision);
-                  return complete();
+                  return reconciliationOnly ? accepted : complete();
                 }
               } else {
                 if (record === undefined) return refuse("SESSION_NOT_FOUND", "The exact session does not exist");

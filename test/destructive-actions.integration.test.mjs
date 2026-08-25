@@ -257,6 +257,42 @@ it("reopens a crash-window PREPARED Delete as DELIVERY_UNKNOWN without trash red
   frontend.close();
 });
 
+it.each([
+  ["missing size", (identity) => { delete identity.size; }],
+  ["string dev", (identity) => { identity.dev = "1"; }],
+  ["negative inode", (identity) => { identity.ino = -1; }],
+  ["invalid mtime", (identity) => { identity.mtimeMs = null; }],
+  ["unknown identity field", (identity) => { identity.extra = true; }],
+])("fails recovered Delete closed for %s identity metadata", async (_name, corruptIdentity) => {
+  const root = await fixtureRoot();
+  const registry = new RegistryStore(join(root, "sessions"));
+  const session = record(root, `delete-invalid-identity-${_name.replaceAll(" ", "-")}`);
+  await writeFile(session.canonicalSessionFile, "session\n");
+  await registry.create(session);
+  let runtime = await createDaemonRuntime({
+    root,
+    trashSessionFile: vi.fn(),
+    destructiveFailpoint(stage) { if (stage === "delete_after_prepare") throw new Error("stop after prepare"); },
+  });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const frontend = connect(runtime);
+  await frontend.next();
+  frontend.send(request("client", `request-${session.sessionId}`, "delete", { sessionId: session.sessionId, revision: 0 }));
+  expect(await frontend.next()).toMatchObject({ ok: false });
+  frontend.close();
+  await runtime.close();
+  runtimes.splice(runtimes.indexOf(runtime), 1);
+
+  const path = join(root, "daemon", "delete-results.json");
+  const store = JSON.parse(await readFile(path, "utf8"));
+  corruptIdentity(Object.values(store.entries)[0].identity);
+  await writeFile(path, `${JSON.stringify(store)}\n`, { mode: 0o600 });
+  runtime = await createDaemonRuntime({ root, trashSessionFile: vi.fn() });
+  runtimes.push(runtime);
+  await expect(runtime.ready).rejects.toThrow("Delete recovery store is invalid");
+});
+
 it("reconciles throw-after-effect Delete delivery without invoking trash twice", async () => {
   const root = await fixtureRoot();
   const registry = new RegistryStore(join(root, "sessions"));
@@ -303,6 +339,11 @@ it("reconciles an exact missing PREPARED Delete without another trash attempt", 
   frontend.send(deletion);
   expect(await frontend.next()).toMatchObject({ result: { status: { stage: "DELIVERY_UNKNOWN" } } });
   await rename(session.canonicalSessionFile, `${session.canonicalSessionFile}.trash`);
+  frontend.send(deletion);
+  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "DELIVERY_UNKNOWN" } } });
+  expect(trash).toHaveBeenCalledTimes(1);
+  expect(await registry.get(session.sessionId)).toBeUndefined();
+
   frontend.send(request("client", "resolve-delete-missing", "resolve_delivery", { targetClientId: "client", targetRequestId: "delete-missing-request", resolution: "retry_at_risk" }));
   await frontend.next();
   frontend.send(deletion);

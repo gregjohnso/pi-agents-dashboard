@@ -1,14 +1,21 @@
-import net from "node:net";
 import { createHash, randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
+import net from "node:net";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { cleanupManagedWorktree as defaultCleanupManagedWorktree } from "../isolation/cleanup.mjs";
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
+import { acquireLifecycleLock } from "../runtime/lifecycle-lock.mjs";
+import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
 import { parseDaemonResponse } from "../shared/contracts.js";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
+const PENDING_LOCK_TIMEOUT_MS = 5_000;
+const PRIVATE_DIRECTORY_MODE = 0o700;
+const PRIVATE_FILE_MODE = 0o600;
+const AUTHENTICATION_STATES = new Set(["STARTING", "RECONCILING", "READY", "FAILED"]);
 const DESTRUCTIVE_COMMANDS = new Set(["stop", "delete", "cleanup"]);
 const RESOLUTIONS = new Set(["retry_at_risk", "abandon"]);
 
@@ -25,11 +32,60 @@ function runtimeRoot(env = process.env) {
 
 /** @param {string} directory */
 async function ensurePrivateDirectory(directory) {
-  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-  await fs.chmod(directory, 0o700);
+  await fs.mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+  await fs.chmod(directory, PRIVATE_DIRECTORY_MODE);
   const metadata = await fs.lstat(directory);
-  if (!metadata.isDirectory() || metadata.isSymbolicLink() || metadata.uid !== process.getuid?.() || (metadata.mode & 0o777) !== 0o700) {
+  if (!metadata.isDirectory() || metadata.isSymbolicLink() || metadata.uid !== process.getuid?.() || (metadata.mode & 0o777) !== PRIVATE_DIRECTORY_MODE) {
     throw Object.assign(new Error("CLI state directory is unsafe"), { code: "CLI_STATE_UNSAFE" });
+  }
+}
+
+/** @param {string} directory */
+async function syncDirectory(directory) {
+  const handle = await fs.open(directory, "r");
+  try { await handle.sync(); } finally { await handle.close(); }
+}
+
+/** @param {string} path @param {string} unsafeMessage */
+async function readPrivateFile(path, unsafeMessage) {
+  const handle = await fs.open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const before = await handle.stat();
+    if (!before.isFile() || before.uid !== process.getuid?.() || (before.mode & 0o777) !== PRIVATE_FILE_MODE) throw Object.assign(new Error(unsafeMessage), { code: "CLI_STATE_UNSAFE" });
+    const text = await handle.readFile("utf8");
+    const after = await handle.stat();
+    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs) throw Object.assign(new Error(unsafeMessage), { code: "CLI_STATE_UNSAFE" });
+    return { text, identity: { dev: after.dev, ino: after.ino, size: after.size, mtimeMs: after.mtimeMs } };
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Publish a fully durable private file without replacing an existing winner. @param {string} directory @param {string} path @param {string} text @param {() => unknown | Promise<unknown>} [beforePublish] */
+async function publishPrivateFile(directory, path, text, beforePublish = () => {}) {
+  const temporary = join(directory, `.publish-${randomUUID()}.tmp`);
+  let handle;
+  try {
+    handle = await fs.open(temporary, "wx", PRIVATE_FILE_MODE);
+    await handle.chmod(PRIVATE_FILE_MODE);
+    const metadata = await handle.stat();
+    if (!metadata.isFile() || (metadata.mode & 0o777) !== PRIVATE_FILE_MODE) throw Object.assign(new Error("CLI temporary state is unsafe"), { code: "CLI_STATE_UNSAFE" });
+    await handle.writeFile(text, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await beforePublish();
+    try {
+      await fs.link(temporary, path);
+    } catch (error) {
+      if (/** @type {NodeJS.ErrnoException} */ (error)?.code === "EEXIST") return false;
+      throw error;
+    }
+    await syncDirectory(directory);
+    return true;
+  } finally {
+    if (handle !== undefined) await handle.close().catch(() => {});
+    await fs.unlink(temporary).catch((error) => { if (/** @type {NodeJS.ErrnoException} */ (error)?.code !== "ENOENT") throw error; });
   }
 }
 
@@ -39,9 +95,7 @@ export async function loadCliClientIdentity({ root = runtimeRoot(), randomId = r
   const path = join(directory, "client-id");
   await ensurePrivateDirectory(directory);
   try {
-    const metadata = await fs.lstat(path);
-    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.uid !== process.getuid?.() || (metadata.mode & 0o777) !== 0o600) throw Object.assign(new Error("CLI client identity is unsafe"), { code: "CLI_STATE_UNSAFE" });
-    const clientId = (await fs.readFile(path, "utf8")).trim();
+    const clientId = (await readPrivateFile(path, "CLI client identity is unsafe")).text.trim();
     if (!exactId(clientId)) throw Object.assign(new Error("CLI client identity is invalid"), { code: "CLI_STATE_CORRUPT" });
     return clientId;
   } catch (error) {
@@ -49,32 +103,24 @@ export async function loadCliClientIdentity({ root = runtimeRoot(), randomId = r
   }
   const generated = `cli-${randomId()}`;
   if (!exactId(generated)) throw new TypeError("CLI client ID generator returned an invalid identity");
-  try {
-    const handle = await fs.open(path, "wx", 0o600);
-    try {
-      await handle.chmod(0o600);
-      await handle.writeFile(`${generated}\n`, "utf8");
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    const directoryHandle = await fs.open(directory, "r");
-    try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
-    return generated;
-  } catch (error) {
-    if (error instanceof Error && /** @type {NodeJS.ErrnoException} */ (error).code === "EEXIST") return loadCliClientIdentity({ root, randomId });
-    throw error;
-  }
+  if (await publishPrivateFile(directory, path, `${generated}\n`)) return generated;
+  return loadCliClientIdentity({ root, randomId });
 }
 
 /** @param {unknown} value */
 function validateAuthentication(value) {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) throw Object.assign(new Error("Daemon authentication frame is invalid"), { code: "INVALID_DAEMON_AUTHENTICATION" });
+  const invalid = () => Object.assign(new Error("Daemon authentication frame is invalid"), { code: "INVALID_DAEMON_AUTHENTICATION" });
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw invalid();
   const frame = /** @type {Record<string, any>} */ (value);
-  const allowed = new Set(["version", "kind", "state", "recovering", "error", "daemonEpoch", "pid"]);
-  if (frame.version !== 1 || frame.kind !== "authenticated" || typeof frame.state !== "string" || typeof frame.recovering !== "boolean" || !exactId(frame.daemonEpoch) || !Number.isSafeInteger(frame.pid) || Object.keys(frame).some((key) => !allowed.has(key))) {
-    throw Object.assign(new Error("Daemon authentication frame is invalid"), { code: "INVALID_DAEMON_AUTHENTICATION" });
-  }
+  const baseKeys = ["version", "kind", "state", "recovering", "daemonEpoch", "pid"];
+  const failed = frame.state === "FAILED";
+  const allowed = new Set(failed ? [...baseKeys, "error"] : baseKeys);
+  const error = frame.error;
+  const validError = typeof error === "object" && error !== null && !Array.isArray(error) &&
+    Object.keys(error).length === 3 && Object.keys(error).every((key) => ["code", "message", "retryable"].includes(key)) &&
+    exactId(error.code) && typeof error.message === "string" && typeof error.retryable === "boolean";
+  const recovering = frame.state === "STARTING" || frame.state === "RECONCILING";
+  if (frame.version !== 1 || frame.kind !== "authenticated" || !AUTHENTICATION_STATES.has(frame.state) || frame.recovering !== recovering || !exactId(frame.daemonEpoch) || !Number.isSafeInteger(frame.pid) || frame.pid <= 0 || Object.keys(frame).length !== allowed.size || Object.keys(frame).some((key) => !allowed.has(key)) || (failed && !validError)) throw invalid();
 }
 
 /** @param {string} op @param {any} payload @param {string} clientId @param {string} requestId @param {any} result */
@@ -118,7 +164,8 @@ export function createDaemonRequester({ root = runtimeRoot(), clientId, maxBytes
       let responseCheck;
       const deliveryUnknown = () => Object.assign(new Error("Daemon response was lost after submission"), { code: "DELIVERY_UNKNOWN", clientId, requestId });
       const protocolError = (code, message, cause) => Object.assign(new Error(message, cause === undefined ? undefined : { cause }), { code });
-      const timer = setTimeout(() => finish(submitted ? deliveryUnknown() : Object.assign(new Error("Daemon request timed out"), { code: "DAEMON_REQUEST_TIMEOUT" })), timeoutMs);
+      /** @type {NodeJS.Timeout} */
+      let timer;
       /** @param {unknown} error @param {unknown} [value] */
       const finish = (error, value) => {
         if (settled) return;
@@ -129,7 +176,20 @@ export function createDaemonRequester({ root = runtimeRoot(), clientId, maxBytes
         if (error !== undefined) rejectRequest(error);
         else resolveRequest(value);
       };
-      const transportClosed = (error) => finish(submitted ? deliveryUnknown() : error ?? Object.assign(new Error("Daemon connection closed"), { code: "CONNECTION_CLOSED" }));
+      const settleValidated = () => {
+        if (validatedResponse === undefined) return false;
+        if (!validatedResponse.ok) finish(Object.assign(new Error(validatedResponse.error.message || "Daemon request failed"), validatedResponse.error));
+        else finish(undefined, validatedResponse.result);
+        return true;
+      };
+      /** Finalize buffered UTF-8/JSONL before classifying a transport boundary. @param {unknown} fallback */
+      const finalizeTransport = (fallback) => {
+        if (settled) return;
+        try { decoder.end(); } catch (error) { finish(error); return; }
+        if (!settleValidated()) finish(fallback);
+      };
+      const transportClosed = (error) => finalizeTransport(submitted ? deliveryUnknown() : error ?? Object.assign(new Error("Daemon connection closed"), { code: "CONNECTION_CLOSED" }));
+      timer = setTimeout(() => finalizeTransport(submitted ? deliveryUnknown() : Object.assign(new Error("Daemon request timed out"), { code: "DAEMON_REQUEST_TIMEOUT" })), timeoutMs);
       socket.once("connect", () => socket.write(encoder.encode({ version: 1, token })));
       socket.on("error", transportClosed);
       socket.on("data", (chunk) => {
@@ -158,18 +218,12 @@ export function createDaemonRequester({ root = runtimeRoot(), clientId, maxBytes
           const parsed = responses[0];
           if (parsed.ok) validateExpectedResult(op, payload, clientId, requestId, parsed.result);
           validatedResponse = parsed;
-          responseCheck = setImmediate(() => {
-            if (!parsed.ok) finish(Object.assign(new Error(parsed.error.message || "Daemon request failed"), parsed.error));
-            else finish(undefined, parsed.result);
-          });
+          responseCheck = setImmediate(() => finalizeTransport(deliveryUnknown()));
         } catch (error) {
           finish(error);
         }
       });
-      socket.once("end", () => {
-        try { decoder.end(); } catch (error) { finish(error); return; }
-        transportClosed();
-      });
+      socket.once("end", () => transportClosed());
       socket.once("close", () => transportClosed());
     });
   };
@@ -225,73 +279,197 @@ async function pendingDirectory(root) {
   return directory;
 }
 
+/** @param {any} entry @param {string} action @param {string} sessionId @param {number} revision */
+function validatePendingEntry(entry, action, sessionId, revision) {
+  const keys = ["schemaVersion", "action", "sessionId", "revision", "clientId", "requestId"];
+  if (entry?.schemaVersion !== 1 || entry.action !== action || entry.sessionId !== sessionId || entry.revision !== revision || !exactId(entry.clientId) || !exactId(entry.requestId) || Object.keys(entry).length !== keys.length || Object.keys(entry).some((key) => !keys.includes(key))) throw Object.assign(new Error("Pending CLI request is corrupt"), { code: "CLI_STATE_CORRUPT" });
+}
+
+/** @param {string} path @param {string} action @param {string} sessionId @param {number} revision */
+async function readPendingPath(path, action, sessionId, revision) {
+  let persisted;
+  try {
+    persisted = await readPrivateFile(path, "Pending CLI request is unsafe");
+  } catch (error) {
+    if (["ELOOP", "ENOTDIR"].includes(/** @type {NodeJS.ErrnoException} */ (error)?.code ?? "")) throw Object.assign(new Error("Pending CLI request is unsafe", { cause: error }), { code: "CLI_STATE_UNSAFE" });
+    throw error;
+  }
+  let entry;
+  try { entry = JSON.parse(persisted.text); } catch (error) { throw Object.assign(new Error("Pending CLI request is corrupt", { cause: error }), { code: "CLI_STATE_CORRUPT" }); }
+  validatePendingEntry(entry, action, sessionId, revision);
+  return { path, entry, identity: persisted.identity };
+}
+
+/** Remove only a dead holder's exact token entry. @param {string} lockPath */
+async function recoverStalePendingLock(lockPath) {
+  let metadata;
+  try { metadata = await fs.lstat(lockPath); } catch (error) {
+    if (/** @type {NodeJS.ErrnoException} */ (error)?.code === "ENOENT") return true;
+    throw error;
+  }
+  if (!metadata.isDirectory() || metadata.isSymbolicLink() || metadata.uid !== process.getuid?.() || (metadata.mode & 0o777) !== PRIVATE_DIRECTORY_MODE) return false;
+  const entries = await fs.readdir(lockPath);
+  if (entries.length !== 1 || !exactId(entries[0])) return false;
+  const entryPath = join(lockPath, entries[0]);
+  let first;
+  try { first = await readPrivateFile(entryPath, "Pending CLI request lock is unsafe"); } catch { return false; }
+  let record;
+  try { record = JSON.parse(first.text); } catch { return false; }
+  if (record?.token !== entries[0] || !Number.isSafeInteger(record.owner?.pid) || record.owner.pid <= 0 || !exactId(record.owner?.startIdentity)) return false;
+  try {
+    const live = await inspectProcessIdentity(record.owner.pid);
+    if (live.startIdentity === record.owner.startIdentity) return false;
+  } catch (error) {
+    if (/** @type {NodeJS.ErrnoException} */ (error)?.code !== "ENOENT") return false;
+  }
+  let current;
+  try { current = await readPrivateFile(entryPath, "Pending CLI request lock is unsafe"); } catch { return false; }
+  if (current.text !== first.text || !sameFileIdentity(current.identity, first.identity)) return false;
+  try { await fs.unlink(entryPath); } catch (error) {
+    if (/** @type {NodeJS.ErrnoException} */ (error)?.code !== "ENOENT") throw error;
+  }
+  await fs.rmdir(lockPath).catch((error) => { if (!["ENOENT", "ENOTEMPTY"].includes(/** @type {NodeJS.ErrnoException} */ (error)?.code ?? "")) throw error; });
+  return true;
+}
+
+/** @param {string} directory @param {string} key @param {() => Promise<any>} action */
+async function withPendingLock(directory, key, action) {
+  const lockPath = join(directory, `.${key}.lock`);
+  const deadline = Date.now() + PENDING_LOCK_TIMEOUT_MS;
+  const processIdentity = await inspectProcessIdentity(process.pid);
+  let lock;
+  for (;;) {
+    try {
+      lock = await acquireLifecycleLock(lockPath, { pid: processIdentity.pid, startIdentity: processIdentity.startIdentity, processGroupId: processIdentity.processGroupId, key, operation: "pending_request" });
+      break;
+    } catch (error) {
+      if (/** @type {any} */ (error)?.code !== "LOCK_HELD") throw error;
+      if (await recoverStalePendingLock(lockPath)) continue;
+      if (Date.now() >= deadline) throw Object.assign(new Error("Pending CLI request lock remained held"), { code: "CLI_STATE_BUSY" });
+      await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+    }
+  }
+  try { return await action(); } finally { await lock.release(); }
+}
+
 /** @param {string} root @param {string} action @param {string} sessionId @param {number} revision */
 async function readPending(root, action, sessionId, revision) {
   const directory = await pendingDirectory(root);
   const path = join(directory, `${pendingKey(action, sessionId, revision)}.json`);
   try {
-    const metadata = await fs.lstat(path);
-    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.uid !== process.getuid?.() || (metadata.mode & 0o777) !== 0o600) throw Object.assign(new Error("Pending CLI request is unsafe"), { code: "CLI_STATE_UNSAFE" });
-    let entry;
-    try { entry = JSON.parse(await fs.readFile(path, "utf8")); } catch (error) { throw Object.assign(new Error("Pending CLI request is corrupt", { cause: error }), { code: "CLI_STATE_CORRUPT" }); }
-    if (entry?.schemaVersion !== 1 || entry.action !== action || entry.sessionId !== sessionId || entry.revision !== revision || !exactId(entry.clientId) || !exactId(entry.requestId) || Object.keys(entry).some((key) => !["schemaVersion", "action", "sessionId", "revision", "clientId", "requestId"].includes(key))) throw Object.assign(new Error("Pending CLI request is corrupt"), { code: "CLI_STATE_CORRUPT" });
-    return { path, entry };
+    return await readPendingPath(path, action, sessionId, revision);
   } catch (error) {
-    if (error instanceof Error && /** @type {NodeJS.ErrnoException} */ (error).code === "ENOENT") return { path };
+    if (/** @type {NodeJS.ErrnoException} */ (error)?.code === "ENOENT") return { path };
     throw error;
   }
 }
 
-/** @param {string} root @param {any} entry */
-async function putPending(root, entry) {
+/** @param {string} root @param {any} entry @param {(stage: string, context: any) => unknown | Promise<unknown>} [failpoint] */
+async function putPending(root, entry, failpoint = () => {}) {
   const directory = await pendingDirectory(root);
-  const path = join(directory, `${pendingKey(entry.action, entry.sessionId, entry.revision)}.json`);
+  const key = pendingKey(entry.action, entry.sessionId, entry.revision);
+  const path = join(directory, `${key}.json`);
   const candidate = { schemaVersion: 1, ...entry };
-  try {
-    const handle = await fs.open(path, "wx", 0o600);
-    try {
-      await handle.chmod(0o600);
-      await handle.writeFile(`${JSON.stringify(candidate)}\n`, "utf8");
-      await handle.sync();
-    } finally {
-      await handle.close();
+  return withPendingLock(directory, key, async () => {
+    await recoverPendingClear(directory, key, path, entry.action, entry.sessionId, entry.revision);
+    const winner = await readPending(root, entry.action, entry.sessionId, entry.revision);
+    if (winner.entry !== undefined) return winner;
+    const published = await publishPrivateFile(directory, path, `${JSON.stringify(candidate)}\n`, async () => failpoint("pending_before_publish", { path, entry: candidate }));
+    if (!published) {
+      const existing = await readPending(root, entry.action, entry.sessionId, entry.revision);
+      if (existing.entry === undefined) throw Object.assign(new Error("Pending CLI request winner disappeared"), { code: "CLI_STATE_UNSAFE" });
+      return existing;
     }
-    const directoryHandle = await fs.open(directory, "r");
-    try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
-    return { path, entry: candidate };
-  } catch (error) {
-    if (error instanceof Error && /** @type {NodeJS.ErrnoException} */ (error).code === "EEXIST") {
-      const winner = await readPending(root, entry.action, entry.sessionId, entry.revision);
-      if (winner.entry === undefined) throw Object.assign(new Error("Pending CLI request winner disappeared"), { code: "CLI_STATE_UNSAFE" });
-      return winner;
-    }
-    throw error;
+    await failpoint("pending_after_publish", { path, entry: candidate });
+    return readPendingPath(path, entry.action, entry.sessionId, entry.revision);
+  });
+}
+
+/** @param {any} left @param {any} right */
+function sameFileIdentity(left, right) {
+  return left?.dev === right?.dev && left?.ino === right?.ino && left?.size === right?.size && left?.mtimeMs === right?.mtimeMs;
+}
+
+/** Restore the single exact pending tombstone left by a crashed clearer. @param {string} directory @param {string} key @param {string} path @param {string} action @param {string} sessionId @param {number} revision */
+async function recoverPendingClear(directory, key, path, action, sessionId, revision) {
+  const prefix = `.${key}.clear.`;
+  const tombstones = (await fs.readdir(directory)).filter((name) => name.startsWith(prefix) && name.endsWith(".tmp"));
+  if (tombstones.length === 0) return;
+  if (tombstones.length !== 1) throw Object.assign(new Error("Pending CLI clear recovery is ambiguous"), { code: "CLI_STATE_UNSAFE" });
+  const tombstone = join(directory, tombstones[0]);
+  const moved = await readPendingPath(tombstone, action, sessionId, revision);
+  let current;
+  try { current = await readPendingPath(path, action, sessionId, revision); } catch (error) {
+    if (/** @type {NodeJS.ErrnoException} */ (error)?.code !== "ENOENT") throw error;
   }
+  if (current === undefined) {
+    await fs.rename(tombstone, path);
+    await syncDirectory(directory);
+    return;
+  }
+  if (JSON.stringify(current.entry) !== JSON.stringify(moved.entry) || !sameFileIdentity(current.identity, moved.identity)) throw Object.assign(new Error("Pending CLI clear recovery conflicts with a replacement"), { code: "CLI_STATE_UNSAFE" });
+  await fs.unlink(tombstone);
+  await syncDirectory(directory);
 }
 
-/** @param {string} root @param {string | undefined} path @param {any} expected */
-async function clearPending(root, path, expected) {
-  if (path === undefined) return;
-  const current = await readPending(root, expected.action, expected.sessionId, expected.revision);
-  if (current.path !== path || current.entry === undefined || JSON.stringify(current.entry) !== JSON.stringify(expected)) return;
-  await fs.unlink(path).catch((error) => { if (error?.code !== "ENOENT") throw error; });
-  const directory = await fs.open(resolve(path, ".."), "r");
-  try { await directory.sync(); } finally { await directory.close(); }
+/** @param {string} root @param {string | undefined} path @param {any} expected @param {(stage: string, context: any) => unknown | Promise<unknown>} [failpoint] */
+async function clearPending(root, path, expected, failpoint = () => {}) {
+  if (path === undefined || expected?.entry === undefined) return;
+  const directory = await pendingDirectory(root);
+  const key = pendingKey(expected.entry.action, expected.entry.sessionId, expected.entry.revision);
+  await withPendingLock(directory, key, async () => {
+    await recoverPendingClear(directory, key, path, expected.entry.action, expected.entry.sessionId, expected.entry.revision);
+    const current = await readPending(root, expected.entry.action, expected.entry.sessionId, expected.entry.revision);
+    if (current.path !== path || current.entry === undefined || JSON.stringify(current.entry) !== JSON.stringify(expected.entry) || !sameFileIdentity(current.identity, expected.identity)) return;
+    const tombstone = join(directory, `.${key}.clear.${randomUUID()}.tmp`);
+    await failpoint("pending_before_clear", { path, tombstone, entry: current.entry });
+    await fs.rename(path, tombstone);
+    let restore = true;
+    try {
+      await failpoint("pending_after_tombstone", { path, tombstone, entry: current.entry });
+      const moved = await readPendingPath(tombstone, current.entry.action, current.entry.sessionId, current.entry.revision);
+      if (JSON.stringify(moved.entry) !== JSON.stringify(current.entry) || !sameFileIdentity(moved.identity, current.identity)) throw Object.assign(new Error("Pending CLI request changed during clear"), { code: "CLI_STATE_UNSAFE" });
+      await fs.unlink(tombstone);
+      restore = false;
+      await syncDirectory(directory);
+    } finally {
+      if (restore) {
+        try {
+          await fs.link(tombstone, path);
+          await syncDirectory(directory);
+          await fs.unlink(tombstone);
+          await syncDirectory(directory);
+        } catch (error) {
+          if (/** @type {NodeJS.ErrnoException} */ (error)?.code !== "EEXIST") throw error;
+        }
+      }
+    }
+  });
 }
 
-/** @param {string} root @param {string} clientId @param {string} requestId */
-async function clearPendingIdentity(root, clientId, requestId) {
+/** @param {string} root @param {string} clientId @param {string} requestId @param {(stage: string, context: any) => unknown | Promise<unknown>} [failpoint] */
+async function clearPendingIdentity(root, clientId, requestId, failpoint = () => {}) {
   const directory = await pendingDirectory(root);
   for (const name of await fs.readdir(directory)) {
-    if (!name.endsWith(".json")) continue;
-    const path = join(directory, name);
-    const metadata = await fs.lstat(path);
-    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.uid !== process.getuid?.() || (metadata.mode & 0o777) !== 0o600) throw Object.assign(new Error("Pending CLI request is unsafe"), { code: "CLI_STATE_UNSAFE" });
+    const isPending = name.endsWith(".json");
+    const isTombstone = /^\.[a-f0-9]{64}\.clear\..+\.tmp$/u.test(name);
+    if (!isPending && !isTombstone) continue;
+    const discoveredPath = join(directory, name);
+    let raw;
+    try { raw = await readPrivateFile(discoveredPath, "Pending CLI request is unsafe"); } catch (error) {
+      if (/** @type {NodeJS.ErrnoException} */ (error)?.code === "ENOENT") continue;
+      if (["ELOOP", "ENOTDIR"].includes(/** @type {NodeJS.ErrnoException} */ (error)?.code ?? "")) throw Object.assign(new Error("Pending CLI request is unsafe", { cause: error }), { code: "CLI_STATE_UNSAFE" });
+      throw error;
+    }
     let entry;
-    try { entry = JSON.parse(await fs.readFile(path, "utf8")); } catch (error) { throw Object.assign(new Error("Pending CLI request is corrupt", { cause: error }), { code: "CLI_STATE_CORRUPT" }); }
+    try { entry = JSON.parse(raw.text); } catch (error) { throw Object.assign(new Error("Pending CLI request is corrupt", { cause: error }), { code: "CLI_STATE_CORRUPT" }); }
     if (entry?.clientId !== clientId || entry?.requestId !== requestId) continue;
-    const current = await readPending(root, entry.action, entry.sessionId, entry.revision);
-    if (current.path === path && current.entry !== undefined) await clearPending(root, path, current.entry);
+    validatePendingEntry(entry, entry.action, entry.sessionId, entry.revision);
+    const key = pendingKey(entry.action, entry.sessionId, entry.revision);
+    const path = join(directory, `${key}.json`);
+    if ((isPending && name !== `${key}.json`) || (isTombstone && !name.startsWith(`.${key}.clear.`))) throw Object.assign(new Error("Pending CLI request filename conflicts with its content"), { code: "CLI_STATE_UNSAFE" });
+    const expected = isPending ? await readPending(root, entry.action, entry.sessionId, entry.revision) : { path, entry, identity: raw.identity };
+    if (expected.entry !== undefined) await clearPending(root, path, expected, failpoint);
   }
 }
 
@@ -320,7 +498,7 @@ export async function runSessionCommand(argv, options = {}) {
     const request = options.request ?? createDaemonRequester({ root, clientId, timeoutMs: options.timeoutMs });
     const result = await request("resolve_delivery", { targetClientId: parsed.targetClientId, targetRequestId: parsed.targetRequestId, resolution: parsed.resolution });
     if (result?.kind !== "command") return { code: 1, error: { code: "INVALID_RESPONSE", message: "Daemon returned the wrong resolution result" } };
-    if (parsed.resolution === "abandon" || result.status?.stage === "COMPLETED" || result.status?.stage === "FAILED") await clearPendingIdentity(root, parsed.targetClientId, parsed.targetRequestId);
+    if (parsed.resolution === "abandon" || result.status?.stage === "COMPLETED" || result.status?.stage === "FAILED") await clearPendingIdentity(root, parsed.targetClientId, parsed.targetRequestId, options.pendingFailpoint);
     return { code: 0, result };
   }
 
@@ -336,14 +514,15 @@ export async function runSessionCommand(argv, options = {}) {
 
   if (parsed.command === "stop" || parsed.command === "delete") {
     const clientId = await loadCliClientIdentity({ root, randomId: options.randomId });
-    const request = options.request ?? createDaemonRequester({ root, clientId, timeoutMs: options.timeoutMs });
     const existing = await readPending(root, parsed.command, parsed.sessionId, parsed.revision);
     const pending = existing.entry === undefined
-      ? await putPending(root, { action: parsed.command, sessionId: parsed.sessionId, revision: parsed.revision, clientId, requestId: randomUUID() })
+      ? await putPending(root, { action: parsed.command, sessionId: parsed.sessionId, revision: parsed.revision, clientId, requestId: randomUUID() }, options.pendingFailpoint)
       : existing;
+    if (pending.entry.clientId !== clientId) throw Object.assign(new Error("Persistent CLI identity changed while a destructive request remains pending"), { code: "CLI_CLIENT_IDENTITY_CHANGED", pendingClientId: pending.entry.clientId, currentClientId: clientId, requestId: pending.entry.requestId });
+    const request = options.request ?? createDaemonRequester({ root, clientId: pending.entry.clientId, timeoutMs: options.timeoutMs });
     try {
       const result = await request(parsed.command, { sessionId: parsed.sessionId, revision: parsed.revision }, pending.entry.requestId);
-      if (result?.kind === "command" && ["COMPLETED", "FAILED"].includes(result.status?.stage)) await clearPending(root, pending.path, pending.entry);
+      if (result?.kind === "command" && ["COMPLETED", "FAILED"].includes(result.status?.stage)) await clearPending(root, pending.path, pending, options.pendingFailpoint);
       return classifyCommandResult(result);
     } catch (error) {
       if (error?.code === "DELIVERY_UNKNOWN") return { code: 1, error: { code: "DELIVERY_UNKNOWN", message: error.message, clientId: pending.entry.clientId, requestId: pending.entry.requestId } };

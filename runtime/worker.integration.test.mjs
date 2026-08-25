@@ -258,6 +258,61 @@ it("closes the active daemon connection and returns on explicit shutdown", async
   await expect(reconnecting).resolves.toBeUndefined();
 });
 
+it("disposes an active reconnect channel synchronously when worker shutdown aborts", async () => {
+  const { root, runs, registry, fakeEntry } = await setup(["one"]);
+  const marker = join(root, "reconnect-cleanup.txt");
+  const connector = join(root, "stuck-daemon-connector.mjs");
+  await writeFile(connector, `
+import { appendFileSync } from "node:fs";
+export async function connectDaemon({ config }) {
+  let listener;
+  const log = (value) => appendFileSync(config.marker, value + "\\n");
+  return {
+    closed: new Promise(() => {}),
+    close() { log("close"); throw new Error("close failed"); },
+    onMessage(nextListener) {
+      listener = (message) => { log("deliver:" + message.type); nextListener(message); };
+      return () => { log("remove"); listener = undefined; };
+    },
+    async send(message) {
+      log("send:" + message.type);
+      if (message.type !== "worker_ready") return;
+      listener({ type: "shutdown", token: message.token });
+      log("after-abort:" + (listener === undefined ? "removed" : "active"));
+      listener?.({ type: "shutdown", token: message.token });
+      process.stdout.write(JSON.stringify({ type: "agent_start" }) + "\\n");
+    },
+  };
+}
+`, { mode: 0o600 });
+  const supervisor = new WorkerSupervisor({
+    registry,
+    ownership: new OwnershipManager(registry),
+    runsDirectory: runs,
+    env: process.env,
+    startTimeoutMs: 2_000,
+  });
+  const launched = await supervisor.launch({
+    sessionId: "one",
+    canonicalSessionFile: join(root, "one.jsonl"),
+    cwd: root,
+    runId: "run-reconnect-cleanup",
+    rpcEntry: fakeEntry,
+    daemonConnector: connector,
+    daemonConnectConfig: { marker },
+    reconnectDelaysMs: [5],
+  });
+
+  await supervisor.close();
+  await waitForExit(launched.pid);
+  const calls = (await readFile(marker, "utf8")).trim().split("\n");
+  expect(calls).toContain("remove");
+  expect(calls).toContain("after-abort:removed");
+  expect(calls.filter((call) => call === "deliver:shutdown")).toHaveLength(1);
+  expect(calls).not.toContain("send:worker_event");
+  await waitForOwnershipRelease(registry, "one");
+});
+
 it("starts the injected daemon connector after inherited IPC disconnect while Pi remains alive", async () => {
   const { root, runs, registry, fakeEntry } = await setup(["one"]);
   const marker = join(root, "reconnected.txt");

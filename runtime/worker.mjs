@@ -443,12 +443,27 @@ export async function runWorker(runtimeProcess = process) {
       }
       const connectionSend = (/** @type {any} */ message) => Promise.resolve(connection.send(message));
       sendToDaemon = connectionSend;
-      const removeMessageListener = connection.onMessage((/** @type {any} */ message) => onTransportMessage(message, connectionSend));
-      Promise.resolve(connection.closed).finally(() => {
-        removeMessageListener?.();
+      /** @type {(() => unknown) | undefined} */
+      let removeMessageListener;
+      let disposed = false;
+      const disposeConnection = () => {
+        if (disposed) return;
+        disposed = true;
+        reconnectController.signal.removeEventListener("abort", disposeConnection);
         if (sendToDaemon === connectionSend) sendToDaemon = undefined;
-      }).catch(() => {});
+        try {
+          removeMessageListener?.();
+        } catch {
+        }
+      };
       try {
+        removeMessageListener = connection.onMessage((/** @type {any} */ message) => onTransportMessage(message, connectionSend));
+        reconnectController.signal.addEventListener("abort", disposeConnection, { once: true });
+        Promise.resolve(connection.closed).finally(disposeConnection).catch(() => {});
+        if (reconnectController.signal.aborted) {
+          disposeConnection();
+          return;
+        }
         await connectionSend({
           version: 1,
           type: "worker_ready",
@@ -461,8 +476,7 @@ export async function runWorker(runtimeProcess = process) {
           piChild: identity,
         });
       } catch (error) {
-        removeMessageListener?.();
-        if (sendToDaemon === connectionSend) sendToDaemon = undefined;
+        disposeConnection();
         throw error;
       }
     },

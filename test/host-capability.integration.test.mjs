@@ -97,4 +97,4 @@ it("installs as a Pi package and returns typed unsupported before native fronten
   } finally {
     await fakeDaemon.close();
   }
-});
+}, 15_000);

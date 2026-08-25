@@ -19,16 +19,21 @@ async function makeLockPath() {
   return join(directory, "lifecycle.lock");
 }
 
-it("acquires an exclusive token-bearing mode-0600 lock and releases its own token", async () => {
+/** @param {string} path @param {string} token */
+async function readTokenEntry(path, token) {
+  return JSON.parse(await readFile(join(path, token), "utf8"));
+}
+
+it("acquires an exclusive token-entry lock directory and releases its own token", async () => {
   const path = await makeLockPath();
   const owner = { pid: 42, startTimeTicks: "9001", operation: "start" };
 
   const lock = await acquireLifecycleLock(path, owner);
-  const record = JSON.parse(await readFile(path, "utf8"));
 
-  expect(record).toEqual({ token: lock.token, owner });
+  expect(await readTokenEntry(path, lock.token)).toEqual({ token: lock.token, owner });
   expect(lock.token).toMatch(/^[0-9a-f-]{36}$/);
-  expect((await stat(path)).mode & 0o777).toBe(0o600);
+  expect((await stat(path)).mode & 0o777).toBe(0o700);
+  expect((await stat(join(path, lock.token))).mode & 0o777).toBe(0o600);
   await expect(acquireLifecycleLock(path, owner)).rejects.toMatchObject({ code: "LOCK_HELD" });
 
   await expect(lock.release()).resolves.toBe(true);
@@ -36,51 +41,113 @@ it("acquires an exclusive token-bearing mode-0600 lock and releases its own toke
   await expect(lock.release()).resolves.toBe(false);
 });
 
-it("creates an exact mode-0600 lock under a restrictive inherited umask", async () => {
+it("creates exact lock-directory and token-entry modes under a restrictive inherited umask", async () => {
   const path = await makeLockPath();
   const previousUmask = process.umask(0o777);
+  let lock;
   try {
-    await acquireLifecycleLock(path, { pid: 42 });
+    lock = await acquireLifecycleLock(path, { pid: 42 });
   } finally {
     process.umask(previousUmask);
   }
 
-  expect((await stat(path)).mode & 0o777).toBe(0o600);
+  expect((await stat(path)).mode & 0o777).toBe(0o700);
+  expect((await stat(join(path, lock.token))).mode & 0o777).toBe(0o600);
 });
 
-it("does not remove a lock replaced by another token", async () => {
+it("keeps B public while stale A releases and C attempts acquisition", async () => {
+  const path = await makeLockPath();
+  /** @type {Awaited<ReturnType<typeof acquireLifecycleLock>> | undefined} */
+  let cLock;
+  /** @type {unknown} */
+  let cError;
+  async function attemptC() {
+    if (cLock !== undefined || cError !== undefined) {
+      return;
+    }
+    try {
+      cLock = await acquireLifecycleLock(path, { pid: 100, holder: "C" });
+    } catch (error) {
+      cError = error;
+    }
+  }
+  const aFsOps = {
+    ...fs,
+    /** @param {string} from @param {string} to */
+    async rename(from, to) {
+      await fs.rename(from, to);
+      if (from === path) {
+        await attemptC();
+      }
+    },
+    /** @param {string} entryPath */
+    async unlink(entryPath) {
+      await attemptC();
+      await fs.unlink(entryPath);
+    },
+  };
+  const aLock = await acquireLifecycleLock(path, { pid: 42, holder: "A" }, aFsOps);
+  await rm(path, { recursive: true });
+  const bLock = await acquireLifecycleLock(path, { pid: 99, holder: "B" });
+
+  await expect(aLock.release()).resolves.toBe(false);
+  expect(cLock).toBeUndefined();
+  expect(cError).toMatchObject({ code: "LOCK_HELD" });
+  expect(await readTokenEntry(path, bLock.token)).toEqual({
+    token: bLock.token,
+    owner: { pid: 99, holder: "B" },
+  });
+});
+
+it("release removes only its token entry and keeps a non-empty shared directory", async () => {
   const path = await makeLockPath();
   const lock = await acquireLifecycleLock(path, { pid: 42 });
-  const replacement = { token: "replacement", owner: { pid: 99 } };
-  await writeFile(path, `${JSON.stringify(replacement)}\n`, { mode: 0o600 });
+  const foreignToken = "foreign-token";
+  const foreignEntry = join(path, foreignToken);
+  await writeFile(foreignEntry, '{"owner":"foreign"}\n', { mode: 0o600 });
 
-  await expect(lock.release()).resolves.toBe(false);
-  expect(JSON.parse(await readFile(path, "utf8"))).toEqual(replacement);
+  await expect(lock.release()).resolves.toBe(true);
+
+  await expect(stat(join(path, lock.token))).rejects.toMatchObject({ code: "ENOENT" });
+  expect(await readFile(foreignEntry, "utf8")).toBe('{"owner":"foreign"}\n');
+  expect((await stat(path)).isDirectory()).toBe(true);
 });
 
-it("does not delete a replacement substituted at the release claim boundary", async () => {
+it("returns the holder when staging cleanup fails after publication", async () => {
   const path = await makeLockPath();
-  const replacement = { token: "replacement-at-release", owner: { pid: 99 } };
-  let substituted = false;
+  let published = false;
   const fsOps = {
     ...fs,
     /** @param {string} from @param {string} to */
     async rename(from, to) {
-      if (from === path && !substituted) {
-        substituted = true;
-        await fs.rm(path, { force: true });
-        await fs.writeFile(path, `${JSON.stringify(replacement)}\n`, { mode: 0o600 });
-      }
       await fs.rename(from, to);
+      if (to === path) {
+        published = true;
+      }
+    },
+    /** @param {string} from @param {string} to */
+    async link(from, to) {
+      await fs.link(from, to);
+      if (to === path) {
+        published = true;
+      }
+    },
+    /** @param {string} cleanupPath @param {{ force: boolean, recursive?: boolean }} options */
+    async rm(cleanupPath, options) {
+      if (published && cleanupPath !== path) {
+        throw new Error("post-publication cleanup failed");
+      }
+      await fs.rm(cleanupPath, options);
     },
   };
+
   const lock = await acquireLifecycleLock(path, { pid: 42 }, fsOps);
 
-  await expect(lock.release()).resolves.toBe(false);
-  expect(JSON.parse(await readFile(path, "utf8"))).toEqual(replacement);
+  expect(await readTokenEntry(path, lock.token)).toEqual({ token: lock.token, owner: { pid: 42 } });
+  await expect(lock.release()).resolves.toBe(true);
 });
 
-it("does not follow a hostile symlink at the lock path", async () => {
+it("does not follow or replace a hostile symlink at the lock path", async () => {
   const path = await makeLockPath();
   const target = join(tmpdir(), `dashboard-lock-target-${process.pid}-${Date.now()}`);
   cleanup.push(target);
@@ -93,32 +160,27 @@ it("does not follow a hostile symlink at the lock path", async () => {
   expect(await readFile(target, "utf8")).toBe("sentinel");
 });
 
-it("does not delete a replacement substituted during failed-acquisition cleanup", async () => {
+it("failed acquisition cleans only its staging directory", async () => {
   const path = await makeLockPath();
-  const replacement = { token: "replacement-at-cleanup", owner: { pid: 99 } };
+  const replacement = await acquireLifecycleLock(path, { pid: 99 });
+  /** @type {string[]} */
+  const removed = [];
   const fsOps = {
     ...fs,
-    /** @param {string} lockPath @param {any} flags @param {any} mode */
-    async open(lockPath, flags, mode) {
-      const handle = await fs.open(lockPath, flags, mode);
-      return {
-        writeFile: () => handle.writeFile('{"token":'),
-        /** @param {number} newMode */
-        chmod: (newMode) => handle.chmod(newMode),
-        stat: () => handle.stat(),
-        async sync() {
-          throw new Error("sync failed");
-        },
-        close: () => handle.close(),
-      };
-    },
-    /** @param {string} cleanupPath @param {{ force: boolean }} options */
+    /** @param {string} cleanupPath @param {{ force: boolean, recursive?: boolean }} options */
     async rm(cleanupPath, options) {
-      await fs.writeFile(path, `${JSON.stringify(replacement)}\n`, { mode: 0o600 });
+      removed.push(cleanupPath);
       await fs.rm(cleanupPath, options);
     },
   };
 
-  await expect(acquireLifecycleLock(path, { pid: 42 }, fsOps)).rejects.toThrow("sync failed");
-  expect(JSON.parse(await readFile(path, "utf8"))).toEqual(replacement);
+  await expect(acquireLifecycleLock(path, { pid: 42 }, fsOps)).rejects.toMatchObject({
+    code: "LOCK_HELD",
+  });
+
+  expect(removed).not.toContain(path);
+  expect(await readTokenEntry(path, replacement.token)).toEqual({
+    token: replacement.token,
+    owner: { pid: 99 },
+  });
 });

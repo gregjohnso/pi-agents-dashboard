@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
+import { join } from "node:path";
 
+const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 
 /** A typed lifecycle-lock acquisition conflict. */
@@ -22,29 +24,11 @@ function hasCode(error, codes) {
 }
 
 /**
- * Restore a claimed replacement without overwriting a newer lock at the public path.
+ * Acquire an exclusive lifecycle lock as a complete token-entry directory.
  *
- * @param {string} claimedPath
- * @param {string} path
- * @param {any} fsOps
- */
-async function restoreReplacement(claimedPath, path, fsOps) {
-  try {
-    await fsOps.link(claimedPath, path);
-  } catch (error) {
-    if (hasCode(error, ["EEXIST"])) {
-      return;
-    }
-    throw error;
-  }
-  await fsOps.rm(claimedPath, { force: true });
-}
-
-/**
- * Acquire an exclusive, durable lifecycle lock containing an unguessable release token.
- *
- * The record is completed at a token-specific staging path before one hard-link operation
- * publishes it. Failed acquisition therefore cleans only the holder's staging name.
+ * The directory and entry are prepared at a private staging path. Renaming that
+ * non-empty directory publishes ownership in one operation. A stale holder can
+ * address only its unguessable entry and cannot rename another holder's directory.
  *
  * @param {string} path
  * @param {unknown} owner
@@ -63,15 +47,28 @@ export async function acquireLifecycleLock(path, owner, fsOps = fs) {
   }
 
   const stagingPath = `${path}.${token}.tmp`;
+  const stagingEntryPath = join(stagingPath, token);
   /** @type {any} */
   let handle;
   let published = false;
+  let failed = false;
   try {
-    handle = await fsOps.open(stagingPath, "wx", PRIVATE_FILE_MODE);
+    await fsOps.mkdir(stagingPath, { mode: PRIVATE_DIRECTORY_MODE });
+    await fsOps.chmod(stagingPath, PRIVATE_DIRECTORY_MODE);
+    const directoryMetadata = await fsOps.lstat(stagingPath);
+    if (
+      !directoryMetadata.isDirectory() ||
+      directoryMetadata.isSymbolicLink() ||
+      (directoryMetadata.mode & 0o777) !== PRIVATE_DIRECTORY_MODE
+    ) {
+      throw new Error("Lifecycle lock staging directory must be a mode-0700 directory");
+    }
+
+    handle = await fsOps.open(stagingEntryPath, "wx", PRIVATE_FILE_MODE);
     await handle.chmod(PRIVATE_FILE_MODE);
-    const metadata = await handle.stat();
-    if (!metadata.isFile() || (metadata.mode & 0o777) !== PRIVATE_FILE_MODE) {
-      throw new Error("Lifecycle lock staging file must be a regular mode-0600 file");
+    const entryMetadata = await handle.stat();
+    if (!entryMetadata.isFile() || (entryMetadata.mode & 0o777) !== PRIVATE_FILE_MODE) {
+      throw new Error("Lifecycle lock token entry must be a regular mode-0600 file");
     }
     await handle.writeFile(serialized, "utf8");
     await handle.sync();
@@ -79,26 +76,43 @@ export async function acquireLifecycleLock(path, owner, fsOps = fs) {
     handle = undefined;
 
     try {
-      await fsOps.link(stagingPath, path);
+      const publicMetadata = await fsOps.lstat(path);
+      if (!publicMetadata.isDirectory() || publicMetadata.isSymbolicLink()) {
+        throw new LifecycleLockError("Lifecycle lock is already held");
+      }
+    } catch (error) {
+      if (!hasCode(error, ["ENOENT"])) {
+        throw error;
+      }
+    }
+
+    try {
+      await fsOps.rename(stagingPath, path);
       published = true;
     } catch (cause) {
-      if (hasCode(cause, ["EEXIST", "ELOOP"])) {
+      if (hasCode(cause, ["EEXIST", "ENOTEMPTY", "ELOOP", "ENOTDIR", "EISDIR"])) {
         throw new LifecycleLockError("Lifecycle lock is already held", { cause });
       }
       throw cause;
     }
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
     if (handle !== undefined) {
       await handle.close().catch(() => {});
     }
-    await fsOps.rm(stagingPath, { force: true });
-  }
-
-  if (!published) {
-    throw new Error("Lifecycle lock publication did not complete");
+    try {
+      await fsOps.rm(stagingPath, { recursive: true, force: true });
+    } catch (cleanupError) {
+      if (!published && !failed) {
+        throw cleanupError;
+      }
+    }
   }
 
   let released = false;
+  const entryPath = join(path, token);
   return {
     token,
     owner,
@@ -107,31 +121,18 @@ export async function acquireLifecycleLock(path, owner, fsOps = fs) {
         return false;
       }
 
-      const claimedPath = `${path}.${token}.${randomUUID()}.release`;
       try {
-        await fsOps.rename(path, claimedPath);
+        await fsOps.unlink(entryPath);
       } catch (error) {
-        if (hasCode(error, ["ENOENT"])) {
+        if (hasCode(error, ["ENOENT", "ENOTDIR"])) {
           released = true;
           return false;
         }
         throw error;
       }
 
-      let record;
-      try {
-        record = JSON.parse(await fsOps.readFile(claimedPath, "utf8"));
-      } catch (error) {
-        await restoreReplacement(claimedPath, path, fsOps);
-        return false;
-      }
-      if (record === null || typeof record !== "object" || record.token !== token) {
-        await restoreReplacement(claimedPath, path, fsOps);
-        return false;
-      }
-
-      await fsOps.rm(claimedPath, { force: true });
       released = true;
+      await fsOps.rmdir(path).catch(() => {});
       return true;
     },
   };

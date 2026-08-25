@@ -76,7 +76,7 @@ The package must not ship a weaker plugin-only mode that claims foreground work 
 ### Stop and delete
 
 - Ctrl+X on a live agent opens a confirmation prompt to stop it.
-- Stop sends a graceful abort/shutdown request, then SIGTERM, then SIGKILL after a bounded grace period if the process remains alive.
+- Stop sends a graceful abort/shutdown request, waits 5,000 ms, sends SIGTERM, waits another 5,000 ms, then sends SIGKILL if the process remains alive.
 - Stop targets the selected process group only.
 - After that agent becomes inactive, pressing Ctrl+X again opens a separate deletion confirmation. Ctrl+X on an already inactive session opens the deletion confirmation immediately.
 - Deletion uses Pi's normal trash behavior when available rather than unlinking permanently.
@@ -194,7 +194,7 @@ The npm-published package includes the extension, daemon, worker runtime, and op
 
 `npm install -g pi-agents-dashboard` is also supported for users who want the standalone status and recovery CLI. Global npm installation alone does not register a Pi package; `pi-agents-dashboard install` registers its canonical package root through `pi install`. The package uses no npm lifecycle scripts and remains installable with `--ignore-scripts`.
 
-Installation, daemon execution, workers, sockets, state, and tests remain local to the current machine. Tests run through Pixi and do not use SLURM.
+Installation, daemon execution, workers, sockets, state, and tests remain local to the current machine. The first release supports the current Linux host and fails closed when daemon-owned startup or native attachment is unavailable. Tests run through Pixi and do not use SLURM.
 
 ### Global extension
 
@@ -211,10 +211,10 @@ The extension must compose with an existing custom editor rather than replace it
 
 ### Registry
 
-Runtime state lives beneath the effective Pi configuration directory, not a hard-coded home path:
+Runtime state lives beneath one machine-local, operating-system-user dashboard state directory rather than one effective Pi configuration root:
 
 ```text
-<PI_CODING_AGENT_DIR>/pi-agents-dashboard/
+<PER_USER_DASHBOARD_STATE_DIR>/
 ├── daemon/pid.json
 ├── daemon/control.sock
 ├── daemon/lifecycle.lock
@@ -225,6 +225,8 @@ Runtime state lives beneath the effective Pi configuration directory, not a hard
 └── index/
 ```
 
+Each session record identifies its effective Pi configuration root. The one daemon can therefore span multiple roots without mixing their worker configuration.
+
 - Directories are mode `0700`; files and sockets are user-only.
 - Registry updates use write-to-temp plus atomic rename.
 - Each session record includes session ID/file, worker PID and process start identity, cwd, worktree and branch metadata, model, name, task state, process state, outcome, activity, timestamps, ownership type, and run paths.
@@ -234,7 +236,7 @@ Runtime state lives beneath the effective Pi configuration directory, not a hard
 
 ### Shared daemon
 
-One per-user daemon owns all dashboard-managed session backends on the machine. It starts before a daemon-backed Pi agent loop, exposes one user-only Unix control socket, and remains independent of terminal and dashboard lifetimes.
+One operating-system-user daemon owns all dashboard-managed session backends on the machine across every effective Pi configuration root. It starts before a daemon-backed Pi agent loop, exposes one user-only Unix control socket, and remains independent of terminal and dashboard lifetimes. Daemon state, journals, registry records, event cursors, and worker identity records are durable. After restart, the daemon recovers and reconciles surviving workers before accepting mutations.
 
 The daemon:
 
@@ -253,7 +255,7 @@ The package must connect the visible Pi interface to the daemon-owned backend be
 
 The daemon starts each `runtime/worker.mjs` in a new process group with disconnected terminal streams and file-backed logs. The worker starts Pi in RPC mode and owns that session's stdin/stdout protocol. The daemon remains the only control endpoint visible to frontends.
 
-A later reply to an inactive session asks the daemon to acquire ownership, start a new worker with `--session <path>`, and deliver the queued prompt. Workers may exit or sleep after settling according to the configured idle-retention policy; their sessions remain available globally.
+A later reply to an inactive session asks the daemon to acquire ownership, start a new worker with `--session <path>`, and deliver the queued prompt. A settled worker is retained for 15 minutes (900,000 ms) before it exits or sleeps; task state remains READY while process state records LIVE, SLEEPING, or EXITED. Sessions remain available globally.
 
 Workers use `setsid` or detached process groups, ignored stdin, and file-backed output so they survive shell and SSH teardown. The daemon reports a launch as accepted only after the worker acknowledges registry creation.
 
@@ -261,7 +263,7 @@ Workers use `setsid` or detached process groups, ignored stdin, and file-backed 
 
 A daemon-backed Pi terminal is a frontend, not the owner of agent execution. Opening the dashboard detaches that frontend from the current backend. Enter or Right attaches the same native Pi interface to another backend.
 
-Provider streams and tool executions continue in the daemon-owned worker while no frontend is attached. Exiting the frontend, closing the dashboard, losing SSH, or attaching from another Pi terminal does not migrate or restart that work. The worker remains the sole writer to its session file.
+Provider streams and tool executions continue in the daemon-owned worker while no frontend is attached. Exiting the frontend, closing the dashboard, losing SSH, or attaching from another Pi terminal does not migrate or restart that work. The worker remains the sole writer to its session file. At most one frontend may compose messages or answer pending requests for an attached session; additional attached frontends are read-only observers.
 
 A Pi process started before package installation may appear as an imported saved session after it settles, but it cannot claim live-detachment guarantees. `/agents` identifies that limitation rather than presenting it as a fully managed live session. All new Pi sessions in a supported installation start with daemon ownership.
 
@@ -282,7 +284,7 @@ The daemon control socket uses JSON Lines with client-generated request IDs and 
 - `subscribe`
 - `ack`
 
-Prompt, follow-up, steer, stop, delete, and UI-response requests are durably journaled before acceptance is acknowledged. Repeated request IDs are idempotent. Reconnecting clients resume from their last acknowledged event sequence. The protocol records accepted, delivery-attempted, worker-acknowledged, and completed states separately. An accepted request remains recoverable after a daemon crash. If delivery is ambiguous, the daemon marks it `DELIVERY_UNKNOWN` and asks the user before retrying rather than risking a duplicate prompt.
+Prompt, follow-up, steer, stop, delete, and UI-response requests are durably journaled before acceptance is acknowledged. Repeated request IDs are idempotent. Reconnecting clients resume from their last acknowledged event sequence. The protocol records accepted, delivery-attempted, worker-acknowledged, and completed states separately. An accepted request remains recoverable after a daemon crash. If delivery is ambiguous, the daemon marks it `DELIVERY_UNKNOWN` and exposes explicit Retry at risk and Abandon actions. It never retries automatically.
 
 The protocol is local-user only. The server validates message size, command shape, session identity, and peer ownership where the platform exposes peer credentials. Unknown commands fail closed.
 
@@ -292,7 +294,7 @@ The protocol is local-user only. The server validates message size, command shap
 
 Internal subagent artifacts, copied transcript exports, and nested run transcripts are hidden from the default top-level list. They can be added later as an explicit child-session view.
 
-The dashboard avoids rescanning every session file on every animation frame. It loads the index on open, watches the small registry directory for live updates, and refreshes saved-session metadata on a slower bounded interval or explicit refresh.
+The dashboard avoids rescanning every session file on every animation frame. It loads the index on open, watches the small registry directory for live updates, and refreshes saved-session metadata every 5,000 ms or on explicit refresh. All view has no completed-history time window: saved sessions remain visible until confirmed deletion, and active sessions follow the confirmed stop-then-delete lifecycle.
 
 ## State model
 
@@ -331,14 +333,14 @@ A session can therefore be `READY + LIVE`, `READY + SLEEPING`, or `READY + EXITE
 - Agent launches are independent and concurrent. The daemon does not serialize unrelated launches.
 - Git-backed launches use separate worktrees by default.
 - Multiple sessions may share one working directory only after the launch request explicitly selects Shared directory and the user confirms the concurrent-write warning. This does not relax single-writer ownership of each session file.
-- A configurable concurrent-worker cap protects the host from accidental process floods. The first-release default is 16 live daemon workers across foreground and background sessions.
+- `workers.maxLive` accepts `null` for unlimited workers or a positive integer cap. The first-release default is `null` (unlimited); zero, negative, and fractional values are invalid.
 
 ## Failure handling
 
 - **Dashboard closes:** no worker action.
 - **Pi frontend exits:** daemon-owned workers continue.
 - **SSH disconnects:** daemon-owned workers continue; logs, queues, and registry remain.
-- **Daemon crashes:** workers reconnect to the restarted daemon; it reconciles process identities, registry records, command acknowledgements, and event cursors before accepting new commands.
+- **Daemon crashes:** workers reconnect to the restarted daemon; it reconciles durable process identities, registry records, command acknowledgements, and event cursors before accepting mutations.
 - **Worker crashes:** process identity becomes stale; the dashboard marks the process STALE and preserves logs and session data.
 - **Pi child crashes:** the daemon records exit code and stderr, marks the task FAILED, and marks the process EXITED.
 - **Socket disappears:** clients verify daemon PID and process-start identity, then reconnect or report daemon failure.
@@ -414,12 +416,19 @@ The package will include a Pixi environment and a `pixi run test` task for deter
 
 Package-installation tests cover local-path Pi installation, a packed npm tarball, global npm installation into a disposable prefix, package-relative runtime discovery without a global CLI, `pi install npm:pi-agents-dashboard` command construction, and `pi remove` cleanup without deleting dashboard state.
 
-## Open decisions for review
+## Reviewed first-release configuration
 
-- **O1 Worker cap:** keep the proposed default of 16, choose another positive value, or make it unlimited.
-- **O2 Completed history:** show all saved sessions in All view, or apply a positive default time window such as Jobwatch's 48 hours.
-- **O3 Idle retention:** exit a settled worker immediately or retain it for a positive timeout. Task state remains READY; process state records LIVE, SLEEPING, or EXITED.
-- **O4 Daemon scope:** run one daemon for each effective Pi configuration root, or one operating-system-user daemon that spans multiple roots.
-- **O5 Ambiguous delivery:** offer explicit retry-at-risk and abandon actions for `DELIVERY_UNKNOWN`, or expose status only and require the user to recreate the prompt manually.
-- **O6 Attachment arbitration:** allow one composing frontend with read-only observers, or allow multiple frontends to compose and answer pending requests.
-- **O7 Platform support:** support the current Linux host first, or define a broader Unix contract with separate process-identity implementations.
+Configuration is a complete, schema-versioned JSON document. Readers reject unknown keys, unsupported schema versions, non-positive or non-integer millisecond values, and invalid limits. Writers validate and serialize the complete document before replacing the prior file with a write-to-temp plus atomic rename.
+
+| Field | Reviewed default |
+|---|---:|
+| `schemaVersion` | `1` |
+| `workers.maxLive` | `null` (unlimited) |
+| `workers.idleRetentionMs` | `900000` |
+| `history.completedWindowHours` | `null` (all saved history) |
+| `history.indexRefreshMs` | `5000` |
+| `daemon.heartbeatMs` | `2000` |
+| `daemon.staleAfterMs` | `10000` |
+| `daemon.startTimeoutMs` | `15000` |
+| `stop.gracefulMs` | `5000` |
+| `stop.terminateMs` | `5000` |

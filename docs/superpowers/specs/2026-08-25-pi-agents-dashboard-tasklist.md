@@ -128,7 +128,7 @@ T02 + T14 + T15 ─────────────────────�
 
 ## Milestone 4: Dashboard and Native Attachment
 
-- [ ] **T12 Implement responsive rendering and virtual rows**
+- [x] **T12 Implement responsive rendering and virtual rows**
   - Owner: isolated Lane F.
   - Depends on: T05.
   - Can run in parallel with: T07, T08, T09, T10, T11.

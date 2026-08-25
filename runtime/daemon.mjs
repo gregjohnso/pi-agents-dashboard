@@ -11,6 +11,7 @@ import { claimDaemonLifecycle, releaseDaemonLifecycle, updateDaemonLifecycleStat
 import { createJsonlDecoder, createJsonlEncoder, JsonlFramingError } from "./jsonl.mjs";
 import { ensurePrivateDirectory, initializeRuntimePermissions } from "./permissions.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
+import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "./process-signaler.mjs";
 import { RecoveredWorkerRouter, reconcileRuntime } from "./reconciliation.mjs";
 import { RegistryStore } from "./registry-store.mjs";
 import { reduceSessionState } from "./state-reducer.mjs";
@@ -22,6 +23,7 @@ const DEFAULT_MAX_BYTES = 1024 * 1024;
 const MAX_ATTACHMENT_REQUESTS = 4096;
 const DURABLE_COMMANDS = new Set(["prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response"]);
 const CONNECTOR_PATH = fileURLToPath(new URL("./daemon-connector.mjs", import.meta.url));
+const DEFAULT_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateMs: 5_000 });
 
 /** @param {unknown} value */
 function digest(value) {
@@ -165,6 +167,20 @@ async function createLaunchResultStore(path) {
 function validateWorkerSuccess(record, pending) {
   const allowed = ["clientId", "requestId", "op", "stage", "at", "result", "stderr"];
   if (typeof record !== "object" || record === null || Array.isArray(record) || Object.keys(record).some((key) => !allowed.includes(key)) || record.clientId !== pending.clientId || record.requestId !== pending.requestId || record.op !== pending.op || record.stage !== "RPC_ACKNOWLEDGED" || typeof record.at !== "string") throw Object.assign(new Error("Worker result does not match the pending durable command"), { code: "INVALID_WORKER_RESULT" });
+}
+
+/** @param {any} left @param {any} right */
+function sameProcessIdentity(left, right) {
+  return left?.pid === right?.pid && left?.startIdentity === right?.startIdentity && left?.processGroupId === right?.processGroupId;
+}
+
+/** Capture a regular, canonical session file identity without following a symlink replacement. */
+/** @param {string} path */
+async function inspectSessionFile(path) {
+  if (typeof path !== "string" || resolve(path) !== path) throw Object.assign(new Error("Session file path is not canonical"), { code: "SESSION_PATH_UNSAFE" });
+  const metadata = await fs.lstat(path);
+  if (!metadata.isFile() || metadata.isSymbolicLink() || await fs.realpath(path) !== path) throw Object.assign(new Error("Session file identity is unsafe"), { code: "SESSION_PATH_UNSAFE" });
+  return { path, dev: metadata.dev, ino: metadata.ino, size: metadata.size, mtimeMs: metadata.mtimeMs };
 }
 
 /** @param {any} error */
@@ -375,12 +391,19 @@ export async function createDaemonRuntime({
   responseWriter = async (/** @type {any} */ { value, write }) => write(value),
   closeFailpoint = async () => {},
   attachmentFailpoint = () => {},
+  destructiveFailpoint = async () => {},
+  stopPolicy = DEFAULT_STOP_POLICY,
+  signalProcessGroupImpl = signalProcessGroup,
+  sleepImpl = sleep,
+  trashSessionFile,
   broadcastEvent,
 } = {}) {
   if (typeof root !== "string" || resolve(root) !== root) throw new TypeError("Daemon runtime root must be an absolute canonical path");
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 128) throw new TypeError("maxBytes must be at least 128");
   if (typeof randomId !== "function") throw new TypeError("randomId must be a function");
-  if (typeof responseWriter !== "function" || typeof closeFailpoint !== "function" || typeof attachmentFailpoint !== "function") throw new TypeError("Daemon runtime seams must be functions");
+  if (typeof responseWriter !== "function" || typeof closeFailpoint !== "function" || typeof attachmentFailpoint !== "function" || typeof destructiveFailpoint !== "function" || typeof signalProcessGroupImpl !== "function" || typeof sleepImpl !== "function") throw new TypeError("Daemon runtime seams must be functions");
+  if (!Number.isSafeInteger(stopPolicy?.gracefulMs) || stopPolicy.gracefulMs <= 0 || !Number.isSafeInteger(stopPolicy?.terminateMs) || stopPolicy.terminateMs <= 0) throw new TypeError("stopPolicy must contain approved positive integer waits");
+  if (trashSessionFile !== undefined && typeof trashSessionFile !== "function") throw new TypeError("trashSessionFile must be a function when supplied");
   await ensureLayout(root);
   const daemonDirectory = join(root, "daemon");
   const tokenPath = join(daemonDirectory, "control.token");
@@ -404,6 +427,7 @@ export async function createDaemonRuntime({
     const stopRequested = new Promise((resolveStop) => { resolveStopRequested = resolveStop; });
     const recoveryController = new AbortController();
     const usedCommandIds = new Set();
+    const launchingSessions = new Set();
     /** @type {Map<string, Map<net.Socket, { clientId: string, role: "composer" | "observer" }>>} */
     const attachmentClaims = new Map();
     /** @type {Map<string, { serialized: string, promise: Promise<any> }>} */
@@ -640,8 +664,15 @@ export async function createDaemonRuntime({
           await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
           try {
             const launch = await resolveLaunchRequest(request);
-            const handle = await workerSupervisor.launch({ ...launch, daemonConnector: CONNECTOR_PATH, daemonConnectConfig: { socketPath: join(daemonDirectory, "control.sock"), tokenPath, maxBytes } });
-            await router.register(handle);
+            if (launchingSessions.has(launch.sessionId)) throw Object.assign(new Error("A launch is already in flight for this session"), { code: "LAUNCH_IN_FLIGHT" });
+            launchingSessions.add(launch.sessionId);
+            let handle;
+            try {
+              handle = await workerSupervisor.launch({ ...launch, daemonConnector: CONNECTOR_PATH, daemonConnectConfig: { socketPath: join(daemonDirectory, "control.sock"), tokenPath, maxBytes } });
+              await router.register(handle);
+            } finally {
+              launchingSessions.delete(launch.sessionId);
+            }
             const persisted = await context.launchResults.put(request, { sessionId: handle.sessionId });
             await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
             await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
@@ -657,6 +688,9 @@ export async function createDaemonRuntime({
           return context.arbitrateAttachment(request, socket, authenticatedClientId);
         }
         if (!DURABLE_COMMANDS.has(request.op)) throw Object.assign(new Error(`Unsupported daemon operation: ${request.op}`), { code: "UNSUPPORTED_OPERATION" });
+        if (["stop", "delete"].includes(request.op) && socket !== undefined && attachmentClaims.get(request.payload.sessionId)?.get(socket)?.role === "observer") {
+          throw Object.assign(new Error("Observers cannot stop or delete sessions"), { code: "OBSERVER_READ_ONLY" });
+        }
         const accepted = await context.recovery.journal.accept(request);
         let status = accepted;
         const changed = accepted.stage === "ACCEPTED";
@@ -664,28 +698,135 @@ export async function createDaemonRuntime({
           const route = router.route(request.payload.sessionId);
           const connection = route?.connection;
           const metadata = route?.metadata;
-          if (connection === undefined || metadata?.token === undefined) {
-            status = await context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("WORKER_UNAVAILABLE", "No exact recovered worker owns this session"));
-          } else if (["prompt", "steer", "follow_up", "interrupt"].includes(request.op)) {
-            const id = randomId();
-            if (typeof id !== "string" || id.length < 16 || usedCommandIds.has(id)) throw Object.assign(new Error("Command ID generator did not provide a unique restart-safe ID"), { code: "COMMAND_ID_COLLISION" });
-            usedCommandIds.add(id);
-            await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
-            const retryAtRisk = (await context.recovery.journal.history(request)).some((/** @type {any} */ prior) => prior.stage === "DELIVERY_UNKNOWN");
-            try {
-              await connection.request({ version: 1, type: "command", token: metadata.token, id, command: { clientId: request.clientId, requestId: request.requestId, op: request.op, text: request.payload.text, retryAtRisk } }, { clientId: request.clientId, requestId: request.requestId, op: request.op, durableRequest: request, metadata, routeGeneration: route.routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
-              await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-              status = await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
-            } catch (error) {
-              const deliveryError = /** @type {any} */ (error);
-              const current = await context.recovery.journal.get(request);
-              if (current?.stage !== "DELIVERY_ATTEMPTED") status = current;
-              else if (deliveryError?.delivered === true) {
+          if (["prompt", "steer", "follow_up", "interrupt"].includes(request.op)) {
+            if (connection === undefined || metadata?.token === undefined) {
+              status = await context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("WORKER_UNAVAILABLE", "No exact recovered worker owns this session"));
+            } else {
+              const id = randomId();
+              if (typeof id !== "string" || id.length < 16 || usedCommandIds.has(id)) throw Object.assign(new Error("Command ID generator did not provide a unique restart-safe ID"), { code: "COMMAND_ID_COLLISION" });
+              usedCommandIds.add(id);
+              await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
+              const retryAtRisk = (await context.recovery.journal.history(request)).some((/** @type {any} */ prior) => prior.stage === "DELIVERY_UNKNOWN");
+              try {
+                await connection.request({ version: 1, type: "command", token: metadata.token, id, command: { clientId: request.clientId, requestId: request.requestId, op: request.op, text: request.payload.text, retryAtRisk } }, { clientId: request.clientId, requestId: request.requestId, op: request.op, durableRequest: request, metadata, routeGeneration: route.routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
                 await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-                status = await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "FAILED", dashboardError(deliveryError.code ?? "RPC_FAILED", deliveryError.message));
-              } else status = await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
+                status = await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
+              } catch (error) {
+                const deliveryError = /** @type {any} */ (error);
+                const current = await context.recovery.journal.get(request);
+                if (current?.stage !== "DELIVERY_ATTEMPTED") status = current;
+                else if (deliveryError?.delivered === true) {
+                  await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
+                  status = await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "FAILED", dashboardError(deliveryError.code ?? "RPC_FAILED", deliveryError.message));
+                } else status = await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
+              }
             }
-          } else status = await context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("OPERATION_UNAVAILABLE", "Destructive worker workflow is not assembled in this task"));
+          } else if (request.op === "stop") {
+            const retryAtRisk = (await context.recovery.journal.history(request)).some((/** @type {any} */ prior) => prior.stage === "DELIVERY_UNKNOWN");
+            status = await router.runSession(request.payload.sessionId, async (/** @type {any} */ { metadata: lockedMetadata, route: lockedRoute, forget }) => {
+              const record = await registry.get(request.payload.sessionId);
+              if (record === undefined) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("SESSION_NOT_FOUND", "The exact session does not exist"));
+              const retryObservedTerminal = retryAtRisk && record.revision === request.payload.revision + 1 && record.ownership === undefined && record.processState === "EXITED";
+              if (record.revision !== request.payload.revision && !retryObservedTerminal) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("REVISION_CONFLICT", "Session revision changed before Stop"));
+              if (record.ownership === undefined || !["LIVE", "SLEEPING", "STALE"].includes(record.processState)) {
+                if (!retryAtRisk) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("SESSION_NOT_ACTIVE", "Stop requires current authoritative ownership"));
+                await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
+                await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
+                return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
+              }
+              if (lockedMetadata === undefined || lockedMetadata.runId !== record.ownership.runId || !sameProcessIdentity(lockedMetadata.identity, record.ownership.process)) {
+                return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("OWNERSHIP_CONFLICT", "Durable worker lease does not match the SessionRecord"));
+              }
+              await destructiveFailpoint("stop_before_delivery", request, record);
+              await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
+              const exactRecord = await registry.get(request.payload.sessionId);
+              if (exactRecord?.revision !== record.revision || exactRecord.ownership === undefined || !sameProcessIdentity(exactRecord.ownership.process, record.ownership.process)) {
+                await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
+                return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "FAILED", dashboardError("OWNERSHIP_CONFLICT", "Ownership changed at the signaling boundary"));
+              }
+              let disposition;
+              try {
+                disposition = await stopVerifiedProcessGroup(exactRecord.ownership.process, {
+                  inspect,
+                  requestGraceful: async () => { await lockedRoute?.connection.send({ version: 1, type: "shutdown", token: lockedMetadata.token }).catch(() => {}); },
+                  signalProcessGroup: signalProcessGroupImpl,
+                  sleep: sleepImpl,
+                }, stopPolicy);
+              } catch (error) {
+                const current = await context.recovery.journal.get(request);
+                if (current?.stage === "DELIVERY_ATTEMPTED") return context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
+                throw error;
+              }
+              const observedTerminal = ["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "KILLED"].includes(disposition.disposition);
+              if (["STALE_IDENTITY", "AMBIGUOUS_IDENTITY", "CANCELLED"].includes(disposition.disposition)) {
+                await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
+                return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "FAILED", dashboardError(disposition.disposition, `Stop refused at exact identity boundary: ${disposition.disposition}`));
+              }
+              if (observedTerminal) {
+                const latest = await registry.get(request.payload.sessionId);
+                if (latest?.revision === exactRecord.revision && latest.ownership?.runId === exactRecord.ownership.runId) {
+                  const updated = await registry.update(latest.sessionId, latest.revision, { ownership: undefined, processState: "EXITED", updatedAt: new Date().toISOString() });
+                  const event = await context.recovery.events.append({ kind: "session_changed", payload: { session: updated } });
+                  context.broadcast(event);
+                }
+                await forget();
+              }
+              await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
+              return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
+            });
+          } else if (request.op === "delete") {
+            const retryAtRisk = (await context.recovery.journal.history(request)).some((/** @type {any} */ prior) => prior.stage === "DELIVERY_UNKNOWN");
+            status = await router.runSession(request.payload.sessionId, (/** @type {any} */ { metadata: lockedMetadata, route: lockedRoute }) => context.serializeAttachment(request.payload.sessionId, async () => {
+              const record = await registry.get(request.payload.sessionId);
+              if (record === undefined) {
+                if (!retryAtRisk) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("SESSION_NOT_FOUND", "The exact session does not exist"));
+                await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
+                await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
+                return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
+              }
+              if (record.revision !== request.payload.revision) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("REVISION_CONFLICT", "Session revision changed before Delete"));
+              if (record.ownership !== undefined || ["LIVE", "SLEEPING"].includes(record.processState)) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("SESSION_LIVE", "Delete refuses a live or owned session"));
+              if (lockedMetadata !== undefined || lockedRoute !== undefined || launchingSessions.has(record.sessionId)) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("OWNERSHIP_CONFLICT", "A worker lease, route, or launch is still authoritative"));
+              if ((attachmentClaims.get(record.sessionId)?.size ?? 0) > 0) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("SESSION_ATTACHED", "Delete refuses an attached session"));
+              if (trashSessionFile === undefined) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("TRASH_CAPABILITY_UNAVAILABLE", "Pi exposes no approved public session-trash seam"));
+              let original;
+              try {
+                original = await inspectSessionFile(record.canonicalSessionFile);
+              } catch (error) {
+                const identityError = /** @type {any} */ (error);
+                if (retryAtRisk && identityError?.code === "ENOENT") {
+                  await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
+                  await registry.remove(record.sessionId, record.revision);
+                  await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
+                  return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
+                }
+                return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError(identityError?.code ?? "SESSION_PATH_UNSAFE", error instanceof Error ? error.message : "Session file identity is unsafe"));
+              }
+              await destructiveFailpoint("delete_before_identity_recheck", request, record);
+              const currentIdentity = await inspectSessionFile(record.canonicalSessionFile);
+              if (JSON.stringify(currentIdentity) !== JSON.stringify(original)) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("SESSION_IDENTITY_MISMATCH", "Session file was replaced before trash"));
+              const exactRecord = await registry.get(record.sessionId);
+              if (exactRecord?.revision !== record.revision || exactRecord.ownership !== undefined || ["LIVE", "SLEEPING"].includes(exactRecord.processState) || exactRecord.canonicalSessionFile !== record.canonicalSessionFile || lockedMetadata !== undefined || lockedRoute !== undefined || launchingSessions.has(record.sessionId) || (attachmentClaims.get(record.sessionId)?.size ?? 0) > 0) {
+                return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("DELETE_REVALIDATION_FAILED", "Session ownership, attachment, launch, state, or revision changed before trash"));
+              }
+              await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
+              try {
+                await trashSessionFile(record.canonicalSessionFile, original);
+                await fs.lstat(record.canonicalSessionFile).then(() => { throw Object.assign(new Error("Trash seam left the original session file in place"), { code: "TRASH_FAILED" }); }, (error) => { if (error?.code !== "ENOENT") throw error; });
+                await destructiveFailpoint("delete_after_trash", request, record);
+                await registry.remove(record.sessionId, record.revision);
+                await destructiveFailpoint("delete_after_registry", request, record);
+              } catch (error) {
+                const current = await context.recovery.journal.get(request);
+                if (current?.stage === "DELIVERY_ATTEMPTED") return context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
+                throw error;
+              }
+              const event = await context.recovery.events.append({ kind: "session_deleted", payload: { sessionId: record.sessionId, revision: record.revision } });
+              context.broadcast(event);
+              await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
+              return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
+            }));
+          }
         }
         if (changed) {
           const event = await context.recovery.events.append({ kind: "command_changed", payload: { status } });

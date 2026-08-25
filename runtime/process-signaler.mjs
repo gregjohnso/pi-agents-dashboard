@@ -131,6 +131,16 @@ export async function stopVerifiedProcessGroup(ownership, deps, policy) {
   if (cancelled()) {
     return { disposition: "CANCELLED" };
   }
-  await deps.signalProcessGroup(ownership.processGroupId, "SIGKILL");
-  return { disposition: "KILLED" };
+  try {
+    await deps.signalProcessGroup(ownership.processGroupId, "SIGKILL");
+  } catch (error) {
+    if (error instanceof Error && ["ENOENT", "ESRCH"].includes(/** @type {NodeJS.ErrnoException} */ (error).code ?? "")) {
+      return { disposition: "KILLED" };
+    }
+    throw error;
+  }
+  const observed = await inspect();
+  if (observed === "EXITED") return { disposition: "KILLED" };
+  if (observed === "MATCH") return { disposition: "KILL_REQUESTED" };
+  return { disposition: observed };
 }

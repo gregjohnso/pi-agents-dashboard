@@ -34,12 +34,15 @@ import {
 } from "./dashboard-layout.js";
 import type { DaemonClient } from "./daemon-client.js";
 import {
+  confirmationMatchesSession,
   createDeliveryUnknownOverlay,
   createHelpOverlay,
   createMetadataOverlay,
+  createSessionConfirmation,
   createSessionIntent,
   createSharedDirectoryOverlay,
   type DashboardOverlay,
+  type SessionConfirmation,
   type SessionIntent,
 } from "./dashboard-overlays.js";
 import {
@@ -82,8 +85,8 @@ export interface DashboardBackend {
   preflightLaunch(draft: LaunchDraft, signal?: AbortSignal): Promise<LaunchPreflight>;
   launch(request: LaunchRequest, requestId?: string, signal?: AbortSignal): Promise<LaunchOutcome>;
   resolveDelivery(clientId: string, requestId: string, resolution: DeliveryResolution, signal?: AbortSignal): Promise<void>;
-  stop(sessionId: string, requestId: string, signal?: AbortSignal): Promise<void>;
-  delete(sessionId: string, requestId: string, signal?: AbortSignal): Promise<void>;
+  stop(sessionId: string, revision: number, requestId: string, signal?: AbortSignal): Promise<void>;
+  delete(sessionId: string, revision: number, requestId: string, signal?: AbortSignal): Promise<void>;
 }
 
 export interface PersistedDashboardState {
@@ -191,6 +194,8 @@ export function createDaemonDashboardBackend({
             if (!cursorAfter(acknowledged, event.cursor)) continue;
             if (event.kind === "session_changed") {
               sessions.set(event.payload.session.sessionId, event.payload.session);
+            } else if (event.kind === "session_deleted") {
+              sessions.delete(event.payload.sessionId);
             }
             await listener({ snapshot: { sessions: [...sessions.values()] }, cursor: event.cursor, event });
             const response = await request("ack", { cursor: event.cursor });
@@ -230,13 +235,19 @@ export function createDaemonDashboardBackend({
       const response = await request("resolve_delivery", { targetClientId, targetRequestId, resolution });
       if (!response.ok) throw Object.assign(new Error(response.error.message), response.error);
     },
-    async stop(sessionId, exactRequestId) {
-      const response = await request("stop", { sessionId }, exactRequestId);
+    async stop(sessionId, revision, exactRequestId) {
+      const response = await request("stop", { sessionId, revision }, exactRequestId);
       if (!response.ok) throw Object.assign(new Error(response.error.message), response.error);
+      if (response.result.kind === "command" && response.result.status.stage === "DELIVERY_UNKNOWN") {
+        throw Object.assign(new Error("Stop delivery is ambiguous"), { code: "DELIVERY_UNKNOWN", clientId: response.result.status.clientId, requestId: response.result.status.requestId });
+      }
     },
-    async delete(sessionId, exactRequestId) {
-      const response = await request("delete", { sessionId }, exactRequestId);
+    async delete(sessionId, revision, exactRequestId) {
+      const response = await request("delete", { sessionId, revision }, exactRequestId);
       if (!response.ok) throw Object.assign(new Error(response.error.message), response.error);
+      if (response.result.kind === "command" && response.result.status.stage === "DELIVERY_UNKNOWN") {
+        throw Object.assign(new Error("Delete delivery is ambiguous"), { code: "DELIVERY_UNKNOWN", clientId: response.result.status.clientId, requestId: response.result.status.requestId });
+      }
     },
   };
 }
@@ -404,7 +415,10 @@ export class DashboardController {
     this.preferredSelectionId = sessionId;
     const selected = this.list.selectSession(sessionId);
     this.ensureSelectionVisible();
-    if (selected) this.scheduleUiSave();
+    if (selected) {
+      this.invalidateSessionConfirmation();
+      this.scheduleUiSave();
+    }
     return selected;
   }
 
@@ -514,6 +528,36 @@ export class DashboardController {
     this.overlay = undefined;
   }
 
+  private async confirmSession(confirmation: SessionConfirmation): Promise<void> {
+    if (confirmation.submitting || this.attachmentRole === "observer") return;
+    const selected = this.selectedSession();
+    if (!confirmationMatchesSession(confirmation, selected)) {
+      this.overlay = undefined;
+      return;
+    }
+    const requestId = this.requestId();
+    this.overlay = { ...confirmation, submitting: true };
+    try {
+      await this.backend[confirmation.action](confirmation.sessionId, confirmation.revision, requestId);
+      if (confirmation.action === "stop") {
+        this.setView("all");
+        this.selectSession(confirmation.sessionId);
+      }
+      if (this.overlay?.kind === "session_confirmation" && this.overlay.sessionId === confirmation.sessionId) {
+        this.overlay = undefined;
+      }
+      this.status = { kind: "ready" };
+    } catch (error) {
+      const typed = error as { code?: string; message?: string; clientId?: string; requestId?: string };
+      if (typed.code === "DELIVERY_UNKNOWN") {
+        this.overlay = createDeliveryUnknownOverlay(typed.clientId ?? this.clientId, typed.requestId ?? requestId);
+      } else {
+        this.overlay = undefined;
+        this.setError(error, `${confirmation.action.toUpperCase()}_FAILED`);
+      }
+    }
+  }
+
   async activateSelection(): Promise<void> {
     const selected = this.selectedSession();
     if (selected === undefined) return;
@@ -530,6 +574,17 @@ export class DashboardController {
   }
 
   handleInput(data: string): void {
+    if (this.overlay?.kind === "session_confirmation") {
+      if (this.overlay.submitting) return;
+      if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c")) || data.toLowerCase() === "n") {
+        this.overlay = undefined;
+        return;
+      }
+      if (matchesKey(data, Key.enter) || data.toLowerCase() === "y") {
+        void this.confirmSession(this.overlay);
+      }
+      return;
+    }
     if (this.focus === "confirmation") {
       if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
         this.focus = "composer";
@@ -604,7 +659,10 @@ export class DashboardController {
     if (matchesKey(data, Key.ctrl("x"))) {
       if (this.attachmentRole === "observer") return;
       const selected = this.selectedSession();
-      if (selected !== undefined) this.onSessionIntent?.(createSessionIntent(selected));
+      if (selected !== undefined) {
+        this.overlay = createSessionConfirmation(selected);
+        this.onSessionIntent?.(createSessionIntent(selected));
+      }
       return;
     }
     if (matchesKey(data, Key.enter) || matchesKey(data, Key.right)) {
@@ -712,6 +770,13 @@ export class DashboardController {
   private applySnapshot(snapshot: DashboardSnapshot): void {
     this.sessions = snapshot.sessions;
     this.rebuildList();
+    this.invalidateSessionConfirmation();
+  }
+
+  private invalidateSessionConfirmation(): void {
+    if (this.overlay?.kind === "session_confirmation" && !confirmationMatchesSession(this.overlay, this.selectedSession())) {
+      this.overlay = undefined;
+    }
   }
 
   private rebuildList(): void {
@@ -861,6 +926,7 @@ export class DashboardController {
     if (overlay.kind === "metadata") details = Object.entries(overlay.fields).map(([key, value]) => `${key}: ${value}`);
     else if (overlay.kind === "help") details = overlay.bindings.map((binding) => `${binding.keys}  ${binding.action}`);
     else if (overlay.kind === "shared_directory_confirmation") details = ["Shared directory warning", `Type exactly: ${overlay.canonicalCwd}`, `> ${this.confirmationText}`];
+    else if (overlay.kind === "session_confirmation") details = [`Confirm ${overlay.action.toUpperCase()} for ${overlay.sessionId}?`, overlay.submitting ? "Submitting…" : "Press y/Enter to confirm; n/Escape to cancel."];
     else details = ["DELIVERY_UNKNOWN", "Choose retry_at_risk or abandon; no automatic retry."];
     const start = Math.max(0, Math.floor((lines.length - details.length) / 2));
     details.forEach((detail, index) => { if (start + index < lines.length) lines[start + index] = detail; });

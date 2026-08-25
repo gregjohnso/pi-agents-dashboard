@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 
 import { runDaemonCommand } from "./daemon-commands.mjs";
 import { runPackageCommand } from "./package-commands.mjs";
+import { runSessionCommand } from "./session-commands.mjs";
 
 async function defaultHostProbe() {
   const module = await import("../extensions/agents-dashboard/compatibility.ts");
@@ -24,8 +25,11 @@ export async function runCli(argv = process.argv.slice(2), deps = {}) {
   let result;
   try {
     if (args[0] === "daemon") {
-      if (args.length !== 2) result = { code: 2, error: { code: "INVALID_SYNTAX", message: "Usage: pi-agents-dashboard daemon start|status|restart|recover|stop" } };
-      else result = await (deps.runDaemonCommand ?? runDaemonCommand)(args[1], deps.daemonOptions);
+      const stopWorkers = args[1] === "stop" && args.length === 4 && args.includes("--stop-workers") && args.includes("--yes");
+      if (args.length !== 2 && !stopWorkers) result = { code: 2, error: { code: "INVALID_SYNTAX", message: "Usage: pi-agents-dashboard daemon start|status|restart|recover|stop [--stop-workers --yes]" } };
+      else result = await (deps.runDaemonCommand ?? runDaemonCommand)(args[1], stopWorkers ? { ...deps.daemonOptions, stopWorkers: true, yes: true } : deps.daemonOptions);
+    } else if (args[0] === "session") {
+      result = await (deps.runSessionCommand ?? runSessionCommand)(args.slice(1), deps.sessionOptions);
     } else if ((args[0] === "install" || args[0] === "uninstall") && args.length === 1) {
       result = await (deps.runPackageCommand ?? runPackageCommand)(args[0], deps.packageOptions);
     } else if ((args[0] === "doctor" || args[0] === "run") && args.length === 1) {
@@ -35,7 +39,7 @@ export async function runCli(argv = process.argv.slice(2), deps = {}) {
       else if (args[0] === "run") result = { code: 1, error: { code: "RUN_UNAVAILABLE", message: "Daemon-backed product launch is not exposed by this CLI task" }, result: { kind: "host_capabilities", report } };
       else result = { code: 0, result: { kind: "host_capabilities", report } };
     } else {
-      result = { code: 2, error: { code: "INVALID_SYNTAX", message: "Expected daemon, doctor, install, uninstall, or run" } };
+      result = { code: 2, error: { code: "INVALID_SYNTAX", message: "Expected daemon, session, doctor, install, uninstall, or run" } };
     }
   } catch (error) {
     const conflictCodes = new Set(["OWNERSHIP_CONFLICT", "AMBIGUOUS_IDENTITY", "DAEMON_IDENTITY_CONFLICT", "PROCESS_IDENTITY_CONFLICT", "STALE_LEASE"]);

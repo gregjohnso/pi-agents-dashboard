@@ -9,6 +9,7 @@ import { cleanupStaleDaemon, inspectDaemonEndpoint } from "../runtime/daemon-lif
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
 import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "../runtime/process-signaler.mjs";
+import { createDaemonRequester } from "./session-commands.mjs";
 
 const STATUS_CODES = { HEALTHY: 0, UNHEALTHY: 1, STALE: 1, ABSENT: 3, CONFLICT: 5 };
 const DEFAULT_STOP_POLICY = Object.freeze({ gracefulMs: 500, terminateMs: 500 });
@@ -127,6 +128,17 @@ export async function runDaemonCommand(command, options = {}) {
     const current = await inspectEndpoint(common);
     if (current.status === "ABSENT") return { code: 3, error: { code: "DAEMON_ABSENT", message: "Daemon is not running" } };
     if (current.status !== "HEALTHY") return { code: current.status === "CONFLICT" ? 5 : 1, error: { code: "STOP_REFUSED", message: "Daemon identity is not healthy and exact" } };
+    const request = options.request ?? createDaemonRequester({ root });
+    const state = await request("get_state", {});
+    const liveSessions = state.sessions.filter((record) => record.ownership !== undefined || ["LIVE", "SLEEPING"].includes(record.processState));
+    if (liveSessions.length > 0 && options.allowLiveWorkers !== true && (options.stopWorkers !== true || options.yes !== true)) {
+      return { code: 1, error: { code: "WORKERS_LIVE", message: "Daemon stop requires --stop-workers --yes while workers are live" }, result: { kind: "live_workers", sessionIds: liveSessions.map((record) => record.sessionId) } };
+    }
+    if (liveSessions.length > 0 && options.stopWorkers === true) {
+      const outcomes = await Promise.all(liveSessions.map((record) => request("stop", { sessionId: record.sessionId, revision: record.revision })));
+      const refused = outcomes.find((outcome) => outcome?.kind !== "command" || outcome.status?.stage !== "COMPLETED");
+      if (refused !== undefined) return { code: 1, error: { code: refused?.status?.stage === "DELIVERY_UNKNOWN" ? "DELIVERY_UNKNOWN" : "WORKER_STOP_REFUSED", message: "A worker stop did not complete; daemon remains running" }, result: refused };
+    }
     const ownership = { pid: current.publication.pid, startIdentity: current.publication.startIdentity, processGroupId: current.publication.processGroupId };
     const stop = options.stopProcessGroup ?? stopVerifiedProcessGroup;
     const disposition = await stop(ownership, {
@@ -150,7 +162,7 @@ export async function runDaemonCommand(command, options = {}) {
   if (command === "restart") {
     const current = await inspectEndpoint(common);
     if (current.status === "HEALTHY") {
-      const stopped = await runDaemonCommand("stop", { ...options, root });
+      const stopped = await runDaemonCommand("stop", { ...options, root, allowLiveWorkers: true });
       if (stopped.code !== 0) return stopped;
     } else if (current.status !== "ABSENT") return { code: current.status === "CONFLICT" ? 5 : 1, error: { code: "RESTART_REFUSED", message: "Daemon endpoint requires explicit recovery" } };
     return runDaemonCommand("start", { ...options, root });

@@ -212,7 +212,7 @@ async function assertClean(worktreePath) {
  * @param {any} record
  * @param {{ readLiveOwnership: () => unknown | Promise<unknown> }} options
  */
-export async function cleanupOwnedWorktree(record, options) {
+export async function cleanupManagedWorktree(record, options) {
   validateRecord(record);
   if (typeof options?.readLiveOwnership !== "function") {
     throw new TypeError("readLiveOwnership must be a function");
@@ -293,3 +293,5 @@ export async function cleanupOwnedWorktree(record, options) {
     await lock.release();
   }
 }
+
+export const cleanupOwnedWorktree = cleanupManagedWorktree;

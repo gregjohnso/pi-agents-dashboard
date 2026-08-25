@@ -168,6 +168,30 @@ export class RecoveredWorkerRouter {
     return this.#routes.get(sessionId);
   }
 
+  /** Serialize a daemon lifecycle action with route adoption, replacement, and worker frames. @param {string} sessionId @param {(state: any) => Promise<any>} action */
+  runSession(sessionId, action) {
+    return this.#serializeRoute(sessionId, async () => {
+      const metadata = this.#workers.get(sessionId);
+      const route = this.#routes.get(sessionId);
+      let forgotten = false;
+      return action({
+        metadata,
+        route,
+        forget: async () => {
+          if (forgotten) return;
+          if (this.#workers.get(sessionId) !== metadata || this.#routes.get(sessionId) !== route) {
+            throw Object.assign(new Error("Worker route changed during lifecycle action"), { code: "STALE_WORKER_CONNECTION" });
+          }
+          forgotten = true;
+          this.#workers.delete(sessionId);
+          this.#routes.delete(sessionId);
+          await this.#persist();
+          route?.connection.close?.();
+        },
+      });
+    });
+  }
+
   /** @param {any} metadata @param {any} connection @param {number} routeGeneration */
   #assertRoute(metadata, connection, routeGeneration) {
     const route = this.#routes.get(metadata?.sessionId);

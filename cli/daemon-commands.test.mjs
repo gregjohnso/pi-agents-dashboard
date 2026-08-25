@@ -22,6 +22,7 @@ it("stops only through the verified daemon process-group boundary", async () => 
     root: "/state",
     inspect: async () => publication,
     inspectEndpoint: async () => endpoints.shift() ?? { status: "ABSENT" },
+    request: async () => ({ kind: "state", sessions: [] }),
     stopProcessGroup: async (ownership, deps, policy) => {
       calls.push({ ownership, policy });
       await deps.requestGraceful(ownership);
@@ -50,6 +51,7 @@ it("maps stop identity ambiguity and recovery conflict to exit 5 without signali
   const result = await runDaemonCommand("stop", {
     root: "/state",
     inspectEndpoint: async () => ({ status: "HEALTHY", daemonState: "READY", publication }),
+    request: async () => ({ kind: "state", sessions: [] }),
     stopProcessGroup: async () => ({ disposition: "STALE_IDENTITY" }),
   });
   expect(result).toMatchObject({ code: 5, error: { code: "DAEMON_IDENTITY_CONFLICT" } });

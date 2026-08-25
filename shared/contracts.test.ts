@@ -46,8 +46,8 @@ describe("parseClientRequest", () => {
       { ...envelope, op: "steer", payload: { sessionId: "session-1", text: "change course" } },
       { ...envelope, op: "follow_up", payload: { sessionId: "session-1", text: "also check" } },
       { ...envelope, op: "interrupt", payload: { sessionId: "session-1" } },
-      { ...envelope, op: "stop", payload: { sessionId: "session-1" } },
-      { ...envelope, op: "delete", payload: { sessionId: "session-1" } },
+      { ...envelope, op: "stop", payload: { sessionId: "session-1", revision: 7 } },
+      { ...envelope, op: "delete", payload: { sessionId: "session-1", revision: 7 } },
       {
         ...envelope,
         op: "ui_response",
@@ -107,14 +107,14 @@ describe("parseClientRequest", () => {
       parseClientRequest({
         ...envelope,
         op: "stop",
-        payload: { sessionId: "session-1", processGroupId: 1234 },
+        payload: { sessionId: "session-1", revision: 7, processGroupId: 1234 },
       }),
     ).toThrowError(/processGroupId/);
     expect(() =>
       parseClientRequest({
         ...envelope,
         op: "delete",
-        payload: { sessionId: "session-1", sessionFile: "/tmp/session.jsonl" },
+        payload: { sessionId: "session-1", revision: 7, sessionFile: "/tmp/session.jsonl" },
       }),
     ).toThrowError(/sessionFile/);
     expect(() =>
@@ -129,6 +129,9 @@ describe("parseClientRequest", () => {
     expect(() =>
       parseClientRequest({ ...envelope, op: "attach", payload: { sessionId: "session-1" } }),
     ).toThrowError(/role/);
+    expect(() =>
+      parseClientRequest({ ...envelope, op: "stop", payload: { sessionId: "session-1" } }),
+    ).toThrowError(/revision/);
     expect(() =>
       parseClientRequest({
         ...envelope,

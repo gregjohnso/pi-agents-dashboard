@@ -289,6 +289,31 @@ export class RegistryStore {
     });
   }
 
+  /** Remove one exact inactive record after a compare-and-swap revision check. @param {string} sessionId @param {number} expectedRevision */
+  async remove(sessionId, expectedRevision) {
+    validateSessionId(sessionId);
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
+      throw new TypeError("expectedRevision must be a non-negative integer");
+    }
+    return this.#coordinator.run(CREATE_COORDINATION_KEY, () =>
+      this.#coordinator.run(sessionId, async () => {
+        const current = await this.get(sessionId);
+        if (current === undefined) return undefined;
+        if (current.revision !== expectedRevision) {
+          throw new RegistryRevisionError(sessionId, expectedRevision, current.revision);
+        }
+        await this.#fsOps.unlink(this.#path(sessionId));
+        const directory = await this.#fsOps.open(this.#sessionsDirectory, "r");
+        try {
+          await directory.sync();
+        } finally {
+          await directory.close();
+        }
+        return current;
+      }),
+    );
+  }
+
   /** @param {string} sessionId @param {number} expectedRevision @param {Partial<SessionRecord>} update */
   async update(sessionId, expectedRevision, update) {
     validateSessionId(sessionId);

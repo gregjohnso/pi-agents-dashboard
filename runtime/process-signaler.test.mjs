@@ -45,8 +45,9 @@ it("refuses escalation before any action when process identity changes", async (
 it("uses approved waits and signals only the exact recorded process group", async () => {
   const aliveGroups = new Set([ownership.processGroupId, 777]);
   const signaler = createFakeSignaler(aliveGroups);
+  const exited = Object.assign(new Error("gone"), { code: "ESRCH" });
   const { deps, sleeper } = dependencies(
-    [ownership, ownership, ownership, ownership],
+    [ownership, ownership, ownership, ownership, exited],
     { signaler },
   );
 
@@ -62,6 +63,15 @@ it("uses approved waits and signals only the exact recorded process group", asyn
   expect(sleeper.calls).toEqual([123, 456]);
   expect(aliveGroups.has(ownership.processGroupId)).toBe(false);
   expect(aliveGroups.has(777)).toBe(true);
+});
+
+it("reports KILL as requested, not observed, while the exact identity remains visible", async () => {
+  const { deps, signaler } = dependencies([ownership, ownership, ownership, ownership, ownership]);
+
+  await expect(stopVerifiedProcessGroup(ownership, deps, policy)).resolves.toEqual({
+    disposition: "KILL_REQUESTED",
+  });
+  expect(signaler.calls.at(-1)).toEqual({ type: "signal", pgid: ownership.processGroupId, signal: "SIGKILL" });
 });
 
 it("revalidates after TERM and refuses KILL when the PID was reused", async () => {

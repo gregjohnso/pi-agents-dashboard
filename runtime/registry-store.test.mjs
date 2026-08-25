@@ -57,6 +57,16 @@ it("creates and lists imported records with Task 5 canonical identity unchanged"
   expect((await fs.stat(join(sessions, "imported.json"))).mode & 0o777).toBe(0o600);
 });
 
+it("removes only the exact compare-and-swap revision", async () => {
+  const { sessions, store } = await makeRegistry();
+  await store.create(record("remove-me"));
+  await expect(store.remove("remove-me", 1)).rejects.toMatchObject({ code: "REVISION_CONFLICT" });
+  await expect(store.get("remove-me")).resolves.toBeDefined();
+  await expect(store.remove("remove-me", 0)).resolves.toMatchObject({ sessionId: "remove-me" });
+  await expect(store.get("remove-me")).resolves.toBeUndefined();
+  await expect(fs.access(join(sessions, "remove-me.json"))).rejects.toMatchObject({ code: "ENOENT" });
+});
+
 it("uses compare-and-swap revisions and retains canonical session identity", async () => {
   const { store } = await makeRegistry();
   await store.create(record("one"));

@@ -224,15 +224,63 @@ describe("dashboard controller", () => {
     expect(dashboard.status).toMatchObject({ kind: "error", code: "UNSUPPORTED_HOST" });
   });
 
-  it("routes Ctrl+X to a typed non-destructive intent without backend mutation", async () => {
-    const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
+  it("confirms Ctrl+X against the exact selected revision and invalidates on change", async () => {
+    const backend = new FakeBackend([session("a", { processState: "LIVE" }), session("b", { processState: "EXITED" })]);
     const onSessionIntent = vi.fn();
-    const dashboard = controller(backend, { onSessionIntent });
+    const dashboard = controller(backend, { onSessionIntent, requestId: () => "destructive-request" });
+    await dashboard.open();
+
+    dashboard.handleInput("\x18");
+    expect(dashboard.overlay).toEqual({ kind: "session_confirmation", action: "stop", sessionId: "a", revision: 1, submitting: false });
+    expect(backend.stop).not.toHaveBeenCalled();
+    dashboard.handleInput("n");
+    expect(dashboard.overlay).toBeUndefined();
+    expect(backend.stop).not.toHaveBeenCalled();
+
+    dashboard.handleInput("\x18");
+    await processRenderedEvent(dashboard, backend, { snapshot: { sessions: [session("a", { revision: 2, processState: "LIVE" }), session("b", { processState: "EXITED" })] }, cursor: { daemonEpoch: "epoch", sequence: "1" } });
+    expect(dashboard.overlay).toBeUndefined();
+
+    dashboard.setView("all");
+    dashboard.selectSession("b");
+    dashboard.handleInput("\x18");
+    expect(dashboard.overlay).toMatchObject({ action: "delete", sessionId: "b", revision: 1 });
+    dashboard.handleInput("y");
+    await vi.waitFor(() => expect(backend.delete).toHaveBeenCalledWith("b", 1, "destructive-request"));
+    expect(dashboard.selectedSessionId).toBe("b");
+    expect(onSessionIntent).toHaveBeenCalledWith({ kind: "session_intent", action: "delete", sessionId: "b", revision: 1 });
+  });
+
+  it("keeps a successfully stopped row selected and requires a later Delete confirmation", async () => {
+    const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
+    const dashboard = controller(backend, { requestId: () => "stop-request" });
     await dashboard.open();
     dashboard.handleInput("\x18");
-    expect(onSessionIntent).toHaveBeenCalledWith({ kind: "session_intent", action: "stop", sessionId: "a", revision: 1 });
-    expect(backend.stop).not.toHaveBeenCalled();
-    expect(backend.delete).not.toHaveBeenCalled();
+    dashboard.handleInput("y");
+    await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledWith("a", 1, "stop-request"));
+    await processRenderedEvent(dashboard, backend, { snapshot: { sessions: [session("a", { revision: 2, processState: "EXITED" })] }, cursor: { daemonEpoch: "epoch", sequence: "2" } });
+    expect(dashboard.selectedSessionId).toBe("a");
+    dashboard.handleInput("\x18");
+    expect(dashboard.overlay).toMatchObject({ action: "delete", sessionId: "a", revision: 2 });
+  });
+
+  it("blocks observer confirmation and ignores repeated Ctrl+X while submitting", async () => {
+    let release: (() => void) | undefined;
+    const backend = new FakeBackend([session("a")]);
+    backend.stop = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
+    const dashboard = controller(backend);
+    await dashboard.open();
+    dashboard.handleInput("\x18");
+    dashboard.handleInput("y");
+    dashboard.handleInput("\x18");
+    expect(backend.stop).toHaveBeenCalledTimes(1);
+    release?.();
+
+    const observer = controller(new FakeBackend([session("a")]));
+    await observer.open();
+    observer.attachmentRole = "observer";
+    observer.handleInput("\x18");
+    expect(observer.overlay).toBeUndefined();
   });
 
   it("closes and surfaces a typed malformed-frame state without signaling workers", async () => {

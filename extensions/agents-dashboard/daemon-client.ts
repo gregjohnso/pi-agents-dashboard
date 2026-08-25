@@ -185,11 +185,15 @@ function parsePersistedEvent(value: unknown): PersistedEvent {
   if (event.version !== 1) throw new TypeError("Persisted event version must be 1");
   validateCursor(event.cursor, "persisted event.cursor");
   readString(event, "occurredAt", "persisted event");
-  const kind = readEnum(event, "kind", ["session_changed", "command_changed", "attachment_changed"] as const, "persisted event");
+  const kind = readEnum(event, "kind", ["session_changed", "session_deleted", "command_changed", "attachment_changed"] as const, "persisted event");
   const payload = readRecord(event.payload, "persisted event.payload");
   if (kind === "session_changed") {
     requireKeys(payload, ["session"], [], "persisted event.payload");
     validateSession(payload.session, "persisted event.payload.session");
+  } else if (kind === "session_deleted") {
+    requireKeys(payload, ["sessionId", "revision"], [], "persisted event.payload");
+    readString(payload, "sessionId", "persisted event.payload");
+    if (!Number.isSafeInteger(payload.revision) || (payload.revision as number) < 0) throw new TypeError("persisted event.payload.revision must be a non-negative integer");
   } else if (kind === "command_changed") {
     requireKeys(payload, ["status"], [], "persisted event.payload");
     validateCommandStatus(payload.status, "persisted event.payload.status");

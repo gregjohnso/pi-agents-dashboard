@@ -97,6 +97,7 @@ type RequestEnvelope<Operation extends string, Payload> = {
 
 type EmptyPayload = Record<string, never>;
 type SessionPayload = { sessionId: string };
+type DestructiveSessionPayload = { sessionId: string; revision: number };
 type TextPayload = { sessionId: string; text: string };
 
 export type ClientRequest =
@@ -108,8 +109,8 @@ export type ClientRequest =
   | RequestEnvelope<"steer", TextPayload>
   | RequestEnvelope<"follow_up", TextPayload>
   | RequestEnvelope<"interrupt", SessionPayload>
-  | RequestEnvelope<"stop", SessionPayload>
-  | RequestEnvelope<"delete", SessionPayload>
+  | RequestEnvelope<"stop", DestructiveSessionPayload>
+  | RequestEnvelope<"delete", DestructiveSessionPayload>
   | RequestEnvelope<
       "ui_response",
       { sessionId: string; uiRequestId: string; response: JsonValue }
@@ -151,6 +152,7 @@ interface PersistedEventEnvelope<Kind extends string, Payload> {
 
 export type PersistedEvent =
   | PersistedEventEnvelope<"session_changed", { session: SessionRecord }>
+  | PersistedEventEnvelope<"session_deleted", { sessionId: string; revision: number }>
   | PersistedEventEnvelope<"command_changed", { status: CommandStatus }>
   | PersistedEventEnvelope<
       "attachment_changed",
@@ -327,6 +329,18 @@ function readSessionPayload(value: unknown, operation: string): SessionPayload {
   return { sessionId: readIdentifier(payload, "sessionId", `${operation} payload.sessionId`) };
 }
 
+function readDestructiveSessionPayload(value: unknown, operation: string): DestructiveSessionPayload {
+  const payload = readRecord(value, `${operation} payload`);
+  rejectUnknownKeys(payload, ["sessionId", "revision"], `${operation} payload`);
+  if (!Number.isSafeInteger(payload.revision) || (payload.revision as number) < 0) {
+    throw new TypeError(`${operation} payload.revision must be a non-negative safe integer`);
+  }
+  return {
+    sessionId: readIdentifier(payload, "sessionId", `${operation} payload.sessionId`),
+    revision: payload.revision as number,
+  };
+}
+
 function readTextPayload(value: unknown, operation: string): TextPayload {
   const payload = readRecord(value, `${operation} payload`);
   rejectUnknownKeys(payload, ["sessionId", "text"], `${operation} payload`);
@@ -367,9 +381,10 @@ export function parseClientRequest(value: unknown): ClientRequest {
     }
     case "detach":
     case "interrupt":
+      return { ...base, op, payload: readSessionPayload(request.payload, op) };
     case "stop":
     case "delete":
-      return { ...base, op, payload: readSessionPayload(request.payload, op) };
+      return { ...base, op, payload: readDestructiveSessionPayload(request.payload, op) };
     case "prompt":
     case "steer":
     case "follow_up":

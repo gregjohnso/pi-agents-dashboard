@@ -36,6 +36,14 @@ export interface SessionIntent {
   revision: number;
 }
 
+export interface SessionConfirmation {
+  kind: "session_confirmation";
+  action: SessionIntent["action"];
+  sessionId: string;
+  revision: number;
+  submitting: boolean;
+}
+
 export interface DeliveryUnknownOverlay {
   kind: "delivery_unknown";
   clientId: string;
@@ -47,6 +55,7 @@ export type DashboardOverlay =
   | MetadataOverlay
   | HelpOverlay
   | SharedDirectoryOverlay
+  | SessionConfirmation
   | DeliveryUnknownOverlay;
 
 /** Describe one selected session without collapsing independent state fields. */
@@ -97,14 +106,43 @@ export function createSharedDirectoryOverlay(
   };
 }
 
+function destructiveAction(session: SessionRecord): SessionIntent["action"] {
+  return session.processState === "LIVE" || session.processState === "SLEEPING" ||
+    (session.processState === "STALE" && session.ownership !== undefined)
+    ? "stop"
+    : "delete";
+}
+
 /** Return a typed Task 15 intent; this function performs no destructive action. */
 export function createSessionIntent(session: SessionRecord): SessionIntent {
   return {
     kind: "session_intent",
-    action: session.processState === "LIVE" ? "stop" : "delete",
+    action: destructiveAction(session),
     sessionId: session.sessionId,
     revision: session.revision,
   };
+}
+
+/** Bind confirmation to one canonical session revision and requested action. */
+export function createSessionConfirmation(session: SessionRecord): SessionConfirmation {
+  return {
+    kind: "session_confirmation",
+    action: destructiveAction(session),
+    sessionId: session.sessionId,
+    revision: session.revision,
+    submitting: false,
+  };
+}
+
+/** Check that a confirmation still names the selected record and same action. */
+export function confirmationMatchesSession(
+  confirmation: SessionConfirmation,
+  session: SessionRecord | undefined,
+): boolean {
+  return session !== undefined &&
+    confirmation.sessionId === session.sessionId &&
+    confirmation.revision === session.revision &&
+    confirmation.action === destructiveAction(session);
 }
 
 /** Return explicit resolution choices for an ambiguous durable command. */

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 
+import { acquireWorktreeOwnershipLock } from "../isolation/worktree.mjs";
 import { registryCoordinationScope } from "./registry-store.mjs";
 import { SessionCoordinator } from "./session-coordinator.mjs";
 
@@ -119,6 +120,20 @@ export class OwnershipManager {
     this.#state = state;
   }
 
+  /** Run every ownership mutation under the same managed-worktree lock used by cleanup. @param {string} sessionId @param {() => Promise<any>} action */
+  #runWithOwnershipLock(sessionId, action) {
+    return this.#state.coordinator.run(sessionId, async () => {
+      const record = await this.#registry.get(sessionId);
+      if (record?.isolation?.mode !== "worktree") return action();
+      const lock = await acquireWorktreeOwnershipLock(record.isolation.worktreePath);
+      try {
+        return await action();
+      } finally {
+        await lock.release();
+      }
+    });
+  }
+
   /** @param {string} sessionId @param {string} leaseId @param {number} generation @returns {WriterLease} */
   #currentLease(sessionId, leaseId, generation) {
     const lease = this.#state.leases.get(sessionId);
@@ -137,7 +152,7 @@ export class OwnershipManager {
     if (typeof runId !== "string" || runId.length === 0) {
       throw new TypeError("runId must be a non-empty string");
     }
-    return this.#state.coordinator.run(sessionId, async () => {
+    return this.#runWithOwnershipLock(sessionId, async () => {
       const record = await this.#registry.get(sessionId);
       if (record === undefined) throw new Error(`Unknown registry session: ${sessionId}`);
       if (record.canonicalSessionFile !== canonicalSessionFile) {
@@ -182,7 +197,7 @@ export class OwnershipManager {
   async bindProcesses(sessionId, leaseId, generation, worker, piChild) {
     validateIdentity(worker, "worker");
     validateIdentity(piChild, "piChild");
-    return this.#state.coordinator.run(sessionId, async () => {
+    return this.#runWithOwnershipLock(sessionId, async () => {
       const lease = this.#currentLease(sessionId, leaseId, generation);
       if (lease.worker !== undefined) throw new OwnershipConflictError(sessionId, lease.runId);
       const record = await this.#registry.get(sessionId);
@@ -224,7 +239,7 @@ export class OwnershipManager {
 
   /** @param {string} sessionId @param {string} leaseId @param {number} generation */
   async heartbeat(sessionId, leaseId, generation) {
-    return this.#state.coordinator.run(sessionId, async () => {
+    return this.#runWithOwnershipLock(sessionId, async () => {
       const lease = this.#currentLease(sessionId, leaseId, generation);
       if (lease.worker === undefined) throw new StaleLeaseError(sessionId, leaseId, generation);
       const record = await this.#registry.get(sessionId);
@@ -245,7 +260,7 @@ export class OwnershipManager {
 
   /** @param {string} sessionId @param {string} leaseId @param {number} generation */
   async release(sessionId, leaseId, generation) {
-    return this.#state.coordinator.run(sessionId, async () => {
+    return this.#runWithOwnershipLock(sessionId, async () => {
       const lease = this.#state.leases.get(sessionId);
       if (
         lease === undefined ||

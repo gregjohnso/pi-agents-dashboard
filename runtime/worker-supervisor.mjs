@@ -14,6 +14,8 @@ import { reduceSessionState } from "./state-reducer.mjs";
 
 const DEFAULT_WORKER_PATH = fileURLToPath(new URL("./worker.mjs", import.meta.url));
 const admissionStates = new WeakMap();
+const MAX_QUEUED_FRAME_BYTES = 1024 * 1024;
+const MAX_QUEUED_FRAMES = 256;
 const MAX_BUFFERED_STARTUP_EVENTS = 256;
 const DEFAULT_LAUNCH_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateMs: 5_000 });
 
@@ -45,6 +47,30 @@ export class WorkerSupervisorError extends Error {
 /** @param {unknown} value */
 function digest(value) {
   return createHash("sha256").update(typeof value === "string" ? value : "", "utf8").digest();
+}
+
+/** @param {any} supervision @param {number} bytes */
+function recordFrameDrop(supervision, bytes) {
+  supervision.droppedFrameCount += 1;
+  supervision.droppedFrameBytes += bytes;
+}
+
+/** @param {any} supervision @param {Record<string, unknown>} frame */
+function queueFrame(supervision, frame) {
+  let bytes;
+  try { bytes = Buffer.byteLength(JSON.stringify(frame)); } catch { return; }
+  if (bytes > MAX_QUEUED_FRAME_BYTES) {
+    recordFrameDrop(supervision, bytes);
+    return;
+  }
+  while (supervision.queuedFrames.length >= MAX_QUEUED_FRAMES || supervision.queuedFrameBytes + bytes > MAX_QUEUED_FRAME_BYTES) {
+    const removed = supervision.queuedFrames.shift();
+    if (removed === undefined) break;
+    supervision.queuedFrameBytes -= removed.bytes;
+    recordFrameDrop(supervision, removed.bytes);
+  }
+  supervision.queuedFrames.push({ frame, bytes });
+  supervision.queuedFrameBytes += bytes;
 }
 
 /** @param {unknown} supplied @param {string} expected */
@@ -357,7 +383,7 @@ export class WorkerSupervisor {
         shell: false,
         stdio: ["ignore", stdoutHandle.fd, stderrHandle.fd, "ipc"],
       });
-      supervision = { child, token, sessionId, lease, exit: undefined, identity: undefined, handle: undefined, lifecycle: "launching", queuedFrames: [], startupEvents: [], frameListeners: new Set(), commandResultHandler: undefined };
+      supervision = { child, token, sessionId, lease, exit: undefined, identity: undefined, handle: undefined, lifecycle: "launching", queuedFrames: [], queuedFrameBytes: 0, droppedFrameCount: 0, droppedFrameBytes: 0, startupEvents: [], frameListeners: new Set(), commandResultHandler: undefined };
       supervision.messageReceiver = (/** @type {any} */ message) => {
         if (!authenticated(message?.token, token)) return;
         if (message.type === "pi_frame" && message.sessionId === sessionId && typeof message.frame === "object" && message.frame !== null) {
@@ -367,7 +393,7 @@ export class WorkerSupervisor {
             }
             return;
           }
-          supervision.queuedFrames.push(message.frame);
+          queueFrame(supervision, message.frame);
         } else if (message.type === "worker_event" && message.sessionId === sessionId) {
           if (supervision.lifecycle === "active") {
             void this.#applyWorkerEvent(supervision, message.event).catch(() => {});
@@ -568,8 +594,20 @@ export class WorkerSupervisor {
       onFrame(listener) {
         if (typeof listener !== "function") throw new TypeError("Frame listener must be a function");
         frameListeners.add(listener);
+        if (supervision.droppedFrameCount > 0) {
+          const overflow = {
+            type: "pi_dashboard_frame_queue_overflow",
+            droppedFrames: supervision.droppedFrameCount,
+            droppedBytes: supervision.droppedFrameBytes,
+            recovery: "snapshot_or_diagnostics",
+          };
+          supervision.droppedFrameCount = 0;
+          supervision.droppedFrameBytes = 0;
+          try { listener(overflow); } catch {}
+        }
         for (const buffered of supervision.queuedFrames.splice(0)) {
-          try { listener(buffered); } catch {}
+          supervision.queuedFrameBytes -= buffered.bytes;
+          try { listener(buffered.frame); } catch {}
         }
         return () => frameListeners.delete(listener);
       },

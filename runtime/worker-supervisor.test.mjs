@@ -250,6 +250,41 @@ it("queues complete frames continuously after launch and before the first handle
   await supervisor.close();
 });
 
+it("bounds complete frames by count and reports deterministic overflow before retained frames", async () => {
+  const { runs, registry, ownership } = await setup();
+  const workers = fakeWorkerFactory();
+  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "frame-count-token" });
+  const handle = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "frame-count" });
+  const frame = { type: "queued" };
+  const frameBytes = Buffer.byteLength(JSON.stringify(frame));
+  Array.from({ length: 300 }).forEach(() => workers.children[0].emit("message", { version: 1, type: "pi_frame", token: "frame-count-token", sessionId: "one", frame }));
+  /** @type {Record<string, unknown>[]} */
+  const received = [];
+  handle.onFrame((/** @type {Record<string, unknown>} */ nextFrame) => received.push(nextFrame));
+  expect(received[0]).toEqual({ type: "pi_dashboard_frame_queue_overflow", droppedFrames: 44, droppedBytes: 44 * frameBytes, recovery: "snapshot_or_diagnostics" });
+  expect(received.slice(1)).toEqual(Array.from({ length: 256 }, () => frame));
+  await supervisor.close();
+});
+
+it("bounds complete frames by bytes and reports an oversized dropped frame", async () => {
+  const { runs, registry, ownership } = await setup();
+  const workers = fakeWorkerFactory();
+  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "frame-bytes-token" });
+  const handle = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "frame-bytes" });
+  const oversized = { type: "oversized", payload: "x".repeat(1024 * 1024) };
+  const retained = { type: "retained", sequence: 2 };
+  workers.children[0].emit("message", { version: 1, type: "pi_frame", token: "frame-bytes-token", sessionId: "one", frame: oversized });
+  workers.children[0].emit("message", { version: 1, type: "pi_frame", token: "frame-bytes-token", sessionId: "one", frame: retained });
+  /** @type {Record<string, unknown>[]} */
+  const received = [];
+  handle.onFrame((/** @type {Record<string, unknown>} */ nextFrame) => received.push(nextFrame));
+  expect(received).toEqual([
+    { type: "pi_dashboard_frame_queue_overflow", droppedFrames: 1, droppedBytes: Buffer.byteLength(JSON.stringify(oversized)), recovery: "snapshot_or_diagnostics" },
+    retained,
+  ]);
+  await supervisor.close();
+});
+
 it("refuses missing capabilities before ownership or run artifacts exist", async () => {
   const { runs, registry, ownership } = await setup();
   const executable = { realpath: "/fake/pi", device: "1", inode: "2", size: 3, modifiedTimeNs: "4" };

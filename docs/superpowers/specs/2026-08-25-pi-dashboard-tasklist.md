@@ -2,7 +2,7 @@
 
 **Plan:** `docs/superpowers/specs/2026-08-25-pi-dashboard-execution-plan.md`
 **Spec:** `docs/superpowers/specs/2026-08-25-pi-dashboard-design.md`
-**Status:** Standalone execution approved; T17 is the next integration gate.
+**Status:** T17, T18, and T20 are integrated and reviewed; T19 is the next integration gate.
 **Integrated baseline:** `5a36be230521610f2445f8947c4c92760e874872`
 
 ## Document responsibility
@@ -91,7 +91,7 @@ integrated baseline
 
 ### Milestone 7: Installed Pi and normalized protocol
 
-- [ ] **T18 Launch and supervise the installed Pi executable**
+- [x] **T18 Launch and supervise the installed Pi executable**
   - Owner: Process lane, one writer in an isolated worktree from T17.
   - Depends on: T17.
   - Can run in parallel with: T20.
@@ -143,7 +143,7 @@ integrated baseline
 
 ### Milestone 8: Interactive viewer
 
-- [ ] **T20 Build the full-screen Pi-style chat viewer**
+- [x] **T20 Build the full-screen Pi-style chat viewer**
   - Owner: Viewer UI lane, one writer in an isolated worktree from T17.
   - Depends on: T17 viewer contracts.
   - Can run in parallel with: T18 and, after T18 merges, T19.
@@ -226,9 +226,9 @@ integrated baseline
 - [x] Diagnostic limits approved: four 8 MiB RPC segments and one 8 MiB stderr limit.
 - [x] Historical T14 and T16 release direction superseded.
 - [x] T17 complete and reviewed.
-- [ ] T18 complete and reviewed.
+- [x] T18 complete and reviewed.
 - [ ] T19 complete and reviewed.
-- [ ] T20 complete and reviewed.
+- [x] T20 complete and reviewed.
 - [ ] T21 complete and reviewed.
 - [ ] R1-R6 have no undispositioned finding.
 - [ ] Packed output exposes only `pi-dashboard` and excludes private/runtime/development artifacts.

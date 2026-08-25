@@ -64,7 +64,7 @@ integrated baseline
 
 ### Milestone 6: Foundation
 
-- [ ] **T17 Rename the product, migrate state, and start the standalone list**
+- [x] **T17 Rename the product, migrate state, and start the standalone list**
   - Owner: Foundation lane, one writer.
   - Depends on: integrated baseline.
   - Claimed files: package/lock, bin, CLI naming, config/contracts, paths/migration, daemon composer authorization, `app/list/**`, standalone shell.
@@ -225,7 +225,7 @@ integrated baseline
 - [x] Standalone design approved.
 - [x] Diagnostic limits approved: four 8 MiB RPC segments and one 8 MiB stderr limit.
 - [x] Historical T14 and T16 release direction superseded.
-- [ ] T17 complete and reviewed.
+- [x] T17 complete and reviewed.
 - [ ] T18 complete and reviewed.
 - [ ] T19 complete and reviewed.
 - [ ] T20 complete and reviewed.

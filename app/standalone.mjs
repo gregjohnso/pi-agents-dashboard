@@ -1,12 +1,16 @@
 import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import { ProcessTerminal, TuiAltScreen } from "@earendil-works/pi-tui";
+
 import { inspectDaemonEndpoint } from "../runtime/daemon-lifecycle.mjs";
 import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
 import { resolveDashboardRoots } from "../runtime/paths.mjs";
 import { initializeRuntimePermissions } from "../runtime/permissions.mjs";
 import { migrateLegacyState } from "../runtime/state-migration.mjs";
 import { createStandaloneList } from "./list/standalone-list.mjs";
+import { createPiEditor } from "./viewer/pi-component-adapters.mjs";
+import { ViewerController } from "./viewer/viewer-controller.mjs";
 
 const { runDaemonCommand } = await import(new URL("../cli/daemon-commands.mjs", import.meta.url).href);
 const { loadCliClientIdentity } = await import(new URL("../cli/session-commands.mjs", import.meta.url).href);
@@ -41,6 +45,25 @@ function validProcessIdentity(value) { return Number.isSafeInteger(value?.pid) &
 /** @param {any} left @param {any} right */
 function sameProcessIdentity(left, right) { return left?.pid === right.pid && left?.startIdentity === right.startIdentity && left?.processGroupId === right.processGroupId; }
 
+/** Create a public-component full-screen viewer around the normalized client seam. */
+export function createStandaloneViewer({ sessionId, client, persistence, onReturn, terminal = new ProcessTerminal(), now }) {
+  const tui = new TuiAltScreen(terminal);
+  const editor = createPiEditor({ tui });
+  const controller = new ViewerController({ sessionId, client, editor, persistence, onReturn, now, requestRender: () => tui.renderNow() });
+  tui.addChild({
+    render(width) { return controller.render(width, terminal.rows ?? 24); },
+    handleInput(data) { controller.handleInput(data); tui.requestRender(); },
+    invalidate() {},
+  });
+  tui.setFocus(editor);
+  let closing;
+  return {
+    closed: controller.closed,
+    async open() { await controller.open(); tui.start(); },
+    close() { closing ??= (async () => { await controller.close(); tui.stop(); })(); return closing; },
+  };
+}
+
 /** Start the standalone list without binding its lifetime to daemon or worker lifetime. */
 export async function runDashboardApp({
   cwd, piBin, env, stdin, stdout, stderr,
@@ -48,6 +71,7 @@ export async function runDashboardApp({
   migrate,
   connectOrStart,
   openList,
+  openViewer,
 }) {
   const roots = resolveDashboardRoots(env);
   await initialize();
@@ -66,8 +90,8 @@ export async function runDashboardApp({
     ? await defaultConnectOrStart({ root: roots.destinationStateRoot, piBin, env })
     : await connectOrStart({ root: roots.destinationStateRoot, piBin, env });
   const list = openList === undefined
-    ? await createStandaloneList({ cwd, piBin, env, stdin, stdout, stderr, frontend })
-    : await openList({ cwd, piBin, env, stdin, stdout, stderr, frontend });
+    ? await createStandaloneList({ cwd, piBin, env, stdin, stdout, stderr, frontend, openViewer })
+    : await openList({ cwd, piBin, env, stdin, stdout, stderr, frontend, openViewer });
   try { await list.closed; } finally { await list.close(); await frontend.close(); }
 }
 

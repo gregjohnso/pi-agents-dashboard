@@ -56,8 +56,8 @@ const fixtures = [
     }),
 ];
 describe("responsive dashboard layout", () => {
-    it.each([160, 120, 80, 55, 40])("renders a width-safe %i-column snapshot", (width) => {
-        const layout = createDashboardLayout(width, 20);
+    it.each([[160, 40], [120, 32], [80, 24], [55, 16], [40, 10]])("renders a width-safe %ix%i snapshot", (width, height) => {
+        const layout = createDashboardLayout(width, height);
         const lines = [
             renderColumnHeader(layout),
             ...fixtures.map((record, index) => renderSessionRow(record, layout, { now, selected: index === 1 })),

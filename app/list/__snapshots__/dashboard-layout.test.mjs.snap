@@ -1,6 +1,6 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
-exports[`responsive dashboard layout > renders a width-safe 40-column snapshot 1`] = `
+exports[`responsive dashboard layout > renders a width-safe 40x10 snapshot 1`] = `
 {
   "columns": [
     {
@@ -29,13 +29,13 @@ exports[`responsive dashboard layout > renders a width-safe 40-column snapshot 1
     "▶ unicod… READY    検証中 🚀 résumé naï…",
     "▶ no-act… READY    —                    ",
   ],
-  "listHeight": 10,
+  "listHeight": 0,
   "listTop": 6,
   "width": 40,
 }
 `;
 
-exports[`responsive dashboard layout > renders a width-safe 55-column snapshot 1`] = `
+exports[`responsive dashboard layout > renders a width-safe 55x16 snapshot 1`] = `
 {
   "columns": [
     {
@@ -68,13 +68,13 @@ exports[`responsive dashboard layout > renders a width-safe 55-column snapshot 1
     "▶ unicod… READY    検証中 🚀 résumé naïve café   10m   ",
     "▶ no-act… READY    —                             10m   ",
   ],
-  "listHeight": 10,
+  "listHeight": 6,
   "listTop": 6,
   "width": 55,
 }
 `;
 
-exports[`responsive dashboard layout > renders a width-safe 80-column snapshot 1`] = `
+exports[`responsive dashboard layout > renders a width-safe 80x24 snapshot 1`] = `
 {
   "columns": [
     {
@@ -111,13 +111,13 @@ exports[`responsive dashboard layout > renders a width-safe 80-column snapshot 1
     "▶ unicode- READY     dashboard            検証中 🚀 résumé naïve café    10m    ",
     "▶ no-activ READY     project-name-that-d… —                              10m    ",
   ],
-  "listHeight": 10,
+  "listHeight": 14,
   "listTop": 6,
   "width": 80,
 }
 `;
 
-exports[`responsive dashboard layout > renders a width-safe 120-column snapshot 1`] = `
+exports[`responsive dashboard layout > renders a width-safe 120x32 snapshot 1`] = `
 {
   "columns": [
     {
@@ -154,13 +154,13 @@ exports[`responsive dashboard layout > renders a width-safe 120-column snapshot 
     "▶ unicode- READY     dashboard                検証中 🚀 résumé naïve café                                        10m    ",
     "▶ no-activ READY     project-name-that-does-… —                                                                  10m    ",
   ],
-  "listHeight": 10,
+  "listHeight": 22,
   "listTop": 6,
   "width": 120,
 }
 `;
 
-exports[`responsive dashboard layout > renders a width-safe 160-column snapshot 1`] = `
+exports[`responsive dashboard layout > renders a width-safe 160x40 snapshot 1`] = `
 {
   "columns": [
     {
@@ -197,7 +197,7 @@ exports[`responsive dashboard layout > renders a width-safe 160-column snapshot 
     "▶ unicode- READY     dashboard                検証中 🚀 résumé naïve café                                                                                10m    ",
     "▶ no-activ READY     project-name-that-does-… —                                                                                                          10m    ",
   ],
-  "listHeight": 10,
+  "listHeight": 30,
   "listTop": 6,
   "width": 160,
 }

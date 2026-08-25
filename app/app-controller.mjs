@@ -1,21 +1,33 @@
-/** Own list/viewer transitions while keeping the list instance stable. */
+/** Own list/viewer replacement while keeping selection and scroll in one list instance. */
 export function createAppController({ createList, openViewer }) {
   if (typeof createList !== "function" || typeof openViewer !== "function") throw new TypeError("createList and openViewer are required");
   let viewer;
+  let closed = false;
   const list = createList({
     async openViewer(sessionId) {
+      if (viewer !== undefined || closed) return;
       await list.close();
-      viewer = await openViewer(sessionId);
-      await viewer.closed;
-      await viewer.close();
-      viewer = undefined;
-      await list.open();
+      let opened;
+      const onReturn = () => { void opened?.close(); };
+      opened = await openViewer(sessionId, { onReturn });
+      viewer = opened;
+      try {
+        await viewer.open?.();
+        await viewer.closed;
+      } finally {
+        await viewer.close();
+        if (viewer === opened) viewer = undefined;
+      }
+      if (!closed) await list.open();
     },
   });
   return {
-    async open() { await list.open(); },
+    async open() { closed = false; await list.open(); },
     async close() {
-      if (viewer !== undefined) { await viewer.close(); viewer = undefined; }
+      closed = true;
+      const active = viewer;
+      viewer = undefined;
+      if (active !== undefined) await active.close();
       await list.close();
     },
   };

@@ -1,0 +1,212 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`responsive dashboard layout > renders a width-safe 40-column snapshot 1`] = `
+{
+  "columns": [
+    {
+      "key": "id",
+      "width": 9,
+    },
+    {
+      "key": "state",
+      "width": 8,
+    },
+    {
+      "key": "activity",
+      "width": 21,
+    },
+  ],
+  "density": "minimal",
+  "lines": [
+    "ID        STATE    ACTIVITY             ",
+    "▶ workin… WORKING  bash: pytest extensi…",
+    "▶ waitin… WAITING  Approve access to re…",
+    "◌ ready-… READY    Activity ready-12345…",
+    "  failed… FAILED   provider 429: quota …",
+    "  stoppe… STOPPED  Activity stopped-123…",
+    "× stale-… READY    Activity stale-12345…",
+    "  comple… READY    Release checks passed",
+    "▶ unicod… READY    検証中 🚀 résumé naï…",
+    "▶ no-act… READY    —                    ",
+  ],
+  "listHeight": 10,
+  "listTop": 6,
+  "width": 40,
+}
+`;
+
+exports[`responsive dashboard layout > renders a width-safe 55-column snapshot 1`] = `
+{
+  "columns": [
+    {
+      "key": "id",
+      "width": 9,
+    },
+    {
+      "key": "state",
+      "width": 8,
+    },
+    {
+      "key": "age",
+      "width": 6,
+    },
+    {
+      "key": "activity",
+      "width": 29,
+    },
+  ],
+  "density": "compact",
+  "lines": [
+    "ID        STATE    AGE    ACTIVITY                     ",
+    "▶ workin… WORKING  10m    bash: pytest extensions/agen…",
+    "▶ waitin… WAITING  10m    Approve access to release cr…",
+    "◌ ready-… READY    10m    Activity ready-12345678      ",
+    "  failed… FAILED   10m    provider 429: quota exhausted",
+    "  stoppe… STOPPED  10m    Activity stopped-123456      ",
+    "× stale-… READY    10m    Activity stale-12345678      ",
+    "  comple… READY    10m    Release checks passed        ",
+    "▶ unicod… READY    10m    検証中 🚀 résumé naïve café  ",
+    "▶ no-act… READY    10m    —                            ",
+  ],
+  "listHeight": 10,
+  "listTop": 6,
+  "width": 55,
+}
+`;
+
+exports[`responsive dashboard layout > renders a width-safe 80-column snapshot 1`] = `
+{
+  "columns": [
+    {
+      "key": "id",
+      "width": 10,
+    },
+    {
+      "key": "state",
+      "width": 9,
+    },
+    {
+      "key": "age",
+      "width": 7,
+    },
+    {
+      "key": "project",
+      "width": 20,
+    },
+    {
+      "key": "activity",
+      "width": 30,
+    },
+  ],
+  "density": "compact",
+  "lines": [
+    "ID         STATE     AGE     PROJECT              ACTIVITY                      ",
+    "▶ working- WORKING   10m     working-123456       bash: pytest extensions/agent…",
+    "▶ waiting- WAITING   10m     waiting-123456       Approve access to release cre…",
+    "◌ ready-12 READY     10m     ready-12345678       Activity ready-12345678       ",
+    "  failed-1 FAILED    10m     failed-1234567       provider 429: quota exhausted ",
+    "  stopped- STOPPED   10m     stopped-123456       Activity stopped-123456       ",
+    "× stale-12 READY     10m     stale-12345678       Activity stale-12345678       ",
+    "  complete READY     10m     completed-1234       Release checks passed         ",
+    "▶ unicode- READY     10m     dashboard            検証中 🚀 résumé naïve café   ",
+    "▶ no-activ READY     10m     project-name-that-d… —                             ",
+  ],
+  "listHeight": 10,
+  "listTop": 6,
+  "width": 80,
+}
+`;
+
+exports[`responsive dashboard layout > renders a width-safe 120-column snapshot 1`] = `
+{
+  "columns": [
+    {
+      "key": "id",
+      "width": 10,
+    },
+    {
+      "key": "state",
+      "width": 9,
+    },
+    {
+      "key": "age",
+      "width": 7,
+    },
+    {
+      "key": "model",
+      "width": 20,
+    },
+    {
+      "key": "project",
+      "width": 24,
+    },
+    {
+      "key": "activity",
+      "width": 45,
+    },
+  ],
+  "density": "full",
+  "lines": [
+    "ID         STATE     AGE     MODEL                PROJECT                  ACTIVITY                                     ",
+    "▶ working- WORKING   10m     gpt-5.6              working-123456           bash: pytest extensions/agents-dashboard     ",
+    "▶ waiting- WAITING   10m     gpt-5.6              waiting-123456           Approve access to release credentials?       ",
+    "◌ ready-12 READY     10m     gpt-5.6              ready-12345678           Activity ready-12345678                      ",
+    "  failed-1 FAILED    10m     gpt-5.6              failed-1234567           provider 429: quota exhausted                ",
+    "  stopped- STOPPED   10m     gpt-5.6              stopped-123456           Activity stopped-123456                      ",
+    "× stale-12 READY     10m     gpt-5.6              stale-12345678           Activity stale-12345678                      ",
+    "  complete READY     10m     gpt-5.6              completed-1234           Release checks passed                        ",
+    "▶ unicode- READY     10m     claude-opus-4-1-a-v… dashboard                検証中 🚀 résumé naïve café                  ",
+    "▶ no-activ READY     10m     gpt-5.6              project-name-that-does-… —                                            ",
+  ],
+  "listHeight": 10,
+  "listTop": 6,
+  "width": 120,
+}
+`;
+
+exports[`responsive dashboard layout > renders a width-safe 160-column snapshot 1`] = `
+{
+  "columns": [
+    {
+      "key": "id",
+      "width": 10,
+    },
+    {
+      "key": "state",
+      "width": 9,
+    },
+    {
+      "key": "age",
+      "width": 7,
+    },
+    {
+      "key": "model",
+      "width": 20,
+    },
+    {
+      "key": "project",
+      "width": 24,
+    },
+    {
+      "key": "activity",
+      "width": 85,
+    },
+  ],
+  "density": "full",
+  "lines": [
+    "ID         STATE     AGE     MODEL                PROJECT                  ACTIVITY                                                                             ",
+    "▶ working- WORKING   10m     gpt-5.6              working-123456           bash: pytest extensions/agents-dashboard                                             ",
+    "▶ waiting- WAITING   10m     gpt-5.6              waiting-123456           Approve access to release credentials?                                               ",
+    "◌ ready-12 READY     10m     gpt-5.6              ready-12345678           Activity ready-12345678                                                              ",
+    "  failed-1 FAILED    10m     gpt-5.6              failed-1234567           provider 429: quota exhausted                                                        ",
+    "  stopped- STOPPED   10m     gpt-5.6              stopped-123456           Activity stopped-123456                                                              ",
+    "× stale-12 READY     10m     gpt-5.6              stale-12345678           Activity stale-12345678                                                              ",
+    "  complete READY     10m     gpt-5.6              completed-1234           Release checks passed                                                                ",
+    "▶ unicode- READY     10m     claude-opus-4-1-a-v… dashboard                検証中 🚀 résumé naïve café                                                          ",
+    "▶ no-activ READY     10m     gpt-5.6              project-name-that-does-… —                                                                                    ",
+  ],
+  "listHeight": 10,
+  "listTop": 6,
+  "width": 160,
+}
+`;

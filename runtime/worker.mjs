@@ -79,6 +79,11 @@ export async function createWorkerReplayStore({ path, append: injectedAppend, no
   };
 }
 
+/** @param {any} replay @param {{ clientId: string, requestId: string }} command */
+export function replayDeliveryIsAmbiguous(replay, command) {
+  return ["RPC_WRITE_STARTED", "DELIVERY_UNKNOWN"].includes(replay.current(command)?.stage);
+}
+
 /**
  * Deliver same-session commands serially across the durable Pi write boundary.
  * @param {{ replay: any, adapter: any }} options
@@ -110,8 +115,8 @@ export function createWorkerCommandDispatcher({ replay, adapter }) {
       }
 
       await replay.append({ ...base, stage: "RPC_WRITE_STARTED" });
+      let resultValue;
       try {
-        let resultValue;
         switch (command.op) {
           case "prompt": resultValue = await adapter.prompt(command.text); break;
           case "steer": resultValue = await adapter.steer(command.text); break;
@@ -119,7 +124,6 @@ export function createWorkerCommandDispatcher({ replay, adapter }) {
           case "interrupt": resultValue = await adapter.abort(); break;
           case "get_state": resultValue = await adapter.getState(); break;
         }
-        return replay.append({ ...base, stage: "RPC_ACKNOWLEDGED", result: resultValue });
       } catch (cause) {
         const failure = /** @type {{ code?: unknown, acknowledged?: unknown }} */ (cause);
         const error = {
@@ -131,10 +135,36 @@ export function createWorkerCommandDispatcher({ replay, adapter }) {
         if (failure.acknowledged === true) {
           await replay.append({ ...base, stage: "RPC_ACKNOWLEDGED", error, stderr });
           await replay.append({ ...base, stage: "FAILED", error, stderr });
-        } else {
-          await replay.append({ ...base, stage: "DELIVERY_UNKNOWN", error, stderr });
+          throw cause;
         }
-        throw cause;
+        let appendFailure;
+        try {
+          await replay.append({ ...base, stage: "DELIVERY_UNKNOWN", error, stderr });
+        } catch (persistenceCause) {
+          appendFailure = persistenceCause;
+        }
+        throw Object.assign(new Error("Pi delivery is ambiguous", { cause: appendFailure ?? cause }), {
+          code: "DELIVERY_UNKNOWN",
+          deliveryUnknown: true,
+          rpcCause: cause,
+          appendFailure,
+        });
+      }
+      try {
+        return await replay.append({ ...base, stage: "RPC_ACKNOWLEDGED", result: resultValue });
+      } catch (cause) {
+        let appendFailure;
+        try {
+          await replay.append({ ...base, stage: "DELIVERY_UNKNOWN", error: { code: "ACK_PERSISTENCE_FAILED", message: cause instanceof Error ? cause.message : "Pi acknowledgement persistence failed", retryable: false } });
+        } catch (persistenceCause) {
+          appendFailure = persistenceCause;
+        }
+        throw Object.assign(new Error("Pi delivery is ambiguous", { cause: appendFailure ?? cause }), {
+          code: "DELIVERY_UNKNOWN",
+          deliveryUnknown: true,
+          rpcCause: cause,
+          appendFailure,
+        });
       }
     });
     tail = result.then(() => {}, () => {});
@@ -142,6 +172,14 @@ export function createWorkerCommandDispatcher({ replay, adapter }) {
   }
 
   return { deliver, async close() { await tail; await replay.close(); } };
+}
+
+/** @param {{ close?: () => unknown } | undefined} connection */
+function closeConnectionBestEffort(connection) {
+  try {
+    void Promise.resolve(connection?.close?.()).catch(() => {});
+  } catch {
+  }
 }
 
 /**
@@ -152,6 +190,9 @@ export function createWorkerCommandDispatcher({ replay, adapter }) {
  * @param {{ connect: () => Promise<{ closed: Promise<unknown>, close?: () => unknown }>, onConnection: (connection: unknown) => Promise<void> | void, delaysMs: readonly number[], sleep: (ms: number) => Promise<void>, signal?: AbortSignal }} options
  */
 export async function maintainDaemonConnection({ connect, onConnection, delaysMs, sleep, signal }) {
+  if (typeof connect !== "function" || typeof onConnection !== "function" || typeof sleep !== "function") {
+    throw new TypeError("Reconnect dependencies must be functions");
+  }
   if (!Array.isArray(delaysMs) || delaysMs.length === 0 || delaysMs.some((delay) => !Number.isSafeInteger(delay) || delay <= 0)) {
     throw new TypeError("Reconnect delays must contain positive integers");
   }
@@ -161,28 +202,38 @@ export async function maintainDaemonConnection({ connect, onConnection, delaysMs
     let connection;
     try {
       connection = await connect();
-      failureCount = 0;
       await onConnection(connection);
-      if (signal?.aborted) {
-        await connection.close?.();
-        return;
+      failureCount = 0;
+      if (!signal?.aborted) {
+        await new Promise((resolveClosed) => {
+          const activeConnection = /** @type {{ closed: Promise<unknown>, close?: () => unknown }} */ (connection);
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            signal?.removeEventListener("abort", onAbort);
+            resolveClosed(undefined);
+          };
+          const onAbort = () => {
+            closeConnectionBestEffort(activeConnection);
+            finish();
+          };
+          signal?.addEventListener("abort", onAbort, { once: true });
+          Promise.resolve(activeConnection.closed).then(finish, finish);
+          if (signal?.aborted) onAbort();
+        });
       }
-      await new Promise((resolveClosed, rejectClosed) => {
-        const activeConnection = /** @type {{ closed: Promise<unknown>, close?: () => unknown }} */ (connection);
-        const onAbort = () => {
-          Promise.resolve(activeConnection.close?.()).then(resolveClosed, rejectClosed);
-        };
-        signal?.addEventListener("abort", onAbort, { once: true });
-        Promise.resolve(activeConnection.closed).then(resolveClosed, rejectClosed).finally(() => signal?.removeEventListener("abort", onAbort));
-      });
     } catch {
-      await connection?.close?.();
-      if (signal?.aborted) return;
+    } finally {
+      closeConnectionBestEffort(connection);
     }
     if (signal?.aborted) return;
     const delay = delaysMs[Math.min(failureCount, delaysMs.length - 1)];
     failureCount += 1;
-    await sleep(delay);
+    try {
+      await sleep(delay);
+    } catch {
+    }
   }
 }
 
@@ -379,7 +430,7 @@ export async function runWorker(runtimeProcess = process) {
         error: {
           code: error?.code ?? "RPC_FAILED",
           message: error instanceof Error ? error.message : "RPC failed",
-          deliveryUnknown: replay.current(message.command)?.stage === "DELIVERY_UNKNOWN",
+          deliveryUnknown: error?.deliveryUnknown === true || replayDeliveryIsAmbiguous(replay, message.command),
         },
       }),
     ).catch(() => {});
@@ -397,17 +448,23 @@ export async function runWorker(runtimeProcess = process) {
         removeMessageListener?.();
         if (sendToDaemon === connectionSend) sendToDaemon = undefined;
       }).catch(() => {});
-      await connectionSend({
-        version: 1,
-        type: "worker_ready",
-        token,
-        sessionId: options.sessionId,
-        runId: options.runId,
-        leaseId: options.leaseId,
-        generation: options.generation,
-        worker: identity,
-        piChild: identity,
-      });
+      try {
+        await connectionSend({
+          version: 1,
+          type: "worker_ready",
+          token,
+          sessionId: options.sessionId,
+          runId: options.runId,
+          leaseId: options.leaseId,
+          generation: options.generation,
+          worker: identity,
+          piChild: identity,
+        });
+      } catch (error) {
+        removeMessageListener?.();
+        if (sendToDaemon === connectionSend) sendToDaemon = undefined;
+        throw error;
+      }
     },
   });
   runtimeProcess.send({ version: 1, type: "worker_ready", token, sessionId: options.sessionId, runId: options.runId });

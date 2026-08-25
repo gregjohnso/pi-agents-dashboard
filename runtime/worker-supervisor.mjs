@@ -60,15 +60,14 @@ function sameIdentity(a, b) {
     first.pid === second.pid && first.startIdentity === second.startIdentity && first.processGroupId === second.processGroupId;
 }
 
-/** @param {any} child @returns {{ promise: Promise<{ code: number | null, signal: NodeJS.Signals | null }>, terminal: boolean }} */
-function observeExit(child) {
-  const observation = { terminal: false, promise: /** @type {any} */ (undefined) };
-  observation.promise = new Promise((resolveExit) => {
-    child.once("exit", (/** @type {number | null} */ code, /** @type {NodeJS.Signals | null} */ signal) => {
-      observation.terminal = true;
-      resolveExit({ code, signal });
-    });
-  });
+/** @param {any} child @param {() => void} onTerminal @returns {{ terminal: boolean, detach: () => void }} */
+function observeExit(child, onTerminal) {
+  const observation = { terminal: false, detach: () => child.off("exit", onExit) };
+  const onExit = () => {
+    observation.terminal = true;
+    onTerminal();
+  };
+  child.once("exit", onExit);
   return observation;
 }
 
@@ -111,7 +110,7 @@ async function sendMessage(child, message) {
 function admissionState(scope) {
   let state = admissionStates.get(scope);
   if (state === undefined) {
-    state = { tail: Promise.resolve(), reservations: new Map(), sessions: new SessionCoordinator() };
+    state = { tail: Promise.resolve(), reservations: new Map(), launchingSessions: new Set(), sessions: new SessionCoordinator() };
     admissionStates.set(scope, state);
   }
   return state;
@@ -173,11 +172,14 @@ export class WorkerSupervisor {
   /** @param {string} sessionId */
   async #reserve(sessionId) {
     const reservation = Symbol(sessionId);
-    await Promise.all([...this.#supervisions]
-      .filter((supervision) => supervision.exit.terminal)
-      .map((supervision) => this.#reconcileTerminal(supervision)));
+    const terminals = [...this.#supervisions].filter((supervision) =>
+      (supervision.lifecycle === "terminal" || supervision.exit.terminal) &&
+      (supervision.sessionId === sessionId || !this.#admission.launchingSessions.has(supervision.sessionId)));
+    await Promise.all(terminals.map((supervision) => supervision.sessionId === sessionId
+      ? this.#reconcileTerminalLocked(supervision)
+      : this.#admission.sessions.run(supervision.sessionId, () => this.#reconcileTerminalLocked(supervision))));
     await underAdmissionLock(this.#admission, async () => {
-      const live = new Set((await this.#registry.list()).filter((record) => record.processState === "LIVE" || record.ownership !== undefined).map((record) => record.sessionId));
+      const live = new Set((await this.#registry.list()).filter((record) => record.ownership !== undefined).map((record) => record.sessionId));
       for (const pendingSessionId of this.#admission.reservations.values()) live.add(pendingSessionId);
       if (this.#maxLive !== null && !live.has(sessionId) && live.size >= this.#maxLive) {
         throw new WorkerSupervisorError("WORKER_CAP_REACHED", `Worker cap ${this.#maxLive} is reached`);
@@ -193,28 +195,30 @@ export class WorkerSupervisor {
     await underAdmissionLock(this.#admission, async () => { this.#admission.reservations.delete(reservation); });
   }
 
+  /** @param {any} supervision */
+  #queueTerminalReconciliation(supervision) {
+    void this.#admission.sessions.run(supervision.sessionId, () => this.#reconcileTerminalLocked(supervision)).catch(() => {});
+  }
+
   /** @param {any} supervision @param {boolean} [verifiedTerminal] */
-  async #reconcileTerminal(supervision, verifiedTerminal = false) {
-    if ((!supervision.exit.terminal && !verifiedTerminal)) return;
-    if (supervision.reconcilePromise !== undefined) return supervision.reconcilePromise;
-    supervision.reconcilePromise = (async () => {
-      supervision.handle?.terminal();
-      if (supervision.handle !== undefined) this.#handles.delete(supervision.handle);
-      try {
-        await this.#ownership.release(supervision.sessionId, supervision.lease.leaseId, supervision.lease.generation);
-        this.#supervisions.delete(supervision);
-      } catch (error) {
-        supervision.reconcilePromise = undefined;
-        throw error;
-      }
-    })();
-    return supervision.reconcilePromise;
+  async #reconcileTerminalLocked(supervision, verifiedTerminal = false) {
+    if (supervision.lifecycle === "reconciled") return;
+    if (!supervision.exit.terminal && !verifiedTerminal) return;
+    supervision.lifecycle = "terminal";
+    const handle = supervision.handle;
+    handle?.terminal();
+    supervision.exit.detach();
+    supervision.handle = undefined;
+    if (handle !== undefined) this.#handles.delete(handle);
+    await this.#ownership.release(supervision.sessionId, supervision.lease.leaseId, supervision.lease.generation);
+    supervision.lifecycle = "reconciled";
+    this.#supervisions.delete(supervision);
   }
 
   /** @param {any} supervision */
-  async #stopFailedLaunch(supervision) {
+  async #stopFailedLaunchLocked(supervision) {
     if (supervision.exit.terminal) {
-      await this.#reconcileTerminal(supervision);
+      await this.#reconcileTerminalLocked(supervision);
       return;
     }
     if (supervision.identity === undefined) {
@@ -235,7 +239,7 @@ export class WorkerSupervisor {
       sleep: this.#sleep,
     }, this.#launchStopPolicy).catch(() => ({ disposition: "AMBIGUOUS_IDENTITY" }));
     if (["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "STALE_IDENTITY"].includes(result.disposition)) {
-      await this.#reconcileTerminal(supervision, true);
+      await this.#reconcileTerminalLocked(supervision, true);
     }
   }
 
@@ -245,7 +249,14 @@ export class WorkerSupervisor {
    */
   launch(request) {
     if (typeof request?.sessionId !== "string" || request.sessionId.length === 0) return Promise.reject(new TypeError("sessionId is required"));
-    return this.#admission.sessions.run(request.sessionId, () => this.#launch(request));
+    return this.#admission.sessions.run(request.sessionId, async () => {
+      this.#admission.launchingSessions.add(request.sessionId);
+      try {
+        return await this.#launch(request);
+      } finally {
+        this.#admission.launchingSessions.delete(request.sessionId);
+      }
+    });
   }
 
   /** @param {{ sessionId: string, canonicalSessionFile: string, cwd: string, runId: string, sessionRecord?: import("../shared/contracts.js").SessionRecord, model?: { provider: string, id: string }, thinkingLevel?: string, name?: string, rpcEntry?: string, daemonConnector?: string, daemonConnectConfig?: Record<string, unknown>, reconnectDelaysMs?: number[] }} request */
@@ -307,10 +318,14 @@ export class WorkerSupervisor {
         shell: false,
         stdio: ["ignore", stdoutHandle.fd, stderrHandle.fd, "ipc"],
       });
-      const exit = observeExit(child);
-      supervision = { child, token, sessionId, lease, exit, identity: undefined, handle: undefined, reconcilePromise: undefined };
+      supervision = { child, token, sessionId, lease, exit: undefined, identity: undefined, handle: undefined, lifecycle: "launching" };
+      const exit = observeExit(child, () => {
+        if (supervision.lifecycle === "reconciled") return;
+        supervision.lifecycle = "terminal";
+        this.#queueTerminalReconciliation(supervision);
+      });
+      supervision.exit = exit;
       this.#supervisions.add(supervision);
-      void exit.promise.then(() => this.#reconcileTerminal(supervision)).catch(() => {});
       const helloPromise = waitForMessage(child, "worker_hello", this.#startTimeoutMs);
       await Promise.all([stdoutHandle.close(), stderrHandle.close()]);
       stdoutHandle = undefined;
@@ -339,18 +354,22 @@ export class WorkerSupervisor {
         throw new WorkerSupervisorError("WORKER_READY_MISMATCH", "Worker readiness did not match the authenticated launch");
       }
 
-      await this.#writeWorkerEvent(sessionId, { type: "WORKER_READY", at: new Date().toISOString() });
-      const handle = this.#createHandle({ child, token, sessionId, runId, lease, identity: inspected });
+      await this.#writeWorkerEventLocked(supervision, { type: "WORKER_READY", at: new Date().toISOString() }, "launching");
+      if (supervision.exit.terminal || supervision.lifecycle !== "launching") {
+        await this.#reconcileTerminalLocked(supervision);
+        throw new WorkerSupervisorError("WORKER_PROCESS_EXITED", "Worker exited after readiness");
+      }
+      supervision.lifecycle = "active";
+      const handle = this.#createHandle(supervision);
       supervision.handle = handle;
       this.#handles.add(handle);
-      if (supervision.exit.terminal) throw new WorkerSupervisorError("WORKER_PROCESS_EXITED", "Worker exited after readiness");
       child.unref?.();
       return handle;
     } catch (error) {
       await stdoutHandle?.close().catch(() => {});
       await stderrHandle?.close().catch(() => {});
       if (supervision !== undefined) {
-        await this.#stopFailedLaunch(supervision);
+        await this.#stopFailedLaunchLocked(supervision);
       } else if (lease !== undefined) {
         await this.#ownership.release(sessionId, lease.leaseId, lease.generation).catch(() => {});
       }
@@ -360,28 +379,50 @@ export class WorkerSupervisor {
     }
   }
 
-  /** @param {string} sessionId @param {any} event */
-  async #writeWorkerEvent(sessionId, event) {
-    const current = await this.#registry.get(sessionId);
-    if (current === undefined) throw new Error(`Unknown registry session: ${sessionId}`);
+  /** @param {any} supervision @param {any} event @param {"launching" | "active"} lifecycle */
+  async #writeWorkerEventLocked(supervision, event, lifecycle) {
+    const launchEvent = lifecycle === "launching";
+    if (supervision.exit.terminal || supervision.lifecycle !== lifecycle || !this.#supervisions.has(supervision)) {
+      if (launchEvent) throw new WorkerSupervisorError("WORKER_PROCESS_EXITED", "Worker exited before readiness persistence");
+      return undefined;
+    }
+    const current = await this.#registry.get(supervision.sessionId);
+    if (current === undefined) throw new Error(`Unknown registry session: ${supervision.sessionId}`);
+    const ownsRecord = current.ownership?.runId === supervision.lease.runId &&
+      current.ownership?.acquiredAt === supervision.lease.acquiredAt &&
+      sameIdentity(current.ownership?.process, supervision.identity);
+    if (!ownsRecord) {
+      if (launchEvent) throw new WorkerSupervisorError("STALE_LEASE", "Worker readiness no longer owns the session");
+      return undefined;
+    }
+    if (supervision.exit.terminal || supervision.lifecycle !== lifecycle) {
+      if (launchEvent) throw new WorkerSupervisorError("WORKER_PROCESS_EXITED", "Worker exited before readiness persistence");
+      return undefined;
+    }
     const next = reduceSessionState(current, event);
-    if (next === current) return current;
-    return this.#registry.update(sessionId, current.revision, {
+    const updated = next === current ? current : await this.#registry.update(supervision.sessionId, current.revision, {
       taskState: next.taskState,
       processState: next.processState,
       outcome: next.outcome,
       activity: next.activity,
       updatedAt: next.updatedAt,
     });
+    if (supervision.exit.terminal || supervision.lifecycle === "terminal") {
+      await this.#reconcileTerminalLocked(supervision);
+      if (launchEvent) throw new WorkerSupervisorError("WORKER_PROCESS_EXITED", "Worker exited during readiness persistence");
+    }
+    return updated;
   }
 
-  /** @param {string} sessionId @param {any} event */
-  async #applyWorkerEvent(sessionId, event) {
-    return this.#admission.sessions.run(sessionId, () => this.#writeWorkerEvent(sessionId, event));
+  /** @param {any} supervision @param {any} event */
+  async #applyWorkerEvent(supervision, event) {
+    return this.#admission.sessions.run(supervision.sessionId, () => this.#writeWorkerEventLocked(supervision, event, "active"));
   }
 
-  /** @param {{ child: any, token: string, sessionId: string, runId: string, lease: import("./ownership.mjs").WriterLease, identity: ProcessIdentity }} options */
-  #createHandle({ child, token, sessionId, runId, lease, identity }) {
+  /** @param {any} supervision */
+  #createHandle(supervision) {
+    const { child, token, sessionId, lease, identity } = supervision;
+    const runId = lease.runId;
     let sequence = 0;
     /** @type {Map<string, { resolve(value: unknown): void, reject(error: unknown): void }>} */
     const pending = new Map();
@@ -389,7 +430,7 @@ export class WorkerSupervisor {
     const onMessage = (message) => {
       if (!authenticated(message?.token, token)) return;
       if (message?.type === "worker_event" && message.sessionId === sessionId) {
-        void this.#applyWorkerEvent(sessionId, message.event).catch(() => {});
+        void this.#applyWorkerEvent(supervision, message.event).catch(() => {});
         return;
       }
       if (message?.type !== "command_result") return;
@@ -417,6 +458,9 @@ export class WorkerSupervisor {
       processGroupId: identity.processGroupId,
       /** @param {import("../shared/contracts.js").ClientRequest} command @param {any} journal */
       async deliver(command, journal) {
+        if (supervision.lifecycle !== "active" || supervision.exit.terminal) {
+          throw Object.assign(new Error("Worker delivery became ambiguous"), { code: "DELIVERY_UNKNOWN" });
+        }
         const accepted = await journal.accept(command);
         if (accepted.stage !== "ACCEPTED") return accepted;
         const key = { clientId: command.clientId, requestId: command.requestId };
@@ -460,13 +504,22 @@ export class WorkerSupervisor {
    * @param {Parameters<typeof stopVerifiedProcessGroup>[2]} policy
    */
   async stop(handle, deps, policy) {
-    if (!this.#handles.has(handle)) throw new WorkerSupervisorError("UNKNOWN_WORKER", "Worker handle is not owned by this supervisor");
-    const result = await stopVerifiedProcessGroup(handle.identity, deps, policy);
-    if (["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "STALE_IDENTITY"].includes(result.disposition)) {
-      const supervision = [...this.#supervisions].find((candidate) => candidate.handle === handle);
-      if (supervision !== undefined) await this.#reconcileTerminal(supervision, true);
-    }
-    return result;
+    const supervision = [...this.#supervisions].find((candidate) => candidate.handle === handle);
+    if (supervision === undefined || !this.#handles.has(handle)) throw new WorkerSupervisorError("UNKNOWN_WORKER", "Worker handle is not owned by this supervisor");
+    return this.#admission.sessions.run(supervision.sessionId, async () => {
+      if (supervision.lifecycle !== "active" || supervision.handle !== handle || !this.#handles.has(handle)) {
+        throw new WorkerSupervisorError("UNKNOWN_WORKER", "Worker handle is not owned by this supervisor");
+      }
+      if (supervision.exit.terminal) {
+        await this.#reconcileTerminalLocked(supervision);
+        throw new WorkerSupervisorError("UNKNOWN_WORKER", "Worker has already exited");
+      }
+      const result = await stopVerifiedProcessGroup(handle.identity, deps, policy);
+      if (["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "STALE_IDENTITY"].includes(result.disposition)) {
+        await this.#reconcileTerminalLocked(supervision, true);
+      }
+      return result;
+    });
   }
 
   /** Detach daemon IPC from workers without signaling their process groups. */

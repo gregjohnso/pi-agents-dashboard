@@ -152,6 +152,11 @@ it("refuses a second writer for one canonical session", async () => {
   await waitForOwnershipRelease(registry, "one");
 });
 
+it("rejects invalid reconnect configuration before starting the worker loop", async () => {
+  const connect = /** @type {any} */ (undefined);
+  await expect(maintainDaemonConnection({ connect, onConnection: async () => {}, delaysMs: [5], sleep: async () => {} })).rejects.toBeInstanceOf(TypeError);
+});
+
 it("reconnects with bounded backoff after repeated failures and eventually succeeds", async () => {
   /** @type {string[]} */
   const calls = [];
@@ -187,13 +192,60 @@ it("reconnects with bounded backoff after repeated failures and eventually succe
   ]);
 });
 
+it("treats throwing connection cleanup as best-effort and keeps reconnecting", async () => {
+  const controller = new AbortController();
+  let attempts = 0;
+  const reconnecting = maintainDaemonConnection({
+    signal: controller.signal,
+    delaysMs: [5],
+    sleep: async () => {},
+    connect: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return {
+          closed: Promise.resolve(),
+          close() { throw new Error("normal cleanup failed"); },
+        };
+      }
+      return {
+        closed: Promise.resolve(),
+        async close() { throw new Error("abort cleanup failed"); },
+      };
+    },
+    onConnection: async () => {
+      if (attempts === 2) controller.abort();
+    },
+  });
+
+  await expect(reconnecting).resolves.toBeUndefined();
+  expect(attempts).toBe(2);
+});
+
+it("keeps retrying when setup and cleanup both fail before eventual success", async () => {
+  const controller = new AbortController();
+  let attempts = 0;
+  await expect(maintainDaemonConnection({
+    signal: controller.signal,
+    delaysMs: [5, 10],
+    sleep: async () => {},
+    connect: async () => ({
+      closed: Promise.resolve(),
+      async close() { throw new Error("cleanup rejected"); },
+    }),
+    onConnection: async () => {
+      attempts += 1;
+      if (attempts < 3) throw new Error("connection setup failed");
+      controller.abort();
+    },
+  })).resolves.toBeUndefined();
+  expect(attempts).toBe(3);
+});
+
 it("closes the active daemon connection and returns on explicit shutdown", async () => {
   const controller = new AbortController();
-  /** @type {() => void} */
-  let resolveClosed = () => {};
   const connection = {
-    closed: new Promise((resolve) => { resolveClosed = () => resolve(undefined); }),
-    close() { resolveClosed(); },
+    closed: new Promise(() => {}),
+    async close() { throw new Error("shutdown cleanup rejected"); },
   };
   const reconnecting = maintainDaemonConnection({
     signal: controller.signal,

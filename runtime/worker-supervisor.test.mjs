@@ -9,6 +9,7 @@ import { createCommandJournal } from "./command-journal.mjs";
 import { OwnershipManager } from "./ownership.mjs";
 import { RegistryStore } from "./registry-store.mjs";
 import { WorkerSupervisor } from "./worker-supervisor.mjs";
+import { createWorkerCommandDispatcher, createWorkerReplayStore, replayDeliveryIsAmbiguous } from "./worker.mjs";
 
 /** @type {string[]} */
 const cleanup = [];
@@ -57,8 +58,8 @@ async function setup(sessionIds = ["one"], options = {}) {
   return { root, runs, registry, ownership };
 }
 
-/** @param {{ order?: string[], helloOverrides?: Record<string, unknown>, readyOverrides?: Record<string, unknown>, holdReady?: boolean, activateSendError?: boolean, commandBehavior?: "success" | "disconnect" | "delivery_unknown" | "explicit_error" }} [configuration] */
-function fakeWorkerFactory({ order = [], helloOverrides = {}, readyOverrides = {}, holdReady = false, activateSendError = false, commandBehavior } = {}) {
+/** @param {{ order?: string[], helloOverrides?: Record<string, unknown>, readyOverrides?: Record<string, unknown>, holdReady?: boolean, activateSendError?: boolean, readyExitTiming?: "before" | "after", commandBehavior?: "success" | "disconnect" | "delivery_unknown" | "explicit_error", commandResponder?: (command: any) => Promise<any> }} [configuration] */
+function fakeWorkerFactory({ order = [], helloOverrides = {}, readyOverrides = {}, holdReady = false, activateSendError = false, readyExitTiming, commandBehavior, commandResponder } = {}) {
   let nextPid = 9100;
   /** @type {any[]} */
   const children = [];
@@ -78,14 +79,18 @@ function fakeWorkerFactory({ order = [], helloOverrides = {}, readyOverrides = {
       }
       callback?.();
       if (message.type === "activate" && !holdReady) {
-        queueMicrotask(() => child.emit("message", {
-          version: 1,
-          type: "worker_ready",
-          token: options.env.PI_DASHBOARD_WORKER_TOKEN,
-          sessionId: argv[argv.indexOf("--session-id") + 1],
-          runId: argv[argv.indexOf("--run-id") + 1],
-          ...readyOverrides,
-        }));
+        queueMicrotask(() => {
+          if (readyExitTiming === "before") child.emit("exit", 1, null);
+          child.emit("message", {
+            version: 1,
+            type: "worker_ready",
+            token: options.env.PI_DASHBOARD_WORKER_TOKEN,
+            sessionId: argv[argv.indexOf("--session-id") + 1],
+            runId: argv[argv.indexOf("--run-id") + 1],
+            ...readyOverrides,
+          });
+          if (readyExitTiming === "after") child.emit("exit", 1, null);
+        });
       }
       if (message.type === "command" && commandBehavior === "success") {
         queueMicrotask(() => child.emit("message", { version: 1, type: "command_result", token: options.env.PI_DASHBOARD_WORKER_TOKEN, id: message.id, ok: true, record: { stage: "RPC_ACKNOWLEDGED" } }));
@@ -105,6 +110,15 @@ function fakeWorkerFactory({ order = [], helloOverrides = {}, readyOverrides = {
             message: "Pi RPC failed",
             deliveryUnknown: commandBehavior === "delivery_unknown",
           },
+        }));
+      }
+      if (message.type === "command" && commandResponder !== undefined) {
+        void commandResponder(message.command).then((response) => child.emit("message", {
+          version: 1,
+          type: "command_result",
+          token: options.env.PI_DASHBOARD_WORKER_TOKEN,
+          id: message.id,
+          ...response,
         }));
       }
       if (message.type === "reject" || message.type === "shutdown") {
@@ -406,6 +420,123 @@ it("reconciles ownership when the worker exits between binding and activation", 
   await waitUntil(async () => (await getRecord(registry, "one")).ownership === undefined);
 });
 
+it("reconciles an exit observed before readiness persistence without restoring LIVE", async () => {
+  const { runs, registry, ownership } = await setup();
+  const workers = fakeWorkerFactory({ readyExitTiming: "before" });
+  const supervisor = new WorkerSupervisor({
+    registry,
+    ownership,
+    runsDirectory: runs,
+    spawnImpl: workers.spawnImpl,
+    inspect,
+    randomId: () => "exit-before-ready-token",
+    ...fastLaunchStop,
+  });
+
+  await expect(supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "exit-before-ready" })).rejects.toMatchObject({ code: "WORKER_PROCESS_EXITED" });
+  expect(await getRecord(registry, "one")).toMatchObject({ processState: "EXITED" });
+  expect((await getRecord(registry, "one")).ownership).toBeUndefined();
+});
+
+it.each(["during", "after"])("reconciles an exit observed %s the readiness write before launch rejects", async (boundary) => {
+  const { runs, registry, ownership } = await setup();
+  const workers = fakeWorkerFactory();
+  const originalUpdate = registry.update.bind(registry);
+  let updates = 0;
+  registry.update = async (...args) => {
+    updates += 1;
+    if (updates === 2 && boundary === "during") workers.children[0].emit("exit", 1, null);
+    const result = await originalUpdate(...args);
+    if (updates === 2 && boundary === "after") workers.children[0].emit("exit", 1, null);
+    return result;
+  };
+  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => `exit-${boundary}-ready-token`, ...fastLaunchStop });
+
+  await expect(supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: `exit-${boundary}-ready` })).rejects.toMatchObject({ code: "WORKER_PROCESS_EXITED" });
+  expect(await getRecord(registry, "one")).toMatchObject({ processState: "EXITED" });
+  expect((await getRecord(registry, "one")).ownership).toBeUndefined();
+});
+
+it("discards a queued worker event after exit and removes listeners before durable release", async () => {
+  const { runs, registry, ownership } = await setup();
+  const workers = fakeWorkerFactory();
+  const originalRelease = ownership.release.bind(ownership);
+  let listenersAtRelease;
+  ownership.release = async (...args) => {
+    listenersAtRelease = workers.children[0].listenerCount("message");
+    return originalRelease(...args);
+  };
+  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "queued-event-token" });
+  await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "queued-event" });
+  const revision = (await getRecord(registry, "one")).revision;
+
+  workers.children[0].emit("message", {
+    type: "worker_event",
+    token: "queued-event-token",
+    sessionId: "one",
+    event: { type: "TURN_STARTED", at: "2026-08-25T12:01:00.000Z" },
+  });
+  workers.children[0].emit("exit", 1, null);
+
+  await waitUntil(async () => (await getRecord(registry, "one")).ownership === undefined);
+  expect(await getRecord(registry, "one")).toMatchObject({ revision: revision + 1, taskState: "READY", processState: "EXITED" });
+  expect(listenersAtRelease).toBe(0);
+});
+
+it("finishes terminal reconciliation after an event races its registry write", async () => {
+  const { runs, registry, ownership } = await setup();
+  const workers = fakeWorkerFactory();
+  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "event-release-token" });
+  await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "event-release" });
+  const originalUpdate = registry.update.bind(registry);
+  registry.update = async (...args) => {
+    const result = await originalUpdate(...args);
+    if (args[2]?.taskState === "WORKING") workers.children[0].emit("exit", 1, null);
+    return result;
+  };
+
+  workers.children[0].emit("message", {
+    type: "worker_event",
+    token: "event-release-token",
+    sessionId: "one",
+    event: { type: "TURN_STARTED", at: "2026-08-25T12:02:00.000Z" },
+  });
+
+  await waitUntil(async () => (await getRecord(registry, "one")).ownership === undefined);
+  expect(await getRecord(registry, "one")).toMatchObject({ processState: "EXITED" });
+  expect((await getRecord(registry, "one")).ownership).toBeUndefined();
+});
+
+it("retries failed terminal release during admission and admits the next session", async () => {
+  const { runs, registry, ownership } = await setup(["one", "two"]);
+  const workers = fakeWorkerFactory();
+  const originalRelease = ownership.release.bind(ownership);
+  let releases = 0;
+  ownership.release = async (...args) => {
+    releases += 1;
+    if (releases === 1) throw new Error("release persistence failed");
+    return originalRelease(...args);
+  };
+  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, maxLive: 1, spawnImpl: workers.spawnImpl, inspect, randomId: () => `release-retry-${workers.calls.length}` });
+  await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "release-retry-one" });
+  workers.children[0].emit("exit", 1, null);
+  await waitUntil(async () => releases === 1);
+
+  await expect(supervisor.launch({ sessionId: "two", canonicalSessionFile: (await getRecord(registry, "two")).canonicalSessionFile, cwd: "/repo", runId: "release-retry-two" })).resolves.toMatchObject({ sessionId: "two" });
+  expect(releases).toBeGreaterThanOrEqual(2);
+  expect((await getRecord(registry, "one")).ownership).toBeUndefined();
+});
+
+it("does not charge an ownership-free stale LIVE record against managed capacity", async () => {
+  const { runs, registry, ownership } = await setup(["one", "two"]);
+  const one = await getRecord(registry, "one");
+  await registry.update("one", one.revision, { processState: "LIVE", updatedAt: "2026-08-25T12:03:00.000Z" });
+  const workers = fakeWorkerFactory();
+  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, maxLive: 1, spawnImpl: workers.spawnImpl, inspect, randomId: () => "stale-live-cap-token" });
+
+  await expect(supervisor.launch({ sessionId: "two", canonicalSessionFile: (await getRecord(registry, "two")).canonicalSessionFile, cwd: "/repo", runId: "stale-live-cap" })).resolves.toMatchObject({ sessionId: "two" });
+});
+
 it("journals exact command stages before delivery and preserves request identity", async () => {
   /** @type {string[]} */
   const order = [];
@@ -444,6 +575,45 @@ it("marks delivery unknown when the worker channel is lost after delivery starts
 
   await expect(launched.deliver(command, journal)).resolves.toMatchObject({ stage: "DELIVERY_UNKNOWN" });
   expect((await journal.get(command))?.stage).toBe("DELIVERY_UNKNOWN");
+  await journal.close();
+  await supervisor.close();
+});
+
+it("keeps the upstream journal ambiguous when the replay tail cannot advance past RPC_WRITE_STARTED", async () => {
+  const { root, runs, registry, ownership } = await setup();
+  const replay = await createWorkerReplayStore({
+    append: async (record) => {
+      if (record.stage === "DELIVERY_UNKNOWN") throw new Error("delivery unknown append failed");
+    },
+  });
+  const dispatcher = createWorkerCommandDispatcher({ replay, adapter: {
+    async prompt() { throw Object.assign(new Error("Pi stream closed"), { code: "RPC_STREAM_CLOSED" }); },
+  } });
+  const workers = fakeWorkerFactory({
+    commandResponder: async (workerCommand) => {
+      try {
+        return { ok: true, record: await dispatcher.deliver(workerCommand) };
+      } catch (error) {
+        const failure = /** @type {{ code?: string, deliveryUnknown?: boolean }} */ (error);
+        return {
+          ok: false,
+          error: {
+            code: failure?.code ?? "RPC_FAILED",
+            message: error instanceof Error ? error.message : "RPC failed",
+            deliveryUnknown: failure?.deliveryUnknown === true || replayDeliveryIsAmbiguous(replay, workerCommand),
+          },
+        };
+      }
+    },
+  });
+  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "append-failure-upstream-token" });
+  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "append-failure-upstream" });
+  const journal = await createCommandJournal({ path: join(root, "append-failure-commands.jsonl") });
+  const command = /** @type {import("../shared/contracts.js").ClientRequest} */ ({ version: 1, clientId: "client", requestId: "append-failure", op: "prompt", payload: { sessionId: "one", text: "hello" } });
+
+  await expect(launched.deliver(command, journal)).resolves.toMatchObject({ stage: "DELIVERY_UNKNOWN" });
+  expect(replay.current(command)).toMatchObject({ stage: "RPC_WRITE_STARTED" });
+  expect((await journal.history(command)).map(({ stage }) => stage)).toEqual(["ACCEPTED", "DELIVERY_ATTEMPTED", "DELIVERY_UNKNOWN"]);
   await journal.close();
   await supervisor.close();
 });

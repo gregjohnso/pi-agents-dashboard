@@ -7,7 +7,7 @@ import { PassThrough } from "node:stream";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { PiRpcAdapter } from "./pi-rpc-adapter.mjs";
-import { createWorkerCommandDispatcher, createWorkerReplayStore } from "./worker.mjs";
+import { createWorkerCommandDispatcher, createWorkerReplayStore, replayDeliveryIsAmbiguous } from "./worker.mjs";
 
 /** @type {string[]} */
 const cleanup = [];
@@ -150,9 +150,34 @@ it.each([
     getStderr() { return "provider stderr"; },
   } });
 
-  await expect(dispatcher.deliver({ clientId: "client", requestId: code, op: "prompt", text: "hello" })).rejects.toMatchObject({ code });
+  await expect(dispatcher.deliver({ clientId: "client", requestId: code, op: "prompt", text: "hello" })).rejects.toMatchObject({ code: "DELIVERY_UNKNOWN", deliveryUnknown: true });
   expect(records.map((record) => record.stage)).toEqual(["RECEIVED", "RPC_WRITE_STARTED", "DELIVERY_UNKNOWN"]);
   expect(records.at(-1)).toMatchObject({ stage: "DELIVERY_UNKNOWN", stderr: "provider stderr" });
+});
+
+it("reports delivery unknown when persisting that result fails after the durable Pi write boundary", async () => {
+  /** @type {any[]} */
+  const records = [];
+  const appendFailure = new Error("delivery unknown append failed");
+  const replay = await createWorkerReplayStore({
+    append: async (record) => {
+      if (record.stage === "DELIVERY_UNKNOWN") throw appendFailure;
+      records.push(record);
+    },
+  });
+  const dispatcher = createWorkerCommandDispatcher({ replay, adapter: {
+    async prompt() { throw Object.assign(new Error("stream closed"), { code: "RPC_STREAM_CLOSED" }); },
+  } });
+
+  await expect(dispatcher.deliver({ clientId: "client", requestId: "append-failure", op: "prompt", text: "hello" })).rejects.toMatchObject({
+    code: "DELIVERY_UNKNOWN",
+    deliveryUnknown: true,
+    cause: appendFailure,
+  });
+  expect(records.map((record) => record.stage)).toEqual(["RECEIVED", "RPC_WRITE_STARTED"]);
+  const key = { clientId: "client", requestId: "append-failure" };
+  expect(replay.current(key)).toMatchObject({ stage: "RPC_WRITE_STARTED" });
+  expect(replayDeliveryIsAmbiguous(replay, key)).toBe(true);
 });
 
 it("records an explicit Pi error acknowledgement before the terminal failure", async () => {

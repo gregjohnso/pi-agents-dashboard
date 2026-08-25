@@ -114,7 +114,7 @@ T02 + T14 + T15 ─────────────────────�
 
 ## Milestone 3: Workers and Daemon
 
-- [ ] **T10 Implement Pi RPC workers and process supervision**
+- [x] **T10 Implement Pi RPC workers and process supervision**
   - Owner: one integration writer.
   - Depends on: T07, T08.
   - Deliverables: narrow RPC adapter, worker entrypoint, durable worker boundaries, process supervisor, cap accounting.

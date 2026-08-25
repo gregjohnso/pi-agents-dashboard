@@ -47,7 +47,7 @@ T02 + T14 + T15 ─────────────────────�
 
 ## Milestone 0: Scaffold and Feasibility
 
-- [ ] **T01 Scaffold package and verification harness**
+- [x] **T01 Scaffold package and verification harness**
   - Owner: one writer in the root checkout.
   - Depends on: none.
   - Deliverables: self-contained npm/Pi manifest, package-relative runtime discovery, optional CLI stub, Pixi, TypeScript, Vitest, extension stub, README, license, first commit.

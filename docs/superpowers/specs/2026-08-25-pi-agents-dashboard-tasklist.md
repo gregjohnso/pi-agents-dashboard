@@ -120,7 +120,7 @@ T02 + T14 + T15 ─────────────────────�
   - Deliverables: narrow RPC adapter, worker entrypoint, durable worker boundaries, process supervisor, cap accounting.
   - Gate: two workers have distinct PIDs/PGIDs; frontend and daemon loss do not stop them; readiness precedes acceptance.
 
-- [ ] **T11 Assemble daemon lifecycle, reconciliation, and recovery CLI**
+- [x] **T11 Assemble daemon lifecycle, reconciliation, and recovery CLI**
   - Owner: one integration writer.
   - Depends on: T07, T08, T10.
   - Deliverables: singleton daemon, recovery admission gate, restart reconciliation, `doctor`, daemon CLI, and optional global npm `install|uninstall` registration commands.

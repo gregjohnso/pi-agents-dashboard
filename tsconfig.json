@@ -12,5 +12,5 @@
     "target": "ES2022",
     "types": ["node", "vitest/globals"]
   },
-  "include": ["bin/**/*.mjs", "extensions/**/*.ts", "vitest.config.ts"]
+  "include": ["bin/**/*.mjs", "extensions/**/*.ts", "shared/**/*.ts", "vitest.config.ts"]
 }

@@ -31,18 +31,29 @@ export function createDaemonDashboardBackend({ client, clientId, preflight, requ
         return { sessions: [...sessions.values()] };
     };
     const requestAsComposer = async (operation, sessionId, revision, exactRequestId) => {
-        const attached = await request("attach", { sessionId, role: "composer" });
-        if (!attached.ok || attached.result.kind !== "attached" || attached.result.role !== "composer") {
-            if (!attached.ok) throw Object.assign(new Error(attached.error.message), attached.error);
-            throw Object.assign(new Error("Daemon refused the composer role"), { code: "ATTACHMENT_REQUIRED" });
-        }
+        const transaction = client.createTransactionClient?.() ?? client;
+        const ownsTransaction = transaction !== client;
+        const transactionRequest = async (op, payload, transactionRequestId = requestId()) => transaction.request({ version: 1, clientId, requestId: transactionRequestId, op, payload });
+        let attached = false;
         let response;
         try {
-            response = await request(operation, { sessionId, revision }, exactRequestId);
+            if (ownsTransaction) await transaction.connect();
+            const attachment = await transactionRequest("attach", { sessionId, role: "composer" });
+            if (!attachment.ok || attachment.result.kind !== "attached" || attachment.result.role !== "composer") {
+                if (!attachment.ok) throw Object.assign(new Error(attachment.error.message), attachment.error);
+                throw Object.assign(new Error("Daemon refused the composer role"), { code: "ATTACHMENT_REQUIRED" });
+            }
+            attached = true;
+            try { response = await transactionRequest(operation, { sessionId, revision }, exactRequestId); }
+            catch (error) {
+                if (error?.code === "CONNECTION_CLOSED") throw Object.assign(new Error(`${operation === "stop" ? "Stop" : "Delete"} delivery is ambiguous`), { code: "DELIVERY_UNKNOWN", clientId, requestId: exactRequestId });
+                throw error;
+            }
             return response;
         }
         finally {
-            if (response !== undefined) await request("detach", { sessionId }).catch(() => {});
+            if (attached && response !== undefined) await transactionRequest("detach", { sessionId }).catch(() => {});
+            if (ownsTransaction) await transaction.close();
         }
     };
     const requireCompletedDestructive = (operation, response) => {

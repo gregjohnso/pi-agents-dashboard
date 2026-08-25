@@ -511,6 +511,22 @@ describe("daemon dashboard backend", () => {
         await backend[operation]("exact-session", 3, `${operation}-request`);
         expect(operations).toEqual(["attach", operation, "detach"]);
     });
+    it("does not replay Stop after its composer socket disconnects", async () => {
+        const requests = [];
+        const transaction = {
+            async connect() {},
+            async request(request) {
+                requests.push(request.op);
+                if (request.op === "attach") return { version: 1, requestId: request.requestId, ok: true, result: { kind: "attached", sessionId: "exact-session", role: "composer" } };
+                throw Object.assign(new Error("socket closed"), { code: "CONNECTION_CLOSED", submitted: true });
+            },
+            async close() {},
+        };
+        const client = { createTransactionClient: () => transaction };
+        const backend = createDaemonDashboardBackend({ client, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
+        await expect(backend.stop("exact-session", 3, "stop-request")).rejects.toMatchObject({ code: "DELIVERY_UNKNOWN", clientId: "stable-client", requestId: "stop-request" });
+        expect(requests).toEqual(["attach", "stop"]);
+    });
     it.each(["stop", "delete"])("treats durable %s FAILED as a structured refusal", async (operation) => {
         const status = { clientId: "stable-client", requestId: `${operation}-request`, operation, stage: "FAILED", acceptedAt: timestamp, updatedAt: timestamp, error: { code: "SESSION_REFUSED", message: `${operation} refused`, retryable: false } };
         const client = {

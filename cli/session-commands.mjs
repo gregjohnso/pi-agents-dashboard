@@ -182,7 +182,7 @@ function validateExpectedResult(op, payload, clientId, requestId, result) {
 export async function createPersistentDaemonRequester({ root = runtimeRoot(), clientId, maxBytes = 1024 * 1024, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS }) {
   if (!exactId(clientId)) throw new TypeError("A stable CLI clientId is required");
   const token = (await fs.readFile(join(root, "daemon", "control.token"), "utf8")).trim();
-  const client = createDaemonClient({ socketPath: join(root, "daemon", "control.sock"), token, maxBytes, clientId });
+  const client = createDaemonClient({ socketPath: join(root, "daemon", "control.sock"), token, maxBytes, clientId, reconnect: false });
   await client.connect();
   return {
     async request(op, payload, requestId = randomUUID()) {
@@ -199,6 +199,9 @@ export async function createPersistentDaemonRequester({ root = runtimeRoot(), cl
         if (!response.ok) throw Object.assign(new Error(response.error.message), response.error);
         validateExpectedResult(op, payload, clientId, requestId, response.result);
         return response.result;
+      } catch (error) {
+        if (["stop", "delete"].includes(op) && error?.code === "CONNECTION_CLOSED" && error?.submitted === true) throw Object.assign(new Error("Destructive command delivery is ambiguous"), { code: "DELIVERY_UNKNOWN", clientId, requestId, submitted: true });
+        throw error;
       } finally { clearTimeout(timer); removeFatal(); }
     },
     close: () => client.close(),
@@ -604,6 +607,7 @@ export async function runSessionCommand(argv, options = {}) {
       return classifyCommandResult(result);
     } catch (error) {
       if (error?.code === "DELIVERY_UNKNOWN") return { code: 1, error: { code: "DELIVERY_UNKNOWN", message: error.message, clientId: pending.entry.clientId, requestId: pending.entry.requestId } };
+      if (attached && error?.code === "CONNECTION_CLOSED") return { code: 1, error: { code: "DELIVERY_UNKNOWN", message: "Composer connection was lost before delivery could be confirmed", clientId: pending.entry.clientId, requestId: pending.entry.requestId } };
       throw error;
     } finally {
       if (attached && canDetach) await request("detach", { sessionId: parsed.sessionId }).catch(() => {});

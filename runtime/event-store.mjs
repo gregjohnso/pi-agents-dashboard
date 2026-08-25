@@ -25,13 +25,14 @@ function sequenceOf(cursor) {
 }
 
 /** @param {unknown} value @returns {value is PersistedEvent} */
-function isPersistedEvent(value) {
-  if (typeof value !== "object" || value === null) return false;
+export function validatePersistedEvent(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value) || Object.keys(value).length !== 5 || Object.keys(value).some((key) => !["version", "cursor", "occurredAt", "kind", "payload"].includes(key))) return false;
   const event = /** @type {Partial<PersistedEvent>} */ (value);
-  return event.version === 1 && typeof event.cursor === "object" && event.cursor !== null
-    && typeof event.cursor.daemonEpoch === "string" && typeof event.cursor.sequence === "string"
-    && typeof event.occurredAt === "string" && typeof event.kind === "string"
-    && typeof event.payload === "object" && event.payload !== null;
+  return event.version === 1 && typeof event.cursor === "object" && event.cursor !== null && !Array.isArray(event.cursor)
+    && Object.keys(event.cursor).length === 2 && Object.keys(event.cursor).every((key) => ["daemonEpoch", "sequence"].includes(key))
+    && typeof event.cursor.daemonEpoch === "string" && event.cursor.daemonEpoch.length > 0 && typeof event.cursor.sequence === "string" && /^(0|[1-9]\d*)$/u.test(event.cursor.sequence)
+    && typeof event.occurredAt === "string" && event.occurredAt.length > 0 && typeof event.kind === "string" && event.kind.length > 0
+    && typeof event.payload === "object" && event.payload !== null && !Array.isArray(event.payload);
 }
 
 /**
@@ -47,7 +48,7 @@ export async function createEventStore({ path, daemonEpoch, now = () => new Date
   const events = [];
   try {
     await store.recoverRecords((value) => {
-      if (!isPersistedEvent(value) || value.cursor.daemonEpoch !== daemonEpoch || value.cursor.sequence !== String(events.length + 1)) {
+      if (!validatePersistedEvent(value) || value.cursor.daemonEpoch !== daemonEpoch || value.cursor.sequence !== String(events.length + 1)) {
         throw new EventStoreError("EVENT_STORE_CORRUPT", "Event cursor sequence, daemon epoch, or record shape is invalid");
       }
       events.push(value);

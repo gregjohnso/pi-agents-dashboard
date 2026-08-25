@@ -5,6 +5,8 @@ import { basename, dirname, join, resolve } from "node:path";
 
 import { convertLegacyDashboardConfig } from "../shared/config.mjs";
 import { parseClientRequest, parseDaemonResponse } from "../shared/contracts.mjs";
+import { validateAttachmentResultRecord } from "./attachment-result-store.mjs";
+import { validatePersistedEvent } from "./event-store.mjs";
 import { validateSessionRecord } from "./registry-store.mjs";
 
 const DIRECTORY_MODE = 0o700;
@@ -13,6 +15,7 @@ const MANIFEST = "migration-manifest.json";
 const CANONICAL_MARKER = "CANONICAL";
 const LEGACY_MARKER = "MIGRATED";
 const LOCK = ".migration.lock";
+const RECONCILIATION_MARKER = ".reconciliation-started";
 
 /** @param {string} code @param {string} message @param {Record<string, unknown>} [details] */
 function migrationError(code, message, details = {}) { return Object.assign(new Error(message), { code, ...details }); }
@@ -29,6 +32,22 @@ function digest(value) { return createHash("sha256").update(value).digest("hex")
 function exactObject(value, keys, label) { if (typeof value !== "object" || value === null || Array.isArray(value) || Object.keys(value).some((key) => !keys.includes(key))) throw new TypeError(`${label} is invalid`); }
 /** @param {any} value */
 function validIdentity(value) { return Number.isSafeInteger(value?.pid) && value.pid > 0 && typeof value.startIdentity === "string" && value.startIdentity.length > 0 && Number.isSafeInteger(value.processGroupId) && value.processGroupId > 0; }
+/** @param {string} text @param {(value:any)=>boolean} validate @param {string} label */
+function validateJsonLines(text, validate, label) {
+  if (text.length > 0 && !text.endsWith("\n")) throw new TypeError(`${label} has an incomplete record`);
+  const values = text.split("\n").filter((line) => line.length > 0).map((line) => JSON.parse(line));
+  if (!values.every(validate)) throw new TypeError(`${label} is invalid`);
+  return values;
+}
+/** @param {any} value */
+function validCursorStore(value) { return typeof value === "object" && value !== null && !Array.isArray(value) && Object.entries(value).every(([clientId, cursor]) => clientId.length > 0 && typeof cursor === "object" && cursor !== null && !Array.isArray(cursor) && Object.keys(cursor).length === 2 && Object.keys(cursor).every((key) => ["daemonEpoch", "sequence"].includes(key)) && typeof cursor.daemonEpoch === "string" && cursor.daemonEpoch.length > 0 && /^(0|[1-9]\d*)$/u.test(cursor.sequence)); }
+/** @param {any} value */
+function validLaunchResults(value) { return value?.schemaVersion === 1 && typeof value.results === "object" && value.results !== null && !Array.isArray(value.results) && Object.keys(value).length === 2 && Object.keys(value).every((key) => ["schemaVersion", "results"].includes(key)) && Object.values(value.results).every((result) => typeof result?.sessionId === "string" && result.sessionId.length > 0 && Object.keys(result).length === 1); }
+/** @param {any} value */
+function validDeleteResults(value) {
+  if (value?.schemaVersion !== 1 || typeof value.entries !== "object" || value.entries === null || Array.isArray(value.entries) || Object.keys(value).length !== 2 || Object.keys(value).some((key) => !["schemaVersion", "entries"].includes(key))) return false;
+  return Object.values(value.entries).every((entry) => { const allowed = ["request", "sessionId", "revision", "canonicalSessionFile", "recordCanonical", "identity", "phase"]; const identityKeys = ["path", "realpath", "type", "dev", "ino", "size", "mtimeMs"]; const identity = entry?.identity; return typeof entry === "object" && entry !== null && !Array.isArray(entry) && Object.keys(entry).length === allowed.length && Object.keys(entry).every((key) => allowed.includes(key)) && typeof entry.request === "string" && typeof entry.sessionId === "string" && entry.sessionId.length > 0 && Number.isSafeInteger(entry.revision) && entry.revision >= 0 && typeof entry.canonicalSessionFile === "string" && resolve(entry.canonicalSessionFile) === entry.canonicalSessionFile && typeof entry.recordCanonical === "string" && ["PREPARED", "TRASHED"].includes(entry.phase) && typeof identity === "object" && identity !== null && !Array.isArray(identity) && Object.keys(identity).length === identityKeys.length && Object.keys(identity).every((key) => identityKeys.includes(key)) && identity.path === entry.canonicalSessionFile && identity.realpath === entry.canonicalSessionFile && identity.type === "file" && [identity.dev, identity.ino, identity.size].every((number) => Number.isSafeInteger(number) && number >= 0) && typeof identity.mtimeMs === "number" && Number.isFinite(identity.mtimeMs) && identity.mtimeMs >= 0; });
+}
 /** @param {string} relative @param {string} text */
 function validateLegacyArtifact(relative, text) {
   try {
@@ -51,16 +70,31 @@ function validateLegacyArtifact(relative, text) {
       if (publication.schemaVersion !== 1 || !validIdentity(publication) || typeof publication.daemonEpoch !== "string" || typeof publication.tokenPath !== "string" || typeof publication.startedAt !== "string" || !["STARTING", "RECONCILING", "READY", "FAILED"].includes(publication.state)) throw new TypeError("Daemon publication is invalid");
       return;
     }
-    if (relative === "queue/commands.jsonl") {
-      for (const line of text.trimEnd().split("\n")) {
-        if (line.length === 0) continue;
-        const journal = JSON.parse(line); exactObject(journal, ["commandCanonical", "command", "status"], "Journal record"); const command = parseClientRequest(journal.command);
-        parseDaemonResponse({ version: 1, requestId: command.requestId, ok: true, result: { kind: "command", status: journal.status } });
-        if (journal.status.clientId !== command.clientId || journal.status.requestId !== command.requestId || journal.status.operation !== command.op || typeof journal.commandCanonical !== "string") throw new TypeError("Journal identity is invalid");
-      }
+    if (relative === "daemon/event-acks.json") { if (!validCursorStore(JSON.parse(text))) throw new TypeError("Event cursor store is invalid"); return; }
+    if (relative === "daemon/launch-results.json") { if (!validLaunchResults(JSON.parse(text))) throw new TypeError("Launch result store is invalid"); return; }
+    if (relative === "daemon/delete-results.json") { if (!validDeleteResults(JSON.parse(text))) throw new TypeError("Delete result store is invalid"); return; }
+    if (relative === "daemon/attachment-results.jsonl") {
+      const records = validateJsonLines(text, validateAttachmentResultRecord, "Attachment result store");
+      const latest = new Map();
+      for (const record of records) { const key = `${record.request.clientId}\0${record.request.requestId}`; const previous = latest.get(key); if (previous !== undefined && !(previous.phase === "PREPARED" && record.phase === "COMPLETED" && previous.requestCanonical === record.requestCanonical)) throw new TypeError("Attachment result transition is invalid"); latest.set(key, record); }
       return;
     }
-    if (relative.endsWith(".json")) JSON.parse(text);
+    if (relative === "index/events.jsonl") {
+      const events = validateJsonLines(text, validatePersistedEvent, "Event store");
+      const epoch = events[0]?.cursor.daemonEpoch;
+      if (events.some((event, index) => event.cursor.daemonEpoch !== epoch || event.cursor.sequence !== String(index + 1))) throw new TypeError("Event store sequence is invalid");
+      return;
+    }
+    if (relative === "queue/commands.jsonl") {
+      validateJsonLines(text, (journal) => { try { exactObject(journal, ["commandCanonical", "command", "status"], "Journal record"); const command = parseClientRequest(journal.command); parseDaemonResponse({ version: 1, requestId: command.requestId, ok: true, result: { kind: "command", status: journal.status } }); return journal.status.clientId === command.clientId && journal.status.requestId === command.requestId && journal.status.operation === command.op && typeof journal.commandCanonical === "string"; } catch { return false; } }, "Command journal");
+      return;
+    }
+    if (relative === "daemon/reconciliation.json") { const value = JSON.parse(text); exactObject(value, ["schemaVersion", "daemonEpoch", "completedAt", "conflicts", "recoveryActions"], "Reconciliation record"); if (value.schemaVersion !== 1 || typeof value.daemonEpoch !== "string" || typeof value.completedAt !== "string" || !Array.isArray(value.conflicts) || !Array.isArray(value.recoveryActions)) throw new TypeError("Reconciliation record is invalid"); return; }
+    if (relative === "cli/client-id") { const clientId = text.trim(); if (clientId.length === 0 || clientId.includes("/") || clientId.includes("\0") || clientId !== text.trim()) throw new TypeError("CLI identity is invalid"); return; }
+    if (/^cli\/pending\/[^/]+\.json$/u.test(relative)) { const value = JSON.parse(text); exactObject(value, ["schemaVersion", "action", "sessionId", "revision", "clientId", "requestId"], "Pending CLI request"); if (value.schemaVersion !== 1 || !["stop", "delete"].includes(value.action) || typeof value.sessionId !== "string" || value.sessionId.length === 0 || !Number.isSafeInteger(value.revision) || value.revision < 0 || [value.clientId, value.requestId].some((entry) => typeof entry !== "string" || entry.length === 0)) throw new TypeError("Pending CLI request is invalid"); return; }
+    if (/^runs\/[^/]+\/(worker\.stdout\.log|worker\.stderr\.log)$/u.test(relative)) return;
+    if (/^runs\/[^/]+\/worker-replay\.jsonl$/u.test(relative)) { validateJsonLines(text, (value) => typeof value === "object" && value !== null && typeof value.clientId === "string" && typeof value.requestId === "string" && typeof value.op === "string" && typeof value.stage === "string" && typeof value.at === "string", "Worker replay store"); return; }
+    throw new TypeError(`Unknown legacy state artifact: ${relative}`);
   } catch (error) { throw migrationError("MALFORMED_LEGACY_STATE", `Malformed legacy artifact: ${relative}`, { cause: error }); }
 }
 
@@ -115,7 +149,7 @@ async function validatePublishedDestination(root, files, expectedUserId, fsOps) 
 }
 /** @param {string} root @param {Array<{relative:string,sha256:string}>} files @param {any} fsOps */
 async function validateReconciledDestination(root, files, fsOps) {
-  const allowed = new Set([LOCK, MANIFEST, CANONICAL_MARKER, "daemon", "sessions", "queue", "runs", "index", "cli", "frontend-state.json", "dashboard.json", ...files.map((file) => file.relative.split("/")[0])]);
+  const allowed = new Set([LOCK, MANIFEST, CANONICAL_MARKER, RECONCILIATION_MARKER, "daemon", "sessions", "queue", "runs", "index", "cli", "frontend-state.json", "dashboard.json", ...files.map((file) => file.relative.split("/")[0])]);
   const collision = (await fsOps.readdir(root)).find((/** @type {string} */ name) => !allowed.has(name));
   if (collision !== undefined) throw migrationError("DESTINATION_COLLISION", `Destination contains unexpected artifact: ${collision}`);
 }
@@ -181,6 +215,8 @@ export async function migrateLegacyState({ legacyRoot, destinationRoot, expected
   const releases = [];
   try {
     for (const root of [legacyRoot, destinationRoot].sort()) releases.push(await acquireLock(root, fsOps, root === destinationRoot, expectedUserId));
+    const runtime = await inspectLegacyRuntime();
+    if (runtime?.activeDaemon || (Array.isArray(runtime?.activeSupervisors) && runtime.activeSupervisors.length > 0)) throw migrationError("LEGACY_RUNTIME_ACTIVE", "Verified legacy daemon or supervisor is active", { identities: runtime });
     const tree = await inspectTree(legacyRoot, expectedUserId, fsOps);
     const destinationMetadata = await fsOps.lstat(destinationRoot);
     const destinationIdentity = digest(JSON.stringify({ realpath: await fsOps.realpath(destinationRoot), dev: destinationMetadata.dev, ino: destinationMetadata.ino }));
@@ -201,7 +237,12 @@ export async function migrateLegacyState({ legacyRoot, destinationRoot, expected
       if (existing.schemaVersion !== 1 || existing.destinationIdentity !== destinationIdentity || existing.configFrom !== 1 || existing.configTo !== 2 || !["PREPARED", "PUBLISHED", "RECONCILED"].includes(existing.state) || typeof existing.createdAt !== "string" || typeof existing.updatedAt !== "string" || Object.keys(existing).length !== manifestKeys.length || Object.keys(existing).some((key) => !manifestKeys.includes(key))) throw migrationError("MIGRATION_IDENTITY_MISMATCH", "Destination manifest contract is invalid");
       if (existing.state === "RECONCILED" && await fsOps.readFile(join(destinationRoot, CANONICAL_MARKER), "utf8").then((/** @type {string} */ value) => value.trim() === migrationId).catch(() => false)) { await validateReconciledDestination(destinationRoot, files, fsOps); return { status: "ALREADY_MIGRATED", migrationId, manifestPath }; }
       if (existing.state === "PREPARED") await validateCompletedDestination(destinationRoot, files, fsOps);
-      if (existing.state === "PUBLISHED") await validatePublishedDestination(destinationRoot, files, expectedUserId, fsOps);
+      if (existing.state === "PUBLISHED") {
+        const marker = await fsOps.readFile(join(destinationRoot, RECONCILIATION_MARKER), "utf8").then((/** @type {string} */ value) => value.trim()).catch((/** @type {NodeJS.ErrnoException} */ error) => { if (error.code === "ENOENT") return undefined; throw error; });
+        if (marker !== undefined && marker !== migrationId) throw migrationError("MIGRATION_IDENTITY_MISMATCH", "Reconciliation marker belongs to another migration");
+        if (marker === migrationId) await validatePublishedDestination(destinationRoot, files, expectedUserId, fsOps);
+        else await validateCompletedDestination(destinationRoot, files, fsOps);
+      }
     } else {
       const destinationEntries = (await fsOps.readdir(destinationRoot)).filter((/** @type {string} */ name) => name !== LOCK);
       const expectedTopLevels = new Set(files.map((file) => file.relative.split("/")[0]));
@@ -222,9 +263,6 @@ export async function migrateLegacyState({ legacyRoot, destinationRoot, expected
         published = { schemaVersion: 1, migrationId, sourceIdentity: tree.identity, destinationIdentity, state: "PUBLISHED", configFrom: 1, configTo: 2, createdAt: timestamp, updatedAt: timestamp };
       }
     }
-    const runtime = await inspectLegacyRuntime();
-    if (runtime?.activeDaemon || (Array.isArray(runtime?.activeSupervisors) && runtime.activeSupervisors.length > 0)) throw migrationError("LEGACY_RUNTIME_ACTIVE", "Verified legacy daemon or supervisor is active", { identities: runtime });
-
     if (published === undefined) {
       await failpoint("staging_start");
       const stage = join(destinationRoot, `.migration-stage-${migrationId}`);
@@ -246,13 +284,19 @@ export async function migrateLegacyState({ legacyRoot, destinationRoot, expected
       await fsOps.rename(manifestTemporary, manifestPath); await syncDirectory(destinationRoot, fsOps); await failpoint("after_manifest_publication");
     }
     if (published.state === "RECONCILED") {
+      await fsOps.rm(join(destinationRoot, RECONCILIATION_MARKER), { force: true }); await syncDirectory(destinationRoot, fsOps);
       await durableFile(join(destinationRoot, CANONICAL_MARKER), `${migrationId}\n`, fsOps); await syncDirectory(destinationRoot, fsOps);
       await durableFile(join(legacyRoot, LEGACY_MARKER), `${migrationId}\n`, fsOps); await syncDirectory(legacyRoot, fsOps);
       return { status: "MIGRATED", migrationId, manifestPath };
     }
+    const reconciliationMarkerPath = join(destinationRoot, RECONCILIATION_MARKER);
+    const reconciliationMarker = await fsOps.readFile(reconciliationMarkerPath, "utf8").then((/** @type {string} */ value) => value.trim()).catch((/** @type {NodeJS.ErrnoException} */ error) => { if (error.code === "ENOENT") return undefined; throw error; });
+    if (reconciliationMarker === undefined) { await durableFile(reconciliationMarkerPath, `${migrationId}\n`, fsOps); await syncDirectory(destinationRoot, fsOps); }
+    else if (reconciliationMarker !== migrationId) throw migrationError("MIGRATION_IDENTITY_MISMATCH", "Reconciliation marker belongs to another migration");
     await reconcileDestination({ root: destinationRoot, migrationId, manifest: published });
     await failpoint("before_reconciliation_completion");
     const completed = { ...published, state: "RECONCILED", updatedAt: new Date().toISOString() }; await replaceJson(manifestPath, completed, fsOps);
+    await fsOps.rm(reconciliationMarkerPath, { force: true }); await syncDirectory(destinationRoot, fsOps);
     await failpoint("after_reconciliation");
     await durableFile(join(destinationRoot, CANONICAL_MARKER), `${migrationId}\n`, fsOps); await syncDirectory(destinationRoot, fsOps);
     await durableFile(join(legacyRoot, LEGACY_MARKER), `${migrationId}\n`, fsOps); await syncDirectory(legacyRoot, fsOps);

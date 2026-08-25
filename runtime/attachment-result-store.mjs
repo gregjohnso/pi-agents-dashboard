@@ -48,7 +48,7 @@ function validOutcome(outcome, request) {
 }
 
 /** @param {any} value */
-function validRecord(value) {
+export function validateAttachmentResultRecord(value) {
   return exactKeys(value, ["schemaVersion", "phase", "requestCanonical", "request", "outcome"])
     && value.schemaVersion === 1
     && ["PREPARED", "COMPLETED"].includes(value.phase)
@@ -65,7 +65,7 @@ export async function createAttachmentResultStore(/** @type {{ path: string }} *
   const key = (/** @type {any} */ request) => `${request.clientId}\0${request.requestId}`;
   try {
     await store.recoverRecords((value) => {
-      if (!validRecord(value)) throw new AttachmentResultStoreError("ATTACHMENT_RESULTS_CORRUPT", "Attachment result store contains an invalid record");
+      if (!validateAttachmentResultRecord(value)) throw new AttachmentResultStoreError("ATTACHMENT_RESULTS_CORRUPT", "Attachment result store contains an invalid record");
       const record = /** @type {any} */ (value);
       const existing = outcomes.get(key(record.request));
       const validTransition = existing === undefined || (existing.phase === "PREPARED" && record.phase === "COMPLETED" && existing.requestCanonical === record.requestCanonical);

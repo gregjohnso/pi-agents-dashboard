@@ -171,8 +171,8 @@ function laterCursor(current, candidate) {
         return candidate;
     return BigInt(candidate.sequence) >= BigInt(current.sequence) ? candidate : current;
 }
-/** Create a bounded JSONL daemon client that reconnects until explicitly closed. */
-export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelayMs = 50, maxReconnectDelayMs = 1_000, clientId, subscriberLimit = 100, }) {
+/** Create a bounded JSONL daemon client with optional reconnect-and-replay behavior. */
+export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelayMs = 50, maxReconnectDelayMs = 1_000, clientId, subscriberLimit = 100, reconnect = true, }) {
     if (!Number.isSafeInteger(reconnectDelayMs) || reconnectDelayMs < 0)
         throw new TypeError("reconnectDelayMs must be a non-negative safe integer");
     if (!Number.isSafeInteger(maxReconnectDelayMs) || maxReconnectDelayMs < reconnectDelayMs)
@@ -181,6 +181,8 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
         throw new TypeError("subscriberLimit must be a positive safe integer");
     if (typeof clientId !== "string" || clientId.length === 0)
         throw new TypeError("clientId is required");
+    if (typeof reconnect !== "boolean")
+        throw new TypeError("reconnect must be boolean");
     const encoder = createJsonlEncoder({ maxBytes });
     const pending = new Map();
     const seen = new Map();
@@ -191,6 +193,7 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
     let reconnectLoop;
     let closed = false;
     let authenticated = false;
+    let everConnected = false;
     const hasWork = () => pending.size > 0 || subscribers.size > 0;
     const reportFatalFrame = (error, fallbackCode) => {
         const typed = error;
@@ -205,6 +208,7 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
             throw new DaemonClientError("NOT_CONNECTED", "Daemon is not connected");
         socket.write(encoder.encode(value));
     };
+    const sendPending = (item) => { send(item.request); item.sent = true; };
     const sendSubscriptions = () => {
         for (const subscriber of subscribers) {
             send({ version: 1, clientId, requestId: randomUUID(), op: "subscribe", payload: subscriber.acknowledgedAfter === undefined ? {} : { after: subscriber.acknowledgedAfter } });
@@ -280,8 +284,9 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                         const authentication = /** @type {Record<string, unknown> | null} */ (typeof record === "object" ? record : null);
                         if (authentication !== null && authentication.kind === "authenticated" && authentication.version === 1) {
                             authenticated = true;
+                            everConnected = true;
                             for (const item of pending.values())
-                                send(item.request);
+                                sendPending(item);
                             sendSubscriptions();
                             if (!settled) {
                                 settled = true;
@@ -326,14 +331,22 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                 socket = undefined;
                 authenticated = false;
             }
-            failAttempt(new DaemonClientError("CONNECTION_CLOSED", "Daemon connection closed"));
-            if (!closed && hasWork())
-                void startReconnectLoop().catch(() => { });
+            const closedError = (submitted = false) => Object.assign(new DaemonClientError("CONNECTION_CLOSED", "Daemon connection closed"), { submitted });
+            failAttempt(closedError());
+            if (!reconnect) {
+                for (const item of pending.values()) item.reject(closedError(item.sent));
+                pending.clear();
+                for (const subscriber of subscribers) { subscriber.error = closedError(); subscriber.ended = true; subscriber.waiter?.({ value: undefined, done: true }); }
+                subscribers.clear();
+            }
+            else if (!closed && hasWork()) void startReconnectLoop().catch(() => { });
         });
     });
     function startReconnectLoop() {
         if (closed)
             return Promise.reject(new DaemonClientError("CLIENT_CLOSED", "Daemon client is closed"));
+        if (!reconnect && everConnected && (socket === undefined || !authenticated || socket.destroyed))
+            return Promise.reject(Object.assign(new DaemonClientError("CONNECTION_CLOSED", "Transactional daemon connection is closed"), { submitted: false }));
         if (socket !== undefined && authenticated && !socket.destroyed)
             return Promise.resolve();
         if (reconnectLoop !== undefined)
@@ -345,7 +358,8 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                     await attemptConnection();
                     return;
                 }
-                catch {
+                catch (error) {
+                    if (!reconnect) throw error;
                     if (closed)
                         break;
                     await waitForRetry(retryDelay);
@@ -360,6 +374,7 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
     }
     return {
         connect: startReconnectLoop,
+        createTransactionClient() { return createDaemonClient({ socketPath, token, maxBytes, reconnectDelayMs, maxReconnectDelayMs, clientId, subscriberLimit, reconnect: false }); },
         request(request) {
             if (closed)
                 return Promise.reject(new DaemonClientError("CLIENT_CLOSED", "Daemon client is closed"));
@@ -380,10 +395,10 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                 resolve = yes;
                 reject = no;
             });
-            pending.set(request.requestId, { request, resolve, reject, promise });
+            pending.set(request.requestId, { request, resolve, reject, promise, sent: false });
             seen.set(request.requestId, { canonical: serialized });
             if (socket !== undefined && authenticated && !socket.destroyed)
-                send(request);
+                sendPending(pending.get(request.requestId));
             else
                 void startReconnectLoop().catch(() => { });
             return promise;

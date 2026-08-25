@@ -95,12 +95,36 @@ it.each([
   ["daemon/control.token", ""],
   ["frontend-state.json", JSON.stringify({ schemaVersion: 1, clientId: "client", cursor: { daemonEpoch: "epoch", sequence: "01" } })],
   ["queue/commands.jsonl", "{\"command\":{}}\n"],
+  ["daemon/event-acks.json", JSON.stringify({ client: { daemonEpoch: "epoch", sequence: "01" } })],
+  ["daemon/launch-results.json", JSON.stringify({ schemaVersion: 1, results: { request: {} } })],
+  ["daemon/delete-results.json", JSON.stringify({ schemaVersion: 1, entries: { request: {} } })],
+  ["daemon/attachment-results.jsonl", `${JSON.stringify({ schemaVersion: 1, phase: "PREPARED" })}\n`],
+  ["index/events.jsonl", `${JSON.stringify({ version: 1, cursor: { daemonEpoch: "epoch", sequence: "2" }, occurredAt: "now", kind: "session_changed", payload: {} })}\n`],
+  ["unknown-state.json", JSON.stringify({ value: true })],
 ])("refuses malformed legacy artifact %s", async (relative, text) => {
   const paths = await fixture();
   const directory = join(paths.legacyRoot, relative.split("/").slice(0, -1).join("/"));
   await mkdir(directory, { recursive: true, mode: 0o700 });
   await writeFile(join(paths.legacyRoot, relative), text, { mode: 0o600 });
   await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: vi.fn() })).rejects.toMatchObject({ code: "MALFORMED_LEGACY_STATE" });
+});
+
+it("rejects changed PUBLISHED output before reconciliation starts", async () => {
+  const paths = await fixture();
+  const options = { ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {}, async failpoint(/** @type {string} */ stage) { if (stage === "after_manifest_publication") throw new Error("crash"); } };
+  await expect(migrateLegacyState(options)).rejects.toThrow("crash");
+  const recordPath = join(paths.destinationRoot, "sessions", "one.json");
+  const record = JSON.parse(await readFile(recordPath, "utf8"));
+  await writeFile(recordPath, `${JSON.stringify({ ...record, revision: 1 })}\n`, { mode: 0o600 });
+  await expect(migrateLegacyState({ ...options, failpoint: async () => {} })).rejects.toMatchObject({ code: "MIGRATION_IDENTITY_MISMATCH" });
+});
+
+it("recovers mutable PUBLISHED output only after the reconciliation marker is durable", async () => {
+  const paths = await fixture();
+  const recordPath = join(paths.destinationRoot, "sessions", "one.json");
+  const base = { ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }) };
+  await expect(migrateLegacyState({ ...base, reconcileDestination: async () => { const record = JSON.parse(await readFile(recordPath, "utf8")); await writeFile(recordPath, `${JSON.stringify({ ...record, revision: 1 })}\n`, { mode: 0o600 }); }, async failpoint(/** @type {string} */ stage) { if (stage === "before_reconciliation_completion") throw new Error("crash"); } })).rejects.toThrow("crash");
+  await expect(migrateLegacyState({ ...base, reconcileDestination: async () => {} })).resolves.toMatchObject({ status: "MIGRATED" });
 });
 
 it("treats a reconciled migration as idempotent after destination writers mutate copied records", async () => {

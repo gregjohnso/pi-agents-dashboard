@@ -12,12 +12,12 @@ afterEach(async () => {
   await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-it("derives matching legacy and destination roots from each XDG location", () => {
-  expect(resolveDashboardRoots({ HOME: "/home/user", XDG_STATE_HOME: "/state", XDG_RUNTIME_DIR: "/run/user/1" })).toEqual({
+it("uses the actual state root for daemon endpoints and ignores unsupported runtime overrides", () => {
+  expect(resolveDashboardRoots({ HOME: "/home/user", XDG_STATE_HOME: "/state", XDG_RUNTIME_DIR: "/run/user/1", PI_DASHBOARD_RUNTIME_DIR: "/unsupported" })).toEqual({
     legacyStateRoot: "/state/pi-agents-dashboard",
     destinationStateRoot: "/state/pi-dashboard",
-    legacyRuntimeRoot: "/run/user/1/pi-agents-dashboard",
-    destinationRuntimeRoot: "/run/user/1/pi-dashboard",
+    legacyRuntimeRoot: "/state/pi-agents-dashboard",
+    destinationRuntimeRoot: "/state/pi-dashboard",
   });
 });
 

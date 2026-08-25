@@ -68,6 +68,32 @@ it("claims and releases composer around a destructive session command", async ()
   expect(operations.map(([op]) => op)).toEqual(["attach", "stop", "detach"]);
 });
 
+it("does not replay a destructive request after its composer socket disconnects", async () => {
+  const root = await stateRoot();
+  const operations = [];
+  const server = await daemonServer(root, (socket, encoder, frame) => {
+    operations.push(frame.op);
+    if (frame.op === "attach") socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "attached", sessionId: "exact-session-id", role: "composer" } }));
+    else if (frame.op === "stop") socket.destroy();
+  });
+  await expect(runSessionCommand(["stop", "exact-session-id", "--revision", "4", "--yes"], { root, randomId: () => "transaction", timeoutMs: 200 })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN" } });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(operations).toEqual(["attach", "stop"]);
+  await new Promise((resolve) => server.close(resolve));
+});
+
+it("does not send a mutation after the attached socket is lost", async () => {
+  const root = await stateRoot();
+  const operations = [];
+  const server = await daemonServer(root, (socket, encoder, frame) => {
+    operations.push(frame.op);
+    if (frame.op === "attach") socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "attached", sessionId: "exact-session-id", role: "composer" } }), () => socket.destroy());
+  });
+  await expect(runSessionCommand(["stop", "exact-session-id", "--revision", "4", "--yes"], { root, randomId: () => "attachment-loss", timeoutMs: 200 })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN" } });
+  expect(operations).toEqual(["attach"]);
+  await new Promise((resolve) => server.close(resolve));
+});
+
 it("requires exact ID, revision, and confirmation for stop and delete", async () => {
   const root = await stateRoot();
   const request = vi.fn(async () => ({ kind: "command", status: { stage: "COMPLETED" } }));

@@ -9,12 +9,13 @@ export const LINUX_SOCKET_PATH_MAX_BYTES = 107;
 export function resolveDashboardRoots(env = process.env) {
   const home = env.HOME ?? homedir();
   const stateParent = env.XDG_STATE_HOME ?? join(home, ".local", "state");
-  const runtimeParent = env.XDG_RUNTIME_DIR ?? join(home, ".local", "state");
+  const legacyStateRoot = resolve(stateParent, "pi-agents-dashboard");
+  const destinationStateRoot = resolve(env.PI_DASHBOARD_STATE_DIR ?? join(stateParent, "pi-dashboard"));
   return {
-    legacyStateRoot: resolve(stateParent, "pi-agents-dashboard"),
-    destinationStateRoot: resolve(env.PI_DASHBOARD_STATE_DIR ?? join(stateParent, "pi-dashboard")),
-    legacyRuntimeRoot: resolve(runtimeParent, "pi-agents-dashboard"),
-    destinationRuntimeRoot: resolve(env.PI_DASHBOARD_RUNTIME_DIR ?? join(runtimeParent, "pi-dashboard")),
+    legacyStateRoot,
+    destinationStateRoot,
+    legacyRuntimeRoot: legacyStateRoot,
+    destinationRuntimeRoot: destinationStateRoot,
   };
 }
 

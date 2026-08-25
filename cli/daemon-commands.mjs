@@ -139,7 +139,8 @@ export async function runDaemonCommand(command, options = {}) {
         return { code: 1, error: { code: "WORKERS_LIVE", message: "Daemon stop requires --stop-workers --yes while workers are live" }, result: { kind: "live_workers", sessionIds: liveSessions.map((record) => record.sessionId) } };
       }
       if (liveSessions.length > 0 && options.stopWorkers === true) {
-        const outcomes = await Promise.all(liveSessions.map(async (record) => {
+        let outcomes;
+        try { outcomes = await Promise.all(liveSessions.map(async (record) => {
           if (claimsComposer) {
             const attached = await request("attach", { sessionId: record.sessionId, role: "composer" });
             if (attached?.kind !== "attached" || attached.role !== "composer") return attached;
@@ -147,7 +148,8 @@ export async function runDaemonCommand(command, options = {}) {
           let outcome;
           try { outcome = await request("stop", { sessionId: record.sessionId, revision: record.revision }); return outcome; }
           finally { if (claimsComposer && outcome !== undefined) await request("detach", { sessionId: record.sessionId }).catch(() => {}); }
-        }));
+        })); }
+        catch (error) { if (error?.code === "DELIVERY_UNKNOWN" || (error?.code === "CONNECTION_CLOSED" && error?.submitted === true)) return { code: 1, error: { code: "DELIVERY_UNKNOWN", message: "A worker Stop delivery is ambiguous; daemon remains running" } }; throw error; }
         const refused = outcomes.find((outcome) => outcome?.kind !== "command" || outcome.status?.stage !== "COMPLETED");
         if (refused !== undefined) return { code: 1, error: { code: refused?.status?.stage === "DELIVERY_UNKNOWN" ? "DELIVERY_UNKNOWN" : "WORKER_STOP_REFUSED", message: "A worker stop did not complete; daemon remains running" }, result: refused };
       }

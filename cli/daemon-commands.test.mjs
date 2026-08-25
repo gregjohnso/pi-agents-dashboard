@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
 import { daemonEntryPoint, resolveRuntimeRoot, runDaemonCommand } from "./daemon-commands.mjs";
@@ -97,6 +97,22 @@ it("claims composer on each exact worker before --stop-workers mutation", async 
     stopWorkers: true, yes: true, stopProcessGroup: async () => ({ disposition: "GRACEFUL" }),
   });
   expect(operations).toEqual(["get_state", "attach", "stop", "detach"]);
+});
+
+it("keeps the daemon running when a worker Stop socket disconnects after submission", async () => {
+  const publication = { pid: 321, startIdentity: "987654321", processGroupId: 654, tokenPath: "/state/daemon/control.token" };
+  const operations = [];
+  const request = async (op) => {
+    operations.push(op);
+    if (op === "get_state") return { kind: "state", sessions: [{ sessionId: "live", revision: 4, processState: "LIVE", ownership: { runId: "run" } }] };
+    if (op === "attach") return { kind: "attached", sessionId: "live", role: "composer" };
+    throw Object.assign(new Error("socket closed"), { code: "DELIVERY_UNKNOWN", submitted: true });
+  };
+  await expect(runDaemonCommand("stop", {
+    root: "/state", inspectEndpoint: async () => ({ status: "HEALTHY", daemonState: "READY", publication }), composerRequest: request,
+    stopWorkers: true, yes: true, stopProcessGroup: vi.fn(),
+  })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN" } });
+  expect(operations).toEqual(["get_state", "attach", "stop"]);
 });
 
 it("refuses daemon --stop-workers shutdown when any exact worker stop is not observed terminal", async () => {

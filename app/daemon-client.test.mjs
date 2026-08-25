@@ -71,6 +71,14 @@ describe("daemon client", () => {
         expect(await client.request(request)).toMatchObject({ requestId: "exact-request-id", ok: true });
         expect(fixture.count()).toBe(2);
     });
+    it("does not replay a transactional request after its authenticated socket disconnects", async () => {
+        const fixture = await serverFixture(true);
+        const client = createDaemonClient({ socketPath: fixture.socketPath, token: "secret", maxBytes: 1024, reconnect: false, clientId: "client-1" });
+        cleanups.push(() => client.close());
+        await expect(within(client.request(request))).rejects.toMatchObject({ code: "CONNECTION_CLOSED", submitted: true });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(fixture.count()).toBe(1);
+    });
     it("retains an unresolved request while reconnect attempts fail until the daemon starts", async () => {
         const directory = await mkdtemp(join(tmpdir(), "client-late-"));
         const socketPath = join(directory, "control.sock");

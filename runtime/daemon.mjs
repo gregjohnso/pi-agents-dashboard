@@ -13,7 +13,7 @@ import { ensurePrivateDirectory, initializeRuntimePermissions } from "./permissi
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "./process-signaler.mjs";
 import { RecoveredWorkerRouter, reconcileRuntime } from "./reconciliation.mjs";
-import { RegistryStore } from "./registry-store.mjs";
+import { RegistryStore, runSessionLifecycle } from "./registry-store.mjs";
 import { reduceSessionState } from "./state-reducer.mjs";
 import { parseClientRequest } from "../shared/contracts.js";
 
@@ -163,6 +163,63 @@ async function createLaunchResultStore(path) {
   };
 }
 
+/** @param {string} path */
+async function createDeleteResultStore(path) {
+  /** @type {Record<string, any>} */
+  let entries = {};
+  try {
+    const value = JSON.parse(await fs.readFile(path, "utf8"));
+    if (value?.schemaVersion !== 1 || typeof value.entries !== "object" || value.entries === null || Array.isArray(value.entries) || Object.keys(value).some((key) => !["schemaVersion", "entries"].includes(key))) throw new TypeError("Delete recovery store is invalid");
+    entries = value.entries;
+  } catch (error) {
+    if (!(error instanceof Error) || /** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT") throw error;
+  }
+  let tail = Promise.resolve();
+  const key = (/** @type {any} */ request) => `${request.clientId}\0${request.requestId}`;
+  const serialized = (/** @type {any} */ request) => JSON.stringify({ op: request.op, payload: request.payload });
+  const persist = (/** @type {() => any} */ mutate) => {
+    const operation = tail.then(async () => {
+      const result = mutate();
+      await atomicWriteJson(path, { schemaVersion: 1, entries });
+      return result;
+    });
+    tail = operation.then(() => {}, () => {});
+    return operation;
+  };
+  return {
+    /** @param {any} request */
+    get(request) {
+      const entry = entries[key(request)];
+      if (entry !== undefined && entry.request !== serialized(request)) throw Object.assign(new Error("Delete request identity conflicts with recovery state"), { code: "IDEMPOTENCY_CONFLICT" });
+      return entry;
+    },
+    /** @param {any} request @param {any} record @param {any} identity */
+    prepare(request, record, identity) {
+      return persist(() => {
+        const existing = entries[key(request)];
+        const candidate = { request: serialized(request), sessionId: record.sessionId, revision: record.revision, canonicalSessionFile: record.canonicalSessionFile, identity, phase: "PREPARED" };
+        if (existing !== undefined) {
+          if (JSON.stringify({ ...existing, phase: "PREPARED" }) !== JSON.stringify(candidate)) throw Object.assign(new Error("Delete recovery identity changed"), { code: "IDEMPOTENCY_CONFLICT" });
+          return existing;
+        }
+        entries = { ...entries, [key(request)]: candidate };
+        return candidate;
+      });
+    },
+    /** @param {any} request */
+    markTrashed(request) {
+      return persist(() => {
+        const existing = entries[key(request)];
+        if (existing === undefined) throw Object.assign(new Error("Delete recovery preparation is missing"), { code: "DELETE_RECOVERY_MISSING" });
+        const updated = { ...existing, phase: "TRASHED" };
+        entries = { ...entries, [key(request)]: updated };
+        return updated;
+      });
+    },
+    async close() { await tail; },
+  };
+}
+
 /** @param {any} record @param {any} pending */
 function validateWorkerSuccess(record, pending) {
   const allowed = ["clientId", "requestId", "op", "stage", "at", "result", "stderr"];
@@ -303,8 +360,15 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
           let request;
           try {
             request = parseClientRequest(frame);
-          } catch {
-            await send({ version: 1, requestId: typeof frame?.requestId === "string" ? frame.requestId : "invalid-request", ok: false, error: dashboardError("INVALID_REQUEST", "Invalid client request") });
+          } catch (error) {
+            const requestError = /** @type {{ code?: string }} */ (error);
+            const revisionRequired = requestError?.code === "REVISION_REQUIRED";
+            await send({
+              version: 1,
+              requestId: typeof frame?.requestId === "string" ? frame.requestId : "invalid-request",
+              ok: false,
+              error: dashboardError(revisionRequired ? "REVISION_REQUIRED" : "INVALID_REQUEST", revisionRequired ? "Stop and Delete require an exact registry revision" : "Invalid client request"),
+            });
             return;
           }
           if (frontendClientId === undefined) frontendClientId = request.clientId;
@@ -432,8 +496,6 @@ export async function createDaemonRuntime({
     const attachmentClaims = new Map();
     /** @type {Map<string, { serialized: string, promise: Promise<any> }>} */
     const attachmentRequests = new Map();
-    /** @type {Map<string, Promise<unknown>>} */
-    const attachmentTails = new Map();
     /** @type {WeakMap<net.Socket, Set<string>>} */
     const attachmentSessions = new WeakMap();
     /** @type {WeakSet<net.Socket>} */
@@ -447,6 +509,7 @@ export async function createDaemonRuntime({
       cursorStore: undefined,
       launchResults: undefined,
       attachmentResults: undefined,
+      deleteResults: undefined,
       router,
       workerPending: new Map(),
       hostReport: undefined,
@@ -458,14 +521,7 @@ export async function createDaemonRuntime({
       markAttachmentClosing(socket) { closingAttachmentSockets.add(socket); },
       /** @param {string} sessionId @param {() => Promise<any>} operation */
       serializeAttachment(sessionId, operation) {
-        const previous = attachmentTails.get(sessionId) ?? Promise.resolve();
-        const result = previous.catch(() => {}).then(operation);
-        const tail = result.catch(() => {});
-        attachmentTails.set(sessionId, tail);
-        void tail.finally(() => {
-          if (attachmentTails.get(sessionId) === tail) attachmentTails.delete(sessionId);
-        });
-        return result;
+        return runSessionLifecycle(registry, sessionId, operation);
       },
       /** @param {string} sessionId @param {string} clientId @param {"composer" | "observer"} role @param {boolean} attached */
       async appendAttachment(sessionId, clientId, role, attached) {
@@ -664,19 +720,21 @@ export async function createDaemonRuntime({
           await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
           try {
             const launch = await resolveLaunchRequest(request);
-            if (launchingSessions.has(launch.sessionId)) throw Object.assign(new Error("A launch is already in flight for this session"), { code: "LAUNCH_IN_FLIGHT" });
-            launchingSessions.add(launch.sessionId);
-            let handle;
-            try {
-              handle = await workerSupervisor.launch({ ...launch, daemonConnector: CONNECTOR_PATH, daemonConnectConfig: { socketPath: join(daemonDirectory, "control.sock"), tokenPath, maxBytes } });
-              await router.register(handle);
-            } finally {
-              launchingSessions.delete(launch.sessionId);
-            }
-            const persisted = await context.launchResults.put(request, { sessionId: handle.sessionId });
-            await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-            await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
-            return { kind: "launched", sessionId: persisted.sessionId };
+            return await runSessionLifecycle(registry, launch.sessionId, async () => {
+              if (launchingSessions.has(launch.sessionId)) throw Object.assign(new Error("A launch is already in flight for this session"), { code: "LAUNCH_IN_FLIGHT" });
+              launchingSessions.add(launch.sessionId);
+              let handle;
+              try {
+                handle = await workerSupervisor.launch({ ...launch, daemonConnector: CONNECTOR_PATH, daemonConnectConfig: { socketPath: join(daemonDirectory, "control.sock"), tokenPath, maxBytes } });
+                await router.register(handle);
+              } finally {
+                launchingSessions.delete(launch.sessionId);
+              }
+              const persisted = await context.launchResults.put(request, { sessionId: handle.sessionId });
+              await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
+              await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
+              return { kind: "launched", sessionId: persisted.sessionId };
+            });
           } catch (error) {
             const current = await context.recovery.journal.get(request);
             if (current?.stage === "DELIVERY_ATTEMPTED") await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
@@ -757,8 +815,11 @@ export async function createDaemonRuntime({
                 if (current?.stage === "DELIVERY_ATTEMPTED") return context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
                 throw error;
               }
-              const observedTerminal = ["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "KILLED"].includes(disposition.disposition);
-              if (["STALE_IDENTITY", "AMBIGUOUS_IDENTITY", "CANCELLED"].includes(disposition.disposition)) {
+              const observedTerminal = ["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "KILLED", "STALE_IDENTITY"].includes(disposition.disposition);
+              if (disposition.disposition === "KILL_REQUESTED" || (disposition.signaled === true && disposition.disposition !== "STALE_IDENTITY")) {
+                return context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
+              }
+              if (["AMBIGUOUS_IDENTITY", "CANCELLED"].includes(disposition.disposition)) {
                 await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
                 return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "FAILED", dashboardError(disposition.disposition, `Stop refused at exact identity boundary: ${disposition.disposition}`));
               }
@@ -776,31 +837,48 @@ export async function createDaemonRuntime({
             });
           } else if (request.op === "delete") {
             const retryAtRisk = (await context.recovery.journal.history(request)).some((/** @type {any} */ prior) => prior.stage === "DELIVERY_UNKNOWN");
-            status = await router.runSession(request.payload.sessionId, (/** @type {any} */ { metadata: lockedMetadata, route: lockedRoute }) => context.serializeAttachment(request.payload.sessionId, async () => {
-              const record = await registry.get(request.payload.sessionId);
-              if (record === undefined) {
-                if (!retryAtRisk) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("SESSION_NOT_FOUND", "The exact session does not exist"));
+            status = await router.runSession(request.payload.sessionId, async (/** @type {any} */ { metadata: lockedMetadata, route: lockedRoute }) => {
+              const complete = async () => {
                 await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
                 await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
                 return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
+              };
+              let record = await registry.get(request.payload.sessionId);
+              const recovery = retryAtRisk ? context.deleteResults.get(request) : undefined;
+              if (recovery !== undefined) {
+                if (record === undefined) return complete();
+                const safe = recovery.sessionId === request.payload.sessionId &&
+                  recovery.revision === request.payload.revision &&
+                  recovery.canonicalSessionFile === record.canonicalSessionFile &&
+                  record.ownership === undefined &&
+                  !["LIVE", "SLEEPING"].includes(record.processState) &&
+                  lockedMetadata === undefined && lockedRoute === undefined &&
+                  !launchingSessions.has(record.sessionId) &&
+                  (attachmentClaims.get(record.sessionId)?.size ?? 0) === 0;
+                if (!safe) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("DELETE_RECONCILIATION_REFUSED", "Post-trash state is no longer the exact inactive, unowned, unattached, unrouted target"));
+                try {
+                  const currentIdentity = await inspectSessionFile(record.canonicalSessionFile);
+                  if (JSON.stringify(currentIdentity) !== JSON.stringify(recovery.identity) || recovery.phase === "TRASHED") {
+                    return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("DELETE_RECONCILIATION_REFUSED", "Post-trash file identity is not safe to retry"));
+                  }
+                } catch (error) {
+                  if (/** @type {any} */ (error)?.code !== "ENOENT") return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("DELETE_RECONCILIATION_REFUSED", "Post-trash file identity is ambiguous"));
+                  await registry.remove(record.sessionId, record.revision);
+                  return complete();
+                }
+              } else {
+                if (record === undefined) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("SESSION_NOT_FOUND", "The exact session does not exist"));
+                if (record.revision !== request.payload.revision) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("REVISION_CONFLICT", "Session revision changed before Delete"));
               }
-              if (record.revision !== request.payload.revision) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("REVISION_CONFLICT", "Session revision changed before Delete"));
               if (record.ownership !== undefined || ["LIVE", "SLEEPING"].includes(record.processState)) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("SESSION_LIVE", "Delete refuses a live or owned session"));
               if (lockedMetadata !== undefined || lockedRoute !== undefined || launchingSessions.has(record.sessionId)) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("OWNERSHIP_CONFLICT", "A worker lease, route, or launch is still authoritative"));
               if ((attachmentClaims.get(record.sessionId)?.size ?? 0) > 0) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("SESSION_ATTACHED", "Delete refuses an attached session"));
               if (trashSessionFile === undefined) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("TRASH_CAPABILITY_UNAVAILABLE", "Pi exposes no approved public session-trash seam"));
               let original;
               try {
-                original = await inspectSessionFile(record.canonicalSessionFile);
+                original = recovery?.identity ?? await inspectSessionFile(record.canonicalSessionFile);
               } catch (error) {
-                const identityError = /** @type {any} */ (error);
-                if (retryAtRisk && identityError?.code === "ENOENT") {
-                  await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
-                  await registry.remove(record.sessionId, record.revision);
-                  await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-                  return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
-                }
-                return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError(identityError?.code ?? "SESSION_PATH_UNSAFE", error instanceof Error ? error.message : "Session file identity is unsafe"));
+                return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError(/** @type {any} */ (error)?.code ?? "SESSION_PATH_UNSAFE", error instanceof Error ? error.message : "Session file identity is unsafe"));
               }
               await destructiveFailpoint("delete_before_identity_recheck", request, record);
               const currentIdentity = await inspectSessionFile(record.canonicalSessionFile);
@@ -809,28 +887,33 @@ export async function createDaemonRuntime({
               if (exactRecord?.revision !== record.revision || exactRecord.ownership !== undefined || ["LIVE", "SLEEPING"].includes(exactRecord.processState) || exactRecord.canonicalSessionFile !== record.canonicalSessionFile || lockedMetadata !== undefined || lockedRoute !== undefined || launchingSessions.has(record.sessionId) || (attachmentClaims.get(record.sessionId)?.size ?? 0) > 0) {
                 return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("DELETE_REVALIDATION_FAILED", "Session ownership, attachment, launch, state, or revision changed before trash"));
               }
+              if (recovery === undefined) await context.deleteResults.prepare(request, record, original);
               await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
               try {
                 await trashSessionFile(record.canonicalSessionFile, original);
                 await fs.lstat(record.canonicalSessionFile).then(() => { throw Object.assign(new Error("Trash seam left the original session file in place"), { code: "TRASH_FAILED" }); }, (error) => { if (error?.code !== "ENOENT") throw error; });
+                await context.deleteResults.markTrashed(request);
                 await destructiveFailpoint("delete_after_trash", request, record);
                 await registry.remove(record.sessionId, record.revision);
                 await destructiveFailpoint("delete_after_registry", request, record);
               } catch (error) {
+                await fs.lstat(record.canonicalSessionFile).then(() => {}, async (missing) => { if (missing?.code === "ENOENT") await context.deleteResults.markTrashed(request).catch(() => {}); });
                 const current = await context.recovery.journal.get(request);
                 if (current?.stage === "DELIVERY_ATTEMPTED") return context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
                 throw error;
               }
-              const event = await context.recovery.events.append({ kind: "session_deleted", payload: { sessionId: record.sessionId, revision: record.revision } });
-              context.broadcast(event);
               await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
               return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
-            }));
+            });
           }
         }
         if (changed) {
-          const event = await context.recovery.events.append({ kind: "command_changed", payload: { status } });
-          context.broadcast(event);
+          const publish = async () => {
+            const event = await context.recovery.events.append({ kind: "command_changed", payload: { status } });
+            context.broadcast(event);
+          };
+          if (typeof request.payload?.sessionId === "string") await runSessionLifecycle(registry, request.payload.sessionId, publish);
+          else await publish();
         }
         return { kind: "command", status };
       },
@@ -870,6 +953,7 @@ export async function createDaemonRuntime({
         context.cursorStore = await createCursorStore(join(daemonDirectory, "event-acks.json"), daemonEpoch);
         context.launchResults = await createLaunchResultStore(join(daemonDirectory, "launch-results.json"));
         context.attachmentResults = await createAttachmentResultStore({ path: join(daemonDirectory, "attachment-results.jsonl") });
+        context.deleteResults = await createDeleteResultStore(join(daemonDirectory, "delete-results.json"));
         for (const entry of context.attachmentResults.entries()) await context.recovery.journal.reconcileAttachment(entry.request, entry.phase);
         for (const action of context.recovery.recoveryActions) {
           if (action.action === "SAFE_REDELIVERY" && !["attach", "detach"].includes(action.command.op)) await context.handleRequest(action.command, undefined, new Set(), action.command.clientId, true);
@@ -927,6 +1011,7 @@ export async function createDaemonRuntime({
           await cleanup("cursor_store", async () => context.cursorStore?.close());
           await cleanup("launch_result_store", async () => context.launchResults?.close());
           await cleanup("attachment_result_store", async () => context.attachmentResults?.close());
+          await cleanup("delete_result_store", async () => context.deleteResults?.close());
           await cleanup("recovery_stores", async () => context.recovery?.close());
           await cleanup("lifecycle", () => releaseDaemonLifecycle(claim));
           closeState = errors.length === 0 ? "CLOSED" : "FAILED_CLOSED";

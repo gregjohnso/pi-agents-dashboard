@@ -30,7 +30,7 @@ const SESSION_RECORD_KEYS = [
 ];
 
 /** @typedef {import("../shared/contracts.js").SessionRecord} SessionRecord */
-/** @typedef {{ coordinator: SessionCoordinator }} RegistryCoordinationScope */
+/** @typedef {{ coordinator: SessionCoordinator, lifecycle: SessionCoordinator }} RegistryCoordinationScope */
 
 /** @type {Map<string, RegistryCoordinationScope>} */
 const registryScopes = new Map();
@@ -200,6 +200,16 @@ export function registryCoordinationScope(registry) {
   return scope;
 }
 
+/** Serialize a complete ownership/revision lifecycle for one exact session. @param {RegistryStore} registry @param {string} sessionId @param {() => any | Promise<any>} operation */
+export function runSessionLifecycle(registry, sessionId, operation) {
+  return registryCoordinationScope(registry).lifecycle.run(sessionId, operation);
+}
+
+/** Run only a known nested lifecycle operation under its caller's exact session lock. @param {RegistryStore} registry @param {string} sessionId @param {() => any | Promise<any>} operation */
+export function runNestedSessionLifecycle(registry, sessionId, operation) {
+  return registryCoordinationScope(registry).lifecycle.runNested(sessionId, operation);
+}
+
 /** Atomic, compare-and-swap storage for canonical session records. */
 export class RegistryStore {
   #sessionsDirectory;
@@ -220,7 +230,10 @@ export class RegistryStore {
     this.#atomicWrite = options.atomicWrite ?? atomicWriteJson;
     let scope = registryScopes.get(this.#sessionsDirectory);
     if (scope === undefined) {
-      scope = { coordinator: options.coordinator ?? new SessionCoordinator() };
+      scope = {
+        coordinator: options.coordinator ?? new SessionCoordinator(),
+        lifecycle: new SessionCoordinator(),
+      };
       registryScopes.set(this.#sessionsDirectory, scope);
     }
     this.#coordinator = scope.coordinator;

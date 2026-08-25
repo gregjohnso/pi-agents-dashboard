@@ -113,16 +113,21 @@ export class OwnershipManager {
       state = {
         leases: new Map(),
         generations: new Map(),
-        coordinator: options.coordinator ?? new SessionCoordinator(),
+        coordinator: options.coordinator ?? registryCoordinationScope(registry).lifecycle,
       };
       ownershipStates.set(scope, state);
     }
     this.#state = state;
   }
 
-  /** Run every ownership mutation under the same managed-worktree lock used by cleanup. @param {string} sessionId @param {() => Promise<any>} action */
+  /**
+   * Run every ownership mutation under the session lifecycle lock, then the Task 9 worktree lock.
+   * Cleanup takes only the worktree lock and performs read-only daemon queries, so it never waits
+   * for the lifecycle lock while holding the worktree lock.
+   * @param {string} sessionId @param {() => Promise<any>} action
+   */
   #runWithOwnershipLock(sessionId, action) {
-    return this.#state.coordinator.run(sessionId, async () => {
+    return this.#state.coordinator.runNested(sessionId, async () => {
       const record = await this.#registry.get(sessionId);
       if (record?.isolation?.mode !== "worktree") return action();
       const lock = await acquireWorktreeOwnershipLock(record.isolation.worktreePath);

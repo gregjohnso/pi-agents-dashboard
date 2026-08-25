@@ -7,7 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, expect, it } from "vitest";
 
 import { atomicWriteJson } from "./atomic-file.mjs";
-import { RegistryStore } from "./registry-store.mjs";
+import { RegistryStore, runNestedSessionLifecycle, runSessionLifecycle } from "./registry-store.mjs";
 
 /** @type {string[]} */
 const cleanup = [];
@@ -43,6 +43,33 @@ function record(sessionId, overrides = {}) {
     ...overrides,
   });
 }
+
+it("shares one reentrant lifecycle serializer across registry instances", async () => {
+  const { sessions, store } = await makeRegistry();
+  const other = new RegistryStore(`${sessions}/.`);
+  /** @type {string[]} */
+  const order = [];
+  /** @type {((value?: unknown) => void) | undefined} */
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  /** @type {((value?: unknown) => void) | undefined} */
+  let started;
+  const firstStarted = new Promise((resolve) => { started = resolve; });
+  const first = runSessionLifecycle(store, "exact", async () => {
+    order.push("delete:checks");
+    await runNestedSessionLifecycle(other, "exact", async () => { order.push("delete:nested-result"); });
+    started?.();
+    await gate;
+    order.push("delete:done");
+  });
+  await firstStarted;
+  const launch = runSessionLifecycle(other, "exact", async () => { order.push("launch"); });
+  await Promise.resolve();
+  expect(order).toEqual(["delete:checks", "delete:nested-result"]);
+  release?.();
+  await Promise.all([first, launch]);
+  expect(order).toEqual(["delete:checks", "delete:nested-result", "delete:done", "launch"]);
+});
 
 it("creates and lists imported records with Task 5 canonical identity unchanged", async () => {
   const { sessions, store } = await makeRegistry();

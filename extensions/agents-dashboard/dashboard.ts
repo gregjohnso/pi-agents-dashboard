@@ -168,15 +168,32 @@ export function createDaemonDashboardBackend({
     return client.request({ version: 1, clientId, requestId: exactRequestId, op, payload } as Parameters<DaemonClient["request"]>[0]);
   };
 
+  const refreshState = async () => {
+    const response = await request("get_state", {});
+    if (!response.ok) throw Object.assign(new Error(response.error.message), response.error);
+    if (response.result.kind !== "state") throw Object.assign(new Error("Daemon returned the wrong state result"), { code: "INVALID_RESPONSE" });
+    sessions.clear();
+    for (const session of response.result.sessions) sessions.set(session.sessionId, session);
+    return { sessions: [...sessions.values()] };
+  };
+
+  const requireCompletedDestructive = (operation: "stop" | "delete", response: Awaited<ReturnType<typeof request>>) => {
+    if (!response.ok) throw Object.assign(new Error(response.error.message), response.error);
+    if (response.result.kind !== "command") throw Object.assign(new Error(`Daemon returned the wrong ${operation} result`), { code: "INVALID_RESPONSE" });
+    if (response.result.status.stage === "DELIVERY_UNKNOWN") {
+      throw Object.assign(new Error(`${operation === "stop" ? "Stop" : "Delete"} delivery is ambiguous`), { code: "DELIVERY_UNKNOWN", clientId: response.result.status.clientId, requestId: response.result.status.requestId });
+    }
+    if (response.result.status.stage === "FAILED") {
+      const error = response.result.status.error ?? { code: "COMMAND_FAILED", message: `${operation} failed`, retryable: false };
+      throw Object.assign(new Error(error.message), error);
+    }
+    if (response.result.status.stage !== "COMPLETED") throw Object.assign(new Error(`${operation} ended in ${response.result.status.stage}`), { code: response.result.status.stage });
+  };
+
   return {
     async getSnapshot() {
       await client.connect();
-      const response = await request("get_state", {});
-      if (!response.ok) throw Object.assign(new Error(response.error.message), response.error);
-      if (response.result.kind !== "state") throw Object.assign(new Error("Daemon returned the wrong state result"), { code: "INVALID_RESPONSE" });
-      sessions.clear();
-      for (const session of response.result.sessions) sessions.set(session.sessionId, session);
-      return { sessions: [...sessions.values()] };
+      return refreshState();
     },
     subscribe(after, listener, onError) {
       let active = true;
@@ -192,12 +209,14 @@ export function createDaemonDashboardBackend({
             if (next.done || !active) return;
             const event = next.value;
             if (!cursorAfter(acknowledged, event.cursor)) continue;
+            let snapshot = { sessions: [...sessions.values()] };
             if (event.kind === "session_changed") {
               sessions.set(event.payload.session.sessionId, event.payload.session);
-            } else if (event.kind === "session_deleted") {
-              sessions.delete(event.payload.sessionId);
+              snapshot = { sessions: [...sessions.values()] };
+            } else if (event.kind === "command_changed" && event.payload.status.operation === "delete" && event.payload.status.stage === "COMPLETED") {
+              snapshot = await refreshState();
             }
-            await listener({ snapshot: { sessions: [...sessions.values()] }, cursor: event.cursor, event });
+            await listener({ snapshot, cursor: event.cursor, event });
             const response = await request("ack", { cursor: event.cursor });
             if (!response.ok) throw Object.assign(new Error(response.error.message), response.error);
             if (response.result.kind !== "acknowledged") throw Object.assign(new Error("Daemon returned the wrong acknowledgement result"), { code: "INVALID_RESPONSE" });
@@ -236,18 +255,10 @@ export function createDaemonDashboardBackend({
       if (!response.ok) throw Object.assign(new Error(response.error.message), response.error);
     },
     async stop(sessionId, revision, exactRequestId) {
-      const response = await request("stop", { sessionId, revision }, exactRequestId);
-      if (!response.ok) throw Object.assign(new Error(response.error.message), response.error);
-      if (response.result.kind === "command" && response.result.status.stage === "DELIVERY_UNKNOWN") {
-        throw Object.assign(new Error("Stop delivery is ambiguous"), { code: "DELIVERY_UNKNOWN", clientId: response.result.status.clientId, requestId: response.result.status.requestId });
-      }
+      requireCompletedDestructive("stop", await request("stop", { sessionId, revision }, exactRequestId));
     },
     async delete(sessionId, revision, exactRequestId) {
-      const response = await request("delete", { sessionId, revision }, exactRequestId);
-      if (!response.ok) throw Object.assign(new Error(response.error.message), response.error);
-      if (response.result.kind === "command" && response.result.status.stage === "DELIVERY_UNKNOWN") {
-        throw Object.assign(new Error("Delete delivery is ambiguous"), { code: "DELIVERY_UNKNOWN", clientId: response.result.status.clientId, requestId: response.result.status.requestId });
-      }
+      requireCompletedDestructive("delete", await request("delete", { sessionId, revision }, exactRequestId));
     },
   };
 }
@@ -552,7 +563,7 @@ export class DashboardController {
       if (typed.code === "DELIVERY_UNKNOWN") {
         this.overlay = createDeliveryUnknownOverlay(typed.clientId ?? this.clientId, typed.requestId ?? requestId);
       } else {
-        this.overlay = undefined;
+        this.overlay = { ...confirmation, submitting: false };
         this.setError(error, `${confirmation.action.toUpperCase()}_FAILED`);
       }
     }

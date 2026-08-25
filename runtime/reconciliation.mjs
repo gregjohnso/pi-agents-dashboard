@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { atomicWriteJson } from "./atomic-file.mjs";
 import { createCommandJournal } from "./command-journal.mjs";
 import { createEventStore } from "./event-store.mjs";
-import { RegistryStore } from "./registry-store.mjs";
+import { RegistryStore, registryCoordinationScope } from "./registry-store.mjs";
 
 /** @param {any} left @param {any} right */
 function sameIdentity(left, right) {
@@ -53,7 +53,7 @@ export class RecoveredWorkerRouter {
   #workers = new Map();
   #routes = new Map();
   #routeGenerations = new Map();
-  #routeTails = new Map();
+  #lifecycle;
   #loaded = false;
 
   /** @param {{ registry: RegistryStore, inspect(pid: number): Promise<any>, metadataPath: string }} options */
@@ -61,6 +61,7 @@ export class RecoveredWorkerRouter {
     this.#registry = registry;
     this.#inspect = inspect;
     this.#metadataPath = metadataPath;
+    this.#lifecycle = registryCoordinationScope(registry).lifecycle;
   }
 
   async load() {
@@ -87,7 +88,7 @@ export class RecoveredWorkerRouter {
 
   /** @param {any} handle */
   async register(handle) {
-    return this.#serializeRoute(handle.sessionId, async () => {
+    return this.#lifecycle.runNested(handle.sessionId, async () => {
       const routeGeneration = (this.#routeGenerations.get(handle.sessionId) ?? 0) + 1;
       this.#routeGenerations.set(handle.sessionId, routeGeneration);
       const record = await this.#registry.get(handle.sessionId);
@@ -120,12 +121,7 @@ export class RecoveredWorkerRouter {
 
   /** @template T @param {string} sessionId @param {() => Promise<T>} action */
   #serializeRoute(sessionId, action) {
-    const previous = this.#routeTails.get(sessionId) ?? Promise.resolve();
-    const result = previous.then(action);
-    const tail = result.then(() => {}, () => {});
-    this.#routeTails.set(sessionId, tail);
-    void tail.finally(() => { if (this.#routeTails.get(sessionId) === tail) this.#routeTails.delete(sessionId); });
-    return result;
+    return this.#lifecycle.run(sessionId, action);
   }
 
   /** @param {any} frame @param {any} connection */
@@ -230,7 +226,7 @@ export class RecoveredWorkerRouter {
     const routes = [...this.#routes.values()];
     this.#routes.clear();
     for (const route of routes) route.connection.close?.();
-    await Promise.allSettled([...this.#routeTails.values()]);
+    await this.#lifecycle.idle();
   }
 }
 

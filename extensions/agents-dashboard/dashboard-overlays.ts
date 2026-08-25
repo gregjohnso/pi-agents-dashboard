@@ -41,6 +41,8 @@ export interface SessionConfirmation {
   action: SessionIntent["action"];
   sessionId: string;
   revision: number;
+  processState: SessionRecord["processState"];
+  ownershipFingerprint: string;
   submitting: boolean;
 }
 
@@ -123,6 +125,13 @@ export function createSessionIntent(session: SessionRecord): SessionIntent {
   };
 }
 
+function ownershipFingerprint(session: SessionRecord): string {
+  const ownership = session.ownership;
+  return ownership === undefined
+    ? "unowned"
+    : JSON.stringify([ownership.runId, ownership.process.pid, ownership.process.startIdentity, ownership.process.processGroupId, ownership.acquiredAt, ownership.heartbeatAt]);
+}
+
 /** Bind confirmation to one canonical session revision and requested action. */
 export function createSessionConfirmation(session: SessionRecord): SessionConfirmation {
   return {
@@ -130,6 +139,8 @@ export function createSessionConfirmation(session: SessionRecord): SessionConfir
     action: destructiveAction(session),
     sessionId: session.sessionId,
     revision: session.revision,
+    processState: session.processState,
+    ownershipFingerprint: ownershipFingerprint(session),
     submitting: false,
   };
 }
@@ -142,6 +153,8 @@ export function confirmationMatchesSession(
   return session !== undefined &&
     confirmation.sessionId === session.sessionId &&
     confirmation.revision === session.revision &&
+    confirmation.processState === session.processState &&
+    confirmation.ownershipFingerprint === ownershipFingerprint(session) &&
     confirmation.action === destructiveAction(session);
 }
 

@@ -125,6 +125,18 @@ describe("parseClientRequest", () => {
     ).toThrowError(/sessionId/);
   });
 
+  it("identifies exact legacy destructive payloads as requiring a revision", () => {
+    for (const op of ["stop", "delete"] as const) {
+      try {
+        parseClientRequest({ ...envelope, op, payload: { sessionId: "session-1" } });
+        throw new Error("legacy destructive request was accepted");
+      } catch (error) {
+        expect(error).toMatchObject({ code: "REVISION_REQUIRED" });
+      }
+    }
+    expect(() => parseClientRequest({ ...envelope, op: "stop", payload: { sessionId: "session-1", unknown: true } })).toThrowError(/unknown/i);
+  });
+
   it("rejects missing or invalid operation payload fields", () => {
     expect(() =>
       parseClientRequest({ ...envelope, op: "attach", payload: { sessionId: "session-1" } }),

@@ -152,7 +152,6 @@ interface PersistedEventEnvelope<Kind extends string, Payload> {
 
 export type PersistedEvent =
   | PersistedEventEnvelope<"session_changed", { session: SessionRecord }>
-  | PersistedEventEnvelope<"session_deleted", { sessionId: string; revision: number }>
   | PersistedEventEnvelope<"command_changed", { status: CommandStatus }>
   | PersistedEventEnvelope<
       "attachment_changed",
@@ -332,6 +331,11 @@ function readSessionPayload(value: unknown, operation: string): SessionPayload {
 function readDestructiveSessionPayload(value: unknown, operation: string): DestructiveSessionPayload {
   const payload = readRecord(value, `${operation} payload`);
   rejectUnknownKeys(payload, ["sessionId", "revision"], `${operation} payload`);
+  if (!Object.hasOwn(payload, "revision")) {
+    const error = new TypeError(`${operation} payload.revision is required`);
+    Object.assign(error, { code: "REVISION_REQUIRED" });
+    throw error;
+  }
   if (!Number.isSafeInteger(payload.revision) || (payload.revision as number) < 0) {
     throw new TypeError(`${operation} payload.revision must be a non-negative safe integer`);
   }

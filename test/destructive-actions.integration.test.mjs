@@ -74,6 +74,7 @@ it("journals Stop before exact-group escalation and leaves task/outcome independ
   const worker = { pid: 9101, startIdentity: "910100", processGroupId: 9101 };
   const sentinelPgid = 9202;
   let alive = true;
+  let killRequested = false;
   const registry = new RegistryStore(join(root, "sessions"));
   const session = record(root, "stop-target", {
     processState: "LIVE",
@@ -96,7 +97,7 @@ it("journals Stop before exact-group escalation and leaves task/outcome independ
     },
     signalProcessGroupImpl(pgid, signal) {
       signals.push({ pgid, signal });
-      if (pgid === worker.processGroupId && signal === "SIGTERM") alive = false;
+      if (pgid === worker.processGroupId && signal === "SIGKILL") killRequested = true;
     },
   });
   runtimes.push(runtime);
@@ -108,14 +109,26 @@ it("journals Stop before exact-group escalation and leaves task/outcome independ
   const frontend = connect(runtime);
   await frontend.next();
   frontend.send(request("client", "stop-request", "stop", { sessionId: session.sessionId, revision: 0 }));
-  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
-  expect(signals).toEqual([{ pgid: worker.processGroupId, signal: "SIGTERM" }]);
+  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "DELIVERY_UNKNOWN" } } });
+  expect(killRequested).toBe(true);
+  expect(signals).toEqual([
+    { pgid: worker.processGroupId, signal: "SIGTERM" },
+    { pgid: worker.processGroupId, signal: "SIGKILL" },
+  ]);
   expect(signals.some((entry) => entry.pgid === sentinelPgid)).toBe(false);
+  const pending = await registry.get(session.sessionId);
+  expect(pending).toMatchObject({ revision: 0, processState: "LIVE", taskState: "READY", outcome: "READY_FOR_REVIEW", ownership: { runId: "run-stop" } });
+
+  alive = false;
+  frontend.send(request("client", "resolve-stop", "resolve_delivery", { targetClientId: "client", targetRequestId: "stop-request", resolution: "retry_at_risk" }));
+  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "ACCEPTED" } } });
+  frontend.send(request("client", "stop-request", "stop", { sessionId: session.sessionId, revision: 0 }));
+  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
   const stopped = await registry.get(session.sessionId);
   expect(stopped).toMatchObject({ processState: "EXITED", taskState: "READY", outcome: "READY_FOR_REVIEW" });
   expect(stopped.ownership).toBeUndefined();
   const journal = await readFile(join(root, "queue", "commands.jsonl"), "utf8");
-  expect(journal.indexOf('"stage":"DELIVERY_ATTEMPTED"')).toBeLessThan(journal.indexOf('"stage":"WORKER_ACKNOWLEDGED"'));
+  expect(journal.indexOf('"stage":"DELIVERY_ATTEMPTED"')).toBeLessThan(journal.lastIndexOf('"stage":"WORKER_ACKNOWLEDGED"'));
   frontend.close();
   workerSocket.close();
 });
@@ -138,6 +151,9 @@ it("refuses observer, live, and symlink-replaced Delete targets without invoking
   const frontend = connect(runtime);
   await frontend.next();
 
+  frontend.send(request("legacy-client", "legacy-delete", "delete", { sessionId: live.sessionId }));
+  expect(await frontend.next()).toMatchObject({ ok: false, error: { code: "REVISION_REQUIRED" } });
+  expect(trash).not.toHaveBeenCalled();
   frontend.send(request("client", "live-delete-request", "delete", { sessionId: live.sessionId, revision: 0 }));
   expect(await frontend.next()).toMatchObject({ result: { status: { stage: "FAILED", error: { code: "SESSION_LIVE" } } } });
   frontend.send(request("client", "attach-observer", "attach", { sessionId: replaced.sessionId, role: "observer" }));
@@ -186,6 +202,8 @@ it("keeps Delete response-loss safe, preserves shared cwd/worktree, and retries 
   frontend.send(deletion);
   expect(await frontend.next()).toMatchObject({ result: { status: { stage: "DELIVERY_UNKNOWN" } } });
   expect(trash).toHaveBeenCalledTimes(1);
+  const afterTrash = await registry.get(session.sessionId);
+  await registry.update(session.sessionId, afterTrash.revision, { updatedAt: "2026-08-25T12:00:01.000Z" });
 
   frontend.send(request("client", "resolve-delete", "resolve_delivery", { targetClientId: "client", targetRequestId: "delete-request", resolution: "retry_at_risk" }));
   expect(await frontend.next()).toMatchObject({ result: { status: { stage: "ACCEPTED" } } });

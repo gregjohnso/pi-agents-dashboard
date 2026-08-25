@@ -54,10 +54,12 @@ describe("dashboard overlays", () => {
 
   it("binds Stop/Delete confirmation to exact session identity, revision, state, and action", () => {
     const stop = createSessionConfirmation(session);
-    expect(stop).toEqual({ kind: "session_confirmation", action: "stop", sessionId: "session-1", revision: 2, submitting: false });
+    expect(stop).toMatchObject({ kind: "session_confirmation", action: "stop", sessionId: "session-1", revision: 2, processState: "LIVE", submitting: false });
     expect(confirmationMatchesSession(stop, session)).toBe(true);
     expect(confirmationMatchesSession(stop, { ...session, revision: 3 })).toBe(false);
     expect(confirmationMatchesSession(stop, { ...session, processState: "EXITED" })).toBe(false);
+    expect(confirmationMatchesSession(stop, { ...session, processState: "SLEEPING" })).toBe(false);
+    expect(confirmationMatchesSession(stop, { ...session, ownership: { kind: "managed", runId: "late", process: { pid: 9, startIdentity: "9", processGroupId: 9 }, acquiredAt: session.createdAt, heartbeatAt: session.updatedAt } })).toBe(false);
     expect(confirmationMatchesSession(stop, { ...session, sessionId: "other" })).toBe(false);
 
     const sleeping = { ...session, processState: "SLEEPING" as const };

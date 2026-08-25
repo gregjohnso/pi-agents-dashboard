@@ -231,7 +231,7 @@ describe("dashboard controller", () => {
     await dashboard.open();
 
     dashboard.handleInput("\x18");
-    expect(dashboard.overlay).toEqual({ kind: "session_confirmation", action: "stop", sessionId: "a", revision: 1, submitting: false });
+    expect(dashboard.overlay).toMatchObject({ kind: "session_confirmation", action: "stop", sessionId: "a", revision: 1, processState: "LIVE", submitting: false });
     expect(backend.stop).not.toHaveBeenCalled();
     dashboard.handleInput("n");
     expect(dashboard.overlay).toBeUndefined();
@@ -249,6 +249,22 @@ describe("dashboard controller", () => {
     await vi.waitFor(() => expect(backend.delete).toHaveBeenCalledWith("b", 1, "destructive-request"));
     expect(dashboard.selectedSessionId).toBe("b");
     expect(onSessionIntent).toHaveBeenCalledWith({ kind: "session_intent", action: "delete", sessionId: "b", revision: 1 });
+  });
+
+  it("preserves failed destructive confirmation with its structured refusal and permits an explicit retry", async () => {
+    const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
+    backend.stop
+      .mockRejectedValueOnce(Object.assign(new Error("ownership changed"), { code: "OWNERSHIP_CONFLICT" }))
+      .mockResolvedValueOnce(undefined);
+    const dashboard = controller(backend, { requestId: () => "stop-request" });
+    await dashboard.open();
+    dashboard.handleInput("\x18");
+    dashboard.handleInput("y");
+    await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "OWNERSHIP_CONFLICT", message: "ownership changed" }));
+    expect(dashboard.overlay).toMatchObject({ kind: "session_confirmation", action: "stop", submitting: false });
+    dashboard.handleInput("y");
+    await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledTimes(2));
+    expect(dashboard.status).toMatchObject({ kind: "ready" });
   });
 
   it("keeps a successfully stopped row selected and requires a later Delete confirmation", async () => {
@@ -560,6 +576,42 @@ describe("dashboard controller", () => {
 });
 
 describe("daemon dashboard backend", () => {
+  it.each(["stop", "delete"] as const)("treats durable %s FAILED as a structured refusal", async (operation) => {
+    const status = { clientId: "stable-client", requestId: `${operation}-request`, operation, stage: "FAILED", acceptedAt: timestamp, updatedAt: timestamp, error: { code: "SESSION_REFUSED", message: `${operation} refused`, retryable: false } } as const;
+    const client = {
+      async connect() {},
+      async request(request: { requestId: string }) { return { version: 1 as const, requestId: request.requestId, ok: true as const, result: { kind: "command" as const, status } }; },
+      subscribe() { return { async *[Symbol.asyncIterator]() {} }; },
+      async close() {},
+    };
+    const backend = createDaemonDashboardBackend({ client: client as never, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
+    await expect(backend[operation]("exact-session", 3, `${operation}-request`)).rejects.toMatchObject({ code: "SESSION_REFUSED", message: `${operation} refused` });
+  });
+
+  it("refreshes state after completed Delete command_changed and removes the absent row", async () => {
+    const cursor = { daemonEpoch: "epoch", sequence: "1" };
+    const deleted = session("deleted", { processState: "EXITED" });
+    const event = { version: 1 as const, cursor, occurredAt: timestamp, kind: "command_changed" as const, payload: { status: { clientId: "stable-client", requestId: "delete-request", operation: "delete" as const, stage: "COMPLETED" as const, acceptedAt: timestamp, updatedAt: timestamp } } };
+    let stateReads = 0;
+    const client = {
+      async connect() {},
+      async request(request: { requestId: string; op: string; payload: { cursor?: EventCursor } }) {
+        if (request.op === "get_state") { stateReads += 1; return { version: 1 as const, requestId: request.requestId, ok: true as const, result: { kind: "state" as const, sessions: stateReads === 1 ? [deleted] : [] } }; }
+        return { version: 1 as const, requestId: request.requestId, ok: true as const, result: { kind: "acknowledged" as const, cursor: request.payload.cursor! } };
+      },
+      subscribe() { return { async *[Symbol.asyncIterator]() { yield event; } }; },
+      async close() {},
+    };
+    const backend = createDaemonDashboardBackend({ client: client as never, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
+    expect((await backend.getSnapshot()).sessions).toHaveLength(1);
+    const updates: DashboardUpdate[] = [];
+    const unsubscribe = await backend.subscribe(undefined, (update) => { updates.push(update); }, () => {});
+    await vi.waitFor(() => expect(updates).toHaveLength(1));
+    expect(updates[0]?.snapshot.sessions).toEqual([]);
+    expect(stateReads).toBe(2);
+    unsubscribe();
+  });
+
   it("sends no acknowledgement when reducer, render, or persistence processing rejects", async () => {
     const one = { daemonEpoch: "epoch", sequence: "1" };
     const requests: Array<{ op: string }> = [];

@@ -74,11 +74,12 @@ it("reports KILL as requested, not observed, while the exact identity remains vi
   expect(signaler.calls.at(-1)).toEqual({ type: "signal", pgid: ownership.processGroupId, signal: "SIGKILL" });
 });
 
-it("revalidates after TERM and refuses KILL when the PID was reused", async () => {
+it("revalidates after TERM and reports ambiguous delivery when the PID was reused", async () => {
   const { deps, signaler } = dependencies([ownership, ownership, ownership, reusedIdentity]);
 
   await expect(stopVerifiedProcessGroup(ownership, deps, policy)).resolves.toEqual({
     disposition: "STALE_IDENTITY",
+    signaled: true,
   });
   expect(signaler.calls).toEqual([
     { type: "graceful", ownership },
@@ -108,6 +109,7 @@ it("stops at graceful and TERM cancellation boundaries without later signals", a
 
   await expect(stopVerifiedProcessGroup(ownership, terminating.deps, policy)).resolves.toEqual({
     disposition: "CANCELLED",
+    signaled: true,
   });
   expect(terminating.signaler.calls).toEqual([
     { type: "graceful", ownership },

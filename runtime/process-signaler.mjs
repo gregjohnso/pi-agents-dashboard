@@ -126,10 +126,12 @@ export async function stopVerifiedProcessGroup(ownership, deps, policy) {
 
   const killBoundary = await inspect();
   if (killBoundary !== "MATCH") {
-    return { disposition: killBoundary === "EXITED" ? "TERMINATED" : killBoundary };
+    return killBoundary === "EXITED"
+      ? { disposition: "TERMINATED" }
+      : { disposition: killBoundary, signaled: true };
   }
   if (cancelled()) {
-    return { disposition: "CANCELLED" };
+    return { disposition: "CANCELLED", signaled: true };
   }
   try {
     await deps.signalProcessGroup(ownership.processGroupId, "SIGKILL");
@@ -142,5 +144,5 @@ export async function stopVerifiedProcessGroup(ownership, deps, policy) {
   const observed = await inspect();
   if (observed === "EXITED") return { disposition: "KILLED" };
   if (observed === "MATCH") return { disposition: "KILL_REQUESTED" };
-  return { disposition: observed };
+  return { disposition: observed, signaled: true };
 }

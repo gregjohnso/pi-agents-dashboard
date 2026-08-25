@@ -8,7 +8,6 @@ import { OwnershipManager } from "./ownership.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "./process-signaler.mjs";
 import { registryCoordinationScope } from "./registry-store.mjs";
-import { SessionCoordinator } from "./session-coordinator.mjs";
 import { reduceSessionState } from "./state-reducer.mjs";
 
 const DEFAULT_WORKER_PATH = fileURLToPath(new URL("./worker.mjs", import.meta.url));
@@ -106,11 +105,11 @@ async function sendMessage(child, message) {
   });
 }
 
-/** @param {object} scope */
+/** @param {ReturnType<typeof registryCoordinationScope>} scope */
 function admissionState(scope) {
   let state = admissionStates.get(scope);
   if (state === undefined) {
-    state = { tail: Promise.resolve(), reservations: new Map(), launchingSessions: new Set(), sessions: new SessionCoordinator() };
+    state = { tail: Promise.resolve(), reservations: new Map(), launchingSessions: new Set(), sessions: scope.lifecycle };
     admissionStates.set(scope, state);
   }
   return state;
@@ -238,7 +237,7 @@ export class WorkerSupervisor {
       signalProcessGroup: this.#signalProcessGroup,
       sleep: this.#sleep,
     }, this.#launchStopPolicy).catch(() => ({ disposition: "AMBIGUOUS_IDENTITY" }));
-    if (["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "STALE_IDENTITY"].includes(result.disposition)) {
+    if (["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "KILLED", "STALE_IDENTITY"].includes(result.disposition)) {
       await this.#reconcileTerminalLocked(supervision, true);
     }
   }
@@ -249,7 +248,7 @@ export class WorkerSupervisor {
    */
   launch(request) {
     if (typeof request?.sessionId !== "string" || request.sessionId.length === 0) return Promise.reject(new TypeError("sessionId is required"));
-    return this.#admission.sessions.run(request.sessionId, async () => {
+    return this.#admission.sessions.runNested(request.sessionId, async () => {
       this.#admission.launchingSessions.add(request.sessionId);
       try {
         return await this.#launch(request);
@@ -515,7 +514,7 @@ export class WorkerSupervisor {
         throw new WorkerSupervisorError("UNKNOWN_WORKER", "Worker has already exited");
       }
       const result = await stopVerifiedProcessGroup(handle.identity, deps, policy);
-      if (["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "STALE_IDENTITY"].includes(result.disposition)) {
+      if (["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "KILLED", "STALE_IDENTITY"].includes(result.disposition)) {
         await this.#reconcileTerminalLocked(supervision, true);
       }
       return result;

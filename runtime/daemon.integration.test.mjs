@@ -949,9 +949,9 @@ it("shares close state, reports every staged failure after releasing lifecycle o
   const firstClose = runtime.close();
   const secondClose = runtime.close();
   expect(secondClose).toBe(firstClose);
-  await expect(firstClose).rejects.toMatchObject({ code: "DAEMON_CLOSE_FAILED", errors: { length: 9 } });
+  await expect(firstClose).rejects.toMatchObject({ code: "DAEMON_CLOSE_FAILED", errors: { length: 10 } });
   expect(runtime.status().closeState).toBe("FAILED_CLOSED");
-  expect(failedStages).toEqual(["request_admission", "reconciliation", "request_chains", "supervisor", "cursor_store", "launch_result_store", "attachment_result_store", "recovery_stores", "lifecycle"]);
+  expect(failedStages).toEqual(["request_admission", "reconciliation", "request_chains", "supervisor", "cursor_store", "launch_result_store", "attachment_result_store", "delete_result_store", "recovery_stores", "lifecycle"]);
   await expect(access(join(stateRoot, "daemon", "pid.json"))).rejects.toMatchObject({ code: "ENOENT" });
   await expect(access(runtime.socketPath)).rejects.toMatchObject({ code: "ENOENT" });
 

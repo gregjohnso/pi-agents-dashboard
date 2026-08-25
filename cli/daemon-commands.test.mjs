@@ -37,6 +37,22 @@ it("stops only through the verified daemon process-group boundary", async () => 
   ]);
 });
 
+it("refuses daemon --stop-workers shutdown when any exact worker stop is not observed terminal", async () => {
+  const publication = { pid: 321, startIdentity: "987654321", processGroupId: 654, tokenPath: "/state/daemon/control.token" };
+  const request = async (op) => op === "get_state"
+    ? { kind: "state", sessions: [{ sessionId: "still-live", revision: 4, processState: "LIVE", ownership: { runId: "run" } }] }
+    : { kind: "command", status: { stage: "DELIVERY_UNKNOWN" } };
+  const stopProcessGroup = async () => { throw new Error("daemon must remain running"); };
+  await expect(runDaemonCommand("stop", {
+    root: "/state",
+    inspectEndpoint: async () => ({ status: "HEALTHY", daemonState: "READY", publication }),
+    request,
+    stopWorkers: true,
+    yes: true,
+    stopProcessGroup,
+  })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN" } });
+});
+
 it("maps a daemon child recovery-conflict exit to CLI exit 5", async () => {
   const result = await runDaemonCommand("start", {
     root: "/state",

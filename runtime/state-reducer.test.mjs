@@ -21,6 +21,7 @@ const baseRecord = {
   updatedAt: "2026-08-25T11:00:00.000Z",
 };
 
+const outcomePreservingProcessEvents = /** @type {const} */ (["WORKER_SLEEPING", "WORKER_EXITED"]);
 const transitions = /** @type {const} */ ([
   ["WORKER_READY", { taskState: "READY", processState: "LIVE", outcome: "NONE" }],
   ["TURN_STARTED", { taskState: "WORKING", processState: "LIVE", outcome: "NONE" }],
@@ -56,6 +57,16 @@ describe("reduceSessionState", () => {
       { taskState: "READY", processState: "EXITED", outcome: "COMPLETED" },
     ]);
   });
+
+  it.each(outcomePreservingProcessEvents)(
+    "preserves an absent outcome when %s has no explicit completion",
+    (type) => {
+      /** @type {SessionRecord} */
+      const readyWithoutOutcome = { ...baseRecord, outcome: "NONE" };
+
+      expect(reduceSessionState(readyWithoutOutcome, { type, at: now }).outcome).toBe("NONE");
+    },
+  );
 
   it("uses blocking, tool, stream, final, then process-error activity precedence", () => {
     const result = reduceSessionState(baseRecord, {

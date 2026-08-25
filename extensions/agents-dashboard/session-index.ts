@@ -1,8 +1,10 @@
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute } from "node:path";
 
 import type { SessionInfo } from "@earendil-works/pi-coding-agent";
 
 import type { SessionRecord } from "../../shared/contracts.js";
+
+export type SessionFileIdentity = (sessionFile: string) => string;
 
 interface ValidSavedSession {
   info: SessionInfo;
@@ -17,11 +19,10 @@ function compareText(left: string, right: string): number {
   return 0;
 }
 
-function canonicalSessionPath(path: string): string {
-  return resolve(path);
-}
-
-function readSavedSession(value: unknown): ValidSavedSession | undefined {
+function readSavedSession(
+  value: unknown,
+  sessionFileIdentity: SessionFileIdentity,
+): ValidSavedSession | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const candidate = value as Partial<SessionInfo>;
   if (
@@ -47,7 +48,7 @@ function readSavedSession(value: unknown): ValidSavedSession | undefined {
   }
   return {
     info: candidate as SessionInfo,
-    canonicalPath: canonicalSessionPath(candidate.path),
+    canonicalPath: sessionFileIdentity(candidate.path),
     createdAt: candidate.created.toISOString(),
     updatedAt: candidate.modified.toISOString(),
   };
@@ -65,7 +66,7 @@ function savedSessionRecord(saved: ValidSavedSession): SessionRecord {
     cwd: info.cwd,
     taskState: "READY",
     processState: "EXITED",
-    outcome: info.messageCount > 0 ? "COMPLETED" : "NONE",
+    outcome: "NONE",
     activity: { kind: "saved_session", summary, updatedAt: saved.updatedAt },
     createdAt: saved.createdAt,
     updatedAt: saved.updatedAt,
@@ -74,10 +75,13 @@ function savedSessionRecord(saved: ValidSavedSession): SessionRecord {
   return record;
 }
 
-function pathAliases(record: SessionRecord): readonly string[] {
+function pathAliases(
+  record: SessionRecord,
+  sessionFileIdentity: SessionFileIdentity,
+): readonly string[] {
   return [
-    canonicalSessionPath(record.sessionFile),
-    canonicalSessionPath(record.canonicalSessionFile),
+    sessionFileIdentity(record.sessionFile),
+    sessionFileIdentity(record.canonicalSessionFile),
   ];
 }
 
@@ -93,13 +97,14 @@ function compareSnapshotRows(left: SessionRecord, right: SessionRecord): number 
 export function mergeSessionIndex(
   saved: readonly SessionInfo[],
   live: readonly SessionRecord[],
+  sessionFileIdentity: SessionFileIdentity,
 ): readonly SessionRecord[] {
   const rows: SessionRecord[] = [];
   const rowById = new Map<string, number>();
   const rowByPath = new Map<string, number>();
 
   const validSaved = saved
-    .map(readSavedSession)
+    .map((entry) => readSavedSession(entry, sessionFileIdentity))
     .filter((entry): entry is ValidSavedSession => (
       entry !== undefined && !entry.info.parentSessionPath
     ))
@@ -130,13 +135,13 @@ export function mergeSessionIndex(
   const livePaths = new Set<string>();
 
   for (const { record } of orderedLive) {
-    const aliases = pathAliases(record);
+    const aliases = pathAliases(record, sessionFileIdentity);
     if (liveIds.has(record.sessionId) || aliases.some((path) => livePaths.has(path))) continue;
 
     const matchingIndices = rows.flatMap((row, index) => (
       (
         row.sessionId === record.sessionId
-        || pathAliases(row).some((path) => aliases.includes(path))
+        || pathAliases(row, sessionFileIdentity).some((path) => aliases.includes(path))
       ) ? [index] : []
     ));
     const savedName = matchingIndices

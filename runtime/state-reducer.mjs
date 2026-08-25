@@ -89,13 +89,13 @@ export function reduceSessionState(record, event) {
       return transition(record, event.at, {
         taskState: "READY",
         processState: "SLEEPING",
-        outcome: record.outcome === "READY_FOR_REVIEW" ? "READY_FOR_REVIEW" : "COMPLETED",
+        outcome: record.outcome,
       });
     case "WORKER_EXITED":
       return transition(record, event.at, {
         taskState: "READY",
         processState: "EXITED",
-        outcome: record.outcome === "READY_FOR_REVIEW" ? "READY_FOR_REVIEW" : "COMPLETED",
+        outcome: record.outcome,
       });
     case "USER_STOPPED":
       return transition(record, event.at, {

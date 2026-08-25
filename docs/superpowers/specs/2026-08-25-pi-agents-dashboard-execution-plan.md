@@ -961,7 +961,7 @@ pixi run git commit -m "feat: render virtual agents dashboard"
 - Consumes daemon client, Task 12 renderer, Task 5 selectors, and host capability report.
 - Produces `/agents`, the clean/armed Left gesture, dashboard controller, launch form, metadata/help, and confirmation surfaces.
 
-- [ ] **Step 1: Write fake-clock gesture tests**
+- [x] **Step 1: Write fake-clock gesture tests**
 
 ```ts
 it("opens once when clean and twice within 500 ms after editing", () => {
@@ -975,15 +975,15 @@ it("opens once when clean and twice within 500 ms after editing", () => {
 
 Cover whitespace, cursor not at start, modified Left, non-main focus, type then erase, history navigation, 501 ms expiry, other-key cancellation, repeat/release, successful-submit reset, and existing editor pass-through.
 
-- [ ] **Step 2: Write input-context and launch tests**
+- [x] **Step 2: Write input-context and launch tests**
 
 List Ctrl+C/Escape closes only the frontend. Composer Ctrl+C preserves the draft and returns list focus. Blank Enter does not launch. Shared-directory warnings require exact-path confirmation. Search, state/project filters, grouping, sort, metadata, and help retain selection by ID.
 
-- [ ] **Step 3: Run and verify failure**
+- [x] **Step 3: Run and verify failure**
 
 Run: `pixi run vitest run extensions/agents-dashboard/key-gesture.test.ts extensions/agents-dashboard/launch-composer.test.ts extensions/agents-dashboard/dashboard-overlays.test.ts extensions/agents-dashboard/dashboard.test.ts`
 
-- [ ] **Step 4: Implement typed UI coordination**
+- [x] **Step 4: Implement typed UI coordination**
 
 ```ts
 export interface DashboardBackend {
@@ -998,11 +998,11 @@ export interface DashboardBackend {
 
 `dashboard.ts` owns subscriptions, focus, rendering, and disposal. Overlays return typed results and never signal workers directly. Render failure closes the custom UI and reports an error without calling abort, stop, or delete.
 
-- [ ] **Step 5: Register `/agents` and the host gesture adapter**
+- [x] **Step 5: Register `/agents` and the host gesture adapter**
 
 Use only public extension APIs. If the composable editor hook is absent, `/agents` still reports the host incompatibility and the exact remediation; it must not replace another custom editor silently.
 
-- [ ] **Step 6: Run and commit**
+- [x] **Step 6: Run and commit**
 
 Run: `pixi run typecheck && pixi run vitest run extensions/agents-dashboard/{key-gesture,launch-composer,dashboard-overlays,dashboard}.test.ts`
 

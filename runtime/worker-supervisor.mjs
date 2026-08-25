@@ -17,7 +17,7 @@ const DEFAULT_LAUNCH_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateM
 
 /** @typedef {(command: string, argv: string[], options: any) => any} SpawnLike */
 
-/** @typedef {import("../shared/contracts.js").ProcessIdentity} ProcessIdentity */
+/** @typedef {import("../shared/contracts.mjs").ProcessIdentity} ProcessIdentity */
 /**
  * @typedef {object} WorkerHello
  * @property {1} version
@@ -244,7 +244,7 @@ export class WorkerSupervisor {
 
   /**
    * Launch one session worker. Same-session launches serialize; different sessions overlap after admission.
-   * @param {{ sessionId: string, canonicalSessionFile: string, cwd: string, runId: string, sessionRecord?: import("../shared/contracts.js").SessionRecord, model?: { provider: string, id: string }, thinkingLevel?: string, name?: string, rpcEntry?: string, daemonConnector?: string, daemonConnectConfig?: Record<string, unknown>, reconnectDelaysMs?: number[] }} request
+   * @param {{ sessionId: string, canonicalSessionFile: string, cwd: string, runId: string, sessionRecord?: import("../shared/contracts.mjs").SessionRecord, model?: { provider: string, id: string }, thinkingLevel?: string, name?: string, rpcEntry?: string, daemonConnector?: string, daemonConnectConfig?: Record<string, unknown>, reconnectDelaysMs?: number[] }} request
    */
   launch(request) {
     if (typeof request?.sessionId !== "string" || request.sessionId.length === 0) return Promise.reject(new TypeError("sessionId is required"));
@@ -258,7 +258,7 @@ export class WorkerSupervisor {
     });
   }
 
-  /** @param {{ sessionId: string, canonicalSessionFile: string, cwd: string, runId: string, sessionRecord?: import("../shared/contracts.js").SessionRecord, model?: { provider: string, id: string }, thinkingLevel?: string, name?: string, rpcEntry?: string, daemonConnector?: string, daemonConnectConfig?: Record<string, unknown>, reconnectDelaysMs?: number[] }} request */
+  /** @param {{ sessionId: string, canonicalSessionFile: string, cwd: string, runId: string, sessionRecord?: import("../shared/contracts.mjs").SessionRecord, model?: { provider: string, id: string }, thinkingLevel?: string, name?: string, rpcEntry?: string, daemonConnector?: string, daemonConnectConfig?: Record<string, unknown>, reconnectDelaysMs?: number[] }} request */
   async #launch({ sessionId, canonicalSessionFile, cwd, runId, sessionRecord, model, thinkingLevel, name, rpcEntry = this.#rpcEntry, daemonConnector, daemonConnectConfig = {}, reconnectDelaysMs = [100, 250, 500, 1_000, 2_000] }) {
     if ([canonicalSessionFile, cwd, runId, rpcEntry].some((value) => typeof value !== "string" || value.length === 0)) throw new TypeError("Worker launch fields must be non-empty strings");
     let record = await this.#registry.get(sessionId);
@@ -455,7 +455,7 @@ export class WorkerSupervisor {
       piChildIdentity: identity,
       pid: identity.pid,
       processGroupId: identity.processGroupId,
-      /** @param {import("../shared/contracts.js").ClientRequest} command @param {any} journal */
+      /** @param {import("../shared/contracts.mjs").ClientRequest} command @param {any} journal */
       async deliver(command, journal) {
         if (supervision.lifecycle !== "active" || supervision.exit.terminal) {
           throw Object.assign(new Error("Worker delivery became ambiguous"), { code: "DELIVERY_UNKNOWN" });
@@ -463,7 +463,7 @@ export class WorkerSupervisor {
         const accepted = await journal.accept(command);
         if (accepted.stage !== "ACCEPTED") return accepted;
         const key = { clientId: command.clientId, requestId: command.requestId };
-        const retryAtRisk = (await journal.history(key)).some((/** @type {import("../shared/contracts.js").CommandStatus} */ status) => status.stage === "DELIVERY_UNKNOWN");
+        const retryAtRisk = (await journal.history(key)).some((/** @type {import("../shared/contracts.mjs").CommandStatus} */ status) => status.stage === "DELIVERY_UNKNOWN");
         await journal.transition(key, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
         const id = `${runId}:${++sequence}`;
         try {

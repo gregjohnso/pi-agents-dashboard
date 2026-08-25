@@ -33,7 +33,7 @@ async function fixture() {
 /**
  * @param {string} cwd
  * @param {string} confirmedCwd
- * @returns {import("../shared/contracts.js").LaunchRequest}
+ * @returns {import("../shared/contracts.mjs").LaunchRequest}
  */
 function sharedRequest(cwd, confirmedCwd) {
   return {

@@ -1,4 +1,4 @@
-/** @typedef {import("../shared/contracts.js").SessionRecord} SessionRecord */
+/** @typedef {import("../shared/contracts.mjs").SessionRecord} SessionRecord */
 
 /** @typedef {{ summary: string }} ActivitySignal */
 

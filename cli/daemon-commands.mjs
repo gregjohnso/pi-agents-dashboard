@@ -16,7 +16,7 @@ const DEFAULT_STOP_POLICY = Object.freeze({ gracefulMs: 500, terminateMs: 500 })
 
 export function resolveRuntimeRoot(env = process.env) {
   const home = env.HOME ?? homedir();
-  return resolve(env.PI_AGENTS_DASHBOARD_STATE_DIR ?? join(env.XDG_STATE_HOME ?? join(home, ".local", "state"), "pi-agents-dashboard"));
+  return resolve(env.PI_DASHBOARD_STATE_DIR ?? join(env.XDG_STATE_HOME ?? join(home, ".local", "state"), "pi-dashboard"));
 }
 
 export async function daemonEntryPoint() {

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { reduceSessionState } from "./state-reducer.mjs";
 
-/** @typedef {import("../shared/contracts.js").SessionRecord} SessionRecord */
+/** @typedef {import("../shared/contracts.mjs").SessionRecord} SessionRecord */
 
 const now = "2026-08-25T12:00:00.000Z";
 /** @type {SessionRecord} */

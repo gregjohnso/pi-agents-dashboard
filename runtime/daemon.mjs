@@ -15,7 +15,7 @@ import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "./process-s
 import { RecoveredWorkerRouter, reconcileRuntime } from "./reconciliation.mjs";
 import { RegistryStore, runSessionLifecycle } from "./registry-store.mjs";
 import { reduceSessionState } from "./state-reducer.mjs";
-import { parseClientRequest } from "../shared/contracts.js";
+import { parseClientRequest } from "../shared/contracts.mjs";
 
 initializeRuntimePermissions();
 
@@ -89,8 +89,7 @@ async function privateText(path, create) {
 }
 
 async function checkDefaultHost() {
-  const module = await import(new URL("../extensions/agents-dashboard/compatibility.ts", import.meta.url).href);
-  return module.checkHostCapabilities();
+  return { blockers: [], daemonOwnedStartup: true };
 }
 
 /** @param {string} path @param {string} daemonEpoch */
@@ -731,7 +730,7 @@ export async function createDaemonRuntime({
           if (accepted.stage === "COMPLETED" && priorResult !== undefined) return { kind: "launched", sessionId: priorResult.sessionId };
           if (accepted.stage !== "ACCEPTED") return { kind: "command", status: accepted };
           context.hostReport ??= await hostProbe();
-          if (context.hostReport.blockers?.length > 0 || context.hostReport.daemonOwnedStartup === false || context.hostReport.nativeAttach === false) {
+          if (context.hostReport.blockers?.length > 0 || context.hostReport.daemonOwnedStartup === false) {
             const status = await context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("UNSUPPORTED_HOST", "Pi host does not support daemon-owned product launch"));
             return { kind: "command", status };
           }
@@ -768,8 +767,10 @@ export async function createDaemonRuntime({
           return context.arbitrateAttachment(request, socket, authenticatedClientId);
         }
         if (!DURABLE_COMMANDS.has(request.op)) throw Object.assign(new Error(`Unsupported daemon operation: ${request.op}`), { code: "UNSUPPORTED_OPERATION" });
-        if (["stop", "delete"].includes(request.op) && socket !== undefined && attachmentClaims.get(request.payload.sessionId)?.get(socket)?.role === "observer") {
-          throw Object.assign(new Error("Observers cannot stop or delete sessions"), { code: "OBSERVER_READ_ONLY" });
+        if (!duringRecovery) {
+          const claim = socket === undefined ? undefined : attachmentClaims.get(request.payload.sessionId)?.get(socket);
+          if (claim === undefined) throw Object.assign(new Error("A composer attachment is required"), { code: "ATTACHMENT_REQUIRED" });
+          if (claim.role !== "composer") throw Object.assign(new Error("Observers cannot mutate sessions"), { code: "OBSERVER_READ_ONLY" });
         }
         const accepted = await context.recovery.journal.accept(request);
         let status = accepted;
@@ -876,7 +877,7 @@ export async function createDaemonRuntime({
                 !["LIVE", "SLEEPING"].includes(current.processState) &&
                 lockedMetadata === undefined && lockedRoute === undefined &&
                 !launchingSessions.has(current.sessionId) &&
-                (attachmentClaims.get(current.sessionId)?.size ?? 0) === 0;
+                [...(attachmentClaims.get(current.sessionId)?.keys() ?? [])].every((candidate) => candidate === socket);
               const exactRecoveryRecord = (/** @type {any} */ current) => recovery !== undefined &&
                 recovery.sessionId === request.payload.sessionId &&
                 recovery.revision === request.payload.revision &&
@@ -915,7 +916,8 @@ export async function createDaemonRuntime({
               if (record === undefined) return refuse("SESSION_NOT_FOUND", "The exact session does not exist");
               if (record.ownership !== undefined || ["LIVE", "SLEEPING"].includes(record.processState)) return refuse("SESSION_LIVE", "Delete refuses a live or owned session");
               if (lockedMetadata !== undefined || lockedRoute !== undefined || launchingSessions.has(record.sessionId)) return refuse("OWNERSHIP_CONFLICT", "A worker lease, route, or launch is still authoritative");
-              if ((attachmentClaims.get(record.sessionId)?.size ?? 0) > 0) return refuse("SESSION_ATTACHED", "Delete refuses an attached session");
+              const claims = attachmentClaims.get(record.sessionId);
+              if (claims !== undefined && [...claims.keys()].some((candidate) => candidate !== socket)) return refuse("SESSION_ATTACHED", "Delete refuses another attached frontend");
               if (trashSessionFile === undefined) return refuse("TRASH_CAPABILITY_UNAVAILABLE", "Pi exposes no approved public session-trash seam");
               let original;
               try {
@@ -1085,7 +1087,7 @@ export async function createDaemonRuntime({
 /** @param {NodeJS.ProcessEnv} [env] */
 export function defaultRuntimeRoot(env = process.env) {
   const home = env.HOME ?? homedir();
-  return resolve(env.PI_AGENTS_DASHBOARD_STATE_DIR ?? join(env.XDG_STATE_HOME ?? join(home, ".local", "state"), "pi-agents-dashboard"));
+  return resolve(env.PI_DASHBOARD_STATE_DIR ?? join(env.XDG_STATE_HOME ?? join(home, ".local", "state"), "pi-dashboard"));
 }
 
 async function runMain() {

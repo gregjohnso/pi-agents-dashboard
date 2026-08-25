@@ -24,10 +24,10 @@ async function makeRegistry(options) {
   return { sessions, store: new RegistryStore(sessions, options) };
 }
 
-/** @param {string} sessionId @param {Partial<import("../shared/contracts.js").SessionRecord>} [overrides] */
+/** @param {string} sessionId @param {Partial<import("../shared/contracts.mjs").SessionRecord>} [overrides] */
 function record(sessionId, overrides = {}) {
   const now = "2026-08-25T12:00:00.000Z";
-  return /** @type {import("../shared/contracts.js").SessionRecord} */ ({
+  return /** @type {import("../shared/contracts.mjs").SessionRecord} */ ({
     schemaVersion: 1,
     revision: 0,
     sessionId,

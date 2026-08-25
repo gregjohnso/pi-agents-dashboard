@@ -1,8 +1,22 @@
 import { lstat, realpath } from "node:fs/promises";
+import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { Buffer } from "node:buffer";
 
 export const LINUX_SOCKET_PATH_MAX_BYTES = 107;
+
+/** Derive legacy and standalone roots from the same per-user XDG parents. @param {NodeJS.ProcessEnv | Record<string, string | undefined>} [env] */
+export function resolveDashboardRoots(env = process.env) {
+  const home = env.HOME ?? homedir();
+  const stateParent = env.XDG_STATE_HOME ?? join(home, ".local", "state");
+  const runtimeParent = env.XDG_RUNTIME_DIR ?? join(home, ".local", "state");
+  return {
+    legacyStateRoot: resolve(stateParent, "pi-agents-dashboard"),
+    destinationStateRoot: resolve(env.PI_DASHBOARD_STATE_DIR ?? join(stateParent, "pi-dashboard")),
+    legacyRuntimeRoot: resolve(runtimeParent, "pi-agents-dashboard"),
+    destinationRuntimeRoot: resolve(env.PI_DASHBOARD_RUNTIME_DIR ?? join(runtimeParent, "pi-dashboard")),
+  };
+}
 
 /**
  * Resolve the fixed artifact names beneath an existing, non-symlink runtime root.

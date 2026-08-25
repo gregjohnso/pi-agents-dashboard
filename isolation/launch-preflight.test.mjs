@@ -41,8 +41,8 @@ async function repository({ commit = true } = {}) {
 
 /**
  * @param {string} cwd
- * @param {import("../shared/contracts.js").LaunchIsolation} [isolation]
- * @returns {import("../shared/contracts.js").LaunchRequest}
+ * @param {import("../shared/contracts.mjs").LaunchIsolation} [isolation]
+ * @returns {import("../shared/contracts.mjs").LaunchRequest}
  */
 function request(cwd, isolation = { mode: "worktree" }) {
   return {

@@ -125,6 +125,44 @@ function startPersistentFakeWorker(config, worker) {
   return loop;
 }
 
+it("rejects every composer-only command before journaling for observers and unattached sockets", async () => {
+  const runtime = await createDaemonRuntime({ root: await root() });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const owner = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  const observer = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  const unattached = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await Promise.all([owner.ready, observer.ready, unattached.ready]);
+  owner.send({ version: 1, clientId: "owner", requestId: "attach-owner", op: "attach", payload: { sessionId: "session", role: "composer" } });
+  expect(await owner.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+  observer.send({ version: 1, clientId: "observer", requestId: "attach-observer", op: "attach", payload: { sessionId: "session", role: "composer" } });
+  expect(await observer.next()).toMatchObject({ ok: true, result: { role: "observer" } });
+
+  const variants = [
+    ["prompt", { sessionId: "session", text: "next" }],
+    ["follow_up", { sessionId: "session", text: "next" }],
+    ["steer", { sessionId: "session", text: "next" }],
+    ["interrupt", { sessionId: "session" }],
+    ["ui_response", { sessionId: "session", uiRequestId: "ui", response: true }],
+    ["stop", { sessionId: "session", revision: 1 }],
+    ["delete", { sessionId: "session", revision: 1 }],
+  ];
+  for (const [op, payload] of variants) {
+    const observerRequest = { version: 1, clientId: "observer", requestId: `observer-${op}`, op, payload };
+    observer.send(observerRequest);
+    expect(await observer.next()).toMatchObject({ ok: false, error: { code: "OBSERVER_READ_ONLY" } });
+    expect(await runtime.commandStatus(observerRequest)).toBeUndefined();
+
+    const unattachedRequest = { version: 1, clientId: "unattached", requestId: `unattached-${op}`, op, payload };
+    unattached.send(unattachedRequest);
+    expect(await unattached.next()).toMatchObject({ ok: false, error: { code: "ATTACHMENT_REQUIRED" } });
+    expect(await runtime.commandStatus(unattachedRequest)).toBeUndefined();
+  }
+  owner.close();
+  observer.close();
+  unattached.close();
+});
+
 it("shares one daemon across two effective Pi config roots and rejects mutations while recovering", async () => {
   /** @type {((value?: unknown) => void) | undefined} */
   let releaseRecovery;
@@ -969,7 +1007,7 @@ it("serializes monotonic event acknowledgements by stable socket client identity
   const second = connect({ socketPath: runtime.socketPath, token: runtime.token });
   await Promise.all([first.ready, second.ready]);
   for (const [client, requestId] of [[first, "event-one"], [second, "event-two"]]) {
-    client.send({ version: 1, clientId: "stable-client", requestId, op: "prompt", payload: { sessionId: "missing", text: "x" } });
+    client.send({ version: 1, clientId: "stable-client", requestId, op: "attach", payload: { sessionId: requestId, role: "composer" } });
     await client.next();
   }
   first.send({ version: 1, clientId: "stable-client", requestId: "ack-two", op: "ack", payload: { cursor: { daemonEpoch: runtime.daemonEpoch, sequence: "2" } } });
@@ -1133,6 +1171,8 @@ it("reconnects two surviving fake workers through the concrete connector after d
   await firstRuntime.ready;
   const frontend = connect({ socketPath: firstRuntime.socketPath, token: firstRuntime.token });
   await frontend.ready;
+  frontend.send({ version: 1, clientId: "client", requestId: "attach-before-restart", op: "attach", payload: { sessionId: "one", role: "composer" } });
+  expect(await frontend.next()).toMatchObject({ ok: true, result: { role: "composer" } });
   frontend.send({ version: 1, clientId: "client", requestId: "before-restart", op: "prompt", payload: { sessionId: "one", text: "hello" } });
   expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
   frontend.close();
@@ -1147,11 +1187,15 @@ it("reconnects two surviving fake workers through the concrete connector after d
   expect(loops.every((loop) => loop.connectionCount >= 2)).toBe(true);
   const malformed = connect({ socketPath: secondRuntime.socketPath, token: secondRuntime.token });
   await malformed.ready;
+  malformed.send({ version: 1, clientId: "client", requestId: "attach-malformed", op: "attach", payload: { sessionId: "one", role: "composer" } });
+  expect(await malformed.next()).toMatchObject({ ok: true, result: { role: "composer" } });
   malformed.send({ version: 1, clientId: "client", requestId: "invalid-worker-result", op: "prompt", payload: { sessionId: "one", text: "invalid result" } });
   expect(await malformed.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "DELIVERY_UNKNOWN" } } });
   malformed.close();
   const resumed = connect({ socketPath: secondRuntime.socketPath, token: secondRuntime.token });
   await resumed.ready;
+  resumed.send({ version: 1, clientId: "client", requestId: "attach-resumed", op: "attach", payload: { sessionId: "two", role: "composer" } });
+  expect(await resumed.next()).toMatchObject({ ok: true, result: { role: "composer" } });
   resumed.send({ version: 1, clientId: "client", requestId: "after-restart", op: "steer", payload: { sessionId: "two", text: "next" } });
   expect(await resumed.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
   const beforeLostResponse = loops[1].commandCount;
@@ -1161,6 +1205,8 @@ it("reconnects two surviving fake workers through the concrete connector after d
   await new Promise((resolve) => setTimeout(resolve, 30));
   const retry = connect({ socketPath: secondRuntime.socketPath, token: secondRuntime.token });
   await retry.ready;
+  retry.send({ version: 1, clientId: "client", requestId: "attach-retry", op: "attach", payload: { sessionId: "two", role: "composer" } });
+  expect(await retry.next()).toMatchObject({ ok: true, result: { role: "composer" } });
   retry.send(lostResponse);
   expect(await retry.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
   expect(loops[1].commandCount).toBe(beforeLostResponse + 1);

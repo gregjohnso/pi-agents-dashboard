@@ -14,10 +14,9 @@
   },
   "include": [
     "bin/**/*.mjs",
-    "extensions/**/*.ts",
     "isolation/**/*.mjs",
     "runtime/**/*.mjs",
-    "shared/**/*.ts",
+    "shared/**/*.mjs",
     "vitest.config.ts"
   ]
 }

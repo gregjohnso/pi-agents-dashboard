@@ -16,7 +16,7 @@ afterEach(async () => {
 
 function record(sessionId = "session-1") {
   const now = "2026-08-25T12:00:00.000Z";
-  return /** @type {import("../shared/contracts.js").SessionRecord} */ ({
+  return /** @type {import("../shared/contracts.mjs").SessionRecord} */ ({
     schemaVersion: 1,
     revision: 0,
     sessionId,

@@ -42,14 +42,18 @@ function record(root, sessionId, overrides = {}) {
   };
 }
 
+let automaticAttachment = 0;
+
 function connect(runtime, role = "frontend") {
   const encoder = createJsonlEncoder({ maxBytes: 1024 * 1024 });
   const decoder = createJsonlDecoder({ maxBytes: 1024 * 1024 });
   const socket = net.createConnection(runtime.socketPath);
   const queue = [];
   const waiters = [];
+  const attachmentRoles = new Map();
   socket.on("data", (chunk) => {
     for (const frame of decoder.push(chunk)) {
+      if (typeof frame?.requestId === "string" && frame.requestId.startsWith("automatic-composer-")) continue;
       const waiter = waiters.shift();
       if (waiter === undefined) queue.push(frame);
       else waiter(frame);
@@ -60,7 +64,15 @@ function connect(runtime, role = "frontend") {
   return {
     socket,
     next,
-    send(value) { socket.write(encoder.encode(value)); },
+    send(value) {
+      if (value.op === "attach") attachmentRoles.set(value.payload.sessionId, value.payload.role);
+      else if (value.op === "detach") attachmentRoles.delete(value.payload.sessionId);
+      else if (["prompt", "follow_up", "steer", "interrupt", "ui_response", "stop", "delete"].includes(value.op) && (value.op !== "stop" && value.op !== "delete" || Number.isSafeInteger(value.payload.revision)) && !attachmentRoles.has(value.payload.sessionId)) {
+        attachmentRoles.set(value.payload.sessionId, "composer");
+        socket.write(encoder.encode({ version: 1, clientId: value.clientId, requestId: `automatic-composer-${automaticAttachment++}`, op: "attach", payload: { sessionId: value.payload.sessionId, role: "composer" } }));
+      }
+      socket.write(encoder.encode(value));
+    },
     close() { socket.destroy(); },
   };
 }

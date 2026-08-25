@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import { CommandJournalError, createCommandJournal } from "./command-journal.mjs";
 
-/** @typedef {import("../shared/contracts.js").ClientRequest} ClientRequest */
-/** @typedef {import("../shared/contracts.js").CommandStage} CommandStage */
+/** @typedef {import("../shared/contracts.mjs").ClientRequest} ClientRequest */
+/** @typedef {import("../shared/contracts.mjs").CommandStage} CommandStage */
 
 /** @type {string[]} */
 const directories = [];

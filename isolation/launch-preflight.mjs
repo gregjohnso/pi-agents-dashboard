@@ -54,7 +54,7 @@ async function canonicalDirectory(value, name) {
 /**
  * Canonicalize an approved launch request and derive trusted isolation metadata.
  *
- * @param {import("../shared/contracts.js").LaunchRequest & { piConfigRoot?: unknown }} request
+ * @param {import("../shared/contracts.mjs").LaunchRequest & { piConfigRoot?: unknown }} request
  * @param {{ piConfigRoot?: string, currentOwnerSessionIds?: string[] }} options
  */
 export async function launchPreflight(request, options = {}) {

@@ -2,10 +2,10 @@ import { openDurableAppendStore, AppendStoreError } from "./append-store.mjs";
 
 const MAX_RECORD_BYTES = 1024 * 1024;
 
-/** @typedef {import("../shared/contracts.js").ClientRequest} DurableCommand */
-/** @typedef {import("../shared/contracts.js").CommandStage} CommandStage */
-/** @typedef {import("../shared/contracts.js").CommandStatus} CommandStatus */
-/** @typedef {import("../shared/contracts.js").DashboardError} DashboardError */
+/** @typedef {import("../shared/contracts.mjs").ClientRequest} DurableCommand */
+/** @typedef {import("../shared/contracts.mjs").CommandStage} CommandStage */
+/** @typedef {import("../shared/contracts.mjs").CommandStatus} CommandStatus */
+/** @typedef {import("../shared/contracts.mjs").DashboardError} DashboardError */
 /** @typedef {{ clientId: string, requestId: string }} RequestKey */
 /** @typedef {{ commandCanonical: string, command: DurableCommand, status: CommandStatus }} JournalRecord */
 /** @typedef {(name: "before_sync" | "after_sync", record: JournalRecord) => void | Promise<void>} JournalFailpoint */
@@ -189,7 +189,7 @@ export async function createCommandJournal({ path, now = () => new Date().toISOS
         return append({ commandCanonical: previous.commandCanonical, command: previous.command, status });
       });
     },
-    /** @param {RequestKey} key @param {import("../shared/contracts.js").DeliveryResolution} resolution @returns {Promise<CommandStatus>} */
+    /** @param {RequestKey} key @param {import("../shared/contracts.mjs").DeliveryResolution} resolution @returns {Promise<CommandStatus>} */
     resolveDelivery(key, resolution) {
       return serialize(async () => {
         assertKey(key);

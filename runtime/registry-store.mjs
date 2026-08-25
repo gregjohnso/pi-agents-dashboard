@@ -29,7 +29,7 @@ const SESSION_RECORD_KEYS = [
   "updatedAt",
 ];
 
-/** @typedef {import("../shared/contracts.js").SessionRecord} SessionRecord */
+/** @typedef {import("../shared/contracts.mjs").SessionRecord} SessionRecord */
 /** @typedef {{ coordinator: SessionCoordinator, lifecycle: SessionCoordinator }} RegistryCoordinationScope */
 
 /** @type {Map<string, RegistryCoordinationScope>} */

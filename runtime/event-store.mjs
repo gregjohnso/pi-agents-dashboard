@@ -2,8 +2,8 @@ import { openDurableAppendStore, AppendStoreError } from "./append-store.mjs";
 
 const MAX_RECORD_BYTES = 1024 * 1024;
 
-/** @typedef {import("../shared/contracts.js").EventCursor} EventCursor */
-/** @typedef {import("../shared/contracts.js").PersistedEvent} PersistedEvent */
+/** @typedef {import("../shared/contracts.mjs").EventCursor} EventCursor */
+/** @typedef {import("../shared/contracts.mjs").PersistedEvent} PersistedEvent */
 /** @typedef {(name: "after_persist_before_broadcast", event: PersistedEvent) => void | Promise<void>} EventFailpoint */
 /** @typedef {(result: IteratorResult<PersistedEvent>) => void} EventWaiter */
 /** @typedef {{ queue: PersistedEvent[], waiter?: EventWaiter, error?: Error, ended: boolean, push(event: PersistedEvent): void }} Subscriber */

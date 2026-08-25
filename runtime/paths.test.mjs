@@ -4,12 +4,28 @@ import { join } from "node:path";
 
 import { afterEach, expect, it } from "vitest";
 
-import { canonicalRuntimePaths } from "./paths.mjs";
+import { canonicalRuntimePaths, resolveDashboardRoots } from "./paths.mjs";
 
 /** @type {string[]} */
 const cleanup = [];
 afterEach(async () => {
   await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+});
+
+it("derives matching legacy and destination roots from each XDG location", () => {
+  expect(resolveDashboardRoots({ HOME: "/home/user", XDG_STATE_HOME: "/state", XDG_RUNTIME_DIR: "/run/user/1" })).toEqual({
+    legacyStateRoot: "/state/pi-agents-dashboard",
+    destinationStateRoot: "/state/pi-dashboard",
+    legacyRuntimeRoot: "/run/user/1/pi-agents-dashboard",
+    destinationRuntimeRoot: "/run/user/1/pi-dashboard",
+  });
+});
+
+it("keeps explicit destination state overrides separate from the legacy root", () => {
+  expect(resolveDashboardRoots({ HOME: "/home/user", PI_DASHBOARD_STATE_DIR: "/custom/new" })).toMatchObject({
+    legacyStateRoot: "/home/user/.local/state/pi-agents-dashboard",
+    destinationStateRoot: "/custom/new",
+  });
 });
 
 it("returns canonical paths beneath a real private runtime root", async () => {

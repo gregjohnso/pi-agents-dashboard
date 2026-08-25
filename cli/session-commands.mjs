@@ -9,7 +9,7 @@ import { cleanupManagedWorktree as defaultCleanupManagedWorktree } from "../isol
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
 import { acquireLifecycleLock } from "../runtime/lifecycle-lock.mjs";
 import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
-import { parseDaemonResponse } from "../shared/contracts.js";
+import { parseDaemonResponse } from "../shared/contracts.mjs";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
 const IDENTITY_LOCK_TIMEOUT_MS = 5_000;
@@ -31,7 +31,7 @@ function exactId(value) {
 
 function runtimeRoot(env = process.env) {
   const home = env.HOME ?? homedir();
-  return resolve(env.PI_AGENTS_DASHBOARD_STATE_DIR ?? join(env.XDG_STATE_HOME ?? join(home, ".local", "state"), "pi-agents-dashboard"));
+  return resolve(env.PI_DASHBOARD_STATE_DIR ?? join(env.XDG_STATE_HOME ?? join(home, ".local", "state"), "pi-dashboard"));
 }
 
 /** @param {string} directory @param {any} [fsOps] */

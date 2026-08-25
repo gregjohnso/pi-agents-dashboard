@@ -4,7 +4,7 @@ import { acquireWorktreeOwnershipLock } from "../isolation/worktree.mjs";
 import { registryCoordinationScope } from "./registry-store.mjs";
 import { SessionCoordinator } from "./session-coordinator.mjs";
 
-/** @typedef {import("../shared/contracts.js").ProcessIdentity} ProcessIdentity */
+/** @typedef {import("../shared/contracts.mjs").ProcessIdentity} ProcessIdentity */
 /**
  * @typedef {object} WriterLease
  * @property {string} sessionId
@@ -78,7 +78,7 @@ function sameIdentity(a, b) {
   );
 }
 
-/** @param {import("../shared/contracts.js").SessionRecord | undefined} record @param {WriterLease} lease */
+/** @param {import("../shared/contracts.mjs").SessionRecord | undefined} record @param {WriterLease} lease */
 function hasLeaseOwnership(record, lease) {
   if (
     record?.ownership === undefined ||

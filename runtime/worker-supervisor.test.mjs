@@ -22,7 +22,7 @@ afterEach(async () => {
   await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-/** @param {string} root @param {string} sessionId @returns {import("../shared/contracts.js").SessionRecord} */
+/** @param {string} root @param {string} sessionId @returns {import("../shared/contracts.mjs").SessionRecord} */
 function sessionRecord(root, sessionId) {
   const now = "2026-08-25T12:00:00.000Z";
   const sessionFile = join(root, `${sessionId}.jsonl`);
@@ -550,7 +550,7 @@ it("journals exact command stages before delivery and preserves request identity
       if (name === "after_sync") order.push(`journal:${record.status.clientId}:${record.status.requestId}:${record.status.stage}`);
     },
   });
-  const command = /** @type {import("../shared/contracts.js").ClientRequest} */ ({ version: 1, clientId: "client\0exact", requestId: "request\0exact", op: "prompt", payload: { sessionId: "one", text: "hello" } });
+  const command = /** @type {import("../shared/contracts.mjs").ClientRequest} */ ({ version: 1, clientId: "client\0exact", requestId: "request\0exact", op: "prompt", payload: { sessionId: "one", text: "hello" } });
 
   await launched.deliver(command, journal);
 
@@ -571,7 +571,7 @@ it("marks delivery unknown when the worker channel is lost after delivery starts
   const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "disconnect-token" });
   const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-disconnect" });
   const journal = await createCommandJournal({ path: join(root, "commands.jsonl") });
-  const command = /** @type {import("../shared/contracts.js").ClientRequest} */ ({ version: 1, clientId: "client", requestId: "ambiguous", op: "prompt", payload: { sessionId: "one", text: "hello" } });
+  const command = /** @type {import("../shared/contracts.mjs").ClientRequest} */ ({ version: 1, clientId: "client", requestId: "ambiguous", op: "prompt", payload: { sessionId: "one", text: "hello" } });
 
   await expect(launched.deliver(command, journal)).resolves.toMatchObject({ stage: "DELIVERY_UNKNOWN" });
   expect((await journal.get(command))?.stage).toBe("DELIVERY_UNKNOWN");
@@ -609,7 +609,7 @@ it("keeps the upstream journal ambiguous when the replay tail cannot advance pas
   const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "append-failure-upstream-token" });
   const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "append-failure-upstream" });
   const journal = await createCommandJournal({ path: join(root, "append-failure-commands.jsonl") });
-  const command = /** @type {import("../shared/contracts.js").ClientRequest} */ ({ version: 1, clientId: "client", requestId: "append-failure", op: "prompt", payload: { sessionId: "one", text: "hello" } });
+  const command = /** @type {import("../shared/contracts.mjs").ClientRequest} */ ({ version: 1, clientId: "client", requestId: "append-failure", op: "prompt", payload: { sessionId: "one", text: "hello" } });
 
   await expect(launched.deliver(command, journal)).resolves.toMatchObject({ stage: "DELIVERY_UNKNOWN" });
   expect(replay.current(command)).toMatchObject({ stage: "RPC_WRITE_STARTED" });
@@ -627,7 +627,7 @@ it.each([
   const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => `result-${commandBehavior}` });
   const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: `run-${commandBehavior}` });
   const journal = await createCommandJournal({ path: join(root, `commands-${commandBehavior}.jsonl`) });
-  const command = /** @type {import("../shared/contracts.js").ClientRequest} */ ({ version: 1, clientId: "client", requestId: commandBehavior, op: "prompt", payload: { sessionId: "one", text: "hello" } });
+  const command = /** @type {import("../shared/contracts.mjs").ClientRequest} */ ({ version: 1, clientId: "client", requestId: commandBehavior, op: "prompt", payload: { sessionId: "one", text: "hello" } });
 
   await expect(launched.deliver(command, journal)).resolves.toMatchObject({ stage: expectedStage });
   expect((await journal.get(command))?.stage).toBe(expectedStage);

@@ -18,7 +18,7 @@ vi.mock("node:crypto", async (importOriginal) => {
 
 import { createControlServer } from "./control-server.mjs";
 
-/** @typedef {import("../shared/contracts.js").ClientRequest} ClientRequest */
+/** @typedef {import("../shared/contracts.mjs").ClientRequest} ClientRequest */
 /** @typedef {Parameters<typeof createControlServer>[0]} ControlServerOptions */
 
 /** @type {Array<() => Promise<void>>} */

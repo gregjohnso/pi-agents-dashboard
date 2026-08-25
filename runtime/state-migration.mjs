@@ -1,0 +1,199 @@
+import { createHash, randomUUID } from "node:crypto";
+import * as fs from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
+
+import { convertLegacyDashboardConfig } from "../shared/config.mjs";
+
+const DIRECTORY_MODE = 0o700;
+const FILE_MODE = 0o600;
+const MANIFEST = "migration-manifest.json";
+const CANONICAL_MARKER = "CANONICAL";
+const LEGACY_MARKER = "MIGRATED";
+const LOCK = ".migration.lock";
+
+/** @param {string} code @param {string} message @param {Record<string, unknown>} [details] */
+function migrationError(code, message, details = {}) { return Object.assign(new Error(message), { code, ...details }); }
+/** @param {string} directory @param {any} fsOps */
+async function syncDirectory(directory, fsOps) { const handle = await fsOps.open(directory, "r"); try { await handle.sync(); } finally { await handle.close(); } }
+/** @param {string} path @param {string|Buffer} value @param {any} fsOps */
+async function durableFile(path, value, fsOps) {
+  const handle = await fsOps.open(path, "wx", FILE_MODE);
+  try { await handle.chmod(FILE_MODE); await handle.writeFile(value); await handle.sync(); } finally { await handle.close(); }
+}
+/** @param {string} path @param {any} fsOps */
+async function readJson(path, fsOps) { try { return JSON.parse(await fsOps.readFile(path, "utf8")); } catch (error) { throw migrationError("MALFORMED_LEGACY_STATE", `Malformed legacy JSON: ${path}`, { cause: error }); } }
+/** @param {string} value */
+function digest(value) { return createHash("sha256").update(value).digest("hex"); }
+
+/** @param {string} root @param {number} expectedUserId @param {any} fsOps */
+async function inspectTree(root, expectedUserId, fsOps) {
+  const rootRealpath = await fsOps.realpath(root);
+  const rootMetadata = await fsOps.lstat(root);
+  if (rootRealpath !== root || !rootMetadata.isDirectory() || rootMetadata.isSymbolicLink() || rootMetadata.uid !== expectedUserId || (rootMetadata.mode & 0o777) !== DIRECTORY_MODE) throw migrationError("UNSAFE_LEGACY_STATE", `Legacy root is not a canonical private directory: ${root}`);
+  /** @type {Array<{relative:string,type:"directory"|"file",text?:string}>} */
+  const entries = [];
+  /** @param {string} directory @param {string} relative */
+  async function visit(directory, relative) {
+    for (const name of (await fsOps.readdir(directory)).sort()) {
+      if (relative === "" && [LOCK, LEGACY_MARKER].includes(name)) continue;
+      const path = join(directory, name); const childRelative = relative === "" ? name : join(relative, name); const metadata = await fsOps.lstat(path);
+      if (metadata.isSymbolicLink() || metadata.uid !== expectedUserId) throw migrationError("UNSAFE_LEGACY_STATE", `Unsafe legacy artifact: ${path}`);
+      if (metadata.isDirectory()) {
+        if ((metadata.mode & 0o777) !== DIRECTORY_MODE || await fsOps.realpath(path) !== path) throw migrationError("UNSAFE_LEGACY_STATE", `Unsafe legacy directory: ${path}`);
+        entries.push({ relative: childRelative, type: "directory" }); await visit(path, childRelative);
+      } else if (metadata.isFile()) {
+        if ((metadata.mode & 0o777) !== FILE_MODE) throw migrationError("UNSAFE_LEGACY_STATE", `Unsafe legacy file mode: ${path}`);
+        const text = await fsOps.readFile(path, "utf8");
+        if (name.endsWith(".json")) { try { JSON.parse(text); } catch (error) { throw migrationError("MALFORMED_LEGACY_STATE", `Malformed legacy JSON: ${path}`, { cause: error }); } }
+        entries.push({ relative: childRelative, type: "file", text });
+      } else throw migrationError("UNSAFE_LEGACY_STATE", `Unsupported legacy artifact: ${path}`);
+    }
+  }
+  await visit(root, "");
+  const identity = digest(JSON.stringify({ root: rootRealpath, dev: rootMetadata.dev, ino: rootMetadata.ino, entries: entries.map((entry) => [entry.relative, entry.type, entry.text === undefined ? undefined : digest(entry.text)]) }));
+  return { identity, entries };
+}
+
+/** @param {string} path @param {any} fsOps */
+async function maybeManifest(path, fsOps) {
+  try { return JSON.parse(await fsOps.readFile(path, "utf8")); } catch (error) { if (/** @type {NodeJS.ErrnoException} */ (error).code === "ENOENT") return undefined; throw migrationError("MIGRATION_IDENTITY_MISMATCH", "Destination migration manifest is malformed", { cause: error }); }
+}
+/** @param {string} root @param {Array<{relative:string,sha256:string}>} files @param {any} fsOps */
+async function validateCompletedDestination(root, files, fsOps) {
+  const allowed = new Set([LOCK, MANIFEST, CANONICAL_MARKER, ...files.map((file) => file.relative.split("/")[0])]);
+  const collision = (await fsOps.readdir(root)).find((/** @type {string} */ name) => !allowed.has(name));
+  if (collision !== undefined) throw migrationError("DESTINATION_COLLISION", `Destination contains unexpected artifact: ${collision}`);
+  await Promise.all(files.map(async (/** @type {{relative:string,sha256:string}} */ file) => {
+    const text = await fsOps.readFile(join(root, file.relative), "utf8").catch(() => undefined);
+    if (text === undefined || digest(text) !== file.sha256) throw migrationError("MIGRATION_IDENTITY_MISMATCH", `Migrated file identity changed: ${file.relative}`);
+  }));
+}
+/** @param {string} root @param {any} fsOps @param {boolean} create @param {number} expectedUserId */
+async function acquireLock(root, fsOps, create, expectedUserId) {
+  if (create) {
+    let created = false;
+    try { await fsOps.lstat(root); }
+    catch (error) { if (/** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT") throw error; await fsOps.mkdir(root, { recursive: true, mode: DIRECTORY_MODE }); await fsOps.chmod(root, DIRECTORY_MODE); created = true; }
+    const metadata = await fsOps.lstat(root);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink() || metadata.uid !== expectedUserId || (metadata.mode & 0o777) !== DIRECTORY_MODE) {
+      if (created) await fsOps.rm(root, { recursive: true, force: true });
+      throw migrationError("UNSAFE_DESTINATION_STATE", `Destination root is not a private directory: ${root}`);
+    }
+  }
+  const path = join(root, LOCK);
+  try { await fsOps.mkdir(path, { mode: DIRECTORY_MODE }); } catch (error) { if (/** @type {NodeJS.ErrnoException} */ (error).code === "EEXIST") throw migrationError("MIGRATION_LOCKED", `Migration lock is held: ${path}`); throw error; }
+  return async () => fsOps.rm(path, { recursive: true, force: true });
+}
+/** @param {string} root @param {Array<{relative:string,sha256:string}>} files @param {boolean} complete @param {any} fsOps */
+async function validateRecoveryFiles(root, files, complete, fsOps) {
+  const expected = new Map(files.map((file) => [file.relative, file.sha256]));
+  const seen = new Set();
+  /** @param {string} directory @param {string} relative */
+  async function visit(directory, relative) {
+    for (const name of await fsOps.readdir(directory)) {
+      if (relative === "" && name === LOCK) continue;
+      const path = join(directory, name); const child = relative === "" ? name : join(relative, name); const metadata = await fsOps.lstat(path);
+      if (metadata.isSymbolicLink()) throw migrationError("DESTINATION_COLLISION", `Unsafe interrupted migration artifact: ${child}`);
+      if (metadata.isDirectory()) await visit(path, child);
+      else if (metadata.isFile() && expected.get(child) === digest(await fsOps.readFile(path, "utf8"))) seen.add(child);
+      else throw migrationError("DESTINATION_COLLISION", `Interrupted migration artifact changed: ${child}`);
+    }
+  }
+  await visit(root, "");
+  if (complete && seen.size !== expected.size) throw migrationError("DESTINATION_COLLISION", "Interrupted migration output is incomplete");
+}
+
+/** @param {string} path @param {unknown} value @param {any} fsOps */
+async function replaceJson(path, value, fsOps) {
+  const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
+  await durableFile(temporary, `${JSON.stringify(value, null, 2)}\n`, fsOps); await fsOps.rename(temporary, path); await syncDirectory(dirname(path), fsOps);
+}
+
+/**
+ * Atomically migrate private legacy dashboard metadata to the standalone root.
+ * @param {{legacyRoot:string,destinationRoot:string,expectedUserId:number,inspectLegacyRuntime:()=>Promise<any>,reconcileDestination:(context:{root:string,migrationId:string,manifest:any})=>Promise<any>,fsOps?:any,failpoint?:(stage:string)=>Promise<void>}} options
+ */
+export async function migrateLegacyState({ legacyRoot, destinationRoot, expectedUserId, inspectLegacyRuntime, reconcileDestination, fsOps = fs, failpoint = async () => {} }) {
+  if (![legacyRoot, destinationRoot].every((root) => typeof root === "string" && resolve(root) === root) || legacyRoot === destinationRoot) throw new TypeError("Migration roots must be distinct absolute canonical paths");
+  if (!Number.isSafeInteger(expectedUserId) || expectedUserId < 0) throw new TypeError("expectedUserId must be a non-negative integer");
+  if (typeof inspectLegacyRuntime !== "function" || typeof reconcileDestination !== "function" || typeof failpoint !== "function") throw new TypeError("Migration seams must be functions");
+  const releases = [];
+  try {
+    for (const root of [legacyRoot, destinationRoot].sort()) releases.push(await acquireLock(root, fsOps, root === destinationRoot, expectedUserId));
+    const tree = await inspectTree(legacyRoot, expectedUserId, fsOps);
+    const destinationMetadata = await fsOps.lstat(destinationRoot);
+    const destinationIdentity = digest(JSON.stringify({ realpath: await fsOps.realpath(destinationRoot), dev: destinationMetadata.dev, ino: destinationMetadata.ino }));
+    const migrationId = digest(JSON.stringify([tree.identity, destinationIdentity, 1, 2]));
+    const manifestPath = join(destinationRoot, MANIFEST);
+    const preparedEntries = tree.entries.map((entry) => {
+      if (entry.type !== "file") return entry;
+      let text = entry.text ?? "";
+      if (entry.relative === "dashboard.json") { try { text = `${JSON.stringify(convertLegacyDashboardConfig(JSON.parse(text)), null, 2)}\n`; } catch (error) { throw migrationError("MALFORMED_LEGACY_STATE", "Legacy dashboard configuration is invalid", { cause: error }); } }
+      return { ...entry, text };
+    });
+    const files = preparedEntries.filter((entry) => entry.type === "file").map((entry) => ({ relative: entry.relative, type: "file", sha256: digest(entry.text ?? "") }));
+    const existing = await maybeManifest(manifestPath, fsOps);
+    let published = existing;
+    if (existing !== undefined) {
+      if (existing.migrationId !== migrationId || existing.sourceIdentity !== tree.identity) throw migrationError("MIGRATION_IDENTITY_MISMATCH", "Destination manifest belongs to another migration");
+      const manifestKeys = ["schemaVersion", "migrationId", "sourceIdentity", "destinationIdentity", "state", "configFrom", "configTo", "createdAt", "updatedAt"];
+      if (existing.schemaVersion !== 1 || existing.destinationIdentity !== destinationIdentity || existing.configFrom !== 1 || existing.configTo !== 2 || !["PREPARED", "PUBLISHED", "RECONCILED"].includes(existing.state) || typeof existing.createdAt !== "string" || typeof existing.updatedAt !== "string" || Object.keys(existing).length !== manifestKeys.length || Object.keys(existing).some((key) => !manifestKeys.includes(key))) throw migrationError("MIGRATION_IDENTITY_MISMATCH", "Destination manifest contract is invalid");
+      await validateCompletedDestination(destinationRoot, files, fsOps);
+      if (existing.state === "RECONCILED" && await fsOps.readFile(join(destinationRoot, CANONICAL_MARKER), "utf8").then((/** @type {string} */ value) => value.trim() === migrationId).catch(() => false)) return { status: "ALREADY_MIGRATED", migrationId, manifestPath };
+    } else {
+      const destinationEntries = (await fsOps.readdir(destinationRoot)).filter((/** @type {string} */ name) => name !== LOCK);
+      const expectedTopLevels = new Set(files.map((file) => file.relative.split("/")[0]));
+      const stageName = `.migration-stage-${migrationId}`;
+      const generated = destinationEntries.filter((/** @type {string} */ name) => expectedTopLevels.has(name));
+      const stagePresent = destinationEntries.includes(stageName);
+      const temporaryNames = destinationEntries.filter((/** @type {string} */ name) => name.startsWith(`.${MANIFEST}.`) && name.endsWith(".tmp"));
+      if (destinationEntries.some((/** @type {string} */ name) => !expectedTopLevels.has(name) && name !== stageName && !temporaryNames.includes(name))) throw migrationError("DESTINATION_COLLISION", "Destination is not empty");
+      if (stagePresent) { await validateRecoveryFiles(join(destinationRoot, stageName), files, false, fsOps); await fsOps.rm(join(destinationRoot, stageName), { recursive: true, force: true }); }
+      for (const name of temporaryNames) {
+        const temporary = JSON.parse(await fsOps.readFile(join(destinationRoot, name), "utf8"));
+        if (temporary.migrationId !== migrationId || temporary.sourceIdentity !== tree.identity) throw migrationError("DESTINATION_COLLISION", "Interrupted manifest identity changed");
+        await fsOps.rm(join(destinationRoot, name), { force: true });
+      }
+      if (generated.length > 0) {
+        await validateRecoveryFiles(destinationRoot, files, true, fsOps);
+        const timestamp = new Date().toISOString();
+        published = { schemaVersion: 1, migrationId, sourceIdentity: tree.identity, destinationIdentity, state: "PUBLISHED", configFrom: 1, configTo: 2, createdAt: timestamp, updatedAt: timestamp };
+      }
+    }
+    const runtime = await inspectLegacyRuntime();
+    if (runtime?.activeDaemon || (Array.isArray(runtime?.activeSupervisors) && runtime.activeSupervisors.length > 0)) throw migrationError("LEGACY_RUNTIME_ACTIVE", "Verified legacy daemon or supervisor is active", { identities: runtime });
+
+    if (published === undefined) {
+      await failpoint("staging_start");
+      const stage = join(destinationRoot, `.migration-stage-${migrationId}`);
+      await fsOps.mkdir(stage, { mode: DIRECTORY_MODE });
+      for (const entry of preparedEntries) {
+        const target = join(stage, entry.relative);
+        if (entry.type === "directory") { await fsOps.mkdir(target, { recursive: true, mode: DIRECTORY_MODE }); await fsOps.chmod(target, DIRECTORY_MODE); continue; }
+        await fsOps.mkdir(dirname(target), { recursive: true, mode: DIRECTORY_MODE });
+        await durableFile(target, entry.text ?? "", fsOps); await failpoint("after_staged_file_fsync");
+      }
+      await Promise.all(preparedEntries.filter((entry) => entry.type === "directory").map((entry) => syncDirectory(join(stage, entry.relative), fsOps)));
+      await syncDirectory(stage, fsOps);
+      for (const entry of await fsOps.readdir(stage)) await fsOps.rename(join(stage, entry), join(destinationRoot, entry));
+      await fsOps.rmdir(stage); await syncDirectory(destinationRoot, fsOps);
+      const timestamp = new Date().toISOString();
+      published = { schemaVersion: 1, migrationId, sourceIdentity: tree.identity, destinationIdentity, state: "PUBLISHED", configFrom: 1, configTo: 2, createdAt: timestamp, updatedAt: timestamp };
+      const manifestTemporary = join(destinationRoot, `.${MANIFEST}.${randomUUID()}.tmp`);
+      await durableFile(manifestTemporary, `${JSON.stringify(published, null, 2)}\n`, fsOps); await failpoint("before_manifest_rename");
+      await fsOps.rename(manifestTemporary, manifestPath); await syncDirectory(destinationRoot, fsOps); await failpoint("after_manifest_publication");
+    }
+    if (published.state === "RECONCILED") {
+      await durableFile(join(destinationRoot, CANONICAL_MARKER), `${migrationId}\n`, fsOps); await syncDirectory(destinationRoot, fsOps);
+      await durableFile(join(legacyRoot, LEGACY_MARKER), `${migrationId}\n`, fsOps); await syncDirectory(legacyRoot, fsOps);
+      return { status: "MIGRATED", migrationId, manifestPath };
+    }
+    await reconcileDestination({ root: destinationRoot, migrationId, manifest: published });
+    await failpoint("before_reconciliation_completion");
+    const completed = { ...published, state: "RECONCILED", updatedAt: new Date().toISOString() }; await replaceJson(manifestPath, completed, fsOps);
+    await failpoint("after_reconciliation");
+    await durableFile(join(destinationRoot, CANONICAL_MARKER), `${migrationId}\n`, fsOps); await syncDirectory(destinationRoot, fsOps);
+    await durableFile(join(legacyRoot, LEGACY_MARKER), `${migrationId}\n`, fsOps); await syncDirectory(legacyRoot, fsOps);
+    return { status: "MIGRATED", migrationId, manifestPath };
+  } finally { for (const release of releases.reverse()) await release().catch(() => {}); }
+}

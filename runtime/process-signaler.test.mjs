@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 
-import { loadDashboardConfig } from "../shared/config.js";
+import { loadDashboardConfig } from "../shared/config.mjs";
 import { stopVerifiedProcessGroup } from "./process-signaler.mjs";
 import {
   createFakeSignaler,

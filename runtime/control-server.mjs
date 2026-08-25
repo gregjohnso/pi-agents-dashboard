@@ -3,10 +3,10 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { chmodPrivateSocket } from "./permissions.mjs";
 import { createJsonlDecoder, createJsonlEncoder, JsonlFramingError } from "./jsonl.mjs";
-import { parseClientRequest } from "../shared/contracts.js";
+import { parseClientRequest } from "../shared/contracts.mjs";
 
-/** @typedef {import("../shared/contracts.js").ClientRequest} ClientRequest */
-/** @typedef {import("../shared/contracts.js").DashboardError} DashboardError */
+/** @typedef {import("../shared/contracts.mjs").ClientRequest} ClientRequest */
+/** @typedef {import("../shared/contracts.mjs").DashboardError} DashboardError */
 
 /** @param {string} code @param {string} message @param {boolean} [retryable] @returns {DashboardError} */
 function dashboardError(code, message, retryable = false) {

@@ -14,7 +14,7 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-/** @param {string} sessionId @param {import("../shared/contracts.js").ProcessIdentity} identity @returns {import("../shared/contracts.js").SessionRecord} */
+/** @param {string} sessionId @param {import("../shared/contracts.mjs").ProcessIdentity} identity @returns {import("../shared/contracts.mjs").SessionRecord} */
 function record(sessionId, identity) {
   const now = "2026-08-25T12:00:00.000Z";
   return {
@@ -46,7 +46,7 @@ it("reopens truncated stores and converts unresolved delivery to DELIVERY_UNKNOW
   const root = await fixture();
   const journalPath = join(root, "queue", "commands.jsonl");
   const journal = await createCommandJournal({ path: journalPath });
-  const command = /** @type {import("../shared/contracts.js").ClientRequest} */ ({ version: 1, clientId: "client", requestId: "request", op: "prompt", payload: { sessionId: "one", text: "hello" } });
+  const command = /** @type {import("../shared/contracts.mjs").ClientRequest} */ ({ version: 1, clientId: "client", requestId: "request", op: "prompt", payload: { sessionId: "one", text: "hello" } });
   await journal.accept(command);
   await journal.transition(command, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
   await journal.close();
@@ -73,8 +73,8 @@ it("reopens truncated stores and converts unresolved delivery to DELIVERY_UNKNOW
 it("redelivers only ACCEPTED commands and never acknowledged or worker-local RECEIVED attempts", async () => {
   const root = await fixture();
   const journal = await createCommandJournal({ path: join(root, "queue", "commands.jsonl") });
-  const accepted = /** @type {import("../shared/contracts.js").ClientRequest} */ ({ version: 1, clientId: "client", requestId: "accepted", op: "prompt", payload: { sessionId: "one", text: "safe" } });
-  const acknowledged = /** @type {import("../shared/contracts.js").ClientRequest} */ ({ ...accepted, requestId: "acknowledged", payload: { ...accepted.payload, text: "done" } });
+  const accepted = /** @type {import("../shared/contracts.mjs").ClientRequest} */ ({ version: 1, clientId: "client", requestId: "accepted", op: "prompt", payload: { sessionId: "one", text: "safe" } });
+  const acknowledged = /** @type {import("../shared/contracts.mjs").ClientRequest} */ ({ ...accepted, requestId: "acknowledged", payload: { ...accepted.payload, text: "done" } });
   await journal.accept(accepted);
   await journal.accept(acknowledged);
   await journal.transition(acknowledged, ["ACCEPTED"], "DELIVERY_ATTEMPTED");

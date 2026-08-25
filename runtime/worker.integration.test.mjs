@@ -16,7 +16,7 @@ afterEach(async () => {
   await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-/** @param {string} root @param {string} sessionId @returns {import("../shared/contracts.js").SessionRecord} */
+/** @param {string} root @param {string} sessionId @returns {import("../shared/contracts.mjs").SessionRecord} */
 function record(root, sessionId) {
   const now = "2026-08-25T12:00:00.000Z";
   const canonicalSessionFile = join(root, `${sessionId}.jsonl`);

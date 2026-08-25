@@ -1,44 +1,35 @@
 {
-  "name": "pi-agents-dashboard",
+  "name": "pi-dashboard",
   "version": "0.0.0",
   "type": "module",
   "engines": {
     "node": ">=22.19.0"
   },
   "bin": {
-    "pi-agents-dashboard": "./bin/pi-agents-dashboard.mjs"
+    "pi-dashboard": "./bin/pi-dashboard.mjs"
   },
   "files": [
+    "app",
     "bin",
     "cli",
-    "extensions",
     "runtime",
     "shared",
     "isolation",
     "README.md",
     "LICENSE"
   ],
-  "pi": {
-    "extensions": [
-      "./extensions/agents-dashboard/index.ts"
-    ]
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-agent-core": "*",
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
-  },
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --project tsconfig.app.json",
     "test": "vitest run",
     "test:unit": "vitest run --exclude '**/*.integration.test.*' --exclude '**/*.tmux.test.*'",
     "test:integration": "vitest run '**/*.integration.test.*'",
     "pack:check": "npm pack --dry-run --json"
   },
-  "devDependencies": {
+  "dependencies": {
     "@earendil-works/pi-coding-agent": "0.84.3",
-    "@earendil-works/pi-tui": "0.84.3",
+    "@earendil-works/pi-tui": "0.84.3"
+  },
+  "devDependencies": {
     "@types/node": "22.19.19",
     "typescript": "5.9.3",
     "vitest": "4.1.9"

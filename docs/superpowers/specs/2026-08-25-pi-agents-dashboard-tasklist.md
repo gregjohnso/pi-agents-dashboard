@@ -69,7 +69,7 @@ T02 + T14 + T15 ─────────────────────�
 
 ## Milestone 1: Contracts and Pure Logic
 
-- [ ] **T04 Freeze shared contracts and JSONL framing**
+- [x] **T04 Freeze shared contracts and JSONL framing**
   - Owner: one contract writer.
   - Depends on: T03.
   - Deliverables: session, launch, ownership, command, event, error, cursor, and config types; strict bounded JSONL codec.

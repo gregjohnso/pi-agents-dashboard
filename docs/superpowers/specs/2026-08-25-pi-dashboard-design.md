@@ -43,7 +43,7 @@ pi-dashboard
 2. Launch concurrent sessions through the installed `pi --mode rpc` executable.
 3. Keep runs alive after the app, terminal, or secure shell (SSH) connection closes.
 4. Show live and saved sessions across working directories in one dense list.
-5. Open a full-screen interactive viewer with transcript, composition, tools, pending responses, and session controls.
+5. Open a full-screen Pi-style chat viewer that shows the conversation and what the agent is doing while preserving composition, pending responses, and session controls.
 6. Recover registry, commands, normalized viewer events, process identities, and cursor state after a daemon restart.
 7. Install as a normal npm executable from a registry or local path.
 8. Detect required Pi capabilities without pinning support to a Pi version string.
@@ -53,7 +53,7 @@ pi-dashboard
 
 - Reimplement Pi's model loop, tool execution, provider support, or canonical session writer.
 - Import private Pi modules or deep `dist/` paths.
-- Match Pi's native `InteractiveMode` or extension surfaces.
+- Reuse Pi's private `InteractiveMode` controller or bind the viewer to a live in-process `AgentSession`. The viewer should match useful Pi chat behavior through public components and normalized RPC data.
 - Render image or file contents in the first standalone release.
 - Depend on tmux for production process lifetime.
 - Support cross-machine dashboards or control.
@@ -115,24 +115,49 @@ The return gesture is:
 
 The second key must match the first. Focused overlays consume Escape before the viewer return gesture. Ctrl+C in the viewer sends an interrupt command to the selected session. Ctrl+C in the list closes the app without signaling a run.
 
-### The viewer is fully interactive
+### The viewer is a live chat interface
 
-The viewer uses public `pi-tui` primitives and a public editor component. Its layout and session controller belong to `pi-dashboard`.
+The viewer presents the normalized session as a chronological chat, not as a log table. User prompts, assistant markdown, thinking, tool work, lifecycle notices, and pending questions appear where they occurred. The current activity remains visible above the composer when its inline block has scrolled off-screen.
 
 | Surface | First-release behavior |
 |---|---|
-| Transcript | Render normalized user, assistant, system, and activity entries with stable IDs. Stream assistant deltas into the current entry. |
-| Composer | Send `prompt` while idle and `follow_up` while working. Preserve a per-session draft and history. |
-| Steer | Send an explicit `steer` command at Pi's next supported boundary. |
-| Interrupt | Ctrl+C sends `interrupt` and leaves the viewer open. |
-| Tools | Show tool name, state, bounded arguments, streaming activity, result, error, and duration. Calls and results are collapsible. |
+| User messages | Render distinct message cards with wrapped text and preserved file or image metadata. |
+| Assistant messages | Render markdown, code, links, lists, and streamed deltas in one updating response block. |
+| Thinking | Render thinking content in a distinct collapsible block when Pi exposes it. Show the active thinking level even when content is hidden. |
+| Agent activity | Show a working indicator and plain-language phase such as `Thinking`, `Streaming response`, `Running bash`, `Compacting context`, `Retrying in 4s`, or `Waiting for confirmation`. Include elapsed time and bounded detail when available. |
+| Tools | Insert tool cards in conversation order. Show tool name, state, bounded arguments, streaming updates, result, error, and duration. Keep active and failed cards expanded; completed cards are collapsible. |
+| Composer | Use Pi's public `CustomEditor`. Send `prompt` while idle and `follow_up` while working. Preserve a per-session draft and history. |
+| Steer | Send an explicit `steer` command at Pi's next supported boundary and label its delivery state. |
+| Interrupt | Ctrl+C sends `interrupt`, updates the activity line, and leaves the viewer open. |
 | Pending UI | Render supported confirm, select, input, and editor requests as focused overlays. Send `ui_response` through the daemon. |
 | Model status | Show provider, model, and changes reported by Pi. |
 | Thinking status | Show the active thinking level and changes reported by Pi. |
+| Lifecycle notices | Render compaction, retry, reconnect, compatibility, and terminal errors as bounded system cards rather than mixing them into assistant prose. |
 | Images and files | Preserve normalized metadata and render a placeholder with safe path, media type, dimensions, or size when present. |
-| Unknown Pi events | Render a bounded generic activity entry and retain the raw frame only in diagnostics. |
+| Unknown Pi events | Render a bounded generic activity card and retain the raw frame only in diagnostics. |
 
-At most one frontend holds the composer role for a session. Other frontends can observe, search, scroll, and inspect tools. They cannot submit text, steer, interrupt, answer pending requests, stop, or delete.
+The activity surface is driven by normalized Pi events, not guesses from stdout text. A phase remains visible until a later normalized event replaces or clears it. Completed phases remain in the chat timeline when they explain a delay, retry, tool result, or failure.
+
+At most one frontend holds the composer role for a session. Other frontends can observe, search, scroll, inspect tools, and follow streaming output. They cannot submit text, steer, interrupt, answer pending requests, stop, or delete.
+
+### Public Pi UI components are the default building blocks
+
+`pi-dashboard` imports only public package-root exports from `@earendil-works/pi-tui` and `@earendil-works/pi-coding-agent`. It reuses the highest-level public component whose input can be produced safely from the normalized viewer protocol.
+
+| Need | Public Pi infrastructure |
+|---|---|
+| User and assistant chat blocks | `UserMessageComponent`, `AssistantMessageComponent`, `Markdown`, and `getMarkdownTheme()` |
+| Tool cards | `ToolExecutionComponent` with normalized call, update, and result adapters |
+| Transcript viewport | `TuiAltScreen`, `ScrollView`, `VStack`, `HStack`, `Container`, `Box`, `Text`, and `Spacer` |
+| Composer | `CustomEditor`, Pi keybinding actions, `KeybindingsManager`, and IME focus behavior |
+| Prompts and selectors | TUI overlays, `SelectList`, `SettingsList`, `Input`, and `DynamicBorder` |
+| Rendering and input safety | `matchesKey`, `Key`, `visibleWidth`, `truncateToWidth`, and `wrapTextWithAnsi` |
+| Visual tokens | Public `Theme` and Pi message, tool, markdown, status, and thinking color tokens mapped to the dashboard palette |
+| Help text | Public keybinding hint helpers where the active binding is available |
+
+Each reused component sits behind a thin dashboard adapter so the bundled UI dependency and the installed Pi child can have different versions. The adapter converts normalized records into the dashboard's pinned public component types. If a record cannot safely satisfy a high-level component contract, the viewer composes the public primitives above rather than importing private Pi code or copying Pi source.
+
+The dashboard owns only the Jobwatch list, standalone viewer controller, normalized protocol, session roles, activity model, placeholders, and dashboard-specific status/footer layout. It does not import deep `dist/` paths, private `InteractiveMode` components, or objects that require an in-process `AgentSession`.
 
 ### Stop, delete, and cleanup
 
@@ -144,7 +169,7 @@ Worktree cleanup is a separate full-ID confirmed action. It refuses live ownersh
 
 Ambiguous Stop or Delete delivery becomes `DELIVERY_UNKNOWN`. Only explicit `retry_at_risk` or `abandon` resolution can change that command state.
 
-## The visual design follows Jobwatch
+## The list follows Jobwatch and the viewer follows Pi chat
 
 ### Visual language
 
@@ -180,9 +205,32 @@ The list shows ID, task state, age, model, project, and activity. A liveness gly
 
 ### Viewer layout
 
-The viewer has a one-line session header, a virtualized transcript, focused overlays, an editor, and a compact status footer. The header shows name, task state, process state, model, thinking level, working directory, and composer role. Tool blocks default to collapsed after completion and remain expanded while active or failed.
+The viewer uses Pi's chat rhythm inside the dashboard palette: distinct user cards, assistant markdown, inline thinking and tool blocks, a working indicator, a bordered editor, and a compact footer.
 
-Rendering truncates every line to terminal width. Narrow layouts hide optional columns before clipping required state or selection information.
+```text
+ pi-dashboard · a31f92c1 · WORKING · gpt-5.6 · high · composer
+────────────────────────────────────────────────────────────────────────────
+ You
+ Run the focused tests and explain any failures.
+
+ Assistant
+ I will inspect the test configuration first.
+
+╭ bash · RUNNING · 12s ────────────────────────────────────────────────────╮
+│ pytest -s -n 0 --no-cov --cache-clear -v test/viewer.test.ts            │
+│ collected 18 items ...                                                   │
+╰──────────────────────────────────────────────────────────────────────────╯
+
+ ● Running bash · collected 18 items · 12s
+────────────────────────────────────────────────────────────────────────────
+❯ send a follow-up
+────────────────────────────────────────────────────────────────────────────
+ high · 18k context · /worktrees/a31f92c1 · Left twice to return
+```
+
+The one-line header shows name, task state, process state, model, thinking level, working directory, and composer role. The virtualized transcript keeps conversation order and follows new output only while the viewer is at the bottom. Scrolling up pauses follow mode and shows a new-activity marker. Focused overlays appear above the chat. Tool blocks default to collapsed after completion and remain expanded while active or failed.
+
+Rendering truncates every line to terminal width. Narrow layouts hide optional metadata before clipping the message role, active phase, composer, or required state.
 
 ## One daemon owns state and supervised Pi RPC children
 
@@ -269,6 +317,8 @@ Each event has viewer protocol version, session ID, stable event ID, sequence cu
 - `image_placeholder`
 - `file_placeholder`
 - `unknown_pi_event`
+
+The `activity` payload contains a phase, display label, optional bounded detail, source event ID, start time, and related tool call or retry time when present. First-release phases are `idle`, `thinking`, `assistant_streaming`, `tool_pending`, `tool_running`, `tool_streaming`, `compacting`, `retrying`, `waiting`, `interrupting`, `stopping`, and `error`. The frontend derives elapsed display time from the start time; it does not persist timer ticks as events.
 
 The daemon persists a normalized event before broadcasting it. A frontend processes and renders the event, persists its cursor, then acknowledges it. Reconnect requests events after the last acknowledged cursor. Cursor epoch mismatch requests a fresh snapshot. Duplicate stable event IDs are idempotent.
 
@@ -463,7 +513,9 @@ Command protocol version and normalized viewer protocol version are independent 
 - Normalization fixtures cover every first-release viewer event, history/live deduplication, stable IDs, cursor replay, and unknown events.
 - Raw RPC and stderr rotation enforce 32 MiB and 8 MiB limits with truncation markers.
 - List and transcript virtualization preserve session and item selection over updates and resize.
+- Chat component adapters cover user cards, assistant markdown and deltas, thinking blocks, tool updates and results, system cards, active phase replacement, and follow-mode pause.
 - Viewer input covers prompt, follow-up, steer, interrupt, pending UI responses, composer arbitration, and the 500 ms return gesture.
+- Public Pi component tests import only package-root exports and verify bounded rendering with the dashboard's pinned dependency.
 - Task state, process state, outcome, and activity remain independent.
 - Command journals preserve idempotency and explicit `DELIVERY_UNKNOWN` resolution.
 - Migration validates locks, identities, permissions, collisions, interrupted stages, and idempotent restart.
@@ -476,7 +528,7 @@ Command protocol version and normalized viewer protocol version are independent 
 - Closing the app leaves both runs alive. Restarting the daemon reconnects both supervisors and resumes normalized event delivery.
 - New runs use an updated Pi executable identity while existing runs continue under the prior identity.
 - Required capability failure starts no writer. Unknown optional events become generic activity.
-- Snapshot plus replay reconstructs transcript, tools, pending UI requests, model state, and thinking state after frontend and daemon crashes.
+- Snapshot plus replay reconstructs the chat, active phase, tools, pending UI requests, model state, and thinking state after frontend and daemon crashes.
 - Prompt, follow-up, steer, interrupt, and UI response preserve acknowledgement boundaries and ambiguity semantics.
 - Session resume reuses the canonical session ID and file with one writer.
 - Worktree and shared-directory rules remain unchanged.
@@ -484,7 +536,8 @@ Command protocol version and normalized viewer protocol version are independent 
 
 ### Terminal acceptance
 
-- Snapshot tests cover the Jobwatch-style list and viewer at `160x40`, `120x32`, `80x24`, `55x16`, and `40x10`.
+- Snapshot tests cover the Jobwatch-style list and Pi-style chat viewer at `160x40`, `120x32`, `80x24`, `55x16`, and `40x10`.
+- Chat snapshots cover user and assistant messages, streaming markdown, hidden and visible thinking, each tool state, retry, compaction, pending UI, errors, active status, paused follow mode, and observer mode.
 - Enter and Right open the viewer. Left and Escape follow the clean and 500 ms dirty/history return table.
 - Ctrl+C closes the list and interrupts a viewed session.
 - Search, filters, sorting, grouping, metadata, composer focus, tool expansion, overlays, and observer restrictions remain keyboard accessible.
@@ -497,4 +550,5 @@ Command protocol version and normalized viewer protocol version are independent 
 - `npx pi-dashboard` and a disposable global npm prefix resolve package-relative runtime files.
 - Package contents exclude private state, diagnostics, worktrees, sessions, `.superpowers`, `.vscode`, and development caches.
 - The app locates the configured or `PATH` Pi executable without importing private Pi modules.
+- UI imports resolve only through the public roots of `@earendil-works/pi-tui` and `@earendil-works/pi-coding-agent`; no deep `dist/` import ships.
 - Native attachment, a Pi fork, and a Pi version allowlist are absent from release gates.

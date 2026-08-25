@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { constants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 import { TextDecoder } from "node:util";
@@ -40,15 +41,30 @@ function fallbackSourceId(path, line, rawBytes) {
 /**
  * Open one canonical Pi JSONL session for incremental, read-only consumption.
  *
- * @param {{ path: string, maxRecordBytes?: number, maxErrorMessageBytes?: number }} options
+ * @param {{ path: string, maxRecordBytes?: number, maxErrorMessageBytes?: number, fsOps?: { open(path: string, flags: number): Promise<any>, lstat(path: string): Promise<any>, realpath(path: string): Promise<string> } }} options
  */
-export async function createSessionHistoryReader({ path, maxRecordBytes = DEFAULT_MAX_RECORD_BYTES, maxErrorMessageBytes = DEFAULT_MAX_ERROR_MESSAGE_BYTES }) {
+export async function createSessionHistoryReader({ path, maxRecordBytes = DEFAULT_MAX_RECORD_BYTES, maxErrorMessageBytes = DEFAULT_MAX_ERROR_MESSAGE_BYTES, fsOps = { open, lstat, realpath } }) {
   if (typeof path !== "string" || resolve(path) !== path) throw new TypeError("Session history path must be absolute and canonical");
   if (!Number.isSafeInteger(maxRecordBytes) || maxRecordBytes < 1) throw new TypeError("maxRecordBytes must be a positive safe integer");
   if (!Number.isSafeInteger(maxErrorMessageBytes) || maxErrorMessageBytes < 64) throw new TypeError("maxErrorMessageBytes must be at least 64");
-  const metadata = await lstat(path);
-  if (!metadata.isFile() || metadata.isSymbolicLink() || await realpath(path) !== path) throw new SessionHistoryError("SESSION_HISTORY_UNSAFE", "Canonical session history must be a regular non-symlink file");
-  const handle = await open(path, "r");
+  let handle;
+  try {
+    handle = await fsOps.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (cause) {
+    if (["ELOOP", "EMLINK"].includes(/** @type {NodeJS.ErrnoException} */ (cause)?.code ?? "")) throw new SessionHistoryError("SESSION_HISTORY_UNSAFE", "Canonical session history must not be a symbolic link", { cause });
+    throw cause;
+  }
+  try {
+    const descriptor = await handle.stat();
+    const canonicalPath = await fsOps.realpath(path);
+    const metadata = await fsOps.lstat(path);
+    if (!descriptor.isFile() || !metadata.isFile() || metadata.isSymbolicLink() || canonicalPath !== path || descriptor.dev !== metadata.dev || descriptor.ino !== metadata.ino) {
+      throw new SessionHistoryError("SESSION_HISTORY_UNSAFE", "Canonical session pathname and opened descriptor identity must match");
+    }
+  } catch (error) {
+    await handle.close().catch(() => {});
+    throw error;
+  }
   const decoder = new TextDecoder("utf-8", { fatal: true });
   let scanOffset = 0;
   let consumedOffset = 0;

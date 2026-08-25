@@ -1,7 +1,8 @@
+import { constants } from "node:fs";
 import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createSessionHistoryReader } from "./session-history.mjs";
 
@@ -58,6 +59,23 @@ describe("canonical Pi session history", () => {
     expect(completed.entries[0].sourceId).toMatch(/^history-/u);
     expect((await reader.read()).position).toEqual(completed.position);
     await reader.close();
+  });
+
+  it("opens with no-follow and rejects pathname/descriptor identity replacement", async () => {
+    const { path } = await fixture([`${line(records[0])}\n`]);
+    const close = vi.fn(async () => {});
+    const openImpl = vi.fn(async (_path, flags) => ({ stat: async () => ({ dev: 2, ino: 2, isFile: () => true }), close }));
+    await expect(createSessionHistoryReader({
+      path,
+      fsOps: {
+        open: openImpl,
+        lstat: async () => ({ dev: 1, ino: 1, isFile: () => true, isSymbolicLink: () => false }),
+        realpath: async () => path,
+      },
+    })).rejects.toMatchObject({ code: "SESSION_HISTORY_UNSAFE" });
+    expect(openImpl).toHaveBeenCalledWith(path, expect.any(Number));
+    expect(openImpl.mock.calls[0][1] & constants.O_NOFOLLOW).toBe(constants.O_NOFOLLOW);
+    expect(close).toHaveBeenCalledOnce();
   });
 
   it("reports bounded typed parse errors without exposing malformed source text", async () => {

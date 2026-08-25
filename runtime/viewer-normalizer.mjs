@@ -69,9 +69,20 @@ function record(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? /** @type {Record<string, any>} */ (value) : undefined;
 }
 
+/** @param {unknown} value @returns {unknown} */
+function sanitizeViewerValue(value) {
+  if (Array.isArray(value)) return value.map(sanitizeViewerValue);
+  const parsed = record(value);
+  if (parsed === undefined) return value;
+  if (["image", "file"].includes(parsed.type)) {
+    return Object.fromEntries(Object.entries(parsed).filter(([key]) => !["data", "content", "extractedText", "preview"].includes(key)).map(([key, entry]) => [key, sanitizeViewerValue(entry)]));
+  }
+  return Object.fromEntries(Object.entries(parsed).map(([key, entry]) => [key, sanitizeViewerValue(entry)]));
+}
+
 /** @param {unknown} value */
 function safeArguments(value) {
-  const parsed = record(value);
+  const parsed = record(sanitizeViewerValue(value));
   if (parsed === undefined) return {};
   const text = canonical(parsed);
   if (Buffer.byteLength(text) <= MAX_TEXT_BYTES) return parsed;
@@ -216,7 +227,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       tools.set(tool.id, tool);
       output.push(...publish({ kind: "tool_finished", tool }, eventId, at));
     } else {
-      const text = typeof message.content === "string" ? message.content : canonical(message.content);
+      const text = normalized.content.filter((block) => ["text", "thinking"].includes(block.type)).map((block) => block.text).join("\n");
       const payload = { kind: "system_message", itemId, text: bound(text, 16_384), level: "info" };
       items.set(itemId, payload);
       output.push(...publish(payload, eventId, at));
@@ -255,10 +266,16 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     }
     if (entry.type === "custom_message") {
       if (entry.display !== true) return [];
-      const text = typeof entry.content === "string" ? entry.content : canonical(entry.content);
+      const normalized = normalizeContent(entry.content, sourceId);
+      const text = normalized.content.filter((block) => ["text", "thinking"].includes(block.type)).map((block) => block.text).join("\n");
       const payload = { kind: "system_message", itemId: sourceId, text: bound(text, 16_384), level: "info" };
       items.set(sourceId, payload);
-      return publish(payload, sourceId, at);
+      const output = [...publish(payload, sourceId, at)];
+      for (const [index, placeholder] of normalized.placeholders.entries()) {
+        items.set(placeholder.attachment.id, placeholder);
+        output.push(...publish(placeholder, `${sourceId}:attachment:${index}`, at));
+      }
+      return output;
     }
     if (["compaction", "branch_summary"].includes(entry.type)) {
       const text = typeof entry.summary === "string" ? entry.summary : `${entry.type} completed`;
@@ -274,20 +291,23 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
   /** @param {Record<string, any>} frame */
   function consumeFrame(frame) {
     if (record(frame) === undefined || typeof frame.type !== "string") incompatible("PI_REQUIRED_SHAPE", "Pi frame requires a type");
-    const sourceId = typeof frame.id === "string" && frame.id.length > 0 ? frame.id : deterministicId("live-source", { index: liveIndex + 1, type: frame.type });
+    const frameIndex = ++liveIndex;
+    const sourceId = typeof frame.id === "string" && frame.id.length > 0 ? frame.id : deterministicId("live-source", { index: frameIndex, type: frame.type });
     const at = timestamp(frame.timestamp) ?? timestamp(frame.message?.timestamp) ?? now();
     if (frame.type === "response") {
-      if (frame.command !== "get_state" || frame.success !== true) return [];
+      if (frame.success !== true || !["get_state", "set_model", "cycle_model"].includes(frame.command)) return [];
       const state = record(frame.data);
-      if (state === undefined) incompatible("PI_REQUIRED_SHAPE", "Pi get_state response requires data");
+      if (state === undefined) incompatible("PI_REQUIRED_SHAPE", `Pi ${frame.command} response requires data`);
       const output = [];
-      const nextModel = record(state.model);
+      const nextModel = frame.command === "set_model" ? state : record(state.model);
       const provider = nextModel === undefined ? null : typeof nextModel.provider === "string" ? nextModel.provider : null;
       const id = nextModel === undefined ? null : typeof nextModel.id === "string" ? nextModel.id : null;
       model = provider === null || id === null ? null : { provider, id };
       output.push(...publish({ kind: "model_state", provider, model: id }, `${sourceId}:model`, at));
-      thinkingLevel = typeof state.thinkingLevel === "string" ? state.thinkingLevel : null;
-      output.push(...publish({ kind: "thinking_state", level: thinkingLevel }, `${sourceId}:thinking`, at));
+      if (frame.command === "get_state" || typeof state.thinkingLevel === "string") {
+        thinkingLevel = typeof state.thinkingLevel === "string" ? state.thinkingLevel : null;
+        output.push(...publish({ kind: "thinking_state", level: thinkingLevel }, `${sourceId}:thinking`, at));
+      }
       if (state.isCompacting === true) output.push(...replaceActivity("compacting", "Compacting context", sourceId));
       else if (state.isStreaming === true) output.push(...replaceActivity("assistant_streaming", "Assistant streaming", sourceId));
       return output;
@@ -312,7 +332,15 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       if (update.type === "text_delta" || update.type === "thinking_delta") {
         if (typeof update.delta !== "string") incompatible("PI_REQUIRED_SHAPE", "Pi assistant delta requires delta text");
         currentAssistant.delta += 1;
-        output.push(...publish({ kind: "assistant_delta", itemId: currentAssistant.itemId, delta: bound(update.delta, MAX_TEXT_BYTES) }, `${currentAssistant.itemId}:delta:${currentAssistant.delta}`, at));
+        const blockType = update.type === "thinking_delta" ? "thinking" : "text";
+        const block = currentAssistant.blocks[update.contentIndex] ?? { type: blockType, text: "" };
+        block.type = blockType;
+        block.text = bound(`${block.text}${update.delta}`, MAX_TEXT_BYTES);
+        currentAssistant.blocks[update.contentIndex] = block;
+        const partial = { kind: "assistant_message", itemId: currentAssistant.itemId, content: currentAssistant.blocks.filter(Boolean).map((/** @type {any} */ entry) => ({ ...entry })) };
+        items.set(currentAssistant.itemId, partial);
+        const deltaId = deterministicId("assistant-delta", { itemId: currentAssistant.itemId, contentIndex: update.contentIndex, type: update.type, cumulative: block.text });
+        output.push(...publish({ kind: "assistant_delta", itemId: currentAssistant.itemId, delta: bound(update.delta, MAX_TEXT_BYTES) }, deltaId, at));
         output.push(...replaceActivity(update.type === "thinking_delta" ? "thinking" : "assistant_streaming", update.type === "thinking_delta" ? "Thinking" : "Assistant streaming", sourceId));
       } else if (update.type === "toolcall_start") {
         if (typeof update.id !== "string" || typeof update.toolName !== "string") incompatible("PI_REQUIRED_SHAPE", "Pi tool-call start requires id and toolName");
@@ -373,6 +401,11 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       pendingUi.delete(frame.id);
       return [...publish({ kind: "ui_resolved", requestId: frame.id }, `${sourceId}:resolved`, at), ...replaceActivity("thinking", "Continuing", sourceId)];
     }
+    if (frame.type === "thinking_level_changed") {
+      if (typeof frame.level !== "string") incompatible("PI_REQUIRED_SHAPE", "Pi thinking-level change requires level");
+      thinkingLevel = frame.level;
+      return publish({ kind: "thinking_state", level: thinkingLevel }, `${sourceId}:thinking`, at);
+    }
     if (frame.type === "agent_start") return [...publish({ kind: "turn_state", working: true }, `${sourceId}:turn`, at), ...replaceActivity("thinking", "Thinking", sourceId)];
     if (frame.type === "agent_settled") return [...publish({ kind: "turn_state", working: false }, `${sourceId}:turn`, at), ...replaceActivity("idle", "Idle", sourceId)];
     if (frame.type === "compaction_start") return replaceActivity("compacting", "Compacting context", sourceId);
@@ -420,6 +453,11 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     model = restored.model;
     thinkingLevel = restored.thinkingLevel;
     activity = restored.activity;
+    if (["assistant_streaming", "thinking"].includes(activity.phase)) {
+      const assistants = restored.items.filter((/** @type {any} */ item) => item.kind === "assistant_message");
+      const partial = assistants.at(-1);
+      if (partial !== undefined) currentAssistant = { itemId: partial.itemId, blocks: partial.content.map((/** @type {any} */ block) => ({ ...block })), delta: 0 };
+    }
   }
 
   /** Add one bounded canonical-history error to snapshot state. @param {any} error */

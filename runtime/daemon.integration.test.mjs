@@ -111,6 +111,7 @@ function startPersistentFakeWorker(config, worker) {
           });
         });
         await connection.send({ version: 1, type: "worker_ready", token: worker.token, sessionId: worker.sessionId, runId: worker.runId, leaseId: worker.leaseId, generation: worker.generation, worker: worker.identity, piChild: worker.piChildIdentity });
+        for (const frame of worker.framesAfterReady ?? []) await connection.send({ version: 1, type: "pi_frame", token: worker.token, sessionId: worker.sessionId, frame });
         await connection.closed;
       } catch {
       } finally {
@@ -1141,6 +1142,27 @@ it("waits for an admitted launch chain before lifecycle release", async () => {
   await replacement.close();
   expect(await readFile(join(stateRoot, "queue", "commands.jsonl"), "utf8")).toBe(journalAfterClose);
   client.close();
+});
+
+it("durably admits authenticated Pi frames while worker reconnect reconciliation is still active", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const identity = { pid: 251, startIdentity: "worker-early", processGroupId: 251 };
+  const piChild = { pid: 252, startIdentity: "pi-early", processGroupId: 251 };
+  const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === 251 ? identity : piChild;
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const now = "2026-08-25T12:00:00.000Z";
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "early", sessionFile: "/sessions/early.jsonl", canonicalSessionFile: "/sessions/early.jsonl", cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-early", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-early", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "early", runId: "run-early", leaseId: "lease-early", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  const runtime = await createDaemonRuntime({ root: stateRoot, inspect, reconnectTimeoutMs: 1_000 });
+  runtimes.push(runtime);
+  startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "early", runId: "run-early", leaseId: "lease-early", generation: 1, identity, piChildIdentity: piChild, token: "early-token", framesAfterReady: [{ type: "message_end", message: { role: "user", content: "during recovery", timestamp: Date.parse(now) } }] });
+  await runtime.ready;
+  const frontend = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 4096 });
+  await frontend.ready;
+  frontend.send({ version: 1, clientId: "viewer", requestId: "early-snapshot", op: "get_viewer_snapshot", payload: { sessionId: "early" } });
+  expect(await frontend.next()).toMatchObject({ ok: true, result: { snapshot: { items: [expect.objectContaining({ kind: "user_message", content: [{ type: "text", text: "during recovery" }] })] } } });
+  frontend.close();
 });
 
 it("reconnects two surviving fake workers through the concrete connector after daemon restart", async () => {

@@ -42,6 +42,23 @@ async function fixture() {
   return root;
 }
 
+it("initializes durable viewer recovery before admitting reconnect traffic", async () => {
+  const root = await fixture();
+  let viewerReady = false;
+  const recovered = await reconcileRuntime({
+    root,
+    daemonEpoch: "epoch",
+    inspect: async () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); },
+    onViewerReady: async (viewer) => { viewerReady = viewer !== undefined; },
+    waitForReconnect: async () => {
+      expect(viewerReady).toBe(true);
+      return [];
+    },
+  });
+  expect(viewerReady).toBe(true);
+  await recovered.close();
+});
+
 it("reopens truncated stores and converts unresolved delivery to DELIVERY_UNKNOWN", async () => {
   const root = await fixture();
   const journalPath = join(root, "queue", "commands.jsonl");

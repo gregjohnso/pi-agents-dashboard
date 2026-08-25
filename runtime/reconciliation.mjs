@@ -280,7 +280,8 @@ async function createViewerRecovery({ root, daemonEpoch, registry }) {
     } catch (error) {
       const missing = /** @type {NodeJS.ErrnoException} */ (error)?.code === "ENOENT";
       if (!missing && !(error instanceof SessionHistoryError)) throw error;
-      normalizer.consumeError({ code: missing ? "SESSION_HISTORY_MISSING" : error.code, message: missing ? "Canonical session history is unavailable" : error.message, retryable: missing });
+      const historyError = /** @type {SessionHistoryError} */ (error);
+      normalizer.consumeError({ code: missing ? "SESSION_HISTORY_MISSING" : historyError.code, message: missing ? "Canonical session history is unavailable" : historyError.message, retryable: missing });
       reader = { async read() { return { entries: [], errors: [], position: { byteOffset: 0, line: 0 } }; }, async close() {} };
     }
     const state = { sessionId: record.sessionId, store, normalizer, reader, role: "observer" };
@@ -336,8 +337,8 @@ async function createViewerRecovery({ root, daemonEpoch, registry }) {
   };
 }
 
-/** @param {{ root: string, daemonEpoch: string, inspect(pid: number): Promise<any>, waitForReconnect?: (workers: any[], router: RecoveredWorkerRouter) => Promise<string[]>, router?: RecoveredWorkerRouter, signal?: AbortSignal }} options */
-export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReconnect = async () => [], router: suppliedRouter, signal }) {
+/** @param {{ root: string, daemonEpoch: string, inspect(pid: number): Promise<any>, waitForReconnect?: (workers: any[], router: RecoveredWorkerRouter) => Promise<string[]>, onViewerReady?: (viewer: any) => void | Promise<void>, router?: RecoveredWorkerRouter, signal?: AbortSignal }} options */
+export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReconnect = async () => [], onViewerReady = () => {}, router: suppliedRouter, signal }) {
   const registry = new RegistryStore(join(root, "sessions"));
   const journalPath = join(root, "queue", "commands.jsonl");
   const eventPath = join(root, "index", "events.jsonl");
@@ -357,6 +358,8 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReco
     cancelled();
     events = await createEventStore({ path: eventPath, daemonEpoch });
     await router.load();
+    viewer = await createViewerRecovery({ root, daemonEpoch, registry });
+    await onViewerReady(viewer);
     cancelled();
     /** @type {any[]} */
     const liveWorkers = [];
@@ -412,7 +415,6 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReco
       command: record.command,
       action: record.status.stage === "ACCEPTED" ? "SAFE_REDELIVERY" : record.status.stage === "DELIVERY_UNKNOWN" ? "DELIVERY_AMBIGUOUS" : "NO_REDELIVERY",
     }));
-    viewer = await createViewerRecovery({ root, daemonEpoch, registry });
     await atomicWriteJson(join(root, "daemon", "reconciliation.json"), { schemaVersion: 1, daemonEpoch, completedAt: new Date().toISOString(), conflicts, recoveryActions });
     return {
       registry,

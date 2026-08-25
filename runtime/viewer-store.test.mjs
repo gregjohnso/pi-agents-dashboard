@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { pumpViewerSubscription } from "./daemon.mjs";
 import { ViewerStoreError, createViewerStore } from "./viewer-store.mjs";
 
 /** @type {string[]} */
@@ -79,6 +80,30 @@ describe("durable per-session viewer store", () => {
     await expect(failing.publishSnapshot(snapshot(1, "changed"))).rejects.toThrow("snapshot crash");
     expect(await failing.getSnapshot()).toEqual(snapshot(1));
     await failing.close();
+  });
+
+  it("uses one ordered replay/live pump and waits for each write before reading the next event", async () => {
+    const store = await createViewerStore({ directory: await location(), sessionId: "session-1", daemonEpoch: "epoch-1", subscriberLimit: 2 });
+    await store.append(draft);
+    const subscription = store.subscribe();
+    /** @type {string[]} */
+    const writes = [];
+    /** @type {(value?: unknown) => void} */
+    let releaseFirst = () => {};
+    const firstBlocked = new Promise((resolve) => { releaseFirst = resolve; });
+    const pumping = pumpViewerSubscription(subscription, async (event) => {
+      writes.push(event.eventId);
+      if (event.eventId === "event-1") await firstBlocked;
+    });
+    await Promise.resolve();
+    await store.append({ ...draft, eventId: "event-2" });
+    expect(writes).toEqual(["event-1"]);
+    releaseFirst();
+    while (writes.length < 2) await Promise.resolve();
+    expect(writes).toEqual(["event-1", "event-2"]);
+    await subscription.return();
+    await pumping;
+    await store.close();
   });
 
   it("durably acknowledges one client's cursor without advancing other clients", async () => {

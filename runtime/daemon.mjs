@@ -261,11 +261,20 @@ function validateWorkerFailure(error) {
   if (typeof error !== "object" || error === null || Array.isArray(error) || Object.keys(error).some((key) => !["code", "message", "deliveryUnknown"].includes(key)) || typeof error.code !== "string" || typeof error.message !== "string" || (error.deliveryUnknown !== undefined && typeof error.deliveryUnknown !== "boolean")) throw Object.assign(new Error("Worker failure result is invalid"), { code: "INVALID_WORKER_RESULT" });
 }
 
+/** Send one normalized subscription through a single ordered async path. @param {AsyncIterableIterator<any>} subscription @param {(event: any) => Promise<unknown>} write */
+export async function pumpViewerSubscription(subscription, write) {
+  try {
+    for await (const event of subscription) await write(event);
+  } finally {
+    await subscription.return?.();
+  }
+}
+
 /** @param {{ socketPath: string, token: string, maxBytes: number, context: any }} options */
 function createSocketServer({ socketPath, token, maxBytes, context }) {
   const sockets = new Set();
   const subscribers = new Set();
-  const viewerSubscribers = new Map();
+  const viewerSubscriptions = new Map();
   const chains = new Set();
   let accepting = true;
   /** @type {Promise<void> | undefined} */
@@ -319,7 +328,9 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
       context.markAttachmentClosing?.(socket);
       sockets.delete(socket);
       subscribers.delete(socket);
-      for (const sessionSubscribers of viewerSubscribers.values()) sessionSubscribers.delete(socket);
+      const activeViewerSubscriptions = viewerSubscriptions.get(socket) ?? [];
+      viewerSubscriptions.delete(socket);
+      for (const subscription of activeViewerSubscriptions) void subscription.return?.();
       const attachmentRelease = context.releaseAttachments?.(socket, frontendClientId);
       if (attachmentRelease !== undefined) {
         chains.add(attachmentRelease);
@@ -394,18 +405,24 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
             await send(failure(request.requestId, Object.assign(new Error("Client identity changed on an authenticated connection"), { code: "CLIENT_IDENTITY_CONFLICT" })));
             return;
           }
+          /** @type {AsyncIterableIterator<any> | undefined} */
+          let viewerSubscription;
           try {
             const result = await context.handleRequest(request, socket, subscribers, frontendClientId);
-            await context.writeResponse({ request, value: response(request.requestId, result), write: send, close });
+            viewerSubscription = result?._viewerSubscription;
+            const publicResult = viewerSubscription === undefined ? result : { kind: result.kind, cursor: result.cursor };
+            await context.writeResponse({ request, value: response(request.requestId, publicResult), write: send, close });
             if (request.op === "subscribe") {
               const replay = await context.recovery.events.replay(request.payload.after);
               for (const event of replay) await send(event);
-            } else if (request.op === "subscribe_viewer") {
-              const store = context.recovery.viewer.store(request.payload.sessionId);
-              if (store === undefined) throw Object.assign(new Error("Viewer session does not exist"), { code: "SESSION_NOT_FOUND" });
-              for (const event of await store.replay(request.payload.after)) await send(event);
+            } else if (viewerSubscription !== undefined) {
+              let active = viewerSubscriptions.get(socket);
+              if (active === undefined) { active = new Set(); viewerSubscriptions.set(socket, active); }
+              active.add(viewerSubscription);
+              void pumpViewerSubscription(viewerSubscription, send).catch(() => socket.destroy()).finally(() => active.delete(viewerSubscription));
             }
           } catch (error) {
+            await viewerSubscription?.return?.();
             await send(failure(request.requestId, error)).catch(() => {});
           }
         });
@@ -432,7 +449,6 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
   server.on("error", () => {});
   return {
     subscribers,
-    viewerSubscribers,
     sockets,
     async listen() {
       await new Promise((resolveListen, rejectListen) => {
@@ -449,11 +465,7 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
       const encoded = createJsonlEncoder({ maxBytes }).encode(event);
       for (const socket of subscribers) if (!socket.destroyed) socket.write(encoded, () => {});
     },
-    /** @param {any} event */
-    broadcastViewer(event) {
-      const encoded = createJsonlEncoder({ maxBytes }).encode(event);
-      for (const socket of viewerSubscribers.get(event.sessionId) ?? []) if (!socket.destroyed) socket.write(encoded, () => {});
-    },
+
     beginShutdown() {
       if (!accepting) return;
       accepting = false;
@@ -539,6 +551,7 @@ export async function createDaemonRuntime({
       stateError: undefined,
       admissionOpen: true,
       recovery: undefined,
+      viewerRecovery: undefined,
       cursorStore: undefined,
       launchResults: undefined,
       attachmentResults: undefined,
@@ -547,7 +560,6 @@ export async function createDaemonRuntime({
       workerPending: new Map(),
       hostReport: undefined,
       broadcast: () => {},
-      broadcastViewer: () => {},
       writeResponse: responseWriter,
       requestStop: () => resolveStopRequested(undefined),
       publicStatus() { return { state: context.state, recovering: ["STARTING", "RECONCILING"].includes(context.state), error: context.stateError, daemonEpoch, pid: identity.pid }; },
@@ -704,15 +716,17 @@ export async function createDaemonRuntime({
           });
           return;
         }
-        if (context.state !== "READY") throw Object.assign(new Error("Daemon recovery is still in progress"), { code: "RECOVERING", retryable: true });
         if (frame.type === "pi_frame") {
           const allowed = ["version", "type", "token", "sessionId", "frame"];
           if (frame.version !== 1 || frame.sessionId !== metadata.sessionId || Object.keys(frame).some((key) => !allowed.includes(key)) || typeof frame.frame !== "object" || frame.frame === null || Array.isArray(frame.frame)) throw Object.assign(new Error("Invalid Pi viewer frame"), { code: "INVALID_WORKER_FRAME" });
+          const viewer = context.recovery?.viewer ?? context.viewerRecovery;
+          if (viewer === undefined) throw Object.assign(new Error("Viewer recovery is still initializing"), { code: "RECOVERING", retryable: true });
           await router.runCurrent(metadata, connection, routeGeneration, async () => {
-            for (const event of await context.recovery.viewer.ingest(frame.sessionId, frame.frame)) context.broadcastViewer(event);
+            await viewer.ingest(frame.sessionId, frame.frame);
           });
           return;
         }
+        if (context.state !== "READY") throw Object.assign(new Error("Daemon recovery is still in progress"), { code: "RECOVERING", retryable: true });
         const eventKeys = ["version", "type", "token", "sessionId", "event"];
         if (frame.type !== "worker_event" || frame.version !== 1 || frame.sessionId !== metadata.sessionId || Object.keys(frame).some((key) => !eventKeys.includes(key)) || typeof frame.event !== "object" || frame.event === null || Array.isArray(frame.event)) throw Object.assign(new Error("Invalid worker frame"), { code: "INVALID_WORKER_FRAME" });
         await router.runCurrent(metadata, connection, routeGeneration, async () => {
@@ -737,11 +751,8 @@ export async function createDaemonRuntime({
           if (socket === undefined) throw new TypeError("Viewer subscription requires a live socket");
           const store = context.recovery.viewer.store(request.payload.sessionId);
           if (store === undefined) throw Object.assign(new Error("Viewer session does not exist"), { code: "SESSION_NOT_FOUND" });
-          if (request.payload.after !== undefined) await store.replay(request.payload.after);
-          let sessionSubscribers = socketServer.viewerSubscribers.get(request.payload.sessionId);
-          if (sessionSubscribers === undefined) { sessionSubscribers = new Set(); socketServer.viewerSubscribers.set(request.payload.sessionId, sessionSubscribers); }
-          sessionSubscribers.add(socket);
-          return { kind: "viewer_subscribed", cursor: store.currentCursor() };
+          const subscription = store.subscribe(request.payload.after);
+          return { kind: "viewer_subscribed", cursor: store.currentCursor(), _viewerSubscription: subscription };
         }
         if (request.op === "ack_viewer") {
           if (request.clientId !== authenticatedClientId) throw Object.assign(new Error("Viewer cursor client identity changed"), { code: "CLIENT_IDENTITY_CONFLICT" });
@@ -793,7 +804,7 @@ export async function createDaemonRuntime({
                 await context.recovery.viewer.ensure(handle.sessionId);
                 handle.onFrame?.((/** @type {Record<string, unknown>} */ frame) => {
                   void runSessionLifecycle(registry, handle.sessionId, async () => {
-                    for (const event of await context.recovery.viewer.ingest(handle.sessionId, frame)) context.broadcastViewer(event);
+                    await context.recovery.viewer.ingest(handle.sessionId, frame);
                   }).catch(() => {});
                 });
               } finally {
@@ -1023,7 +1034,7 @@ export async function createDaemonRuntime({
       if (broadcastEvent !== undefined) return broadcastEvent(event, () => socketServer.broadcast(event));
       return socketServer.broadcast(event);
     };
-    context.broadcastViewer = (/** @type {any} */ event) => socketServer.broadcastViewer(event);
+
     context.state = "RECONCILING";
     await updateDaemonLifecycleState(claim, "RECONCILING");
     const defaultReconcile = () => reconcileRuntime({
@@ -1032,6 +1043,7 @@ export async function createDaemonRuntime({
       inspect,
       router,
       signal: recoveryController.signal,
+      onViewerReady: (viewer) => { context.viewerRecovery = viewer; },
       waitForReconnect: async (workers) => {
         const expected = workers.filter((worker) => worker.metadata !== undefined).map((worker) => worker.sessionId);
         if (expected.length === 0) return [];
@@ -1047,6 +1059,7 @@ export async function createDaemonRuntime({
     const ready = (async () => {
       try {
         context.recovery = reconcile === undefined ? await defaultReconcile() : await reconcile({ root, daemonEpoch, router, defaultReconcile, signal: recoveryController.signal });
+        context.viewerRecovery = context.recovery.viewer;
         if (context.recovery.conflicts.length > 0) throw Object.assign(new Error("Worker ownership conflicts block daemon recovery"), { code: "OWNERSHIP_CONFLICT", conflicts: context.recovery.conflicts });
         context.cursorStore = await createCursorStore(join(daemonDirectory, "event-acks.json"), daemonEpoch);
         context.launchResults = await createLaunchResultStore(join(daemonDirectory, "launch-results.json"));

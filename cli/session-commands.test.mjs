@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import net from "node:net";
+import * as fs from "node:fs/promises";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -30,15 +31,16 @@ function commandStatus(operation, stage, clientId, requestId) {
   return { clientId, requestId, operation, stage, acceptedAt: at, updatedAt: at };
 }
 
-async function daemonServer(root, respond, authentication = { version: 1, kind: "authenticated", state: "READY", recovering: false, daemonEpoch: "epoch", pid: 1 }) {
+async function daemonServer(root, respond, authentication = { version: 1, kind: "authenticated", state: "READY", recovering: false, daemonEpoch: "epoch", pid: 1 }, { closeOnInputEnd = true } = {}) {
   const daemon = join(root, "daemon");
   await mkdir(daemon, { mode: 0o700 });
   await writeFile(join(daemon, "control.token"), "secret\n", { mode: 0o600 });
   const socketPath = join(daemon, "control.sock");
-  const server = net.createServer((socket) => {
+  const server = net.createServer({ allowHalfOpen: true }, (socket) => {
     const decoder = createJsonlDecoder({ maxBytes: 4096 });
     const encoder = createJsonlEncoder({ maxBytes: 4096 });
     let authenticated = false;
+    socket.on("error", () => {});
     socket.on("data", (chunk) => {
       for (const frame of decoder.push(chunk)) {
         if (!authenticated) {
@@ -47,6 +49,7 @@ async function daemonServer(root, respond, authentication = { version: 1, kind: 
         } else respond(socket, encoder, frame);
       }
     });
+    socket.on("end", () => { if (closeOnInputEnd) socket.end(); });
   });
   await new Promise((resolve, reject) => server.listen(socketPath, resolve).once("error", reject));
   return server;
@@ -77,6 +80,75 @@ it("persists one private stable CLI client identity", async () => {
   const second = await loadCliClientIdentity({ root, randomId: () => "different-id" });
   expect(first).toBe("cli-stable-cli-id");
   expect(second).toBe(first);
+});
+
+it("serializes empty-state identity initialization and returns one complete winner", async () => {
+  const root = await stateRoot();
+  let releaseWinner;
+  const winnerBlocked = new Promise((resolve) => { releaseWinner = resolve; });
+  let enteredPublish;
+  const publishEntered = new Promise((resolve) => { enteredPublish = resolve; });
+  const first = loadCliClientIdentity({
+    root,
+    randomId: () => "first",
+    identityFailpoint: async (stage) => {
+      if (stage === "identity_before_publish") {
+        enteredPublish();
+        await winnerBlocked;
+      }
+    },
+  });
+  await publishEntered;
+  const second = loadCliClientIdentity({ root, randomId: () => "second" });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  expect((await readdir(join(root, "cli"))).filter((name) => name === "client-id")).toEqual([]);
+  releaseWinner();
+  await expect(Promise.all([first, second])).resolves.toEqual(["cli-first", "cli-first"]);
+  expect(await readFile(join(root, "cli", "client-id"), "utf8")).toBe("cli-first\n");
+  expect((await readdir(join(root, "cli"))).filter((name) => name.includes(".tmp") || name.endsWith(".lock"))).toEqual([]);
+});
+
+it("cleans identity locks and publication temps when the initializing winner crashes", async () => {
+  const root = await stateRoot();
+  await expect(loadCliClientIdentity({
+    root,
+    randomId: () => "crashed",
+    identityFailpoint(stage) { if (stage === "identity_before_publish") throw new Error("simulated identity crash"); },
+  })).rejects.toThrow("simulated identity crash");
+  expect(await readdir(join(root, "cli"))).toEqual([]);
+  await expect(loadCliClientIdentity({ root, randomId: () => "recovered" })).resolves.toBe("cli-recovered");
+});
+
+it("recovers a dead identity initializer lock before reading the stable winner", async () => {
+  const root = await stateRoot();
+  await expect(loadCliClientIdentity({ root, randomId: () => "stable" })).resolves.toBe("cli-stable");
+  const lockPath = join(root, "cli", ".client-id.lock");
+  const token = "dead-identity-token";
+  await mkdir(lockPath, { mode: 0o700 });
+  await writeFile(join(lockPath, token), `${JSON.stringify({ token, owner: { pid: 2147483647, startIdentity: "1" } })}\n`, { mode: 0o600 });
+  await expect(loadCliClientIdentity({ root, randomId: () => "different" })).resolves.toBe("cli-stable");
+  expect((await readdir(join(root, "cli"))).filter((name) => name.endsWith(".lock"))).toEqual([]);
+});
+
+it("bounds an EEXIST winner reread by configured attempts", async () => {
+  const root = await stateRoot();
+  const fsOps = {
+    ...fs,
+    link: vi.fn(async () => { throw Object.assign(new Error("winner not visible"), { code: "EEXIST" }); }),
+  };
+  await expect(loadCliClientIdentity({ root, randomId: () => "loser", fsOps, winnerReadAttempts: 2, winnerReadTimeoutMs: 100, winnerReadDelayMs: 1 })).rejects.toMatchObject({ code: "CLI_STATE_BUSY" });
+  expect(fsOps.link).toHaveBeenCalledTimes(1);
+  expect(await readdir(join(root, "cli"))).toEqual([]);
+});
+
+it.each(["EPERM", "EOPNOTSUPP", "EXDEV"])('fails closed with a typed compatibility error when hard-link publication returns %s', async (code) => {
+  const root = await stateRoot();
+  const fsOps = {
+    ...fs,
+    link: vi.fn(async () => { throw Object.assign(new Error("unsupported publication"), { code }); }),
+  };
+  await expect(loadCliClientIdentity({ root, randomId: () => "unsupported", fsOps })).rejects.toMatchObject({ code: "ATOMIC_PUBLICATION_UNSUPPORTED" });
+  expect(await readdir(join(root, "cli"))).toEqual([]);
 });
 
 it("keeps worktree cleanup separate and supplies an authoritative ownership reader", async () => {
@@ -177,7 +249,7 @@ it.each(["end", "close"])("returns one validated response when the peer immediat
   await new Promise((resolve) => server.close(resolve));
 });
 
-it("returns one validated response when the peer immediately errors", async () => {
+it("half-closes its write side exactly once and accepts a complete response at an error boundary", async () => {
   const root = await stateRoot();
   const daemon = join(root, "daemon");
   await mkdir(daemon, { mode: 0o700 });
@@ -185,16 +257,22 @@ it("returns one validated response when the peer immediately errors", async () =
   const encoder = createJsonlEncoder({ maxBytes: 4096 });
   class ErrorAfterResponseSocket extends EventEmitter {
     writes = 0;
+    ends = 0;
     destroyed = false;
     write(_chunk, callback) {
       this.writes += 1;
       callback?.();
-      if (this.writes === 1) queueMicrotask(() => this.emit("data", encoder.encode({ version: 1, kind: "authenticated", state: "READY", recovering: false, daemonEpoch: "epoch", pid: 1 })));
-      if (this.writes === 2) queueMicrotask(() => {
+      queueMicrotask(() => this.emit("data", encoder.encode({ version: 1, kind: "authenticated", state: "READY", recovering: false, daemonEpoch: "epoch", pid: 1 })));
+      return true;
+    }
+    end(_chunk, callback) {
+      this.ends += 1;
+      callback?.();
+      queueMicrotask(() => {
         this.emit("data", encoder.encode({ version: 1, requestId: "response-error", ok: true, result: { kind: "state", sessions: [] } }));
         this.emit("error", new Error("peer reset"));
       });
-      return true;
+      return this;
     }
     destroy() { this.destroyed = true; }
   }
@@ -204,6 +282,52 @@ it("returns one validated response when the peer immediately errors", async () =
     return socket;
   } });
   await expect(requester("get_state", {}, "response-error")).resolves.toEqual({ kind: "state", sessions: [] });
+  expect(socket.writes).toBe(1);
+  expect(socket.ends).toBe(1);
+});
+
+it.each([
+  ["duplicate", (encoder, response) => encoder.encode(response), "DUPLICATE_DAEMON_RESPONSE"],
+  ["trailing", (encoder) => encoder.encode({ nonsense: true }), "UNEXPECTED_DAEMON_FRAME"],
+  ["partial", () => Buffer.from("{\""), "TRAILING_DAEMON_DATA"],
+])("rejects delayed %s data before the response boundary", async (_name, encodeSuffix, code) => {
+  const root = await stateRoot();
+  const response = { version: 1, requestId: "response-delayed", ok: true, result: { kind: "state", sessions: [] } };
+  const server = await daemonServer(root, (socket, encoder) => {
+    socket.write(encoder.encode(response));
+    setTimeout(() => socket.end(encodeSuffix(encoder, response)), 10);
+  }, undefined, { closeOnInputEnd: false });
+  const requester = createDaemonRequester({ root, clientId: "cli-stable", maxBytes: 4096, timeoutMs: 200 });
+  await expect(requester("get_state", {}, "response-delayed")).rejects.toMatchObject({ code });
+  await new Promise((resolve) => server.close(resolve));
+});
+
+it("finalizes one complete candidate at the configured timeout for a persistent peer", async () => {
+  const root = await stateRoot();
+  const daemon = join(root, "daemon");
+  await mkdir(daemon, { mode: 0o700 });
+  await writeFile(join(daemon, "control.token"), "secret\n", { mode: 0o600 });
+  const encoder = createJsonlEncoder({ maxBytes: 4096 });
+  class PersistentResponseSocket extends EventEmitter {
+    destroyed = false;
+    write(_chunk, callback) {
+      callback?.();
+      queueMicrotask(() => this.emit("data", encoder.encode({ version: 1, kind: "authenticated", state: "READY", recovering: false, daemonEpoch: "epoch", pid: 1 })));
+      return true;
+    }
+    end(_chunk) {
+      queueMicrotask(() => this.emit("data", encoder.encode({ version: 1, requestId: "response-persistent", ok: true, result: { kind: "state", sessions: [] } })));
+      return this;
+    }
+    destroy() { this.destroyed = true; }
+  }
+  const socket = new PersistentResponseSocket();
+  const requester = createDaemonRequester({ root, clientId: "cli-stable", maxBytes: 4096, timeoutMs: 20, createConnection: () => {
+    queueMicrotask(() => socket.emit("connect"));
+    return socket;
+  } });
+  await expect(requester("get_state", {}, "response-persistent")).resolves.toEqual({ kind: "state", sessions: [] });
+  expect(socket.destroyed).toBe(true);
 });
 
 it("rejects a validated response followed by a partial trailing frame", async () => {

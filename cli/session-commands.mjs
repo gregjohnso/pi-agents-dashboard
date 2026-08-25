@@ -12,8 +12,12 @@ import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
 import { parseDaemonResponse } from "../shared/contracts.js";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
+const IDENTITY_LOCK_TIMEOUT_MS = 5_000;
+const IDENTITY_WINNER_READ_ATTEMPTS = 100;
+const IDENTITY_WINNER_READ_DELAY_MS = 5;
 const PENDING_LOCK_TIMEOUT_MS = 5_000;
 const PRIVATE_DIRECTORY_MODE = 0o700;
+const ATOMIC_PUBLICATION_UNSUPPORTED_CODES = new Set(["EPERM", "EOPNOTSUPP", "ENOTSUP", "ENOSYS", "EXDEV"]);
 const PRIVATE_FILE_MODE = 0o600;
 const AUTHENTICATION_STATES = new Set(["STARTING", "RECONCILING", "READY", "FAILED"]);
 const DESTRUCTIVE_COMMANDS = new Set(["stop", "delete", "cleanup"]);
@@ -30,25 +34,25 @@ function runtimeRoot(env = process.env) {
   return resolve(env.PI_AGENTS_DASHBOARD_STATE_DIR ?? join(env.XDG_STATE_HOME ?? join(home, ".local", "state"), "pi-agents-dashboard"));
 }
 
-/** @param {string} directory */
-async function ensurePrivateDirectory(directory) {
-  await fs.mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
-  await fs.chmod(directory, PRIVATE_DIRECTORY_MODE);
-  const metadata = await fs.lstat(directory);
+/** @param {string} directory @param {any} [fsOps] */
+async function ensurePrivateDirectory(directory, fsOps = fs) {
+  await fsOps.mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+  await fsOps.chmod(directory, PRIVATE_DIRECTORY_MODE);
+  const metadata = await fsOps.lstat(directory);
   if (!metadata.isDirectory() || metadata.isSymbolicLink() || metadata.uid !== process.getuid?.() || (metadata.mode & 0o777) !== PRIVATE_DIRECTORY_MODE) {
     throw Object.assign(new Error("CLI state directory is unsafe"), { code: "CLI_STATE_UNSAFE" });
   }
 }
 
-/** @param {string} directory */
-async function syncDirectory(directory) {
-  const handle = await fs.open(directory, "r");
+/** @param {string} directory @param {any} [fsOps] */
+async function syncDirectory(directory, fsOps = fs) {
+  const handle = await fsOps.open(directory, "r");
   try { await handle.sync(); } finally { await handle.close(); }
 }
 
-/** @param {string} path @param {string} unsafeMessage */
-async function readPrivateFile(path, unsafeMessage) {
-  const handle = await fs.open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+/** @param {string} path @param {string} unsafeMessage @param {any} [fsOps] */
+async function readPrivateFile(path, unsafeMessage, fsOps = fs) {
+  const handle = await fsOps.open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
   try {
     const before = await handle.stat();
     if (!before.isFile() || before.uid !== process.getuid?.() || (before.mode & 0o777) !== PRIVATE_FILE_MODE) throw Object.assign(new Error(unsafeMessage), { code: "CLI_STATE_UNSAFE" });
@@ -61,12 +65,12 @@ async function readPrivateFile(path, unsafeMessage) {
   }
 }
 
-/** Publish a fully durable private file without replacing an existing winner. @param {string} directory @param {string} path @param {string} text @param {() => unknown | Promise<unknown>} [beforePublish] */
-async function publishPrivateFile(directory, path, text, beforePublish = () => {}) {
+/** Publish a fully durable private file without replacing an existing winner. @param {string} directory @param {string} path @param {string} text @param {() => unknown | Promise<unknown>} [beforePublish] @param {any} [fsOps] */
+async function publishPrivateFile(directory, path, text, beforePublish = () => {}, fsOps = fs) {
   const temporary = join(directory, `.publish-${randomUUID()}.tmp`);
   let handle;
   try {
-    handle = await fs.open(temporary, "wx", PRIVATE_FILE_MODE);
+    handle = await fsOps.open(temporary, "wx", PRIVATE_FILE_MODE);
     await handle.chmod(PRIVATE_FILE_MODE);
     const metadata = await handle.stat();
     if (!metadata.isFile() || (metadata.mode & 0o777) !== PRIVATE_FILE_MODE) throw Object.assign(new Error("CLI temporary state is unsafe"), { code: "CLI_STATE_UNSAFE" });
@@ -76,35 +80,62 @@ async function publishPrivateFile(directory, path, text, beforePublish = () => {
     handle = undefined;
     await beforePublish();
     try {
-      await fs.link(temporary, path);
+      await fsOps.link(temporary, path);
     } catch (error) {
-      if (/** @type {NodeJS.ErrnoException} */ (error)?.code === "EEXIST") return false;
+      const code = /** @type {NodeJS.ErrnoException} */ (error)?.code ?? "";
+      if (code === "EEXIST") return false;
+      if (ATOMIC_PUBLICATION_UNSUPPORTED_CODES.has(code)) throw Object.assign(new Error("State filesystem does not support atomic no-replace publication", { cause: error }), { code: "ATOMIC_PUBLICATION_UNSUPPORTED" });
       throw error;
     }
-    await syncDirectory(directory);
+    await syncDirectory(directory, fsOps);
     return true;
   } finally {
     if (handle !== undefined) await handle.close().catch(() => {});
-    await fs.unlink(temporary).catch((error) => { if (/** @type {NodeJS.ErrnoException} */ (error)?.code !== "ENOENT") throw error; });
+    await fsOps.unlink(temporary).catch((error) => { if (/** @type {NodeJS.ErrnoException} */ (error)?.code !== "ENOENT") throw error; });
   }
 }
 
 /** Load or create the private stable identity shared by CLI invocations. */
-export async function loadCliClientIdentity({ root = runtimeRoot(), randomId = randomUUID } = {}) {
+export async function loadCliClientIdentity({
+  root = runtimeRoot(),
+  randomId = randomUUID,
+  identityFailpoint = () => {},
+  fsOps = fs,
+  inspect = inspectProcessIdentity,
+  lockTimeoutMs = IDENTITY_LOCK_TIMEOUT_MS,
+  winnerReadAttempts = IDENTITY_WINNER_READ_ATTEMPTS,
+  winnerReadTimeoutMs = lockTimeoutMs,
+  winnerReadDelayMs = IDENTITY_WINNER_READ_DELAY_MS,
+} = {}) {
+  if (![lockTimeoutMs, winnerReadAttempts, winnerReadTimeoutMs].every((value) => Number.isSafeInteger(value) && value > 0) || !Number.isSafeInteger(winnerReadDelayMs) || winnerReadDelayMs < 0) throw new TypeError("CLI identity wait bounds are invalid");
   const directory = join(root, "cli");
   const path = join(directory, "client-id");
-  await ensurePrivateDirectory(directory);
-  try {
-    const clientId = (await readPrivateFile(path, "CLI client identity is unsafe")).text.trim();
+  await ensurePrivateDirectory(directory, fsOps);
+  const readIdentity = async () => {
+    let persisted;
+    try { persisted = await readPrivateFile(path, "CLI client identity is unsafe", fsOps); } catch (error) {
+      if (/** @type {NodeJS.ErrnoException} */ (error)?.code === "ENOENT") return undefined;
+      throw error;
+    }
+    const clientId = persisted.text.trim();
     if (!exactId(clientId)) throw Object.assign(new Error("CLI client identity is invalid"), { code: "CLI_STATE_CORRUPT" });
     return clientId;
-  } catch (error) {
-    if (!(error instanceof Error) || /** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT") throw error;
-  }
-  const generated = `cli-${randomId()}`;
-  if (!exactId(generated)) throw new TypeError("CLI client ID generator returned an invalid identity");
-  if (await publishPrivateFile(directory, path, `${generated}\n`)) return generated;
-  return loadCliClientIdentity({ root, randomId });
+  };
+  return withCliStateLock(directory, "client-id", async () => {
+    const lockedExisting = await readIdentity();
+    if (lockedExisting !== undefined) return lockedExisting;
+    const generated = `cli-${randomId()}`;
+    if (!exactId(generated)) throw new TypeError("CLI client ID generator returned an invalid identity");
+    const published = await publishPrivateFile(directory, path, `${generated}\n`, async () => identityFailpoint("identity_before_publish", { path, clientId: generated }), fsOps);
+    if (published) return generated;
+    const deadline = Date.now() + winnerReadTimeoutMs;
+    for (let attempt = 0; attempt < winnerReadAttempts && Date.now() <= deadline; attempt += 1) {
+      const winner = await readIdentity();
+      if (winner !== undefined) return winner;
+      if (attempt + 1 < winnerReadAttempts && Date.now() < deadline) await new Promise((resolveWait) => setTimeout(resolveWait, winnerReadDelayMs));
+    }
+    throw Object.assign(new Error("CLI identity winner did not become readable"), { code: "CLI_STATE_BUSY" });
+  }, { timeoutMs: lockTimeoutMs, operation: "client_identity", busyMessage: "CLI client identity lock remained held", fsOps, inspect });
 }
 
 /** @param {unknown} value */
@@ -160,8 +191,6 @@ export function createDaemonRequester({ root = runtimeRoot(), clientId, maxBytes
       let submitted = false;
       /** @type {any} */
       let validatedResponse;
-      /** @type {NodeJS.Immediate | undefined} */
-      let responseCheck;
       const deliveryUnknown = () => Object.assign(new Error("Daemon response was lost after submission"), { code: "DELIVERY_UNKNOWN", clientId, requestId });
       const protocolError = (code, message, cause) => Object.assign(new Error(message, cause === undefined ? undefined : { cause }), { code });
       /** @type {NodeJS.Timeout} */
@@ -171,7 +200,6 @@ export function createDaemonRequester({ root = runtimeRoot(), clientId, maxBytes
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        if (responseCheck !== undefined) clearImmediate(responseCheck);
         socket.destroy();
         if (error !== undefined) rejectRequest(error);
         else resolveRequest(value);
@@ -200,11 +228,15 @@ export function createDaemonRequester({ root = runtimeRoot(), clientId, maxBytes
             validateAuthentication(frames[0]);
             if (frames.length !== 1) throw protocolError("UNEXPECTED_DAEMON_FRAME", "Daemon sent trailing data with authentication");
             submitted = true;
-            socket.write(encoder.encode({ version: 1, clientId, requestId, op, payload }), (error) => { if (error) transportClosed(error); });
+            socket.end(encoder.encode({ version: 1, clientId, requestId, op, payload }));
             return;
           }
+          if (validatedResponse !== undefined) {
+            if (frames.length === 0) throw protocolError("TRAILING_DAEMON_DATA", "Daemon sent partial data after its validated response");
+            if (frames.every((frame) => typeof frame === "object" && frame !== null && Object.hasOwn(frame, "requestId"))) throw protocolError("DUPLICATE_DAEMON_RESPONSE", "Daemon sent data after its validated response");
+            throw protocolError("UNEXPECTED_DAEMON_FRAME", "Daemon sent trailing data after its validated response");
+          }
           if (frames.length === 0) return;
-          if (validatedResponse !== undefined) throw protocolError("DUPLICATE_DAEMON_RESPONSE", "Daemon sent data after its validated response");
           if (frames.some((frame) => typeof frame !== "object" || frame === null || !Object.hasOwn(frame, "requestId"))) throw protocolError("UNEXPECTED_DAEMON_FRAME", "Daemon sent an event or trailing frame where a response was required");
           /** @type {any[]} */
           const responses = [];
@@ -218,7 +250,6 @@ export function createDaemonRequester({ root = runtimeRoot(), clientId, maxBytes
           const parsed = responses[0];
           if (parsed.ok) validateExpectedResult(op, payload, clientId, requestId, parsed.result);
           validatedResponse = parsed;
-          responseCheck = setImmediate(() => finalizeTransport(deliveryUnknown()));
         } catch (error) {
           finish(error);
         }
@@ -300,56 +331,61 @@ async function readPendingPath(path, action, sessionId, revision) {
   return { path, entry, identity: persisted.identity };
 }
 
-/** Remove only a dead holder's exact token entry. @param {string} lockPath */
-async function recoverStalePendingLock(lockPath) {
+/** Remove only a dead holder's exact token entry. @param {string} lockPath @param {{ fsOps?: any, inspect?: typeof inspectProcessIdentity, unsafeMessage?: string }} [options] */
+async function recoverStaleCliLock(lockPath, { fsOps = fs, inspect = inspectProcessIdentity, unsafeMessage = "CLI state lock is unsafe" } = {}) {
   let metadata;
-  try { metadata = await fs.lstat(lockPath); } catch (error) {
+  try { metadata = await fsOps.lstat(lockPath); } catch (error) {
     if (/** @type {NodeJS.ErrnoException} */ (error)?.code === "ENOENT") return true;
     throw error;
   }
   if (!metadata.isDirectory() || metadata.isSymbolicLink() || metadata.uid !== process.getuid?.() || (metadata.mode & 0o777) !== PRIVATE_DIRECTORY_MODE) return false;
-  const entries = await fs.readdir(lockPath);
+  const entries = await fsOps.readdir(lockPath);
   if (entries.length !== 1 || !exactId(entries[0])) return false;
   const entryPath = join(lockPath, entries[0]);
   let first;
-  try { first = await readPrivateFile(entryPath, "Pending CLI request lock is unsafe"); } catch { return false; }
+  try { first = await readPrivateFile(entryPath, unsafeMessage, fsOps); } catch { return false; }
   let record;
   try { record = JSON.parse(first.text); } catch { return false; }
   if (record?.token !== entries[0] || !Number.isSafeInteger(record.owner?.pid) || record.owner.pid <= 0 || !exactId(record.owner?.startIdentity)) return false;
   try {
-    const live = await inspectProcessIdentity(record.owner.pid);
+    const live = await inspect(record.owner.pid);
     if (live.startIdentity === record.owner.startIdentity) return false;
   } catch (error) {
     if (/** @type {NodeJS.ErrnoException} */ (error)?.code !== "ENOENT") return false;
   }
   let current;
-  try { current = await readPrivateFile(entryPath, "Pending CLI request lock is unsafe"); } catch { return false; }
+  try { current = await readPrivateFile(entryPath, unsafeMessage, fsOps); } catch { return false; }
   if (current.text !== first.text || !sameFileIdentity(current.identity, first.identity)) return false;
-  try { await fs.unlink(entryPath); } catch (error) {
+  try { await fsOps.unlink(entryPath); } catch (error) {
     if (/** @type {NodeJS.ErrnoException} */ (error)?.code !== "ENOENT") throw error;
   }
-  await fs.rmdir(lockPath).catch((error) => { if (!["ENOENT", "ENOTEMPTY"].includes(/** @type {NodeJS.ErrnoException} */ (error)?.code ?? "")) throw error; });
+  await fsOps.rmdir(lockPath).catch((error) => { if (!["ENOENT", "ENOTEMPTY"].includes(/** @type {NodeJS.ErrnoException} */ (error)?.code ?? "")) throw error; });
   return true;
 }
 
-/** @param {string} directory @param {string} key @param {() => Promise<any>} action */
-async function withPendingLock(directory, key, action) {
+/** @param {string} directory @param {string} key @param {() => Promise<any>} action @param {{ timeoutMs?: number, operation?: string, busyMessage?: string, unsafeMessage?: string, fsOps?: any, inspect?: typeof inspectProcessIdentity }} [options] */
+async function withCliStateLock(directory, key, action, { timeoutMs = PENDING_LOCK_TIMEOUT_MS, operation = "pending_request", busyMessage = "Pending CLI request lock remained held", unsafeMessage = "Pending CLI request lock is unsafe", fsOps = fs, inspect = inspectProcessIdentity } = {}) {
   const lockPath = join(directory, `.${key}.lock`);
-  const deadline = Date.now() + PENDING_LOCK_TIMEOUT_MS;
-  const processIdentity = await inspectProcessIdentity(process.pid);
+  const deadline = Date.now() + timeoutMs;
+  const processIdentity = await inspect(process.pid);
   let lock;
   for (;;) {
     try {
-      lock = await acquireLifecycleLock(lockPath, { pid: processIdentity.pid, startIdentity: processIdentity.startIdentity, processGroupId: processIdentity.processGroupId, key, operation: "pending_request" });
+      lock = await acquireLifecycleLock(lockPath, { pid: processIdentity.pid, startIdentity: processIdentity.startIdentity, processGroupId: processIdentity.processGroupId, key, operation }, fsOps);
       break;
     } catch (error) {
       if (/** @type {any} */ (error)?.code !== "LOCK_HELD") throw error;
-      if (await recoverStalePendingLock(lockPath)) continue;
-      if (Date.now() >= deadline) throw Object.assign(new Error("Pending CLI request lock remained held"), { code: "CLI_STATE_BUSY" });
+      if (await recoverStaleCliLock(lockPath, { fsOps, inspect, unsafeMessage })) continue;
+      if (Date.now() >= deadline) throw Object.assign(new Error(busyMessage), { code: "CLI_STATE_BUSY" });
       await new Promise((resolveWait) => setTimeout(resolveWait, 5));
     }
   }
   try { return await action(); } finally { await lock.release(); }
+}
+
+/** @param {string} directory @param {string} key @param {() => Promise<any>} action */
+async function withPendingLock(directory, key, action) {
+  return withCliStateLock(directory, key, action);
 }
 
 /** @param {string} root @param {string} action @param {string} sessionId @param {number} revision */

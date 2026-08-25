@@ -410,13 +410,18 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
       }
     });
     socket.on("end", () => {
+      context.markAttachmentClosing?.(socket);
+      /** @type {{ code?: string, message?: string } | undefined} */
+      let framingError;
       try {
         decoder.end();
       } catch (error) {
-        const framing = /** @type {{ code?: string, message?: string }} */ (error);
-        void send({ version: 1, ok: false, error: dashboardError(framing.code ?? "INCOMPLETE_FRAME", framing.message ?? "Incomplete frame") }).catch(() => {});
+        framingError = /** @type {{ code?: string, message?: string }} */ (error);
       }
-      socket.end();
+      const finalizeInput = framingError === undefined
+        ? chain
+        : chain.then(() => send({ version: 1, ok: false, error: dashboardError(framingError.code ?? "INCOMPLETE_FRAME", framingError.message ?? "Incomplete frame") }));
+      void finalizeInput.finally(() => { if (!socket.destroyed) socket.end(); }).catch(() => {});
     });
   });
   server.on("error", () => {});

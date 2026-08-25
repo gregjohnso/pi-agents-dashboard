@@ -1,23 +1,72 @@
-// @ts-nocheck
 import net from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+const cryptoSpies = vi.hoisted(() => ({ timingSafeEqual: vi.fn() }));
+vi.mock("node:crypto", async (importOriginal) => {
+  const actual = /** @type {typeof import("node:crypto")} */ (await importOriginal());
+  return {
+    ...actual,
+    timingSafeEqual(/** @type {NodeJS.ArrayBufferView} */ left, /** @type {NodeJS.ArrayBufferView} */ right) {
+      cryptoSpies.timingSafeEqual(left, right);
+      return actual.timingSafeEqual(left, right);
+    },
+  };
+});
+
 import { createControlServer } from "./control-server.mjs";
 
+/** @typedef {import("../shared/contracts.js").ClientRequest} ClientRequest */
+/** @typedef {Parameters<typeof createControlServer>[0]} ControlServerOptions */
+
+/** @type {Array<() => Promise<void>>} */
 const cleanups = [];
-afterEach(async () => { await Promise.all(cleanups.splice(0).map((cleanup) => cleanup())); });
+afterEach(async () => {
+  await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
+  cryptoSpies.timingSafeEqual.mockClear();
+});
+
+/** @param {Partial<ControlServerOptions>} [options] */
 async function fixture(options = {}) {
-  const directory = await mkdtemp(join(tmpdir(), "control-")); const socketPath = join(directory, "control.sock");
+  const directory = await mkdtemp(join(tmpdir(), "control-"));
+  const socketPath = join(directory, "control.sock");
+  /** @type {ClientRequest[]} */
   const received = [];
-  const server = await createControlServer({ socketPath, token: "secret", maxBytes: 256, handleRequest: async (request) => { received.push(request); return { version: 1, requestId: request.requestId, ok: true, result: { kind: "state", sessions: [] } }; }, ...options });
-  cleanups.push(async () => { await server.close(); await rm(directory, { recursive: true, force: true }); });
+  const server = await createControlServer({
+    socketPath,
+    token: "secret",
+    maxBytes: 256,
+    handleRequest: async (request) => {
+      received.push(request);
+      return { version: 1, requestId: request.requestId, ok: true, result: { kind: "state", sessions: [] } };
+    },
+    ...options,
+  });
+  cleanups.push(async () => {
+    await server.close();
+    await rm(directory, { recursive: true, force: true });
+  });
   return { socketPath, received };
 }
-function exchange(socketPath, chunks) { return new Promise((resolve) => { const socket = net.createConnection(socketPath); let text = ""; socket.on("data", (chunk) => text += chunk); socket.on("close", () => resolve(text.trim().split("\n").filter(Boolean).map(JSON.parse))); socket.on("connect", () => { for (const chunk of chunks) socket.write(chunk); socket.end(); }); }); }
-const auth = JSON.stringify({ version: 1, token: "secret" }) + "\n";
-const request = JSON.stringify({ version: 1, clientId: "client-1", requestId: "request-1", op: "get_state", payload: {} }) + "\n";
+
+/** @param {string} socketPath @param {Array<string | Buffer>} chunks @returns {Promise<unknown[]>} */
+function exchange(socketPath, chunks) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection(socketPath);
+    let text = "";
+    socket.on("data", (chunk) => { text += chunk; });
+    socket.on("close", () => resolve(text.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))));
+    socket.on("connect", () => {
+      for (const chunk of chunks) socket.write(chunk);
+      socket.end();
+    });
+  });
+}
+
+const auth = `${JSON.stringify({ version: 1, token: "secret" })}\n`;
+const request = `${JSON.stringify({ version: 1, clientId: "client-1", requestId: "request-1", op: "get_state", payload: {} })}\n`;
 
 describe("authenticated control server", () => {
   it("authenticates before accepting exact Task 4 requests", async () => {
@@ -28,11 +77,19 @@ describe("authenticated control server", () => {
     expect(received).toHaveLength(1);
   });
 
+  it("compares fixed-length authentication values even when token lengths differ", async () => {
+    const { socketPath } = await fixture();
+    await exchange(socketPath, [`${JSON.stringify({ version: 1, token: "x" })}\n`]);
+    expect(cryptoSpies.timingSafeEqual).toHaveBeenCalledOnce();
+    const [supplied, expected] = /** @type {[NodeJS.ArrayBufferView, NodeJS.ArrayBufferView]} */ (cryptoSpies.timingSafeEqual.mock.calls[0]);
+    expect(supplied.byteLength).toBe(expected.byteLength);
+  });
+
   it.each([
-    ["wrong token", JSON.stringify({ version: 1, token: "wrong" }) + "\n", "AUTHENTICATION_FAILED"],
-    ["wrong auth version", JSON.stringify({ version: 2, token: "secret" }) + "\n", "UNSUPPORTED_VERSION"],
+    ["wrong token", `${JSON.stringify({ version: 1, token: "wrong" })}\n`, "AUTHENTICATION_FAILED"],
+    ["wrong auth version", `${JSON.stringify({ version: 2, token: "secret" })}\n`, "UNSUPPORTED_VERSION"],
     ["malformed JSON", "{oops\n", "MALFORMED_JSON"],
-    ["oversized record", JSON.stringify({ version: 1, token: "x".repeat(300) }) + "\n", "FRAME_TOO_LARGE"],
+    ["oversized record", `${JSON.stringify({ version: 1, token: "x".repeat(300) })}\n`, "FRAME_TOO_LARGE"],
   ])("rejects %s without dispatch", async (_name, frame, code) => {
     const { socketPath, received } = await fixture();
     expect((await exchange(socketPath, [frame]))[0]).toMatchObject({ version: 1, ok: false, error: { code } });
@@ -44,7 +101,7 @@ describe("authenticated control server", () => {
     ["wrong request version", { version: 2, clientId: "c", requestId: "exact-id", op: "get_state", payload: {} }],
   ])("rejects %s after authentication", async (_name, bad) => {
     const { socketPath, received } = await fixture();
-    const responses = await exchange(socketPath, [auth, JSON.stringify(bad) + "\n"]);
+    const responses = await exchange(socketPath, [auth, `${JSON.stringify(bad)}\n`]);
     expect(responses).toContainEqual(expect.objectContaining({ requestId: "exact-id", ok: false, error: expect.objectContaining({ code: "INVALID_REQUEST" }) }));
     expect(received).toHaveLength(0);
   });

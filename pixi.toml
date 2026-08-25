@@ -1,0 +1,16 @@
+[workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+nodejs = ">=22.19,<23"
+git = "*"
+
+[tasks]
+install = "npm install"
+vitest = "npx --no-install vitest"
+typecheck = "npm run typecheck"
+test-unit = "npm run test:unit"
+test-integration = "npm run test:integration"
+test = "npm test"
+pack-check = "npm run pack:check"

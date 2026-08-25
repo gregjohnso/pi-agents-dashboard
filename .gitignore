@@ -1,0 +1,7 @@
+node_modules/
+.pixi/
+.worktrees/
+.superpowers/*
+!.superpowers/sdd/
+.superpowers/sdd/*
+!.superpowers/sdd/.gitignore

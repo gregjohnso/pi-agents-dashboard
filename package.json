@@ -1,0 +1,45 @@
+{
+  "name": "pi-agents-dashboard",
+  "version": "0.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "bin": {
+    "pi-agents-dashboard": "./bin/pi-agents-dashboard.mjs"
+  },
+  "files": [
+    "bin",
+    "cli",
+    "extensions",
+    "runtime",
+    "shared",
+    "isolation",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/agents-dashboard/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:unit": "vitest run --exclude '**/*.integration.test.*' --exclude '**/*.tmux.test.*'",
+    "test:integration": "vitest run '**/*.integration.test.*'",
+    "pack:check": "npm pack --dry-run --json"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.3",
+    "@types/node": "22.19.19",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
+  }
+}

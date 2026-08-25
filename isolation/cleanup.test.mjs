@@ -4,11 +4,15 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
 
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 
 import { cleanupOwnedWorktree } from "./cleanup.mjs";
 import { launchPreflight } from "./launch-preflight.mjs";
-import { createWorktree, WORKTREE_OWNERSHIP_FILE } from "./worktree.mjs";
+import {
+  acquireWorktreeOwnershipLock,
+  createWorktree,
+  WORKTREE_OWNERSHIP_FILE,
+} from "./worktree.mjs";
 
 const execFileAsync = promisify(execFile);
 /** @type {string[]} */
@@ -114,6 +118,95 @@ it("refuses untracked files", async () => {
   await expect(cleanupOwnedWorktree(isolation)).rejects.toMatchObject({
     code: "UNTRACKED_FILES",
   });
+});
+
+it("classifies ignored untracked files as UNTRACKED_FILES", async () => {
+  const { isolation } = await fixture();
+  await writeFile(join(isolation.worktreePath, ".gitignore"), "ignored.txt\n");
+  await git(isolation.worktreePath, "add", ".gitignore");
+  await git(isolation.worktreePath, "commit", "-m", "ignore test artifact");
+  await writeFile(join(isolation.worktreePath, "ignored.txt"), "keep\n");
+
+  await expect(cleanupOwnedWorktree(isolation)).rejects.toMatchObject({
+    code: "UNTRACKED_FILES",
+  });
+  await expect(access(join(isolation.worktreePath, "ignored.txt"))).resolves.toBeUndefined();
+});
+
+it("rechecks live ownership immediately before worktree removal", async () => {
+  const { isolation } = await fixture();
+  const readLiveOwnership = vi
+    .fn()
+    .mockResolvedValueOnce(null)
+    .mockResolvedValueOnce({ runId: "late-owner" });
+
+  await expect(
+    cleanupOwnedWorktree(isolation, { readLiveOwnership }),
+  ).rejects.toMatchObject({ code: "LIVE_OWNERSHIP" });
+  expect(readLiveOwnership).toHaveBeenCalledTimes(2);
+  await expect(access(isolation.worktreePath)).resolves.toBeUndefined();
+});
+
+it("holds the authoritative ownership lock throughout cleanup", async () => {
+  const { isolation } = await fixture();
+  const lock = await acquireWorktreeOwnershipLock(isolation.worktreePath);
+
+  await expect(cleanupOwnedWorktree(isolation)).rejects.toMatchObject({
+    code: "WORKTREE_OWNERSHIP_LOCKED",
+  });
+  await lock.release();
+  await expect(cleanupOwnedWorktree(isolation)).resolves.toEqual({ disposition: "REMOVED" });
+});
+
+it("rechecks the ownership marker and repository immediately before worktree removal", async () => {
+  const { isolation } = await fixture();
+  const { stdout } = await git(isolation.worktreePath, "rev-parse", "--git-dir");
+  const markerPath = join(stdout.trim(), WORKTREE_OWNERSHIP_FILE);
+  const marker = JSON.parse(await readFile(markerPath, "utf8"));
+  const readLiveOwnership = vi
+    .fn()
+    .mockResolvedValueOnce(null)
+    .mockImplementationOnce(async () => {
+      await writeFile(markerPath, `${JSON.stringify({ ...marker, repositoryRoot: isolation.worktreePath })}\n`);
+      return null;
+    });
+
+  await expect(
+    cleanupOwnedWorktree(isolation, { readLiveOwnership }),
+  ).rejects.toMatchObject({ code: "IDENTITY_MISMATCH" });
+  await expect(access(isolation.worktreePath)).resolves.toBeUndefined();
+});
+
+it("rechecks the branch immediately before worktree removal", async () => {
+  const { isolation } = await fixture();
+  const readLiveOwnership = vi
+    .fn()
+    .mockResolvedValueOnce(null)
+    .mockImplementationOnce(async () => {
+      await git(isolation.worktreePath, "switch", "-c", "late-branch");
+      return null;
+    });
+
+  await expect(
+    cleanupOwnedWorktree(isolation, { readLiveOwnership }),
+  ).rejects.toMatchObject({ code: "IDENTITY_MISMATCH" });
+  await expect(access(isolation.worktreePath)).resolves.toBeUndefined();
+});
+
+it("rechecks HEAD immediately before worktree removal", async () => {
+  const { isolation } = await fixture();
+  const readLiveOwnership = vi
+    .fn()
+    .mockResolvedValueOnce(null)
+    .mockImplementationOnce(async () => {
+      await commit(isolation, "late.txt", "late commit\n");
+      return null;
+    });
+
+  await expect(
+    cleanupOwnedWorktree(isolation, { readLiveOwnership }),
+  ).rejects.toMatchObject({ code: "IDENTITY_MISMATCH" });
+  await expect(access(isolation.worktreePath)).resolves.toBeUndefined();
 });
 
 it("refuses unpushed commits against a local bare remote", async () => {

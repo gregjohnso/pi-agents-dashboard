@@ -71,8 +71,9 @@ async function setup(ids) {
   const registry = new RegistryStore(sessions);
   for (const id of ids) await registry.create(record(root, id));
   const fakeEntry = join(root, "fake-rpc-entry.mjs");
-  await writeFile(fakeEntry, `
+  await writeFile(fakeEntry, `#!/usr/bin/env node
 import { writeFile } from "node:fs/promises";
+if (process.argv.includes("--help")) { process.stdout.write("pi fake\\n--mode rpc\\n"); process.exit(0); }
 const sessionIndex = process.argv.indexOf("--session");
 if (sessionIndex === -1) throw new Error("missing --session");
 const sessionFile = process.argv[sessionIndex + 1];
@@ -91,7 +92,7 @@ process.stdin.on("data", (chunk) => {
     process.stdout.write(JSON.stringify(response) + "\\n");
   }
 });
-`, { mode: 0o600 });
+`, { mode: 0o700 });
   return { root, runs, registry, fakeEntry };
 }
 
@@ -107,15 +108,18 @@ it("starts two bounded workers as distinct process-group leaders and opens sessi
   });
 
   const [one, two] = await Promise.all([
-    supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-one", rpcEntry: fakeEntry }),
-    supervisor.launch({ sessionId: "two", canonicalSessionFile: join(root, "two.jsonl"), cwd: root, runId: "run-two", rpcEntry: fakeEntry }),
+    supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-one", piPath: fakeEntry }),
+    supervisor.launch({ sessionId: "two", canonicalSessionFile: join(root, "two.jsonl"), cwd: root, runId: "run-two", piPath: fakeEntry }),
   ]);
 
   expect(one.identity.pid).not.toBe(two.identity.pid);
+  expect(one.piChildIdentity.pid).not.toBe(two.piChildIdentity.pid);
+  expect(one.piChildIdentity.pid).not.toBe(one.identity.pid);
+  expect(two.piChildIdentity.pid).not.toBe(two.identity.pid);
   expect(one.identity.processGroupId).toBe(one.identity.pid);
   expect(two.identity.processGroupId).toBe(two.identity.pid);
-  expect(JSON.parse(await readFile(join(root, "one.jsonl"), "utf8"))).toEqual({ pid: one.identity.pid });
-  expect(JSON.parse(await readFile(join(root, "two.jsonl"), "utf8"))).toEqual({ pid: two.identity.pid });
+  expect(JSON.parse(await readFile(join(root, "one.jsonl"), "utf8"))).toEqual({ pid: one.piChildIdentity.pid });
+  expect(JSON.parse(await readFile(join(root, "two.jsonl"), "utf8"))).toEqual({ pid: two.piChildIdentity.pid });
   expect((await registry.get("one"))?.ownership?.process).toEqual(one.identity);
   expect((await registry.get("two"))?.ownership?.process).toEqual(two.identity);
 
@@ -136,7 +140,7 @@ it("refuses a second writer for one canonical session", async () => {
     env: { ...process.env, PI_DASHBOARD_TEST_EXIT_MS: "500" },
     startTimeoutMs: 2_000,
   });
-  const request = { sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, rpcEntry: fakeEntry };
+  const request = { sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, piPath: fakeEntry };
 
   const results = await Promise.allSettled([
     supervisor.launch({ ...request, runId: "run-one" }),
@@ -297,7 +301,7 @@ export async function connectDaemon({ config }) {
     canonicalSessionFile: join(root, "one.jsonl"),
     cwd: root,
     runId: "run-reconnect-cleanup",
-    rpcEntry: fakeEntry,
+    piPath: fakeEntry,
     daemonConnector: connector,
     daemonConnectConfig: { marker },
     reconnectDelaysMs: [5],
@@ -346,7 +350,7 @@ export async function connectDaemon({ config }) {
     canonicalSessionFile: join(root, "one.jsonl"),
     cwd: root,
     runId: "run-reconnect",
-    rpcEntry: fakeEntry,
+    piPath: fakeEntry,
     daemonConnector: connector,
     daemonConnectConfig: { marker },
     reconnectDelaysMs: [5, 10],

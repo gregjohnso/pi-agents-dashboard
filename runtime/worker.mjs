@@ -8,11 +8,12 @@ import { PiRpcAdapter } from "./pi-rpc-adapter.mjs";
 import { validateWorkerReplayRecord } from "./worker-replay-contract.mjs";
 import { initializeRuntimePermissions } from "./permissions.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
+import { runInstalledPiWorker } from "./installed-pi-worker.mjs";
 
 initializeRuntimePermissions();
 
 const MAX_REPLAY_RECORD_BYTES = 1024 * 1024;
-const WORKER_OPERATIONS = new Set(["prompt", "steer", "follow_up", "interrupt", "get_state"]);
+const WORKER_OPERATIONS = new Set(["prompt", "steer", "follow_up", "interrupt", "ui_response", "get_state"]);
 
 /** @param {string} value */
 function digest(value) {
@@ -81,7 +82,7 @@ export function replayDeliveryIsAmbiguous(replay, command) {
 export function createWorkerCommandDispatcher({ replay, adapter }) {
   let tail = Promise.resolve();
 
-  /** @param {{ clientId: string, requestId: string, op: string, text?: string, retryAtRisk?: boolean }} command */
+  /** @param {{ clientId: string, requestId: string, op: string, text?: string, response?: unknown, retryAtRisk?: boolean }} command */
   function deliver(command) {
     const result = tail.then(async () => {
       if (typeof command?.clientId !== "string" || typeof command.requestId !== "string") {
@@ -112,6 +113,7 @@ export function createWorkerCommandDispatcher({ replay, adapter }) {
           case "steer": resultValue = await adapter.steer(command.text); break;
           case "follow_up": resultValue = await adapter.followUp(command.text); break;
           case "interrupt": resultValue = await adapter.abort(); break;
+          case "ui_response": resultValue = await adapter.uiResponse(command.response); break;
           case "get_state": resultValue = await adapter.getState(); break;
         }
       } catch (cause) {
@@ -290,7 +292,7 @@ function parseArgs(argv) {
 }
 
 /** @param {NodeJS.Process} runtimeProcess */
-export async function runWorker(runtimeProcess = process) {
+async function runLegacyWorker(runtimeProcess = process) {
   const options = parseArgs(runtimeProcess.argv.slice(2));
   const token = runtimeProcess.env.PI_DASHBOARD_WORKER_TOKEN;
   if (typeof token !== "string" || token.length === 0 || typeof runtimeProcess.send !== "function") {
@@ -479,11 +481,19 @@ export async function runWorker(runtimeProcess = process) {
   }
 }
 
+export async function runWorker(runtimeProcess = process) {
+  return runInstalledPiWorker(runtimeProcess, { createWorkerReplayStore, createWorkerCommandDispatcher, replayDeliveryIsAmbiguous, maintainDaemonConnection });
+}
+
 const isMain = process.argv[1] !== undefined && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (isMain) {
   runWorker().catch((error) => {
     process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
-    process.exitCode = 1;
     process.disconnect?.();
+    try {
+      process.kill(-process.pid, "SIGTERM");
+    } catch {
+      process.exit(1);
+    }
   });
 }

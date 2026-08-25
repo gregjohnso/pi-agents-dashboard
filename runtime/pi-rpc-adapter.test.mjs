@@ -61,14 +61,15 @@ it("uses the public RPC entry with structured argv and an exact environment", as
     thinkingLevel: "high",
     name: "name; still one arg",
     env: { PATH: "/exact/path", SAFE: "value" },
-    rpcEntry: "/public/rpc-entry.js",
+    executable: "/installed/pi",
     spawnImpl,
   });
 
   expect(calls).toEqual([{
-    command: process.execPath,
+    command: "/installed/pi",
     argv: [
-      "/public/rpc-entry.js",
+      "--mode",
+      "rpc",
       "--session",
       "/tmp/session ; not-shell.jsonl",
       "--provider",
@@ -190,7 +191,7 @@ it("records an explicit Pi error acknowledgement before the terminal failure", a
     cwd: "/tmp",
     sessionFile: "/tmp/fake-session.jsonl",
     env: {},
-    rpcEntry: "/public/rpc-entry.js",
+    executable: "/installed/pi",
     spawnImpl: () => child,
   });
   const replay = await createWorkerReplayStore({ append: async (record) => { records.push(record); } });
@@ -211,6 +212,15 @@ it("fails unsupported operations before recording RPC_WRITE_STARTED", async () =
   expect(records.map((record) => record.stage)).toEqual(["RECEIVED", "FAILED"]);
 });
 
+it("retains the raw malformed record before closing the protocol stream", async () => {
+  const child = fakeRpcProcess((_command, process) => process.stdout.write("{malformed}\n"));
+  const diagnostics = { append: vi.fn(async () => {}) };
+  const adapter = PiRpcAdapter.connect({ input: child.stdin, output: child.stdout, diagnostics });
+  await expect(adapter.getState()).rejects.toMatchObject({ code: "MALFORMED_RPC_OUTPUT" });
+  expect(diagnostics.append).toHaveBeenCalledWith("{malformed}\n");
+  await adapter.close();
+});
+
 it("rejects malformed Pi output, retains stderr, and does not respawn", async () => {
   const child = fakeRpcProcess((_command, process) => {
     process.stderr.write("fake provider stderr\n");
@@ -221,7 +231,7 @@ it("rejects malformed Pi output, retains stderr, and does not respawn", async ()
     cwd: "/tmp",
     sessionFile: "/tmp/session.jsonl",
     env: {},
-    rpcEntry: "/public/rpc-entry.js",
+    executable: "/installed/pi",
     spawnImpl() {
       spawns += 1;
       return child;
@@ -232,6 +242,26 @@ it("rejects malformed Pi output, retains stderr, and does not respawn", async ()
   expect(adapter.getStderr()).toContain("fake provider stderr");
   await expect(adapter.getState()).rejects.toMatchObject({ code: "MALFORMED_RPC_OUTPUT" });
   expect(spawns).toBe(1);
+  await adapter.close();
+});
+
+it("forwards complete structured frames, records raw diagnostics, and sends UI responses", async () => {
+  const child = fakeRpcProcess((command, process) => {
+    process.stdout.write(`${JSON.stringify({ type: "extension_ui_request", id: "ui-1" })}\n`);
+    process.stdout.write(`${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true })}\n`);
+  });
+  const diagnostics = { append: vi.fn(async () => {}) };
+  const adapter = PiRpcAdapter.connect({ input: child.stdin, output: child.stdout, diagnostics, maxRecordBytes: 1_024 });
+  /** @type {Record<string, unknown>[]} */
+  const frames = [];
+  adapter.onFrame((frame) => frames.push(frame));
+
+  await expect(adapter.uiResponse({ requestId: "ui-1", response: true })).resolves.toBeUndefined();
+  expect(frames).toEqual([
+    { type: "extension_ui_request", id: "ui-1" },
+    expect.objectContaining({ type: "response", command: "extension_ui_response", success: true }),
+  ]);
+  expect(diagnostics.append).toHaveBeenCalledTimes(2);
   await adapter.close();
 });
 
@@ -249,7 +279,7 @@ it("validates correlated responses and contains event-listener failures", async 
     cwd: "/tmp",
     sessionFile: "/tmp/session.jsonl",
     env: {},
-    rpcEntry: "/public/rpc-entry.js",
+    executable: "/installed/pi",
     spawnImpl: () => child,
   });
   let observed = 0;

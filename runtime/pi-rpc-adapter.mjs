@@ -1,12 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
 
 import { createJsonlDecoder, createJsonlEncoder } from "./jsonl.mjs";
 
 const MAX_RPC_FRAME_BYTES = 16 * 1024 * 1024;
 const MAX_STDERR_BYTES = 256 * 1024;
-const PUBLIC_RPC_ENTRY = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent/rpc-entry"));
 
 /** @typedef {(command: string, argv: string[], options: any) => any} SpawnLike */
 /** @typedef {{ command: string, resolve(value: unknown): void, reject(error: unknown): void }} PendingRequest */
@@ -53,30 +51,43 @@ export class PiRpcAdapter {
   #input;
   #output;
   #process;
-  #encoder = createJsonlEncoder({ maxBytes: MAX_RPC_FRAME_BYTES });
-  #decoder = createJsonlDecoder({ maxBytes: MAX_RPC_FRAME_BYTES });
+  #encoder;
+  #decoder;
   /** @type {Map<string, PendingRequest>} */
   #pending = new Map();
+  /** @type {Set<(frame: Record<string, unknown>) => void>} */
+  #frameListeners = new Set();
   /** @type {Set<(event: Record<string, unknown>) => void>} */
-  #listeners = new Set();
+  #eventListeners = new Set();
   #stderr = "";
   /** @type {PiRpcError | undefined} */
   #failed;
   #closed = false;
   #ownedProcess;
+  #diagnostics;
+  #diagnosticBytes = Buffer.alloc(0);
 
-  /** @param {{ input: NodeJS.WritableStream, output: NodeJS.ReadableStream, process?: import("node:child_process").ChildProcess, ownedProcess?: boolean }} options */
-  constructor({ input, output, process: child, ownedProcess = false }) {
+  /** @param {{ input: NodeJS.WritableStream, output: NodeJS.ReadableStream, process?: import("node:child_process").ChildProcess, ownedProcess?: boolean, diagnostics?: { append(record: string): Promise<unknown> | unknown }, maxRecordBytes?: number }} options */
+  constructor({ input, output, process: child, ownedProcess = false, diagnostics, maxRecordBytes = MAX_RPC_FRAME_BYTES }) {
     if (typeof input?.write !== "function" || typeof output?.on !== "function") {
       throw new TypeError("Pi RPC requires writable input and readable output streams");
     }
+    if (!Number.isSafeInteger(maxRecordBytes) || maxRecordBytes <= 0) throw new TypeError("maxRecordBytes must be a positive integer");
+    if (diagnostics !== undefined && typeof diagnostics.append !== "function") throw new TypeError("diagnostics must expose append(record)");
     this.#input = input;
     this.#output = output;
     this.#process = child;
     this.#ownedProcess = ownedProcess;
+    this.#diagnostics = diagnostics;
+    this.#encoder = createJsonlEncoder({ maxBytes: maxRecordBytes });
+    this.#decoder = createJsonlDecoder({ maxBytes: maxRecordBytes });
 
     output.on("data", (chunk) => this.#consume(chunk));
     output.on("end", () => {
+      if (this.#diagnosticBytes.length > 0) {
+        void Promise.resolve(this.#diagnostics?.append(this.#diagnosticBytes.toString("utf8"))).catch(() => {});
+        this.#diagnosticBytes = Buffer.alloc(0);
+      }
       try {
         this.#decoder.end();
         this.#fail(new PiRpcError("RPC_STREAM_CLOSED", "Pi RPC output closed"));
@@ -95,16 +106,16 @@ export class PiRpcAdapter {
   }
 
   /**
-   * Start the documented public Pi RPC entry with structured arguments.
-   * @param {{ cwd: string, sessionFile: string, model?: { provider: string, id: string }, thinkingLevel?: string, name?: string, env?: NodeJS.ProcessEnv, rpcEntry?: string, spawnImpl?: SpawnLike }} options
+   * Start an installed Pi executable with structured arguments.
+   * @param {{ executable: string, cwd: string, sessionFile: string, model?: { provider: string, id: string }, thinkingLevel?: string, name?: string, env?: NodeJS.ProcessEnv, spawnImpl?: SpawnLike }} options
    */
-  static async start({ cwd, sessionFile, model, thinkingLevel, name, env = process.env, rpcEntry = PUBLIC_RPC_ENTRY, spawnImpl = spawn }) {
-    if (typeof cwd !== "string" || typeof sessionFile !== "string") throw new TypeError("cwd and sessionFile are required");
-    const argv = [rpcEntry, "--session", sessionFile];
+  static async start({ executable, cwd, sessionFile, model, thinkingLevel, name, env = process.env, spawnImpl = spawn }) {
+    if (typeof executable !== "string" || typeof cwd !== "string" || typeof sessionFile !== "string") throw new TypeError("executable, cwd, and sessionFile are required");
+    const argv = ["--mode", "rpc", "--session", sessionFile];
     if (model !== undefined) argv.push("--provider", model.provider, "--model", model.id);
     if (thinkingLevel !== undefined) argv.push("--thinking", thinkingLevel);
     if (name !== undefined) argv.push("--name", name);
-    const child = spawnImpl(process.execPath, argv, {
+    const child = spawnImpl(executable, argv, {
       cwd,
       env,
       shell: false,
@@ -114,15 +125,23 @@ export class PiRpcAdapter {
     return new PiRpcAdapter({ input: child.stdin, output: child.stdout, process: child, ownedProcess: true });
   }
 
-  /** Connect the adapter to an already-gated public RPC entry in this worker process. */
-  /** @param {{ input: NodeJS.WritableStream, output: NodeJS.ReadableStream }} options */
-  static connect({ input, output }) {
-    return new PiRpcAdapter({ input, output });
+  /** Connect the adapter to one installed Pi child's owned pipes. */
+  /** @param {{ input: NodeJS.WritableStream, output: NodeJS.ReadableStream, diagnostics?: { append(record: string): Promise<unknown> | unknown }, maxRecordBytes?: number, process?: import("node:child_process").ChildProcess }} options */
+  static connect({ input, output, diagnostics, maxRecordBytes, process: child }) {
+    return new PiRpcAdapter({ input, output, diagnostics, maxRecordBytes, process: child });
   }
 
   /** @param {Uint8Array} chunk */
   #consume(chunk) {
     if (this.#failed !== undefined || this.#closed) return;
+    this.#diagnosticBytes = Buffer.concat([this.#diagnosticBytes, Buffer.from(chunk)]);
+    for (;;) {
+      const newline = this.#diagnosticBytes.indexOf(0x0a);
+      if (newline === -1) break;
+      const record = this.#diagnosticBytes.subarray(0, newline + 1);
+      this.#diagnosticBytes = this.#diagnosticBytes.subarray(newline + 1);
+      void Promise.resolve(this.#diagnostics?.append(record.toString("utf8"))).catch(() => {});
+    }
     let frames;
     try {
       frames = this.#decoder.push(chunk);
@@ -134,6 +153,9 @@ export class PiRpcAdapter {
       if (!isRecord(frame) || typeof frame.type !== "string") {
         this.#fail(new PiRpcError("MALFORMED_RPC_OUTPUT", "Pi emitted an invalid RPC frame"));
         return;
+      }
+      for (const listener of this.#frameListeners) {
+        try { listener(frame); } catch {}
       }
       if (frame.type === "response") {
         if (typeof frame.id !== "string") {
@@ -154,12 +176,8 @@ export class PiRpcAdapter {
         }
         continue;
       }
-      for (const listener of this.#listeners) {
-        try {
-          listener(frame);
-        } catch {
-          // Listener failures do not own the RPC stream.
-        }
+      for (const listener of this.#eventListeners) {
+        try { listener(frame); } catch {}
       }
     }
   }
@@ -196,13 +214,22 @@ export class PiRpcAdapter {
   /** @param {string} text */
   async followUp(text) { await this.#request("follow_up", { message: text }); }
   async abort() { await this.#request("abort"); }
+  /** @param {{ requestId: string, response: unknown }} response */
+  async uiResponse(response) { await this.#request("extension_ui_response", response); }
   async getState() { return this.#request("get_state"); }
+
+  /** @param {(frame: Record<string, unknown>) => void} listener */
+  onFrame(listener) {
+    if (typeof listener !== "function") throw new TypeError("RPC frame listener must be a function");
+    this.#frameListeners.add(listener);
+    return () => this.#frameListeners.delete(listener);
+  }
 
   /** @param {(event: Record<string, unknown>) => void} listener */
   onEvent(listener) {
     if (typeof listener !== "function") throw new TypeError("RPC event listener must be a function");
-    this.#listeners.add(listener);
-    return () => this.#listeners.delete(listener);
+    this.#eventListeners.add(listener);
+    return () => this.#eventListeners.delete(listener);
   }
 
   getStderr() { return this.#stderr; }

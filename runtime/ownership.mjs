@@ -242,6 +242,20 @@ export class OwnershipManager {
     });
   }
 
+  /** Persist the distinct Pi child and complete run runtime identity before readiness. @param {string} sessionId @param {string} leaseId @param {number} generation @param {unknown} piChild @param {import("../shared/contracts.mjs").RunRuntimeIdentity} runtime */
+  async bindPiChild(sessionId, leaseId, generation, piChild, runtime) {
+    validateIdentity(piChild, "piChild");
+    return this.#runWithOwnershipLock(sessionId, async () => {
+      const lease = this.#currentLease(sessionId, leaseId, generation);
+      if (lease.worker === undefined) throw new StaleLeaseError(sessionId, leaseId, generation);
+      const record = await this.#registry.get(sessionId);
+      if (record === undefined || !hasLeaseOwnership(record, lease)) throw new StaleLeaseError(sessionId, leaseId, generation);
+      const updated = await this.#registry.update(sessionId, record.revision, { runtime });
+      lease.piChild = /** @type {ProcessIdentity} */ (piChild);
+      return updated;
+    });
+  }
+
   /** @param {string} sessionId @param {string} leaseId @param {number} generation */
   async heartbeat(sessionId, leaseId, generation) {
     return this.#runWithOwnershipLock(sessionId, async () => {

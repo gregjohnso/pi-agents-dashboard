@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -78,15 +78,36 @@ function fakeWorkerFactory({ order = [], helloOverrides = {}, readyOverrides = {
         return false;
       }
       callback?.();
-      if (message.type === "activate" && !holdReady) {
+      if (message.type === "activate") {
+        queueMicrotask(() => {
+          const worker = { pid: child.pid, startIdentity: String(child.pid), processGroupId: child.pid };
+          const piChild = { pid: child.pid + 100, startIdentity: String(child.pid + 100), processGroupId: child.pid };
+          child.emit("message", {
+            version: 1,
+            type: "pi_child",
+            token: options.env.PI_DASHBOARD_WORKER_TOKEN,
+            sessionId: argv[argv.indexOf("--session-id") + 1],
+            runId: argv[argv.indexOf("--run-id") + 1],
+            leaseId: argv[argv.indexOf("--lease-id") + 1],
+            generation: Number(argv[argv.indexOf("--generation") + 1]),
+            worker,
+            piChild,
+          });
+        });
+      }
+      if (message.type === "child_bound" && !holdReady) {
         queueMicrotask(() => {
           if (readyExitTiming === "before") child.emit("exit", 1, null);
+          const worker = { pid: child.pid, startIdentity: String(child.pid), processGroupId: child.pid };
+          const piChild = { pid: child.pid + 100, startIdentity: String(child.pid + 100), processGroupId: child.pid };
           child.emit("message", {
             version: 1,
             type: "worker_ready",
             token: options.env.PI_DASHBOARD_WORKER_TOKEN,
             sessionId: argv[argv.indexOf("--session-id") + 1],
             runId: argv[argv.indexOf("--run-id") + 1],
+            worker,
+            piChild,
             ...readyOverrides,
           });
           if (readyExitTiming === "after") child.emit("exit", 1, null);
@@ -148,7 +169,6 @@ function fakeWorkerFactory({ order = [], helloOverrides = {}, readyOverrides = {
         leaseId: argv[argv.indexOf("--lease-id") + 1],
         generation: Number(argv[argv.indexOf("--generation") + 1]),
         worker: identity,
-        piChild: identity,
         ...helloOverrides,
       });
     });
@@ -158,7 +178,7 @@ function fakeWorkerFactory({ order = [], helloOverrides = {}, readyOverrides = {
 }
 
 /** @param {number} pid */
-const inspect = async (pid) => ({ pid, startIdentity: String(pid), processGroupId: pid });
+const inspect = async (pid) => ({ pid, startIdentity: String(pid), processGroupId: pid >= 9200 ? pid - 100 : pid });
 
 /** @param {RegistryStore} registry @param {string} sessionId @returns {Promise<any>} */
 async function getRecord(registry, sessionId) {
@@ -182,8 +202,13 @@ it("creates and binds the registry before activation and reports ready after aut
   const { runs, registry, ownership } = await setup();
   const originalBind = ownership.bindProcesses.bind(ownership);
   ownership.bindProcesses = async (...args) => {
-    order.push("bind");
+    order.push("bind-supervisor");
     return originalBind(...args);
+  };
+  const originalBindPiChild = ownership.bindPiChild.bind(ownership);
+  ownership.bindPiChild = async (...args) => {
+    order.push("bind-pi-child");
+    return originalBindPiChild(...args);
   };
   const workers = fakeWorkerFactory({ order });
   const supervisor = new WorkerSupervisor({
@@ -200,15 +225,48 @@ it("creates and binds the registry before activation and reports ready after aut
     canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile,
     cwd: "/repo with spaces",
     runId: "run-1",
-    rpcEntry: "/tmp/fake rpc entry.mjs",
+    piPath: "/tmp/fake pi executable",
   });
 
-  expect(order).toEqual(["bind", "parent:activate"]);
+  expect(order).toEqual(["bind-supervisor", "parent:activate", "bind-pi-child", "parent:child_bound"]);
   expect(launched).toMatchObject({ ready: true, sessionId: "one", runId: "run-1" });
   expect(await getRecord(registry, "one")).toMatchObject({
     processState: "LIVE",
     ownership: { process: launched.identity },
   });
+});
+
+it("refuses missing capabilities before ownership or run artifacts exist", async () => {
+  const { runs, registry, ownership } = await setup();
+  const executable = { realpath: "/fake/pi", device: "1", inode: "2", size: 3, modifiedTimeNs: "4" };
+  const supervisor = new WorkerSupervisor({
+    registry,
+    ownership,
+    runsDirectory: runs,
+    resolveExecutableImpl: async () => executable,
+    probeCapabilitiesImpl: async () => ({ executable, reportedVersion: "old", rpcMode: true, jsonl: true, commands: ["get_state"], events: [], missingRequired: ["steer"] }),
+  });
+
+  await expect(supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "unsupported" })).rejects.toMatchObject({ code: "UNSUPPORTED_PI_CAPABILITY", missingCapabilities: ["steer"] });
+  expect((await getRecord(registry, "one")).ownership).toBeUndefined();
+  expect(await readdir(runs)).toEqual([]);
+});
+
+it("refuses executable replacement after probing and before worker spawn", async () => {
+  const { runs, registry, ownership } = await setup();
+  const executable = { realpath: "/fake/pi", device: "1", inode: "2", size: 3, modifiedTimeNs: "4" };
+  const capabilities = /** @type {import("../shared/contracts.mjs").PiCapabilityReport} */ ({ executable, reportedVersion: "current", rpcMode: true, jsonl: true, commands: ["get_state", "prompt", "follow_up", "steer", "abort", "extension_ui_response"], events: [], missingRequired: [] });
+  const supervisor = new WorkerSupervisor({
+    registry,
+    ownership,
+    runsDirectory: runs,
+    resolveExecutableImpl: async () => executable,
+    probeCapabilitiesImpl: async () => capabilities,
+    assertExecutableImpl: async () => { throw Object.assign(new Error("replaced"), { code: "PI_EXECUTABLE_REPLACED" }); },
+  });
+
+  await expect(supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "replaced" })).rejects.toMatchObject({ code: "PI_EXECUTABLE_REPLACED" });
+  expect((await getRecord(registry, "one")).ownership).toBeUndefined();
 });
 
 it("carries generation with lease ID and rejects a generation-mismatched hello", async () => {
@@ -701,7 +759,7 @@ it("uses detached no-shell spawning, ignored stdin, file logs, and disconnects w
     model: { provider: "fake", id: "model;id" },
     thinkingLevel: "high",
     name: "safe;name",
-    rpcEntry: "/tmp/fake;entry.mjs",
+    piPath: "/tmp/fake;pi",
     daemonConnector: "/tmp/fake connector.mjs",
     daemonConnectConfig: { socketPath: "/tmp/daemon socket" },
     reconnectDelaysMs: [10, 20],

@@ -173,6 +173,17 @@ it("coordinates canonical-file uniqueness across stores for one directory", asyn
   expect(conflict.reason).toMatchObject({ code: "CANONICAL_SESSION_CONFLICT" });
 });
 
+it("round-trips the frozen installed-Pi runtime identity", async () => {
+  const { store } = await makeRegistry();
+  const executable = { realpath: "/installed/pi", device: "1", inode: "2", size: 3, modifiedTimeNs: "4" };
+  const process = { pid: 101, startIdentity: "start", processGroupId: 101 };
+  const piChild = { pid: 102, startIdentity: "child", processGroupId: 101 };
+  const capabilities = { executable, reportedVersion: "1.2.3", rpcMode: true, jsonl: true, commands: ["get_state", "prompt", "follow_up", "steer", "abort", "extension_ui_response"], events: [], missingRequired: [] };
+  const runtime = /** @type {import("../shared/contracts.mjs").RunRuntimeIdentity} */ ({ executable, piVersion: "1.2.3", capabilities, rpcAdapterVersion: 1, viewerProtocolVersion: 1, supervisor: process, piChild });
+  await store.create(record("runtime", { runtime }));
+  await expect(store.get("runtime")).resolves.toMatchObject({ runtime });
+});
+
 it("refuses corrupted registry JSON without rewriting it", async () => {
   const { sessions, store } = await makeRegistry();
   const path = join(sessions, "broken.json");

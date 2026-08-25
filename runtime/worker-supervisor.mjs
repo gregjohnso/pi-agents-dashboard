@@ -5,13 +5,14 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { OwnershipManager } from "./ownership.mjs";
+import { probePiCapabilities } from "./pi-capability-probe.mjs";
+import { assertPiExecutableIdentity, resolvePiExecutable } from "./pi-executable.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "./process-signaler.mjs";
 import { registryCoordinationScope } from "./registry-store.mjs";
 import { reduceSessionState } from "./state-reducer.mjs";
 
 const DEFAULT_WORKER_PATH = fileURLToPath(new URL("./worker.mjs", import.meta.url));
-const DEFAULT_RPC_ENTRY = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent/rpc-entry"));
 const admissionStates = new WeakMap();
 const DEFAULT_LAUNCH_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateMs: 5_000 });
 
@@ -28,7 +29,6 @@ const DEFAULT_LAUNCH_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateM
  * @property {string} leaseId
  * @property {number} generation
  * @property {ProcessIdentity} worker
- * @property {ProcessIdentity} piChild
  */
 
 /** A stable worker admission or handshake failure. */
@@ -131,8 +131,13 @@ export class WorkerSupervisor {
   #spawn;
   #inspect;
   #workerPath;
-  #rpcEntry;
+  #configuredPiPath;
   #env;
+  #injectedSpawn;
+  #capabilityCache;
+  #resolveExecutable;
+  #probeCapabilities;
+  #assertExecutable;
   #randomId;
   #startTimeoutMs;
   #launchStopPolicy;
@@ -143,9 +148,9 @@ export class WorkerSupervisor {
   #supervisions = new Set();
 
   /**
-   * @param {{ registry: import("./registry-store.mjs").RegistryStore, ownership?: OwnershipManager, runsDirectory: string, maxLive?: number | null, spawnImpl?: SpawnLike, inspect?: typeof inspectProcessIdentity, workerPath?: string, rpcEntry?: string, env?: NodeJS.ProcessEnv, randomId?: () => string, startTimeoutMs?: number, launchStopPolicy?: { gracefulMs: number, terminateMs: number }, signalProcessGroupImpl?: typeof signalProcessGroup, sleepImpl?: typeof sleep }} options
+   * @param {{ registry: import("./registry-store.mjs").RegistryStore, ownership?: OwnershipManager, runsDirectory: string, maxLive?: number | null, spawnImpl?: SpawnLike, inspect?: typeof inspectProcessIdentity, workerPath?: string, configuredPiPath?: string | null, env?: NodeJS.ProcessEnv, randomId?: () => string, startTimeoutMs?: number, launchStopPolicy?: { gracefulMs: number, terminateMs: number }, signalProcessGroupImpl?: typeof signalProcessGroup, sleepImpl?: typeof sleep, resolveExecutableImpl?: typeof resolvePiExecutable, probeCapabilitiesImpl?: typeof probePiCapabilities, assertExecutableImpl?: typeof assertPiExecutableIdentity, capabilityCache?: Map<string, import("../shared/contracts.mjs").PiCapabilityReport> }} options
    */
-  constructor({ registry, ownership = new OwnershipManager(registry), runsDirectory, maxLive = null, spawnImpl = spawn, inspect = inspectProcessIdentity, workerPath = DEFAULT_WORKER_PATH, rpcEntry = DEFAULT_RPC_ENTRY, env = process.env, randomId = randomUUID, startTimeoutMs = 15_000, launchStopPolicy = DEFAULT_LAUNCH_STOP_POLICY, signalProcessGroupImpl = signalProcessGroup, sleepImpl = sleep }) {
+  constructor({ registry, ownership = new OwnershipManager(registry), runsDirectory, maxLive = null, spawnImpl = spawn, inspect = inspectProcessIdentity, workerPath = DEFAULT_WORKER_PATH, configuredPiPath = null, env = process.env, randomId = randomUUID, startTimeoutMs = 15_000, launchStopPolicy = DEFAULT_LAUNCH_STOP_POLICY, signalProcessGroupImpl = signalProcessGroup, sleepImpl = sleep, resolveExecutableImpl = resolvePiExecutable, probeCapabilitiesImpl = probePiCapabilities, assertExecutableImpl = assertPiExecutableIdentity, capabilityCache = new Map() }) {
     if (maxLive !== null && (!Number.isSafeInteger(maxLive) || maxLive <= 0)) throw new TypeError("maxLive must be null or a positive integer");
     if (!Number.isSafeInteger(startTimeoutMs) || startTimeoutMs <= 0) throw new TypeError("startTimeoutMs must be a positive integer");
     if (!Number.isSafeInteger(launchStopPolicy?.gracefulMs) || launchStopPolicy.gracefulMs <= 0 || !Number.isSafeInteger(launchStopPolicy?.terminateMs) || launchStopPolicy.terminateMs <= 0) throw new TypeError("launchStopPolicy must contain positive integer delays");
@@ -158,8 +163,13 @@ export class WorkerSupervisor {
     this.#spawn = spawnImpl;
     this.#inspect = inspect;
     this.#workerPath = workerPath;
-    this.#rpcEntry = rpcEntry;
+    this.#configuredPiPath = configuredPiPath;
     this.#env = { ...env };
+    this.#injectedSpawn = spawnImpl !== spawn;
+    this.#capabilityCache = capabilityCache;
+    this.#resolveExecutable = resolveExecutableImpl;
+    this.#probeCapabilities = probeCapabilitiesImpl;
+    this.#assertExecutable = assertExecutableImpl;
     this.#randomId = randomId;
     this.#startTimeoutMs = startTimeoutMs;
     this.#launchStopPolicy = launchStopPolicy;
@@ -217,6 +227,15 @@ export class WorkerSupervisor {
   /** @param {any} supervision */
   async #stopFailedLaunchLocked(supervision) {
     if (supervision.exit.terminal) {
+      if (supervision.piChildIdentity !== undefined && supervision.identity !== undefined) {
+        try {
+          const piChild = await this.#inspect(supervision.piChildIdentity.pid);
+          if (sameIdentity(piChild, supervision.piChildIdentity) && piChild.processGroupId === supervision.identity.processGroupId) {
+            await this.#signalProcessGroup(supervision.identity.processGroupId, "SIGKILL");
+          }
+        } catch {
+        }
+      }
       await this.#reconcileTerminalLocked(supervision);
       return;
     }
@@ -244,7 +263,7 @@ export class WorkerSupervisor {
 
   /**
    * Launch one session worker. Same-session launches serialize; different sessions overlap after admission.
-   * @param {{ sessionId: string, canonicalSessionFile: string, cwd: string, runId: string, sessionRecord?: import("../shared/contracts.mjs").SessionRecord, model?: { provider: string, id: string }, thinkingLevel?: string, name?: string, rpcEntry?: string, daemonConnector?: string, daemonConnectConfig?: Record<string, unknown>, reconnectDelaysMs?: number[] }} request
+   * @param {{ sessionId: string, canonicalSessionFile: string, cwd: string, runId: string, sessionRecord?: import("../shared/contracts.mjs").SessionRecord, model?: { provider: string, id: string }, thinkingLevel?: string, name?: string, piPath?: string, daemonConnector?: string, daemonConnectConfig?: Record<string, unknown>, reconnectDelaysMs?: number[] }} request
    */
   launch(request) {
     if (typeof request?.sessionId !== "string" || request.sessionId.length === 0) return Promise.reject(new TypeError("sessionId is required"));
@@ -258,9 +277,9 @@ export class WorkerSupervisor {
     });
   }
 
-  /** @param {{ sessionId: string, canonicalSessionFile: string, cwd: string, runId: string, sessionRecord?: import("../shared/contracts.mjs").SessionRecord, model?: { provider: string, id: string }, thinkingLevel?: string, name?: string, rpcEntry?: string, daemonConnector?: string, daemonConnectConfig?: Record<string, unknown>, reconnectDelaysMs?: number[] }} request */
-  async #launch({ sessionId, canonicalSessionFile, cwd, runId, sessionRecord, model, thinkingLevel, name, rpcEntry = this.#rpcEntry, daemonConnector, daemonConnectConfig = {}, reconnectDelaysMs = [100, 250, 500, 1_000, 2_000] }) {
-    if ([canonicalSessionFile, cwd, runId, rpcEntry].some((value) => typeof value !== "string" || value.length === 0)) throw new TypeError("Worker launch fields must be non-empty strings");
+  /** @param {{ sessionId: string, canonicalSessionFile: string, cwd: string, runId: string, sessionRecord?: import("../shared/contracts.mjs").SessionRecord, model?: { provider: string, id: string }, thinkingLevel?: string, name?: string, piPath?: string, daemonConnector?: string, daemonConnectConfig?: Record<string, unknown>, reconnectDelaysMs?: number[] }} request */
+  async #launch({ sessionId, canonicalSessionFile, cwd, runId, sessionRecord, model, thinkingLevel, name, piPath, daemonConnector, daemonConnectConfig = {}, reconnectDelaysMs = [100, 250, 500, 1_000, 2_000] }) {
+    if ([canonicalSessionFile, cwd, runId].some((value) => typeof value !== "string" || value.length === 0)) throw new TypeError("Worker launch fields must be non-empty strings");
     let record = await this.#registry.get(sessionId);
     if (record === undefined) {
       if (sessionRecord === undefined) throw new Error(`Unknown registry session: ${sessionId}`);
@@ -268,6 +287,20 @@ export class WorkerSupervisor {
       record = await this.#registry.get(sessionId);
     }
     if (record?.canonicalSessionFile !== canonicalSessionFile) throw Object.assign(new Error("Worker launch requires the canonical registry session file"), { code: "CANONICAL_SESSION_MISMATCH" });
+
+    let executable;
+    let capabilities;
+    const selectedPath = piPath;
+    if (this.#injectedSpawn) {
+      executable = { realpath: selectedPath ?? process.execPath, device: "injected", inode: "injected", size: 0, modifiedTimeNs: "0" };
+      capabilities = /** @type {import("../shared/contracts.mjs").PiCapabilityReport} */ ({ executable, reportedVersion: "injected", rpcMode: true, jsonl: true, commands: ["get_state", "prompt", "follow_up", "steer", "abort", "extension_ui_response"], events: [], missingRequired: [] });
+    } else {
+      executable = await this.#resolveExecutable({ cliPath: selectedPath, configuredPath: this.#configuredPiPath, pathEnv: this.#env.PATH ?? "" });
+      capabilities = await this.#probeCapabilities({ executable, cache: this.#capabilityCache, timeoutMs: this.#startTimeoutMs, env: this.#env });
+      if (capabilities.missingRequired.length > 0) {
+        throw Object.assign(new WorkerSupervisorError("UNSUPPORTED_PI_CAPABILITY", `Installed Pi is missing required capabilities: ${capabilities.missingRequired.join(", ")}`), { missingCapabilities: capabilities.missingRequired });
+      }
+    }
 
     let reservation;
     let lease;
@@ -286,6 +319,7 @@ export class WorkerSupervisor {
       stdoutHandle = await open(join(runDirectory, "worker.stdout.log"), "wx", 0o600);
       stderrHandle = await open(join(runDirectory, "worker.stderr.log"), "wx", 0o600);
       const replayPath = join(runDirectory, "worker-replay.jsonl");
+      const diagnosticsDirectory = join(runDirectory, "diagnostics");
       const argv = [
         this.#workerPath,
         "--session-id", sessionId,
@@ -295,7 +329,10 @@ export class WorkerSupervisor {
         "--lease-id", lease.leaseId,
         "--generation", String(lease.generation),
         "--replay-path", replayPath,
-        "--rpc-entry", rpcEntry,
+        "--pi-executable", executable.realpath,
+        "--pi-identity", JSON.stringify(executable),
+        "--capabilities", JSON.stringify(capabilities),
+        "--diagnostics-directory", diagnosticsDirectory,
       ];
       if (model !== undefined) argv.push("--model-provider", model.provider, "--model-id", model.id);
       if (thinkingLevel !== undefined) argv.push("--thinking-level", thinkingLevel);
@@ -310,6 +347,7 @@ export class WorkerSupervisor {
           "--reconnect-delays-ms", JSON.stringify(reconnectDelaysMs),
         );
       }
+      if (!this.#injectedSpawn) await this.#assertExecutable(executable);
       child = this.#spawn(process.execPath, argv, {
         cwd,
         env: { ...this.#env, PI_DASHBOARD_WORKER_TOKEN: token },
@@ -339,17 +377,39 @@ export class WorkerSupervisor {
       if (hello.version !== 1 || hello.sessionId !== sessionId || hello.runId !== runId || hello.leaseId !== lease.leaseId || hello.generation !== lease.generation) {
         throw new WorkerSupervisorError("WORKER_HELLO_MISMATCH", "Worker hello did not match the ownership lease");
       }
-      if (!sameIdentity(hello.worker, inspected) || !sameIdentity(hello.piChild, inspected) || inspected.pid !== childPid || inspected.processGroupId !== childPid) {
+      if (!sameIdentity(hello.worker, inspected) || inspected.pid !== childPid || inspected.processGroupId !== childPid) {
         throw new WorkerSupervisorError("WORKER_IDENTITY_MISMATCH", "Worker PID, start identity, or process group did not match");
       }
 
       await this.#ownership.bindProcesses(sessionId, lease.leaseId, lease.generation, inspected, inspected);
       if (supervision.exit.terminal) throw new WorkerSupervisorError("WORKER_PROCESS_EXITED", "Worker exited after ownership binding");
+      const piChildPromise = waitForMessage(child, "pi_child", this.#startTimeoutMs);
+      void piChildPromise.catch(() => {});
+      await sendMessage(child, { version: 1, type: "activate", token, leaseId: lease.leaseId, generation: lease.generation });
+      const piMessage = await piChildPromise;
+      if (!authenticated(piMessage.token, token) || piMessage.sessionId !== sessionId || piMessage.runId !== runId || piMessage.leaseId !== lease.leaseId || piMessage.generation !== lease.generation) {
+        throw new WorkerSupervisorError("WORKER_CHILD_MISMATCH", "Pi child handshake did not match the authenticated launch");
+      }
+      const piInspected = await this.#inspect(piMessage.piChild?.pid);
+      if (!sameIdentity(piMessage.worker, inspected) || !sameIdentity(piMessage.piChild, piInspected) || piInspected.pid === inspected.pid || piInspected.processGroupId !== inspected.processGroupId) {
+        throw new WorkerSupervisorError("WORKER_IDENTITY_MISMATCH", "Pi child identity or process-group membership did not match");
+      }
+      supervision.piChildIdentity = piInspected;
+      const runtime = {
+        executable,
+        piVersion: capabilities.reportedVersion,
+        capabilities,
+        rpcAdapterVersion: /** @type {const} */ (1),
+        viewerProtocolVersion: /** @type {const} */ (1),
+        supervisor: inspected,
+        piChild: piInspected,
+      };
+      await this.#ownership.bindPiChild(sessionId, lease.leaseId, lease.generation, piInspected, runtime);
       const readyPromise = waitForMessage(child, "worker_ready", this.#startTimeoutMs);
       void readyPromise.catch(() => {});
-      await sendMessage(child, { version: 1, type: "activate", token, leaseId: lease.leaseId, generation: lease.generation });
+      await sendMessage(child, { version: 1, type: "child_bound", token, leaseId: lease.leaseId, generation: lease.generation });
       const ready = await readyPromise;
-      if (!authenticated(ready.token, token) || ready.sessionId !== sessionId || ready.runId !== runId) {
+      if (!authenticated(ready.token, token) || ready.sessionId !== sessionId || ready.runId !== runId || !sameIdentity(ready.worker, inspected) || !sameIdentity(ready.piChild, piInspected)) {
         throw new WorkerSupervisorError("WORKER_READY_MISMATCH", "Worker readiness did not match the authenticated launch");
       }
 
@@ -425,11 +485,19 @@ export class WorkerSupervisor {
     let sequence = 0;
     /** @type {Map<string, { resolve(value: unknown): void, reject(error: unknown): void }>} */
     const pending = new Map();
+    /** @type {Set<(frame: Record<string, unknown>) => void>} */
+    const frameListeners = new Set();
     /** @param {any} message */
     const onMessage = (message) => {
       if (!authenticated(message?.token, token)) return;
       if (message?.type === "worker_event" && message.sessionId === sessionId) {
         void this.#applyWorkerEvent(supervision, message.event).catch(() => {});
+        return;
+      }
+      if (message?.type === "pi_frame" && message.sessionId === sessionId && typeof message.frame === "object" && message.frame !== null) {
+        for (const listener of frameListeners) {
+          try { listener(message.frame); } catch {}
+        }
         return;
       }
       if (message?.type !== "command_result") return;
@@ -452,7 +520,7 @@ export class WorkerSupervisor {
       leaseId: lease.leaseId,
       generation: lease.generation,
       identity,
-      piChildIdentity: identity,
+      piChildIdentity: supervision.piChildIdentity,
       pid: identity.pid,
       processGroupId: identity.processGroupId,
       /** @param {import("../shared/contracts.mjs").ClientRequest} command @param {any} journal */
@@ -468,8 +536,8 @@ export class WorkerSupervisor {
         const id = `${runId}:${++sequence}`;
         try {
           const result = new Promise((resolveResult, rejectResult) => pending.set(id, { resolve: resolveResult, reject: rejectResult }));
-          const payload = /** @type {{ text?: string }} */ (command.payload);
-          await sendMessage(child, { version: 1, type: "command", token, id, command: { clientId: command.clientId, requestId: command.requestId, op: command.op, text: payload.text, retryAtRisk } });
+          const payload = /** @type {{ text?: string, uiRequestId?: string, response?: unknown }} */ (command.payload);
+          await sendMessage(child, { version: 1, type: "command", token, id, command: { clientId: command.clientId, requestId: command.requestId, op: command.op, text: payload.text, response: command.op === "ui_response" ? { requestId: payload.uiRequestId, response: payload.response } : undefined, retryAtRisk } });
           await result;
           await journal.transition(key, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
           return journal.transition(key, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
@@ -483,12 +551,20 @@ export class WorkerSupervisor {
           return journal.transition(key, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
         }
       },
+      /** @param {(frame: Record<string, unknown>) => void} listener */
+      onFrame(listener) {
+        if (typeof listener !== "function") throw new TypeError("Frame listener must be a function");
+        frameListeners.add(listener);
+        return () => frameListeners.delete(listener);
+      },
       terminal() {
         onDisconnect();
+        frameListeners.clear();
         child.off("message", onMessage);
         child.off("disconnect", onDisconnect);
       },
       detach() {
+        frameListeners.clear();
         child.off("message", onMessage);
         if (child.connected !== false) child.disconnect?.();
       },

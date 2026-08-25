@@ -25,6 +25,7 @@ const SESSION_RECORD_KEYS = [
   "ownership",
   "isolation",
   "latestRunId",
+  "runtime",
   "createdAt",
   "updatedAt",
 ];
@@ -106,6 +107,39 @@ function validateProcessIdentity(value) {
   }
 }
 
+/** @param {unknown} value @param {string} path */
+function validateExecutableIdentity(value, path) {
+  if (!isPlainObject(value)) throw new TypeError(`${path} must be an object`);
+  rejectUnknownKeys(value, ["realpath", "device", "inode", "size", "modifiedTimeNs"], path);
+  for (const key of ["realpath", "device", "inode", "modifiedTimeNs"]) requireString(value, key, `${path}.${key}`);
+  if (!Number.isSafeInteger(value.size) || value.size < 0) throw new TypeError(`${path}.size must be a non-negative integer`);
+}
+
+/** @param {unknown} value @param {string} path */
+function validateRuntimeProcess(value, path) {
+  if (!isPlainObject(value)) throw new TypeError(`${path} must be an object`);
+  rejectUnknownKeys(value, ["pid", "startIdentity", "processGroupId"], path);
+  if (!Number.isSafeInteger(value.pid) || value.pid <= 0 || !Number.isSafeInteger(value.processGroupId) || value.processGroupId <= 0) throw new TypeError(`${path} process IDs must be positive integers`);
+  requireString(value, "startIdentity", `${path}.startIdentity`);
+}
+
+/** @param {unknown} value */
+function validateRuntime(value) {
+  if (!isPlainObject(value)) throw new TypeError("runtime must be an object");
+  rejectUnknownKeys(value, ["executable", "piVersion", "capabilities", "rpcAdapterVersion", "viewerProtocolVersion", "supervisor", "piChild"], "runtime");
+  validateExecutableIdentity(value.executable, "runtime.executable");
+  if (value.piVersion !== null) requireString(value, "piVersion", "runtime.piVersion");
+  if (value.rpcAdapterVersion !== 1 || value.viewerProtocolVersion !== 1) throw new TypeError("runtime protocol versions must be 1");
+  validateRuntimeProcess(value.supervisor, "runtime.supervisor");
+  validateRuntimeProcess(value.piChild, "runtime.piChild");
+  const capabilities = value.capabilities;
+  if (!isPlainObject(capabilities)) throw new TypeError("runtime.capabilities must be an object");
+  rejectUnknownKeys(capabilities, ["executable", "reportedVersion", "rpcMode", "jsonl", "commands", "events", "missingRequired"], "runtime.capabilities");
+  validateExecutableIdentity(capabilities.executable, "runtime.capabilities.executable");
+  if (capabilities.reportedVersion !== null) requireString(capabilities, "reportedVersion", "runtime.capabilities.reportedVersion");
+  if (typeof capabilities.rpcMode !== "boolean" || typeof capabilities.jsonl !== "boolean" || !Array.isArray(capabilities.commands) || !Array.isArray(capabilities.events) || !Array.isArray(capabilities.missingRequired) || [...capabilities.commands, ...capabilities.events, ...capabilities.missingRequired].some((entry) => typeof entry !== "string")) throw new TypeError("runtime.capabilities is invalid");
+}
+
 /** @param {unknown} value */
 function validateModel(value) {
   if (!isPlainObject(value)) throw new TypeError("model must be an object");
@@ -157,6 +191,7 @@ export function validateSessionRecord(value) {
   if (value.model !== undefined) validateModel(value.model);
   if (value.thinkingLevel !== undefined) requireString(value, "thinkingLevel");
   if (value.latestRunId !== undefined) requireString(value, "latestRunId");
+  if (value.runtime !== undefined) validateRuntime(value.runtime);
   if (value.isolation !== undefined) validateIsolation(value.isolation);
   if (value.ownership !== undefined) {
     if (!isPlainObject(value.ownership) || value.ownership.kind !== "managed") {

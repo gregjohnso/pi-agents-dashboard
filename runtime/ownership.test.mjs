@@ -119,6 +119,18 @@ it("binds the lease to the frozen managed ownership contract and updates heartbe
   });
 });
 
+it("persists the distinct Pi child runtime identity before readiness", async () => {
+  const { registry, ownership } = await makeOwnership({ randomId: () => "lease-runtime" });
+  const lease = await ownership.acquire("session-1", "/pi/sessions/session-1.jsonl", "run-runtime");
+  await ownership.bindProcesses("session-1", lease.leaseId, lease.generation, worker, worker);
+  const executable = { realpath: "/installed/pi", device: "1", inode: "2", size: 3, modifiedTimeNs: "4" };
+  const capabilities = { executable, reportedVersion: "1.2.3", rpcMode: true, jsonl: true, commands: ["get_state", "prompt", "follow_up", "steer", "abort", "extension_ui_response"], events: ["agent_start"], missingRequired: [] };
+  const runtime = /** @type {import("../shared/contracts.mjs").RunRuntimeIdentity} */ ({ executable, piVersion: "1.2.3", capabilities, rpcAdapterVersion: 1, viewerProtocolVersion: 1, supervisor: worker, piChild });
+
+  await expect(ownership.bindPiChild("session-1", lease.leaseId, lease.generation, piChild, runtime)).resolves.toMatchObject({ runtime });
+  expect(await registry.get("session-1")).toMatchObject({ ownership: { process: worker }, runtime: { supervisor: worker, piChild } });
+});
+
 it("rejects a stale worker hello and stale release after lease generation advances", async () => {
   const leaseIds = ["lease-old", "lease-current"];
   const { registry, ownership } = await makeOwnership({ randomId: () => leaseIds.shift() });

@@ -106,6 +106,18 @@ describe("authenticated control server", () => {
     expect(received).toHaveLength(0);
   });
 
+  it("dispatches strict viewer snapshot, subscribe, and acknowledgement operations", async () => {
+    const { socketPath, received } = await fixture();
+    const viewerRequests = [
+      { version: 1, clientId: "client-1", requestId: "viewer-1", op: "get_viewer_snapshot", payload: { sessionId: "session-1" } },
+      { version: 1, clientId: "client-1", requestId: "viewer-2", op: "subscribe_viewer", payload: { sessionId: "session-1", after: { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "0" } } },
+      { version: 1, clientId: "client-1", requestId: "viewer-3", op: "ack_viewer", payload: { cursor: { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "1" } } },
+    ];
+    const responses = await exchange(socketPath, [auth, ...viewerRequests.map((value) => `${JSON.stringify(value)}\n`)]);
+    expect(responses.slice(1)).toHaveLength(3);
+    expect(received).toEqual(viewerRequests);
+  });
+
   it("does not dispatch worker action when a frontend disconnects", async () => {
     const { socketPath, received } = await fixture();
     await exchange(socketPath, [auth]);

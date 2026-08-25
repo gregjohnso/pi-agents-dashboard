@@ -18,10 +18,15 @@ export class EventStoreError extends Error {
   }
 }
 
+/** Parse the canonical unsigned sequence representation shared by durable stream cursors. @param {unknown} value */
+export function parseCursorSequence(value) {
+  if (typeof value !== "string" || !/^(0|[1-9]\d*)$/u.test(value)) throw new TypeError("Cursor sequence must be a canonical unsigned integer string");
+  return BigInt(value);
+}
+
 /** @param {EventCursor} cursor @returns {bigint} */
 function sequenceOf(cursor) {
-  if (typeof cursor.sequence !== "string" || !/^(0|[1-9]\d*)$/.test(cursor.sequence)) throw new EventStoreError("INVALID_CURSOR", "Cursor sequence must be a canonical unsigned integer string");
-  return BigInt(cursor.sequence);
+  try { return parseCursorSequence(cursor.sequence); } catch (cause) { throw new EventStoreError("INVALID_CURSOR", "Cursor sequence must be a canonical unsigned integer string", { cause }); }
 }
 
 /** @param {unknown} value @returns {value is PersistedEvent} */

@@ -2,6 +2,7 @@ import net from "node:net";
 import { randomUUID } from "node:crypto";
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
 import { parseDaemonResponse } from "../shared/contracts.mjs";
+import { parseViewerEvent, parseViewerSnapshot } from "../shared/viewer-contracts.mjs";
 export class DaemonClientError extends Error {
     code;
     constructor(code, message) {
@@ -10,7 +11,7 @@ export class DaemonClientError extends Error {
         this.code = code;
     }
 }
-const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "subscribe", "ack", "resolve_delivery"];
+const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery"];
 const COMMAND_STAGES = ["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED", "DELIVERY_UNKNOWN", "FAILED"];
 function readRecord(value, path) {
     if (typeof value !== "object" || value === null || Array.isArray(value))
@@ -171,6 +172,11 @@ function laterCursor(current, candidate) {
         return candidate;
     return BigInt(candidate.sequence) >= BigInt(current.sequence) ? candidate : current;
 }
+function laterViewerCursor(current, candidate) {
+    if (current === undefined || current.daemonEpoch !== candidate.daemonEpoch || current.sessionId !== candidate.sessionId)
+        return candidate;
+    return BigInt(candidate.sequence) >= BigInt(current.sequence) ? candidate : current;
+}
 /** Create a bounded JSONL daemon client with optional reconnect-and-replay behavior. */
 export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelayMs = 50, maxReconnectDelayMs = 1_000, clientId, subscriberLimit = 100, reconnect = true, }) {
     if (!Number.isSafeInteger(reconnectDelayMs) || reconnectDelayMs < 0)
@@ -187,6 +193,7 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
     const pending = new Map();
     const seen = new Map();
     const subscribers = new Set();
+    const viewerSubscribers = new Set();
     const fatalErrorListeners = new Set();
     const wakeDelays = new Set();
     let socket;
@@ -194,7 +201,7 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
     let closed = false;
     let authenticated = false;
     let everConnected = false;
-    const hasWork = () => pending.size > 0 || subscribers.size > 0;
+    const hasWork = () => pending.size > 0 || subscribers.size > 0 || viewerSubscribers.size > 0;
     const reportFatalFrame = (error, fallbackCode) => {
         const typed = error;
         const reported = error instanceof DaemonClientError
@@ -212,6 +219,9 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
     const sendSubscriptions = () => {
         for (const subscriber of subscribers) {
             send({ version: 1, clientId, requestId: randomUUID(), op: "subscribe", payload: subscriber.acknowledgedAfter === undefined ? {} : { after: subscriber.acknowledgedAfter } });
+        }
+        for (const subscriber of viewerSubscribers) {
+            send({ version: 1, clientId, requestId: randomUUID(), op: "subscribe_viewer", payload: { sessionId: subscriber.sessionId, ...(subscriber.acknowledgedAfter === undefined ? {} : { after: subscriber.acknowledgedAfter }) } });
         }
     };
     const dispatchEvent = (event) => {
@@ -233,9 +243,34 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
             }
         }
     };
+    const dispatchViewerEvent = (event) => {
+        for (const subscriber of viewerSubscribers) {
+            if (subscriber.ended || subscriber.sessionId !== event.sessionId)
+                continue;
+            if (subscriber.waiter !== undefined) {
+                const waiter = subscriber.waiter;
+                subscriber.waiter = undefined;
+                waiter({ value: event, done: false });
+            }
+            else if (subscriber.queue.length >= subscriberLimit) {
+                subscriber.error = new DaemonClientError("SUBSCRIBER_OVERFLOW", "Viewer subscriber exceeded its bounded queue");
+                subscriber.ended = true;
+                viewerSubscribers.delete(subscriber);
+            }
+            else {
+                subscriber.queue.push(event);
+            }
+        }
+    };
     const applyAcknowledgement = (cursor) => {
         for (const subscriber of subscribers)
             subscriber.acknowledgedAfter = laterCursor(subscriber.acknowledgedAfter, cursor);
+    };
+    const applyViewerAcknowledgement = (cursor) => {
+        for (const subscriber of viewerSubscribers) {
+            if (subscriber.sessionId === cursor.sessionId)
+                subscriber.acknowledgedAfter = laterViewerCursor(subscriber.acknowledgedAfter, cursor);
+        }
     };
     const waitForRetry = (milliseconds) => new Promise((resolve) => {
         if (closed || milliseconds === 0) {
@@ -312,7 +347,12 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                             entry.response = response;
                         if (item.request.op === "ack" && response.ok && response.result.kind === "acknowledged")
                             applyAcknowledgement(response.result.cursor);
+                        if (item.request.op === "ack_viewer" && response.ok && response.result.kind === "viewer_acknowledged")
+                            applyViewerAcknowledgement(response.result.cursor);
                         item.resolve(response);
+                    }
+                    else if (typeof record === "object" && record !== null && Object.hasOwn(record, "eventId")) {
+                        dispatchViewerEvent(parseViewerEvent(record));
                     }
                     else {
                         dispatchEvent(parsePersistedEvent(record));
@@ -338,6 +378,8 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                 pending.clear();
                 for (const subscriber of subscribers) { subscriber.error = closedError(); subscriber.ended = true; subscriber.waiter?.({ value: undefined, done: true }); }
                 subscribers.clear();
+                for (const subscriber of viewerSubscribers) { subscriber.error = closedError(); subscriber.ended = true; subscriber.waiter?.({ value: undefined, done: true }); }
+                viewerSubscribers.clear();
             }
             else if (!closed && hasWork()) void startReconnectLoop().catch(() => { });
         });
@@ -436,6 +478,56 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
             };
             return iterable;
         },
+        async getViewerSnapshot(sessionId) {
+            if (typeof sessionId !== "string" || sessionId.length === 0)
+                throw new TypeError("sessionId is required");
+            const response = await this.request({ version: 1, clientId, requestId: randomUUID(), op: "get_viewer_snapshot", payload: { sessionId } });
+            if (!response.ok)
+                throw new DaemonClientError(response.error.code, response.error.message);
+            return parseViewerSnapshot(response.result.snapshot);
+        },
+        subscribeViewer(sessionId, after) {
+            if (typeof sessionId !== "string" || sessionId.length === 0)
+                throw new TypeError("sessionId is required");
+            if (after !== undefined && after.sessionId !== sessionId)
+                throw new DaemonClientError("VIEWER_SESSION_MISMATCH", "Viewer cursor belongs to another session");
+            const subscriber = { sessionId, acknowledgedAfter: after, queue: [], ended: closed };
+            if (!closed) {
+                viewerSubscribers.add(subscriber);
+                if (socket !== undefined && authenticated && !socket.destroyed) {
+                    send({ version: 1, clientId, requestId: randomUUID(), op: "subscribe_viewer", payload: { sessionId, ...(after === undefined ? {} : { after }) } });
+                }
+                else {
+                    void startReconnectLoop().catch(() => { });
+                }
+            }
+            return {
+                [Symbol.asyncIterator]() { return this; },
+                async next() {
+                    if (subscriber.error !== undefined)
+                        throw subscriber.error;
+                    const event = subscriber.queue.shift();
+                    if (event !== undefined)
+                        return { value: event, done: false };
+                    if (subscriber.ended)
+                        return { value: undefined, done: true };
+                    return new Promise((resolve) => { subscriber.waiter = resolve; });
+                },
+                async return() {
+                    subscriber.ended = true;
+                    viewerSubscribers.delete(subscriber);
+                    subscriber.waiter?.({ value: undefined, done: true });
+                    subscriber.waiter = undefined;
+                    return { value: undefined, done: true };
+                },
+            };
+        },
+        async ackViewer(cursor) {
+            const response = await this.request({ version: 1, clientId, requestId: randomUUID(), op: "ack_viewer", payload: { cursor } });
+            if (!response.ok)
+                throw new DaemonClientError(response.error.code, response.error.message);
+            return response.result.cursor;
+        },
         onFatalError(listener) {
             fatalErrorListeners.add(listener);
             return () => fatalErrorListeners.delete(listener);
@@ -455,6 +547,12 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                 subscriber.waiter = undefined;
             }
             subscribers.clear();
+            for (const subscriber of viewerSubscribers) {
+                subscriber.ended = true;
+                subscriber.waiter?.({ value: undefined, done: true });
+                subscriber.waiter = undefined;
+            }
+            viewerSubscribers.clear();
             fatalErrorListeners.clear();
             if (socket !== undefined && !socket.destroyed) {
                 await new Promise((resolve) => {

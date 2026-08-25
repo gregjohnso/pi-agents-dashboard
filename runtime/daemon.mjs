@@ -265,6 +265,7 @@ function validateWorkerFailure(error) {
 function createSocketServer({ socketPath, token, maxBytes, context }) {
   const sockets = new Set();
   const subscribers = new Set();
+  const viewerSubscribers = new Map();
   const chains = new Set();
   let accepting = true;
   /** @type {Promise<void> | undefined} */
@@ -318,6 +319,7 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
       context.markAttachmentClosing?.(socket);
       sockets.delete(socket);
       subscribers.delete(socket);
+      for (const sessionSubscribers of viewerSubscribers.values()) sessionSubscribers.delete(socket);
       const attachmentRelease = context.releaseAttachments?.(socket, frontendClientId);
       if (attachmentRelease !== undefined) {
         chains.add(attachmentRelease);
@@ -398,6 +400,10 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
             if (request.op === "subscribe") {
               const replay = await context.recovery.events.replay(request.payload.after);
               for (const event of replay) await send(event);
+            } else if (request.op === "subscribe_viewer") {
+              const store = context.recovery.viewer.store(request.payload.sessionId);
+              if (store === undefined) throw Object.assign(new Error("Viewer session does not exist"), { code: "SESSION_NOT_FOUND" });
+              for (const event of await store.replay(request.payload.after)) await send(event);
             }
           } catch (error) {
             await send(failure(request.requestId, error)).catch(() => {});
@@ -426,6 +432,7 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
   server.on("error", () => {});
   return {
     subscribers,
+    viewerSubscribers,
     sockets,
     async listen() {
       await new Promise((resolveListen, rejectListen) => {
@@ -441,6 +448,11 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
     broadcast(event) {
       const encoded = createJsonlEncoder({ maxBytes }).encode(event);
       for (const socket of subscribers) if (!socket.destroyed) socket.write(encoded, () => {});
+    },
+    /** @param {any} event */
+    broadcastViewer(event) {
+      const encoded = createJsonlEncoder({ maxBytes }).encode(event);
+      for (const socket of viewerSubscribers.get(event.sessionId) ?? []) if (!socket.destroyed) socket.write(encoded, () => {});
     },
     beginShutdown() {
       if (!accepting) return;
@@ -535,6 +547,7 @@ export async function createDaemonRuntime({
       workerPending: new Map(),
       hostReport: undefined,
       broadcast: () => {},
+      broadcastViewer: () => {},
       writeResponse: responseWriter,
       requestStop: () => resolveStopRequested(undefined),
       publicStatus() { return { state: context.state, recovering: ["STARTING", "RECONCILING"].includes(context.state), error: context.stateError, daemonEpoch, pid: identity.pid }; },
@@ -692,6 +705,14 @@ export async function createDaemonRuntime({
           return;
         }
         if (context.state !== "READY") throw Object.assign(new Error("Daemon recovery is still in progress"), { code: "RECOVERING", retryable: true });
+        if (frame.type === "pi_frame") {
+          const allowed = ["version", "type", "token", "sessionId", "frame"];
+          if (frame.version !== 1 || frame.sessionId !== metadata.sessionId || Object.keys(frame).some((key) => !allowed.includes(key)) || typeof frame.frame !== "object" || frame.frame === null || Array.isArray(frame.frame)) throw Object.assign(new Error("Invalid Pi viewer frame"), { code: "INVALID_WORKER_FRAME" });
+          await router.runCurrent(metadata, connection, routeGeneration, async () => {
+            for (const event of await context.recovery.viewer.ingest(frame.sessionId, frame.frame)) context.broadcastViewer(event);
+          });
+          return;
+        }
         const eventKeys = ["version", "type", "token", "sessionId", "event"];
         if (frame.type !== "worker_event" || frame.version !== 1 || frame.sessionId !== metadata.sessionId || Object.keys(frame).some((key) => !eventKeys.includes(key)) || typeof frame.event !== "object" || frame.event === null || Array.isArray(frame.event)) throw Object.assign(new Error("Invalid worker frame"), { code: "INVALID_WORKER_FRAME" });
         await router.runCurrent(metadata, connection, routeGeneration, async () => {
@@ -708,6 +729,26 @@ export async function createDaemonRuntime({
         if (!context.admissionOpen) throw Object.assign(new Error("Daemon is shutting down"), { code: "SHUTTING_DOWN", retryable: true });
         if (request.op === "get_state") return { kind: "state", sessions: await registry.list() };
         if (context.state !== "READY" && !duringRecovery) throw Object.assign(new Error(context.state === "FAILED" ? context.stateError?.message ?? "Daemon recovery failed" : "Daemon recovery is still in progress"), { code: context.state === "FAILED" ? context.stateError?.code ?? "RECOVERY_FAILED" : "RECOVERING", retryable: context.state !== "FAILED" });
+        if (request.op === "get_viewer_snapshot") {
+          const role = socket === undefined ? "observer" : attachmentClaims.get(request.payload.sessionId)?.get(socket)?.role ?? "observer";
+          return { kind: "viewer_snapshot", snapshot: await context.recovery.viewer.snapshot(request.payload.sessionId, role) };
+        }
+        if (request.op === "subscribe_viewer") {
+          if (socket === undefined) throw new TypeError("Viewer subscription requires a live socket");
+          const store = context.recovery.viewer.store(request.payload.sessionId);
+          if (store === undefined) throw Object.assign(new Error("Viewer session does not exist"), { code: "SESSION_NOT_FOUND" });
+          if (request.payload.after !== undefined) await store.replay(request.payload.after);
+          let sessionSubscribers = socketServer.viewerSubscribers.get(request.payload.sessionId);
+          if (sessionSubscribers === undefined) { sessionSubscribers = new Set(); socketServer.viewerSubscribers.set(request.payload.sessionId, sessionSubscribers); }
+          sessionSubscribers.add(socket);
+          return { kind: "viewer_subscribed", cursor: store.currentCursor() };
+        }
+        if (request.op === "ack_viewer") {
+          if (request.clientId !== authenticatedClientId) throw Object.assign(new Error("Viewer cursor client identity changed"), { code: "CLIENT_IDENTITY_CONFLICT" });
+          const store = context.recovery.viewer.store(request.payload.cursor.sessionId);
+          if (store === undefined) throw Object.assign(new Error("Viewer session does not exist"), { code: "SESSION_NOT_FOUND" });
+          return { kind: "viewer_acknowledged", cursor: await store.acknowledge(authenticatedClientId, request.payload.cursor) };
+        }
         if (request.op === "subscribe") {
           if (socket === undefined) throw new TypeError("Subscription requires a live socket");
           subscribers.add(socket);
@@ -744,10 +785,17 @@ export async function createDaemonRuntime({
             return await runSessionLifecycle(registry, launch.sessionId, async () => {
               if (launchingSessions.has(launch.sessionId)) throw Object.assign(new Error("A launch is already in flight for this session"), { code: "LAUNCH_IN_FLIGHT" });
               launchingSessions.add(launch.sessionId);
+              /** @type {any} */
               let handle;
               try {
                 handle = await workerSupervisor.launch({ ...launch, daemonConnector: CONNECTOR_PATH, daemonConnectConfig: { socketPath: join(daemonDirectory, "control.sock"), tokenPath, maxBytes } });
                 await router.register(handle);
+                await context.recovery.viewer.ensure(handle.sessionId);
+                handle.onFrame?.((/** @type {Record<string, unknown>} */ frame) => {
+                  void runSessionLifecycle(registry, handle.sessionId, async () => {
+                    for (const event of await context.recovery.viewer.ingest(handle.sessionId, frame)) context.broadcastViewer(event);
+                  }).catch(() => {});
+                });
               } finally {
                 launchingSessions.delete(launch.sessionId);
               }
@@ -975,6 +1023,7 @@ export async function createDaemonRuntime({
       if (broadcastEvent !== undefined) return broadcastEvent(event, () => socketServer.broadcast(event));
       return socketServer.broadcast(event);
     };
+    context.broadcastViewer = (/** @type {any} */ event) => socketServer.broadcastViewer(event);
     context.state = "RECONCILING";
     await updateDaemonLifecycleState(claim, "RECONCILING");
     const defaultReconcile = () => reconcileRuntime({

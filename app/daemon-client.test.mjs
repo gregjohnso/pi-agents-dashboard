@@ -290,6 +290,43 @@ describe("daemon client", () => {
         expect(connections).toBe(2);
         await iterator.return?.();
     });
+    it("gets viewer snapshots, subscribes by session cursor, and acknowledges only after consumer processing", async () => {
+        const directory = await mkdtemp(join(tmpdir(), "viewer-client-"));
+        const socketPath = join(directory, "control.sock");
+        const operations = [];
+        const zero = { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "0" };
+        const one = { ...zero, sequence: "1" };
+        const activity = { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "source", startedAt: "2026-08-25T00:00:00.000Z" };
+        const snapshot = { version: 1, sessionId: "session-1", registryRevision: 1, cursor: zero, runtime: null, role: "observer", taskState: "READY", processState: "SLEEPING", outcome: "NONE", activity, model: null, thinkingLevel: null, items: [], tools: [], pendingUi: [], errors: [] };
+        const event = { version: 1, sessionId: "session-1", eventId: "event-1", cursor: one, timestamp: "2026-08-25T00:00:00.000Z", payload: { kind: "user_message", itemId: "user-1", content: [{ type: "text", text: "hello" }] } };
+        const server = net.createServer((socket) => {
+            const decoder = createJsonlDecoder({ maxBytes: 4096 });
+            let authed = false;
+            socket.on("data", (chunk) => {
+                for (const value of decoder.push(chunk)) {
+                    if (!authed) { authed = true; socket.write(encodeJsonl({ version: 1, kind: "authenticated" })); continue; }
+                    const incoming = value;
+                    operations.push(incoming.op);
+                    if (incoming.op === "get_viewer_snapshot") socket.write(encodeJsonl({ version: 1, requestId: incoming.requestId, ok: true, result: { kind: "viewer_snapshot", snapshot } }));
+                    else if (incoming.op === "subscribe_viewer") {
+                        socket.write(encodeJsonl({ version: 1, requestId: incoming.requestId, ok: true, result: { kind: "viewer_subscribed", cursor: zero } }));
+                        socket.write(encodeJsonl(event));
+                    } else if (incoming.op === "ack_viewer") socket.write(encodeJsonl({ version: 1, requestId: incoming.requestId, ok: true, result: { kind: "viewer_acknowledged", cursor: incoming.payload.cursor } }));
+                }
+            });
+        });
+        await new Promise((resolve, reject) => server.listen(socketPath, resolve).once("error", reject));
+        const client = createDaemonClient({ socketPath, token: "secret", maxBytes: 4096, clientId: "client-1" });
+        cleanups.push(async () => { await client.close(); await new Promise((resolve) => server.close(() => resolve())); await rm(directory, { recursive: true, force: true }); });
+        await expect(client.getViewerSnapshot("session-1")).resolves.toEqual(snapshot);
+        const iterator = client.subscribeViewer("session-1", zero)[Symbol.asyncIterator]();
+        const delivered = await within(iterator.next());
+        expect(delivered).toEqual({ value: event, done: false });
+        expect(operations).not.toContain("ack_viewer");
+        await expect(client.ackViewer(one)).resolves.toEqual(one);
+        expect(operations).toEqual(["get_viewer_snapshot", "subscribe_viewer", "ack_viewer"]);
+        await iterator.return?.();
+    });
     it("finishes subscriptions created after the client closes", async () => {
         const client = createDaemonClient({ socketPath: "/unused", token: "secret", maxBytes: 1024, clientId: "client-1" });
         await client.close();

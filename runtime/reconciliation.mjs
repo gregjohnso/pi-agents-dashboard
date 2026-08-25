@@ -5,6 +5,9 @@ import { atomicWriteJson } from "./atomic-file.mjs";
 import { createCommandJournal } from "./command-journal.mjs";
 import { createEventStore } from "./event-store.mjs";
 import { RegistryStore, registryCoordinationScope } from "./registry-store.mjs";
+import { createSessionHistoryReader, SessionHistoryError } from "./session-history.mjs";
+import { createViewerNormalizer } from "./viewer-normalizer.mjs";
+import { createViewerStore } from "./viewer-store.mjs";
 
 /** @param {any} left @param {any} right */
 function sameIdentity(left, right) {
@@ -230,6 +233,109 @@ export class RecoveredWorkerRouter {
   }
 }
 
+/** Recover every per-session normalized stream before daemon mutation admission. @param {{ root: string, daemonEpoch: string, registry: RegistryStore }} options */
+async function createViewerRecovery({ root, daemonEpoch, registry }) {
+  const directory = join(root, "index", "viewer");
+  /** @type {Map<string, any>} */
+  const sessions = new Map();
+
+  /** @param {any} state */
+  async function publish(state) {
+    const current = await registry.get(state.sessionId);
+    if (current === undefined) throw Object.assign(new Error(`Unknown viewer session: ${state.sessionId}`), { code: "SESSION_NOT_FOUND" });
+    const snapshot = state.normalizer.snapshot({
+      daemonEpoch,
+      sequence: state.store.currentCursor().sequence,
+      registryRevision: current.revision,
+      runtime: current.runtime ?? null,
+      model: current.model ?? null,
+      thinkingLevel: current.thinkingLevel ?? null,
+      role: state.role ?? "observer",
+      taskState: current.taskState,
+      processState: current.processState,
+      outcome: current.outcome,
+    });
+    return state.store.publishSnapshot(snapshot);
+  }
+
+  /** @param {any} state */
+  async function readHistory(state) {
+    const history = await state.reader.read();
+    for (const error of history.errors) state.normalizer.consumeError(error);
+    for (const item of history.entries) {
+      const drafts = state.normalizer.consumeHistory(item.entry, { ...item.position, sourceId: item.sourceId });
+      for (const draft of drafts) await state.store.append(draft);
+    }
+  }
+
+  /** @param {any} record */
+  async function openSession(record) {
+    const existing = sessions.get(record.sessionId);
+    if (existing !== undefined) return existing;
+    const store = await createViewerStore({ directory, sessionId: record.sessionId, daemonEpoch });
+    const normalizer = createViewerNormalizer({ sessionId: record.sessionId, protocolVersion: 1, now: () => new Date().toISOString() });
+    let reader;
+    try {
+      reader = await createSessionHistoryReader({ path: record.canonicalSessionFile });
+    } catch (error) {
+      const missing = /** @type {NodeJS.ErrnoException} */ (error)?.code === "ENOENT";
+      if (!missing && !(error instanceof SessionHistoryError)) throw error;
+      normalizer.consumeError({ code: missing ? "SESSION_HISTORY_MISSING" : error.code, message: missing ? "Canonical session history is unavailable" : error.message, retryable: missing });
+      reader = { async read() { return { entries: [], errors: [], position: { byteOffset: 0, line: 0 } }; }, async close() {} };
+    }
+    const state = { sessionId: record.sessionId, store, normalizer, reader, role: "observer" };
+    sessions.set(record.sessionId, state);
+    const snapshot = await store.getSnapshot();
+    if (snapshot !== undefined) normalizer.restore(snapshot);
+    const replay = await store.replay(snapshot?.cursor);
+    for (const event of replay) normalizer.applyViewerEvent(event);
+    await readHistory(state);
+    await publish(state);
+    return state;
+  }
+
+  try {
+    for (const record of await registry.list()) await openSession(record);
+  } catch (error) {
+    await Promise.allSettled([...sessions.values()].flatMap((state) => [state.reader.close(), state.store.close()]));
+    throw error;
+  }
+
+  return {
+    /** @param {string} sessionId */
+    async ensure(sessionId) {
+      const record = await registry.get(sessionId);
+      if (record === undefined) throw Object.assign(new Error(`Unknown viewer session: ${sessionId}`), { code: "SESSION_NOT_FOUND" });
+      return openSession(record);
+    },
+    /** @param {string} sessionId @param {any} frame */
+    async ingest(sessionId, frame) {
+      const state = sessions.get(sessionId);
+      if (state === undefined) throw Object.assign(new Error(`Unknown viewer session: ${sessionId}`), { code: "SESSION_NOT_FOUND" });
+      /** @type {any[]} */
+      const persisted = [];
+      for (const draft of state.normalizer.consumeFrame(frame)) persisted.push(await state.store.append(draft));
+      await publish(state);
+      return persisted;
+    },
+    /** @param {string} sessionId @param {"composer" | "observer"} [role] */
+    async snapshot(sessionId, role = "observer") {
+      const state = sessions.get(sessionId);
+      if (state === undefined) throw Object.assign(new Error(`Unknown viewer session: ${sessionId}`), { code: "SESSION_NOT_FOUND" });
+      state.role = role;
+      await readHistory(state);
+      return publish(state);
+    },
+    /** @param {string} sessionId */
+    store(sessionId) { return sessions.get(sessionId)?.store; },
+    async close() {
+      const results = await Promise.allSettled([...sessions.values()].flatMap((state) => [state.reader.close(), state.store.close()]));
+      const errors = results.filter((result) => result.status === "rejected").map((result) => result.reason);
+      if (errors.length > 0) throw new AggregateError(errors, "Viewer recovery stores closed with errors");
+    },
+  };
+}
+
 /** @param {{ root: string, daemonEpoch: string, inspect(pid: number): Promise<any>, waitForReconnect?: (workers: any[], router: RecoveredWorkerRouter) => Promise<string[]>, router?: RecoveredWorkerRouter, signal?: AbortSignal }} options */
 export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReconnect = async () => [], router: suppliedRouter, signal }) {
   const registry = new RegistryStore(join(root, "sessions"));
@@ -239,6 +345,8 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReco
   let journal;
   /** @type {any} */
   let events;
+  /** @type {any} */
+  let viewer;
   const router = suppliedRouter ?? new RecoveredWorkerRouter({ registry, inspect, metadataPath: join(root, "daemon", "workers.json") });
   const cancelled = () => {
     if (signal?.aborted) throw Object.assign(new Error("Reconciliation was cancelled"), { code: "RECONCILIATION_CANCELLED" });
@@ -304,6 +412,7 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReco
       command: record.command,
       action: record.status.stage === "ACCEPTED" ? "SAFE_REDELIVERY" : record.status.stage === "DELIVERY_UNKNOWN" ? "DELIVERY_AMBIGUOUS" : "NO_REDELIVERY",
     }));
+    viewer = await createViewerRecovery({ root, daemonEpoch, registry });
     await atomicWriteJson(join(root, "daemon", "reconciliation.json"), { schemaVersion: 1, daemonEpoch, completedAt: new Date().toISOString(), conflicts, recoveryActions });
     return {
       registry,
@@ -313,14 +422,15 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReco
       liveWorkers,
       conflicts,
       recoveryActions,
+      viewer,
       async close() {
-        const results = await Promise.allSettled([router.close(), journal.close(), events.close()]);
+        const results = await Promise.allSettled([router.close(), journal.close(), events.close(), viewer.close()]);
         const errors = results.filter((result) => result.status === "rejected").map((result) => result.reason);
         if (errors.length > 0) throw new AggregateError(errors, "Reconciliation stores closed with errors");
       },
     };
   } catch (error) {
-    await Promise.allSettled([journal?.close(), events?.close()]);
+    await Promise.allSettled([journal?.close(), events?.close(), viewer?.close()]);
     if (suppliedRouter === undefined) await router.close().catch(() => {});
     throw error;
   }

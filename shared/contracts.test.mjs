@@ -19,6 +19,9 @@ const variants = [
   ["delete", { sessionId: "session", revision: 2 }],
   ["subscribe", {}],
   ["ack", { cursor: { daemonEpoch: "epoch", sequence: "2" } }],
+  ["get_viewer_snapshot", { sessionId: "session" }],
+  ["subscribe_viewer", { sessionId: "session", after: { daemonEpoch: "epoch", sessionId: "session", sequence: "2" } }],
+  ["ack_viewer", { cursor: { daemonEpoch: "epoch", sessionId: "session", sequence: "2" } }],
   ["resolve_delivery", { targetClientId: "client", targetRequestId: "request", resolution: "abandon" }],
 ];
 

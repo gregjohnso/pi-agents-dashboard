@@ -2,7 +2,7 @@ import { appendFile, chmod, mkdtemp, open, rm, symlink, writeFile } from "node:f
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { EventStoreError, createEventStore } from "./event-store.mjs";
+import { EventStoreError, createEventStore, parseCursorSequence } from "./event-store.mjs";
 
 /** @type {string[]} */
 const directories = [];
@@ -12,6 +12,11 @@ afterEach(async () => { await Promise.all(directories.splice(0).map((directory) 
 const change = { kind: "attachment_changed", payload: { sessionId: "session-1", clientId: "client-1", role: "observer", attached: true } };
 
 describe("event store", () => {
+  it("shares exact arbitrary-size sequence parsing with session-scoped viewer cursors", () => {
+    expect(parseCursorSequence("18446744073709551616")).toBe(18446744073709551616n);
+    expect(() => parseCursorSequence("01")).toThrow(/canonical/u);
+  });
+
   it("persists monotonically exact string cursors and replays strictly after a cursor", async () => {
     const store = await createEventStore({ path: await path(), daemonEpoch: "epoch-1", now: () => "2026-01-01T00:00:00.000Z" });
     const first = await store.append(change);

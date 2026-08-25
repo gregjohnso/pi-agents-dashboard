@@ -1,6 +1,10 @@
 import { expect, it } from "vitest";
 
-import { checkHostCapabilities, type HostCapabilityProbe } from "./compatibility.js";
+import {
+  checkHostCapabilities,
+  type HostCapabilityModuleLoader,
+  type HostCapabilityProbe,
+} from "./compatibility.js";
 
 it("reports unsupported rather than degrading on stock Pi 0.84.3", async () => {
   const report = await checkHostCapabilities();
@@ -18,6 +22,29 @@ it("reports unsupported rather than degrading on stock Pi 0.84.3", async () => {
     "Pi 0.84.3 has no documented public extension startup hook for selecting a daemon-owned backend before the model loop starts.",
     "Pi 0.84.3 has no documented public native attachment adapter that binds InteractiveMode to a daemon-owned remote session.",
   ]);
+});
+
+it("returns typed unsupported when an optional public entry cannot load", async () => {
+  const moduleLoader: HostCapabilityModuleLoader = {
+    loadPiPackage: async () => ({}),
+    loadClientEntry: async () => {
+      throw new Error("optional Pi client entry is unavailable");
+    },
+    resolveRpcEntry: () => true,
+  };
+
+  await expect(checkHostCapabilities(undefined, moduleLoader)).resolves.toEqual({
+    piVersion: "unknown",
+    globalPackage: false,
+    rpcWorker: false,
+    daemonOwnedStartup: false,
+    nativeAttach: false,
+    composableLeftGesture: false,
+    fullscreenCustomUi: false,
+    blockers: [
+      "Pi host capability inspection failed closed: optional Pi client entry is unavailable",
+    ],
+  });
 });
 
 it("keeps the release blocked unless daemon startup and native attachment are both supported", async () => {

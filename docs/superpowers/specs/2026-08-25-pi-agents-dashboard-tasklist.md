@@ -82,7 +82,7 @@ T02 + T14 + T15 ─────────────────────�
   - Deliverables: independent task/process/outcome/activity reducer; live/saved merge; search/filter/sort/group selectors.
   - Gate: table-driven state matrix and canonical merge tests pass.
 
-- [ ] **T06 Implement runtime safety primitives**
+- [x] **T06 Implement runtime safety primitives**
   - Owner: isolated Lane B.
   - Depends on: T04.
   - Can run in parallel with: T05.

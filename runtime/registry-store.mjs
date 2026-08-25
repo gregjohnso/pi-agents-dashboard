@@ -8,8 +8,34 @@ const CREATE_COORDINATION_KEY = "\0registry-create";
 const TASK_STATES = new Set(["WORKING", "WAITING", "READY", "FAILED", "STOPPED"]);
 const PROCESS_STATES = new Set(["LIVE", "SLEEPING", "EXITED", "STALE"]);
 const OUTCOMES = new Set(["NONE", "COMPLETED", "READY_FOR_REVIEW"]);
+const SESSION_RECORD_KEYS = [
+  "schemaVersion",
+  "revision",
+  "sessionId",
+  "sessionFile",
+  "canonicalSessionFile",
+  "cwd",
+  "name",
+  "model",
+  "thinkingLevel",
+  "taskState",
+  "processState",
+  "outcome",
+  "activity",
+  "ownership",
+  "isolation",
+  "latestRunId",
+  "createdAt",
+  "updatedAt",
+];
 
 /** @typedef {import("../shared/contracts.js").SessionRecord} SessionRecord */
+/** @typedef {{ coordinator: SessionCoordinator }} RegistryCoordinationScope */
+
+/** @type {Map<string, RegistryCoordinationScope>} */
+const registryScopes = new Map();
+/** @type {WeakMap<RegistryStore, RegistryCoordinationScope>} */
+const storeScopes = new WeakMap();
 
 /** A compare-and-swap revision mismatch. */
 export class RegistryRevisionError extends Error {
@@ -54,28 +80,61 @@ function isPlainObject(value) {
   return prototype === Object.prototype || prototype === null;
 }
 
-/** @param {Record<string, any>} record @param {string} key */
-function requireString(record, key) {
+/** @param {Record<string, any>} record @param {string} key @param {string} [path] */
+function requireString(record, key, path = key) {
   if (typeof record[key] !== "string" || record[key].length === 0) {
-    throw new TypeError(`${key} must be a non-empty string`);
+    throw new TypeError(`${path} must be a non-empty string`);
   }
+}
+
+/** @param {Record<string, any>} record @param {readonly string[]} allowed @param {string} path */
+function rejectUnknownKeys(record, allowed, path) {
+  const unknown = Object.keys(record).find((key) => !allowed.includes(key));
+  if (unknown !== undefined) throw new TypeError(`Unknown ${path} field: ${unknown}`);
 }
 
 /** @param {unknown} value */
 function validateProcessIdentity(value) {
   if (!isPlainObject(value)) throw new TypeError("ownership.process must be an object");
+  rejectUnknownKeys(value, ["pid", "startIdentity", "processGroupId"], "ownership.process");
   if (!Number.isSafeInteger(value.pid) || value.pid <= 0) {
     throw new TypeError("ownership.process.pid must be a positive integer");
   }
-  requireString(value, "startIdentity");
+  requireString(value, "startIdentity", "ownership.process.startIdentity");
   if (!Number.isSafeInteger(value.processGroupId) || value.processGroupId <= 0) {
     throw new TypeError("ownership.process.processGroupId must be a positive integer");
   }
 }
 
+/** @param {unknown} value */
+function validateModel(value) {
+  if (!isPlainObject(value)) throw new TypeError("model must be an object");
+  rejectUnknownKeys(value, ["provider", "id"], "model");
+  requireString(value, "provider", "model.provider");
+  requireString(value, "id", "model.id");
+}
+
+/** @param {unknown} value */
+function validateIsolation(value) {
+  if (!isPlainObject(value)) throw new TypeError("isolation must be an object");
+  if (value.mode === "worktree") {
+    rejectUnknownKeys(value, ["mode", "worktreePath", "branch"], "isolation");
+    requireString(value, "worktreePath", "isolation.worktreePath");
+    requireString(value, "branch", "isolation.branch");
+    return;
+  }
+  if (value.mode === "shared_directory") {
+    rejectUnknownKeys(value, ["mode", "canonicalCwd"], "isolation");
+    requireString(value, "canonicalCwd", "isolation.canonicalCwd");
+    return;
+  }
+  throw new TypeError("isolation.mode is invalid");
+}
+
 /** @param {unknown} value @returns {SessionRecord} */
 function validateRecord(value) {
   if (!isPlainObject(value)) throw new TypeError("Session record must be an object");
+  rejectUnknownKeys(value, SESSION_RECORD_KEYS, "SessionRecord");
   if (value.schemaVersion !== 1) throw new TypeError("schemaVersion must be 1");
   if (!Number.isSafeInteger(value.revision) || value.revision < 0) {
     throw new TypeError("revision must be a non-negative integer");
@@ -83,6 +142,7 @@ function validateRecord(value) {
   for (const key of ["sessionId", "sessionFile", "canonicalSessionFile", "cwd", "createdAt", "updatedAt"]) {
     requireString(value, key);
   }
+  validateSessionId(value.sessionId);
   if (!isAbsolute(value.canonicalSessionFile) || resolve(value.canonicalSessionFile) !== value.canonicalSessionFile) {
     throw new TypeError("canonicalSessionFile must be an absolute canonical path");
   }
@@ -90,13 +150,26 @@ function validateRecord(value) {
   if (!PROCESS_STATES.has(value.processState)) throw new TypeError("processState is invalid");
   if (!OUTCOMES.has(value.outcome)) throw new TypeError("outcome is invalid");
   if (!isPlainObject(value.activity)) throw new TypeError("activity must be an object");
-  for (const key of ["kind", "summary", "updatedAt"]) requireString(value.activity, key);
+  rejectUnknownKeys(value.activity, ["kind", "summary", "updatedAt"], "activity");
+  for (const key of ["kind", "summary", "updatedAt"]) requireString(value.activity, key, `activity.${key}`);
 
+  if (value.name !== undefined) requireString(value, "name");
+  if (value.model !== undefined) validateModel(value.model);
+  if (value.thinkingLevel !== undefined) requireString(value, "thinkingLevel");
+  if (value.latestRunId !== undefined) requireString(value, "latestRunId");
+  if (value.isolation !== undefined) validateIsolation(value.isolation);
   if (value.ownership !== undefined) {
     if (!isPlainObject(value.ownership) || value.ownership.kind !== "managed") {
       throw new TypeError("ownership must be managed");
     }
-    for (const key of ["runId", "acquiredAt", "heartbeatAt"]) requireString(value.ownership, key);
+    rejectUnknownKeys(
+      value.ownership,
+      ["kind", "runId", "process", "acquiredAt", "heartbeatAt"],
+      "ownership",
+    );
+    for (const key of ["runId", "acquiredAt", "heartbeatAt"]) {
+      requireString(value.ownership, key, `ownership.${key}`);
+    }
     validateProcessIdentity(value.ownership.process);
   }
   return /** @type {SessionRecord} */ (value);
@@ -116,6 +189,17 @@ function validateSessionId(sessionId) {
   }
 }
 
+/**
+ * Return the directory-scoped coordination identity for one registry store.
+ *
+ * @param {RegistryStore} registry
+ */
+export function registryCoordinationScope(registry) {
+  const scope = storeScopes.get(registry);
+  if (scope === undefined) throw new TypeError("Expected a RegistryStore instance");
+  return scope;
+}
+
 /** Atomic, compare-and-swap storage for canonical session records. */
 export class RegistryStore {
   #sessionsDirectory;
@@ -131,10 +215,16 @@ export class RegistryStore {
     if (typeof sessionsDirectory !== "string" || !isAbsolute(sessionsDirectory)) {
       throw new TypeError("Registry sessions directory must be an absolute path");
     }
-    this.#sessionsDirectory = sessionsDirectory;
+    this.#sessionsDirectory = resolve(sessionsDirectory);
     this.#fsOps = options.fsOps ?? fs;
     this.#atomicWrite = options.atomicWrite ?? atomicWriteJson;
-    this.#coordinator = options.coordinator ?? new SessionCoordinator();
+    let scope = registryScopes.get(this.#sessionsDirectory);
+    if (scope === undefined) {
+      scope = { coordinator: options.coordinator ?? new SessionCoordinator() };
+      registryScopes.set(this.#sessionsDirectory, scope);
+    }
+    this.#coordinator = scope.coordinator;
+    storeScopes.set(this, scope);
   }
 
   /** @param {string} sessionId */
@@ -143,14 +233,18 @@ export class RegistryStore {
     return join(this.#sessionsDirectory, `${sessionId}.json`);
   }
 
-  /** @param {string} path @returns {Promise<SessionRecord | undefined>} */
-  async #readPath(path) {
+  /** @param {string} path @param {string} expectedSessionId @returns {Promise<SessionRecord | undefined>} */
+  async #readPath(path, expectedSessionId) {
     try {
       const metadata = await this.#fsOps.lstat(path);
       if (!metadata.isFile() || metadata.isSymbolicLink()) {
         throw new TypeError("Registry record must be a regular file");
       }
-      return validateRecord(JSON.parse(await this.#fsOps.readFile(path, "utf8")));
+      const record = validateRecord(JSON.parse(await this.#fsOps.readFile(path, "utf8")));
+      if (record.sessionId !== expectedSessionId) {
+        throw new TypeError("Registry filename and sessionId must match");
+      }
+      return record;
     } catch (error) {
       if (error instanceof Error && /** @type {NodeJS.ErrnoException} */ (error).code === "ENOENT") return undefined;
       if (error instanceof RegistryCorruptError) throw error;
@@ -164,14 +258,16 @@ export class RegistryStore {
       names
         .filter((/** @type {string} */ name) => name.endsWith(".json"))
         .sort()
-        .map((/** @type {string} */ name) => this.#readPath(join(this.#sessionsDirectory, name))),
+        .map((/** @type {string} */ name) =>
+          this.#readPath(join(this.#sessionsDirectory, name), name.slice(0, -".json".length)),
+        ),
     );
     return records.filter((record) => record !== undefined);
   }
 
   /** @param {string} sessionId */
   async get(sessionId) {
-    return this.#readPath(this.#path(sessionId));
+    return this.#readPath(this.#path(sessionId), sessionId);
   }
 
   /** @param {SessionRecord} record */

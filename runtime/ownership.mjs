@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 
+import { registryCoordinationScope } from "./registry-store.mjs";
 import { SessionCoordinator } from "./session-coordinator.mjs";
 
 /** @typedef {import("../shared/contracts.js").ProcessIdentity} ProcessIdentity */
@@ -38,13 +39,14 @@ export class OwnershipConflictError extends Error {
 
 /** A delayed hello or release from a superseded lease. */
 export class StaleLeaseError extends Error {
-  /** @param {string} sessionId @param {string} leaseId */
-  constructor(sessionId, leaseId) {
-    super(`Lease ${leaseId} is stale for session ${sessionId}`);
+  /** @param {string} sessionId @param {string} leaseId @param {number} generation */
+  constructor(sessionId, leaseId, generation) {
+    super(`Lease ${leaseId} generation ${generation} is stale for session ${sessionId}`);
     this.name = "StaleLeaseError";
     this.code = "STALE_LEASE";
     this.sessionId = sessionId;
     this.leaseId = leaseId;
+    this.generation = generation;
   }
 }
 
@@ -66,6 +68,27 @@ function validateIdentity(identity, label) {
   }
 }
 
+/** @param {ProcessIdentity} a @param {ProcessIdentity} b */
+function sameIdentity(a, b) {
+  return (
+    a.pid === b.pid &&
+    a.startIdentity === b.startIdentity &&
+    a.processGroupId === b.processGroupId
+  );
+}
+
+/** @param {import("../shared/contracts.js").SessionRecord | undefined} record @param {WriterLease} lease */
+function hasLeaseOwnership(record, lease) {
+  if (
+    record?.ownership === undefined ||
+    record.ownership.runId !== lease.runId ||
+    record.ownership.acquiredAt !== lease.acquiredAt
+  ) {
+    return false;
+  }
+  return lease.worker === undefined || sameIdentity(record.ownership.process, lease.worker);
+}
+
 /** Acquire and manage generation-bearing writer leases for canonical session files. */
 export class OwnershipManager {
   #registry;
@@ -83,23 +106,28 @@ export class OwnershipManager {
     this.#now = options.now ?? (() => new Date().toISOString());
     this.#randomId = options.randomId ?? randomUUID;
 
-    let state = ownershipStates.get(registry);
+    const scope = registryCoordinationScope(registry);
+    let state = ownershipStates.get(scope);
     if (state === undefined) {
       state = {
         leases: new Map(),
         generations: new Map(),
         coordinator: options.coordinator ?? new SessionCoordinator(),
       };
-      ownershipStates.set(registry, state);
+      ownershipStates.set(scope, state);
     }
     this.#state = state;
   }
 
-  /** @param {string} sessionId @param {string} leaseId @returns {WriterLease} */
-  #currentLease(sessionId, leaseId) {
+  /** @param {string} sessionId @param {string} leaseId @param {number} generation @returns {WriterLease} */
+  #currentLease(sessionId, leaseId, generation) {
     const lease = this.#state.leases.get(sessionId);
-    if (lease === undefined || lease.leaseId !== leaseId) {
-      throw new StaleLeaseError(sessionId, leaseId);
+    if (
+      lease === undefined ||
+      lease.leaseId !== leaseId ||
+      lease.generation !== generation
+    ) {
+      throw new StaleLeaseError(sessionId, leaseId, generation);
     }
     return lease;
   }
@@ -150,12 +178,12 @@ export class OwnershipManager {
     });
   }
 
-  /** @param {string} sessionId @param {string} leaseId @param {unknown} worker @param {unknown} piChild */
-  async bindProcesses(sessionId, leaseId, worker, piChild) {
+  /** @param {string} sessionId @param {string} leaseId @param {number} generation @param {unknown} worker @param {unknown} piChild */
+  async bindProcesses(sessionId, leaseId, generation, worker, piChild) {
     validateIdentity(worker, "worker");
     validateIdentity(piChild, "piChild");
     return this.#state.coordinator.run(sessionId, async () => {
-      const lease = this.#currentLease(sessionId, leaseId);
+      const lease = this.#currentLease(sessionId, leaseId, generation);
       if (lease.worker !== undefined) throw new OwnershipConflictError(sessionId, lease.runId);
       const record = await this.#registry.get(sessionId);
       if (record === undefined) throw new Error(`Unknown registry session: ${sessionId}`);
@@ -163,36 +191,49 @@ export class OwnershipManager {
         throw new OwnershipConflictError(sessionId, record.ownership.runId);
       }
 
-      await this.#registry.update(sessionId, record.revision, {
-        latestRunId: lease.runId,
-        processState: "LIVE",
-        updatedAt: lease.acquiredAt,
-        ownership: {
-          kind: "managed",
-          runId: lease.runId,
-          process: worker,
-          acquiredAt: lease.acquiredAt,
-          heartbeatAt: lease.acquiredAt,
-        },
-      });
+      const ownership = {
+        kind: /** @type {const} */ ("managed"),
+        runId: lease.runId,
+        process: worker,
+        acquiredAt: lease.acquiredAt,
+        heartbeatAt: lease.acquiredAt,
+      };
+      try {
+        await this.#registry.update(sessionId, record.revision, {
+          latestRunId: lease.runId,
+          processState: "LIVE",
+          updatedAt: lease.acquiredAt,
+          ownership,
+        });
+      } catch (error) {
+        const committed = await this.#registry.get(sessionId);
+        if (
+          committed?.revision !== record.revision + 1 ||
+          committed.processState !== "LIVE" ||
+          committed.latestRunId !== lease.runId ||
+          !hasLeaseOwnership(committed, { ...lease, worker })
+        ) {
+          throw error;
+        }
+      }
       lease.worker = worker;
       lease.piChild = piChild;
       return { ...lease };
     });
   }
 
-  /** @param {string} sessionId @param {string} leaseId */
-  async heartbeat(sessionId, leaseId) {
+  /** @param {string} sessionId @param {string} leaseId @param {number} generation */
+  async heartbeat(sessionId, leaseId, generation) {
     return this.#state.coordinator.run(sessionId, async () => {
-      const lease = this.#currentLease(sessionId, leaseId);
-      if (lease.worker === undefined) throw new StaleLeaseError(sessionId, leaseId);
+      const lease = this.#currentLease(sessionId, leaseId, generation);
+      if (lease.worker === undefined) throw new StaleLeaseError(sessionId, leaseId, generation);
       const record = await this.#registry.get(sessionId);
       if (
         record === undefined ||
         record.ownership === undefined ||
         record.ownership.runId !== lease.runId
       ) {
-        throw new StaleLeaseError(sessionId, leaseId);
+        throw new StaleLeaseError(sessionId, leaseId, generation);
       }
       const heartbeatAt = this.#now();
       return this.#registry.update(sessionId, record.revision, {
@@ -202,27 +243,38 @@ export class OwnershipManager {
     });
   }
 
-  /** @param {string} sessionId @param {string} leaseId */
-  async release(sessionId, leaseId) {
+  /** @param {string} sessionId @param {string} leaseId @param {number} generation */
+  async release(sessionId, leaseId, generation) {
     return this.#state.coordinator.run(sessionId, async () => {
       const lease = this.#state.leases.get(sessionId);
-      if (lease === undefined || lease.leaseId !== leaseId) return false;
+      if (
+        lease === undefined ||
+        lease.leaseId !== leaseId ||
+        lease.generation !== generation
+      ) {
+        return false;
+      }
 
-      if (lease.worker !== undefined) {
-        const record = await this.#registry.get(sessionId);
-        if (
-          record === undefined ||
-          record.ownership === undefined ||
-          record.ownership.runId !== lease.runId
-        ) {
-          return false;
-        }
+      const record = await this.#registry.get(sessionId);
+      if (record?.ownership !== undefined) {
+        if (!hasLeaseOwnership(record, lease)) return false;
         const updatedAt = this.#now();
-        await this.#registry.update(sessionId, record.revision, {
-          ownership: undefined,
-          processState: "EXITED",
-          updatedAt,
-        });
+        try {
+          await this.#registry.update(sessionId, record.revision, {
+            ownership: undefined,
+            processState: "EXITED",
+            updatedAt,
+          });
+        } catch (error) {
+          const committed = await this.#registry.get(sessionId);
+          if (
+            committed?.revision !== record.revision + 1 ||
+            committed.ownership !== undefined ||
+            committed.processState !== "EXITED"
+          ) {
+            throw error;
+          }
+        }
       }
 
       this.#state.leases.delete(sessionId);

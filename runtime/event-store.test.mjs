@@ -84,23 +84,41 @@ describe("event store", () => {
     await reopened.close();
   });
 
-  it("rejects a zero-progress write before syncing or acknowledging", async () => {
+  it("poisons the store after a partial write stalls and recovers the torn tail on reopen", async () => {
     const storePath = await path();
     const probe = await open(storePath, "a", 0o600);
     const prototype = Object.getPrototypeOf(probe);
     await probe.close();
-    const write = vi.spyOn(prototype, "write").mockImplementation(async (buffer) => ({ bytesWritten: 0, buffer }));
+    const originalWrite = prototype.write;
+    let writeAttempt = 0;
+    const write = vi.spyOn(prototype, "write").mockImplementation(function (buffer) {
+      writeAttempt += 1;
+      if (writeAttempt === 1) return originalWrite.call(this, /** @type {Buffer} */ (buffer).subarray(0, 7));
+      if (writeAttempt === 2) return Promise.resolve({ bytesWritten: 0, buffer });
+      return originalWrite.call(this, buffer);
+    });
     const sync = vi.spyOn(prototype, "sync");
     const store = await createEventStore({ path: storePath, daemonEpoch: "epoch-1" });
     sync.mockClear();
     try {
-      await expect(store.append(change)).rejects.toThrow(/progress/i);
+      await expect(store.append(change)).rejects.toMatchObject({ name: "AppendStoreError", code: "WRITE_STALLED" });
+      await expect(store.append(change)).rejects.toMatchObject({ name: "AppendStoreError", code: "STORE_FAILED" });
+      expect(write).toHaveBeenCalledTimes(2);
       expect(sync).not.toHaveBeenCalled();
     } finally {
       write.mockRestore();
       sync.mockRestore();
       await store.close();
     }
+
+    const reopened = await createEventStore({ path: storePath, daemonEpoch: "epoch-1" });
+    await expect(reopened.replay()).resolves.toEqual([]);
+    await expect(reopened.append(change)).resolves.toMatchObject({ cursor: { daemonEpoch: "epoch-1", sequence: "1" } });
+    await reopened.close();
+
+    const verified = await createEventStore({ path: storePath, daemonEpoch: "epoch-1" });
+    await expect(verified.replay()).resolves.toHaveLength(1);
+    await verified.close();
   });
 
   it("rejects symlinks and existing stores with unsafe modes", async () => {

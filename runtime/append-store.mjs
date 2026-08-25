@@ -73,6 +73,9 @@ export async function openDurableAppendStore({ path, maxRecordBytes }) {
     throw error;
   }
 
+  /** @type {AppendStoreError | undefined} */
+  let terminalFailure;
+
   /** @param {(record: unknown) => void} onRecord @returns {Promise<void>} */
   async function recoverRecords(onRecord) {
     if (handle === undefined) throw new AppendStoreError("STORE_CLOSED", "Durable append store is closed");
@@ -125,19 +128,26 @@ export async function openDurableAppendStore({ path, maxRecordBytes }) {
     /** @param {unknown} record */
     async write(record) {
       if (handle === undefined) throw new AppendStoreError("STORE_CLOSED", "Durable append store is closed");
+      if (terminalFailure !== undefined) throw terminalFailure;
       const json = JSON.stringify(record);
       if (json === undefined) throw new TypeError("Append store record must be JSON serializable");
       const line = Buffer.from(`${json}\n`, "utf8");
       if (line.length - 1 > maxRecordBytes) throw new AppendStoreError("RECORD_TOO_LARGE", "Append store record exceeds its byte limit");
       let offset = 0;
-      while (offset < line.length) {
-        const { bytesWritten } = await handle.write(line.subarray(offset));
-        if (bytesWritten === 0) throw new AppendStoreError("WRITE_STALLED", "Durable append store write made no progress");
-        offset += bytesWritten;
+      try {
+        while (offset < line.length) {
+          const { bytesWritten } = await handle.write(line.subarray(offset));
+          if (bytesWritten === 0) throw new AppendStoreError("WRITE_STALLED", "Durable append store write made no progress");
+          offset += bytesWritten;
+        }
+      } catch (cause) {
+        if (offset > 0) terminalFailure = new AppendStoreError("STORE_FAILED", "Durable append store has an incomplete record; close and reopen it before writing", { cause });
+        throw cause;
       }
     },
     async sync() {
       if (handle === undefined) throw new AppendStoreError("STORE_CLOSED", "Durable append store is closed");
+      if (terminalFailure !== undefined) throw terminalFailure;
       await handle.sync();
     },
     async close() {

@@ -73,6 +73,22 @@ describe("VirtualSessionList", () => {
     expect(list.selectedRowIndex).toBe(4);
   });
 
+  it("uses Task 5 canonical cwd identity for alias display paths", () => {
+    const alias = session(0, { cwd: "/projects/team/../shared" });
+    const canonical = session(2, { cwd: "/projects/shared" });
+    const list = new VirtualSessionList([alias, canonical], {
+      groupBy: "cwd",
+      renderRow: (row) => label(row),
+    });
+
+    expect(list.rows.map((row) => ({ kind: row.kind, label: label(row) }))).toEqual([
+      { kind: "group", label: "[shared]" },
+      { kind: "session", label: "session-00000" },
+      { kind: "session", label: "session-00002" },
+    ]);
+    expect(list.rows[0]).toMatchObject({ kind: "group", count: 2 });
+  });
+
   it("keeps selection by session ID when rows reorder", () => {
     const first = session(1);
     const selected = session(2);

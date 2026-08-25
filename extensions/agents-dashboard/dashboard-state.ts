@@ -97,13 +97,23 @@ function compareValues(left: string | number, right: string | number): number {
   return compareText(String(left), String(right));
 }
 
+/** Return the canonical identity used to coalesce dashboard group rows. */
+export function dashboardGroupIdentity(
+  session: SessionRecord,
+  groupBy: DashboardGroup,
+): string {
+  return groupBy === "taskState"
+    ? session.taskState
+    : canonicalPath(session.cwd).toLowerCase();
+}
+
 function compareGroups(left: SessionRecord, right: SessionRecord, groupBy: DashboardGroup): number {
   if (groupBy === "taskState") {
     return TASK_STATE_ORDER[left.taskState] - TASK_STATE_ORDER[right.taskState];
   }
   return compareText(
-    canonicalPath(left.cwd).toLowerCase(),
-    canonicalPath(right.cwd).toLowerCase(),
+    dashboardGroupIdentity(left, groupBy),
+    dashboardGroupIdentity(right, groupBy),
   );
 }
 

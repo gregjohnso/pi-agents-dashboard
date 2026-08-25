@@ -21,10 +21,10 @@ const COLUMN_LABELS: Record<SortKey, string> = {
   activity: "ACTIVITY",
 };
 
-const CONTROL_CHARACTERS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu;
 
 function plainText(value: string): string {
-  return stripVTControlCharacters(value).replace(CONTROL_CHARACTERS, "");
+  return stripVTControlCharacters(value).replace(CONTROL_CHARACTERS, " ");
 }
 
 function fit(value: string, width: number): string {

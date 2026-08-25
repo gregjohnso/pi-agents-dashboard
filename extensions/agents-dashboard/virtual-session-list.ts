@@ -3,7 +3,10 @@ import { basename } from "node:path";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 
 import type { SessionRecord } from "../../shared/contracts.js";
-import type { DashboardGroup } from "./dashboard-state.js";
+import {
+  dashboardGroupIdentity,
+  type DashboardGroup,
+} from "./dashboard-state.js";
 import {
   createDashboardLayout,
   renderGroupHeader,
@@ -28,7 +31,7 @@ function sessionSignature(session: SessionRecord): string {
   return JSON.stringify(session);
 }
 
-function groupValue(session: SessionRecord, groupBy: DashboardGroup): string {
+function groupDisplayValue(session: SessionRecord, groupBy: DashboardGroup): string {
   return groupBy === "taskState" ? session.taskState : session.cwd;
 }
 
@@ -53,13 +56,20 @@ function buildRows(
   const rows: VirtualRow[] = [];
   let index = 0;
   while (index < sessions.length) {
-    const value = groupValue(sessions[index], groupBy);
+    const session = sessions[index];
+    const identity = dashboardGroupIdentity(session, groupBy);
+    const displayValue = groupDisplayValue(session, groupBy);
     let end = index + 1;
-    while (end < sessions.length && groupValue(sessions[end], groupBy) === value) end += 1;
+    while (
+      end < sessions.length
+      && dashboardGroupIdentity(sessions[end], groupBy) === identity
+    ) {
+      end += 1;
+    }
     rows.push({
       kind: "group",
-      key: `group:${groupBy}:${value}:${index}`,
-      label: groupLabel(value, groupBy),
+      key: `group:${groupBy}:${identity}:${index}`,
+      label: groupLabel(displayValue, groupBy),
       count: end - index,
       selectable: false,
     });

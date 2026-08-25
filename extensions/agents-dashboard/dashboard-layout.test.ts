@@ -7,6 +7,7 @@ import type { SessionRecord } from "../../shared/contracts.js";
 import {
   createDashboardLayout,
   renderColumnHeader,
+  renderGroupHeader,
   renderSessionRow,
 } from "./dashboard-layout.js";
 import { JOBWATCH_ANSI } from "./dashboard-theme.js";
@@ -83,6 +84,31 @@ describe("responsive dashboard layout", () => {
       columns: layout.columns,
       lines: lines.map(stripVTControlCharacters),
     }).toMatchSnapshot();
+  });
+
+  it("sanitizes untrusted controls to one line before applying renderer-owned ANSI", () => {
+    const layout = createDashboardLayout(160, 20);
+    const hostile = session("id\twith\r\ncontrols\x07", {
+      cwd: "/projects/project\tname\r\nnext",
+      model: { provider: "provider", id: "model\tname\r\nnext\x1b[31mred" },
+      activity: {
+        kind: "tool",
+        summary: "first\tcolumn\r\nsecond\x07\x1b]8;;https://example.test\x07link\x1b]8;;\x07",
+        updatedAt: "2026-08-25T11:59:00.000Z",
+      },
+    });
+    const lines = [
+      renderSessionRow(hostile, layout, { now }),
+      renderGroupHeader("group\ttitle\r\nnext\x07\x1b[31mred", 1, layout),
+    ];
+
+    for (const line of lines) {
+      expect(stripVTControlCharacters(line)).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);
+      expect(stripVTControlCharacters(line)).not.toContain("\n");
+      expect(visibleWidth(line)).toBeLessThanOrEqual(layout.width);
+    }
+    expect(lines[0]).toContain(JOBWATCH_ANSI.cyan);
+    expect(lines[1]).toContain(JOBWATCH_ANSI.sky);
   });
 
   it("uses the Jobwatch palette for information, state, selection, and black surfaces", () => {

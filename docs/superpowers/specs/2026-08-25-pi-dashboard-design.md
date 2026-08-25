@@ -20,8 +20,6 @@ This revision supersedes native Pi attachment and the blocked native-attachment 
 pi-dashboard
 ```
 
-**Compatibility shim:** `/agents` displays `Run pi-dashboard to open the agents dashboard.` for one transition release. It does not open a dashboard or control a session.
-
 **Current state:** The daemon, durable control protocol, registry, process supervision, dashboard list, and destructive workflows exist under the former `pi-agents-dashboard` name. Native attachment is not part of the replacement design.
 
 **Next implementation:** Rename the product, add the standalone shell and migration, launch the installed `pi --mode rpc` executable, normalize viewer data, build the interactive viewer, and run standalone acceptance.
@@ -411,7 +409,7 @@ Legacy configuration schema version 1 converts to `pi-dashboard` schema version 
 - Raw RPC and stderr diagnostics use the approved rotating limits.
 - Timers, watchers, render barriers, subscriptions, and editor wrappers are disposed on app or viewer close.
 
-## Installation and deprecation
+## Installation
 
 Canonical installation is:
 
@@ -430,7 +428,7 @@ npm install /absolute/path/to/pi-dashboard
 
 The package uses no npm lifecycle scripts and remains installable with `--ignore-scripts`. A global installation is sufficient because the standalone executable is canonical.
 
-For the first standalone release, the package also exposes a Pi extension containing only `/agents`. That command displays `Run pi-dashboard to open the agents dashboard.` and performs no session mutation. The shim is removed in the next major release. `pi install` is not a canonical installation path.
+`pi install` is not a supported installation path. The package contains no Pi extension entry point.
 
 The repository, package metadata, executable, visible UI, documentation, and new state roots use `pi-dashboard`. The private repository and local project directory are renamed during implementation. No npm publication occurs until standalone acceptance is approved.
 
@@ -483,7 +481,6 @@ Command protocol version and normalized viewer protocol version are independent 
 - Session resume reuses the canonical session ID and file with one writer.
 - Worktree and shared-directory rules remain unchanged.
 - State migration refuses a live legacy daemon, survives interruption, preserves legacy source on failure, and publishes one reconciled new daemon.
-- `/agents` emits only the deprecation message and performs no mutation.
 
 ### Terminal acceptance
 

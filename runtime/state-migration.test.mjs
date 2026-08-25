@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -100,6 +100,10 @@ it.each([
   ["daemon/delete-results.json", JSON.stringify({ schemaVersion: 1, entries: { request: {} } })],
   ["daemon/attachment-results.jsonl", `${JSON.stringify({ schemaVersion: 1, phase: "PREPARED" })}\n`],
   ["index/events.jsonl", `${JSON.stringify({ version: 1, cursor: { daemonEpoch: "epoch", sequence: "2" }, occurredAt: "now", kind: "session_changed", payload: {} })}\n`],
+  ["frontend-state.json", JSON.stringify({ schemaVersion: 1, clientId: "client", viewState: null, launchDraft: {} })],
+  ["frontend-state.json", JSON.stringify({ schemaVersion: 1, clientId: "client", viewState: {}, launchDraft: null })],
+  ["runs/one/worker-replay.jsonl", `${JSON.stringify({ clientId: "client", requestId: "request", op: "stop", stage: "UNKNOWN", at: "now" })}\n`],
+  ["runs/one/worker-replay.jsonl", `${JSON.stringify({ clientId: "", requestId: "request", op: "stop", stage: "RECEIVED", at: "now" })}\n`],
   ["unknown-state.json", JSON.stringify({ value: true })],
 ])("refuses malformed legacy artifact %s", async (relative, text) => {
   const paths = await fixture();
@@ -117,6 +121,18 @@ it("rejects changed PUBLISHED output before reconciliation starts", async () => 
   const record = JSON.parse(await readFile(recordPath, "utf8"));
   await writeFile(recordPath, `${JSON.stringify({ ...record, revision: 1 })}\n`, { mode: 0o600 });
   await expect(migrateLegacyState({ ...options, failpoint: async () => {} })).rejects.toMatchObject({ code: "MIGRATION_IDENTITY_MISMATCH" });
+});
+
+it.each([
+  ["a public expected file", async (/** @type {{destinationRoot:string}} */ paths) => chmod(join(paths.destinationRoot, "sessions", "one.json"), 0o644)],
+  ["a same-content symlink", async (/** @type {{legacyRoot:string,destinationRoot:string}} */ paths) => { const target = join(paths.destinationRoot, "sessions", "one.json"); await rm(target); await symlink(join(paths.legacyRoot, "sessions", "one.json"), target); }],
+  ["an extra nested artifact", async (/** @type {{destinationRoot:string}} */ paths) => writeFile(join(paths.destinationRoot, "sessions", "extra.json"), "{}", { mode: 0o600 })],
+])("rejects untouched PUBLISHED output containing %s", async (_name, mutate) => {
+  const paths = await fixture();
+  const options = { ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {}, async failpoint(/** @type {string} */ stage) { if (stage === "after_manifest_publication") throw new Error("crash"); } };
+  await expect(migrateLegacyState(options)).rejects.toThrow("crash");
+  await mutate(paths);
+  await expect(migrateLegacyState({ ...options, failpoint: async () => {} })).rejects.toMatchObject({ code: expect.stringMatching(/^(MIGRATION_IDENTITY_MISMATCH|DESTINATION_COLLISION)$/u) });
 });
 
 it("recovers mutable PUBLISHED output only after the reconciliation marker is durable", async () => {

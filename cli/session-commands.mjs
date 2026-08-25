@@ -189,7 +189,7 @@ export async function createPersistentDaemonRequester({ root = runtimeRoot(), cl
       let timer;
       let rejectFatal;
       const fatal = new Promise((_, reject) => { rejectFatal = reject; });
-      const removeFatal = client.onFatalError((error) => rejectFatal(error?.code === "MALFORMED_FRAME" ? Object.assign(new Error(error.message), { code: "INVALID_DAEMON_RESPONSE" }) : error));
+      const removeFatal = client.onFatalError((error) => rejectFatal(Object.assign(new Error(error.message), { code: "INVALID_DAEMON_RESPONSE" })));
       try {
         const response = await Promise.race([
           client.request({ version: 1, clientId, requestId, op, payload }),
@@ -200,7 +200,9 @@ export async function createPersistentDaemonRequester({ root = runtimeRoot(), cl
         validateExpectedResult(op, payload, clientId, requestId, response.result);
         return response.result;
       } catch (error) {
-        if (["stop", "delete"].includes(op) && error?.code === "CONNECTION_CLOSED" && error?.submitted === true) throw Object.assign(new Error("Destructive command delivery is ambiguous"), { code: "DELIVERY_UNKNOWN", clientId, requestId, submitted: true });
+        const destructive = ["stop", "delete"].includes(op);
+        const responseUnvalidated = ["INVALID_DAEMON_RESPONSE", "UNEXPECTED_DAEMON_RESPONSE"].includes(error?.code);
+        if (destructive && (responseUnvalidated || (error?.code === "CONNECTION_CLOSED" && error?.submitted === true))) throw Object.assign(new Error("Destructive command delivery is ambiguous"), { code: "DELIVERY_UNKNOWN", clientId, requestId, submitted: true });
         throw error;
       } finally { clearTimeout(timer); removeFatal(); }
     },

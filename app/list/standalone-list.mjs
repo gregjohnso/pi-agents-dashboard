@@ -7,14 +7,7 @@ import { ProcessTerminal, TuiAltScreen } from "@earendil-works/pi-tui";
 
 import { createDaemonClient } from "../daemon-client.mjs";
 import { DashboardController, createDaemonDashboardBackend } from "./dashboard.mjs";
-
-/** @param {any} state */
-function validateFrontendState(state) {
-  const allowed = ["schemaVersion", "clientId", "cursor", "viewState", "launchDraft"];
-  if (typeof state !== "object" || state === null || Array.isArray(state) || Object.keys(state).some((key) => !allowed.includes(key)) || state.schemaVersion !== 1 || typeof state.clientId !== "string" || state.clientId.length === 0 || typeof state.viewState !== "object" || state.viewState === null || typeof state.launchDraft !== "object" || state.launchDraft === null) throw Object.assign(new Error("Frontend state is malformed"), { code: "FRONTEND_STATE_CORRUPT" });
-  if (state.cursor !== undefined && (typeof state.cursor !== "object" || state.cursor === null || Object.keys(state.cursor).some((key) => !["daemonEpoch", "sequence"].includes(key)) || typeof state.cursor.daemonEpoch !== "string" || !/^(0|[1-9]\d*)$/u.test(state.cursor.sequence))) throw Object.assign(new Error("Frontend cursor is malformed"), { code: "FRONTEND_STATE_CORRUPT" });
-  return state;
-}
+import { validateFrontendState } from "./frontend-state.mjs";
 
 /** Create private fsync-backed frontend cursor persistence. @param {string} path @param {string} clientId @param {{fsOps?:any,failpoint?:(stage:string)=>unknown|Promise<unknown>}} [options] */
 export function createFrontendPersistence(path, clientId, options = {}) {

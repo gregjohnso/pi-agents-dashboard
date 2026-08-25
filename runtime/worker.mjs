@@ -5,13 +5,13 @@ import { resolve } from "node:path";
 
 import { openDurableAppendStore } from "./append-store.mjs";
 import { PiRpcAdapter } from "./pi-rpc-adapter.mjs";
+import { validateWorkerReplayRecord } from "./worker-replay-contract.mjs";
 import { initializeRuntimePermissions } from "./permissions.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 
 initializeRuntimePermissions();
 
 const MAX_REPLAY_RECORD_BYTES = 1024 * 1024;
-const REPLAY_STAGES = new Set(["RECEIVED", "RPC_WRITE_STARTED", "RPC_ACKNOWLEDGED", "DELIVERY_UNKNOWN", "FAILED"]);
 const WORKER_OPERATIONS = new Set(["prompt", "steer", "follow_up", "interrupt", "get_state"]);
 
 /** @param {string} value */
@@ -22,16 +22,6 @@ function digest(value) {
 /** @param {unknown} supplied @param {string} expected */
 function matchesToken(supplied, expected) {
   return timingSafeEqual(digest(typeof supplied === "string" ? supplied : ""), digest(expected)) && typeof supplied === "string";
-}
-
-/** @param {unknown} value @returns {value is Record<string, any>} */
-function isReplayRecord(value) {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const record = /** @type {Record<string, unknown>} */ (value);
-  return typeof record.clientId === "string" && record.clientId.length > 0 &&
-    typeof record.requestId === "string" && record.requestId.length > 0 &&
-    typeof record.op === "string" && REPLAY_STAGES.has(/** @type {string} */ (record.stage)) &&
-    typeof record.at === "string";
 }
 
 /**
@@ -46,7 +36,7 @@ export async function createWorkerReplayStore({ path, append: injectedAppend, no
     if (typeof path !== "string") throw new TypeError("Worker replay path is required");
     store = await openDurableAppendStore({ path, maxRecordBytes: MAX_REPLAY_RECORD_BYTES });
     await store.recoverRecords((value) => {
-      if (!isReplayRecord(value)) throw new Error("Worker replay contains an invalid record");
+      if (!validateWorkerReplayRecord(value)) throw new Error("Worker replay contains an invalid record");
       records.set(`${value.clientId}\0${value.requestId}`, value);
     });
   }
@@ -54,7 +44,7 @@ export async function createWorkerReplayStore({ path, append: injectedAppend, no
   /** @param {any} record */
   async function append(record) {
     const complete = { ...record, at: record.at ?? now() };
-    if (!isReplayRecord(complete)) throw new TypeError("Invalid worker replay record");
+    if (!validateWorkerReplayRecord(complete)) throw new TypeError("Invalid worker replay record");
     if (injectedAppend !== undefined) {
       await injectedAppend(complete);
     } else {

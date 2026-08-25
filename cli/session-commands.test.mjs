@@ -645,14 +645,14 @@ it.each([
   await new Promise((resolve) => server.close(resolve));
 });
 
-it("retains pending identity when a successful daemon frame fails validation", async () => {
+it.each(["stop", "delete"])("classifies an unvalidated %s response as delivery unknown and retains pending identity", async (operation) => {
   const root = await stateRoot();
   const server = await daemonServer(root, (socket, encoder, frame) => {
     if (frame.op === "attach") socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "attached", sessionId: "exact-session-id", role: "composer" } }));
     else if (frame.op === "detach") socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "detached", sessionId: "exact-session-id" } }));
     else socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "mystery" } }));
   });
-  await expect(runSessionCommand(["delete", "exact-session-id", "--revision", "4", "--yes"], { root, randomId: () => "stable", timeoutMs: 200 })).rejects.toMatchObject({ code: "INVALID_DAEMON_RESPONSE" });
+  await expect(runSessionCommand([operation, "exact-session-id", "--revision", "4", "--yes"], { root, randomId: () => "stable", timeoutMs: 200 })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN", clientId: "cli-stable", requestId: expect.any(String) } });
   expect(await readdir(join(root, "cli", "pending"))).toHaveLength(1);
   await new Promise((resolve) => server.close(resolve));
 });

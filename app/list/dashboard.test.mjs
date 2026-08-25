@@ -527,6 +527,18 @@ describe("daemon dashboard backend", () => {
         await expect(backend.stop("exact-session", 3, "stop-request")).rejects.toMatchObject({ code: "DELIVERY_UNKNOWN", clientId: "stable-client", requestId: "stop-request" });
         expect(requests).toEqual(["attach", "stop"]);
     });
+    it("classifies a malformed response after Delete submission as delivery unknown", async () => {
+        const transaction = {
+            async connect() {},
+            async request(request) {
+                if (request.op === "attach") return { version: 1, requestId: request.requestId, ok: true, result: { kind: "attached", sessionId: "exact-session", role: "composer" } };
+                throw Object.assign(new Error("malformed daemon frame"), { code: "MALFORMED_FRAME" });
+            },
+            async close() {},
+        };
+        const backend = createDaemonDashboardBackend({ client: { createTransactionClient: () => transaction }, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
+        await expect(backend.delete("exact-session", 3, "delete-request")).rejects.toMatchObject({ code: "DELIVERY_UNKNOWN", clientId: "stable-client", requestId: "delete-request" });
+    });
     it.each(["stop", "delete"])("treats durable %s FAILED as a structured refusal", async (operation) => {
         const status = { clientId: "stable-client", requestId: `${operation}-request`, operation, stage: "FAILED", acceptedAt: timestamp, updatedAt: timestamp, error: { code: "SESSION_REFUSED", message: `${operation} refused`, retryable: false } };
         const client = {

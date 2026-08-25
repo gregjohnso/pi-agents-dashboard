@@ -3,11 +3,13 @@ import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
+import { validateFrontendState } from "../app/list/frontend-state.mjs";
 import { convertLegacyDashboardConfig } from "../shared/config.mjs";
 import { parseClientRequest, parseDaemonResponse } from "../shared/contracts.mjs";
 import { validateAttachmentResultRecord } from "./attachment-result-store.mjs";
 import { validatePersistedEvent } from "./event-store.mjs";
 import { validateSessionRecord } from "./registry-store.mjs";
+import { validateWorkerReplayRecord } from "./worker-replay-contract.mjs";
 
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -54,12 +56,7 @@ function validateLegacyArtifact(relative, text) {
     if (relative === "dashboard.json") { convertLegacyDashboardConfig(JSON.parse(text)); return; }
     if (/^sessions\/[^/]+\.json$/u.test(relative)) { const record = validateSessionRecord(JSON.parse(text)); if (`sessions/${record.sessionId}.json` !== relative) throw new TypeError("Registry filename and session ID differ"); return; }
     if (relative === "daemon/control.token") { const token = text.trim(); if (token.length === 0 || token.length > 4096 || /\s/u.test(token)) throw new TypeError("Control token is invalid"); return; }
-    if (relative === "frontend-state.json") {
-      const state = JSON.parse(text); exactObject(state, ["schemaVersion", "clientId", "cursor", "viewState", "launchDraft"], "Frontend state");
-      if (state.schemaVersion !== 1 || typeof state.clientId !== "string" || state.clientId.length === 0) throw new TypeError("Frontend state identity is invalid");
-      if (state.cursor !== undefined) { exactObject(state.cursor, ["daemonEpoch", "sequence"], "Frontend cursor"); if (typeof state.cursor.daemonEpoch !== "string" || !/^(0|[1-9]\d*)$/u.test(state.cursor.sequence)) throw new TypeError("Frontend cursor is invalid"); }
-      return;
-    }
+    if (relative === "frontend-state.json") { validateFrontendState(JSON.parse(text)); return; }
     if (relative === "daemon/workers.json") {
       const metadata = JSON.parse(text); exactObject(metadata, ["schemaVersion", "workers"], "Worker metadata"); if (metadata.schemaVersion !== 1 || !Array.isArray(metadata.workers)) throw new TypeError("Worker metadata is invalid");
       for (const worker of metadata.workers) { exactObject(worker, ["sessionId", "runId", "leaseId", "generation", "identity", "piChildIdentity", "token"], "Worker record"); if ([worker.sessionId, worker.runId, worker.leaseId].some((entry) => typeof entry !== "string" || entry.length === 0) || !Number.isSafeInteger(worker.generation) || worker.generation <= 0 || !validIdentity(worker.identity) || !validIdentity(worker.piChildIdentity) || (worker.token !== undefined && (typeof worker.token !== "string" || worker.token.length === 0))) throw new TypeError("Worker record is invalid"); }
@@ -93,7 +90,7 @@ function validateLegacyArtifact(relative, text) {
     if (relative === "cli/client-id") { const clientId = text.trim(); if (clientId.length === 0 || clientId.includes("/") || clientId.includes("\0") || clientId !== text.trim()) throw new TypeError("CLI identity is invalid"); return; }
     if (/^cli\/pending\/[^/]+\.json$/u.test(relative)) { const value = JSON.parse(text); exactObject(value, ["schemaVersion", "action", "sessionId", "revision", "clientId", "requestId"], "Pending CLI request"); if (value.schemaVersion !== 1 || !["stop", "delete"].includes(value.action) || typeof value.sessionId !== "string" || value.sessionId.length === 0 || !Number.isSafeInteger(value.revision) || value.revision < 0 || [value.clientId, value.requestId].some((entry) => typeof entry !== "string" || entry.length === 0)) throw new TypeError("Pending CLI request is invalid"); return; }
     if (/^runs\/[^/]+\/(worker\.stdout\.log|worker\.stderr\.log)$/u.test(relative)) return;
-    if (/^runs\/[^/]+\/worker-replay\.jsonl$/u.test(relative)) { validateJsonLines(text, (value) => typeof value === "object" && value !== null && typeof value.clientId === "string" && typeof value.requestId === "string" && typeof value.op === "string" && typeof value.stage === "string" && typeof value.at === "string", "Worker replay store"); return; }
+    if (/^runs\/[^/]+\/worker-replay\.jsonl$/u.test(relative)) { validateJsonLines(text, validateWorkerReplayRecord, "Worker replay store"); return; }
     throw new TypeError(`Unknown legacy state artifact: ${relative}`);
   } catch (error) { throw migrationError("MALFORMED_LEGACY_STATE", `Malformed legacy artifact: ${relative}`, { cause: error }); }
 }
@@ -153,15 +150,55 @@ async function validateReconciledDestination(root, files, fsOps) {
   const collision = (await fsOps.readdir(root)).find((/** @type {string} */ name) => !allowed.has(name));
   if (collision !== undefined) throw migrationError("DESTINATION_COLLISION", `Destination contains unexpected artifact: ${collision}`);
 }
-/** @param {string} root @param {Array<{relative:string,sha256:string}>} files @param {any} fsOps */
-async function validateCompletedDestination(root, files, fsOps) {
-  const allowed = new Set([LOCK, MANIFEST, CANONICAL_MARKER, ...files.map((file) => file.relative.split("/")[0])]);
-  const collision = (await fsOps.readdir(root)).find((/** @type {string} */ name) => !allowed.has(name));
-  if (collision !== undefined) throw migrationError("DESTINATION_COLLISION", `Destination contains unexpected artifact: ${collision}`);
-  await Promise.all(files.map(async (/** @type {{relative:string,sha256:string}} */ file) => {
-    const text = await fsOps.readFile(join(root, file.relative), "utf8").catch(() => undefined);
-    if (text === undefined || digest(text) !== file.sha256) throw migrationError("MIGRATION_IDENTITY_MISMATCH", `Migrated file identity changed: ${file.relative}`);
-  }));
+/** @param {string} path @param {any} metadata @param {number} expectedUserId @param {any} fsOps */
+async function readPrivateDestinationFile(path, metadata, expectedUserId, fsOps) {
+  const handle = await fsOps.open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.uid !== expectedUserId || (opened.mode & 0o777) !== FILE_MODE || opened.dev !== metadata.dev || opened.ino !== metadata.ino) throw migrationError("MIGRATION_IDENTITY_MISMATCH", `Migrated file is unsafe: ${path}`);
+    const text = await handle.readFile("utf8");
+    const completed = await handle.stat();
+    if (completed.dev !== opened.dev || completed.ino !== opened.ino || completed.size !== opened.size || completed.mtimeMs !== opened.mtimeMs) throw migrationError("MIGRATION_IDENTITY_MISMATCH", `Migrated file changed while read: ${path}`);
+    return text;
+  } finally { await handle.close(); }
+}
+/** @param {string} root @param {Array<{relative:string,type:"directory"|"file",text?:string}>} entries @param {number} expectedUserId @param {any} fsOps */
+async function validateCompletedDestination(root, entries, expectedUserId, fsOps) {
+  const expected = new Map(entries.map((entry) => [entry.relative, entry]));
+  const seen = new Set();
+  /** @param {string} directory @param {string} relative */
+  async function visit(directory, relative) {
+    for (const name of await fsOps.readdir(directory)) {
+      const path = join(directory, name);
+      const child = relative === "" ? name : join(relative, name);
+      const metadata = await fsOps.lstat(path);
+      if (relative === "" && name === LOCK) {
+        if (!metadata.isDirectory() || metadata.isSymbolicLink() || metadata.uid !== expectedUserId || (metadata.mode & 0o777) !== DIRECTORY_MODE) throw migrationError("DESTINATION_COLLISION", "Migration lock is unsafe");
+        continue;
+      }
+      if (relative === "" && name === MANIFEST) {
+        try { await readPrivateDestinationFile(path, metadata, expectedUserId, fsOps); }
+        catch (error) { if (/** @type {any} */ (error)?.code === "MIGRATION_IDENTITY_MISMATCH") throw error; throw migrationError("MIGRATION_IDENTITY_MISMATCH", "Migration manifest is unsafe", { cause: error }); }
+        continue;
+      }
+      const entry = expected.get(child);
+      if (entry === undefined || metadata.isSymbolicLink() || metadata.uid !== expectedUserId) throw migrationError("DESTINATION_COLLISION", `Unexpected interrupted migration artifact: ${child}`);
+      if (entry.type === "directory") {
+        if (!metadata.isDirectory() || (metadata.mode & 0o777) !== DIRECTORY_MODE) throw migrationError("DESTINATION_COLLISION", `Interrupted migration directory is unsafe: ${child}`);
+        seen.add(child);
+        await visit(path, child);
+        continue;
+      }
+      if (!metadata.isFile()) throw migrationError("DESTINATION_COLLISION", `Interrupted migration artifact has the wrong type: ${child}`);
+      let text;
+      try { text = await readPrivateDestinationFile(path, metadata, expectedUserId, fsOps); }
+      catch (error) { if (/** @type {any} */ (error)?.code === "MIGRATION_IDENTITY_MISMATCH") throw error; throw migrationError("MIGRATION_IDENTITY_MISMATCH", `Migrated file is unsafe: ${child}`, { cause: error }); }
+      if (digest(text) !== digest(entry.text ?? "")) throw migrationError("MIGRATION_IDENTITY_MISMATCH", `Migrated file identity changed: ${child}`);
+      seen.add(child);
+    }
+  }
+  await visit(root, "");
+  if (seen.size !== expected.size) throw migrationError("DESTINATION_COLLISION", "Interrupted migration output is incomplete");
 }
 /** @param {string} root @param {any} fsOps @param {boolean} create @param {number} expectedUserId */
 async function acquireLock(root, fsOps, create, expectedUserId) {
@@ -236,12 +273,12 @@ export async function migrateLegacyState({ legacyRoot, destinationRoot, expected
       const manifestKeys = ["schemaVersion", "migrationId", "sourceIdentity", "destinationIdentity", "state", "configFrom", "configTo", "createdAt", "updatedAt"];
       if (existing.schemaVersion !== 1 || existing.destinationIdentity !== destinationIdentity || existing.configFrom !== 1 || existing.configTo !== 2 || !["PREPARED", "PUBLISHED", "RECONCILED"].includes(existing.state) || typeof existing.createdAt !== "string" || typeof existing.updatedAt !== "string" || Object.keys(existing).length !== manifestKeys.length || Object.keys(existing).some((key) => !manifestKeys.includes(key))) throw migrationError("MIGRATION_IDENTITY_MISMATCH", "Destination manifest contract is invalid");
       if (existing.state === "RECONCILED" && await fsOps.readFile(join(destinationRoot, CANONICAL_MARKER), "utf8").then((/** @type {string} */ value) => value.trim() === migrationId).catch(() => false)) { await validateReconciledDestination(destinationRoot, files, fsOps); return { status: "ALREADY_MIGRATED", migrationId, manifestPath }; }
-      if (existing.state === "PREPARED") await validateCompletedDestination(destinationRoot, files, fsOps);
+      if (existing.state === "PREPARED") await validateCompletedDestination(destinationRoot, preparedEntries, expectedUserId, fsOps);
       if (existing.state === "PUBLISHED") {
         const marker = await fsOps.readFile(join(destinationRoot, RECONCILIATION_MARKER), "utf8").then((/** @type {string} */ value) => value.trim()).catch((/** @type {NodeJS.ErrnoException} */ error) => { if (error.code === "ENOENT") return undefined; throw error; });
         if (marker !== undefined && marker !== migrationId) throw migrationError("MIGRATION_IDENTITY_MISMATCH", "Reconciliation marker belongs to another migration");
         if (marker === migrationId) await validatePublishedDestination(destinationRoot, files, expectedUserId, fsOps);
-        else await validateCompletedDestination(destinationRoot, files, fsOps);
+        else await validateCompletedDestination(destinationRoot, preparedEntries, expectedUserId, fsOps);
       }
     } else {
       const destinationEntries = (await fsOps.readdir(destinationRoot)).filter((/** @type {string} */ name) => name !== LOCK);

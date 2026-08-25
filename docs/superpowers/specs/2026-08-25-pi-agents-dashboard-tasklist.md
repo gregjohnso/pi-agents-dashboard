@@ -22,14 +22,14 @@ Use the [design spec](2026-08-25-pi-agents-dashboard-design.md) for requirements
 
 ## Decision Gate
 
-- [ ] **O1 Worker cap** is resolved in the design spec.
-- [ ] **O2 Completed history** is resolved in the design spec.
-- [ ] **O3 Idle retention** is resolved in the design spec.
-- [ ] **O4 Daemon scope** is resolved in the design spec.
-- [ ] **O5 Ambiguous delivery** is resolved in the design spec.
-- [ ] **O6 Attachment arbitration** is resolved in the design spec.
-- [ ] **O7 Platform support** is resolved in the design spec.
-- [ ] Task 3 configuration and protocol fixtures match the approved design decisions.
+- [x] **O1 Worker cap** is resolved in the design spec.
+- [x] **O2 Completed history** is resolved in the design spec.
+- [x] **O3 Idle retention** is resolved in the design spec.
+- [x] **O4 Daemon scope** is resolved in the design spec.
+- [x] **O5 Ambiguous delivery** is resolved in the design spec.
+- [x] **O6 Attachment arbitration** is resolved in the design spec.
+- [x] **O7 Platform support** is resolved in the design spec.
+- [x] Task 3 configuration and protocol fixtures match the approved design decisions.
 
 ## Dependency Graph
 
@@ -53,14 +53,14 @@ T02 + T14 + T15 ─────────────────────�
   - Deliverables: self-contained npm/Pi manifest, package-relative runtime discovery, optional CLI stub, Pixi, TypeScript, Vitest, extension stub, README, license, first commit.
   - Gate: `pixi run typecheck && pixi run test-unit && pixi run pack-check`.
 
-- [ ] **T02 Prove Pi host capability seam**
+- [x] **T02 Prove Pi host capability seam**
   - Owner: isolated writer after T01.
   - Depends on: T01.
   - Can run in parallel with: T03.
   - Deliverables: feature probe, supported/unsupported integration fixture, host-seam evidence document.
   - Gate: stock Pi 0.84.3 fails closed; a supported host proves normal Pi-package startup, daemon ownership, native attachment, and package-relative runtime discovery without private imports or a global CLI.
 
-- [ ] **T03 Resolve product and protocol decisions**
+- [x] **T03 Resolve product and protocol decisions**
   - Owner: parent plus user approval.
   - Depends on: T01.
   - Can run in parallel with: T02.

@@ -91,7 +91,7 @@ T02 + T14 + T15 ─────────────────────�
 
 ## Milestone 2: Durable Foundations
 
-- [ ] **T07 Implement registry, ownership, and per-session serialization**
+- [x] **T07 Implement registry, ownership, and per-session serialization**
   - Owner: isolated Lane C.
   - Depends on: T04, T06.
   - Can run in parallel with: T08, T09, T12.

@@ -1,19 +1,23 @@
 import net from "node:net";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, expect, it } from "vitest";
 
+import { connectDaemon } from "./daemon-connector.mjs";
 import { createJsonlDecoder, createJsonlEncoder } from "./jsonl.mjs";
 import { createDaemonRuntime } from "./daemon.mjs";
 import { RegistryStore } from "./registry-store.mjs";
 
 /** @type {any[]} */
 const runtimes = [];
+/** @type {any[]} */
+const workerLoops = [];
 /** @type {string[]} */
 const roots = [];
 afterEach(async () => {
   await Promise.all(runtimes.splice(0).map((runtime) => runtime.close()));
+  await Promise.all(workerLoops.splice(0).map((worker) => worker.stop()));
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -41,6 +45,7 @@ function connect({ socketPath, token, role, maxBytes = 1024, onFrame }) {
       else received.push(frame);
     }
   });
+  socket.on("error", () => {});
   const next = () => received.length > 0 ? Promise.resolve(received.shift()) : new Promise((resolve) => waiters.push(resolve));
   const ready = new Promise((resolve, reject) => {
     socket.once("connect", () => {
@@ -52,6 +57,66 @@ function connect({ socketPath, token, role, maxBytes = 1024, onFrame }) {
   /** @param {any} value */
   const send = (value) => { socket.write(encoder.encode(value)); };
   return { socket, ready, next, send, close() { socket.destroy(); } };
+}
+
+/** @param {{ socketPath: string, tokenPath: string }} config @param {any} worker */
+function startPersistentFakeWorker(config, worker) {
+  const controller = new AbortController();
+  let connectionCount = 0;
+  let commandCount = 0;
+  /** @type {string[]} */
+  const commandIds = [];
+  /** @type {any} */
+  let previousCommand;
+  let alive = true;
+  const run = (async () => {
+    while (!controller.signal.aborted) {
+      /** @type {any} */
+      let connection;
+      try {
+        connection = await connectDaemon({ config: { ...config, maxBytes: 1024 }, signal: controller.signal });
+        connectionCount += 1;
+        connection.onMessage((/** @type {any} */ frame) => {
+          if (frame?.type !== "command") return;
+          commandCount += 1;
+          commandIds.push(frame.id);
+          if (frame.command.requestId === worker.malformedRequestId) {
+            void connection.send({ version: 1, type: "command_result", token: worker.token, id: frame.id, ok: true, record: { stage: "RPC_ACKNOWLEDGED" } });
+            return;
+          }
+          if (previousCommand !== undefined) {
+            void connection.send({
+              version: 1,
+              type: "command_result",
+              token: worker.token,
+              id: previousCommand.id,
+              ok: true,
+              record: { clientId: previousCommand.command.clientId, requestId: previousCommand.command.requestId, op: previousCommand.command.op, stage: "RPC_ACKNOWLEDGED", at: new Date().toISOString(), result: null },
+            });
+          }
+          previousCommand = frame;
+          void connection.send({
+            version: 1,
+            type: "command_result",
+            token: worker.token,
+            id: frame.id,
+            ok: true,
+            record: { clientId: frame.command.clientId, requestId: frame.command.requestId, op: frame.command.op, stage: "RPC_ACKNOWLEDGED", at: new Date().toISOString(), result: null },
+          });
+        });
+        await connection.send({ version: 1, type: "worker_ready", token: worker.token, sessionId: worker.sessionId, runId: worker.runId, leaseId: worker.leaseId, generation: worker.generation, worker: worker.identity, piChild: worker.piChildIdentity });
+        await connection.closed;
+      } catch {
+      } finally {
+        connection?.close();
+      }
+      if (!controller.signal.aborted) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    alive = false;
+  })();
+  const loop = { pid: worker.identity.pid, get alive() { return alive; }, get connectionCount() { return connectionCount; }, get commandCount() { return commandCount; }, get commandIds() { return [...commandIds]; }, async stop() { controller.abort(); await run; } };
+  workerLoops.push(loop);
+  return loop;
 }
 
 it("shares one daemon across two effective Pi config roots and rejects mutations while recovering", async () => {
@@ -86,6 +151,36 @@ it("shares one daemon across two effective Pi config roots and rejects mutations
   second.close();
 });
 
+it("rejects worker mutations during reconciliation without touching unopened stores", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const workerIdentity = { pid: 901, startIdentity: "worker-901", processGroupId: 901 };
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const now = "2026-08-25T12:00:00.000Z";
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "recovering", sessionFile: "/sessions/recovering.jsonl", canonicalSessionFile: "/sessions/recovering.jsonl", cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-recovering", process: workerIdentity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-recovering", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "recovering", runId: "run-recovering", leaseId: "lease-recovering", generation: 1, identity: workerIdentity, piChildIdentity: workerIdentity }] })}\n`, { mode: 0o600 });
+  /** @type {((value?: unknown) => void) | undefined} */
+  let releaseRecovery;
+  const gate = new Promise((resolve) => { releaseRecovery = resolve; });
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    inspect: async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : workerIdentity,
+    reconnectTimeoutMs: 20,
+    reconcile: async (/** @type {any} */ options) => { await gate; return options.defaultReconcile(); },
+  });
+  const worker = connect({ socketPath: runtime.socketPath, token: runtime.token, role: "worker" });
+  await worker.ready;
+  worker.send({ version: 1, type: "worker_ready", token: "private-worker", sessionId: "recovering", runId: "run-recovering", leaseId: "lease-recovering", generation: 1, worker: workerIdentity, piChild: workerIdentity });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  worker.send({ version: 1, type: "worker_event", token: "private-worker", sessionId: "recovering", event: { type: "TURN_STARTED", at: now } });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(runtime.status()).toMatchObject({ state: "RECONCILING" });
+  /** @type {(value?: unknown) => void} */ (releaseRecovery)();
+  await expect(runtime.ready).rejects.toMatchObject({ code: "OWNERSHIP_CONFLICT" });
+  await runtime.close();
+  worker.close();
+});
+
 it("authenticates every connection and applies strict framing limits", async () => {
   const runtime = await createDaemonRuntime({ root: await root(), hostProbe: async () => ({ blockers: [] }), maxBytes: 256 });
   runtimes.push(runtime);
@@ -104,74 +199,213 @@ it("authenticates every connection and applies strict framing limits", async () 
   expect(oversized).toMatchObject({ error: { code: "FRAME_TOO_LARGE" } });
 });
 
-it("reconnects two exact workers and routes durable commands after daemon restart", async () => {
+it("contains connector listener exceptions and keeps an error handler after authentication", async () => {
+  const stateRoot = await root();
+  const socketPath = join(stateRoot, "connector.sock");
+  const tokenPath = join(stateRoot, "connector.token");
+  await writeFile(tokenPath, "private-token\n", { mode: 0o600 });
+  const server = net.createServer((socket) => {
+    const decoder = createJsonlDecoder({ maxBytes: 1024 });
+    const encoder = createJsonlEncoder({ maxBytes: 1024 });
+    socket.on("error", () => {});
+    socket.on("data", (chunk) => {
+      if (decoder.push(chunk).length === 0) return;
+      socket.write(encoder.encode({ version: 1, kind: "authenticated" }), () => {
+        setTimeout(() => socket.write(encoder.encode({ version: 1, type: "command", id: "late-frame" })), 10);
+      });
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, () => resolve(undefined));
+  });
+  const connection = await connectDaemon({ config: { socketPath, tokenPath, maxBytes: 1024 } });
+  connection.onMessage(() => { throw new Error("listener failure"); });
+  await Promise.race([connection.closed, new Promise((_, reject) => setTimeout(() => reject(new Error("connector did not close")), 500))]);
+  await new Promise((resolve) => server.close(() => resolve(undefined)));
+});
+
+it("publishes failed recovery status and removes lifecycle artifacts on close", async () => {
+  const stateRoot = await root();
+  const runtime = await createDaemonRuntime({ root: stateRoot, reconcile: async () => { throw Object.assign(new Error("ownership conflict"), { code: "OWNERSHIP_CONFLICT" }); } });
+  await expect(runtime.ready).rejects.toMatchObject({ code: "OWNERSHIP_CONFLICT" });
+  const status = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await expect(status.ready).resolves.toMatchObject({ state: "FAILED", error: { code: "OWNERSHIP_CONFLICT" } });
+  status.close();
+  await runtime.close();
+  await expect(access(join(stateRoot, "daemon", "pid.json"))).rejects.toMatchObject({ code: "ENOENT" });
+  await expect(access(runtime.socketPath)).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+it("fails closed and closes partial cursor stores", async () => {
+  const stateRoot = await root();
+  await mkdir(join(stateRoot, "daemon"), { mode: 0o700 });
+  await writeFile(join(stateRoot, "daemon", "event-acks.json"), "{\"client\":", { mode: 0o600 });
+  const runtime = await createDaemonRuntime({ root: stateRoot });
+  await expect(runtime.ready).rejects.toThrow();
+  expect(runtime.status()).toMatchObject({ state: "FAILED" });
+  await runtime.close();
+  await expect(access(join(stateRoot, "daemon", "pid.json"))).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+it("cancels and drains reconciliation before releasing lifecycle ownership", async () => {
+  const stateRoot = await root();
+  let sawAbort = false;
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    reconcile: async (/** @type {any} */ { signal }) => {
+      await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+      sawAbort = true;
+      throw Object.assign(new Error("cancelled"), { code: "RECONCILIATION_CANCELLED" });
+    },
+  });
+  await runtime.close();
+  expect(sawAbort).toBe(true);
+  await expect(access(join(stateRoot, "daemon", "pid.json"))).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+it("serializes monotonic event acknowledgements by stable socket client identity", async () => {
+  const stateRoot = await root();
+  const runtime = await createDaemonRuntime({ root: stateRoot });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const first = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  const second = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await Promise.all([first.ready, second.ready]);
+  for (const [client, requestId] of [[first, "event-one"], [second, "event-two"]]) {
+    client.send({ version: 1, clientId: "stable-client", requestId, op: "prompt", payload: { sessionId: "missing", text: "x" } });
+    await client.next();
+  }
+  first.send({ version: 1, clientId: "stable-client", requestId: "ack-two", op: "ack", payload: { cursor: { daemonEpoch: runtime.daemonEpoch, sequence: "2" } } });
+  second.send({ version: 1, clientId: "stable-client", requestId: "ack-one", op: "ack", payload: { cursor: { daemonEpoch: runtime.daemonEpoch, sequence: "1" } } });
+  await Promise.all([first.next(), second.next()]);
+  const cursors = JSON.parse(await readFile(join(stateRoot, "daemon", "event-acks.json"), "utf8"));
+  expect(cursors["stable-client"]).toEqual({ daemonEpoch: runtime.daemonEpoch, sequence: "2" });
+  first.send({ version: 1, clientId: "changed-client", requestId: "wrong-client", op: "ack", payload: { cursor: { daemonEpoch: runtime.daemonEpoch, sequence: "2" } } });
+  expect(await first.next()).toMatchObject({ ok: false, error: { code: "CLIENT_IDENTITY_CONFLICT" } });
+  first.close();
+  second.close();
+});
+
+it("journals launch before the irreversible call and refuses ambiguous duplicate retry", async () => {
+  const stateRoot = await root();
+  let launches = 0;
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    hostProbe: async () => ({ blockers: [] }),
+    resolveLaunchRequest: async () => ({ sessionId: "launch-session" }),
+    workerSupervisor: {
+      async launch() { launches += 1; throw Object.assign(new Error("crash after spawn"), { code: "LAUNCH_CRASH" }); },
+      async close() {},
+    },
+  });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await client.ready;
+  const launch = { version: 1, clientId: "launcher", requestId: "exact-launch", op: "launch", payload: { prompt: "go", cwd: "/repo", sourceSessionId: "source", isolation: { mode: "worktree" } } };
+  client.send(launch);
+  expect(await client.next()).toMatchObject({ ok: false, error: { code: "LAUNCH_CRASH" } });
+  expect(await runtime.commandStatus(launch)).toMatchObject({ stage: "DELIVERY_UNKNOWN" });
+  client.send(launch);
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "DELIVERY_UNKNOWN" } } });
+  expect(launches).toBe(1);
+  client.close();
+});
+
+it("waits for an admitted launch chain before lifecycle release", async () => {
+  const stateRoot = await root();
+  /** @type {((value?: unknown) => void) | undefined} */
+  let releaseLaunch;
+  const launchGate = new Promise((resolve) => { releaseLaunch = resolve; });
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    hostProbe: async () => ({ blockers: [] }),
+    resolveLaunchRequest: async () => ({ sessionId: "launch-session" }),
+    workerSupervisor: {
+      async launch() { await launchGate; throw Object.assign(new Error("stopped launch"), { code: "LAUNCH_STOPPED" }); },
+      async close() {},
+    },
+  });
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await client.ready;
+  client.send({ version: 1, clientId: "launcher", requestId: "shutdown-launch", op: "launch", payload: { prompt: "go", cwd: "/repo", sourceSessionId: "source", isolation: { mode: "worktree" } } });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  let closed = false;
+  const closing = runtime.close().then(() => { closed = true; });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(closed).toBe(false);
+  /** @type {(value?: unknown) => void} */ (releaseLaunch)();
+  await closing;
+  expect(closed).toBe(true);
+  client.close();
+});
+
+it("reconnects two surviving fake workers through the concrete connector after daemon restart", async () => {
   const stateRoot = await root();
   for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const identities = new Map([
     [201, { pid: 201, startIdentity: "worker-one", processGroupId: 201 }],
+    [211, { pid: 211, startIdentity: "pi-one", processGroupId: 201 }],
     [202, { pid: 202, startIdentity: "worker-two", processGroupId: 202 }],
+    [212, { pid: 212, startIdentity: "pi-two", processGroupId: 202 }],
   ]);
   /** @param {number} pid */
   const inspect = async (pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : identities.get(pid) ?? Promise.reject(Object.assign(new Error("gone"), { code: "ENOENT" }));
   const registry = new RegistryStore(join(stateRoot, "sessions"));
   const now = "2026-08-25T12:00:00.000Z";
-  for (const [sessionId, pid] of /** @type {Array<[string, number]>} */ ([["one", 201], ["two", 202]])) {
-    const identity = /** @type {import("../shared/contracts.js").ProcessIdentity} */ (identities.get(pid));
-    await registry.create({ schemaVersion: 1, revision: 0, sessionId, sessionFile: `/sessions/${sessionId}.jsonl`, canonicalSessionFile: `/sessions/${sessionId}.jsonl`, cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: `run-${sessionId}`, process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: `run-${sessionId}`, createdAt: now, updatedAt: now });
+  /** @type {any[]} */
+  const workers = [
+    { sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, identity: identities.get(201), piChildIdentity: identities.get(211), token: "worker-token-one", malformedRequestId: "invalid-worker-result" },
+    { sessionId: "two", runId: "run-two", leaseId: "lease-two", generation: 1, identity: identities.get(202), piChildIdentity: identities.get(212), token: "worker-token-two" },
+  ];
+  for (const worker of workers) {
+    await registry.create({ schemaVersion: 1, revision: 0, sessionId: worker.sessionId, sessionFile: `/sessions/${worker.sessionId}.jsonl`, canonicalSessionFile: `/sessions/${worker.sessionId}.jsonl`, cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: worker.runId, process: worker.identity, acquiredAt: now, heartbeatAt: now }, latestRunId: worker.runId, createdAt: now, updatedAt: now });
   }
-  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [
-    { sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, identity: identities.get(201), piChildIdentity: identities.get(201) },
-    { sessionId: "two", runId: "run-two", leaseId: "lease-two", generation: 1, identity: identities.get(202), piChildIdentity: identities.get(202) },
-  ] })}\n`, { mode: 0o600 });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: workers.map(({ token: _token, malformedRequestId: _malformedRequestId, ...worker }) => worker) })}\n`, { mode: 0o600 });
 
-  const startAndReconnect = async () => {
-    const runtime = await createDaemonRuntime({ root: stateRoot, inspect, hostProbe: async () => ({ blockers: [] }), reconnectTimeoutMs: 500 });
-    const workers = [
-      { sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, identity: identities.get(201), token: "worker-token-one" },
-      { sessionId: "two", runId: "run-two", leaseId: "lease-two", generation: 1, identity: identities.get(202), token: "worker-token-two" },
-    ].map((worker) => {
-      const connection = connect({
-        socketPath: runtime.socketPath,
-        token: runtime.token,
-        role: "worker",
-        onFrame(/** @type {any} */ frame, /** @type {any} */ socket, /** @type {any} */ encoder) {
-          if (frame?.type !== "command") return false;
-          socket.write(encoder.encode({ version: 1, type: "command_result", token: worker.token, id: frame.id, ok: true, record: { stage: "RPC_ACKNOWLEDGED" } }));
-          return true;
-        },
-      });
-      void connection.ready.then(() => connection.send({ version: 1, type: "worker_ready", token: worker.token, sessionId: worker.sessionId, runId: worker.runId, leaseId: worker.leaseId, generation: worker.generation, worker: worker.identity, piChild: worker.identity }));
-      return connection;
-    });
-    await runtime.ready;
-    return { runtime, workers };
-  };
-
-  const first = await startAndReconnect();
-  const frontend = connect({ socketPath: first.runtime.socketPath, token: first.runtime.token });
+  const firstRuntime = await createDaemonRuntime({ root: stateRoot, inspect, hostProbe: async () => ({ blockers: [] }), reconnectTimeoutMs: 1_000 });
+  const loops = workers.map((worker) => startPersistentFakeWorker({ socketPath: firstRuntime.socketPath, tokenPath: firstRuntime.tokenPath }, worker));
+  await firstRuntime.ready;
+  const frontend = connect({ socketPath: firstRuntime.socketPath, token: firstRuntime.token });
   await frontend.ready;
   frontend.send({ version: 1, clientId: "client", requestId: "before-restart", op: "prompt", payload: { sessionId: "one", text: "hello" } });
   expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
-  frontend.send({ version: 1, clientId: "client", requestId: "ack-before-restart", op: "ack", payload: { cursor: { daemonEpoch: first.runtime.daemonEpoch, sequence: "1" } } });
-  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "acknowledged", cursor: { sequence: "1" } } });
   frontend.close();
-  await first.runtime.close();
-  first.workers.forEach((worker) => worker.close());
+  await firstRuntime.close();
+  expect(loops.map((loop) => [loop.pid, loop.alive])).toEqual([[201, true], [202, true]]);
 
-  const second = await startAndReconnect();
-  runtimes.push(second.runtime);
-  const resumed = connect({ socketPath: second.runtime.socketPath, token: second.runtime.token });
+  const secondRuntime = await createDaemonRuntime({ root: stateRoot, inspect, hostProbe: async () => ({ blockers: [] }), reconnectTimeoutMs: 1_000 });
+  runtimes.push(secondRuntime);
+  await secondRuntime.ready;
+  expect(secondRuntime.daemonEpoch).toBe(firstRuntime.daemonEpoch);
+  expect(secondRuntime.token).toBe(firstRuntime.token);
+  expect(loops.every((loop) => loop.connectionCount >= 2)).toBe(true);
+  const malformed = connect({ socketPath: secondRuntime.socketPath, token: secondRuntime.token });
+  await malformed.ready;
+  malformed.send({ version: 1, clientId: "client", requestId: "invalid-worker-result", op: "prompt", payload: { sessionId: "one", text: "invalid result" } });
+  expect(await malformed.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "DELIVERY_UNKNOWN" } } });
+  malformed.close();
+  const resumed = connect({ socketPath: secondRuntime.socketPath, token: secondRuntime.token });
   await resumed.ready;
-  expect(second.runtime.daemonEpoch).toBe(first.runtime.daemonEpoch);
-  expect(second.runtime.token).toBe(first.runtime.token);
-  resumed.send({ version: 1, clientId: "client", requestId: "resume-events", op: "subscribe", payload: { after: { daemonEpoch: second.runtime.daemonEpoch, sequence: "0" } } });
-  expect(await resumed.next()).toMatchObject({ ok: true, result: { kind: "subscribed", cursor: { sequence: "1" } } });
-  expect(await resumed.next()).toMatchObject({ kind: "command_changed", payload: { status: { requestId: "before-restart" } } });
   resumed.send({ version: 1, clientId: "client", requestId: "after-restart", op: "steer", payload: { sessionId: "two", text: "next" } });
-  expect(await resumed.next()).toMatchObject({ kind: "command_changed", payload: { status: { requestId: "after-restart", stage: "COMPLETED" } } });
   expect(await resumed.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  const beforeLostResponse = loops[1].commandCount;
+  const lostResponse = { version: 1, clientId: "client", requestId: "lost-response", op: "prompt", payload: { sessionId: "two", text: "persist first" } };
+  resumed.send(lostResponse);
   resumed.close();
-  second.workers.forEach((worker) => worker.close());
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const retry = connect({ socketPath: secondRuntime.socketPath, token: secondRuntime.token });
+  await retry.ready;
+  retry.send(lostResponse);
+  expect(await retry.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  expect(loops[1].commandCount).toBe(beforeLostResponse + 1);
+  expect(new Set(loops.flatMap((loop) => loop.commandIds)).size).toBe(loops.reduce((total, loop) => total + loop.commandIds.length, 0));
+  retry.close();
+  await secondRuntime.close();
+  runtimes.splice(runtimes.indexOf(secondRuntime), 1);
+  expect(loops.map((loop) => [loop.pid, loop.alive])).toEqual([[201, true], [202, true]]);
 });
 
 it("closes daemon and frontend sockets without signaling worker processes", async () => {

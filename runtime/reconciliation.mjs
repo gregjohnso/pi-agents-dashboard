@@ -52,6 +52,7 @@ export class RecoveredWorkerRouter {
   #metadataPath;
   #workers = new Map();
   #connections = new Map();
+  #routeTails = new Map();
   #loaded = false;
 
   /** @param {{ registry: RegistryStore, inspect(pid: number): Promise<any>, metadataPath: string }} options */
@@ -107,15 +108,29 @@ export class RecoveredWorkerRouter {
     return [...this.#connections.keys()];
   }
 
+  /** @template T @param {string} sessionId @param {() => Promise<T>} action */
+  #serializeRoute(sessionId, action) {
+    const previous = this.#routeTails.get(sessionId) ?? Promise.resolve();
+    const result = previous.then(action);
+    const tail = result.then(() => {}, () => {});
+    this.#routeTails.set(sessionId, tail);
+    void tail.finally(() => { if (this.#routeTails.get(sessionId) === tail) this.#routeTails.delete(sessionId); });
+    return result;
+  }
+
   /** @param {any} frame @param {any} connection */
   async adopt(frame, connection) {
     const allowed = ["version", "type", "token", "sessionId", "runId", "leaseId", "generation", "worker", "piChild"];
     if (typeof frame !== "object" || frame === null || Array.isArray(frame) || Object.keys(frame).some((key) => !allowed.includes(key)) || frame.version !== 1 || frame.type !== "worker_ready") throw Object.assign(new Error("Invalid worker ready frame"), { code: "INVALID_WORKER_FRAME" });
+    return this.#serializeRoute(frame.sessionId, async () => {
     const expected = this.#workers.get(frame.sessionId);
     const record = await this.#registry.get(frame.sessionId);
     if (expected === undefined || record?.ownership === undefined || expected.runId !== frame.runId || expected.leaseId !== frame.leaseId || expected.generation !== frame.generation || !sameIdentity(expected.identity, frame.worker) || !sameIdentity(expected.piChildIdentity, frame.piChild) || record.ownership.runId !== frame.runId || !sameIdentity(record.ownership.process, frame.worker)) throw Object.assign(new Error("Worker ownership or generation conflicts with durable state"), { code: "OWNERSHIP_CONFLICT" });
-    const actual = await this.#inspect(frame.worker.pid);
-    if (!sameIdentity(actual, frame.worker)) throw Object.assign(new Error("Worker process identity changed"), { code: "PROCESS_IDENTITY_CONFLICT" });
+    const [actualWorker, actualPiChild] = await Promise.all([
+      this.#inspect(frame.worker.pid),
+      frame.piChild.pid === frame.worker.pid ? Promise.resolve(undefined) : this.#inspect(frame.piChild.pid),
+    ]);
+    if (!sameIdentity(actualWorker, frame.worker) || (actualPiChild !== undefined && !sameIdentity(actualPiChild, frame.piChild))) throw Object.assign(new Error("Worker or Pi-child process identity changed"), { code: "PROCESS_IDENTITY_CONFLICT" });
     if (expected.token !== undefined && expected.token !== frame.token) throw Object.assign(new Error("Worker authentication failed"), { code: "WORKER_AUTHENTICATION_FAILED" });
     if (expected.token === undefined) {
       if (typeof frame.token !== "string" || frame.token.length === 0) throw Object.assign(new Error("Worker authentication token is missing"), { code: "WORKER_AUTHENTICATION_FAILED" });
@@ -128,6 +143,32 @@ export class RecoveredWorkerRouter {
       if (this.#connections.get(frame.sessionId) === connection) this.#connections.delete(frame.sessionId);
     }).catch(() => {});
     return expected;
+    });
+  }
+
+  /** Verify the current route and both live process identities before one frame boundary. @param {any} metadata @param {any} connection */
+  async assertCurrent(metadata, connection) {
+    const expected = this.#workers.get(metadata?.sessionId);
+    if (expected !== metadata || this.#connections.get(metadata?.sessionId) !== connection) throw Object.assign(new Error("Worker connection was replaced"), { code: "STALE_WORKER_CONNECTION" });
+    const record = await this.#registry.get(metadata.sessionId);
+    if (record?.ownership === undefined || record.ownership.runId !== metadata.runId || !sameIdentity(record.ownership.process, metadata.identity)) throw Object.assign(new Error("Worker no longer owns the durable session"), { code: "OWNERSHIP_CONFLICT" });
+    const [actualWorker, actualPiChild] = await Promise.all([
+      this.#inspect(metadata.identity.pid),
+      metadata.piChildIdentity.pid === metadata.identity.pid ? Promise.resolve(undefined) : this.#inspect(metadata.piChildIdentity.pid),
+    ]);
+    if (!sameIdentity(actualWorker, metadata.identity) || (actualPiChild !== undefined && !sameIdentity(actualPiChild, metadata.piChildIdentity))) throw Object.assign(new Error("Worker or Pi-child process identity changed"), { code: "PROCESS_IDENTITY_CONFLICT" });
+    if (this.#workers.get(metadata.sessionId)?.leaseId !== metadata.leaseId || this.#workers.get(metadata.sessionId)?.generation !== metadata.generation) throw Object.assign(new Error("Worker lease or generation changed"), { code: "OWNERSHIP_CONFLICT" });
+    return true;
+  }
+
+  /** Serialize one worker mutation against connection replacement. @param {any} metadata @param {any} connection @param {() => Promise<any>} action */
+  runCurrent(metadata, connection, action) {
+    return this.#serializeRoute(metadata.sessionId, async () => {
+      await this.assertCurrent(metadata, connection);
+      const result = await action();
+      await this.assertCurrent(metadata, connection);
+      return result;
+    });
   }
 
   /** @param {string} sessionId */
@@ -141,73 +182,97 @@ export class RecoveredWorkerRouter {
   }
 }
 
-/** @param {{ root: string, daemonEpoch: string, inspect(pid: number): Promise<any>, waitForReconnect?: (workers: any[], router: RecoveredWorkerRouter) => Promise<string[]>, router?: RecoveredWorkerRouter }} options */
-export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReconnect = async () => [], router: suppliedRouter }) {
+/** @param {{ root: string, daemonEpoch: string, inspect(pid: number): Promise<any>, waitForReconnect?: (workers: any[], router: RecoveredWorkerRouter) => Promise<string[]>, router?: RecoveredWorkerRouter, signal?: AbortSignal }} options */
+export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReconnect = async () => [], router: suppliedRouter, signal }) {
   const registry = new RegistryStore(join(root, "sessions"));
   const journalPath = join(root, "queue", "commands.jsonl");
   const eventPath = join(root, "index", "events.jsonl");
-  const journal = await createCommandJournal({ path: journalPath });
+  /** @type {any} */
+  let journal;
+  /** @type {any} */
   let events;
+  const router = suppliedRouter ?? new RecoveredWorkerRouter({ registry, inspect, metadataPath: join(root, "daemon", "workers.json") });
+  const cancelled = () => {
+    if (signal?.aborted) throw Object.assign(new Error("Reconciliation was cancelled"), { code: "RECONCILIATION_CANCELLED" });
+  };
   try {
+    cancelled();
+    journal = await createCommandJournal({ path: journalPath });
+    cancelled();
     events = await createEventStore({ path: eventPath, daemonEpoch });
+    await router.load();
+    cancelled();
+    /** @type {any[]} */
+    const liveWorkers = [];
+    /** @type {any[]} */
+    const conflicts = [];
+    for (const record of await registry.list()) {
+      cancelled();
+      if (record.ownership === undefined) continue;
+      let actual;
+      try {
+        actual = await inspect(record.ownership.process.pid);
+      } catch (error) {
+        conflicts.push({ sessionId: record.sessionId, reason: exited(error) ? "WORKER_EXITED" : "PROCESS_IDENTITY_AMBIGUOUS", ownership: record.ownership });
+        continue;
+      }
+      if (!sameIdentity(actual, record.ownership.process)) {
+        conflicts.push({ sessionId: record.sessionId, reason: "PROCESS_IDENTITY_MISMATCH", ownership: record.ownership, actual });
+        continue;
+      }
+      const metadata = router.metadata(record.sessionId);
+      if (metadata === undefined) {
+        conflicts.push({ sessionId: record.sessionId, reason: "OWNERSHIP_METADATA_MISSING", ownership: record.ownership });
+        continue;
+      }
+      if (metadata.runId !== record.ownership.runId || !sameIdentity(metadata.identity, actual)) {
+        conflicts.push({ sessionId: record.sessionId, reason: "OWNERSHIP_METADATA_CONFLICT", ownership: record.ownership, metadata });
+        continue;
+      }
+      let piChild;
+      try {
+        piChild = metadata.piChildIdentity.pid === metadata.identity.pid ? actual : await inspect(metadata.piChildIdentity.pid);
+      } catch (error) {
+        conflicts.push({ sessionId: record.sessionId, reason: exited(error) ? "PI_CHILD_EXITED" : "PI_CHILD_IDENTITY_AMBIGUOUS", ownership: record.ownership, metadata });
+        continue;
+      }
+      if (!sameIdentity(piChild, metadata.piChildIdentity)) {
+        conflicts.push({ sessionId: record.sessionId, reason: "PI_CHILD_IDENTITY_MISMATCH", ownership: record.ownership, metadata, actual: piChild });
+        continue;
+      }
+      liveWorkers.push({ sessionId: record.sessionId, runId: record.ownership.runId, identity: actual, piChildIdentity: piChild, metadata });
+    }
+    cancelled();
+    const reconnected = new Set(await waitForReconnect(liveWorkers, router));
+    cancelled();
+    for (const worker of liveWorkers) {
+      if (!reconnected.has(worker.sessionId) && !router.connectedSessionIds().includes(worker.sessionId)) conflicts.push({ sessionId: worker.sessionId, reason: "WORKER_RECONNECT_TIMEOUT", ownership: worker });
+    }
+    const commands = await latestJournalRecords(journalPath);
+    const recoveryActions = commands.map((record) => ({
+      clientId: record.status.clientId,
+      requestId: record.status.requestId,
+      sessionId: record.command?.payload?.sessionId,
+      command: record.command,
+      action: record.status.stage === "ACCEPTED" ? "SAFE_REDELIVERY" : record.status.stage === "DELIVERY_UNKNOWN" ? "DELIVERY_AMBIGUOUS" : "NO_REDELIVERY",
+    }));
+    await atomicWriteJson(join(root, "daemon", "reconciliation.json"), { schemaVersion: 1, daemonEpoch, completedAt: new Date().toISOString(), conflicts, recoveryActions });
+    return {
+      registry,
+      journal,
+      events,
+      router,
+      liveWorkers,
+      conflicts,
+      recoveryActions,
+      async close() {
+        await router.close();
+        await Promise.all([journal.close(), events.close()]);
+      },
+    };
   } catch (error) {
-    await journal.close();
+    await Promise.allSettled([journal?.close(), events?.close()]);
+    if (suppliedRouter === undefined) await router.close().catch(() => {});
     throw error;
   }
-  const router = suppliedRouter ?? new RecoveredWorkerRouter({ registry, inspect, metadataPath: join(root, "daemon", "workers.json") });
-  await router.load();
-  /** @type {any[]} */
-  const liveWorkers = [];
-  /** @type {any[]} */
-  const conflicts = [];
-  for (const record of await registry.list()) {
-    if (record.ownership === undefined) continue;
-    let actual;
-    try {
-      actual = await inspect(record.ownership.process.pid);
-    } catch (error) {
-      conflicts.push({ sessionId: record.sessionId, reason: exited(error) ? "WORKER_EXITED" : "PROCESS_IDENTITY_AMBIGUOUS", ownership: record.ownership });
-      continue;
-    }
-    if (!sameIdentity(actual, record.ownership.process)) {
-      conflicts.push({ sessionId: record.sessionId, reason: "PROCESS_IDENTITY_MISMATCH", ownership: record.ownership, actual });
-      continue;
-    }
-    const metadata = router.metadata(record.sessionId);
-    if (metadata === undefined) {
-      conflicts.push({ sessionId: record.sessionId, reason: "OWNERSHIP_METADATA_MISSING", ownership: record.ownership });
-      continue;
-    }
-    if (metadata.runId !== record.ownership.runId || !sameIdentity(metadata.identity, actual)) {
-      conflicts.push({ sessionId: record.sessionId, reason: "OWNERSHIP_METADATA_CONFLICT", ownership: record.ownership, metadata });
-      continue;
-    }
-    liveWorkers.push({ sessionId: record.sessionId, runId: record.ownership.runId, identity: actual, metadata });
-  }
-  const reconnected = new Set(await waitForReconnect(liveWorkers, router));
-  for (const worker of liveWorkers) {
-    if (worker.metadata !== undefined && !reconnected.has(worker.sessionId) && !router.connectedSessionIds().includes(worker.sessionId)) conflicts.push({ sessionId: worker.sessionId, reason: "WORKER_RECONNECT_TIMEOUT", ownership: worker });
-  }
-  const commands = await latestJournalRecords(journalPath);
-  const recoveryActions = commands.map((record) => ({
-    clientId: record.status.clientId,
-    requestId: record.status.requestId,
-    sessionId: record.command?.payload?.sessionId,
-    command: record.command,
-    action: record.status.stage === "ACCEPTED" ? "SAFE_REDELIVERY" : record.status.stage === "DELIVERY_UNKNOWN" ? "DELIVERY_AMBIGUOUS" : "NO_REDELIVERY",
-  }));
-  await atomicWriteJson(join(root, "daemon", "reconciliation.json"), { schemaVersion: 1, daemonEpoch, completedAt: new Date().toISOString(), conflicts, recoveryActions });
-  return {
-    registry,
-    journal,
-    events,
-    router,
-    liveWorkers,
-    conflicts,
-    recoveryActions,
-    async close() {
-      await router.close();
-      await Promise.all([journal.close(), events.close()]);
-    },
-  };
 }

@@ -6,7 +6,7 @@ import { afterEach, expect, it } from "vitest";
 import { createCommandJournal } from "./command-journal.mjs";
 import { createEventStore } from "./event-store.mjs";
 import { RegistryStore } from "./registry-store.mjs";
-import { reconcileRuntime } from "./reconciliation.mjs";
+import { RecoveredWorkerRouter, reconcileRuntime } from "./reconciliation.mjs";
 
 /** @type {string[]} */
 const roots = [];
@@ -86,6 +86,39 @@ it("redelivers only ACCEPTED commands and never acknowledged or worker-local REC
     { clientId: "client", requestId: "acknowledged", sessionId: "one", action: "NO_REDELIVERY" },
   ]);
   await recovered.close();
+});
+
+it("validates the authoritative Pi child and invalidates frames from replaced routes", async () => {
+  const root = await fixture();
+  const registry = new RegistryStore(join(root, "sessions"));
+  const worker = { pid: 301, startIdentity: "worker", processGroupId: 301 };
+  const piChild = { pid: 302, startIdentity: "pi-child", processGroupId: 301 };
+  await registry.create(record("exact", worker));
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "exact", runId: "run-exact", leaseId: "lease-exact", generation: 4, identity: worker, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  let reusedPiChild = true;
+  const router = new RecoveredWorkerRouter({
+    registry,
+    metadataPath: join(root, "daemon", "workers.json"),
+    inspect: async (pid) => pid === worker.pid ? worker : reusedPiChild ? { ...piChild, startIdentity: "reused" } : piChild,
+  });
+  await router.load();
+  const frame = { version: 1, type: "worker_ready", token: "worker-token", sessionId: "exact", runId: "run-exact", leaseId: "lease-exact", generation: 4, worker, piChild };
+  const connection = () => {
+    /** @type {(value?: unknown) => void} */
+    let resolveClosed = () => {};
+    const closed = new Promise((resolve) => { resolveClosed = resolve; });
+    return { closed, close: () => resolveClosed(undefined) };
+  };
+  await expect(router.adopt(frame, connection())).rejects.toMatchObject({ code: "PROCESS_IDENTITY_CONFLICT" });
+  reusedPiChild = false;
+  const oldConnection = connection();
+  const currentConnection = connection();
+  const metadata = await router.adopt(frame, oldConnection);
+  await router.adopt(frame, currentConnection);
+  let mutated = false;
+  await expect(router.runCurrent(metadata, oldConnection, async () => { mutated = true; })).rejects.toMatchObject({ code: "STALE_WORKER_CONNECTION" });
+  expect(mutated).toBe(false);
+  await router.close();
 });
 
 it("retains exact ownership conflicts fail-closed for live matches, dead workers, and PID reuse", async () => {

@@ -1,4 +1,4 @@
-import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { access, lstat, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, expect, it } from "vitest";
@@ -70,25 +70,70 @@ it("keeps a lifecycle transaction held through publication cleanup", async () =>
   await releaseDaemonLifecycle(claim);
 });
 
-it("releases both lifecycle locks once when publication cleanup rejects", async () => {
+it("reports publication read errors and releases both lifecycle locks once", async () => {
   const root = await fixture();
   const publication = { schemaVersion: 1, pid: 81, startIdentity: "800", processGroupId: 81, daemonEpoch: "epoch", tokenPath: join(root, "daemon", "control.token"), startedAt: "2026-08-25T12:00:00.000Z", state: "READY" };
+  let publicationRemovals = 0;
   let lockReleases = 0;
   let transactionReleases = 0;
   const claim = {
     root,
     publication,
-    lock: { async release() { lockReleases += 1; } },
-    transaction: { async release() { transactionReleases += 1; } },
+    lock: { async release() { lockReleases += 1; throw new Error("injected lifecycle lock release failure"); } },
+    transaction: { async release() { transactionReleases += 1; throw new Error("injected transaction release failure"); } },
   };
   const fsOps = {
-    async lstat() { return { isFile: () => true, isSymbolicLink: () => false, uid: process.getuid?.(), mode: 0o600 }; },
-    async readFile() { return JSON.stringify(publication); },
-    async rm() { throw new Error("injected publication cleanup failure"); },
+    async lstat() { throw Object.assign(new Error("injected publication read failure"), { code: "EIO" }); },
+    async rm() { publicationRemovals += 1; },
   };
-  await expect(releaseDaemonLifecycle(claim, { fsOps })).rejects.toBeInstanceOf(AggregateError);
+  await expect(releaseDaemonLifecycle(claim, { fsOps })).rejects.toMatchObject({
+    errors: [
+      expect.objectContaining({ code: "DAEMON_IDENTITY_CONFLICT" }),
+      expect.objectContaining({ message: "injected lifecycle lock release failure" }),
+      expect.objectContaining({ message: "injected transaction release failure" }),
+    ],
+  });
+  expect(publicationRemovals).toBe(0);
   expect(lockReleases).toBe(1);
   expect(transactionReleases).toBe(1);
+});
+
+it("attempts socket, PID, and lock cleanup independently before exact recovery", async () => {
+  const root = await fixture();
+  const oldIdentity = { pid: 82, startIdentity: "800", processGroupId: 82 };
+  const newIdentity = { pid: 82, startIdentity: "801", processGroupId: 82 };
+  let actual = oldIdentity;
+  const inspect = async () => actual;
+  const claim = await claimDaemonLifecycle({ root, identity: oldIdentity, daemonEpoch: "old", tokenPath: join(root, "daemon", "control.token"), inspect });
+  await writeFile(join(root, "daemon", "control.sock"), "old socket");
+  /** @type {string[]} */
+  const removals = [];
+  const fsOps = {
+    lstat,
+    readFile,
+    /** @param {string} path @param {any} options */
+    async rm(path, options) {
+      removals.push(path);
+      if (path.endsWith("control.sock")) throw new Error("injected socket unlink failure");
+      if (path.endsWith("pid.json")) throw new Error("injected PID unlink failure");
+      return rm(path, options);
+    },
+  };
+  await expect(releaseDaemonLifecycle(claim, { fsOps })).rejects.toMatchObject({
+    errors: [
+      expect.objectContaining({ message: "injected socket unlink failure" }),
+      expect.objectContaining({ message: "injected PID unlink failure" }),
+    ],
+  });
+  expect(removals).toEqual([
+    join(root, "daemon", "control.sock"),
+    join(root, "daemon", "pid.json"),
+  ]);
+
+  actual = newIdentity;
+  const replacement = await claimDaemonLifecycle({ root, identity: newIdentity, daemonEpoch: "new", tokenPath: join(root, "daemon", "control.token"), inspect });
+  expect((await inspectDaemonEndpoint({ root, inspect, probe: async () => true })).publication.daemonEpoch).toBe("new");
+  await releaseDaemonLifecycle(replacement);
 });
 
 it("refuses an unowned socket instead of unlinking a possibly live daemon", async () => {

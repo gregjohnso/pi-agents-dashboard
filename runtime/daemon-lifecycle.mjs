@@ -242,26 +242,33 @@ export async function updateDaemonLifecycleState(claim, state, error, fsOps = fs
 export async function releaseDaemonLifecycle(claim, { preservePublication = false, removeSocket = true, fsOps = fs } = {}) {
   /** @type {unknown[]} */
   const errors = [];
-  try {
-    if (!preservePublication) {
-      const current = await readPublication(claim.root, fsOps).catch(() => undefined);
-      if (samePublication(current, claim.publication)) {
-        if (removeSocket) await fsOps.rm(join(claim.root, "daemon", "control.sock"), { force: true });
-        await fsOps.rm(join(claim.root, "daemon", "pid.json"), { force: true });
-      }
+  /** @param {() => Promise<unknown>} action */
+  const cleanup = async (action) => {
+    try {
+      await action();
+    } catch (error) {
+      errors.push(error);
     }
-  } catch (error) {
-    errors.push(error);
-  }
+  };
   try {
-    await claim.lock.release();
-  } catch (error) {
-    errors.push(error);
-  }
-  try {
-    await claim.transaction.release();
-  } catch (error) {
-    errors.push(error);
+    try {
+      if (!preservePublication) {
+        let current;
+        try {
+          current = await readPublication(claim.root, fsOps);
+        } catch (error) {
+          errors.push(error);
+        }
+        if (samePublication(current, claim.publication)) {
+          if (removeSocket) await cleanup(() => fsOps.rm(join(claim.root, "daemon", "control.sock"), { force: true }));
+          await cleanup(() => fsOps.rm(join(claim.root, "daemon", "pid.json"), { force: true }));
+        }
+      }
+    } finally {
+      await cleanup(() => claim.lock.release());
+    }
+  } finally {
+    await cleanup(() => claim.transaction.release());
   }
   if (errors.length > 0) throw new AggregateError(errors, "Daemon lifecycle release completed with cleanup errors");
 }

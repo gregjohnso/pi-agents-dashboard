@@ -121,7 +121,7 @@ it("validates the authoritative Pi child and invalidates frames from replaced ro
   await router.close();
 });
 
-it("refuses an old command result during identity await without removing the replacement pending entry", async () => {
+it("finishes an accepted old command result before replacing its route", async () => {
   const root = await fixture();
   const registry = new RegistryStore(join(root, "sessions"));
   const worker = { pid: 401, startIdentity: "worker", processGroupId: 401 };
@@ -160,30 +160,155 @@ it("refuses an old command result during identity await without removing the rep
   const pending = new Map();
   const oldPending = { connection: oldConnection, routeGeneration: oldRoute.routeGeneration, sessionId: "barrier", runId: "run-barrier", leaseId: "lease-barrier", generation: 7, clientId: "client", requestId: "old", op: "prompt" };
   pending.set("shared-result-id", oldPending);
-  let oldResultResolved = false;
   const oldResult = router.runCurrent(oldRoute.metadata, oldConnection, oldRoute.routeGeneration, async () => {
+    expect(pending.get("shared-result-id")).toBe(oldPending);
     pending.delete("shared-result-id");
-    oldResultResolved = true;
+    return "old-accepted";
   });
   await identityStartedPromise;
   const currentConnection = connection();
-  const replacement = router.adopt(frame, currentConnection);
-  const newPending = { ...oldPending, connection: currentConnection, routeGeneration: oldRoute.routeGeneration + 1, requestId: "current" };
-  pending.set("shared-result-id", newPending);
+  let replacementSettled = false;
+  const replacement = router.adopt(frame, currentConnection).finally(() => { replacementSettled = true; });
+  await Promise.resolve();
+  expect(replacementSettled).toBe(false);
+  expect(router.route("barrier")?.connection).toBe(oldConnection);
   /** @type {(value?: unknown) => void} */ (releaseIdentity)();
-  await expect(oldResult).rejects.toMatchObject({ code: "STALE_WORKER_CONNECTION" });
+  await expect(oldResult).resolves.toBe("old-accepted");
   const currentRoute = await replacement;
-  expect(oldResultResolved).toBe(false);
-  expect(pending.get("shared-result-id")).toBe(newPending);
-  let currentResultResolved = false;
-  await expect(router.runCurrent(currentRoute.metadata, currentConnection, currentRoute.routeGeneration, async () => {
-    expect(pending.get("shared-result-id")).toBe(newPending);
-    pending.delete("shared-result-id");
-    currentResultResolved = true;
-    return "accepted";
-  })).resolves.toBe("accepted");
-  expect(currentResultResolved).toBe(true);
   expect(pending.has("shared-result-id")).toBe(false);
+
+  const currentPending = { ...oldPending, connection: currentConnection, routeGeneration: currentRoute.routeGeneration, requestId: "current" };
+  pending.set("shared-result-id", currentPending);
+  await expect(router.runCurrent(currentRoute.metadata, currentConnection, currentRoute.routeGeneration, async () => {
+    expect(pending.get("shared-result-id")).toBe(currentPending);
+    pending.delete("shared-result-id");
+    return "current-accepted";
+  })).resolves.toBe("current-accepted");
+  expect(pending.has("shared-result-id")).toBe(false);
+  await router.close();
+});
+
+it("finishes every old worker-event side effect before route replacement advances", async () => {
+  const root = await fixture();
+  const registry = new RegistryStore(join(root, "sessions"));
+  const worker = { pid: 501, startIdentity: "worker", processGroupId: 501 };
+  await registry.create(record("event-old-first", worker));
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "event-old-first", runId: "run-event-old-first", leaseId: "lease-event", generation: 1, identity: worker, piChildIdentity: worker }] })}\n`, { mode: 0o600 });
+  /** @type {((value?: unknown) => void) | undefined} */
+  let releaseIdentity;
+  /** @type {((value?: unknown) => void) | undefined} */
+  let identityStarted;
+  let blockIdentity = false;
+  const identityStartedPromise = new Promise((resolve) => { identityStarted = resolve; });
+  const identityGate = new Promise((resolve) => { releaseIdentity = resolve; });
+  const router = new RecoveredWorkerRouter({
+    registry,
+    metadataPath: join(root, "daemon", "workers.json"),
+    inspect: async () => {
+      if (blockIdentity) {
+        identityStarted?.();
+        await identityGate;
+      }
+      return worker;
+    },
+  });
+  await router.load();
+  const frame = { version: 1, type: "worker_ready", token: "worker-token", sessionId: "event-old-first", runId: "run-event-old-first", leaseId: "lease-event", generation: 1, worker, piChild: worker };
+  const connection = () => {
+    /** @type {(value?: unknown) => void} */
+    let resolveClosed = () => {};
+    const closed = new Promise((resolve) => { resolveClosed = resolve; });
+    return { closed, close: () => resolveClosed(undefined) };
+  };
+  const oldConnection = connection();
+  const oldRoute = await router.adopt(frame, oldConnection);
+  blockIdentity = true;
+  const sideEffects = { updates: 0, appends: 0, broadcasts: 0 };
+  const oldEvent = router.runCurrent(oldRoute.metadata, oldConnection, oldRoute.routeGeneration, async () => {
+    sideEffects.updates += 1;
+    await Promise.resolve();
+    sideEffects.appends += 1;
+    await Promise.resolve();
+    sideEffects.broadcasts += 1;
+  });
+  await identityStartedPromise;
+  const currentConnection = connection();
+  let replacementSettled = false;
+  const replacement = router.adopt(frame, currentConnection).finally(() => { replacementSettled = true; });
+  await Promise.resolve();
+  expect(replacementSettled).toBe(false);
+  expect(sideEffects).toEqual({ updates: 0, appends: 0, broadcasts: 0 });
+  /** @type {(value?: unknown) => void} */ (releaseIdentity)();
+  await oldEvent;
+  expect(sideEffects).toEqual({ updates: 1, appends: 1, broadcasts: 1 });
+  const currentRoute = await replacement;
+  await router.runCurrent(currentRoute.metadata, currentConnection, currentRoute.routeGeneration, async () => {
+    sideEffects.updates += 1;
+    sideEffects.appends += 1;
+    sideEffects.broadcasts += 1;
+  });
+  expect(sideEffects).toEqual({ updates: 2, appends: 2, broadcasts: 2 });
+  await router.close();
+});
+
+it("invalidates queued old worker events when replacement wins first", async () => {
+  const root = await fixture();
+  const registry = new RegistryStore(join(root, "sessions"));
+  const worker = { pid: 601, startIdentity: "worker", processGroupId: 601 };
+  await registry.create(record("event-replacement-first", worker));
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "event-replacement-first", runId: "run-event-replacement-first", leaseId: "lease-event", generation: 1, identity: worker, piChildIdentity: worker }] })}\n`, { mode: 0o600 });
+  /** @type {((value?: unknown) => void) | undefined} */
+  let releaseIdentity;
+  /** @type {((value?: unknown) => void) | undefined} */
+  let identityStarted;
+  let blockIdentity = false;
+  const identityStartedPromise = new Promise((resolve) => { identityStarted = resolve; });
+  const identityGate = new Promise((resolve) => { releaseIdentity = resolve; });
+  const router = new RecoveredWorkerRouter({
+    registry,
+    metadataPath: join(root, "daemon", "workers.json"),
+    inspect: async () => {
+      if (blockIdentity) {
+        identityStarted?.();
+        await identityGate;
+      }
+      return worker;
+    },
+  });
+  await router.load();
+  const frame = { version: 1, type: "worker_ready", token: "worker-token", sessionId: "event-replacement-first", runId: "run-event-replacement-first", leaseId: "lease-event", generation: 1, worker, piChild: worker };
+  const connection = () => {
+    /** @type {(value?: unknown) => void} */
+    let resolveClosed = () => {};
+    const closed = new Promise((resolve) => { resolveClosed = resolve; });
+    return { closed, close: () => resolveClosed(undefined) };
+  };
+  const oldConnection = connection();
+  const oldRoute = await router.adopt(frame, oldConnection);
+  blockIdentity = true;
+  const currentConnection = connection();
+  const replacement = router.adopt(frame, currentConnection);
+  await identityStartedPromise;
+  const sideEffects = { updates: 0, appends: 0, broadcasts: 0 };
+  const oldActions = [1, 2].map(() => router.runCurrent(oldRoute.metadata, oldConnection, oldRoute.routeGeneration, async () => {
+    sideEffects.updates += 1;
+    sideEffects.appends += 1;
+    sideEffects.broadcasts += 1;
+  }));
+  /** @type {(value?: unknown) => void} */ (releaseIdentity)();
+  const currentRoute = await replacement;
+  const outcomes = await Promise.allSettled(oldActions);
+  expect(outcomes).toEqual([
+    expect.objectContaining({ status: "rejected", reason: expect.objectContaining({ code: "STALE_WORKER_CONNECTION" }) }),
+    expect.objectContaining({ status: "rejected", reason: expect.objectContaining({ code: "STALE_WORKER_CONNECTION" }) }),
+  ]);
+  expect(sideEffects).toEqual({ updates: 0, appends: 0, broadcasts: 0 });
+  await router.runCurrent(currentRoute.metadata, currentConnection, currentRoute.routeGeneration, async () => {
+    sideEffects.updates += 1;
+    sideEffects.appends += 1;
+    sideEffects.broadcasts += 1;
+  });
+  expect(sideEffects).toEqual({ updates: 1, appends: 1, broadcasts: 1 });
   await router.close();
 });
 

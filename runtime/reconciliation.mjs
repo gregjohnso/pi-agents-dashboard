@@ -87,9 +87,9 @@ export class RecoveredWorkerRouter {
 
   /** @param {any} handle */
   async register(handle) {
-    const routeGeneration = (this.#routeGenerations.get(handle.sessionId) ?? 0) + 1;
-    this.#routeGenerations.set(handle.sessionId, routeGeneration);
     return this.#serializeRoute(handle.sessionId, async () => {
+      const routeGeneration = (this.#routeGenerations.get(handle.sessionId) ?? 0) + 1;
+      this.#routeGenerations.set(handle.sessionId, routeGeneration);
       const record = await this.#registry.get(handle.sessionId);
       if (record?.ownership === undefined || record.ownership.runId !== handle.runId || !sameIdentity(record.ownership.process, handle.identity)) throw Object.assign(new Error("Launched worker does not own the durable registry record"), { code: "OWNERSHIP_CONFLICT" });
       this.#workers.set(handle.sessionId, {
@@ -132,12 +132,12 @@ export class RecoveredWorkerRouter {
   async adopt(frame, connection) {
     const allowed = ["version", "type", "token", "sessionId", "runId", "leaseId", "generation", "worker", "piChild"];
     if (typeof frame !== "object" || frame === null || Array.isArray(frame) || Object.keys(frame).some((key) => !allowed.includes(key)) || frame.version !== 1 || frame.type !== "worker_ready") throw Object.assign(new Error("Invalid worker ready frame"), { code: "INVALID_WORKER_FRAME" });
-    const expected = this.#workers.get(frame.sessionId);
-    if (expected === undefined || expected.runId !== frame.runId || expected.leaseId !== frame.leaseId || expected.generation !== frame.generation || !sameIdentity(expected.identity, frame.worker) || !sameIdentity(expected.piChildIdentity, frame.piChild)) throw Object.assign(new Error("Worker ownership or generation conflicts with durable state"), { code: "OWNERSHIP_CONFLICT" });
-    if (expected.token !== undefined && expected.token !== frame.token) throw Object.assign(new Error("Worker authentication failed"), { code: "WORKER_AUTHENTICATION_FAILED" });
-    const routeGeneration = (this.#routeGenerations.get(frame.sessionId) ?? 0) + 1;
-    this.#routeGenerations.set(frame.sessionId, routeGeneration);
     return this.#serializeRoute(frame.sessionId, async () => {
+      const expected = this.#workers.get(frame.sessionId);
+      if (expected === undefined || expected.runId !== frame.runId || expected.leaseId !== frame.leaseId || expected.generation !== frame.generation || !sameIdentity(expected.identity, frame.worker) || !sameIdentity(expected.piChildIdentity, frame.piChild)) throw Object.assign(new Error("Worker ownership or generation conflicts with durable state"), { code: "OWNERSHIP_CONFLICT" });
+      if (expected.token !== undefined && expected.token !== frame.token) throw Object.assign(new Error("Worker authentication failed"), { code: "WORKER_AUTHENTICATION_FAILED" });
+      const routeGeneration = (this.#routeGenerations.get(frame.sessionId) ?? 0) + 1;
+      this.#routeGenerations.set(frame.sessionId, routeGeneration);
       const record = await this.#registry.get(frame.sessionId);
       if (this.#routeGenerations.get(frame.sessionId) !== routeGeneration) throw Object.assign(new Error("Worker connection was superseded during registration"), { code: "STALE_WORKER_CONNECTION" });
       if (record?.ownership === undefined || record.ownership.runId !== frame.runId || !sameIdentity(record.ownership.process, frame.worker)) throw Object.assign(new Error("Worker ownership or generation conflicts with durable state"), { code: "OWNERSHIP_CONFLICT" });
@@ -193,9 +193,7 @@ export class RecoveredWorkerRouter {
   runCurrent(metadata, connection, routeGeneration, action) {
     return this.#serializeRoute(metadata.sessionId, async () => {
       await this.#assertCurrent(metadata, connection, routeGeneration);
-      const result = await action();
-      await this.#assertCurrent(metadata, connection, routeGeneration);
-      return result;
+      return action();
     });
   }
 

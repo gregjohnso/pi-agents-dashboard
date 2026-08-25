@@ -150,7 +150,7 @@ T02 + T14 + T15 ─────────────────────�
 
 ## Milestone 5: Safety and Acceptance
 
-- [ ] **T15 Complete Stop, Delete, trash, and worktree cleanup**
+- [x] **T15 Complete Stop, Delete, trash, and worktree cleanup**
   - Owner: one destructive-workflow writer.
   - Depends on: T09, T11, T13.
   - Can run in parallel with: T14 after shared UI/backend contracts stabilize.

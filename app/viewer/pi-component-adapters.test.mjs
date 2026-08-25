@@ -1,7 +1,7 @@
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 
-import { createPiComponentAdapters, createPiEditor } from "./pi-component-adapters.mjs";
+import { adaptAssistantMessage, createPiComponentAdapters, createPiEditor } from "./pi-component-adapters.mjs";
 
 const tui = { requestRender: vi.fn(), setFocus: vi.fn(), mode: "fullscreen" };
 
@@ -16,6 +16,20 @@ describe("public Pi component adapters", () => {
     for (const component of fixtures) {
       expect(component.render(40).every((line) => visibleWidth(line) <= 40)).toBe(true);
     }
+  });
+
+  it("adapts normalized assistant content to the complete public AssistantMessage shape", () => {
+    expect(adaptAssistantMessage({ kind: "assistant_message", itemId: "a", content: [{ type: "thinking", text: "reason" }, { type: "text", text: "answer" }] })).toEqual({
+      role: "assistant",
+      content: [{ type: "thinking", thinking: "reason" }, { type: "text", text: "answer" }],
+      api: "pi-dashboard-normalized",
+      provider: "pi-dashboard",
+      model: "normalized-viewer",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: "stop",
+      timestamp: 0,
+    });
+    expect(adaptAssistantMessage({ kind: "assistant_message", itemId: "stream", content: [{ type: "text", text: "partial" }] }, { streaming: true }).stopReason).toBe("pending");
   });
 
   it("uses the public CustomEditor with Pi keybindings and IME focus", () => {

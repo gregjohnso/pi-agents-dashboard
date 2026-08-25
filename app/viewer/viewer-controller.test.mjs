@@ -21,15 +21,16 @@ function fixture(overrides = {}) {
   let listener;
   const commands = [];
   const order = [];
+  const saved = [];
   const client = {
     async getSnapshot() { return snapshot(overrides.snapshot); },
     subscribe(_sessionId, _cursor, next) { listener = next; return () => order.push("unsubscribe"); },
     async command(operation, payload) { commands.push({ operation, payload }); },
     async ack(_sessionId, cursor) { order.push(`ack:${cursor.sequence}`); },
   };
-  const persistence = { async load() { return overrides.persisted; }, async save(value) { await overrides.save?.(value); order.push(`persist:${value.cursor?.sequence ?? "draft"}`); } };
+  const persistence = { async load() { return overrides.persisted; }, async save(value) { await overrides.save?.(value); saved.push(structuredClone(value)); order.push(`persist:${value.cursor?.sequence ?? "draft"}`); } };
   const instance = new ViewerController({ sessionId: "s", client, editor: editor(), persistence, requestRender: async () => { order.push("render"); }, onReturn: vi.fn(), now: () => 0 });
-  return { instance, client, commands, order, emit: (event) => listener(event) };
+  return { instance, client, commands, order, saved, emit: (event) => listener(event) };
 }
 
 describe("viewer commands and role restrictions", () => {
@@ -52,22 +53,90 @@ describe("viewer commands and role restrictions", () => {
     expect(f.commands.filter(({ operation }) => operation === "ui_response")).toHaveLength(1);
   });
 
+  it.each([
+    ["confirm", {}, "y", true],
+    ["select", { options: ["one", "two"] }, "\r", "one"],
+    ["input", { initialValue: "single" }, "\r", "single"],
+    ["editor", { initialValue: "line one\nline two" }, "\r", "line one\nline two"],
+  ])("sends one durable ui_response for a %s request", async (method, requestFields, input, expected) => {
+    const f = fixture();
+    await f.instance.open();
+    await f.emit({ version: 1, sessionId: "s", eventId: `ui-${method}`, cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "pending_ui_request", request: { id: `request-${method}`, method, title: `Request ${method}`, ...requestFields } } });
+    f.instance.handleInput(input);
+    f.instance.handleInput(input);
+    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "ui_response", payload: { sessionId: "s", uiRequestId: `request-${method}`, response: expected } }]));
+  });
+
   it("observer mode disables every mutation but preserves scroll, search, and tool inspection", async () => {
     const f = fixture({ snapshot: { role: "observer", tools: [{ id: "t", name: "bash", state: "completed", arguments: {}, result: [{ type: "text", text: "ok" }], startedAt: timestamp, finishedAt: timestamp }] } });
     await f.instance.open();
     f.instance.editor.setText("blocked");
-    for (const input of ["\r", "\x03", "\x1b[5~", "/", "e"]) f.instance.handleInput(input);
+    for (const input of ["\r", "\x03", "\x1b[5~", "\x0f", "\x1b[B", "\x0f", "\x1b", "\x14", "/", "x"]) f.instance.handleInput(input);
     f.instance.submitSteer("blocked");
     expect(f.commands).toEqual([]);
     expect(f.instance.render(55, 16).join("\n")).toContain("OBSERVER");
   });
 
-  it("keeps drafts and history scoped to the exact session", async () => {
+  it("supports transcript search/navigation, selected-tool inspection, explicit steer input, and thinking visibility", async () => {
+    const tool = (id) => ({ id, name: "future_tool", state: "completed", arguments: { id }, result: [{ type: "text", text: `result ${id}` }], startedAt: timestamp, finishedAt: timestamp });
+    const f = fixture({ snapshot: {
+      items: [
+        { kind: "system_message", itemId: "first", text: "needle first", level: "info" },
+        { kind: "assistant_message", itemId: "middle", content: [{ type: "thinking", text: "private reasoning" }, { type: "text", text: "middle" }] },
+        { kind: "system_message", itemId: "second", text: "needle second", level: "info" },
+      ],
+      tools: [tool("tool-a"), tool("tool-b")], thinkingLevel: "high",
+    } });
+    await f.instance.open();
+    for (const input of ["/", ..."needle"]) f.instance.handleInput(input);
+    expect(f.instance.search).toMatchObject({ query: "needle", matchIndex: 0, matches: ["first", "second"] });
+    expect(f.instance.transcript.selectedSearchItemId).toBe("first");
+    f.instance.handleInput("\r");
+    expect(f.instance.transcript.selectedSearchItemId).toBe("second");
+    expect(f.instance.render(80, 24).join("\n")).toContain("Search: needle [2/2]");
+    f.instance.handleInput("\x10");
+    expect(f.instance.transcript.selectedSearchItemId).toBe("first");
+    f.instance.handleInput("\x1b");
+    expect(f.instance.search).toBeUndefined();
+
+    f.instance.handleInput("\x0f");
+    expect(f.instance.transcript.selectedToolId).toBe("tool-a");
+    f.instance.handleInput("\x1b[B");
+    expect(f.instance.transcript.selectedToolId).toBe("tool-b");
+    expect(f.instance.transcript.expandedTools.has("tool-b")).toBe(false);
+    f.instance.handleInput("\x0f");
+    expect(f.instance.transcript.expandedTools.has("tool-b")).toBe(true);
+    expect(f.instance.render(80, 24).join("\n")).toContain("tool:future_tool completed expanded");
+
+    expect(f.instance.hideThinking).toBe(false);
+    f.instance.handleInput("\x14");
+    expect(f.instance.hideThinking).toBe(true);
+    expect(f.instance.render(80, 24).join("\n")).toContain("thinking:high/hidden");
+
+    f.instance.editor.setText("composer draft");
+    f.instance.handleInput("\x13");
+    expect(f.instance.inputMode).toBe("steer");
+    expect(f.instance.editor.getText()).toBe("");
+    for (const input of "urgent boundary") f.instance.handleInput(input);
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => {
+      expect(f.commands.at(-1)).toEqual({ operation: "steer", payload: { sessionId: "s", text: "urgent boundary" } });
+      expect(f.instance.inputMode).toBe("prompt");
+    });
+    expect(f.instance.editor.getText()).toBe("composer draft");
+    expect(f.instance.render(80, 24).join("\n")).toContain("Steer queued");
+  });
+
+  it("keeps drafts and history scoped to the exact session, including while steer input is open", async () => {
     const f = fixture({ persisted: { sessionId: "other", draft: "leak", history: ["leak"] } });
     await f.instance.open();
     expect(f.instance.editor.getText()).toBe("");
+    f.instance.editor.setText("session draft");
+    f.instance.handleInput("\x13");
+    for (const input of "temporary steer") f.instance.handleInput(input);
     await f.instance.close();
     expect(f.order).toContain("persist:0");
+    expect(f.saved.at(-1)).toMatchObject({ sessionId: "s", draft: "session draft", history: [] });
   });
 });
 
@@ -80,6 +149,52 @@ describe("viewer rendering and navigation", () => {
     expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
     expect(lines.join("\n")).toContain("Thinking");
     expect(lines.map(stripVTControlCharacters)).toMatchSnapshot();
+  });
+
+  it.each([[160, 40], [120, 32], [80, 24], [55, 16], [40, 10]])("snapshots the complete chat-state matrix at %ix%i", async (width, height) => {
+    const message = (kind, text) => kind === "assistant_message"
+      ? { kind, itemId: kind, content: [{ type: "text", text }] }
+      : { kind, itemId: `${kind}-${text}`, text, level: text.includes("error") ? "error" : "info" };
+    const tool = (state) => ({ id: `tool-${state}`, name: "future_tool", state, arguments: { state }, startedAt: timestamp, ...(state === "completed" ? { result: [{ type: "text", text: "completed output" }], finishedAt: timestamp } : {}), ...(state === "failed" ? { error: "tool failed", finishedAt: timestamp } : {}) });
+    const cases = [
+      ["user", { items: [{ kind: "user_message", itemId: "user", content: [{ type: "text", text: "User card" }] }] }],
+      ["assistant", { items: [message("assistant_message", "## Assistant markdown\n- item")] }],
+      ["thinking-visible", { items: [{ kind: "assistant_message", itemId: "thinking", content: [{ type: "thinking", text: "Visible reasoning" }, { type: "text", text: "Answer" }] }], thinkingLevel: "high" }],
+      ...["pending", "running", "streaming", "completed", "failed"].map((state) => [`tool-${state}`, { items: [], tools: [tool(state)] }]),
+      ["retry", { items: [message("system_message", "Retrying in 4s")] }],
+      ["compaction", { items: [message("system_message", "Compacting context")] }],
+      ["reconnect", { items: [message("system_message", "Connection lost; reconnecting")] }],
+      ["error", { errors: [{ code: "PROVIDER_ERROR", message: "provider error", retryable: true }] }],
+      ["unknown", { items: [{ kind: "unknown_pi_event", piType: "future", summary: "Future Pi event" }] }],
+      ["placeholders", { items: [{ kind: "image_placeholder", attachment: { id: "image", path: "safe.png", mediaType: "image/png", width: 10, height: 5 } }, { kind: "file_placeholder", attachment: { id: "file", path: "safe.txt", size: 12 } }] }],
+      ["active", { taskState: "WORKING", activity: { kind: "activity", phase: "tool_running", label: "Running bash", detail: "pytest", sourceEventId: "active", startedAt: timestamp } }],
+      ["pending-ui", { taskState: "WAITING", pendingUi: [{ id: "ui-editor", method: "editor", title: "Edit response", initialValue: "line one\nline two" }] }],
+      ["observer", { role: "observer" }],
+      ["model-thinking", { model: { provider: "anthropic", id: "opus" }, thinkingLevel: "high" }],
+    ];
+    const matrix = {};
+    for (const [name, overrides] of cases) {
+      const f = fixture({ snapshot: overrides });
+      await f.instance.open();
+      if (name === "thinking-visible") {
+        matrix["thinking-hidden"] = f.instance.handleInput("\x14") ?? f.instance.render(width, height).map(stripVTControlCharacters);
+        f.instance.handleInput("\x14");
+      }
+      matrix[name] = f.instance.render(width, height).map(stripVTControlCharacters);
+      await f.instance.close();
+    }
+    const streaming = fixture({ snapshot: { items: [] } });
+    await streaming.instance.open();
+    await streaming.emit({ version: 1, sessionId: "s", eventId: "stream", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "assistant_delta", itemId: "streaming", delta: "Streaming **markdown" } });
+    matrix.streaming = streaming.instance.render(width, height).map(stripVTControlCharacters);
+    await streaming.instance.close();
+    const paused = fixture({ snapshot: { items: Array.from({ length: 12 }, (_, index) => message("system_message", `history ${index}`)) } });
+    await paused.instance.open();
+    paused.instance.transcript.scrollBy(-2);
+    await paused.emit({ version: 1, sessionId: "s", eventId: "new", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "system_message", itemId: "new", text: "new output", level: "info" } });
+    matrix["paused-follow"] = paused.instance.render(width, height).map(stripVTControlCharacters);
+    await paused.instance.close();
+    expect(matrix).toMatchSnapshot();
   });
 
   it("uses the exact clean and dirty Left/Escape return gesture", async () => {

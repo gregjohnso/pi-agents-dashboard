@@ -21,11 +21,41 @@ describe("pending Pi UI overlays", () => {
     expect(overlay.render(40).every((line) => visibleWidth(line) <= 40)).toBe(true);
   });
 
-  it("captures Escape as cancellation before viewer navigation", () => {
+  it("uses a multiline public editor and restores the prior IME focus after submit", () => {
+    const focused = [];
+    const returnFocus = { focused: true };
+    let currentFocus = returnFocus;
+    const focusedTui = { ...tui, setFocus(component) { currentFocus.focused = false; focused.push(component); currentFocus = component; if (currentFocus !== null) currentFocus.focused = true; } };
     const respond = vi.fn();
-    const overlay = new PendingUiOverlay({ request: { id: "i", method: "input", title: "Name" }, tui, respond });
+    const overlay = new PendingUiOverlay({ request: { id: "e", method: "editor", title: "Edit", initialValue: "first\nsecond" }, tui: focusedTui, returnFocus, respond });
+    expect(overlay.control.constructor.name).toBe("ExtensionEditorComponent");
+    expect(overlay.render(80).join("\n")).toContain("first");
+    expect(overlay.render(80).join("\n")).toContain("second");
+    expect(focused[0]).toBe(overlay.control);
+    expect(overlay.control.focused).toBe(true);
+    expect(returnFocus.focused).toBe(false);
+    overlay.handleInput("\r");
+    expect(respond).toHaveBeenCalledWith({ requestId: "e", value: "first\nsecond" });
+    expect(focused.at(-1)).toBe(returnFocus);
+    expect(returnFocus.focused).toBe(true);
+    expect(overlay.control.focused).toBe(false);
+  });
+
+  it("transfers and restores input focus when Escape cancels before viewer navigation", () => {
+    const focused = [];
+    const returnFocus = { focused: true };
+    let currentFocus = returnFocus;
+    const focusedTui = { ...tui, setFocus(component) { currentFocus.focused = false; focused.push(component); currentFocus = component; if (currentFocus !== null) currentFocus.focused = true; } };
+    const respond = vi.fn();
+    const overlay = new PendingUiOverlay({ request: { id: "i", method: "input", title: "Name" }, tui: focusedTui, returnFocus, respond });
+    expect(focused[0]).toBe(overlay.control);
+    expect(overlay.control.focused).toBe(true);
+    expect(returnFocus.focused).toBe(false);
     expect(overlay.handleInput("\x1b")).toBe(true);
     expect(respond).toHaveBeenCalledWith({ requestId: "i", cancelled: true });
+    expect(focused.at(-1)).toBe(returnFocus);
+    expect(returnFocus.focused).toBe(true);
+    expect(overlay.control.focused).toBe(false);
   });
 });
 

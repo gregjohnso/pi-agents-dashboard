@@ -1,4 +1,4 @@
-import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { decodeKittyPrintable, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 import { parseViewerEvent, parseViewerSnapshot } from "../../shared/viewer-contracts.mjs";
 import { createPiComponentAdapters } from "./pi-component-adapters.mjs";
@@ -28,11 +28,13 @@ export class ViewerController {
     this.adapters = adapters ?? createPiComponentAdapters({ tui: editor.tui ?? { mode: "fullscreen", requestRender: () => this.requestRender(), setFocus() {} } });
     this.history = [];
     this.respondedUi = new Set();
+    this.inputMode = "prompt";
+    this.hideThinking = false;
     this.edited = false;
     this.historyUsed = false;
     this.closedState = true;
     this.returnGesture = new ReturnGesture({ now: () => this.now(), onReturn: () => this.onReturn() });
-    this.editor.onSubmit = (text) => { void this.submitText(text); };
+    this.editor.onSubmit = (text) => { void this.submitEditor(text); };
     this.editor.onChange = () => { if (!this.restoring) this.edited = true; };
     this.closed = new Promise((resolve) => { this.resolveClosed = resolve; });
   }
@@ -82,8 +84,12 @@ export class ViewerController {
     const footer = footerParts.join(" · ");
     const activity = renderActivityLine(this.state.activity, width, this.now());
     const editorLines = this.state.role === "composer" ? this.editor.render(width) : [" Observer mode · scroll/search/tool inspection only"];
+    const inputLabel = this.inputMode === "steer" ? [" Steer at next supported boundary"] : this.steerStatus === undefined ? [] : [` Steer ${this.steerStatus}`];
+    const searchLine = this.search === undefined ? [] : [` Search: ${this.search.query} [${this.search.matches.length === 0 ? 0 : this.search.matchIndex + 1}/${this.search.matches.length}]`];
+    const selectedTool = this.transcript.selectedToolId === undefined ? undefined : this.state.tools.get(this.transcript.selectedToolId);
+    const toolLine = selectedTool === undefined ? [] : [` tool:${selectedTool.name} ${selectedTool.state} ${this.transcript.expandedTools.has(selectedTool.id) ? "expanded" : "collapsed"}`];
     const errorLines = this.state.errors.slice(-1).flatMap((error) => renderSystemCard({ text: `${error.code}: ${error.message}`, level: "error" }, width));
-    const fixed = 2 + activity.length + editorLines.length + errorLines.length;
+    const fixed = 2 + activity.length + editorLines.length + inputLabel.length + searchLine.length + toolLine.length + errorLines.length;
     const transcriptHeight = Math.max(0, height - fixed);
     let body = this.transcript.render(width, transcriptHeight);
     if (this.overlay !== undefined) {
@@ -91,7 +97,9 @@ export class ViewerController {
       const start = Math.max(0, body.length - overlayLines.length);
       body = [...body.slice(0, start), ...overlayLines];
     }
-    const lines = [header, ...body, ...errorLines, ...activity, ...editorLines, footer].map((line) => fit(line, width));
+    const thinking = `${this.state.thinkingLevel ?? "default"}/${this.hideThinking ? "hidden" : "visible"}`;
+    const statusFooter = footer.replace(`thinking:${this.state.thinkingLevel ?? "default"}`, `thinking:${thinking}`);
+    const lines = [header, ...body, ...errorLines, ...activity, ...searchLine, ...toolLine, ...inputLabel, ...editorLines, statusFooter].map((line) => fit(line, width));
     while (lines.length < height) lines.splice(1, 0, "");
     return lines.slice(0, height);
   }
@@ -104,6 +112,32 @@ export class ViewerController {
       this.requestRender();
       return;
     }
+    if (this.search !== undefined) { this.handleSearchInput(data); return; }
+    if (this.inputMode === "steer") {
+      this.returnGesture.cancel();
+      if (matchesKey(data, Key.escape)) this.finishSteer(); else this.editor.handleInput(data);
+      this.requestRender();
+      return;
+    }
+    if (matchesKey(data, Key.ctrl("s"))) { this.beginSteer(); return; }
+    if (matchesKey(data, Key.ctrl("t"))) {
+      this.hideThinking = !this.hideThinking;
+      this.transcript.setThinkingHidden(this.hideThinking);
+      this.returnGesture.cancel();
+      this.requestRender();
+      return;
+    }
+    if (this.transcript.selectedToolId !== undefined) {
+      if (matchesKey(data, Key.escape)) this.transcript.clearToolSelection();
+      else if (matchesKey(data, Key.up)) this.transcript.selectNextTool(-1);
+      else if (matchesKey(data, Key.down)) this.transcript.selectNextTool(1);
+      else if (matchesKey(data, Key.ctrl("o")) || matchesKey(data, Key.enter)) this.transcript.toggleSelectedTool();
+      else return;
+      this.returnGesture.cancel();
+      this.requestRender();
+      return;
+    }
+    if (matchesKey(data, Key.ctrl("o"))) { this.transcript.selectNextTool(1); this.returnGesture.cancel(); this.requestRender(); return; }
     if (isPageUp(data) || (this.state.role === "observer" && matchesKey(data, Key.up))) { this.transcript.scrollBy(-1); this.requestRender(); return; }
     if (isPageDown(data) || (this.state.role === "observer" && matchesKey(data, Key.down))) { this.transcript.scrollBy(1); this.requestRender(); return; }
     if (matchesKey(data, Key.up) || matchesKey(data, Key.down)) {
@@ -113,8 +147,7 @@ export class ViewerController {
       this.requestRender();
       return;
     }
-    if (data === "/") { this.searching = true; this.returnGesture.cancel(); this.requestRender(); return; }
-    if (data === "e") { const toolId = this.state.tools.keys().next().value; if (toolId !== undefined) this.transcript.toggleTool(toolId); this.returnGesture.cancel(); this.requestRender(); return; }
+    if (data === "/") { this.search = { query: "", matches: [], matchIndex: -1 }; this.returnGesture.cancel(); this.requestRender(); return; }
     if (matchesKey(data, Key.left) || matchesKey(data, Key.escape)) {
       const key = matchesKey(data, Key.left) ? "left" : "escape";
       const clean = this.editor.getText().length === 0 && !this.edited && !this.historyUsed;
@@ -131,6 +164,67 @@ export class ViewerController {
     if (this.state.role !== "composer") return;
     this.editor.handleInput(data);
     this.requestRender();
+  }
+
+  handleSearchInput(data) {
+    if (matchesKey(data, Key.escape)) {
+      this.transcript.setSearch("");
+      this.search = undefined;
+      this.requestRender();
+      return;
+    }
+    if (matchesKey(data, Key.enter) || matchesKey(data, Key.ctrl("n")) || matchesKey(data, Key.ctrl("p"))) {
+      this.search.matchIndex = this.transcript.nextSearch(matchesKey(data, Key.ctrl("p")) ? -1 : 1);
+      this.requestRender();
+      return;
+    }
+    if (matchesKey(data, Key.backspace)) this.search.query = this.search.query.slice(0, -1);
+    else {
+      const printable = decodeKittyPrintable(data) ?? (data.length === 1 && data.charCodeAt(0) >= 32 ? data : undefined);
+      if (printable === undefined) return;
+      this.search.query += printable;
+    }
+    this.search.matches = this.transcript.setSearch(this.search.query);
+    this.search.matchIndex = this.search.matches.length === 0 ? -1 : 0;
+    this.requestRender();
+  }
+
+  beginSteer() {
+    if (this.state?.role !== "composer") return;
+    this.steerRestore = this.editor.getText();
+    this.steerStatus = "composing";
+    this.inputMode = "steer";
+    this.restoring = true; this.editor.setText(""); this.restoring = false;
+    this.returnGesture.cancel();
+    this.requestRender();
+  }
+
+  finishSteer() {
+    const restore = this.steerRestore ?? "";
+    this.inputMode = "prompt";
+    this.steerRestore = undefined;
+    if (this.steerStatus === "composing") this.steerStatus = undefined;
+    this.restoring = true; this.editor.setText(restore); this.restoring = false;
+  }
+
+  async submitEditor(text) {
+    if (this.inputMode === "steer") {
+      const steer = text.trim();
+      if (steer.length === 0) return;
+      this.steerStatus = "sending";
+      try {
+        await this.submitSteer(steer);
+        this.steerStatus = "queued";
+      } catch (error) {
+        this.steerStatus = "failed";
+        throw error;
+      } finally {
+        this.finishSteer();
+        this.requestRender();
+      }
+      return;
+    }
+    await this.submitText(text);
   }
 
   async submitText(text) {
@@ -162,6 +256,10 @@ export class ViewerController {
       if (event.sessionId !== this.sessionId) throw Object.assign(new Error("Viewer event session mismatch"), { code: "VIEWER_SESSION_MISMATCH" });
       this.state = applyViewerEvent(this.state, event);
       this.transcript.update(this.state);
+      if (this.search !== undefined) {
+        this.search.matches = [...this.transcript.searchMatches];
+        this.search.matchIndex = this.search.matches.indexOf(this.transcript.selectedSearchItemId);
+      }
       this.editor.disableSubmit = this.state.role !== "composer";
       this.installOverlay();
       await this.requestRender();
@@ -175,11 +273,13 @@ export class ViewerController {
 
   installOverlay() {
     const request = this.state?.pendingUi.find((candidate) => !this.respondedUi.has(candidate.id));
-    if (request === undefined || this.state.role !== "composer") { this.overlay = undefined; return; }
+    if (request === undefined || this.state.role !== "composer") { this.overlay?.dispose(); this.overlay = undefined; return; }
     if (this.overlay?.request.id === request.id) return;
+    this.overlay?.dispose();
     this.overlay = new PendingUiOverlay({
       request,
       tui: this.editor.tui ?? { requestRender: () => this.requestRender(), setFocus() {} },
+      returnFocus: this.editor,
       respond: (response) => {
         if (this.state?.role !== "composer") return;
         this.respondedUi.add(response.requestId);
@@ -189,7 +289,7 @@ export class ViewerController {
     });
   }
 
-  persisted(cursor = this.state?.cursor) { return { sessionId: this.sessionId, cursor, draft: this.editor.getText(), history: [...this.history] }; }
+  persisted(cursor = this.state?.cursor) { return { sessionId: this.sessionId, cursor, draft: this.inputMode === "steer" ? this.steerRestore ?? "" : this.editor.getText(), history: [...this.history] }; }
 
   async close(options = {}) {
     if (this.closedState) return;
@@ -198,6 +298,7 @@ export class ViewerController {
     try {
       if (options.persist !== false) await this.persistence.save(this.persisted());
     } finally {
+      this.overlay?.dispose();
       this.overlay = undefined;
       this.resolveClosed?.();
     }

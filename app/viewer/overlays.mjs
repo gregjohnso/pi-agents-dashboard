@@ -1,5 +1,7 @@
-import { DynamicBorder, getMarkdownTheme, getSelectListTheme, initTheme } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, ExtensionEditorComponent, getMarkdownTheme, getSelectListTheme, initTheme } from "@earendil-works/pi-coding-agent";
 import { Input, Markdown, SelectList, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+
+import { createPiKeybindings } from "./pi-component-adapters.mjs";
 
 initTheme(undefined, false);
 
@@ -10,30 +12,49 @@ function fit(line, width) {
 
 /** Focused confirm/select/input/editor request backed by public Pi TUI primitives. */
 export class PendingUiOverlay {
-  constructor({ request, tui, respond }) {
+  constructor({ request, tui, respond, returnFocus = undefined }) {
     this.request = request;
+    tui.terminal ??= { rows: 24, columns: 80 };
     this.tui = tui;
     this.respond = respond;
+    this.returnFocus = returnFocus;
     this.resolved = false;
     this.border = new DynamicBorder((text) => text);
     if (request.method === "select") {
       this.control = new SelectList((request.options ?? []).map((option) => ({ value: option, label: option })), 8, getSelectListTheme());
       this.control.onSelect = (item) => this.resolve({ requestId: request.id, value: item.value });
-    } else if (request.method === "input" || request.method === "editor") {
+    } else if (request.method === "editor") {
+      this.control = new ExtensionEditorComponent(
+        tui,
+        /** @type {any} */ (createPiKeybindings()),
+        request.title,
+        request.initialValue,
+        (value) => this.resolve({ requestId: request.id, value }),
+        () => this.resolve({ requestId: request.id, cancelled: true }),
+      );
+      tui.setFocus(this.control);
+    } else if (request.method === "input") {
       this.control = new Input();
       this.control.setValue(request.initialValue ?? "");
-      this.control.focused = true;
       this.control.onSubmit = (value) => this.resolve({ requestId: request.id, value });
       this.control.onEscape = () => this.resolve({ requestId: request.id, cancelled: true });
+      tui.setFocus(this.control);
     } else {
       this.control = new Markdown("y/Enter confirm · n/Escape cancel", 1, 0, getMarkdownTheme());
     }
   }
+  restoreFocus() {
+    if (this.focusRestored) return;
+    this.focusRestored = true;
+    this.tui.setFocus(this.returnFocus ?? null);
+  }
   resolve(response) {
     if (this.resolved) return;
     this.resolved = true;
+    this.restoreFocus();
     this.respond(response);
   }
+  dispose() { this.restoreFocus(); /** @type {any} */ (this.control).dispose?.(); }
   handleInput(data) {
     if (this.resolved) return true;
     if (data === "\x1b") { this.resolve({ requestId: this.request.id, cancelled: true }); return true; }
@@ -46,7 +67,9 @@ export class PendingUiOverlay {
     return true;
   }
   render(width) {
-    const lines = [...this.border.render(width), fit(` ${this.request.title}`, width), ...this.control.render(width), ...this.border.render(width)];
+    const lines = this.request.method === "editor"
+      ? this.control.render(width)
+      : [...this.border.render(width), fit(` ${this.request.title}`, width), ...this.control.render(width), ...this.border.render(width)];
     return lines.map((line) => fit(line, width));
   }
 }

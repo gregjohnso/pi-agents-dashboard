@@ -12,6 +12,16 @@ const APP_KEYBINDINGS = {
   "app.clipboard.pasteImage": { defaultKeys: [], description: "Paste image" },
   "app.interrupt": { defaultKeys: "ctrl+c", description: "Interrupt" },
   "app.exit": { defaultKeys: "ctrl+d", description: "Exit" },
+  "app.editor.external": { defaultKeys: "ctrl+g", description: "Open external editor" },
+};
+
+const EMPTY_USAGE = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 0,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
 function boundedLines(lines, width) {
@@ -26,17 +36,22 @@ function textContent(content) {
   }).join("\n");
 }
 
-function assistantMessage(item) {
-  return /** @type {any} */ ({
+/** Adapt normalized content to every required public AssistantMessage field. */
+export function adaptAssistantMessage(item, options = {}) {
+  return {
     role: "assistant",
     content: item.content.map((part) => part.type === "thinking"
       ? { type: "thinking", thinking: part.text }
       : part.type === "text"
         ? { type: "text", text: part.text }
         : { type: "text", text: `[${part.type}: ${part.attachmentId}]` }),
-    stopReason: "stop",
-    timestamp: Date.now(),
-  });
+    api: options.api ?? "pi-dashboard-normalized",
+    provider: options.provider ?? "pi-dashboard",
+    model: options.model ?? "normalized-viewer",
+    usage: { ...EMPTY_USAGE, cost: { ...EMPTY_USAGE.cost } },
+    stopReason: options.stopReason ?? (options.streaming ? "pending" : "stop"),
+    timestamp: options.timestamp ?? 0,
+  };
 }
 
 function toolResult(tool) {
@@ -48,11 +63,16 @@ function toolResult(tool) {
   return { content, isError: tool.state === "failed" };
 }
 
+/** Create package-root Pi/TUI keybindings for public editors and overlays. */
+export function createPiKeybindings() {
+  return new KeybindingsManager(/** @type {any} */ ({ ...TUI_KEYBINDINGS, ...APP_KEYBINDINGS }));
+}
+
 /** Create Pi's public CustomEditor with package-root keybindings and a width-safe theme. */
 export function createPiEditor({ tui }) {
   const plain = (text) => text;
   tui.terminal ??= { rows: 24, columns: 80 };
-  const keybindings = new KeybindingsManager(/** @type {any} */ ({ ...TUI_KEYBINDINGS, ...APP_KEYBINDINGS }));
+  const keybindings = createPiKeybindings();
   const editor = new CustomEditor(tui, {
     borderColor: plain,
     selectList: { selectedPrefix: plain, selectedText: plain, description: plain, scrollInfo: plain, noMatch: plain },
@@ -69,7 +89,7 @@ export function createPiComponentAdapters({ tui, cwd = process.cwd(), hideThinki
     },
     assistant(item, options = {}) {
       const component = new AssistantMessageComponent(undefined, options.hideThinking ?? hideThinking, markdownTheme, `Thinking (${options.thinkingLevel ?? "active"})…`, 1);
-      component.updateContent(assistantMessage(item), options.streaming ?? false);
+      component.updateContent(/** @type {any} */ (adaptAssistantMessage(item, options)), options.streaming ?? false);
       return component;
     },
     tool(tool) {

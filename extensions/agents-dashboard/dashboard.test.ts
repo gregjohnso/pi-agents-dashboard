@@ -1,4 +1,4 @@
-import { Key, visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 
 import type { EventCursor, LaunchRequest, SessionRecord } from "../../shared/contracts.js";
@@ -51,7 +51,7 @@ class FakeBackend implements DashboardBackend {
   }
 
   async getSnapshot() { return this.snapshot; }
-  subscribe(_after: EventCursor | undefined, listener: (update: DashboardUpdate) => Promise<void> | void, onError: (error: { code: string; message: string }) => void) {
+  subscribe(_after: EventCursor | undefined, listener: (update: DashboardUpdate) => Promise<void> | void, onError: (error: { code: string; message: string }) => void): ReturnType<DashboardBackend["subscribe"]> {
     this.listener = listener;
     this.errorListener = onError;
     return () => { this.unsubscribed += 1; };
@@ -76,6 +76,7 @@ function persistence(initial: Awaited<ReturnType<DashboardPersistence["load"]>> 
 
 const unsupportedAttach: NativeAttachSeam = {
   async attach() { return { kind: "unsupported", error: { code: "UNSUPPORTED_HOST", message: "Native attach is unavailable" } }; },
+  async detach() { return { kind: "unsupported", error: { code: "UNSUPPORTED_HOST", message: "Native detach is unavailable" } }; },
 };
 
 function controller(backend: FakeBackend, overrides: Partial<ConstructorParameters<typeof DashboardController>[0]> = {}) {
@@ -141,7 +142,7 @@ describe("dashboard controller", () => {
     const dashboard = controller(backend, { onClose });
     await dashboard.open();
     dashboard.handleInput("\x03");
-    expect(onClose).toHaveBeenCalledWith({ kind: "closed" });
+    await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith({ kind: "closed" }));
     expect(backend.stop).not.toHaveBeenCalled();
     expect(backend.delete).not.toHaveBeenCalled();
     expect(backend.unsubscribed).toBe(1);
@@ -182,7 +183,14 @@ describe("dashboard controller", () => {
     expect(backend.requests).toHaveLength(1);
     await dashboard.confirmSharedLaunch("/wrong");
     expect(backend.requests).toHaveLength(1);
-    await dashboard.confirmSharedLaunch("/repo");
+    expect(dashboard.focus).toBe("confirmation");
+    dashboard.handleInput("/");
+    dashboard.handleInput("r");
+    dashboard.handleInput("e");
+    dashboard.handleInput("p");
+    dashboard.handleInput("o");
+    dashboard.handleInput("\r");
+    await vi.waitFor(() => expect(backend.requests).toHaveLength(2));
     expect(backend.requests[1]).toMatchObject({ isolation: { mode: "shared_directory", confirmedCwd: "/repo" } });
   });
 
@@ -202,7 +210,7 @@ describe("dashboard controller", () => {
 
   it("delegates Enter/Right only to native attach and surfaces typed UNSUPPORTED_HOST", async () => {
     const attach = vi.fn(unsupportedAttach.attach);
-    const dashboard = controller(new FakeBackend([session("a")]), { nativeAttach: { attach } });
+    const dashboard = controller(new FakeBackend([session("a")]), { nativeAttach: { attach, detach: unsupportedAttach.detach } });
     await dashboard.open();
     await dashboard.activateSelection();
     expect(attach).toHaveBeenCalledWith({ sessionId: "a", selectedRevision: 1 });
@@ -233,6 +241,7 @@ describe("dashboard controller", () => {
 
   it("restores safe view state and cursor but never stale composer ownership", async () => {
     const saved = persistence({
+      schemaVersion: 1,
       clientId: "stable-client",
       cursor: { daemonEpoch: "epoch", sequence: "4" },
       viewState: { query: { view: "all", search: "b" }, selectedSessionId: "b" },
@@ -245,9 +254,125 @@ describe("dashboard controller", () => {
     await dashboard.close();
     expect(saved.saved.length).toBeGreaterThan(0);
   });
+
+  it("renders and persists an event before the backend may acknowledge it", async () => {
+    const order: string[] = [];
+    const backend = new FakeBackend([session("a")]);
+    const saved = persistence();
+    saved.save = vi.fn(async () => { order.push("persist"); });
+    const dashboard = controller(backend, { persistence: saved, requestRender: () => order.push("request-render") });
+    await dashboard.open();
+    order.length = 0;
+    const render = vi.spyOn(dashboard, "render").mockImplementation(() => { order.push("render"); return []; });
+    await backend.listener?.({ snapshot: { sessions: [session("a", { revision: 2 })] }, cursor: { daemonEpoch: "epoch", sequence: "1" } });
+    expect(order).toEqual(["render", "persist", "request-render"]);
+    render.mockRestore();
+  });
+
+  it.each(["render", "persistence"])("closes on %s failure so the backend sends no acknowledgement", async (failure) => {
+    const backend = new FakeBackend([session("a")]);
+    const onClose = vi.fn();
+    const saved = persistence();
+    if (failure === "persistence") saved.save = vi.fn(async () => { throw Object.assign(new Error("disk failed"), { code: "PERSIST_FAILED" }); });
+    const dashboard = controller(backend, { persistence: saved, onClose });
+    await dashboard.open();
+    if (failure === "render") vi.spyOn(dashboard, "render").mockImplementation(() => { throw new Error("render failed"); });
+    await expect(backend.listener?.({ snapshot: { sessions: [session("a", { revision: 2 })] }, cursor: { daemonEpoch: "epoch", sequence: "1" } })).rejects.toThrow();
+    expect(onClose).toHaveBeenCalledWith(expect.objectContaining({ kind: "error" }));
+    expect(backend.unsubscribed).toBe(1);
+  });
+
+  it("disposes a subscription that resolves after close and installs nothing", async () => {
+    let resolveSubscribe: ((unsubscribe: () => void) => void) | undefined;
+    const backend = new FakeBackend([session("a")]);
+    const unsubscribe = vi.fn();
+    backend.subscribe = vi.fn(() => new Promise((resolve) => { resolveSubscribe = resolve; })) as unknown as DashboardBackend["subscribe"];
+    const dashboard = controller(backend);
+    const opening = dashboard.open();
+    await vi.waitFor(() => expect(backend.subscribe).toHaveBeenCalled());
+    await dashboard.close();
+    resolveSubscribe?.(unsubscribe);
+    await opening;
+    expect(unsubscribe).toHaveBeenCalledOnce();
+  });
+
+  it("provides keyboard and mouse access to filters, sorting, grouping, search, and every launch field", async () => {
+    const dashboard = controller(new FakeBackend([
+      session("a", { taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "approval", summary: "waiting", updatedAt: timestamp } }),
+      session("b"),
+    ]));
+    await dashboard.open();
+    dashboard.handleInput("/");
+    dashboard.handleInput("w");
+    dashboard.handleInput("\r");
+    dashboard.handleInput("t");
+    dashboard.handleInput("p");
+    dashboard.handleInput("o");
+    dashboard.handleInput("a");
+    dashboard.handleInput("s");
+    dashboard.handleInput("g");
+    expect(dashboard.query).toMatchObject({ search: "w", taskStates: ["WORKING"], processStates: ["LIVE"], outcomes: ["NONE"], activityKinds: ["approval"], sort: { key: "age", direction: "asc" }, groupBy: "taskState" });
+    expect(dashboard.selectedSessionId).toBe("a");
+    expect(dashboard.render(80, 14).join("\n")).toContain("a");
+    dashboard.handleMouse({ row: 2, column: 2, button: "left" });
+    expect(dashboard.focus).toBe("search");
+
+    dashboard.focusComposer();
+    const fields = ["prompt", "cwd", "isolationMode", "modelProvider", "modelId", "thinkingLevel", "name"];
+    expect(dashboard.composerField).toBe(fields[0]);
+    for (const field of fields.slice(1)) {
+      dashboard.handleInput("\t");
+      expect(dashboard.composerField).toBe(field);
+    }
+    const rendered = dashboard.render(100, 16).join("\n");
+    expect(rendered).toContain("isolation:");
+    expect(rendered).toContain("model:");
+    expect(rendered).toContain("thinking:");
+    expect(rendered).toContain("name:");
+  });
+
+  it("blocks observer composer and control focus and detaches native attachment on close", async () => {
+    const detach = vi.fn(async () => ({ kind: "detached" as const }));
+    const nativeAttach: NativeAttachSeam = {
+      async attach() { return { kind: "attached", role: "observer", controls: { left: "detach_to_dashboard", escape: "detach_to_dashboard", ctrlC: "native_pi" } }; },
+      detach,
+    };
+    const onSessionIntent = vi.fn();
+    const dashboard = controller(new FakeBackend([session("a")]), { nativeAttach, onSessionIntent });
+    await dashboard.open();
+    await dashboard.activateSelection();
+    dashboard.focusComposer();
+    dashboard.handleInput("n");
+    dashboard.handleInput("\x18");
+    await dashboard.submitComposer();
+    expect(dashboard.focus).toBe("list");
+    expect(onSessionIntent).not.toHaveBeenCalled();
+    await dashboard.close();
+    expect(detach).toHaveBeenCalledWith({ sessionId: "a" });
+  });
 });
 
 describe("daemon dashboard backend", () => {
+  it("sends no acknowledgement when reducer, render, or persistence processing rejects", async () => {
+    const one = { daemonEpoch: "epoch", sequence: "1" };
+    const requests: Array<{ op: string }> = [];
+    const event = { version: 1 as const, cursor: one, occurredAt: timestamp, kind: "session_changed" as const, payload: { session: session("a") } };
+    const client = {
+      async connect() {},
+      async request(request: { op: string; requestId: string }) {
+        requests.push(request);
+        return { version: 1 as const, requestId: request.requestId, ok: true as const, result: { kind: "acknowledged" as const, cursor: one } };
+      },
+      subscribe() { return { async *[Symbol.asyncIterator]() { yield event; } }; },
+      async close() {},
+    };
+    const backend = createDaemonDashboardBackend({ client: client as never, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
+    const onError = vi.fn();
+    await backend.subscribe(undefined, async () => { throw Object.assign(new Error("render failed"), { code: "RENDER_FAILED" }); }, onError);
+    await vi.waitFor(() => expect(onError).toHaveBeenCalledWith({ code: "RENDER_FAILED", message: "render failed" }));
+    expect(requests.some((request) => request.op === "ack")).toBe(false);
+  });
+
   it("processes replay once, acknowledges only successful events, and resumes from the acknowledged cursor", async () => {
     const zero = { daemonEpoch: "epoch", sequence: "0" };
     const one = { daemonEpoch: "epoch", sequence: "1" };
@@ -271,7 +396,7 @@ describe("daemon dashboard backend", () => {
     };
     const backend = createDaemonDashboardBackend({ client, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
     const updates: DashboardUpdate[] = [];
-    const unsubscribe = backend.subscribe(zero, (update) => { updates.push(update); }, () => {});
+    const unsubscribe = await backend.subscribe(zero, (update) => { updates.push(update); }, () => {});
     await new Promise((resolve) => setTimeout(resolve, 0));
     unsubscribe();
     expect(updates).toHaveLength(1);

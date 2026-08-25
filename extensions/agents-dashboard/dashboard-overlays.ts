@@ -73,8 +73,10 @@ export function createHelpOverlay(): HelpOverlay {
     bindings: [
       { keys: "↑/↓ PgUp/PgDn Home/End", action: "navigate" },
       { keys: "Enter/→", action: "open native Pi session" },
-      { keys: "n/Tab", action: "focus launch composer" },
-      { keys: "/ s p c v t Ctrl+S", action: "search, filter, view, sort, group" },
+      { keys: "n, then Tab/Shift+Tab", action: "edit prompt, cwd, isolation, provider/model, thinking, and name" },
+      { keys: "/ t p o a j", action: "edit search; cycle task, process, outcome, activity, and project filters" },
+      { keys: "v s g c", action: "cycle view, sort, group; clear filters" },
+      { keys: "mouse controls/form", action: "focus or cycle the clicked search, filter, sort, group, or launch field" },
       { keys: "i / ?", action: "metadata / help" },
       { keys: "Ctrl+C / Escape", action: "close dashboard" },
       { keys: "Ctrl+X", action: "request Task 15 confirmation" },

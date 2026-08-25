@@ -1,6 +1,9 @@
+import { CustomEditor } from "@earendil-works/pi-coding-agent";
+import { getKeybindings, type EditorTheme, type TUI } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  DashboardGestureEditor,
   createLeftGestureState,
   reduceLeftGesture,
   type LeftGestureEvent,
@@ -80,5 +83,44 @@ describe("Left dashboard gesture", () => {
     const other = reduceLeftGesture(state, { ...left(200), key: "a" });
     if (other.passThrough) delegate("a");
     expect(delegate.mock.calls).toEqual([["left"], ["a"]]);
+  });
+
+  it("uses the real public CustomEditor cursor, history, and keybindings", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const tui = { requestRender: vi.fn() } as unknown as TUI;
+    const theme: EditorTheme = {
+      borderColor: (text) => text,
+      selectList: { selectedPrefix: () => "", selectedText: (text) => text, description: (text) => text, scrollInfo: (text) => text, noMatch: (text) => text },
+    };
+    const base = new CustomEditor(tui, theme, getKeybindings() as never);
+    const open = vi.fn();
+    const editor = new DashboardGestureEditor(base, open, Date.now);
+
+    editor.handleInput("\x1b[D");
+    expect(open).toHaveBeenCalledTimes(1);
+    editor.handleInput("x");
+    editor.handleInput("\x01");
+    editor.handleInput("\x1b[D");
+    expect(open).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(500);
+    editor.handleInput("\x1b[D");
+    expect(open).toHaveBeenCalledTimes(2);
+
+    base.setText("");
+    base.addToHistory("history prompt");
+    editor.handleInput("\x1b[A");
+    expect(editor.getText()).toBe("history prompt");
+    editor.handleInput("\x01");
+    editor.handleInput("\x1b[D");
+    vi.advanceTimersByTime(501);
+    editor.handleInput("\x1b[D");
+    expect(open).toHaveBeenCalledTimes(2);
+    vi.advanceTimersByTime(1);
+    editor.handleInput("\x1b[D");
+    expect(open).toHaveBeenCalledTimes(3);
+
+    editor.dispose();
+    vi.useRealTimers();
   });
 });

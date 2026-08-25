@@ -1,7 +1,11 @@
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it, vi } from "vitest";
 
 import manifest from "../../package.json";
-import { registerAgentsDashboard } from "./index.js";
+import { openFrontendPersistence, registerAgentsDashboard } from "./index.js";
 
 it("ships one self-contained Pi extension and optional executable", () => {
   expect(manifest.bin).toEqual({ "pi-agents-dashboard": "./bin/pi-agents-dashboard.mjs" });
@@ -39,23 +43,27 @@ describe("agents extension registration", () => {
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("pi-agents-dashboard doctor"), "error");
   });
 
-  it("installs a composable gesture wrapper without replacing the existing editor silently", async () => {
-    let sessionStart: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  it("fails closed for an arbitrary EditorComponent and restores the owned factory on shutdown", async () => {
+    let sessionStart: ((event: unknown, ctx: any) => Promise<void>) | undefined;
+    let sessionShutdown: ((event: unknown, ctx: any) => Promise<void>) | undefined;
     const pi = {
       registerCommand: vi.fn(),
       on(name: string, handler: typeof sessionStart) {
         if (name === "session_start") sessionStart = handler;
+        if (name === "session_shutdown") sessionShutdown = handler;
       },
     };
-    const previous = vi.fn(() => ({
+    const base = {
       getText: () => "",
       setText: vi.fn(),
       render: () => [""],
       invalidate: vi.fn(),
       handleInput: vi.fn(),
-      getCursor: () => ({ line: 0, col: 0 }),
-    }));
-    const setEditorComponent = vi.fn();
+    };
+    const previous = vi.fn(() => base);
+    let current: unknown = previous;
+    const setEditorComponent = vi.fn((factory) => { current = factory; });
+    const notify = vi.fn();
     registerAgentsDashboard(pi as never, {
       checkCapabilities: async () => ({
         piVersion: "supported",
@@ -69,13 +77,66 @@ describe("agents extension registration", () => {
       }),
       openDashboard: vi.fn(),
     });
-    await sessionStart?.({}, {
+    const ctx = {
       mode: "tui",
-      ui: { getEditorComponent: () => previous, setEditorComponent, notify: vi.fn() },
-    });
+      ui: { getEditorComponent: () => current, setEditorComponent, notify },
+    };
+    await sessionStart?.({}, ctx);
     expect(setEditorComponent).toHaveBeenCalledOnce();
     const factory = setEditorComponent.mock.calls[0]?.[0] as (...args: unknown[]) => unknown;
-    factory({ requestRender: vi.fn() }, {}, {});
-    expect(previous).toHaveBeenCalledOnce();
+    expect(factory({ requestRender: vi.fn() }, {}, {})).toBe(base);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("public CustomEditor"), "warning");
+    await sessionShutdown?.({}, ctx);
+    expect(setEditorComponent).toHaveBeenLastCalledWith(previous);
+  });
+
+  it("strictly validates every persisted section and writes an atomic private schema", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "dashboard-persistence-"));
+    try {
+      const path = join(directory, "frontend-state.json");
+      const opened = await openFrontendPersistence(path);
+      await opened.persistence.save({
+        schemaVersion: 1,
+        clientId: opened.clientId,
+        cursor: { daemonEpoch: "epoch", sequence: "9" },
+        viewState: {
+          query: {
+            view: "all", search: "needle", taskStates: ["READY"], processStates: ["LIVE"], outcomes: ["NONE"],
+            activityKinds: ["assistant_final"], projectPaths: ["/repo"], sort: { key: "activity", direction: "desc" }, groupBy: "cwd",
+          },
+          selectedSessionId: "selected",
+        },
+        launchDraft: {
+          prompt: "prompt", cwd: "/repo", sourceSessionId: "source", isolationMode: "shared_directory",
+          model: { provider: "provider", id: "model" }, thinkingLevel: "high", name: "name",
+        },
+      });
+      expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ schemaVersion: 1, cursor: { sequence: "9" }, launchDraft: { isolationMode: "shared_directory" } });
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
+
+      await writeFile(path, JSON.stringify({ schemaVersion: 1, clientId: "trusted", cursor: { daemonEpoch: "epoch", sequence: "-1" }, unexpected: true }));
+      await expect(openFrontendPersistence(path)).rejects.toMatchObject({ code: "PERSISTENCE_INVALID" });
+      await writeFile(path, JSON.stringify({ schemaVersion: 2, clientId: "trusted" }));
+      await expect(openFrontendPersistence(path)).rejects.toMatchObject({ code: "PERSISTENCE_INVALID" });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reports typed persistence failure and does not open a dashboard with untrusted identity", async () => {
+    let command: { handler(args: string, ctx: unknown): Promise<void> } | undefined;
+    const notify = vi.fn();
+    registerAgentsDashboard({
+      registerCommand(_name: string, options: typeof command) { command = options; },
+      on: vi.fn(),
+    } as never, {
+      checkCapabilities: async () => ({
+        piVersion: "supported", globalPackage: true, rpcWorker: true, daemonOwnedStartup: true,
+        nativeAttach: true, composableLeftGesture: true, fullscreenCustomUi: true, blockers: [],
+      }),
+      openDashboard: async () => { throw Object.assign(new Error("invalid frontend-state.json"), { code: "PERSISTENCE_INVALID" }); },
+    });
+    await command?.handler("", { mode: "tui", ui: { notify } } as never);
+    expect(notify).toHaveBeenCalledWith("PERSISTENCE_INVALID: invalid frontend-state.json", "error");
   });
 });

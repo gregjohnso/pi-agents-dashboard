@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 
-import type { SessionRecord, TaskState } from "../../shared/contracts.js";
+import type { Outcome, ProcessState, SessionRecord, TaskState } from "../../shared/contracts.js";
 
 export type DashboardView = "live" | "done" | "all";
 export type DashboardSortKey = "age" | "id" | "state" | "model" | "project" | "activity";
@@ -12,6 +12,9 @@ export interface DashboardQuery {
   view: DashboardView;
   search?: string;
   taskStates?: readonly TaskState[];
+  processStates?: readonly ProcessState[];
+  outcomes?: readonly Outcome[];
+  activityKinds?: readonly string[];
   projectPaths?: readonly string[];
   sort?: { key: DashboardSortKey; direction: SortDirection };
   groupBy?: DashboardGroup;
@@ -124,6 +127,9 @@ export function selectDashboardSessions(
 ): readonly SessionRecord[] {
   const needle = query.search?.trim().toLowerCase() ?? "";
   const taskStates = query.taskStates === undefined ? undefined : new Set(query.taskStates);
+  const processStates = query.processStates === undefined ? undefined : new Set(query.processStates);
+  const outcomes = query.outcomes === undefined ? undefined : new Set(query.outcomes);
+  const activityKinds = query.activityKinds === undefined ? undefined : new Set(query.activityKinds);
   const projectPaths = query.projectPaths === undefined
     ? undefined
     : new Set(query.projectPaths.map(canonicalPath));
@@ -132,6 +138,9 @@ export function selectDashboardSessions(
     (query.historyPolicy?.(session) ?? true)
     && isInView(session, query.view)
     && (taskStates?.has(session.taskState) ?? true)
+    && (processStates?.has(session.processState) ?? true)
+    && (outcomes?.has(session.outcome) ?? true)
+    && (activityKinds?.has(session.activity.kind) ?? true)
     && (projectPaths?.has(canonicalPath(session.cwd)) ?? true)
     && (needle.length === 0 || searchText(session).includes(needle))
   ));

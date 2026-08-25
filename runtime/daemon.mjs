@@ -351,6 +351,7 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
     async drainAndClose() {
       await Promise.allSettled([...chains]);
       for (const socket of sockets) socket.destroy();
+      while (chains.size > 0) await Promise.allSettled([...chains]);
       if (server.listening && serverClosed === undefined) serverClosed = new Promise((resolveClose) => server.close(() => resolveClose(undefined)));
       await serverClosed;
     },
@@ -460,20 +461,19 @@ export async function createDaemonRuntime({
           const prior = claims.get(socket);
           if (request.op === "detach") {
             if (prior !== undefined) {
-              claims.delete(socket);
               await context.publishAttachment(sessionId, prior.clientId, prior.role, false);
+              claims.delete(socket);
             }
             if (claims.size === 0) attachmentClaims.delete(sessionId);
             return { kind: "detached", sessionId };
           }
-          const composer = [...claims.values()].find((claim) => claim.role === "composer");
-          const grantedRole = request.payload.role === "composer" && (composer === undefined || composer.clientId === request.clientId)
+          const composerSocket = [...claims].find(([, claim]) => claim.role === "composer")?.[0];
+          const grantedRole = request.payload.role === "composer" && (composerSocket === undefined || composerSocket === socket)
             ? "composer"
             : "observer";
           if (prior !== undefined && prior.clientId === request.clientId && prior.role === grantedRole) return { kind: "attached", sessionId, role: grantedRole };
-          if (prior !== undefined) await context.publishAttachment(sessionId, prior.clientId, prior.role, false);
-          claims.set(socket, { clientId: request.clientId, role: grantedRole });
           await context.publishAttachment(sessionId, request.clientId, grantedRole, true);
+          claims.set(socket, { clientId: request.clientId, role: grantedRole });
           return { kind: "attached", sessionId, role: grantedRole };
         });
         cache.set(cacheKey, { serialized, result });
@@ -487,8 +487,8 @@ export async function createDaemonRuntime({
           if (claims === undefined) return;
           const prior = claims.get(socket);
           if (prior === undefined) return;
-          claims.delete(socket);
           await context.publishAttachment(sessionId, prior.clientId, prior.role, false);
+          claims.delete(socket);
           if (claims.size === 0) attachmentClaims.delete(sessionId);
         })));
       },

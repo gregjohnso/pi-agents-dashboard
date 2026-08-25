@@ -14,7 +14,9 @@ import type {
   DeliveryResolution,
   EventCursor,
   LaunchRequest,
+  Outcome,
   PersistedEvent,
+  ProcessState,
   SessionRecord,
   TaskState,
 } from "../../shared/contracts.js";
@@ -76,7 +78,7 @@ export interface DashboardBackend {
     after: EventCursor | undefined,
     listener: (update: DashboardUpdate) => Promise<void> | void,
     onError: (error: DashboardTransportError) => void,
-  ): () => void;
+  ): (() => void) | Promise<() => void>;
   preflightLaunch(draft: LaunchDraft, signal?: AbortSignal): Promise<LaunchPreflight>;
   launch(request: LaunchRequest, requestId?: string, signal?: AbortSignal): Promise<LaunchOutcome>;
   resolveDelivery(clientId: string, requestId: string, resolution: DeliveryResolution, signal?: AbortSignal): Promise<void>;
@@ -85,12 +87,14 @@ export interface DashboardBackend {
 }
 
 export interface PersistedDashboardState {
+  schemaVersion: 1;
   clientId: string;
   cursor?: EventCursor;
   viewState?: {
     query: Omit<DashboardQuery, "historyPolicy">;
     selectedSessionId?: string;
   };
+  launchDraft?: LaunchDraft;
 }
 
 export interface DashboardPersistence {
@@ -111,9 +115,15 @@ export type NativeAttachResult =
   | { kind: "unsupported"; error: DashboardTransportError }
   | { kind: "failed"; error: DashboardTransportError };
 
+export type NativeDetachResult =
+  | { kind: "detached" }
+  | { kind: "unsupported"; error: DashboardTransportError }
+  | { kind: "failed"; error: DashboardTransportError };
+
 /** Task 14 implements this seam with Pi's native interface. */
 export interface NativeAttachSeam {
   attach(request: { sessionId: string; selectedRevision: number }): Promise<NativeAttachResult>;
+  detach(request: { sessionId: string }): Promise<NativeDetachResult>;
 }
 
 export type DashboardStatus =
@@ -239,7 +249,6 @@ export interface DashboardControllerOptions {
   sourceSessionId: string;
   launchDefaults: Omit<LaunchDefaults, "sourceSessionId">;
   requestId?: () => string;
-  now?: () => number;
   onClose?: (result: DashboardCloseResult) => void;
   onSessionIntent?: (intent: SessionIntent) => void;
   requestRender?: () => void;
@@ -254,6 +263,20 @@ function safeQuery(value: Omit<DashboardQuery, "historyPolicy"> | undefined): Da
   return { ...value };
 }
 
+const TASK_STATES: readonly TaskState[] = ["WORKING", "WAITING", "READY", "FAILED", "STOPPED"];
+const PROCESS_STATES: readonly ProcessState[] = ["LIVE", "SLEEPING", "EXITED", "STALE"];
+const OUTCOMES: readonly Outcome[] = ["NONE", "COMPLETED", "READY_FOR_REVIEW"];
+const SORT_KEYS: readonly DashboardSortKey[] = ["age", "id", "state", "model", "project", "activity"];
+const GROUPS: readonly DashboardGroup[] = ["taskState", "cwd"];
+export type ComposerField = "prompt" | "cwd" | "isolationMode" | "modelProvider" | "modelId" | "thinkingLevel" | "name";
+const COMPOSER_FIELDS: readonly ComposerField[] = ["prompt", "cwd", "isolationMode", "modelProvider", "modelId", "thinkingLevel", "name"];
+
+function cycleValue<T>(values: readonly T[], current: T | undefined): T | undefined {
+  if (current === undefined) return values[0];
+  const index = values.indexOf(current);
+  return index < 0 || index === values.length - 1 ? undefined : values[index + 1];
+}
+
 function fitLine(line: string, width: number): string {
   const clipped = truncateToWidth(line.replace(/[\r\n\u2028\u2029]/gu, " "), Math.max(0, width), "");
   return clipped + " ".repeat(Math.max(0, width - visibleWidth(clipped)));
@@ -266,7 +289,6 @@ export class DashboardController {
   private readonly nativeAttach: NativeAttachSeam;
   private readonly clientId: string;
   private readonly requestId: () => string;
-  private readonly now: () => number;
   private readonly onClose?: (result: DashboardCloseResult) => void;
   private readonly onSessionIntent?: (intent: SessionIntent) => void;
   private readonly requestRender?: () => void;
@@ -280,9 +302,14 @@ export class DashboardController {
   private pendingShared?: { draft: LaunchDraft; preflight: LaunchPreflight };
   private closed = true;
   private preferredSelectionId?: string;
+  private openGeneration = 0;
+  private openController?: AbortController;
+  private attachedSessionId?: string;
+  private confirmationText = "";
 
   query: DashboardQuery = defaultQuery();
-  focus: "list" | "composer" = "list";
+  focus: "list" | "search" | "composer" | "confirmation" = "list";
+  composerField: ComposerField = "prompt";
   composerDraft: LaunchDraft;
   overlay?: DashboardOverlay;
   status: DashboardStatus = { kind: "loading" };
@@ -294,7 +321,6 @@ export class DashboardController {
     this.nativeAttach = options.nativeAttach;
     this.clientId = options.clientId;
     this.requestId = options.requestId ?? randomUUID;
-    this.now = options.now ?? Date.now;
     this.onClose = options.onClose;
     this.onSessionIntent = options.onSessionIntent;
     this.requestRender = options.requestRender;
@@ -311,42 +337,76 @@ export class DashboardController {
   async open(): Promise<void> {
     if (!this.closed) return;
     this.closed = false;
+    const generation = ++this.openGeneration;
+    const controller = new AbortController();
+    this.openController = controller;
     this.status = { kind: "loading" };
     try {
       const persisted = await this.persistence.load();
+      if (!this.isCurrentOpen(generation)) return;
       if (persisted?.clientId === this.clientId) {
         this.cursor = persisted.cursor;
         this.query = safeQuery(persisted.viewState?.query);
         this.preferredSelectionId = persisted.viewState?.selectedSessionId;
+        if (persisted.launchDraft !== undefined) this.composerDraft = { ...persisted.launchDraft, model: { ...persisted.launchDraft.model } };
       }
-      const snapshot = await this.backend.getSnapshot();
+      const snapshot = await this.backend.getSnapshot(controller.signal);
+      if (!this.isCurrentOpen(generation)) return;
       this.applySnapshot(snapshot);
-      this.unsubscribe = this.backend.subscribe(
+      this.render(this.width, this.height);
+      const unsubscribe = await this.backend.subscribe(
         this.cursor,
         async (update) => {
-          this.applySnapshot(update.snapshot);
-          this.cursor = update.cursor;
-          await this.persist();
-          this.requestRender?.();
+          if (!this.isCurrentOpen(generation)) return;
+          try {
+            this.applySnapshot(update.snapshot);
+            this.render(this.width, this.height);
+            await this.persist(update.cursor);
+            if (!this.isCurrentOpen(generation)) throw Object.assign(new Error("Dashboard closed during event persistence"), { code: "DASHBOARD_CLOSED" });
+            this.cursor = update.cursor;
+            this.requestRender?.();
+          } catch (error) {
+            const typed = this.typedError(error, "EVENT_PROCESSING_FAILED");
+            this.fail(typed);
+            throw Object.assign(new Error(typed.message), { code: typed.code });
+          }
         },
-        (error) => this.fail(error),
+        (error) => { if (this.isCurrentOpen(generation)) this.fail(error); },
       );
+      if (!this.isCurrentOpen(generation)) {
+        unsubscribe();
+        return;
+      }
+      this.unsubscribe = unsubscribe;
       this.status = { kind: "ready" };
     } catch (error) {
-      const typed = error as { code?: string; message?: string };
-      this.fail({ code: typed.code ?? "DASHBOARD_OPEN_FAILED", message: typed.message ?? "Dashboard could not open" });
+      if (!this.isCurrentOpen(generation)) return;
+      this.fail(this.typedError(error, "DASHBOARD_OPEN_FAILED"));
     }
   }
 
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.openGeneration += 1;
+    this.openController?.abort();
+    this.openController = undefined;
     const unsubscribe = this.unsubscribe;
     this.unsubscribe = undefined;
     unsubscribe?.();
-    this.attachmentRole = undefined;
-    this.onClose?.({ kind: "closed" });
-    await this.persist().catch(() => {});
+    this.overlay = undefined;
+    this.pendingShared = undefined;
+    this.confirmationText = "";
+    let result: DashboardCloseResult = { kind: "closed" };
+    try {
+      await this.detachNative();
+      await this.persist();
+    } catch (error) {
+      const typed = this.typedError(error, "DASHBOARD_CLOSE_FAILED");
+      this.status = { kind: "error", ...typed };
+      result = { kind: "error", ...typed };
+    }
+    this.onClose?.(result);
   }
 
   resize(width: number, height: number): void {
@@ -368,6 +428,18 @@ export class DashboardController {
 
   setTaskStates(taskStates?: readonly TaskState[]): void {
     this.setQuery({ ...this.query, taskStates });
+  }
+
+  setProcessStates(processStates?: readonly ProcessState[]): void {
+    this.setQuery({ ...this.query, processStates });
+  }
+
+  setOutcomes(outcomes?: readonly Outcome[]): void {
+    this.setQuery({ ...this.query, outcomes });
+  }
+
+  setActivityKinds(activityKinds?: readonly string[]): void {
+    this.setQuery({ ...this.query, activityKinds });
   }
 
   setProjectPaths(projectPaths?: readonly string[]): void {
@@ -402,7 +474,9 @@ export class DashboardController {
   }
 
   focusComposer(): void {
+    if (this.attachmentRole === "observer") return;
     this.focus = "composer";
+    this.composerField = "prompt";
   }
 
   setComposerPrompt(prompt: string): void {
@@ -414,12 +488,14 @@ export class DashboardController {
   }
 
   async submitComposer(): Promise<void> {
-    if (this.composerDraft.prompt.trim().length === 0) return;
+    if (this.attachmentRole === "observer" || this.composerDraft.prompt.trim().length === 0) return;
     try {
       const preflight = await this.backend.preflightLaunch(this.composerDraft);
       const prepared = prepareLaunchRequest(this.composerDraft, preflight);
       if (prepared.kind === "confirmation_required") {
-        this.pendingShared = { draft: { ...this.composerDraft }, preflight };
+        this.pendingShared = { draft: { ...this.composerDraft, model: { ...this.composerDraft.model } }, preflight };
+        this.confirmationText = "";
+        this.focus = "confirmation";
         this.overlay = createSharedDirectoryOverlay(prepared.canonicalCwd, prepared.ownerSessionIds);
         return;
       }
@@ -438,6 +514,7 @@ export class DashboardController {
       return;
     }
     this.pendingShared = undefined;
+    this.confirmationText = "";
     this.overlay = undefined;
     await this.launch(prepared.request);
   }
@@ -457,6 +534,7 @@ export class DashboardController {
       this.status = { kind: "error", code: result.error.code, message: result.error.message };
       return;
     }
+    this.attachedSessionId = selected.sessionId;
     this.attachmentRole = result.role;
     this.status = result.role === "observer"
       ? { kind: "observer", message: "Read-only observer: composing and pending-request responses require explicit composer takeover after release." }
@@ -464,22 +542,70 @@ export class DashboardController {
   }
 
   handleInput(data: string): void {
+    if (this.focus === "confirmation") {
+      if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+        this.focus = "composer";
+        this.pendingShared = undefined;
+        this.confirmationText = "";
+        this.overlay = undefined;
+        return;
+      }
+      if (matchesKey(data, Key.enter)) {
+        void this.confirmSharedLaunch(this.confirmationText);
+        return;
+      }
+      if (matchesKey(data, Key.backspace)) {
+        this.confirmationText = this.confirmationText.slice(0, -1);
+        return;
+      }
+      const printable = this.printable(data);
+      if (printable !== undefined) this.confirmationText += printable;
+      return;
+    }
+
+    if (this.focus === "search") {
+      if (matchesKey(data, Key.enter) || matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+        this.focus = "list";
+        return;
+      }
+      if (matchesKey(data, Key.backspace)) {
+        this.setSearch((this.query.search ?? "").slice(0, -1));
+        return;
+      }
+      const printable = this.printable(data);
+      if (printable !== undefined) this.setSearch((this.query.search ?? "") + printable);
+      return;
+    }
+
     if (this.focus === "composer") {
       if (matchesKey(data, Key.ctrl("c")) || matchesKey(data, Key.escape)) {
         this.focus = "list";
+        return;
+      }
+      if (matchesKey(data, Key.tab)) {
+        this.cycleComposerField(1);
+        return;
+      }
+      if (matchesKey(data, "shift+tab")) {
+        this.cycleComposerField(-1);
         return;
       }
       if (matchesKey(data, Key.enter)) {
         void this.submitComposer();
         return;
       }
-      if (matchesKey(data, Key.backspace)) {
-        this.setComposerPrompt(this.composerDraft.prompt.slice(0, -1));
+      if (this.composerField === "isolationMode") {
+        if (matchesKey(data, Key.left) || matchesKey(data, Key.right) || data === " ") {
+          this.setIsolationMode(this.composerDraft.isolationMode === "worktree" ? "shared_directory" : "worktree");
+        }
         return;
       }
-      const printable = decodeKittyPrintable(data)
-        ?? (data.length === 1 && data.charCodeAt(0) >= 32 ? data : undefined);
-      if (printable !== undefined) this.setComposerPrompt(this.composerDraft.prompt + printable);
+      if (matchesKey(data, Key.backspace)) {
+        this.editComposerField((value) => value.slice(0, -1));
+        return;
+      }
+      const printable = this.printable(data);
+      if (printable !== undefined) this.editComposerField((value) => value + printable);
       return;
     }
 
@@ -488,6 +614,7 @@ export class DashboardController {
       return;
     }
     if (matchesKey(data, Key.ctrl("x"))) {
+      if (this.attachmentRole === "observer") return;
       const selected = this.selectedSession();
       if (selected !== undefined) this.onSessionIntent?.(createSessionIntent(selected));
       return;
@@ -502,11 +629,19 @@ export class DashboardController {
     else if (matchesKey(data, Key.pageUp)) this.moveSelection(-Math.max(1, this.listHeight()));
     else if (matchesKey(data, Key.home)) this.selectBoundary(false);
     else if (matchesKey(data, Key.end)) this.selectBoundary(true);
-    else if (matchesKey(data, Key.tab) || data === "n") this.focus = "composer";
+    else if (data === "/") this.focus = "search";
+    else if ((matchesKey(data, Key.tab) || data === "n") && this.attachmentRole !== "observer") this.focusComposer();
     else if (data === "i") this.toggleMetadata();
     else if (data === "?") this.toggleHelp();
     else if (data === "v") this.cycleView();
     else if (data === "c") this.clearFilters();
+    else if (data === "t") this.setTaskStates(this.singletonCycle(TASK_STATES, this.query.taskStates));
+    else if (data === "p") this.setProcessStates(this.singletonCycle(PROCESS_STATES, this.query.processStates));
+    else if (data === "o") this.setOutcomes(this.singletonCycle(OUTCOMES, this.query.outcomes));
+    else if (data === "a") this.cycleActivityFilter();
+    else if (data === "j") this.setProjectPaths(this.singletonCycle([...new Set(this.sessions.map((session) => session.cwd))], this.query.projectPaths));
+    else if (data === "s") this.cycleSort();
+    else if (data === "g") this.setGrouping(cycleValue(GROUPS, this.query.groupBy));
   }
 
   handleMouse(event: { row: number; column: number; button: "left" | "wheel_up" | "wheel_down" }): void {
@@ -519,6 +654,27 @@ export class DashboardController {
       return;
     }
     const layout = createDashboardLayout(this.width, this.height);
+    if (Math.floor(event.row) === 2) {
+      const column = Math.max(0, Math.floor(event.column));
+      const segments = this.controlSegments();
+      let offset = 1;
+      const index = segments.findIndex((segment) => {
+        const inside = column >= offset && column < offset + segment.length;
+        offset += segment.length + 1;
+        return inside;
+      });
+      this.activateControl(index < 0 ? 0 : index);
+      return;
+    }
+    if (Math.floor(event.row) === this.height - 3 && this.attachmentRole !== "observer") {
+      this.focusComposer();
+      return;
+    }
+    if (Math.floor(event.row) === this.height - 2 && this.attachmentRole !== "observer") {
+      this.focus = "composer";
+      this.composerField = COMPOSER_FIELDS[1 + Math.min(COMPOSER_FIELDS.length - 2, Math.floor(Math.max(0, event.column) * (COMPOSER_FIELDS.length - 1) / Math.max(1, this.width)))];
+      return;
+    }
     const index = this.viewportOffset + Math.floor(event.row) - layout.listTop;
     const row = this.list.rows[index];
     if (row?.kind === "session") this.selectSession(row.session.sessionId);
@@ -528,28 +684,30 @@ export class DashboardController {
     try {
       this.resize(width, height);
       const layout = createDashboardLayout(this.width, this.height);
-      const counts = countDashboardSessions(this.sessions);
-      const lines = Array.from({ length: this.height }, () => "");
-      if (lines.length > 0) lines[0] = " pi agents";
-      if (lines.length > 1) lines[1] = ` Working ${counts.working}  Ready ${counts.ready}  Failed ${counts.failed}  Sessions ${counts.sessions}  Processes ${counts.processes}`;
-      if (lines.length > 2) lines[2] = ` [${this.query.view}] sort:${this.query.sort?.key ?? "none"} group:${this.query.groupBy ?? "none"}`;
-      if (lines.length > 3) lines[3] = renderColumnHeader(layout);
-      const rendered = this.list.renderViewport({ offset: this.viewportOffset, height: layout.listHeight, width: this.width });
-      for (let index = 0; index < rendered.length; index += 1) {
-        const target = layout.listTop + index;
-        if (target < lines.length) lines[target] = rendered[index].line;
-      }
-      if (lines.length >= 3) {
-        lines[lines.length - 3] = `❯ ${this.composerDraft.prompt || "describe a task for a new session"}`;
-        lines[lines.length - 2] = this.status.kind === "error" ? `${this.status.code}: ${this.status.message}` : "";
-        lines[lines.length - 1] = " ↑↓ nav  Enter/→ open  i info  n new  / search  v view  ^X intent  ? help";
-      }
+    const counts = countDashboardSessions(this.sessions);
+    const lines = Array.from({ length: this.height }, () => "");
+    if (lines.length > 0) lines[0] = " pi agents";
+    if (lines.length > 1) lines[1] = ` Working ${counts.working}  Ready ${counts.ready}  Failed ${counts.failed}  Sessions ${counts.sessions}  Processes ${counts.processes}`;
+    if (lines.length > 2) lines[2] = ` ${this.controlSegments().join(" ")}`;
+    if (lines.length > 3) lines[3] = renderColumnHeader(layout);
+    const rendered = this.list.renderViewport({ offset: this.viewportOffset, height: layout.listHeight, width: this.width });
+    for (let index = 0; index < rendered.length; index += 1) {
+      const target = layout.listTop + index;
+      if (target < lines.length) lines[target] = rendered[index].line;
+    }
+    if (lines.length >= 3) {
+      const composerMarker = this.focus === "composer" ? `[${this.composerField}]` : "";
+      lines[lines.length - 3] = `❯${composerMarker} ${this.composerDraft.prompt || "describe a task for a new session"}`;
+      const form = `cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
+      lines[lines.length - 2] = this.status.kind === "error" ? `${this.status.code}: ${this.status.message}  ${form}` : form;
+      lines[lines.length - 1] = " ↑↓ nav Enter/→ open / search t/p/o/a/j filters s sort g group n form Tab fields ^X intent ? help";
+    }
       this.renderOverlay(lines);
       return lines.map((line) => fitLine(line, this.width));
     } catch (error) {
-      this.setError(error, "RENDER_FAILED");
-      const message = this.status.kind === "error" ? `${this.status.code}: ${this.status.message}` : "RENDER_FAILED";
-      return [fitLine(message, Math.max(0, width))];
+      const typed = this.typedError(error, "RENDER_FAILED");
+      this.fail(typed);
+      throw Object.assign(new Error(typed.message), { code: typed.code });
     }
   }
 
@@ -610,6 +768,80 @@ export class DashboardController {
     this.setView(next);
   }
 
+  private controlSegments(): string[] {
+    return [
+      `/search:${this.query.search ?? ""}`,
+      `v:${this.query.view}`,
+      `t:${this.query.taskStates?.join(",") ?? "all"}`,
+      `p:${this.query.processStates?.join(",") ?? "all"}`,
+      `o:${this.query.outcomes?.join(",") ?? "all"}`,
+      `a:${this.query.activityKinds?.join(",") ?? "all"}`,
+      `j:${this.query.projectPaths?.join(",") ?? "all"}`,
+      `s:${this.query.sort === undefined ? "none" : `${this.query.sort.key}/${this.query.sort.direction}`}`,
+      `g:${this.query.groupBy ?? "none"}`,
+    ];
+  }
+
+  private activateControl(index: number): void {
+    switch (index) {
+      case 0: this.focus = "search"; break;
+      case 1: this.cycleView(); break;
+      case 2: this.setTaskStates(this.singletonCycle(TASK_STATES, this.query.taskStates)); break;
+      case 3: this.setProcessStates(this.singletonCycle(PROCESS_STATES, this.query.processStates)); break;
+      case 4: this.setOutcomes(this.singletonCycle(OUTCOMES, this.query.outcomes)); break;
+      case 5: this.cycleActivityFilter(); break;
+      case 6: this.setProjectPaths(this.singletonCycle([...new Set(this.sessions.map((session) => session.cwd))], this.query.projectPaths)); break;
+      case 7: this.cycleSort(); break;
+      case 8: this.setGrouping(cycleValue(GROUPS, this.query.groupBy)); break;
+    }
+  }
+
+  private singletonCycle<T>(values: readonly T[], current: readonly T[] | undefined): readonly T[] | undefined {
+    const next = cycleValue(values, current?.length === 1 ? current[0] : undefined);
+    return next === undefined ? undefined : [next];
+  }
+
+  private cycleActivityFilter(): void {
+    const kinds = [...new Set(this.sessions.map((session) => session.activity.kind))].sort();
+    this.setActivityKinds(this.singletonCycle(kinds, this.query.activityKinds));
+  }
+
+  private cycleSort(): void {
+    const current = this.query.sort;
+    if (current === undefined) {
+      this.setSort(SORT_KEYS[0], "asc");
+      return;
+    }
+    if (current.direction === "asc") {
+      this.setSort(current.key, "desc");
+      return;
+    }
+    const next = cycleValue(SORT_KEYS, current.key);
+    this.setQuery({ ...this.query, sort: next === undefined ? undefined : { key: next, direction: "asc" } });
+  }
+
+  private cycleComposerField(delta: number): void {
+    const current = COMPOSER_FIELDS.indexOf(this.composerField);
+    this.composerField = COMPOSER_FIELDS[(current + delta + COMPOSER_FIELDS.length) % COMPOSER_FIELDS.length];
+  }
+
+  private editComposerField(edit: (value: string) => string): void {
+    switch (this.composerField) {
+      case "prompt": this.composerDraft = { ...this.composerDraft, prompt: edit(this.composerDraft.prompt) }; break;
+      case "cwd": this.composerDraft = { ...this.composerDraft, cwd: edit(this.composerDraft.cwd) }; break;
+      case "modelProvider": this.composerDraft = { ...this.composerDraft, model: { ...this.composerDraft.model, provider: edit(this.composerDraft.model.provider) } }; break;
+      case "modelId": this.composerDraft = { ...this.composerDraft, model: { ...this.composerDraft.model, id: edit(this.composerDraft.model.id) } }; break;
+      case "thinkingLevel": this.composerDraft = { ...this.composerDraft, thinkingLevel: edit(this.composerDraft.thinkingLevel) }; break;
+      case "name": this.composerDraft = { ...this.composerDraft, name: edit(this.composerDraft.name) }; break;
+      case "isolationMode": break;
+    }
+  }
+
+  private printable(data: string): string | undefined {
+    return decodeKittyPrintable(data)
+      ?? (data.length === 1 && data.charCodeAt(0) >= 32 ? data : undefined);
+  }
+
   private async launch(request: LaunchRequest): Promise<void> {
     const outcome = await this.backend.launch(request, this.requestId());
     if (outcome.kind === "launched") {
@@ -632,37 +864,63 @@ export class DashboardController {
     let details: string[];
     if (overlay.kind === "metadata") details = Object.entries(overlay.fields).map(([key, value]) => `${key}: ${value}`);
     else if (overlay.kind === "help") details = overlay.bindings.map((binding) => `${binding.keys}  ${binding.action}`);
-    else if (overlay.kind === "shared_directory_confirmation") details = ["Shared directory warning", `Type exactly: ${overlay.canonicalCwd}`];
+    else if (overlay.kind === "shared_directory_confirmation") details = ["Shared directory warning", `Type exactly: ${overlay.canonicalCwd}`, `> ${this.confirmationText}`];
     else details = ["DELIVERY_UNKNOWN", "Choose retry_at_risk or abandon; no automatic retry."];
     const start = Math.max(0, Math.floor((lines.length - details.length) / 2));
     details.forEach((detail, index) => { if (start + index < lines.length) lines[start + index] = detail; });
   }
 
-  private async persist(): Promise<void> {
+  private async persist(cursor = this.cursor): Promise<void> {
     await this.persistence.save({
+      schemaVersion: 1,
       clientId: this.clientId,
-      cursor: this.cursor,
+      cursor,
       viewState: {
         query: (({ historyPolicy: _historyPolicy, ...query }) => query)(this.query),
         selectedSessionId: this.preferredSelectionId ?? this.selectedSessionId,
       },
+      launchDraft: { ...this.composerDraft, model: { ...this.composerDraft.model } },
     });
+  }
+
+  private isCurrentOpen(generation: number): boolean {
+    return !this.closed && this.openGeneration === generation;
+  }
+
+  private typedError(error: unknown, fallbackCode: string): DashboardTransportError {
+    const typed = error as { code?: string; message?: string };
+    return { code: typed.code ?? fallbackCode, message: typed.message ?? fallbackCode };
+  }
+
+  private async detachNative(): Promise<void> {
+    const sessionId = this.attachedSessionId;
+    if (sessionId === undefined) return;
+    const result = await this.nativeAttach.detach({ sessionId });
+    if (result.kind !== "detached") throw Object.assign(new Error(result.error.message), result.error);
+    this.attachedSessionId = undefined;
+    this.attachmentRole = undefined;
   }
 
   private fail(error: DashboardTransportError): void {
     this.status = { kind: "error", code: error.code, message: error.message };
     if (!this.closed) {
       this.closed = true;
+      this.openGeneration += 1;
+      this.openController?.abort();
+      this.openController = undefined;
       const unsubscribe = this.unsubscribe;
       this.unsubscribe = undefined;
       unsubscribe?.();
-      this.attachmentRole = undefined;
+      this.overlay = undefined;
+      this.pendingShared = undefined;
+      this.confirmationText = "";
+      void this.detachNative().catch(() => {});
       this.onClose?.({ kind: "error", code: error.code, message: error.message });
     }
   }
 
   private setError(error: unknown, fallbackCode: string): void {
-    const typed = error as { code?: string; message?: string };
-    this.status = { kind: "error", code: typed.code ?? fallbackCode, message: typed.message ?? fallbackCode };
+    const typed = this.typedError(error, fallbackCode);
+    this.status = { kind: "error", code: typed.code, message: typed.message };
   }
 }

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFile, realpath, rename, writeFile } from "node:fs/promises";
+import { readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -8,14 +8,6 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import {
-  isKeyRelease,
-  isKeyRepeat,
-  Key,
-  matchesKey,
-  parseKey,
-  type EditorComponent,
-} from "@earendil-works/pi-tui";
 
 import { checkHostCapabilities, type HostCapabilityReport } from "./compatibility.js";
 import { createDaemonClient } from "./daemon-client.js";
@@ -25,94 +17,15 @@ import {
   type DashboardPersistence,
   type PersistedDashboardState,
 } from "./dashboard.js";
-import { reduceLeftGesture, createLeftGestureState, type LeftGestureState } from "./key-gesture.js";
+import { DashboardGestureEditor } from "./key-gesture.js";
 
 const UNSUPPORTED_REMEDIATION = "UNSUPPORTED_HOST: run `pi-agents-dashboard doctor`; upgrade Pi to a version exposing the documented daemon-owned startup, native attachment, composable editor, and fullscreen custom UI APIs.";
+
+type EditorFactory = NonNullable<ReturnType<ExtensionContext["ui"]["getEditorComponent"]>>;
 
 interface AgentsDashboardDependencies {
   checkCapabilities(): Promise<HostCapabilityReport>;
   openDashboard(ctx: ExtensionContext, report: HostCapabilityReport): Promise<void>;
-}
-
-interface CursorEditor extends EditorComponent {
-  getCursor?(): { line: number; col: number };
-  focused?: boolean;
-}
-
-class GestureEditor implements EditorComponent {
-  private readonly base: CursorEditor;
-  private readonly openDashboard: () => void;
-  private gesture: LeftGestureState;
-  private submitHandler?: (text: string) => void;
-  private changeHandler?: (text: string) => void;
-
-  constructor(base: CursorEditor, openDashboard: () => void) {
-    this.base = base;
-    this.openDashboard = openDashboard;
-    this.gesture = base.getText().length === 0
-      ? createLeftGestureState()
-      : reduceLeftGesture(createLeftGestureState(), { type: "editorChanged", text: base.getText() }).state;
-    const priorSubmit = base.onSubmit;
-    const priorChange = base.onChange;
-    base.onSubmit = (text) => {
-      this.gesture = reduceLeftGesture(this.gesture, { type: "submitted" }).state;
-      priorSubmit?.(text);
-      this.submitHandler?.(text);
-    };
-    base.onChange = (text) => {
-      this.gesture = reduceLeftGesture(this.gesture, { type: "editorChanged", text }).state;
-      priorChange?.(text);
-      this.changeHandler?.(text);
-    };
-  }
-
-  get onSubmit(): ((text: string) => void) | undefined { return this.submitHandler; }
-  set onSubmit(handler: ((text: string) => void) | undefined) { this.submitHandler = handler; }
-  get onChange(): ((text: string) => void) | undefined { return this.changeHandler; }
-  set onChange(handler: ((text: string) => void) | undefined) { this.changeHandler = handler; }
-  get borderColor() { return this.base.borderColor; }
-  set borderColor(value) { this.base.borderColor = value; }
-  get focused(): boolean { return this.base.focused ?? false; }
-  set focused(value: boolean) { this.base.focused = value; }
-
-  getText(): string { return this.base.getText(); }
-  setText(text: string): void { this.base.setText(text); }
-  render(width: number): string[] { return this.base.render(width); }
-  invalidate(): void { this.base.invalidate(); }
-  addToHistory(text: string): void { this.base.addToHistory?.(text); }
-  insertTextAtCursor(text: string): void { this.base.insertTextAtCursor?.(text); }
-  getExpandedText(): string { return this.base.getExpandedText?.() ?? this.base.getText(); }
-  setAutocompleteProvider(provider: Parameters<NonNullable<EditorComponent["setAutocompleteProvider"]>>[0]): void { this.base.setAutocompleteProvider?.(provider); }
-  setPaddingX(padding: number): void { this.base.setPaddingX?.(padding); }
-  setAutocompleteMaxVisible(maxVisible: number): void { this.base.setAutocompleteMaxVisible?.(maxVisible); }
-
-  handleInput(data: string): void {
-    const parsed = parseKey(data) ?? "unknown";
-    const cursor = this.base.getCursor?.();
-    const result = reduceLeftGesture(this.gesture, {
-      type: "key",
-      key: matchesKey(data, Key.left) ? "left" : parsed,
-      at: Date.now(),
-      editorText: this.base.getText(),
-      cursorAtStart: cursor?.line === 0 && cursor.col === 0,
-      mainEditorFocused: this.focused,
-      modified: parsed !== "left",
-      phase: isKeyRelease(data) ? "release" : isKeyRepeat(data) ? "repeat" : "press",
-    });
-    this.gesture = result.state;
-    if (result.openDashboard) {
-      this.openDashboard();
-      return;
-    }
-    if (!result.passThrough) return;
-
-    const before = this.base.getText();
-    const historyCandidate = matchesKey(data, Key.up) || matchesKey(data, Key.down);
-    this.base.handleInput(data);
-    if (historyCandidate && this.base.getText() !== before) {
-      this.gesture = reduceLeftGesture(this.gesture, { type: "historyNavigated" }).state;
-    }
-  }
 }
 
 function unsupported(report: HostCapabilityReport): boolean {
@@ -132,24 +45,122 @@ function runtimeRoot(env: NodeJS.ProcessEnv = process.env): string {
   return resolve(env.PI_AGENTS_DASHBOARD_STATE_DIR ?? join(env.XDG_STATE_HOME ?? join(home, ".local", "state"), "pi-agents-dashboard"));
 }
 
-async function filePersistence(path: string): Promise<{ clientId: string; persistence: DashboardPersistence }> {
+function persistenceError(message: string, cause?: unknown): Error {
+  return Object.assign(new Error(message, cause === undefined ? undefined : { cause }), { code: "PERSISTENCE_INVALID" });
+}
+
+function record(value: unknown, path: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw persistenceError(`${path} must be an object`);
+  return value as Record<string, unknown>;
+}
+
+function exactKeys(value: Record<string, unknown>, allowed: readonly string[], path: string): void {
+  const unknown = Object.keys(value).find((key) => !allowed.includes(key));
+  if (unknown !== undefined) throw persistenceError(`${path}.${unknown} is not supported`);
+}
+
+function text(value: unknown, path: string, { empty = false, max = 4096 } = {}): string {
+  if (typeof value !== "string" || (!empty && value.length === 0) || value.length > max || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)) {
+    throw persistenceError(`${path} must be ${empty ? "a" : "a non-empty"} string of at most ${max} characters`);
+  }
+  return value;
+}
+
+function optionalTextArray(value: unknown, path: string, allowed?: readonly string[]): readonly string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0 || value.length > 1024) throw persistenceError(`${path} must be a non-empty bounded array`);
+  const result = value.map((entry, index) => text(entry, `${path}[${index}]`));
+  if (new Set(result).size !== result.length || (allowed !== undefined && result.some((entry) => !allowed.includes(entry)))) throw persistenceError(`${path} contains an invalid or duplicate value`);
+  return result;
+}
+
+function parsePersistedState(value: unknown): PersistedDashboardState {
+  const state = record(value, "frontend state");
+  exactKeys(state, ["schemaVersion", "clientId", "cursor", "viewState", "launchDraft"], "frontend state");
+  if (state.schemaVersion !== 1) throw persistenceError("frontend state.schemaVersion must equal 1");
+  const clientId = text(state.clientId, "frontend state.clientId", { max: 256 });
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/u.test(clientId)) throw persistenceError("frontend state.clientId contains invalid identity characters");
+  const parsed: PersistedDashboardState = { schemaVersion: 1, clientId };
+  if (state.cursor !== undefined) {
+    const cursor = record(state.cursor, "frontend state.cursor");
+    exactKeys(cursor, ["daemonEpoch", "sequence"], "frontend state.cursor");
+    const sequence = text(cursor.sequence, "frontend state.cursor.sequence", { max: 128 });
+    if (!/^(0|[1-9]\d*)$/u.test(sequence)) throw persistenceError("frontend state.cursor.sequence must be a canonical unsigned integer");
+    parsed.cursor = { daemonEpoch: text(cursor.daemonEpoch, "frontend state.cursor.daemonEpoch", { max: 256 }), sequence };
+  }
+  if (state.viewState !== undefined) {
+    const view = record(state.viewState, "frontend state.viewState");
+    exactKeys(view, ["query", "selectedSessionId"], "frontend state.viewState");
+    const query = record(view.query, "frontend state.viewState.query");
+    exactKeys(query, ["view", "search", "taskStates", "processStates", "outcomes", "activityKinds", "projectPaths", "sort", "groupBy"], "frontend state.viewState.query");
+    if (!["live", "done", "all"].includes(String(query.view))) throw persistenceError("frontend state.viewState.query.view is invalid");
+    const parsedQuery: NonNullable<PersistedDashboardState["viewState"]>["query"] = { view: query.view as "live" | "done" | "all" };
+    if (query.search !== undefined) parsedQuery.search = text(query.search, "frontend state.viewState.query.search", { empty: true });
+    parsedQuery.taskStates = optionalTextArray(query.taskStates, "frontend state.viewState.query.taskStates", ["WORKING", "WAITING", "READY", "FAILED", "STOPPED"]) as typeof parsedQuery.taskStates;
+    parsedQuery.processStates = optionalTextArray(query.processStates, "frontend state.viewState.query.processStates", ["LIVE", "SLEEPING", "EXITED", "STALE"]) as typeof parsedQuery.processStates;
+    parsedQuery.outcomes = optionalTextArray(query.outcomes, "frontend state.viewState.query.outcomes", ["NONE", "COMPLETED", "READY_FOR_REVIEW"]) as typeof parsedQuery.outcomes;
+    parsedQuery.activityKinds = optionalTextArray(query.activityKinds, "frontend state.viewState.query.activityKinds");
+    parsedQuery.projectPaths = optionalTextArray(query.projectPaths, "frontend state.viewState.query.projectPaths");
+    if (query.sort !== undefined) {
+      const sort = record(query.sort, "frontend state.viewState.query.sort");
+      exactKeys(sort, ["key", "direction"], "frontend state.viewState.query.sort");
+      if (!["age", "id", "state", "model", "project", "activity"].includes(String(sort.key)) || !["asc", "desc"].includes(String(sort.direction))) throw persistenceError("frontend state.viewState.query.sort is invalid");
+      parsedQuery.sort = { key: sort.key as NonNullable<typeof parsedQuery.sort>["key"], direction: sort.direction as NonNullable<typeof parsedQuery.sort>["direction"] };
+    }
+    if (query.groupBy !== undefined) {
+      if (!["taskState", "cwd"].includes(String(query.groupBy))) throw persistenceError("frontend state.viewState.query.groupBy is invalid");
+      parsedQuery.groupBy = query.groupBy as NonNullable<typeof parsedQuery.groupBy>;
+    }
+    parsed.viewState = { query: parsedQuery };
+    if (view.selectedSessionId !== undefined) parsed.viewState.selectedSessionId = text(view.selectedSessionId, "frontend state.viewState.selectedSessionId", { max: 256 });
+  }
+  if (state.launchDraft !== undefined) {
+    const draft = record(state.launchDraft, "frontend state.launchDraft");
+    exactKeys(draft, ["prompt", "cwd", "sourceSessionId", "isolationMode", "model", "thinkingLevel", "name"], "frontend state.launchDraft");
+    const model = record(draft.model, "frontend state.launchDraft.model");
+    exactKeys(model, ["provider", "id"], "frontend state.launchDraft.model");
+    if (!["worktree", "shared_directory"].includes(String(draft.isolationMode))) throw persistenceError("frontend state.launchDraft.isolationMode is invalid");
+    parsed.launchDraft = {
+      prompt: text(draft.prompt, "frontend state.launchDraft.prompt", { empty: true, max: 100_000 }),
+      cwd: text(draft.cwd, "frontend state.launchDraft.cwd"),
+      sourceSessionId: text(draft.sourceSessionId, "frontend state.launchDraft.sourceSessionId", { max: 256 }),
+      isolationMode: draft.isolationMode as "worktree" | "shared_directory",
+      model: { provider: text(model.provider, "frontend state.launchDraft.model.provider", { max: 256 }), id: text(model.id, "frontend state.launchDraft.model.id", { max: 256 }) },
+      thinkingLevel: text(draft.thinkingLevel, "frontend state.launchDraft.thinkingLevel", { max: 256 }),
+      name: text(draft.name, "frontend state.launchDraft.name", { max: 1024 }),
+    };
+  }
+  return parsed;
+}
+
+/** Open strict, atomic frontend persistence without trusting malformed identity or cursor state. */
+export async function openFrontendPersistence(path: string): Promise<{ clientId: string; persistence: DashboardPersistence }> {
   let loaded: PersistedDashboardState | undefined;
   try {
-    loaded = JSON.parse(await readFile(path, "utf8")) as PersistedDashboardState;
+    loaded = parsePersistedState(JSON.parse(await readFile(path, "utf8")));
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      if ((error as { code?: string }).code === "PERSISTENCE_INVALID") throw error;
+      throw persistenceError(`Could not trust ${path}`, error);
+    }
   }
-  const clientId = typeof loaded?.clientId === "string" && loaded.clientId.length > 0 ? loaded.clientId : randomUUID();
+  const clientId = loaded?.clientId ?? randomUUID();
   const persistence: DashboardPersistence = {
-    async load() { return loaded ?? { clientId }; },
+    async load() { return loaded; },
     async save(state) {
-      loaded = state;
+      const validated = parsePersistedState(state);
       const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-      await writeFile(temporary, `${JSON.stringify(state)}\n`, { mode: 0o600 });
-      await rename(temporary, path);
+      try {
+        await writeFile(temporary, `${JSON.stringify(validated)}\n`, { mode: 0o600, flag: "wx" });
+        await rename(temporary, path);
+        loaded = validated;
+      } catch (error) {
+        await unlink(temporary).catch(() => {});
+        throw error;
+      }
     },
   };
-  if (loaded === undefined) await persistence.save({ clientId });
+  if (loaded === undefined) await persistence.save({ schemaVersion: 1, clientId });
   return { clientId, persistence };
 }
 
@@ -159,7 +170,7 @@ async function openDashboardWithPublicUi(ctx: ExtensionContext): Promise<void> {
     return;
   }
   const root = runtimeRoot();
-  const { clientId, persistence } = await filePersistence(join(root, "frontend-state.json"));
+  const { clientId, persistence } = await openFrontendPersistence(join(root, "frontend-state.json"));
   const token = (await readFile(join(root, "daemon", "control.token"), "utf8")).trim();
   const client = createDaemonClient({
     socketPath: join(root, "daemon", "control.sock"),
@@ -185,6 +196,9 @@ async function openDashboardWithPublicUi(ctx: ExtensionContext): Promise<void> {
         nativeAttach: {
           async attach() {
             return { kind: "unsupported", error: { code: "UNSUPPORTED_HOST", message: "Native Pi attachment is reserved for Task 14 and unavailable on this host." } };
+          },
+          async detach() {
+            return { kind: "unsupported", error: { code: "UNSUPPORTED_HOST", message: "Native Pi detachment is reserved for Task 14 and unavailable on this host." } };
           },
         },
         clientId,
@@ -225,12 +239,17 @@ export function registerAgentsDashboard(
   },
 ): void {
   const activate = async (ctx: ExtensionContext) => {
-    const report = await dependencies.checkCapabilities();
-    if (unsupported(report)) {
-      await reportUnsupported(ctx, report);
-      return;
+    try {
+      const report = await dependencies.checkCapabilities();
+      if (unsupported(report)) {
+        await reportUnsupported(ctx, report);
+        return;
+      }
+      await dependencies.openDashboard(ctx, report);
+    } catch (error) {
+      const typed = error as { code?: string; message?: string };
+      ctx.ui.notify(`${typed.code ?? "DASHBOARD_OPEN_FAILED"}: ${typed.message ?? "Dashboard could not open"}`, "error");
     }
-    await dependencies.openDashboard(ctx, report);
   };
 
   pi.registerCommand("agents", {
@@ -238,20 +257,38 @@ export function registerAgentsDashboard(
     handler: async (_args, ctx) => activate(ctx),
   });
 
+  const installations = new Map<ExtensionContext["ui"], { previous: EditorFactory | undefined; wrapper: EditorFactory; editors: Set<DashboardGestureEditor> }>();
+
   pi.on("session_start", async (_event, ctx) => {
     if (ctx.mode !== "tui") return;
     const report = await dependencies.checkCapabilities();
     if (!report.composableLeftGesture) return;
     const previous = ctx.ui.getEditorComponent();
-    ctx.ui.setEditorComponent((tui, theme, keybindings) => {
+    const editors = new Set<DashboardGestureEditor>();
+    const wrapper: EditorFactory = (tui, theme, keybindings) => {
       const base = previous?.(tui, theme, keybindings)
         ?? new CustomEditor(tui, theme, keybindings);
-      const cursorEditor = base as CursorEditor;
-      if (typeof cursorEditor.getCursor !== "function") {
-        ctx.ui.notify("UNSUPPORTED_HOST: Left gesture disabled because the existing custom editor does not expose public cursor state; use /agents or install a composable Editor-compatible component.", "warning");
+      if (!(base instanceof CustomEditor)) {
+        ctx.ui.notify("UNSUPPORTED_HOST: Left gesture disabled because the existing editor is not a public CustomEditor; use /agents or compose with Pi's documented CustomEditor.", "warning");
+        return base;
       }
-      return new GestureEditor(cursorEditor, () => { void activate(ctx); });
-    });
+      const editor = new DashboardGestureEditor(base, () => { void activate(ctx); });
+      editors.add(editor);
+      return editor;
+    };
+    installations.set(ctx.ui, { previous, wrapper, editors });
+    ctx.ui.setEditorComponent(wrapper);
+  });
+
+  pi.on("session_shutdown", async (_event, ctx) => {
+    const installation = installations.get(ctx.ui);
+    if (installation === undefined) return;
+    installations.delete(ctx.ui);
+    if (ctx.ui.getEditorComponent() === installation.wrapper) {
+      for (const editor of installation.editors) editor.dispose();
+      installation.editors.clear();
+      ctx.ui.setEditorComponent(installation.previous);
+    }
   });
 }
 

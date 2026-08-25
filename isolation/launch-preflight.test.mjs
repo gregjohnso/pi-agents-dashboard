@@ -73,7 +73,7 @@ it("preflights an attached branch and preserves a subdirectory cwd", async () =>
     sourceBranch: "main",
     sourceDirty: false,
     piConfigRoot: fixture.piConfigRoot,
-    worktreesRoot: join(fixture.piConfigRoot, "agents-dashboard", "worktrees"),
+    worktreesRoot: join(fixture.piConfigRoot, "pi-dashboard", "worktrees"),
   });
 });
 

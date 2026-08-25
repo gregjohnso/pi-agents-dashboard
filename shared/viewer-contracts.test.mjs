@@ -15,7 +15,7 @@ const payloads = [
   { kind: "tool_started", tool }, { kind: "tool_updated", tool }, { kind: "tool_finished", tool: { ...tool, state: "completed", result: content, finishedAt: "2026-08-25T00:00:01Z" } },
   { kind: "turn_state", working: true }, { kind: "pending_ui_request", request }, { kind: "ui_resolved", requestId: "ui-1" },
   { kind: "model_state", provider: "provider", model: "model" }, { kind: "thinking_state", level: "high" },
-  { kind: "activity", phase: "tool_running", label: "Running bash", startedAt: "2026-08-25T00:00:00Z", toolCallId: "tool-1" },
+  { kind: "activity", phase: "tool_running", label: "Running bash", sourceEventId: "pi-event-1", startedAt: "2026-08-25T00:00:00Z", toolCallId: "tool-1" },
   { kind: "image_placeholder", attachment }, { kind: "file_placeholder", attachment },
   { kind: "unknown_pi_event", piType: "future", summary: "Unsupported Pi event" },
 ];
@@ -33,6 +33,12 @@ it("strictly validates nested content, tools, attachments, and UI requests", () 
   expect(() => parseViewerEvent({ ...base, payload: { kind: "pending_ui_request", request: { ...request, method: "unknown" } } })).toThrow(/method/i);
 });
 
+it("requires source identity and bounds viewer activity text", () => {
+  expect(() => parseViewerEvent({ ...base, payload: { kind: "activity", phase: "thinking", label: "Thinking", startedAt: base.timestamp } })).toThrow(/sourceEventId/i);
+  expect(() => parseViewerEvent({ ...base, payload: { kind: "activity", phase: "thinking", label: "x".repeat(257), sourceEventId: "source", startedAt: base.timestamp } })).toThrow(/label/i);
+  expect(() => parseViewerEvent({ ...base, payload: { kind: "activity", phase: "thinking", label: "Thinking", detail: "x".repeat(4097), sourceEventId: "source", startedAt: base.timestamp } })).toThrow(/detail/i);
+});
+
 it("binds every cursor to the exact viewer session", () => {
   expect(() => parseViewerEvent({ ...base, cursor: { ...base.cursor, sessionId: "other" }, payload: payloads[0] })).toThrow(/session/i);
   expect(() => parseViewerEvent({ ...base, cursor: { ...base.cursor, sequence: "03" }, payload: payloads[0] })).toThrow(/sequence/i);
@@ -42,7 +48,7 @@ it("strictly parses the frozen version-1 viewer snapshot", () => {
   const snapshot = {
     version: 1, sessionId: "session-1", registryRevision: 4, cursor: base.cursor, runtime: null, role: "observer",
     taskState: "READY", processState: "SLEEPING", outcome: "COMPLETED",
-    activity: { kind: "activity", phase: "idle", label: "Idle", startedAt: "2026-08-25T00:00:00Z" },
+    activity: { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "snapshot-source", startedAt: "2026-08-25T00:00:00Z" },
     model: null, thinkingLevel: null, items: [payloads[0]], tools: [tool], pendingUi: [request], errors: [{ code: "WARN", message: "bounded", retryable: false }],
   };
   expect(parseViewerSnapshot(snapshot)).toEqual(snapshot);

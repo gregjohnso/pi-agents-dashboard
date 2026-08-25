@@ -6,7 +6,6 @@ const COLUMN_LABELS = {
     id: "ID",
     state: "STATE",
     age: "AGE",
-    model: "MODEL",
     project: "PROJECT",
     activity: "ACTIVITY",
 };
@@ -32,31 +31,21 @@ function densityForWidth(width) {
 function columnsForWidth(width) {
     if (width <= 0)
         return [];
-    if (width >= 100) {
-        return [
-            { key: "id", width: 10 },
-            { key: "state", width: 9 },
-            { key: "age", width: 7 },
-            { key: "model", width: 20 },
-            { key: "project", width: 24 },
-            { key: "activity", width: width - 75 },
-        ];
-    }
     if (width >= 72) {
         return [
             { key: "id", width: 10 },
             { key: "state", width: 9 },
+            { key: "project", width: width >= 100 ? 24 : 20 },
+            { key: "activity", width: width - (width >= 100 ? 54 : 50) },
             { key: "age", width: 7 },
-            { key: "project", width: 20 },
-            { key: "activity", width: width - 50 },
         ];
     }
     if (width >= 52) {
         return [
             { key: "id", width: 9 },
             { key: "state", width: 8 },
-            { key: "age", width: 6 },
             { key: "activity", width: width - 26 },
+            { key: "age", width: 6 },
         ];
     }
     if (width >= 28) {
@@ -133,7 +122,6 @@ function sessionValues(session, now) {
         id: `${liveness(session)} ${truncateToWidth(plainText(session.sessionId), 8, "")}`,
         state: session.taskState,
         age: age(session.updatedAt, now),
-        model: session.model?.id ?? "—",
         project,
         activity: session.activity.summary.trim() || "—",
     };

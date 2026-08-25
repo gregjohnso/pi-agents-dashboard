@@ -132,7 +132,7 @@ function validateIsolation(value) {
 }
 
 /** @param {unknown} value @returns {SessionRecord} */
-function validateRecord(value) {
+export function validateSessionRecord(value) {
   if (!isPlainObject(value)) throw new TypeError("Session record must be an object");
   rejectUnknownKeys(value, SESSION_RECORD_KEYS, "SessionRecord");
   if (value.schemaVersion !== 1) throw new TypeError("schemaVersion must be 1");
@@ -253,7 +253,7 @@ export class RegistryStore {
       if (!metadata.isFile() || metadata.isSymbolicLink()) {
         throw new TypeError("Registry record must be a regular file");
       }
-      const record = validateRecord(JSON.parse(await this.#fsOps.readFile(path, "utf8")));
+      const record = validateSessionRecord(JSON.parse(await this.#fsOps.readFile(path, "utf8")));
       if (record.sessionId !== expectedSessionId) {
         throw new TypeError("Registry filename and sessionId must match");
       }
@@ -285,7 +285,7 @@ export class RegistryStore {
 
   /** @param {SessionRecord} record */
   async create(record) {
-    validateRecord(record);
+    validateSessionRecord(record);
     validateSessionId(record.sessionId);
     return this.#coordinator.run(CREATE_COORDINATION_KEY, async () => {
       if ((await this.get(record.sessionId)) !== undefined) {
@@ -358,7 +358,7 @@ export class RegistryStore {
         canonicalSessionFile: current.canonicalSessionFile,
         revision: current.revision + 1,
       };
-      validateRecord(next);
+      validateSessionRecord(next);
       await this.#atomicWrite(this.#path(sessionId), next);
       return next;
     });

@@ -17,7 +17,7 @@ async function fixture() {
   const destinationRoot = join(parent, "pi-dashboard");
   await mkdir(join(legacyRoot, "sessions"), { recursive: true, mode: 0o700 });
   await writeFile(join(legacyRoot, "dashboard.json"), JSON.stringify({ schemaVersion: 1, workers: { maxLive: 2 } }), { mode: 0o600 });
-  await writeFile(join(legacyRoot, "sessions", "one.json"), JSON.stringify({ schemaVersion: 1, sessionId: "one", canonicalSessionFile: "/canonical/sessions/one.jsonl", isolation: { mode: "worktree", worktreePath: "/worktrees/one", branch: "one" } }), { mode: 0o600 });
+  await writeFile(join(legacyRoot, "sessions", "one.json"), JSON.stringify({ schemaVersion: 1, revision: 0, sessionId: "one", sessionFile: "/canonical/sessions/one.jsonl", canonicalSessionFile: "/canonical/sessions/one.jsonl", cwd: "/repo", taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "none", summary: "idle", updatedAt: "2026-08-25T00:00:00.000Z" }, isolation: { mode: "worktree", worktreePath: "/worktrees/one", branch: "one" }, createdAt: "2026-08-25T00:00:00.000Z", updatedAt: "2026-08-25T00:00:00.000Z" }), { mode: 0o600 });
   return { legacyRoot, destinationRoot };
 }
 
@@ -83,6 +83,34 @@ it("refuses live legacy ownership before staging", async () => {
     inspectLegacyRuntime: async () => ({ activeDaemon: { pid: 12, startIdentity: "live" }, activeSupervisors: [] }),
     reconcileDestination: vi.fn(),
   })).rejects.toMatchObject({ code: "LEGACY_RUNTIME_ACTIVE" });
+});
+
+it("refuses a structurally invalid legacy registry record before staging", async () => {
+  const paths = await fixture();
+  await writeFile(join(paths.legacyRoot, "sessions", "one.json"), JSON.stringify({ schemaVersion: 1, sessionId: "one" }), { mode: 0o600 });
+  await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: vi.fn() })).rejects.toMatchObject({ code: "MALFORMED_LEGACY_STATE" });
+});
+
+it.each([
+  ["daemon/control.token", ""],
+  ["frontend-state.json", JSON.stringify({ schemaVersion: 1, clientId: "client", cursor: { daemonEpoch: "epoch", sequence: "01" } })],
+  ["queue/commands.jsonl", "{\"command\":{}}\n"],
+])("refuses malformed legacy artifact %s", async (relative, text) => {
+  const paths = await fixture();
+  const directory = join(paths.legacyRoot, relative.split("/").slice(0, -1).join("/"));
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await writeFile(join(paths.legacyRoot, relative), text, { mode: 0o600 });
+  await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: vi.fn() })).rejects.toMatchObject({ code: "MALFORMED_LEGACY_STATE" });
+});
+
+it("treats a reconciled migration as idempotent after destination writers mutate copied records", async () => {
+  const paths = await fixture();
+  const options = { ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {} };
+  const first = await migrateLegacyState(options);
+  const recordPath = join(paths.destinationRoot, "sessions", "one.json");
+  const record = JSON.parse(await readFile(recordPath, "utf8"));
+  await writeFile(recordPath, `${JSON.stringify({ ...record, revision: 1 })}\n`, { mode: 0o600 });
+  await expect(migrateLegacyState(options)).resolves.toEqual({ ...first, status: "ALREADY_MIGRATED" });
 });
 
 it("recovers idempotently only for the same completed migration identity", async () => {

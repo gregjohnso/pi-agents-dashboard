@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { realpath, stat } from "node:fs/promises";
+import { lstat, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
@@ -10,9 +10,11 @@ import { ensurePrivateDirectory } from "../runtime/permissions.mjs";
 import { IsolationError } from "./launch-preflight.mjs";
 
 const execFileAsync = promisify(execFile);
-export const WORKTREE_OWNERSHIP_FILE = "pi-agents-dashboard-owner.json";
+export const WORKTREE_OWNERSHIP_FILE = "pi-dashboard-owner.json";
+export const LEGACY_WORKTREE_OWNERSHIP_FILE = "pi-agents-dashboard-owner.json";
 const WORKTREE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
-const WORKTREE_LOCK_SUFFIX = ".pi-agents-dashboard-ownership.lock";
+const WORKTREE_LOCK_SUFFIX = ".pi-dashboard-ownership.lock";
+const LEGACY_WORKTREE_LOCK_SUFFIX = ".pi-agents-dashboard-ownership.lock";
 
 /** @param {string} cwd @param {string[]} args */
 async function git(cwd, args) {
@@ -48,13 +50,16 @@ function validatePreflight(preflight) {
  * @param {string} worktreePath
  */
 export async function acquireWorktreeOwnershipLock(worktreePath) {
-  const lockPath = `${worktreePath}${WORKTREE_LOCK_SUFFIX}`;
+  /** @type {Array<{release():Promise<unknown>}>} */
+  const locks = [];
   try {
-    return await acquireLifecycleLock(lockPath, {
-      operation: "worktree_ownership",
-      worktreePath,
-    });
+    const lockPaths = [`${worktreePath}${WORKTREE_LOCK_SUFFIX}`];
+    try { await lstat(`${worktreePath}${LEGACY_WORKTREE_LOCK_SUFFIX}`); lockPaths.push(`${worktreePath}${LEGACY_WORKTREE_LOCK_SUFFIX}`); }
+    catch (error) { if (/** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT") throw error; }
+    for (const lockPath of lockPaths.sort()) locks.push(await acquireLifecycleLock(lockPath, { operation: "worktree_ownership", worktreePath }));
+    return { release: async () => { for (const lock of locks.reverse()) await lock.release(); } };
   } catch (cause) {
+    for (const lock of locks.reverse()) await lock.release().catch(() => {});
     if (/** @type {{ code?: unknown }} */ (cause).code === "LOCK_HELD") {
       throw new IsolationError(
         "WORKTREE_OWNERSHIP_LOCKED",
@@ -129,7 +134,7 @@ export async function createWorktree(preflight, options) {
   }
 
   const canonicalPiConfigRoot = await realpath(preflight.piConfigRoot);
-  const dashboardRoot = join(canonicalPiConfigRoot, "agents-dashboard");
+  const dashboardRoot = join(canonicalPiConfigRoot, "pi-dashboard");
   const expectedWorktreesRoot = join(dashboardRoot, "worktrees");
   if (preflight.worktreesRoot !== expectedWorktreesRoot) {
     throw new IsolationError(
@@ -160,7 +165,7 @@ export async function createWorktree(preflight, options) {
   if (!isAbsolute(worktreePath) || resolve(worktreePath) !== worktreePath) {
     throw new IsolationError("INVALID_WORKTREE_PATH", "Derived worktree path is not canonical");
   }
-  const branch = `pi-agents/${options.worktreeId}`;
+  const branch = `pi-dashboard/${options.worktreeId}`;
   const lock = await acquireWorktreeOwnershipLock(worktreePath);
   try {
     try {

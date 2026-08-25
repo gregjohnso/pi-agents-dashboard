@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { access, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
@@ -11,6 +11,7 @@ import { launchPreflight } from "./launch-preflight.mjs";
 import {
   acquireWorktreeOwnershipLock,
   createWorktree,
+  LEGACY_WORKTREE_OWNERSHIP_FILE,
   WORKTREE_OWNERSHIP_FILE,
 } from "./worktree.mjs";
 
@@ -79,6 +80,14 @@ async function commit(isolation, name, contents) {
   await git(isolation.worktreePath, "add", name);
   await git(isolation.worktreePath, "commit", "-m", name);
 }
+
+it("recognizes the legacy ownership marker during cleanup", async () => {
+  const { isolation } = await fixture();
+  const { stdout } = await git(isolation.worktreePath, "rev-parse", "--git-dir");
+  const gitDirectory = stdout.trim();
+  await rename(join(gitDirectory, WORKTREE_OWNERSHIP_FILE), join(gitDirectory, LEGACY_WORKTREE_OWNERSHIP_FILE));
+  await expect(cleanupOwnedWorktree(isolation, noLiveOwnershipOptions)).resolves.toMatchObject({ disposition: "REMOVED" });
+});
 
 it("fails closed when the authoritative ownership reader is omitted", async () => {
   const { isolation } = await fixture();

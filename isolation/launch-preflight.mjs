@@ -148,6 +148,6 @@ export async function launchPreflight(request, options = {}) {
     sourceDirty: statusOutput.length > 0,
     sourceSessionId: request.sourceSessionId,
     piConfigRoot,
-    worktreesRoot: join(piConfigRoot, "agents-dashboard", "worktrees"),
+    worktreesRoot: join(piConfigRoot, "pi-dashboard", "worktrees"),
   };
 }

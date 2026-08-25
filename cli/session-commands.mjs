@@ -5,6 +5,7 @@ import net from "node:net";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
+import { createDaemonClient } from "../app/daemon-client.mjs";
 import { cleanupManagedWorktree as defaultCleanupManagedWorktree } from "../isolation/cleanup.mjs";
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
 import { acquireLifecycleLock } from "../runtime/lifecycle-lock.mjs";
@@ -177,6 +178,33 @@ function validateExpectedResult(op, payload, clientId, requestId, result) {
   }
 }
 
+/** Create one persistent authenticated request session for composer-scoped operations. */
+export async function createPersistentDaemonRequester({ root = runtimeRoot(), clientId, maxBytes = 1024 * 1024, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS }) {
+  if (!exactId(clientId)) throw new TypeError("A stable CLI clientId is required");
+  const token = (await fs.readFile(join(root, "daemon", "control.token"), "utf8")).trim();
+  const client = createDaemonClient({ socketPath: join(root, "daemon", "control.sock"), token, maxBytes, clientId });
+  await client.connect();
+  return {
+    async request(op, payload, requestId = randomUUID()) {
+      let timer;
+      let rejectFatal;
+      const fatal = new Promise((_, reject) => { rejectFatal = reject; });
+      const removeFatal = client.onFatalError((error) => rejectFatal(error?.code === "MALFORMED_FRAME" ? Object.assign(new Error(error.message), { code: "INVALID_DAEMON_RESPONSE" }) : error));
+      try {
+        const response = await Promise.race([
+          client.request({ version: 1, clientId, requestId, op, payload }),
+          fatal,
+          new Promise((_, reject) => { timer = setTimeout(() => reject(Object.assign(new Error("Daemon request timed out"), ["stop", "delete"].includes(op) ? { code: "DELIVERY_UNKNOWN", clientId, requestId } : { code: "DAEMON_REQUEST_TIMEOUT" })), timeoutMs); }),
+        ]);
+        if (!response.ok) throw Object.assign(new Error(response.error.message), response.error);
+        validateExpectedResult(op, payload, clientId, requestId, response.result);
+        return response.result;
+      } finally { clearTimeout(timer); removeFatal(); }
+    },
+    close: () => client.close(),
+  };
+}
+
 /** Create one bounded authenticated requester; transport closure never signals workers. */
 export function createDaemonRequester({ root = runtimeRoot(), clientId, maxBytes = 1024 * 1024, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, createConnection = net.createConnection } = {}) {
   if (!exactId(clientId)) throw new TypeError("A stable CLI clientId is required");
@@ -339,7 +367,9 @@ async function recoverStaleCliLock(lockPath, { fsOps = fs, inspect = inspectProc
     throw error;
   }
   if (!metadata.isDirectory() || metadata.isSymbolicLink() || metadata.uid !== process.getuid?.() || (metadata.mode & 0o777) !== PRIVATE_DIRECTORY_MODE) return false;
-  const entries = await fsOps.readdir(lockPath);
+  let entries;
+  try { entries = await fsOps.readdir(lockPath); }
+  catch (error) { if (/** @type {NodeJS.ErrnoException} */ (error)?.code === "ENOENT") return true; throw error; }
   if (entries.length !== 1 || !exactId(entries[0])) return false;
   const entryPath = join(lockPath, entries[0]);
   let first;
@@ -555,14 +585,29 @@ export async function runSessionCommand(argv, options = {}) {
       ? await putPending(root, { action: parsed.command, sessionId: parsed.sessionId, revision: parsed.revision, clientId, requestId: randomUUID() }, options.pendingFailpoint)
       : existing;
     if (pending.entry.clientId !== clientId) throw Object.assign(new Error("Persistent CLI identity changed while a destructive request remains pending"), { code: "CLI_CLIENT_IDENTITY_CHANGED", pendingClientId: pending.entry.clientId, currentClientId: clientId, requestId: pending.entry.requestId });
-    const request = options.request ?? createDaemonRequester({ root, clientId: pending.entry.clientId, timeoutMs: options.timeoutMs });
+    const persistent = options.request === undefined && options.composerRequest === undefined
+      ? await createPersistentDaemonRequester({ root, clientId: pending.entry.clientId, timeoutMs: options.timeoutMs })
+      : undefined;
+    const request = options.composerRequest ?? persistent?.request ?? options.request;
+    const claimsComposer = options.composerRequest !== undefined || persistent !== undefined;
+    let attached = false;
+    let canDetach = false;
     try {
+      if (claimsComposer) {
+        const attachment = await request("attach", { sessionId: parsed.sessionId, role: "composer" });
+        if (attachment?.kind !== "attached" || attachment.role !== "composer") throw Object.assign(new Error("Daemon refused the composer role"), { code: "ATTACHMENT_REQUIRED" });
+        attached = true;
+      }
       const result = await request(parsed.command, { sessionId: parsed.sessionId, revision: parsed.revision }, pending.entry.requestId);
+      canDetach = true;
       if (result?.kind === "command" && ["COMPLETED", "FAILED"].includes(result.status?.stage)) await clearPending(root, pending.path, pending, options.pendingFailpoint);
       return classifyCommandResult(result);
     } catch (error) {
       if (error?.code === "DELIVERY_UNKNOWN") return { code: 1, error: { code: "DELIVERY_UNKNOWN", message: error.message, clientId: pending.entry.clientId, requestId: pending.entry.requestId } };
       throw error;
+    } finally {
+      if (attached && canDetach) await request("detach", { sessionId: parsed.sessionId }).catch(() => {});
+      await persistent?.close();
     }
   }
 

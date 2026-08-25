@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import { afterEach, expect, it } from "vitest";
 
 import { launchPreflight } from "./launch-preflight.mjs";
-import { createWorktree } from "./worktree.mjs";
+import { createWorktree, WORKTREE_OWNERSHIP_FILE } from "./worktree.mjs";
 
 const execFileAsync = promisify(execFile);
 /** @type {string[]} */
@@ -62,11 +62,11 @@ it("creates an owned branch worktree and preserves the source subdirectory", asy
 
   expect(result).toMatchObject({
     mode: "worktree",
-    worktreePath: join(paths.piConfigRoot, "agents-dashboard", "worktrees", "run-123"),
-    branch: "pi-agents/run-123",
+    worktreePath: join(paths.piConfigRoot, "pi-dashboard", "worktrees", "run-123"),
+    branch: "pi-dashboard/run-123",
     workerCwd: join(
       paths.piConfigRoot,
-      "agents-dashboard",
+      "pi-dashboard",
       "worktrees",
       "run-123",
       "packages",
@@ -78,20 +78,28 @@ it("creates an owned branch worktree and preserves the source subdirectory", asy
   });
   await expect(access(result.workerCwd)).resolves.toBeUndefined();
   const { stdout: branch } = await git(result.worktreePath, "branch", "--show-current");
-  expect(branch.trim()).toBe("pi-agents/run-123");
+  expect(branch.trim()).toBe("pi-dashboard/run-123");
+});
+
+it("uses standalone product names for new worktree artifacts", async () => {
+  expect(WORKTREE_OWNERSHIP_FILE).toBe("pi-dashboard-owner.json");
+  const paths = await fixture();
+  const result = await createWorktree(await preflight(paths), { worktreeId: "standalone-name" });
+  expect(result.worktreePath).toBe(join(paths.piConfigRoot, "pi-dashboard", "worktrees", "standalone-name"));
+  expect(result.branch).toBe("pi-dashboard/standalone-name");
 });
 
 it("creates private dashboard-owned worktree roots", async () => {
   const paths = await fixture();
   await createWorktree(await preflight(paths), { worktreeId: "private-roots" });
 
-  expect((await stat(join(paths.piConfigRoot, "agents-dashboard"))).mode & 0o777).toBe(0o700);
-  expect((await stat(join(paths.piConfigRoot, "agents-dashboard", "worktrees"))).mode & 0o777).toBe(0o700);
+  expect((await stat(join(paths.piConfigRoot, "pi-dashboard"))).mode & 0o777).toBe(0o700);
+  expect((await stat(join(paths.piConfigRoot, "pi-dashboard", "worktrees"))).mode & 0o777).toBe(0o700);
 });
 
 it("rejects a pre-existing non-private dashboard worktree root", async () => {
   const paths = await fixture();
-  const dashboardRoot = join(paths.piConfigRoot, "agents-dashboard");
+  const dashboardRoot = join(paths.piConfigRoot, "pi-dashboard");
   await mkdir(dashboardRoot, { mode: 0o700 });
   const worktreesRoot = join(dashboardRoot, "worktrees");
   await mkdir(worktreesRoot, { mode: 0o700 });
@@ -111,10 +119,10 @@ it("fails closed when an untracked source subdirectory is absent after checkout"
     createWorktree(await preflight(paths, untrackedSource), { worktreeId: "missing-source" }),
   ).rejects.toMatchObject({ code: "SOURCE_SUBDIRECTORY_MISSING" });
   await expect(
-    access(join(paths.piConfigRoot, "agents-dashboard", "worktrees", "missing-source")),
+    access(join(paths.piConfigRoot, "pi-dashboard", "worktrees", "missing-source")),
   ).rejects.toMatchObject({ code: "ENOENT" });
   await expect(
-    git(paths.root, "rev-parse", "--verify", "refs/heads/pi-agents/missing-source"),
+    git(paths.root, "rev-parse", "--verify", "refs/heads/pi-dashboard/missing-source"),
   ).rejects.toBeDefined();
 });
 
@@ -138,11 +146,11 @@ it("keeps the rollback branch when HEAD changes during ownership publication", a
     paths.root,
     "rev-parse",
     "--verify",
-    "refs/heads/pi-agents/rollback-race^{commit}",
+    "refs/heads/pi-dashboard/rollback-race^{commit}",
   );
   expect(branchHead.trim()).not.toBe(preflightResult.baseCommit);
   await expect(
-    access(join(paths.piConfigRoot, "agents-dashboard", "worktrees", "rollback-race")),
+    access(join(paths.piConfigRoot, "pi-dashboard", "worktrees", "rollback-race")),
   ).resolves.toBeUndefined();
 });
 
@@ -157,13 +165,13 @@ it("creates from a canonicalized source-repository alias", async () => {
 
   expect(result.repositoryRoot).toBe(paths.root);
   expect(result.worktreePath).toBe(
-    join(paths.piConfigRoot, "agents-dashboard", "worktrees", "canonical"),
+    join(paths.piConfigRoot, "pi-dashboard", "worktrees", "canonical"),
   );
 });
 
 it("reports branch collision and never falls back to shared directory", async () => {
   const paths = await fixture();
-  await git(paths.root, "branch", "pi-agents/collision");
+  await git(paths.root, "branch", "pi-dashboard/collision");
 
   await expect(
     createWorktree(await preflight(paths), { worktreeId: "collision" }),
@@ -172,7 +180,7 @@ it("reports branch collision and never falls back to shared directory", async ()
 
 it("reports path collision and leaves the existing path intact", async () => {
   const paths = await fixture();
-  const dashboardRoot = join(paths.piConfigRoot, "agents-dashboard");
+  const dashboardRoot = join(paths.piConfigRoot, "pi-dashboard");
   const worktreesRoot = join(dashboardRoot, "worktrees");
   await mkdir(dashboardRoot, { mode: 0o700 });
   await mkdir(worktreesRoot, { mode: 0o700 });

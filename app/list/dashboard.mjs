@@ -30,6 +30,21 @@ export function createDaemonDashboardBackend({ client, clientId, preflight, requ
             sessions.set(session.sessionId, session);
         return { sessions: [...sessions.values()] };
     };
+    const requestAsComposer = async (operation, sessionId, revision, exactRequestId) => {
+        const attached = await request("attach", { sessionId, role: "composer" });
+        if (!attached.ok || attached.result.kind !== "attached" || attached.result.role !== "composer") {
+            if (!attached.ok) throw Object.assign(new Error(attached.error.message), attached.error);
+            throw Object.assign(new Error("Daemon refused the composer role"), { code: "ATTACHMENT_REQUIRED" });
+        }
+        let response;
+        try {
+            response = await request(operation, { sessionId, revision }, exactRequestId);
+            return response;
+        }
+        finally {
+            if (response !== undefined) await request("detach", { sessionId }).catch(() => {});
+        }
+    };
     const requireCompletedDestructive = (operation, response) => {
         if (!response.ok)
             throw Object.assign(new Error(response.error.message), response.error);
@@ -121,10 +136,10 @@ export function createDaemonDashboardBackend({ client, clientId, preflight, requ
                 throw Object.assign(new Error(response.error.message), response.error);
         },
         async stop(sessionId, revision, exactRequestId) {
-            requireCompletedDestructive("stop", await request("stop", { sessionId, revision }, exactRequestId));
+            requireCompletedDestructive("stop", await requestAsComposer("stop", sessionId, revision, exactRequestId));
         },
         async delete(sessionId, revision, exactRequestId) {
-            requireCompletedDestructive("delete", await request("delete", { sessionId, revision }, exactRequestId));
+            requireCompletedDestructive("delete", await requestAsComposer("delete", sessionId, revision, exactRequestId));
         },
     };
 }

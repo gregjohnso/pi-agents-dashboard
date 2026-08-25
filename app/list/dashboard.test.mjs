@@ -495,11 +495,31 @@ describe("dashboard controller", () => {
     });
 });
 describe("daemon dashboard backend", () => {
+    it.each(["stop", "delete"])("claims composer on the same client for %s and detaches afterward", async (operation) => {
+        const operations = [];
+        const client = {
+            async connect() {},
+            async request(request) {
+                operations.push(request.op);
+                if (request.op === "attach") return { version: 1, requestId: request.requestId, ok: true, result: { kind: "attached", sessionId: "exact-session", role: "composer" } };
+                if (request.op === "detach") return { version: 1, requestId: request.requestId, ok: true, result: { kind: "detached", sessionId: "exact-session" } };
+                return { version: 1, requestId: request.requestId, ok: true, result: { kind: "command", status: { clientId: "stable-client", requestId: request.requestId, operation, stage: "COMPLETED", acceptedAt: timestamp, updatedAt: timestamp } } };
+            },
+            subscribe() { return { async *[Symbol.asyncIterator]() {} }; },
+        };
+        const backend = createDaemonDashboardBackend({ client, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
+        await backend[operation]("exact-session", 3, `${operation}-request`);
+        expect(operations).toEqual(["attach", operation, "detach"]);
+    });
     it.each(["stop", "delete"])("treats durable %s FAILED as a structured refusal", async (operation) => {
         const status = { clientId: "stable-client", requestId: `${operation}-request`, operation, stage: "FAILED", acceptedAt: timestamp, updatedAt: timestamp, error: { code: "SESSION_REFUSED", message: `${operation} refused`, retryable: false } };
         const client = {
             async connect() { },
-            async request(request) { return { version: 1, requestId: request.requestId, ok: true, result: { kind: "command", status } }; },
+            async request(request) {
+                if (request.op === "attach") return { version: 1, requestId: request.requestId, ok: true, result: { kind: "attached", sessionId: "exact-session", role: "composer" } };
+                if (request.op === "detach") return { version: 1, requestId: request.requestId, ok: true, result: { kind: "detached", sessionId: "exact-session" } };
+                return { version: 1, requestId: request.requestId, ok: true, result: { kind: "command", status } };
+            },
             subscribe() { return { async *[Symbol.asyncIterator]() { } }; },
             async close() { },
         };

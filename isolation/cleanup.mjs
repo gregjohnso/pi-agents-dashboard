@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { IsolationError } from "./launch-preflight.mjs";
 import {
   acquireWorktreeOwnershipLock,
+  LEGACY_WORKTREE_OWNERSHIP_FILE,
   WORKTREE_OWNERSHIP_FILE,
 } from "./worktree.mjs";
 
@@ -97,7 +98,10 @@ async function inspectIdentity(record, destructiveBoundary = false) {
     gitDirectory = await realpath(
       isAbsolute(gitDirectoryText) ? gitDirectoryText : join(worktreePath, gitDirectoryText),
     );
-    marker = JSON.parse(await readFile(join(gitDirectory, WORKTREE_OWNERSHIP_FILE), "utf8"));
+    let markerText;
+    try { markerText = await readFile(join(gitDirectory, WORKTREE_OWNERSHIP_FILE), "utf8"); }
+    catch (error) { if (/** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT") throw error; markerText = await readFile(join(gitDirectory, LEGACY_WORKTREE_OWNERSHIP_FILE), "utf8"); }
+    marker = JSON.parse(markerText);
   } catch (cause) {
     if (destructiveBoundary) {
       throw new IsolationError(

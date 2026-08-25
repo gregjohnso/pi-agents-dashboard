@@ -81,6 +81,24 @@ it("wires daemon live-worker checks through the persistent private CLI identity"
   await rm(root, { recursive: true, force: true });
 });
 
+it("claims composer on each exact worker before --stop-workers mutation", async () => {
+  const publication = { pid: 321, startIdentity: "987654321", processGroupId: 654, tokenPath: "/state/daemon/control.token" };
+  const operations = [];
+  const request = async (op) => {
+    operations.push(op);
+    if (op === "get_state") return { kind: "state", sessions: [{ sessionId: "live", revision: 4, processState: "LIVE", ownership: { runId: "run" } }] };
+    if (op === "attach") return { kind: "attached", sessionId: "live", role: "composer" };
+    if (op === "detach") return { kind: "detached", sessionId: "live" };
+    return { kind: "command", status: { stage: "COMPLETED" } };
+  };
+  const endpoints = [{ status: "HEALTHY", daemonState: "READY", publication }, { status: "ABSENT" }];
+  await runDaemonCommand("stop", {
+    root: "/state", inspectEndpoint: async () => endpoints.shift() ?? { status: "ABSENT" }, composerRequest: request,
+    stopWorkers: true, yes: true, stopProcessGroup: async () => ({ disposition: "GRACEFUL" }),
+  });
+  expect(operations).toEqual(["get_state", "attach", "stop", "detach"]);
+});
+
 it("refuses daemon --stop-workers shutdown when any exact worker stop is not observed terminal", async () => {
   const publication = { pid: 321, startIdentity: "987654321", processGroupId: 654, tokenPath: "/state/daemon/control.token" };
   const request = async (op) => op === "get_state"

@@ -20,7 +20,7 @@ function exact(value, required, optional, path) {
   if (missing !== undefined) throw new TypeError(`${path}.${missing} is required`);
 }
 /** @param {unknown} value @param {string} path @param {boolean} [nullable] */
-function string(value, path, nullable = false) { if (nullable && value === null) return; if (typeof value !== "string" || value.length === 0 || value.trim() !== value) throw new TypeError(`${path} must be a non-empty string`); }
+function string(value, path, nullable = false, maxLength = 4096) { if (nullable && value === null) return; if (typeof value !== "string" || value.length === 0 || value.trim() !== value || value.length > maxLength) throw new TypeError(`${path} must be a bounded non-empty string`); }
 /** @param {unknown} value @param {string} path */
 function canonicalSequence(value, path) { string(value, path); if (!/^(0|[1-9]\d*)$/u.test(/** @type {string} */ (value))) throw new TypeError(`${path} must be a canonical unsigned integer string`); }
 /** @param {unknown} value @param {readonly string[]} values @param {string} path */
@@ -36,7 +36,7 @@ function content(value, path) {
   if (!Array.isArray(value)) throw new TypeError(`${path} must be an array`);
   value.forEach((entry, index) => {
     const item = record(entry, `${path}[${index}]`); enumeration(item.type, ["text", "thinking", "image", "file"], `${path}[${index}].type`);
-    if (item.type === "text" || item.type === "thinking") { exact(item, ["type", "text"], [], `${path}[${index}]`); if (typeof item.text !== "string") throw new TypeError(`${path}[${index}].text must be a string`); }
+    if (item.type === "text" || item.type === "thinking") { exact(item, ["type", "text"], [], `${path}[${index}]`); if (typeof item.text !== "string" || item.text.length > 65536) throw new TypeError(`${path}[${index}].text must be a bounded string`); }
     else { exact(item, ["type", "attachmentId"], [], `${path}[${index}]`); string(item.attachmentId, `${path}[${index}].attachmentId`); }
   });
 }
@@ -49,29 +49,29 @@ function attachment(value, path) {
 /** @param {unknown} value @param {string} path */
 function tool(value, path) {
   const item = record(value, path); exact(item, ["id", "name", "state", "arguments", "startedAt"], ["result", "error", "finishedAt"], path);
-  string(item.id, `${path}.id`); string(item.name, `${path}.name`); enumeration(item.state, ["pending", "running", "streaming", "completed", "failed"], `${path}.state`); string(item.startedAt, `${path}.startedAt`);
+  string(item.id, `${path}.id`, false, 256); string(item.name, `${path}.name`, false, 256); enumeration(item.state, ["pending", "running", "streaming", "completed", "failed"], `${path}.state`); string(item.startedAt, `${path}.startedAt`, false, 64); if (typeof item.arguments !== "object" || item.arguments === null || Array.isArray(item.arguments) || JSON.stringify(item.arguments).length > 65536) throw new TypeError(`${path}.arguments must be bounded`);
   if (Object.hasOwn(item, "result")) content(item.result, `${path}.result`); if (Object.hasOwn(item, "error")) string(item.error, `${path}.error`); if (Object.hasOwn(item, "finishedAt")) string(item.finishedAt, `${path}.finishedAt`);
 }
 /** @param {unknown} value @param {string} path */
 function uiRequest(value, path) {
   const item = record(value, path); exact(item, ["id", "method", "title"], ["options", "initialValue"], path); string(item.id, `${path}.id`); enumeration(item.method, ["confirm", "select", "input", "editor"], `${path}.method`); string(item.title, `${path}.title`);
   if (Object.hasOwn(item, "options")) { if (!Array.isArray(item.options)) throw new TypeError(`${path}.options must be an array`); item.options.forEach((option, index) => string(option, `${path}.options[${index}]`)); }
-  if (Object.hasOwn(item, "initialValue") && typeof item.initialValue !== "string") throw new TypeError(`${path}.initialValue must be a string`);
+  if (Object.hasOwn(item, "initialValue") && (typeof item.initialValue !== "string" || item.initialValue.length > 16384)) throw new TypeError(`${path}.initialValue must be a bounded string`);
 }
 /** @param {unknown} value @param {string} path @returns {Record<string, any>} */
 function payload(value, path) {
   const item = record(value, path); string(item.kind, `${path}.kind`);
   switch (item.kind) {
     case "user_message": case "assistant_message": exact(item, ["kind", "itemId", "content"], [], path); string(item.itemId, `${path}.itemId`); content(item.content, `${path}.content`); break;
-    case "assistant_delta": exact(item, ["kind", "itemId", "delta"], [], path); string(item.itemId, `${path}.itemId`); if (typeof item.delta !== "string") throw new TypeError(`${path}.delta must be a string`); break;
-    case "system_message": exact(item, ["kind", "itemId", "text", "level"], [], path); string(item.itemId, `${path}.itemId`); if (typeof item.text !== "string") throw new TypeError(`${path}.text must be a string`); enumeration(item.level, ["info", "warning", "error"], `${path}.level`); break;
+    case "assistant_delta": exact(item, ["kind", "itemId", "delta"], [], path); string(item.itemId, `${path}.itemId`); if (typeof item.delta !== "string" || item.delta.length > 65536) throw new TypeError(`${path}.delta must be a bounded string`); break;
+    case "system_message": exact(item, ["kind", "itemId", "text", "level"], [], path); string(item.itemId, `${path}.itemId`); if (typeof item.text !== "string" || item.text.length > 16384) throw new TypeError(`${path}.text must be a bounded string`); enumeration(item.level, ["info", "warning", "error"], `${path}.level`); break;
     case "tool_started": case "tool_updated": case "tool_finished": exact(item, ["kind", "tool"], [], path); tool(item.tool, `${path}.tool`); break;
     case "turn_state": exact(item, ["kind", "working"], [], path); if (typeof item.working !== "boolean") throw new TypeError(`${path}.working must be boolean`); break;
     case "pending_ui_request": exact(item, ["kind", "request"], [], path); uiRequest(item.request, `${path}.request`); break;
     case "ui_resolved": exact(item, ["kind", "requestId"], [], path); string(item.requestId, `${path}.requestId`); break;
     case "model_state": exact(item, ["kind", "provider", "model"], [], path); string(item.provider, `${path}.provider`, true); string(item.model, `${path}.model`, true); break;
     case "thinking_state": exact(item, ["kind", "level"], [], path); string(item.level, `${path}.level`, true); break;
-    case "activity": exact(item, ["kind", "phase", "label", "startedAt"], ["detail", "toolCallId", "retryAt"], path); enumeration(item.phase, PHASES, `${path}.phase`); string(item.label, `${path}.label`); string(item.startedAt, `${path}.startedAt`); for (const key of ["detail", "toolCallId", "retryAt"]) if (Object.hasOwn(item, key)) string(item[key], `${path}.${key}`); break;
+    case "activity": exact(item, ["kind", "phase", "label", "sourceEventId", "startedAt"], ["detail", "toolCallId", "retryAt"], path); enumeration(item.phase, PHASES, `${path}.phase`); string(item.label, `${path}.label`, false, 256); string(item.sourceEventId, `${path}.sourceEventId`, false, 256); string(item.startedAt, `${path}.startedAt`, false, 64); if (Object.hasOwn(item, "detail")) string(item.detail, `${path}.detail`, false, 4096); for (const key of ["toolCallId", "retryAt"]) if (Object.hasOwn(item, key)) string(item[key], `${path}.${key}`, false, key === "toolCallId" ? 256 : 64); break;
     case "image_placeholder": case "file_placeholder": exact(item, ["kind", "attachment"], [], path); attachment(item.attachment, `${path}.attachment`); break;
     case "unknown_pi_event": exact(item, ["kind", "piType", "summary"], [], path); string(item.piType, `${path}.piType`); string(item.summary, `${path}.summary`); break;
     default: throw new TypeError(`${path}.kind is invalid`);

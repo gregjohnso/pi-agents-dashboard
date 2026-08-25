@@ -1,8 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
 import { convertLegacyDashboardConfig } from "../shared/config.mjs";
+import { parseClientRequest, parseDaemonResponse } from "../shared/contracts.mjs";
+import { validateSessionRecord } from "./registry-store.mjs";
 
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -20,10 +23,46 @@ async function durableFile(path, value, fsOps) {
   const handle = await fsOps.open(path, "wx", FILE_MODE);
   try { await handle.chmod(FILE_MODE); await handle.writeFile(value); await handle.sync(); } finally { await handle.close(); }
 }
-/** @param {string} path @param {any} fsOps */
-async function readJson(path, fsOps) { try { return JSON.parse(await fsOps.readFile(path, "utf8")); } catch (error) { throw migrationError("MALFORMED_LEGACY_STATE", `Malformed legacy JSON: ${path}`, { cause: error }); } }
 /** @param {string} value */
 function digest(value) { return createHash("sha256").update(value).digest("hex"); }
+/** @param {any} value @param {readonly string[]} keys @param {string} label */
+function exactObject(value, keys, label) { if (typeof value !== "object" || value === null || Array.isArray(value) || Object.keys(value).some((key) => !keys.includes(key))) throw new TypeError(`${label} is invalid`); }
+/** @param {any} value */
+function validIdentity(value) { return Number.isSafeInteger(value?.pid) && value.pid > 0 && typeof value.startIdentity === "string" && value.startIdentity.length > 0 && Number.isSafeInteger(value.processGroupId) && value.processGroupId > 0; }
+/** @param {string} relative @param {string} text */
+function validateLegacyArtifact(relative, text) {
+  try {
+    if (relative === "dashboard.json") { convertLegacyDashboardConfig(JSON.parse(text)); return; }
+    if (/^sessions\/[^/]+\.json$/u.test(relative)) { const record = validateSessionRecord(JSON.parse(text)); if (`sessions/${record.sessionId}.json` !== relative) throw new TypeError("Registry filename and session ID differ"); return; }
+    if (relative === "daemon/control.token") { const token = text.trim(); if (token.length === 0 || token.length > 4096 || /\s/u.test(token)) throw new TypeError("Control token is invalid"); return; }
+    if (relative === "frontend-state.json") {
+      const state = JSON.parse(text); exactObject(state, ["schemaVersion", "clientId", "cursor", "viewState", "launchDraft"], "Frontend state");
+      if (state.schemaVersion !== 1 || typeof state.clientId !== "string" || state.clientId.length === 0) throw new TypeError("Frontend state identity is invalid");
+      if (state.cursor !== undefined) { exactObject(state.cursor, ["daemonEpoch", "sequence"], "Frontend cursor"); if (typeof state.cursor.daemonEpoch !== "string" || !/^(0|[1-9]\d*)$/u.test(state.cursor.sequence)) throw new TypeError("Frontend cursor is invalid"); }
+      return;
+    }
+    if (relative === "daemon/workers.json") {
+      const metadata = JSON.parse(text); exactObject(metadata, ["schemaVersion", "workers"], "Worker metadata"); if (metadata.schemaVersion !== 1 || !Array.isArray(metadata.workers)) throw new TypeError("Worker metadata is invalid");
+      for (const worker of metadata.workers) { exactObject(worker, ["sessionId", "runId", "leaseId", "generation", "identity", "piChildIdentity", "token"], "Worker record"); if ([worker.sessionId, worker.runId, worker.leaseId].some((entry) => typeof entry !== "string" || entry.length === 0) || !Number.isSafeInteger(worker.generation) || worker.generation <= 0 || !validIdentity(worker.identity) || !validIdentity(worker.piChildIdentity) || (worker.token !== undefined && (typeof worker.token !== "string" || worker.token.length === 0))) throw new TypeError("Worker record is invalid"); }
+      return;
+    }
+    if (relative === "daemon/pid.json") {
+      const publication = JSON.parse(text); exactObject(publication, ["schemaVersion", "pid", "startIdentity", "processGroupId", "daemonEpoch", "tokenPath", "startedAt", "state", "error"], "Daemon publication");
+      if (publication.schemaVersion !== 1 || !validIdentity(publication) || typeof publication.daemonEpoch !== "string" || typeof publication.tokenPath !== "string" || typeof publication.startedAt !== "string" || !["STARTING", "RECONCILING", "READY", "FAILED"].includes(publication.state)) throw new TypeError("Daemon publication is invalid");
+      return;
+    }
+    if (relative === "queue/commands.jsonl") {
+      for (const line of text.trimEnd().split("\n")) {
+        if (line.length === 0) continue;
+        const journal = JSON.parse(line); exactObject(journal, ["commandCanonical", "command", "status"], "Journal record"); const command = parseClientRequest(journal.command);
+        parseDaemonResponse({ version: 1, requestId: command.requestId, ok: true, result: { kind: "command", status: journal.status } });
+        if (journal.status.clientId !== command.clientId || journal.status.requestId !== command.requestId || journal.status.operation !== command.op || typeof journal.commandCanonical !== "string") throw new TypeError("Journal identity is invalid");
+      }
+      return;
+    }
+    if (relative.endsWith(".json")) JSON.parse(text);
+  } catch (error) { throw migrationError("MALFORMED_LEGACY_STATE", `Malformed legacy artifact: ${relative}`, { cause: error }); }
+}
 
 /** @param {string} root @param {number} expectedUserId @param {any} fsOps */
 async function inspectTree(root, expectedUserId, fsOps) {
@@ -43,8 +82,16 @@ async function inspectTree(root, expectedUserId, fsOps) {
         entries.push({ relative: childRelative, type: "directory" }); await visit(path, childRelative);
       } else if (metadata.isFile()) {
         if ((metadata.mode & 0o777) !== FILE_MODE) throw migrationError("UNSAFE_LEGACY_STATE", `Unsafe legacy file mode: ${path}`);
-        const text = await fsOps.readFile(path, "utf8");
-        if (name.endsWith(".json")) { try { JSON.parse(text); } catch (error) { throw migrationError("MALFORMED_LEGACY_STATE", `Malformed legacy JSON: ${path}`, { cause: error }); } }
+        const handle = await fsOps.open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+        let text;
+        try {
+          const opened = await handle.stat();
+          if (!opened.isFile() || opened.uid !== expectedUserId || (opened.mode & 0o777) !== FILE_MODE || opened.dev !== metadata.dev || opened.ino !== metadata.ino) throw migrationError("UNSAFE_LEGACY_STATE", `Legacy file identity changed: ${path}`);
+          text = await handle.readFile("utf8");
+          const completed = await handle.stat();
+          if (completed.dev !== opened.dev || completed.ino !== opened.ino || completed.size !== opened.size || completed.mtimeMs !== opened.mtimeMs) throw migrationError("UNSAFE_LEGACY_STATE", `Legacy file changed while read: ${path}`);
+        } finally { await handle.close(); }
+        validateLegacyArtifact(childRelative, text);
         entries.push({ relative: childRelative, type: "file", text });
       } else throw migrationError("UNSAFE_LEGACY_STATE", `Unsupported legacy artifact: ${path}`);
     }
@@ -57,6 +104,20 @@ async function inspectTree(root, expectedUserId, fsOps) {
 /** @param {string} path @param {any} fsOps */
 async function maybeManifest(path, fsOps) {
   try { return JSON.parse(await fsOps.readFile(path, "utf8")); } catch (error) { if (/** @type {NodeJS.ErrnoException} */ (error).code === "ENOENT") return undefined; throw migrationError("MIGRATION_IDENTITY_MISMATCH", "Destination migration manifest is malformed", { cause: error }); }
+}
+/** @param {string} root @param {Array<{relative:string,sha256:string}>} files @param {number} expectedUserId @param {any} fsOps */
+async function validatePublishedDestination(root, files, expectedUserId, fsOps) {
+  await validateReconciledDestination(root, files, fsOps);
+  for (const file of files) {
+    const metadata = await fsOps.lstat(join(root, file.relative)).catch(() => undefined);
+    if (metadata === undefined || !metadata.isFile() || metadata.isSymbolicLink() || metadata.uid !== expectedUserId || (metadata.mode & 0o777) !== FILE_MODE) throw migrationError("MIGRATION_IDENTITY_MISMATCH", `Published migration artifact is unsafe: ${file.relative}`);
+  }
+}
+/** @param {string} root @param {Array<{relative:string,sha256:string}>} files @param {any} fsOps */
+async function validateReconciledDestination(root, files, fsOps) {
+  const allowed = new Set([LOCK, MANIFEST, CANONICAL_MARKER, "daemon", "sessions", "queue", "runs", "index", "cli", "frontend-state.json", "dashboard.json", ...files.map((file) => file.relative.split("/")[0])]);
+  const collision = (await fsOps.readdir(root)).find((/** @type {string} */ name) => !allowed.has(name));
+  if (collision !== undefined) throw migrationError("DESTINATION_COLLISION", `Destination contains unexpected artifact: ${collision}`);
 }
 /** @param {string} root @param {Array<{relative:string,sha256:string}>} files @param {any} fsOps */
 async function validateCompletedDestination(root, files, fsOps) {
@@ -138,8 +199,9 @@ export async function migrateLegacyState({ legacyRoot, destinationRoot, expected
       if (existing.migrationId !== migrationId || existing.sourceIdentity !== tree.identity) throw migrationError("MIGRATION_IDENTITY_MISMATCH", "Destination manifest belongs to another migration");
       const manifestKeys = ["schemaVersion", "migrationId", "sourceIdentity", "destinationIdentity", "state", "configFrom", "configTo", "createdAt", "updatedAt"];
       if (existing.schemaVersion !== 1 || existing.destinationIdentity !== destinationIdentity || existing.configFrom !== 1 || existing.configTo !== 2 || !["PREPARED", "PUBLISHED", "RECONCILED"].includes(existing.state) || typeof existing.createdAt !== "string" || typeof existing.updatedAt !== "string" || Object.keys(existing).length !== manifestKeys.length || Object.keys(existing).some((key) => !manifestKeys.includes(key))) throw migrationError("MIGRATION_IDENTITY_MISMATCH", "Destination manifest contract is invalid");
-      await validateCompletedDestination(destinationRoot, files, fsOps);
-      if (existing.state === "RECONCILED" && await fsOps.readFile(join(destinationRoot, CANONICAL_MARKER), "utf8").then((/** @type {string} */ value) => value.trim() === migrationId).catch(() => false)) return { status: "ALREADY_MIGRATED", migrationId, manifestPath };
+      if (existing.state === "RECONCILED" && await fsOps.readFile(join(destinationRoot, CANONICAL_MARKER), "utf8").then((/** @type {string} */ value) => value.trim() === migrationId).catch(() => false)) { await validateReconciledDestination(destinationRoot, files, fsOps); return { status: "ALREADY_MIGRATED", migrationId, manifestPath }; }
+      if (existing.state === "PREPARED") await validateCompletedDestination(destinationRoot, files, fsOps);
+      if (existing.state === "PUBLISHED") await validatePublishedDestination(destinationRoot, files, expectedUserId, fsOps);
     } else {
       const destinationEntries = (await fsOps.readdir(destinationRoot)).filter((/** @type {string} */ name) => name !== LOCK);
       const expectedTopLevels = new Set(files.map((file) => file.relative.split("/")[0]));

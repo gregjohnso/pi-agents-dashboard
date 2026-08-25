@@ -73,6 +73,11 @@ describe("responsive dashboard layout", () => {
             lines: lines.map(stripVTControlCharacters),
         }).toMatchSnapshot();
     });
+    it("keeps the fixed list column order and never renders Model", () => {
+        expect(createDashboardLayout(160, 40).columns.map(({ key }) => key)).toEqual(["id", "state", "project", "activity", "age"]);
+        expect(stripVTControlCharacters(renderColumnHeader(createDashboardLayout(160, 40)))).not.toContain("MODEL");
+        expect(createDashboardLayout(120, 32).columns.map(({ key }) => key)).toEqual(["id", "state", "project", "activity", "age"]);
+    });
     it("sanitizes untrusted controls to one line before applying renderer-owned ANSI", () => {
         const layout = createDashboardLayout(160, 20);
         const hostile = session("id\twith\r\ncontrols\x07", {

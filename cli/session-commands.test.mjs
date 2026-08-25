@@ -55,6 +55,19 @@ async function daemonServer(root, respond, authentication = { version: 1, kind: 
   return server;
 }
 
+it("claims and releases composer around a destructive session command", async () => {
+  const root = await stateRoot();
+  const operations = [];
+  const request = vi.fn(async (op, payload, requestId) => {
+    operations.push([op, payload, requestId]);
+    if (op === "attach") return { kind: "attached", sessionId: "exact-session-id", role: "composer" };
+    if (op === "detach") return { kind: "detached", sessionId: "exact-session-id" };
+    return { kind: "command", status: { stage: "COMPLETED" } };
+  });
+  await expect(runSessionCommand(["stop", "exact-session-id", "--revision", "4", "--yes"], { composerRequest: request, root })).resolves.toMatchObject({ code: 0 });
+  expect(operations.map(([op]) => op)).toEqual(["attach", "stop", "detach"]);
+});
+
 it("requires exact ID, revision, and confirmation for stop and delete", async () => {
   const root = await stateRoot();
   const request = vi.fn(async () => ({ kind: "command", status: { stage: "COMPLETED" } }));
@@ -370,17 +383,12 @@ it("creates and sends one pending identity atomically across concurrent destruct
   const received = [];
   const waiting = [];
   const server = await daemonServer(root, (socket, encoder, frame) => {
+    if (frame.op === "attach") { socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "attached", sessionId: "exact-session-id", role: "composer" } })); return; }
+    if (frame.op === "detach") { socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "detached", sessionId: "exact-session-id" } })); return; }
     received.push(frame);
     waiting.push({ socket, encoder, frame });
     if (waiting.length === 2) {
-      for (const item of waiting) {
-        item.socket.write(item.encoder.encode({
-          version: 1,
-          requestId: item.frame.requestId,
-          ok: true,
-          result: { kind: "command", status: commandStatus("delete", "DELIVERY_UNKNOWN", item.frame.clientId, item.frame.requestId) },
-        }));
-      }
+      for (const item of waiting) item.socket.write(item.encoder.encode({ version: 1, requestId: item.frame.requestId, ok: true, result: { kind: "command", status: commandStatus("delete", "DELIVERY_UNKNOWN", item.frame.clientId, item.frame.requestId) } }));
     }
   });
   const argv = ["delete", "exact-session-id", "--revision", "4", "--yes"];
@@ -613,7 +621,11 @@ it.each([
 
 it("retains pending identity when a successful daemon frame fails validation", async () => {
   const root = await stateRoot();
-  const server = await daemonServer(root, (socket, encoder, frame) => socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "mystery" } })));
+  const server = await daemonServer(root, (socket, encoder, frame) => {
+    if (frame.op === "attach") socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "attached", sessionId: "exact-session-id", role: "composer" } }));
+    else if (frame.op === "detach") socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "detached", sessionId: "exact-session-id" } }));
+    else socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "mystery" } }));
+  });
   await expect(runSessionCommand(["delete", "exact-session-id", "--revision", "4", "--yes"], { root, randomId: () => "stable", timeoutMs: 200 })).rejects.toMatchObject({ code: "INVALID_DAEMON_RESPONSE" });
   expect(await readdir(join(root, "cli", "pending"))).toHaveLength(1);
   await new Promise((resolve) => server.close(resolve));

@@ -222,6 +222,7 @@ export interface DaemonClient {
   connect(): Promise<void>;
   request(request: ClientRequest): Promise<DaemonResponse>;
   subscribe(after?: EventCursor): AsyncIterable<PersistedEvent>;
+  onFatalError?(listener: (error: DaemonClientError) => void): () => void;
   close(): Promise<void>;
 }
 
@@ -254,6 +255,7 @@ export function createDaemonClient({
   const pending = new Map<string, Pending>();
   const seen = new Map<string, { canonical: string; response?: DaemonResponse }>();
   const subscribers = new Set<Subscriber>();
+  const fatalErrorListeners = new Set<(error: DaemonClientError) => void>();
   const wakeDelays = new Set<() => void>();
   let socket: net.Socket | undefined;
   let reconnectLoop: Promise<void> | undefined;
@@ -261,6 +263,13 @@ export function createDaemonClient({
   let authenticated = false;
 
   const hasWork = () => pending.size > 0 || subscribers.size > 0;
+  const reportFatalFrame = (error: unknown, fallbackCode: string) => {
+    const typed = error as { code?: string; message?: string };
+    const reported = error instanceof DaemonClientError
+      ? error
+      : new DaemonClientError(typed.code ?? fallbackCode, typed.message ?? fallbackCode);
+    for (const listener of fatalErrorListeners) listener(reported);
+  };
   const send = (value: unknown) => {
     if (socket === undefined || !authenticated || socket.destroyed) throw new DaemonClientError("NOT_CONNECTED", "Daemon is not connected");
     socket.write(encoder.encode(value));
@@ -342,7 +351,9 @@ export function createDaemonClient({
                 resolve();
               }
             } else {
-              failAttempt(new DaemonClientError("AUTHENTICATION_FAILED", "Daemon rejected authentication"));
+              const error = new DaemonClientError("AUTHENTICATION_FAILED", "Daemon rejected authentication");
+              reportFatalFrame(error, "AUTHENTICATION_FAILED");
+              failAttempt(error);
               candidate.destroy();
             }
             continue;
@@ -361,6 +372,7 @@ export function createDaemonClient({
           }
         }
       } catch (error) {
+        reportFatalFrame(error, "MALFORMED_FRAME");
         failAttempt(error);
         candidate.destroy();
       }
@@ -451,6 +463,10 @@ export function createDaemonClient({
       };
       return iterable;
     },
+    onFatalError(listener) {
+      fatalErrorListeners.add(listener);
+      return () => fatalErrorListeners.delete(listener);
+    },
     async close() {
       if (closed) return;
       closed = true;
@@ -463,6 +479,7 @@ export function createDaemonClient({
         subscriber.waiter = undefined;
       }
       subscribers.clear();
+      fatalErrorListeners.clear();
       if (socket !== undefined && !socket.destroyed) {
         await new Promise<void>((resolve) => {
           socket!.once("close", resolve);

@@ -2,7 +2,7 @@ import net from "node:net";
 import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 
 import { connectDaemon } from "./daemon-connector.mjs";
 import { createJsonlDecoder, createJsonlEncoder } from "./jsonl.mjs";
@@ -180,6 +180,76 @@ it("rejects worker mutations during reconciliation without touching unopened sto
   await expect(runtime.ready).rejects.toMatchObject({ code: "OWNERSHIP_CONFLICT" });
   await runtime.close();
   worker.close();
+});
+
+it("arbitrates one composer per session and persists release before observer takeover", async () => {
+  const workerSupervisor = { close: vi.fn(), stop: vi.fn(), delete: vi.fn() };
+  const runtime = await createDaemonRuntime({ root: await root(), workerSupervisor });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const first = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  const second = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  const observer = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await Promise.all([first.ready, second.ready, observer.ready]);
+  /** @param {string} clientId @param {string} requestId @param {string} op @param {any} payload */
+  const request = (clientId, requestId, op, payload) => ({ version: 1, clientId, requestId, op, payload });
+
+  observer.send(request("watcher", "subscribe", "subscribe", {}));
+  expect(await observer.next()).toMatchObject({ ok: true, result: { kind: "subscribed" } });
+  first.send(request("client-a", "attach-a", "attach", { sessionId: "session", role: "composer" }));
+  second.send(request("client-b", "attach-b", "attach", { sessionId: "session", role: "composer" }));
+  const [firstResponse, secondResponse] = await Promise.all([first.next(), second.next()]);
+  expect([firstResponse.result.role, secondResponse.result.role].sort()).toEqual(["composer", "observer"]);
+  await observer.next();
+  await observer.next();
+
+  const winner = firstResponse.result.role === "composer" ? first : second;
+  const loser = winner === first ? second : first;
+  const loserClient = winner === first ? "client-b" : "client-a";
+  winner.close();
+  const released = await observer.next();
+  expect(released).toMatchObject({ kind: "attachment_changed", payload: { sessionId: "session", role: "composer", attached: false } });
+
+  loser.send(request(loserClient, "attach-retry", "attach", { sessionId: "session", role: "composer" }));
+  expect(await loser.next()).toMatchObject({ ok: true, result: { kind: "attached", role: "composer" } });
+  expect(await observer.next()).toMatchObject({ kind: "attachment_changed", payload: { clientId: loserClient, role: "observer", attached: false } });
+  expect(await observer.next()).toMatchObject({ kind: "attachment_changed", payload: { clientId: loserClient, role: "composer", attached: true } });
+  expect(workerSupervisor.stop).not.toHaveBeenCalled();
+  expect(workerSupervisor.delete).not.toHaveBeenCalled();
+  loser.close();
+  observer.close();
+});
+
+it("serializes disconnect against attach and keeps duplicate attachment requests idempotent", async () => {
+  const runtime = await createDaemonRuntime({ root: await root() });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const first = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  const second = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  const events = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await Promise.all([first.ready, second.ready, events.ready]);
+  const attach = { version: 1, clientId: "stable-a", requestId: "same-attach", op: "attach", payload: { sessionId: "session", role: "composer" } };
+  events.send({ version: 1, clientId: "watcher", requestId: "subscribe", op: "subscribe", payload: {} });
+  await events.next();
+  first.send(attach);
+  expect(await first.next()).toMatchObject({ result: { role: "composer" } });
+  await events.next();
+  first.send(attach);
+  expect(await first.next()).toMatchObject({ result: { role: "composer" } });
+  first.close();
+  expect(await events.next()).toMatchObject({ payload: { clientId: "stable-a", attached: false } });
+  second.send({ ...attach, clientId: "stable-b", requestId: "attach-b" });
+  expect(await second.next()).toMatchObject({ result: { role: "composer" } });
+  const transitions = [
+    { payload: { clientId: "stable-a", attached: false } },
+    await events.next(),
+  ];
+  expect(transitions.map((event) => [event.payload.clientId, event.payload.attached])).toEqual([
+    ["stable-a", false],
+    ["stable-b", true],
+  ]);
+  second.close();
+  events.close();
 });
 
 it("authenticates every connection and applies strict framing limits", async () => {

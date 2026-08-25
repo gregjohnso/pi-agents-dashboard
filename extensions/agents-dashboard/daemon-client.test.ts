@@ -200,6 +200,8 @@ describe("daemon client", () => {
     });
     await new Promise<void>((resolve, reject) => server.listen(socketPath, resolve).once("error", reject));
     const client = createDaemonClient({ socketPath, token: "secret", maxBytes: 1024, reconnectDelayMs: 1, clientId: "client-1" });
+    const fatalErrors: unknown[] = [];
+    client.onFatalError?.((error) => fatalErrors.push(error));
     cleanups.push(async () => {
       await client.close();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -207,6 +209,7 @@ describe("daemon client", () => {
     });
     await expect(within(client.request(request))).resolves.toMatchObject({ ok: true, result: { kind: "state", sessions: [] } });
     expect(connections).toBe(2);
+    expect(fatalErrors).toEqual([expect.objectContaining({ code: "MALFORMED_FRAME" })]);
   });
 
   it("retains a pending acknowledgement after a malformed ack without throwing from the listener", async () => {

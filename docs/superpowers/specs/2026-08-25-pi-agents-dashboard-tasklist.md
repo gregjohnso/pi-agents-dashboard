@@ -105,7 +105,7 @@ T02 + T14 + T15 ─────────────────────�
   - Deliverables: command journal, event store, authenticated socket server, reconnecting daemon client.
   - Gate: failpoints at every acknowledgement boundary produce replay or explicit `DELIVERY_UNKNOWN`.
 
-- [ ] **T09 Implement worktree and shared-directory isolation**
+- [x] **T09 Implement worktree and shared-directory isolation**
   - Owner: isolated Lane E.
   - Depends on: T04, T06.
   - Can run in parallel with: T07, T08, T12.

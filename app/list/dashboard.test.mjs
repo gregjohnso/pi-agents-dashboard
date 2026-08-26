@@ -200,20 +200,24 @@ describe("dashboard controller", () => {
         await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith({ kind: "closed" }));
         expect(dashboard.composerDraft.prompt).toBe("draft");
     });
-    it("returns focus to the sessions list while launch startup is pending", async () => {
+    it("shows the sessions list immediately while launch startup is pending", async () => {
         const backend = new FakeBackend([]);
         let completeLaunch;
         backend.launch = vi.fn(() => new Promise((resolve) => { completeLaunch = resolve; }));
-        const dashboard = controller(backend);
+        const renders = [];
+        const dashboard = controller(backend, { requestRender: () => renders.push(dashboard.focus) });
         await dashboard.open();
         dashboard.focusComposer();
         dashboard.setComposerPrompt("Start now");
+        renders.length = 0;
 
         const submitting = dashboard.submitComposer();
         await vi.waitFor(() => expect(backend.launch).toHaveBeenCalledTimes(1));
         expect(dashboard.focus).toBe("list");
+        expect(renders).toContain("list");
         completeLaunch({ kind: "launched", sessionId: "started" });
         await submitting;
+        expect(dashboard.composerDraft.prompt).toBe("");
     });
     it("launches worktrees and requires exact canonical shared-directory confirmation", async () => {
         const backend = new FakeBackend([]);

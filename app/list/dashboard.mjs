@@ -821,13 +821,15 @@ export class DashboardController {
             ?? (data.length === 1 && data.charCodeAt(0) >= 32 ? data : undefined);
     }
     async launch(request) {
+        // Show the list before the daemon answers: startup takes seconds and the session row arrives by subscription.
         this.focus = "list";
+        this.status = { kind: "ready" };
+        this.requestRender?.();
         const outcome = await this.backend.launch(request, this.requestId());
         if (outcome.kind === "launched") {
-            this.focus = "list";
             this.composerDraft = { ...this.composerDraft, prompt: "" };
-            this.status = { kind: "ready" };
             this.scheduleUiSave();
+            this.requestRender?.();
             return;
         }
         if (outcome.kind === "delivery_unknown") {

@@ -116,6 +116,18 @@ describe("viewer commands and role restrictions", () => {
     await vi.waitFor(() => expect(f.commands.at(-1)).toEqual({ operation: "prompt", payload: { sessionId: "s", text: "/review the diff" } }));
   });
 
+  it("explains that an outdated session worker cannot report commands", async () => {
+    const f = fixture({ menu: async () => { throw Object.assign(new Error("Unsupported worker operation: get_session_commands"), { code: "UNSUPPORTED_WORKER_OPERATION" }); } });
+    await f.instance.open();
+    expect(f.instance.state.errors).toContainEqual({ code: "SESSION_COMMANDS_UNAVAILABLE", message: "This session's worker predates slash commands. Stop and reopen the session to refresh them.", retryable: false });
+
+    f.instance.editor.setText("/model");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.instance.state.errors.at(-1)?.code).toBe("MODEL_REQUIRED"));
+    expect(f.instance.selection).toBeUndefined();
+    expect(f.commands).toEqual([]);
+  });
+
   it("opens Pi's selection list for a bare built-in command and applies the choice", async () => {
     const f = fixture({ menu: async () => ({ commands: [], models: [{ provider: "anthropic", id: "claude" }, { provider: "openai", id: "gpt-5" }], thinkingLevels: ["off", "high"], model: null, thinkingLevel: null }) });
     await f.instance.open();

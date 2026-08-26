@@ -53,13 +53,13 @@ export function parseSlashSubmission(text, menu) {
   const name = separator === -1 ? trimmed : trimmed.slice(0, separator);
   const argument = separator === -1 ? "" : trimmed.slice(separator + 1).trim();
   if (name === "/model") {
-    if (argument.length === 0) return { kind: "rejected", code: "MODEL_REQUIRED", message: `Choose a model: ${menu.models.map(modelValue).join(", ") || "no models reported"}` };
+    if (argument.length === 0) return { kind: "rejected", code: "MODEL_REQUIRED", message: menu.models.length === 0 ? "This session reported no models. Stop and reopen it to refresh Pi's command menu." : `Choose a model: ${menu.models.map(modelValue).join(", ")}` };
     const selected = menu.models.find((model) => modelValue(model) === argument);
     if (selected === undefined) return { kind: "rejected", code: "UNKNOWN_MODEL", message: `Unknown model: ${argument}` };
     return { kind: "session_command", payload: { command: "set_model", model: { ...selected } } };
   }
   if (name === "/thinking") {
-    if (argument.length === 0) return { kind: "rejected", code: "THINKING_LEVEL_REQUIRED", message: `Choose a thinking level: ${menu.thinkingLevels.join(", ") || "no levels reported"}` };
+    if (argument.length === 0) return { kind: "rejected", code: "THINKING_LEVEL_REQUIRED", message: menu.thinkingLevels.length === 0 ? "This session reported no thinking levels. Stop and reopen it to refresh Pi's command menu." : `Choose a thinking level: ${menu.thinkingLevels.join(", ")}` };
     if (!menu.thinkingLevels.includes(argument)) return { kind: "rejected", code: "UNKNOWN_THINKING_LEVEL", message: `Unknown thinking level: ${argument}` };
     return { kind: "session_command", payload: { command: "set_thinking_level", level: argument } };
   }

@@ -138,6 +138,17 @@ describe("dashboard controller", () => {
         expect(dashboard.selectedSessionId).toBe("waiting");
         expect(dashboard.query).toMatchObject({ search: "approval", taskStates: ["WAITING"], projectPaths: ["/repo/a"], groupBy: "cwd", sort: { key: "activity", direction: "asc" } });
     });
+    it("counts only the sessions the current view shows", async () => {
+        const dashboard = controller(new FakeBackend([
+            session("live", { processState: "LIVE" }),
+            session("done", { processState: "EXITED", outcome: "COMPLETED" }),
+            session("stopped", { processState: "EXITED", taskState: "STOPPED" }),
+        ]));
+        await dashboard.open();
+        expect(dashboard.render(80, 24)[1]).toContain("Sessions 1");
+        dashboard.setQuery({ view: "all" });
+        expect(dashboard.render(80, 24)[1]).toContain("Sessions 3");
+    });
     it("closes the list only on Ctrl+C; Left and Escape are inert", async () => {
         const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
         const onClose = vi.fn();

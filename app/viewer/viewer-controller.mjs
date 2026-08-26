@@ -193,8 +193,12 @@ export class ViewerController {
         model: menu?.model ?? null,
         thinkingLevel: menu?.thinkingLevel ?? null,
       };
-    } catch {
+    } catch (error) {
       this.menu = EMPTY_SESSION_MENU;
+      const code = /** @type {any} */ (error)?.code;
+      await this.recordError(code === "UNSUPPORTED_WORKER_OPERATION"
+        ? { code: "SESSION_COMMANDS_UNAVAILABLE", message: "This session's worker predates slash commands. Stop and reopen the session to refresh them.", retryable: false }
+        : { code: code ?? "SESSION_COMMANDS_UNAVAILABLE", message: error instanceof Error ? error.message : "Session commands are unavailable", retryable: false });
     }
     this.editor.setAutocompleteProvider?.(new CombinedAutocompleteProvider(/** @type {any} */ (sessionSlashCommands(this.menu)), this.cwd));
   }

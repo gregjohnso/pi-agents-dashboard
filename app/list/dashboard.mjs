@@ -624,7 +624,7 @@ export class DashboardController {
         try {
             this.resize(width, height);
             const layout = createDashboardLayout(this.width, this.height);
-            const counts = countDashboardSessions(this.sessions);
+            const counts = countDashboardSessions(selectDashboardSessions(this.sessions, this.query));
             const lines = Array.from({ length: this.height }, () => "");
             if (lines.length > 0)
                 lines[0] = paintPlainLine(" pi-dashboard", this.width, jobwatchTheme.title);

@@ -271,6 +271,8 @@ export class PiRpcAdapter {
   async setModel(model) { return this.#request("set_model", { provider: model.provider, modelId: model.id }); }
   /** @param {string} level */
   async setThinkingLevel(level) { return this.#request("set_thinking_level", { level }); }
+  /** @param {string} name */
+  async setSessionName(name) { return this.#request("set_session_name", { name }); }
   /** @param {string} [instructions] */
   async compact(instructions) { return this.#request("compact", instructions === undefined ? {} : { customInstructions: instructions }); }
 

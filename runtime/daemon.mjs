@@ -252,6 +252,7 @@ function validateWorkerSuccess(record, pending) {
 function sessionCommandPayload(payload) {
   if (payload.command === "set_model") return { command: "set_model", model: { ...payload.model } };
   if (payload.command === "set_thinking_level") return { command: "set_thinking_level", level: payload.level };
+  if (payload.command === "set_session_name") return { command: "set_session_name", name: payload.name };
   return payload.instructions === undefined ? { command: "compact" } : { command: "compact", instructions: payload.instructions };
 }
 
@@ -1251,6 +1252,15 @@ export async function createDaemonRuntime({
           }
         }
         if (["stop", "delete"].includes(request.op) && status.stage === "COMPLETED") sessionHandles.delete(request.payload.sessionId);
+        if (request.op === "session_command" && request.payload.command === "set_session_name" && status.stage === "COMPLETED") {
+          await runSessionLifecycle(registry, request.payload.sessionId, async () => {
+            const current = await registry.get(request.payload.sessionId);
+            if (current === undefined || current.name === request.payload.name) return;
+            const updated = await registry.update(current.sessionId, current.revision, { name: request.payload.name, updatedAt: new Date().toISOString() });
+            const event = await context.recovery.events.append({ kind: "session_changed", payload: { session: updated } });
+            context.broadcast(event);
+          });
+        }
         if (changed) {
           const publish = async () => {
             const event = await context.recovery.events.append({ kind: "command_changed", payload: { status } });

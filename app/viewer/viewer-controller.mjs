@@ -170,8 +170,14 @@ export class ViewerController {
       this.requestRender();
       return;
     }
-    if (matchesKey(data, Key.left) || matchesKey(data, Key.escape)) {
-      const key = matchesKey(data, Key.left) ? "left" : "escape";
+    if (matchesKey(data, Key.escape)) {
+      // The agent is settled: leave now. The draft is persisted, so no second press is needed.
+      this.returnGesture.cancel();
+      this.onReturn();
+      return;
+    }
+    if (matchesKey(data, Key.left)) {
+      const key = "left";
       const clean = this.editor.getText().length === 0 && !this.edited && !this.historyUsed;
       const result = this.returnGesture.handle(key, { clean, overlayCaptured: false });
       if (result === "armed") this.editor.handleInput(data);

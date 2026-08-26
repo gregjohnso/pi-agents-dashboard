@@ -85,12 +85,13 @@ describe("responsive dashboard layout", () => {
         expect(row).not.toContain("Pi assistant streaming");
     });
     it("keeps the fixed list column order and never renders Model or Project", () => {
-        expect(createDashboardLayout(160, 40).columns.map(({ key }) => key)).toEqual(["id", "name", "state", "activity"]);
+        expect(createDashboardLayout(160, 40).columns.map(({ key }) => key)).toEqual(["id", "name", "state", "activity", "age"]);
         const header = stripVTControlCharacters(renderColumnHeader(createDashboardLayout(160, 40)));
         expect(header).not.toContain("MODEL");
         expect(header).not.toContain("PROJECT");
         expect(header).toContain("NAME");
-        expect(createDashboardLayout(120, 32).columns.map(({ key }) => key)).toEqual(["id", "name", "state", "activity"]);
+        expect(createDashboardLayout(120, 32).columns.map(({ key }) => key)).toEqual(["id", "name", "state", "activity", "age"]);
+        expect(header).toContain("AGE");
     });
     it("renders the session name and falls back when a session has none", () => {
         const layout = createDashboardLayout(160, 40);

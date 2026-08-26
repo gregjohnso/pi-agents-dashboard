@@ -398,8 +398,12 @@ it("discovers slash commands and delivers one session command to the owning work
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "session_commands", sessionId: "menu", ...menu } });
   client.send({ version: 1, clientId: "viewer", requestId: "model-request", op: "session_command", payload: { sessionId: "menu", command: "set_model", model: { provider: "anthropic", id: "claude" } } });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
-  expect(worker.commands.map((/** @type {any} */ command) => command.op)).toEqual(["get_session_commands", "session_command"]);
+  client.send({ version: 1, clientId: "viewer", requestId: "rename-request", op: "session_command", payload: { sessionId: "menu", command: "set_session_name", name: "Coverage loader" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  await vi.waitFor(async () => expect(await new RegistryStore(join(stateRoot, "sessions")).get("menu")).toMatchObject({ name: "Coverage loader" }));
+  expect(worker.commands.map((/** @type {any} */ command) => command.op)).toEqual(["get_session_commands", "session_command", "session_command"]);
   expect(worker.commands[1].sessionCommand).toEqual({ command: "set_model", model: { provider: "anthropic", id: "claude" } });
+  expect(worker.commands[2].sessionCommand).toEqual({ command: "set_session_name", name: "Coverage loader" });
   client.close();
 });
 

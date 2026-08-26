@@ -59,6 +59,10 @@ function applySessionCommand(adapter, request) {
     if (typeof request.level !== "string" || request.level.length === 0) throw Object.assign(new TypeError("session_command level is invalid"), { code: "INVALID_SESSION_COMMAND" });
     return adapter.setThinkingLevel(request.level);
   }
+  if (request?.command === "set_session_name") {
+    if (typeof request.name !== "string" || request.name.trim().length === 0) throw Object.assign(new TypeError("session_command name is invalid"), { code: "INVALID_SESSION_COMMAND" });
+    return adapter.setSessionName(request.name.trim());
+  }
   if (request?.command === "compact") return adapter.compact(typeof request.instructions === "string" && request.instructions.length > 0 ? request.instructions : undefined);
   throw Object.assign(new TypeError("session_command is unsupported"), { code: "INVALID_SESSION_COMMAND" });
 }

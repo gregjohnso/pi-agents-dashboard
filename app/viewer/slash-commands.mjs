@@ -1,5 +1,5 @@
 /** @typedef {{name:string,source:string,description?:string,argumentHint?:string}} MenuCommand */
-/** @typedef {{commands:MenuCommand[],models:{provider:string,id:string}[],thinkingLevels:string[],model:{provider:string,id:string}|null,thinkingLevel:string|null,summaryModel?:{provider:string,id:string}|null}} SessionMenu */
+/** @typedef {{commands:MenuCommand[],models:{provider:string,id:string}[],thinkingLevels:string[],model:{provider:string,id:string}|null,thinkingLevel:string|null,summaryModel?:{provider:string,id:string}|null,name?:string|null}} SessionMenu */
 
 const BUILTIN_SOURCE = "builtin";
 
@@ -34,10 +34,11 @@ export function sessionSlashCommands(menu) {
     { name: "model", description: menu.model === null ? "Select the session model" : `Model: ${modelValue(menu.model)}`, argumentHint: "<provider/id>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, models) },
     { name: "thinking", description: menu.thinkingLevel === null ? "Set the thinking level" : `Thinking: ${menu.thinkingLevel}`, argumentHint: "<level>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, menu.thinkingLevels) },
     { name: "model-summary", description: menu.summaryModel == null ? "Dashboard summaries: off" : `Dashboard summaries: ${modelValue(menu.summaryModel)}`, argumentHint: "<provider/id|off>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, ["off", ...models]) },
+    { name: "rename", description: menu.name == null ? "Name this session" : `Name: ${menu.name}`, argumentHint: "<name>", source: BUILTIN_SOURCE },
     { name: "compact", description: "Compact the conversation", argumentHint: "[instructions]", source: BUILTIN_SOURCE },
     ...menu.commands
       .map((command) => ({ ...command, name: bareName(command.name) }))
-      .filter((command) => !["model", "thinking", "compact", "model-summary"].includes(command.name)),
+      .filter((command) => !["model", "thinking", "compact", "model-summary", "rename"].includes(command.name)),
   ];
 }
 
@@ -70,6 +71,11 @@ export function parseSlashSubmission(text, menu) {
     const selected = menu.models.find((model) => modelValue(model) === argument);
     if (selected === undefined) return { kind: "rejected", code: "UNKNOWN_MODEL", message: `Unknown model: ${argument}` };
     return { kind: "settings", payload: { summaryModel: { ...selected } } };
+  }
+  if (name === "/rename") {
+    if (argument.length === 0) return { kind: "rejected", code: "SESSION_NAME_REQUIRED", message: "Type a session name: /rename <name>" };
+    if (argument.length > 128) return { kind: "rejected", code: "SESSION_NAME_TOO_LONG", message: "Session names are limited to 128 characters" };
+    return { kind: "session_command", payload: { command: "set_session_name", name: argument } };
   }
   if (name === "/compact") {
     return { kind: "session_command", payload: argument.length === 0 ? { command: "compact" } : { command: "compact", instructions: argument } };

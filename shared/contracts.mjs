@@ -27,7 +27,7 @@ import { parseViewerSnapshot } from "./viewer-contracts.mjs";
 
 const ENVELOPE_KEYS = ["version", "clientId", "requestId", "op", "payload"];
 const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries"];
-const SESSION_COMMANDS = ["set_model", "set_thinking_level", "compact"];
+const SESSION_COMMANDS = ["set_model", "set_thinking_level", "compact", "set_session_name"];
 const MAX_MENU_ENTRIES = 1_000;
 
 /** @param {unknown} value @param {string} path @returns {Record<string, any>} */
@@ -197,6 +197,12 @@ export function parseClientRequest(value) {
     if (command === "set_thinking_level") {
       rejectUnknownKeys(payload, ["sessionId", "command", "level"], "session_command payload");
       return { ...base, payload: { sessionId, command, level: readIdentifier(payload, "level", "session_command payload.level") } };
+    }
+    if (command === "set_session_name") {
+      rejectUnknownKeys(payload, ["sessionId", "command", "name"], "session_command payload");
+      const name = readText(payload, "name", "session_command payload.name");
+      if (name.length > 128) throw new TypeError("session_command payload.name must be at most 128 characters");
+      return { ...base, payload: { sessionId, command, name } };
     }
     rejectUnknownKeys(payload, ["sessionId", "command", "instructions"], "session_command payload");
     return { ...base, payload: Object.hasOwn(payload, "instructions") ? { sessionId, command, instructions: readText(payload, "instructions", "session_command payload.instructions") } : { sessionId, command } };

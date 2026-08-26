@@ -327,6 +327,19 @@ describe("viewer rendering and navigation", () => {
     expect(f.commands).toHaveLength(1);
   });
 
+  it("leaves on the Escape after the interrupt even with an edited draft", async () => {
+    const f = fixture({ snapshot: { taskState: "WORKING" } });
+    await f.instance.open();
+    f.instance.editor.setText("half written");
+
+    f.instance.handleInput("\x1b");
+    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "interrupt", payload: { sessionId: "s" } }]));
+    await f.emit({ version: 1, sessionId: "s", eventId: "settled", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "turn_state", working: false } });
+    f.instance.handleInput("\x1b");
+    expect(f.instance.onReturn).toHaveBeenCalledOnce();
+    expect(f.saved.at(-1)).toMatchObject({ draft: "half written" });
+  });
+
   it("leaves a working session with Left without stopping the agent", async () => {
     const f = fixture({ snapshot: { taskState: "WORKING" } });
     await f.instance.open();
@@ -335,16 +348,16 @@ describe("viewer rendering and navigation", () => {
     expect(f.commands).toEqual([]);
   });
 
-  it("uses the exact clean and dirty Left/Escape return gesture", async () => {
+  it("uses the exact clean and dirty Left return gesture", async () => {
     let now = 0;
     const f = fixture();
     f.instance.now = () => now;
     await f.instance.open();
     f.instance.handleInput("x");
-    f.instance.handleInput("\x1b");
+    f.instance.handleInput("\x1b[D");
     expect(f.instance.onReturn).not.toHaveBeenCalled();
     now = 500;
-    f.instance.handleInput("\x1b");
+    f.instance.handleInput("\x1b[D");
     expect(f.instance.onReturn).toHaveBeenCalledOnce();
   });
 

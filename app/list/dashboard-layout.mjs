@@ -7,6 +7,7 @@ const COLUMN_LABELS = {
     name: "NAME",
     state: "STATE",
     activity: "ACTIVITY",
+    age: "AGE",
 };
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu;
 function plainText(value) {
@@ -35,7 +36,8 @@ function columnsForWidth(width) {
             { key: "id", width: 10 },
             { key: "name", width: width >= 100 ? 28 : 22 },
             { key: "state", width: 9 },
-            { key: "activity", width: width - (width >= 100 ? 51 : 45) },
+            { key: "activity", width: width - (width >= 100 ? 58 : 52) },
+            { key: "age", width: 7 },
         ];
     }
     if (width >= 52) {
@@ -43,7 +45,8 @@ function columnsForWidth(width) {
             { key: "id", width: 9 },
             { key: "name", width: 14 },
             { key: "state", width: 8 },
-            { key: "activity", width: width - 34 },
+            { key: "activity", width: width - 40 },
+            { key: "age", width: 6 },
         ];
     }
     if (width >= 28) {

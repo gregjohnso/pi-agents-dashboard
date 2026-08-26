@@ -90,6 +90,24 @@ The shipped UI uses only package-root imports from `@earendil-works/pi-tui` and 
 
 Stop journals before delivery, requests graceful shutdown, waits 5,000 ms, sends TERM only to the exact revalidated process group, waits 5,000 ms, and requests KILL only if the same identity remains. Sentinel groups `777` and `9202` remain untouched in deterministic signal/destructive tests. Delete without the public trash seam returns `TRASH_CAPABILITY_UNAVAILABLE` and preserves both session and worktree paths. Cleanup retains late ownership, marker, repository, branch, HEAD, dirty/untracked, and push-state checks.
 
+## Final release gate
+
+Executed once on the clean integrated branch after all six review lanes, accepted fixes, and scoped re-review:
+
+| Command | Result |
+|---|---|
+| `pixi install --locked` | passed |
+| `pixi run typecheck` | passed |
+| `pixi run test-unit` | 56 files, 600 tests passed |
+| `pixi run test-integration` | 7 files, 78 tests passed |
+| `pixi run test-acceptance` | 3 files, 12 tests passed |
+| `pixi run test` | 66 files, 690 tests passed |
+| `pixi run pack-check` | passed; 12,761 entries audited |
+| `git diff --check` | passed |
+| `git status --short` | clean |
+
+Six parallel read-only reviews reported 15 accepted findings. The same fix writer resolved them in `1fe6127`; scoped review found one remaining installed-viewer blocker and one recovery issue. The same writer resolved both in `3cc54e0`, and the final scoped review returned `GATE: PASS` with no critical or important finding.
+
 ## Residual unverified items
 
 - No npm publication or public-registry installation was performed.

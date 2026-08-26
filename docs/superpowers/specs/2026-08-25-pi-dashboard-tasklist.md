@@ -171,7 +171,7 @@ integrated baseline
 
 ### Milestone 9: Acceptance
 
-- [ ] **T21 Prove standalone package, migration, lifecycle, security, and terminal acceptance**
+- [x] **T21 Prove standalone package, migration, lifecycle, security, and terminal acceptance**
   - Owner: Acceptance integration writer; parallel read-only reviewers; one final fix writer.
   - Depends on: reviewed and integrated T19 and T20.
   - Claimed files: acceptance tests/fixtures, package scripts, Pixi tasks, typecheck coverage, README, accepted focused fixes.
@@ -210,15 +210,15 @@ integrated baseline
 
 ## T21 parallel read-only reviews
 
-- [ ] **R1 Package and migration:** package identity/content, schema conversion, lock/publication order, source/path preservation.
-- [ ] **R2 Executable and protocol:** discovery, identity recheck, no-inference probe, exact argv, process/reconnect identity.
-- [ ] **R3 Normalization and diagnostics:** history/live deduplication, cursors/crash order, privacy, 32/8 MiB bounds.
-- [ ] **R4 TUI and public Pi UI:** Jobwatch columns, chat behavior, key contexts, five dimensions, public imports, disposal.
-- [ ] **R5 Lifetime and destructive safety:** app/daemon loss, mixed versions, ownership, exact signals, trash, cleanup.
-- [ ] **R6 Delivery and documentation:** scripts, install journeys, packed exclusions, README and evidence completeness.
-- [ ] Parent dispositions every finding.
-- [ ] One writer applies all accepted fixes.
-- [ ] One scoped re-review validates the fix range.
+- [x] **R1 Package and migration:** package identity/content, schema conversion, lock/publication order, source/path preservation.
+- [x] **R2 Executable and protocol:** discovery, identity recheck, no-inference probe, exact argv, process/reconnect identity.
+- [x] **R3 Normalization and diagnostics:** history/live deduplication, cursors/crash order, privacy, 32/8 MiB bounds.
+- [x] **R4 TUI and public Pi UI:** Jobwatch columns, chat behavior, key contexts, five dimensions, public imports, disposal.
+- [x] **R5 Lifetime and destructive safety:** app/daemon loss, mixed versions, ownership, exact signals, trash, cleanup.
+- [x] **R6 Delivery and documentation:** scripts, install journeys, packed exclusions, README and evidence completeness.
+- [x] Parent dispositions every finding.
+- [x] One writer applies all accepted fixes.
+- [x] One scoped re-review validates the fix range.
 
 ## Release tracking
 
@@ -229,13 +229,13 @@ integrated baseline
 - [x] T18 complete and reviewed.
 - [x] T19 complete and reviewed.
 - [x] T20 complete and reviewed.
-- [ ] T21 complete and reviewed.
-- [ ] R1-R6 have no undispositioned finding.
-- [ ] Packed output exposes only `pi-dashboard` and excludes private/runtime/development artifacts.
-- [ ] Required capability failure starts no canonical writer.
-- [ ] App and daemon closure leave verified runs alive.
-- [ ] Migration preserves legacy source, canonical Pi session files, and worktrees.
-- [ ] Stop/Delete/cleanup preserve exact identity and scope.
-- [ ] Full release gate exits 0 on a clean checkout.
+- [x] T21 complete and reviewed.
+- [x] R1-R6 have no undispositioned finding.
+- [x] Packed output exposes only `pi-dashboard` and excludes private/runtime/development artifacts.
+- [x] Required capability failure starts no canonical writer.
+- [x] App and daemon closure leave verified runs alive.
+- [x] Migration preserves legacy source, canonical Pi session files, and worktrees.
+- [x] Stop/Delete/cleanup preserve exact identity and scope.
+- [x] Full release gate exits 0 on a clean checkout.
 - [ ] Private repository remote and primary checkout renamed after acceptance.
-- [ ] npm remains unpublished until separate release approval.
+- [x] npm remains unpublished until separate release approval.

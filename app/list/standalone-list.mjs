@@ -67,6 +67,13 @@ export function createDaemonViewerClient({ client, clientId }) {
     async menu(sessionId) {
       const result = await request("get_session_commands", { sessionId });
       if (result?.kind !== "session_commands") throw Object.assign(new Error("Daemon returned the wrong session command menu"), { code: "INVALID_RESPONSE" });
+      const settings = await request("get_settings", {}).catch(() => undefined);
+      return { ...result, summaryModel: settings?.kind === "settings" ? settings.summaryModel : null };
+    },
+    /** @param {Record<string, any>} payload */
+    async setSettings(payload) {
+      const result = await request("set_settings", payload);
+      if (result?.kind !== "settings") throw Object.assign(new Error("Daemon returned the wrong settings result"), { code: "INVALID_RESPONSE" });
       return result;
     },
     subscribe(sessionId, cursor, next, onError) {

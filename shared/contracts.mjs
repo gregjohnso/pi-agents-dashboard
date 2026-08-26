@@ -12,7 +12,8 @@ import { parseViewerSnapshot } from "./viewer-contracts.mjs";
 /** @typedef {{executable:ExecutableIdentity,piVersion:string|null,capabilities:PiCapabilityReport,rpcAdapterVersion:1,viewerProtocolVersion:1,supervisor:ProcessIdentity,piChild:ProcessIdentity}} RunRuntimeIdentity */
 /** @typedef {{kind:"managed",runId:string,process:ProcessIdentity,acquiredAt:string,heartbeatAt:string}} WorkerOwnership */
 /** @typedef {{mode:"worktree",worktreePath:string,branch:string}|{mode:"shared_directory",canonicalCwd:string}} IsolationRecord */
-/** @typedef {{schemaVersion:1,revision:number,sessionId:string,sessionFile:string,canonicalSessionFile:string,cwd:string,name?:string,model?:{provider:string,id:string},thinkingLevel?:string,taskState:TaskState,processState:ProcessState,outcome:Outcome,activity:{kind:string,summary:string,updatedAt:string},ownership?:WorkerOwnership,isolation?:IsolationRecord,latestRunId?:string,runtime?:RunRuntimeIdentity,createdAt:string,updatedAt:string}} SessionRecord */
+/** @typedef {{text:string,generatedAt:string,model:{provider:string,id:string},sourceCursor:string}} SessionSummary */
+/** @typedef {{schemaVersion:1,revision:number,sessionId:string,sessionFile:string,canonicalSessionFile:string,cwd:string,name?:string,model?:{provider:string,id:string},thinkingLevel?:string,taskState:TaskState,processState:ProcessState,outcome:Outcome,activity:{kind:string,summary:string,updatedAt:string},ownership?:WorkerOwnership,isolation?:IsolationRecord,latestRunId?:string,runtime?:RunRuntimeIdentity,summary?:SessionSummary,createdAt:string,updatedAt:string}} SessionRecord */
 /** @typedef {{mode:"worktree"}|{mode:"shared_directory",confirmedCwd:string,ownerSessionIds:string[]}} LaunchIsolation */
 /** @typedef {{prompt:string,cwd:string,sourceSessionId:string,isolation:LaunchIsolation,model?:{provider:string,id:string},thinkingLevel?:string,name?:string}} LaunchRequest */
 /** @typedef {{daemonEpoch:string,sequence:string}} EventCursor */
@@ -25,7 +26,7 @@ import { parseViewerSnapshot } from "./viewer-contracts.mjs";
 /** @typedef {{version:1,cursor:EventCursor,occurredAt:string,kind:"session_changed"|"command_changed"|"attachment_changed",payload:any}} PersistedEvent */
 
 const ENVELOPE_KEYS = ["version", "clientId", "requestId", "op", "payload"];
-const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command"];
+const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries"];
 const SESSION_COMMANDS = ["set_model", "set_thinking_level", "compact"];
 const MAX_MENU_ENTRIES = 1_000;
 
@@ -146,8 +147,17 @@ export function parseClientRequest(value) {
   const requestId = readIdentifier(request, "requestId");
   const op = readEnum(request, "op", OPERATIONS, "operation");
   const base = { version: 1, clientId, requestId, op };
-  if (op === "get_state") {
-    const payload = readRecord(request.payload, "get_state payload"); rejectUnknownKeys(payload, [], "get_state payload"); return { ...base, payload: {} };
+  if (["get_state", "get_settings", "refresh_summaries"].includes(op)) {
+    const payload = readRecord(request.payload, `${op} payload`); rejectUnknownKeys(payload, [], `${op} payload`); return { ...base, payload: {} };
+  }
+  if (op === "set_settings") {
+    const payload = readRecord(request.payload, "set_settings payload");
+    rejectUnknownKeys(payload, ["summaryModel"], "set_settings payload");
+    if (!Object.hasOwn(payload, "summaryModel")) throw new TypeError("set_settings payload.summaryModel is required");
+    if (payload.summaryModel === null) return { ...base, payload: { summaryModel: null } };
+    const model = readRecord(payload.summaryModel, "set_settings payload.summaryModel");
+    rejectUnknownKeys(model, ["provider", "id"], "set_settings payload.summaryModel");
+    return { ...base, payload: { summaryModel: { provider: readIdentifier(model, "provider", "set_settings payload.summaryModel.provider"), id: readIdentifier(model, "id", "set_settings payload.summaryModel.id") } } };
   }
   if (op === "launch") return { ...base, payload: readLaunchRequest(request.payload) };
   if (op === "attach") {
@@ -222,7 +232,18 @@ function validateError(value, path) {
 /** @param {unknown} value @param {string} path */
 function validateSession(value, path) {
   const session = readRecord(value, path);
-  requireKeys(session, ["schemaVersion", "revision", "sessionId", "sessionFile", "canonicalSessionFile", "cwd", "taskState", "processState", "outcome", "activity", "createdAt", "updatedAt"], ["name", "model", "thinkingLevel", "ownership", "isolation", "latestRunId", "runtime"], path);
+  requireKeys(session, ["schemaVersion", "revision", "sessionId", "sessionFile", "canonicalSessionFile", "cwd", "taskState", "processState", "outcome", "activity", "createdAt", "updatedAt"], ["name", "model", "thinkingLevel", "ownership", "isolation", "latestRunId", "runtime", "summary"], path);
+  if (Object.hasOwn(session, "summary")) {
+    const summary = readRecord(session.summary, `${path}.summary`);
+    requireKeys(summary, ["text", "generatedAt", "model", "sourceCursor"], [], `${path}.summary`);
+    if (typeof summary.text !== "string" || summary.text.length === 0 || summary.text.length > 512) throw new TypeError(`${path}.summary.text must be a bounded non-empty string`);
+    readIdentifier(summary, "generatedAt", `${path}.summary.generatedAt`);
+    readIdentifier(summary, "sourceCursor", `${path}.summary.sourceCursor`);
+    const model = readRecord(summary.model, `${path}.summary.model`);
+    requireKeys(model, ["provider", "id"], [], `${path}.summary.model`);
+    readIdentifier(model, "provider", `${path}.summary.model.provider`);
+    readIdentifier(model, "id", `${path}.summary.model.id`);
+  }
   if (session.schemaVersion !== 1 || !Number.isSafeInteger(session.revision) || session.revision < 0) throw new TypeError(`${path} schema version or revision is invalid`);
   for (const key of ["sessionId", "sessionFile", "canonicalSessionFile", "cwd", "createdAt", "updatedAt"]) readIdentifier(session, key, `${path}.${key}`);
   readEnum(session, "taskState", ["WORKING", "WAITING", "READY", "FAILED", "STOPPED"], `${path}.taskState`);
@@ -291,12 +312,22 @@ export function parseDaemonResponse(value) {
   if (!response.ok) { requireKeys(response, ["version", "requestId", "ok", "error"], [], "daemon response"); validateError(response.error, "daemon response.error"); return response; }
   requireKeys(response, ["version", "requestId", "ok", "result"], [], "daemon response");
   const result = readRecord(response.result, "daemon response.result");
-  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "subscribed", "acknowledged", "viewer_snapshot", "viewer_subscribed", "viewer_acknowledged", "session_commands"], "daemon response.result.kind");
+  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "subscribed", "acknowledged", "viewer_snapshot", "viewer_subscribed", "viewer_acknowledged", "session_commands", "settings", "summaries_refreshing"], "daemon response.result.kind");
   if (kind === "state") { requireKeys(result, ["kind", "sessions"], [], "daemon response.result"); if (!Array.isArray(result.sessions)) throw new TypeError("sessions must be an array"); result.sessions.forEach((session, index) => validateSession(session, `daemon response.result.sessions[${index}]`)); }
   else if (["launched", "detached"].includes(kind)) { requireKeys(result, ["kind", "sessionId"], [], "daemon response.result"); readIdentifier(result, "sessionId"); }
   else if (kind === "attached") { requireKeys(result, ["kind", "sessionId", "role"], [], "daemon response.result"); readIdentifier(result, "sessionId"); readEnum(result, "role", ["composer", "observer"]); }
   else if (kind === "command") { requireKeys(result, ["kind", "status"], [], "daemon response.result"); const status = readRecord(result.status, "status"); requireKeys(status, ["clientId", "requestId", "operation", "stage", "acceptedAt", "updatedAt"], ["error"], "status"); for (const key of ["clientId", "requestId", "acceptedAt", "updatedAt"]) readIdentifier(status, key, `status.${key}`); readEnum(status, "operation", OPERATIONS, "status.operation"); readEnum(status, "stage", ["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED", "DELIVERY_UNKNOWN", "FAILED"], "status.stage"); if (Object.hasOwn(status, "error")) validateError(status.error, "status.error"); }
   else if (kind === "session_commands") validateSessionCommands(result);
+  else if (kind === "settings") {
+    requireKeys(result, ["kind", "summaryModel"], [], "daemon response.result");
+    if (result.summaryModel !== null) {
+      const model = readRecord(result.summaryModel, "daemon response.result.summaryModel");
+      requireKeys(model, ["provider", "id"], [], "daemon response.result.summaryModel");
+      readIdentifier(model, "provider", "daemon response.result.summaryModel.provider");
+      readIdentifier(model, "id", "daemon response.result.summaryModel.id");
+    }
+  }
+  else if (kind === "summaries_refreshing") { requireKeys(result, ["kind", "sessionIds"], [], "daemon response.result"); if (!Array.isArray(result.sessionIds)) throw new TypeError("daemon response.result.sessionIds must be an array"); result.sessionIds.forEach((/** @type {unknown} */ sessionId, /** @type {number} */ index) => { if (typeof sessionId !== "string" || sessionId.length === 0) throw new TypeError(`daemon response.result.sessionIds[${index}] must be a non-empty string`); }); }
   else if (kind === "viewer_snapshot") { requireKeys(result, ["kind", "snapshot"], [], "daemon response.result"); parseViewerSnapshot(result.snapshot); }
   else if (["viewer_subscribed", "viewer_acknowledged"].includes(kind)) { requireKeys(result, ["kind", "cursor"], [], "daemon response.result"); readViewerCursor(result.cursor, "daemon response.result.cursor"); }
   else { requireKeys(result, ["kind", "cursor"], [], "daemon response.result"); readCursor(result.cursor, "daemon response.result.cursor"); }

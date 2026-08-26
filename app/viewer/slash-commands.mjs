@@ -1,10 +1,10 @@
 /** @typedef {{name:string,source:string,description?:string,argumentHint?:string}} MenuCommand */
-/** @typedef {{commands:MenuCommand[],models:{provider:string,id:string}[],thinkingLevels:string[],model:{provider:string,id:string}|null,thinkingLevel:string|null}} SessionMenu */
+/** @typedef {{commands:MenuCommand[],models:{provider:string,id:string}[],thinkingLevels:string[],model:{provider:string,id:string}|null,thinkingLevel:string|null,summaryModel?:{provider:string,id:string}|null}} SessionMenu */
 
 const BUILTIN_SOURCE = "builtin";
 
 /** @type {SessionMenu} */
-export const EMPTY_SESSION_MENU = { commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null };
+export const EMPTY_SESSION_MENU = { commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, summaryModel: null };
 
 /** @param {{provider:string,id:string}} model */
 function modelValue(model) {
@@ -33,10 +33,11 @@ export function sessionSlashCommands(menu) {
   return [
     { name: "model", description: menu.model === null ? "Select the session model" : `Model: ${modelValue(menu.model)}`, argumentHint: "<provider/id>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, models) },
     { name: "thinking", description: menu.thinkingLevel === null ? "Set the thinking level" : `Thinking: ${menu.thinkingLevel}`, argumentHint: "<level>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, menu.thinkingLevels) },
+    { name: "model-summary", description: menu.summaryModel == null ? "Dashboard summaries: off" : `Dashboard summaries: ${modelValue(menu.summaryModel)}`, argumentHint: "<provider/id|off>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, ["off", ...models]) },
     { name: "compact", description: "Compact the conversation", argumentHint: "[instructions]", source: BUILTIN_SOURCE },
     ...menu.commands
       .map((command) => ({ ...command, name: bareName(command.name) }))
-      .filter((command) => !["model", "thinking", "compact"].includes(command.name)),
+      .filter((command) => !["model", "thinking", "compact", "model-summary"].includes(command.name)),
   ];
 }
 
@@ -44,7 +45,7 @@ export function sessionSlashCommands(menu) {
  * Resolve one submitted editor line into a prompt or an exact session command.
  * @param {string} text
  * @param {SessionMenu} menu
- * @returns {{kind:"prompt",text:string}|{kind:"session_command",payload:Record<string,any>}|{kind:"rejected",code:string,message:string}}
+ * @returns {{kind:"prompt",text:string}|{kind:"session_command",payload:Record<string,any>}|{kind:"settings",payload:Record<string,any>}|{kind:"rejected",code:string,message:string}}
  */
 export function parseSlashSubmission(text, menu) {
   const trimmed = text.trim();
@@ -62,6 +63,13 @@ export function parseSlashSubmission(text, menu) {
     if (argument.length === 0) return { kind: "rejected", code: "THINKING_LEVEL_REQUIRED", message: menu.thinkingLevels.length === 0 ? "This session reported no thinking levels. Stop and reopen it to refresh Pi's command menu." : `Choose a thinking level: ${menu.thinkingLevels.join(", ")}` };
     if (!menu.thinkingLevels.includes(argument)) return { kind: "rejected", code: "UNKNOWN_THINKING_LEVEL", message: `Unknown thinking level: ${argument}` };
     return { kind: "session_command", payload: { command: "set_thinking_level", level: argument } };
+  }
+  if (name === "/model-summary") {
+    if (argument.length === 0) return { kind: "rejected", code: "SUMMARY_MODEL_REQUIRED", message: menu.models.length === 0 ? "This session reported no models. Stop and reopen it to refresh Pi's command menu." : `Choose a summary model or off: ${menu.models.map(modelValue).join(", ")}` };
+    if (argument === "off") return { kind: "settings", payload: { summaryModel: null } };
+    const selected = menu.models.find((model) => modelValue(model) === argument);
+    if (selected === undefined) return { kind: "rejected", code: "UNKNOWN_MODEL", message: `Unknown model: ${argument}` };
+    return { kind: "settings", payload: { summaryModel: { ...selected } } };
   }
   if (name === "/compact") {
     return { kind: "session_command", payload: argument.length === 0 ? { command: "compact" } : { command: "compact", instructions: argument } };

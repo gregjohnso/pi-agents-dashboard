@@ -16,6 +16,7 @@ import { ensurePrivateDirectory, initializeRuntimePermissions } from "./permissi
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "./process-signaler.mjs";
 import { RecoveredWorkerRouter, reconcileRuntime } from "./reconciliation.mjs";
+import { openSettingsStore, summarizePromptInput, summarizeWithPi } from "./summaries.mjs";
 import { RegistryStore, runSessionLifecycle } from "./registry-store.mjs";
 import { reduceSessionState } from "./state-reducer.mjs";
 import { WorkerSupervisor } from "./worker-supervisor.mjs";
@@ -561,6 +562,9 @@ export async function createDaemonRuntime({
   reconnectTimeoutMs = 15_000,
   workerSupervisor,
   resolveLaunchRequest,
+  summarizeSession,
+  summaryExecutable = "pi",
+  summaryEnv = process.env,
   rollbackLaunch = rollbackPreparedLaunch,
   randomId = randomUUID,
   responseWriter = async (/** @type {any} */ { value, write }) => write(value),
@@ -602,6 +606,9 @@ export async function createDaemonRuntime({
     const stopRequested = new Promise((resolveStop) => { resolveStopRequested = resolveStop; });
     const recoveryController = new AbortController();
     const usedCommandIds = new Set();
+    const settingsStore = await openSettingsStore({ directory: daemonDirectory });
+    /** @type {Set<string>} */
+    const summarizing = new Set();
     const launchingSessions = new Set();
     const sessionStarts = new Map();
     /** Launch-channel handles for workers that have not yet reconnected over the control socket. @type {Map<string, any>} */
@@ -648,6 +655,42 @@ export async function createDaemonRuntime({
             await context.recovery.viewer.ingest(handle.sessionId, frame);
           }).catch(() => {});
         });
+      },
+      /** Refresh opt-in Activity summaries for every session whose transcript advanced. */
+      async refreshSummaries() {
+        const { summaryModel } = settingsStore.current();
+        if (summaryModel === null || context.recovery?.viewer === undefined) return [];
+        const summarize = summarizeSession ?? (async (/** @type {any} */ options) => summarizeWithPi({ ...options, executable: options.executable ?? "pi" }));
+        /** @type {string[]} */
+        const refreshed = [];
+        for (const record of await registry.list()) {
+          if (summarizing.has(record.sessionId)) continue;
+          const snapshot = await context.recovery.viewer.snapshot(record.sessionId, "observer").catch(() => undefined);
+          if (snapshot === undefined) continue;
+          const sourceCursor = snapshot.cursor.sequence;
+          if (record.summary?.sourceCursor === sourceCursor && record.summary.model.provider === summaryModel.provider && record.summary.model.id === summaryModel.id) continue;
+          const transcript = summarizePromptInput(snapshot.items);
+          if (transcript.length === 0) continue;
+          refreshed.push(record.sessionId);
+          summarizing.add(record.sessionId);
+          void (async () => {
+            try {
+              const text = await summarize({ model: summaryModel, transcript, executable: summaryExecutable, env: summaryEnv });
+              if (typeof text !== "string" || text.trim().length === 0) return;
+              await runSessionLifecycle(registry, record.sessionId, async () => {
+                const current = await registry.get(record.sessionId);
+                if (current === undefined) return;
+                const updated = await registry.update(current.sessionId, current.revision, { summary: { text: text.trim().slice(0, 512), generatedAt: new Date().toISOString(), model: { ...summaryModel }, sourceCursor }, updatedAt: new Date().toISOString() });
+                const event = await context.recovery.events.append({ kind: "session_changed", payload: { session: updated } });
+                context.broadcast(event);
+              });
+            } catch {
+            } finally {
+              summarizing.delete(record.sessionId);
+            }
+          })();
+        }
+        return refreshed;
       },
       /** @param {string} sessionId */
       async ensureSessionWorker(sessionId) {
@@ -854,6 +897,8 @@ export async function createDaemonRuntime({
       async handleRequest(request, socket, subscribers, authenticatedClientId = request.clientId, duringRecovery = false) {
         if (!context.admissionOpen) throw Object.assign(new Error("Daemon is shutting down"), { code: "SHUTTING_DOWN", retryable: true });
         if (request.op === "get_state") return { kind: "state", sessions: await registry.list() };
+        if (request.op === "get_settings") return { kind: "settings", ...settingsStore.current() };
+        if (request.op === "set_settings") return { kind: "settings", ...(await settingsStore.setSummaryModel(request.payload.summaryModel)) };
         if (context.state !== "READY" && !duringRecovery) throw Object.assign(new Error(context.state === "FAILED" ? context.stateError?.message ?? "Daemon recovery failed" : "Daemon recovery is still in progress"), { code: context.state === "FAILED" ? context.stateError?.code ?? "RECOVERY_FAILED" : "RECOVERING", retryable: context.state !== "FAILED" });
         if (request.op === "get_viewer_snapshot") {
           const role = socket === undefined ? "observer" : attachmentClaims.get(request.payload.sessionId)?.get(socket)?.role ?? "observer";
@@ -960,6 +1005,7 @@ export async function createDaemonRuntime({
             throw error;
           }
         }
+        if (request.op === "refresh_summaries") return { kind: "summaries_refreshing", sessionIds: await context.refreshSummaries() };
         if (request.op === "attach" || request.op === "detach") {
           if (socket === undefined) throw new TypeError("Attachment requires a live socket");
           return context.arbitrateAttachment(request, socket, authenticatedClientId);
@@ -1335,6 +1381,8 @@ export async function createDefaultDaemonRuntime({ root, piBin, env = process.en
     root,
     workerSupervisor,
     resolveLaunchRequest: createLaunchResolver({ registry, piConfigRoot }),
+    summaryExecutable: configuredPiPath ?? "pi",
+    summaryEnv: env,
     stopPolicy: config.stop,
   });
 }

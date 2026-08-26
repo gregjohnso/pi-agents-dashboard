@@ -1,6 +1,7 @@
 import { stripVTControlCharacters } from "node:util";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
+
 import { createDashboardLayout, renderColumnHeader, renderGroupHeader, renderSessionRow, } from "./dashboard-layout.mjs";
 import { JOBWATCH_ANSI } from "./dashboard-theme.mjs";
 const now = Date.parse("2026-08-25T12:00:00.000Z");
@@ -72,6 +73,16 @@ describe("responsive dashboard layout", () => {
             columns: layout.columns,
             lines: lines.map(stripVTControlCharacters),
         }).toMatchSnapshot();
+    });
+    it("prefers a generated summary over raw activity in the Activity column", () => {
+        const layout = createDashboardLayout(160, 40);
+        const summarized = session("summarized", {
+            activity: { kind: "assistant", summary: "Pi assistant streaming", updatedAt: "2026-08-25T11:59:00.000Z" },
+            summary: { text: "Fixes the coverage loader and reruns tests", generatedAt: "2026-08-25T11:59:30.000Z", model: { provider: "anthropic", id: "haiku" }, sourceCursor: "42" },
+        });
+        const row = stripVTControlCharacters(renderSessionRow(summarized, layout, { now }));
+        expect(row).toContain("Fixes the coverage loader and reruns tests");
+        expect(row).not.toContain("Pi assistant streaming");
     });
     it("keeps the fixed list column order and never renders Model", () => {
         expect(createDashboardLayout(160, 40).columns.map(({ key }) => key)).toEqual(["id", "state", "project", "activity", "age"]);

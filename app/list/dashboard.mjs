@@ -144,6 +144,14 @@ export function createDaemonDashboardBackend({ client, clientId, preflight, requ
             }
             return { kind: "rejected", error: { code: "INVALID_RESPONSE", message: "Daemon returned the wrong launch result" } };
         },
+        async refreshSummaries() {
+            const response = await request("refresh_summaries", {});
+            if (!response.ok)
+                throw Object.assign(new Error(response.error.message), response.error);
+            if (response.result.kind !== "summaries_refreshing")
+                throw Object.assign(new Error("Daemon returned the wrong summary refresh result"), { code: "INVALID_RESPONSE" });
+            return response.result.sessionIds;
+        },
         async resolveDelivery(targetClientId, targetRequestId, resolution) {
             const response = await request("resolve_delivery", { targetClientId, targetRequestId, resolution });
             if (!response.ok)
@@ -287,6 +295,7 @@ export class DashboardController {
             this.unsubscribe = unsubscribe;
             this.status = { kind: "ready" };
             this.requestRender?.();
+            this.refreshSummaries();
         }
         catch (error) {
             if (!this.isCurrentOpen(generation))
@@ -566,6 +575,8 @@ export class DashboardController {
             this.toggleHelp();
         else if (data === "v")
             this.cycleView();
+        else if (data === "R")
+            this.refreshSummaries();
         else if (data === "c")
             this.clearFilters();
         else if (data === "t")
@@ -819,6 +830,12 @@ export class DashboardController {
     printable(data) {
         return decodeKittyPrintable(data)
             ?? (data.length === 1 && data.charCodeAt(0) >= 32 ? data : undefined);
+    }
+    /** Ask the daemon for opt-in Activity summaries; absence of a summary model is not an error. */
+    refreshSummaries() {
+        if (typeof this.backend.refreshSummaries !== "function")
+            return;
+        void Promise.resolve(this.backend.refreshSummaries()).catch(() => { });
     }
     async launch(request) {
         // Show the list before the daemon answers: startup takes seconds and the session row arrives by subscription.

@@ -138,6 +138,23 @@ describe("dashboard controller", () => {
         expect(dashboard.selectedSessionId).toBe("waiting");
         expect(dashboard.query).toMatchObject({ search: "approval", taskStates: ["WAITING"], projectPaths: ["/repo/a"], groupBy: "cwd", sort: { key: "activity", direction: "asc" } });
     });
+    it("asks the daemon to refresh Activity summaries on open and on demand", async () => {
+        const backend = new FakeBackend([session("a")]);
+        backend.refreshSummaries = vi.fn(async () => ["a"]);
+        const dashboard = controller(backend);
+        await dashboard.open();
+        await vi.waitFor(() => expect(backend.refreshSummaries).toHaveBeenCalledTimes(1));
+        dashboard.handleInput("R");
+        await vi.waitFor(() => expect(backend.refreshSummaries).toHaveBeenCalledTimes(2));
+    });
+    it("opens without summaries when the daemon has none configured", async () => {
+        const backend = new FakeBackend([session("a")]);
+        backend.refreshSummaries = vi.fn(async () => { throw Object.assign(new Error("nope"), { code: "SUMMARIES_UNAVAILABLE" }); });
+        const dashboard = controller(backend);
+        await dashboard.open();
+        await vi.waitFor(() => expect(backend.refreshSummaries).toHaveBeenCalled());
+        expect(dashboard.status).toEqual({ kind: "ready" });
+    });
     it("counts only the sessions the current view shows", async () => {
         const dashboard = controller(new FakeBackend([
             session("live", { processState: "LIVE" }),

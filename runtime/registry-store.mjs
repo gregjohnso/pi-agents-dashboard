@@ -26,6 +26,7 @@ const SESSION_RECORD_KEYS = [
   "isolation",
   "latestRunId",
   "runtime",
+  "summary",
   "createdAt",
   "updatedAt",
 ];
@@ -141,6 +142,19 @@ function validateRuntime(value) {
 }
 
 /** @param {unknown} value */
+function validateSummary(value) {
+  if (!isPlainObject(value)) throw new TypeError("summary must be an object");
+  rejectUnknownKeys(value, ["text", "generatedAt", "model", "sourceCursor"], "summary");
+  if (typeof value.text !== "string" || value.text.length === 0 || value.text.length > 512) throw new TypeError("summary.text must be a bounded non-empty string");
+  requireString(value, "generatedAt", "summary.generatedAt");
+  requireString(value, "sourceCursor", "summary.sourceCursor");
+  if (!isPlainObject(value.model)) throw new TypeError("summary.model must be an object");
+  rejectUnknownKeys(value.model, ["provider", "id"], "summary.model");
+  requireString(value.model, "provider", "summary.model.provider");
+  requireString(value.model, "id", "summary.model.id");
+}
+
+/** @param {unknown} value */
 function validateModel(value) {
   if (!isPlainObject(value)) throw new TypeError("model must be an object");
   rejectUnknownKeys(value, ["provider", "id"], "model");
@@ -192,6 +206,7 @@ export function validateSessionRecord(value) {
   if (value.thinkingLevel !== undefined) requireString(value, "thinkingLevel");
   if (value.latestRunId !== undefined) requireString(value, "latestRunId");
   if (value.runtime !== undefined) validateRuntime(value.runtime);
+  if (value.summary !== undefined) validateSummary(value.summary);
   if (value.isolation !== undefined) validateIsolation(value.isolation);
   if (value.ownership !== undefined) {
     if (!isPlainObject(value.ownership) || value.ownership.kind !== "managed") {

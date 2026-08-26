@@ -123,7 +123,7 @@ function sessionValues(session, now) {
         state: session.taskState,
         age: age(session.updatedAt, now),
         project,
-        activity: session.activity.summary.trim() || "—",
+        activity: (session.summary?.text ?? session.activity.summary).trim() || "—",
     };
 }
 /** Render one dense session row without allocating a component per session. */

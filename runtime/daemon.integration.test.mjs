@@ -261,6 +261,44 @@ it("rejects worker mutations during reconciliation without touching unopened sto
   worker.close();
 });
 
+it("summarizes sessions only after the opt-in model is chosen and reuses cached summaries", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const now = "2026-08-25T12:00:00.000Z";
+  const sessionFile = join(stateRoot, "canonical.jsonl");
+  await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "summary", timestamp: now, cwd: stateRoot })}\n${JSON.stringify({ type: "message", id: "user-1", parentId: null, timestamp: now, message: { role: "user", content: "fix the loader" } })}\n`, { mode: 0o600 });
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "summary", sessionFile, canonicalSessionFile: sessionFile, cwd: stateRoot, taskState: "READY", processState: "SLEEPING", outcome: "NONE", activity: { kind: "idle", summary: "Idle", updatedAt: now }, createdAt: now, updatedAt: now });
+  /** @type {any[]} */
+  const summarized = [];
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    summarizeSession: async (/** @type {any} */ options) => { summarized.push(options); return "Fixes the loader"; },
+  });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 16384 });
+  await client.ready;
+
+  client.send({ version: 1, clientId: "viewer", requestId: "settings-1", op: "get_settings", payload: {} });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "settings", summaryModel: null } });
+  client.send({ version: 1, clientId: "viewer", requestId: "refresh-off", op: "refresh_summaries", payload: {} });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "summaries_refreshing", sessionIds: [] } });
+  expect(summarized).toEqual([]);
+
+  client.send({ version: 1, clientId: "viewer", requestId: "settings-2", op: "set_settings", payload: { summaryModel: { provider: "anthropic", id: "haiku" } } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "settings", summaryModel: { provider: "anthropic", id: "haiku" } } });
+  client.send({ version: 1, clientId: "viewer", requestId: "refresh-on", op: "refresh_summaries", payload: {} });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "summaries_refreshing", sessionIds: ["summary"] } });
+  await vi.waitFor(async () => expect((await registry.get("summary"))?.summary).toMatchObject({ text: "Fixes the loader", model: { provider: "anthropic", id: "haiku" } }));
+  expect(summarized[0]).toMatchObject({ model: { provider: "anthropic", id: "haiku" }, transcript: "User: fix the loader" });
+
+  client.send({ version: 1, clientId: "viewer", requestId: "refresh-cached", op: "refresh_summaries", payload: {} });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "summaries_refreshing", sessionIds: [] } });
+  expect(summarized).toHaveLength(1);
+  client.close();
+});
+
 it("reaches a freshly launched worker over its launch channel before any socket reconnect", async () => {
   const stateRoot = await root();
   await mkdir(join(stateRoot, "sessions"), { mode: 0o700 });

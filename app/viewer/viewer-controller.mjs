@@ -248,7 +248,10 @@ export class ViewerController {
       if (!this.openSelection(submission.code)) await this.recordError({ code: submission.code, message: submission.message, retryable: false });
       return;
     }
-    if (submission.kind === "session_command") {
+    if (submission.kind === "settings") {
+      if (!await this.sendSettings(submission.payload)) return;
+      await this.loadMenu();
+    } else if (submission.kind === "session_command") {
       if (!await this.sendCommand("session_command", submission.payload)) return;
       await this.loadMenu();
     } else {
@@ -275,6 +278,22 @@ export class ViewerController {
     } catch (error) {
       const typed = /** @type {any} */ (error);
       await this.recordError({ code: typed?.code ?? "VIEWER_COMMAND_FAILED", message: error instanceof Error ? error.message : "Viewer command failed", retryable: typed?.retryable === true });
+      return false;
+    }
+  }
+
+  /** @param {Record<string, any>} payload */
+  async sendSettings(payload) {
+    if (typeof this.client.setSettings !== "function") {
+      await this.recordError({ code: "SETTINGS_UNAVAILABLE", message: "This frontend cannot change dashboard settings", retryable: false });
+      return false;
+    }
+    try {
+      await this.client.setSettings(payload);
+      return true;
+    } catch (error) {
+      const typed = /** @type {any} */ (error);
+      await this.recordError({ code: typed?.code ?? "SETTINGS_FAILED", message: error instanceof Error ? error.message : "Dashboard settings update failed", retryable: false });
       return false;
     }
   }
@@ -316,13 +335,16 @@ export class ViewerController {
 
   /** Offer one Pi selection list for a built-in command submitted without its argument. @param {string} code */
   openSelection(code) {
+    const models = this.menu.models.map((model) => ({ value: `${model.provider}/${model.id}`, label: `${model.provider}/${model.id}` }));
     const picker = code === "MODEL_REQUIRED"
-      ? { title: "Select a model", items: this.menu.models.map((model) => ({ value: `${model.provider}/${model.id}`, label: `${model.provider}/${model.id}` })) }
+      ? { title: "Select a model", items: models }
       : code === "THINKING_LEVEL_REQUIRED"
         ? { title: "Select a thinking level", items: this.menu.thinkingLevels.map((level) => ({ value: level, label: level })) }
-        : undefined;
+        : code === "SUMMARY_MODEL_REQUIRED"
+          ? { title: "Select a dashboard summary model", items: [{ value: "off", label: "off · disable summaries" }, ...models] }
+          : undefined;
     if (picker === undefined || picker.items.length === 0) return false;
-    const command = code === "MODEL_REQUIRED" ? "/model" : "/thinking";
+    const command = code === "MODEL_REQUIRED" ? "/model" : code === "THINKING_LEVEL_REQUIRED" ? "/thinking" : "/model-summary";
     this.selection?.dispose();
     this.selection = new CommandSelectionOverlay({
       title: picker.title, items: picker.items,

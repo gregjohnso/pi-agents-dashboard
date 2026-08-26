@@ -56,7 +56,7 @@ export function createDaemonViewerClient({ client, clientId }) {
     return response.result;
   };
   return {
-    replayFromOrigin: true,
+    replayFromOrigin: false,
     async attach(sessionId) {
       const attached = await request("attach", { sessionId, role: "composer" });
       if (attached?.kind !== "attached" || attached.role !== "composer") throw Object.assign(new Error("Another frontend owns this session"), { code: "SESSION_IN_USE", retryable: false });

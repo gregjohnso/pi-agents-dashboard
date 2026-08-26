@@ -31,7 +31,7 @@ it("adapts the installed daemon client to origin replay, mutation, ACK, and deta
     async ackViewer(cursor) { return cursor; },
   };
   const viewer = createDaemonViewerClient({ client, clientId: "client" });
-  expect(viewer.replayFromOrigin).toBe(true);
+  expect(viewer.replayFromOrigin).toBe(false);
   await viewer.attach("session");
   const received = [];
   const unsubscribe = viewer.subscribe("session", { sequence: "0" }, async (event) => { received.push(event); }, () => {});

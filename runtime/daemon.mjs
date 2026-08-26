@@ -5,16 +5,21 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+
 import { createAttachmentResultStore } from "./attachment-result-store.mjs";
 import { atomicWriteJson } from "./atomic-file.mjs";
 import { claimDaemonLifecycle, releaseDaemonLifecycle, updateDaemonLifecycleState } from "./daemon-lifecycle.mjs";
 import { createJsonlDecoder, createJsonlEncoder, JsonlFramingError } from "./jsonl.mjs";
+import { createLaunchResolver, rollbackPreparedLaunch } from "./launch-resolver.mjs";
 import { ensurePrivateDirectory, initializeRuntimePermissions } from "./permissions.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "./process-signaler.mjs";
 import { RecoveredWorkerRouter, reconcileRuntime } from "./reconciliation.mjs";
 import { RegistryStore, runSessionLifecycle } from "./registry-store.mjs";
 import { reduceSessionState } from "./state-reducer.mjs";
+import { WorkerSupervisor } from "./worker-supervisor.mjs";
+import { loadDashboardConfig } from "../shared/config.mjs";
 import { parseClientRequest } from "../shared/contracts.mjs";
 
 initializeRuntimePermissions();
@@ -548,6 +553,7 @@ export async function createDaemonRuntime({
   reconnectTimeoutMs = 15_000,
   workerSupervisor,
   resolveLaunchRequest,
+  rollbackLaunch = rollbackPreparedLaunch,
   randomId = randomUUID,
   responseWriter = async (/** @type {any} */ { value, write }) => write(value),
   closeFailpoint = async () => {},
@@ -562,7 +568,7 @@ export async function createDaemonRuntime({
   if (typeof root !== "string" || resolve(root) !== root) throw new TypeError("Daemon runtime root must be an absolute canonical path");
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 128) throw new TypeError("maxBytes must be at least 128");
   if (typeof randomId !== "function") throw new TypeError("randomId must be a function");
-  if (typeof responseWriter !== "function" || typeof closeFailpoint !== "function" || typeof attachmentFailpoint !== "function" || typeof destructiveFailpoint !== "function" || typeof signalProcessGroupImpl !== "function" || typeof sleepImpl !== "function") throw new TypeError("Daemon runtime seams must be functions");
+  if (typeof responseWriter !== "function" || typeof closeFailpoint !== "function" || typeof attachmentFailpoint !== "function" || typeof destructiveFailpoint !== "function" || typeof signalProcessGroupImpl !== "function" || typeof sleepImpl !== "function" || typeof rollbackLaunch !== "function") throw new TypeError("Daemon runtime seams must be functions");
   if (!Number.isSafeInteger(stopPolicy?.gracefulMs) || stopPolicy.gracefulMs <= 0 || !Number.isSafeInteger(stopPolicy?.terminateMs) || stopPolicy.terminateMs <= 0) throw new TypeError("stopPolicy must contain approved positive integer waits");
   if (trashSessionFile !== undefined && typeof trashSessionFile !== "function") throw new TypeError("trashSessionFile must be a function when supplied");
   await ensureLayout(root);
@@ -843,8 +849,10 @@ export async function createDaemonRuntime({
             return { kind: "command", status };
           }
           await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
+          /** @type {any} */
+          let launch;
           try {
-            const launch = await resolveLaunchRequest(request);
+            launch = await resolveLaunchRequest(request);
             return await runSessionLifecycle(registry, launch.sessionId, async () => {
               if (launchingSessions.has(launch.sessionId)) throw Object.assign(new Error("A launch is already in flight for this session"), { code: "LAUNCH_IN_FLIGHT" });
               launchingSessions.add(launch.sessionId);
@@ -859,6 +867,17 @@ export async function createDaemonRuntime({
                     await context.recovery.viewer.ingest(handle.sessionId, frame);
                   }).catch(() => {});
                 });
+                if (typeof launch.initialPrompt === "string") {
+                  const promptRequest = {
+                    version: 1,
+                    clientId: `daemon-launch:${daemonEpoch}`,
+                    requestId: createHash("sha256").update(canonicalJson([request.clientId, request.requestId, handle.sessionId])).digest("hex"),
+                    op: "prompt",
+                    payload: { sessionId: handle.sessionId, text: launch.initialPrompt },
+                  };
+                  const promptStatus = await handle.deliver(promptRequest, context.recovery.journal);
+                  if (promptStatus?.stage !== "COMPLETED") throw Object.assign(new Error(promptStatus?.error?.message ?? `Initial prompt ended in ${promptStatus?.stage ?? "an unknown state"}`), { code: promptStatus?.error?.code ?? promptStatus?.stage ?? "INITIAL_PROMPT_FAILED" });
+                }
               } finally {
                 launchingSessions.delete(launch.sessionId);
               }
@@ -868,8 +887,19 @@ export async function createDaemonRuntime({
               return { kind: "launched", sessionId: persisted.sessionId };
             });
           } catch (error) {
+            const launchError = /** @type {any} */ (error);
             const current = await context.recovery.journal.get(request);
-            if (current?.stage === "DELIVERY_ATTEMPTED") await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
+            if (current?.stage === "DELIVERY_ATTEMPTED" && launchError?.preChild === true && launch !== undefined) {
+              try {
+                await rollbackLaunch(launch, { registry });
+              } catch (rollbackError) {
+                await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
+                await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "FAILED", dashboardError("LAUNCH_ROLLBACK_FAILED", rollbackError instanceof Error ? rollbackError.message : "Prepared launch rollback failed"));
+                throw Object.assign(new Error("Prepared launch rollback failed", { cause: rollbackError }), { code: "LAUNCH_ROLLBACK_FAILED" });
+              }
+              await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
+              await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "FAILED", dashboardError(launchError.code ?? "LAUNCH_FAILED", error instanceof Error ? error.message : "Launch failed"));
+            } else if (current?.stage === "DELIVERY_ATTEMPTED") await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
             throw error;
           }
         }
@@ -1198,6 +1228,32 @@ export async function createDaemonRuntime({
   }
 }
 
+/** Build the production launch seams used by the detached daemon entry point. @param {{root:string,piBin?:string,env?:NodeJS.ProcessEnv}} options */
+export async function createDefaultDaemonRuntime({ root, piBin, env = process.env }) {
+  const configText = await readPrivateText(join(root, "dashboard.json"));
+  const config = loadDashboardConfig(configText === undefined ? {} : JSON.parse(configText));
+  const configuredPiPath = piBin ?? config.pi.executable;
+  const registry = new RegistryStore(join(root, "sessions"));
+  const piConfigPath = resolve(getAgentDir());
+  await ensurePrivateDirectory(piConfigPath);
+  const piConfigRoot = await fs.realpath(piConfigPath);
+  const workerSupervisor = new WorkerSupervisor({
+    registry,
+    runsDirectory: join(root, "runs"),
+    maxLive: config.workers.maxLive,
+    configuredPiPath,
+    env,
+    startTimeoutMs: config.daemon.startTimeoutMs,
+    launchStopPolicy: config.stop,
+  });
+  return createDaemonRuntime({
+    root,
+    workerSupervisor,
+    resolveLaunchRequest: createLaunchResolver({ registry, piConfigRoot }),
+    stopPolicy: config.stop,
+  });
+}
+
 /** @param {NodeJS.ProcessEnv} [env] */
 export function defaultRuntimeRoot(env = process.env) {
   const home = env.HOME ?? homedir();
@@ -1207,8 +1263,10 @@ export function defaultRuntimeRoot(env = process.env) {
 async function runMain() {
   const argv = process.argv.slice(2);
   const rootFlag = argv.indexOf("--root");
+  const piBinFlag = argv.indexOf("--pi-bin");
   const root = rootFlag >= 0 ? argv[rootFlag + 1] : defaultRuntimeRoot();
-  const runtime = await createDaemonRuntime({ root });
+  const piBin = piBinFlag >= 0 ? argv[piBinFlag + 1] : undefined;
+  const runtime = await createDefaultDaemonRuntime({ root, piBin });
   try {
     await runtime.ready;
     await Promise.race([

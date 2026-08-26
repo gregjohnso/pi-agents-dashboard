@@ -97,7 +97,7 @@ export async function runDashboardApp({
 
 /** @param {{root:string,piBin?:string,env:NodeJS.ProcessEnv}} options */
 async function defaultConnectOrStart(options) {
-  const started = await runDaemonCommand("start", { root: options.root, env: options.env });
+  const started = await runDaemonCommand("start", { root: options.root, piBin: options.piBin, env: options.env });
   if (started.code !== 0) throw Object.assign(new Error(started.error?.message ?? "Daemon did not start"), { code: started.error?.code ?? "DAEMON_START_FAILED" });
   const clientId = await loadCliClientIdentity({ root: options.root });
   return { root: options.root, clientId, piBin: options.piBin, async close() {} };

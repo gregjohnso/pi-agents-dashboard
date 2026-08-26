@@ -43,7 +43,7 @@ process.stdin.on("data", (chunk) => {
     const type = command.type;
     const responseId = process.env.FAKE_PI_WRONG_RESPONSE_ID === type ? `wrong-${command.id}` : command.id;
     const validPrompt = ["prompt", "follow_up", "steer"].includes(type) && typeof command.message === "string";
-    log({ kind: "command", command: type, valid: validPrompt, providerInvocation: validPrompt });
+    log({ kind: "command", command: type, message: validPrompt ? command.message : undefined, valid: validPrompt, providerInvocation: validPrompt });
     if (type === "__pi_dashboard_unknown_command__") {
       process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: process.env.FAKE_PI_UNKNOWN_SUCCESS === "1", error: process.env.FAKE_PI_UNKNOWN_SUCCESS === "1" ? undefined : "unknown command" })}\n`);
       continue;

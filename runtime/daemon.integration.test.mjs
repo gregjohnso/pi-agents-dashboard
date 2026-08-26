@@ -1076,6 +1076,31 @@ it("journals launch before the irreversible call and refuses ambiguous duplicate
   client.close();
 });
 
+it("rolls back and fails a launch refused before any child process exists", async () => {
+  const stateRoot = await root();
+  const rollbackLaunch = vi.fn(async () => {});
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    hostProbe: async () => ({ blockers: [] }),
+    resolveLaunchRequest: async () => ({ sessionId: "prepared", canonicalSessionFile: "/sessions/prepared.jsonl", sessionRecord: { isolation: { mode: "shared_directory", canonicalCwd: "/repo" } } }),
+    rollbackLaunch,
+    workerSupervisor: {
+      async launch() { throw Object.assign(new Error("unsupported"), { code: "UNSUPPORTED_PI_CAPABILITY", preChild: true }); },
+      async close() {},
+    },
+  });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await client.ready;
+  const launch = { version: 1, clientId: "launcher", requestId: "pre-child", op: "launch", payload: { prompt: "go", cwd: "/repo", sourceSessionId: "source", isolation: { mode: "worktree" } } };
+  client.send(launch);
+  expect(await client.next()).toMatchObject({ ok: false, error: { code: "UNSUPPORTED_PI_CAPABILITY" } });
+  expect(rollbackLaunch).toHaveBeenCalledOnce();
+  expect(await runtime.commandStatus(launch)).toMatchObject({ stage: "FAILED", error: { code: "UNSUPPORTED_PI_CAPABILITY" } });
+  client.close();
+});
+
 it("replays a durably terminal launch after deterministic response loss without relaunching", async () => {
   const stateRoot = await root();
   let launches = 0;

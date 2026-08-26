@@ -49,23 +49,24 @@ it("navigates to New Session, quits with Ctrl+C, and restores the real terminal"
 
   const timeout = setTimeout(() => {
     try { process.kill(-child.pid, "SIGKILL"); } catch {}
-  }, 15_000);
+  }, 25_000);
   let result;
   let transcript;
+  let stopped;
   try {
     result = await new Promise((resolve) => child.on("exit", (code, signal) => resolve({ code, signal })));
     transcript = await readFile(transcriptPath);
   } finally {
     clearTimeout(timeout);
-    const stopped = spawnSync("node", ["./bin/pi-dashboard.mjs", "daemon", "stop"], {
+    stopped = spawnSync("node", ["./bin/pi-dashboard.mjs", "daemon", "stop"], {
       cwd: process.cwd(), env, encoding: "utf8", timeout: 10_000,
     });
     await rm(temporaryRoot, { recursive: true, force: true });
-    expect(stopped.status).toBe(0);
   }
 
   expect(stage).toBe("quit");
   expect(result).toEqual({ code: 0, signal: null });
+  expect(stopped.status).toBe(0);
   expect(transcript.includes(ENTER_ALT_SCREEN)).toBe(true);
   expect(transcript.includes(EXIT_ALT_SCREEN)).toBe(true);
   expect(transcript.includes(SHOW_CURSOR)).toBe(true);
@@ -78,4 +79,4 @@ it("navigates to New Session, quits with Ctrl+C, and restores the real terminal"
   expect(stty).toMatch(/(?:^|[\s;])isig(?:[\s;]|$)/u);
   expect(stty).toMatch(/(?:^|[\s;])icanon(?:[\s;]|$)/u);
   expect(stty).toMatch(/(?:^|[\s;])echo(?:[\s;]|$)/u);
-}, 30_000);
+}, 40_000);

@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, expect, it } from "vitest";
 
 import { createDaemonClient } from "../app/daemon-client.mjs";
+import { runDaemonCommand } from "../cli/daemon-commands.mjs";
 import { createDaemonRuntime } from "../runtime/daemon.mjs";
 import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
 import { RegistryStore } from "../runtime/registry-store.mjs";
@@ -88,6 +89,39 @@ async function nextMatching(iterator, predicate) {
   }
 }
 
+it("starts the production daemon with launch resolution and delivers the composer prompt", async () => {
+  const root = await setupRoot("pi-dashboard-production-launch-");
+  const executable = join(root, "pi");
+  const log = join(root, "fake-pi.jsonl");
+  await writeFile(executable, sourceFor("production"), { mode: 0o700 });
+  await chmod(executable, 0o700);
+  const env = { ...process.env, FAKE_PI_LOG: log, FAKE_PI_EVENT_AFTER_COMMAND: "prompt" };
+  let client;
+  try {
+    const started = await runDaemonCommand("start", { root, piBin: executable, env });
+    expect(started).toMatchObject({ code: 0, result: { kind: "daemon_started" } });
+    client = createDaemonClient({ socketPath: join(root, "daemon", "control.sock"), token: (await readFile(join(root, "daemon", "control.token"), "utf8")).trim(), clientId: "production-launch", reconnect: false, maxBytes: 256 * 1024 });
+    await client.connect();
+    const launched = await client.request(request("production-launch", "launch-request", "launch", {
+      prompt: "who are you?",
+      cwd: root,
+      sourceSessionId: "dashboard-production-launch",
+      isolation: { mode: "shared_directory", confirmedCwd: root, ownerSessionIds: [] },
+    }));
+    if (!launched.ok) throw new Error(`Production launch failed: ${JSON.stringify(launched)}`);
+    expect(launched).toMatchObject({ ok: true, result: { kind: "launched", sessionId: expect.any(String) } });
+    const records = await new RegistryStore(join(root, "sessions")).list();
+    if (records[0]?.ownership?.process !== undefined) processGroups.set(records[0].ownership.process.pid, records[0].ownership.process);
+    expect(records).toEqual([expect.objectContaining({ sessionId: launched.result.sessionId, cwd: root, isolation: { mode: "shared_directory", canonicalCwd: root }, processState: "LIVE" })]);
+    const commands = (await readFile(log, "utf8")).trim().split("\n").map(JSON.parse).filter((entry) => entry.kind === "command");
+    expect(commands.some((entry) => entry.command === "prompt" && entry.message === "who are you?" && entry.valid === true)).toBe(true);
+  } finally {
+    await client?.close();
+    const stopped = await runDaemonCommand("stop", { root, allowLiveWorkers: true, env });
+    if (![0, 3].includes(stopped.code)) throw new Error(`Production daemon cleanup failed: ${JSON.stringify(stopped)}`);
+  }
+}, 30_000);
+
 it("keeps two mixed-version fake Pi children alive across frontend close and daemon restart, then replays later frames", async () => {
   const root = await setupRoot("pi-dashboard-lifecycle-acceptance-");
   const executable = join(root, "pi-current");
@@ -130,7 +164,7 @@ it("keeps two mixed-version fake Pi children alive across frontend close and dae
   await firstRuntime.ready;
   const first = createDaemonClient({ socketPath: firstRuntime.socketPath, token: firstRuntime.token, clientId: "frontend-before", reconnect: false, maxBytes: 256 * 1024 });
   await first.connect();
-  const launchPayload = { prompt: "bounded fake task", cwd: root, sourceSessionId: "source", isolation: { mode: "shared_directory", confirmedCwd: root } };
+  const launchPayload = { prompt: "bounded fake task", cwd: root, sourceSessionId: "source", isolation: { mode: "shared_directory", confirmedCwd: root, ownerSessionIds: [] } };
   const launchedOne = first.request(request("frontend-before", "launch-one", "launch", launchPayload));
 
   await writeFile(replacement, sourceFor("B"), { mode: 0o700 });

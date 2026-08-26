@@ -49,7 +49,7 @@ export function prepareLaunchRequest(draft, preflight, confirmation) {
         sourceSessionId: draft.sourceSessionId,
         isolation: draft.isolationMode === "worktree"
             ? { mode: "worktree" }
-            : { mode: "shared_directory", confirmedCwd: preflight.canonicalCwd },
+            : { mode: "shared_directory", confirmedCwd: preflight.canonicalCwd, ownerSessionIds: [...preflight.ownerSessionIds] },
     };
     if (draft.model.provider !== "") request.model = { ...draft.model };
     if (draft.thinkingLevel !== "") request.thinkingLevel = draft.thinkingLevel;

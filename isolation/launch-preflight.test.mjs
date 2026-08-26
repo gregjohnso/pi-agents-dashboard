@@ -144,7 +144,7 @@ it("supports explicit shared-directory preflight outside Git", async () => {
   await Promise.all([mkdir(cwd), mkdir(piConfigRoot)]);
 
   const result = await launchPreflight(
-    request(cwd, { mode: "shared_directory", confirmedCwd: cwd }),
+    request(cwd, { mode: "shared_directory", confirmedCwd: cwd, ownerSessionIds: ["session-b", "session-a", "session-a"] }),
     { piConfigRoot, currentOwnerSessionIds: ["session-b", "session-a", "session-a"] },
   );
 

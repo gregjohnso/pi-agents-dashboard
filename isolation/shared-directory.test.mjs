@@ -33,20 +33,21 @@ async function fixture() {
 /**
  * @param {string} cwd
  * @param {string} confirmedCwd
+ * @param {string[]} [ownerSessionIds]
  * @returns {import("../shared/contracts.mjs").LaunchRequest}
  */
-function sharedRequest(cwd, confirmedCwd) {
+function sharedRequest(cwd, confirmedCwd, ownerSessionIds = []) {
   return {
     prompt: "Use the shared directory",
     cwd,
     sourceSessionId: "source-session",
-    isolation: { mode: "shared_directory", confirmedCwd },
+    isolation: { mode: "shared_directory", confirmedCwd, ownerSessionIds },
   };
 }
 
 it("binds confirmation to the exact canonical cwd and current owners", async () => {
   const paths = await fixture();
-  const warning = await launchPreflight(sharedRequest(paths.alias, paths.cwd), {
+  const warning = await launchPreflight(sharedRequest(paths.alias, paths.cwd, ["owner-a"]), {
     piConfigRoot: paths.piConfigRoot,
     currentOwnerSessionIds: ["owner-a"],
   });
@@ -64,7 +65,7 @@ it("binds confirmation to the exact canonical cwd and current owners", async () 
 
 it("accepts only the echoed canonical path and unchanged owner set", async () => {
   const paths = await fixture();
-  const warning = await launchPreflight(sharedRequest(paths.alias, paths.cwd), {
+  const warning = await launchPreflight(sharedRequest(paths.alias, paths.cwd, ["owner-b", "owner-a"]), {
     piConfigRoot: paths.piConfigRoot,
     currentOwnerSessionIds: ["owner-b", "owner-a"],
   });

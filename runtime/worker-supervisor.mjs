@@ -319,15 +319,20 @@ export class WorkerSupervisor {
     let executable;
     let capabilities;
     const selectedPath = piPath;
-    if (this.#injectedSpawn) {
-      executable = { realpath: selectedPath ?? process.execPath, device: "injected", inode: "injected", size: 0, modifiedTimeNs: "0" };
-      capabilities = /** @type {import("../shared/contracts.mjs").PiCapabilityReport} */ ({ executable, reportedVersion: "injected", rpcMode: true, jsonl: true, commands: ["get_state", "prompt", "follow_up", "steer", "abort", "extension_ui_response"], events: [], missingRequired: [] });
-    } else {
-      executable = await this.#resolveExecutable({ cliPath: selectedPath, configuredPath: this.#configuredPiPath, pathEnv: this.#env.PATH ?? "" });
-      capabilities = await this.#probeCapabilities({ executable, cache: this.#capabilityCache, timeoutMs: this.#startTimeoutMs, env: this.#env });
-      if (capabilities.missingRequired.length > 0) {
-        throw Object.assign(new WorkerSupervisorError("UNSUPPORTED_PI_CAPABILITY", `Installed Pi is missing required capabilities: ${capabilities.missingRequired.join(", ")}`), { missingCapabilities: capabilities.missingRequired });
+    try {
+      if (this.#injectedSpawn) {
+        executable = { realpath: selectedPath ?? process.execPath, device: "injected", inode: "injected", size: 0, modifiedTimeNs: "0" };
+        capabilities = /** @type {import("../shared/contracts.mjs").PiCapabilityReport} */ ({ executable, reportedVersion: "injected", rpcMode: true, jsonl: true, commands: ["get_state", "prompt", "follow_up", "steer", "abort", "extension_ui_response"], events: [], missingRequired: [] });
+      } else {
+        executable = await this.#resolveExecutable({ cliPath: selectedPath, configuredPath: this.#configuredPiPath, pathEnv: this.#env.PATH ?? "" });
+        capabilities = await this.#probeCapabilities({ executable, cache: this.#capabilityCache, timeoutMs: this.#startTimeoutMs, env: this.#env });
+        if (capabilities.missingRequired.length > 0) {
+          throw Object.assign(new WorkerSupervisorError("UNSUPPORTED_PI_CAPABILITY", `Installed Pi is missing required capabilities: ${capabilities.missingRequired.join(", ")}`), { missingCapabilities: capabilities.missingRequired });
+        }
       }
+    } catch (error) {
+      if (typeof error === "object" && error !== null) Object.assign(error, { preChild: true });
+      throw error;
     }
 
     let reservation;
@@ -483,6 +488,7 @@ export class WorkerSupervisor {
       } else if (lease !== undefined) {
         await this.#ownership.release(sessionId, lease.leaseId, lease.generation).catch(() => {});
       }
+      if (child === undefined && typeof error === "object" && error !== null) Object.assign(error, { preChild: true });
       throw error;
     } finally {
       await this.#unreserve(reservation);

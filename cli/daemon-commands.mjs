@@ -69,8 +69,8 @@ async function requestDaemonStop(publication, { timeoutMs = 500 } = {}) {
   });
 }
 
-function spawnDaemon(file, argv) {
-  const child = spawn(process.execPath, [file, ...argv], { detached: true, shell: false, stdio: "ignore" });
+function spawnDaemon(file, argv, env) {
+  const child = spawn(process.execPath, [file, ...argv], { detached: true, shell: false, stdio: "ignore", env });
   child.unref();
   return child;
 }
@@ -105,7 +105,9 @@ export async function runDaemonCommand(command, options = {}) {
     if (current.status === "HEALTHY") return { code: 0, result: { kind: "daemon_started", alreadyRunning: true, root, publication: current.publication } };
     if (current.status !== "ABSENT") return { code: current.status === "CONFLICT" ? 5 : 1, error: { code: current.status === "UNHEALTHY" ? "DAEMON_UNHEALTHY" : "STALE_ENDPOINT_REQUIRES_RECOVER", message: "Daemon start refused until endpoint ownership is resolved" } };
     const entry = await daemonEntryPoint();
-    const child = (options.spawnDaemon ?? spawnDaemon)(entry, ["--root", root]);
+    const argv = ["--root", root];
+    if (options.piBin !== undefined) argv.push("--pi-bin", options.piBin);
+    const child = (options.spawnDaemon ?? spawnDaemon)(entry, argv, options.env ?? process.env);
     child.once?.("error", () => {});
     const endpoint = await waitForStatus(root, ["HEALTHY", "CONFLICT"], { ...options, inspect, probe, inspectEndpoint, requireReady: true, child });
     if (endpoint?.status === "HEALTHY") return { code: 0, result: { kind: "daemon_started", alreadyRunning: false, root, publication: endpoint.publication } };

@@ -87,7 +87,7 @@ export async function launchPreflight(request, options = {}) {
       mode: "shared_directory_confirmation",
       canonicalCwd,
       confirmedCanonicalCwd: request.isolation.confirmedCwd,
-      ownerSessionIds: normalizeOwnerSessionIds(options.currentOwnerSessionIds ?? []),
+      ownerSessionIds: normalizeOwnerSessionIds(request.isolation.ownerSessionIds),
       sourceSessionId: request.sourceSessionId,
       piConfigRoot,
     };

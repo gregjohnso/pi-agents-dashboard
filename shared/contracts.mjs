@@ -13,7 +13,7 @@ import { parseViewerSnapshot } from "./viewer-contracts.mjs";
 /** @typedef {{kind:"managed",runId:string,process:ProcessIdentity,acquiredAt:string,heartbeatAt:string}} WorkerOwnership */
 /** @typedef {{mode:"worktree",worktreePath:string,branch:string}|{mode:"shared_directory",canonicalCwd:string}} IsolationRecord */
 /** @typedef {{schemaVersion:1,revision:number,sessionId:string,sessionFile:string,canonicalSessionFile:string,cwd:string,name?:string,model?:{provider:string,id:string},thinkingLevel?:string,taskState:TaskState,processState:ProcessState,outcome:Outcome,activity:{kind:string,summary:string,updatedAt:string},ownership?:WorkerOwnership,isolation?:IsolationRecord,latestRunId?:string,runtime?:RunRuntimeIdentity,createdAt:string,updatedAt:string}} SessionRecord */
-/** @typedef {{mode:"worktree"}|{mode:"shared_directory",confirmedCwd:string}} LaunchIsolation */
+/** @typedef {{mode:"worktree"}|{mode:"shared_directory",confirmedCwd:string,ownerSessionIds:string[]}} LaunchIsolation */
 /** @typedef {{prompt:string,cwd:string,sourceSessionId:string,isolation:LaunchIsolation,model?:{provider:string,id:string},thinkingLevel?:string,name?:string}} LaunchRequest */
 /** @typedef {{daemonEpoch:string,sequence:string}} EventCursor */
 /** @typedef {{daemonEpoch:string,sessionId:string,sequence:string}} ViewerCursor */
@@ -101,8 +101,9 @@ function readLaunchRequest(value) {
     rejectUnknownKeys(isolation, ["mode"], "launch payload.isolation");
     parsedIsolation = { mode: "worktree" };
   } else {
-    rejectUnknownKeys(isolation, ["mode", "confirmedCwd"], "launch payload.isolation");
-    parsedIsolation = { mode: "shared_directory", confirmedCwd: readIdentifier(isolation, "confirmedCwd", "launch payload.isolation.confirmedCwd") };
+    rejectUnknownKeys(isolation, ["mode", "confirmedCwd", "ownerSessionIds"], "launch payload.isolation");
+    if (!Array.isArray(isolation.ownerSessionIds) || isolation.ownerSessionIds.some((/** @type {unknown} */ owner) => typeof owner !== "string" || owner.length === 0 || owner.trim() !== owner)) throw new TypeError("launch payload.isolation.ownerSessionIds must contain identifiers");
+    parsedIsolation = { mode: "shared_directory", confirmedCwd: readIdentifier(isolation, "confirmedCwd", "launch payload.isolation.confirmedCwd"), ownerSessionIds: [...new Set(isolation.ownerSessionIds)].sort() };
   }
   const parsed = {
     prompt: readText(launch, "prompt", "launch payload.prompt"), cwd: readIdentifier(launch, "cwd", "launch payload.cwd"),

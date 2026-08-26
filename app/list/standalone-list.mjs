@@ -148,7 +148,17 @@ export async function createStandaloneList({ cwd, frontend }) {
   const client = createDaemonClient({ socketPath: join(frontend.root, "daemon", "control.sock"), token, maxBytes: 1024 * 1024, clientId: frontend.clientId });
   const backend = createDaemonDashboardBackend({
     client, clientId: frontend.clientId,
-    preflight: async (draft) => ({ canonicalCwd: await fs.realpath(draft.cwd), isolationMode: draft.isolationMode, ownerSessionIds: [] }),
+    preflight: async (draft) => {
+      const canonicalCwd = await fs.realpath(draft.cwd);
+      if (draft.isolationMode !== "shared_directory") return { canonicalCwd, isolationMode: draft.isolationMode, ownerSessionIds: [] };
+      const state = await client.request({ version: 1, clientId: frontend.clientId, requestId: randomUUID(), op: "get_state", payload: {} });
+      if (!state.ok || state.result?.kind !== "state") throw Object.assign(new Error(state.error?.message ?? "Daemon state is unavailable"), state.error ?? { code: "INVALID_RESPONSE" });
+      const ownerSessionIds = state.result.sessions
+        .filter((record) => record.ownership !== undefined && (record.isolation?.mode === "shared_directory" ? record.isolation.canonicalCwd : record.cwd) === canonicalCwd)
+        .map((record) => record.sessionId)
+        .sort();
+      return { canonicalCwd, isolationMode: draft.isolationMode, ownerSessionIds };
+    },
   });
   const terminal = new ProcessTerminal();
   const tui = new TuiAltScreen(terminal);

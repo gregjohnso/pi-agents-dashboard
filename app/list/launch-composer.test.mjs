@@ -52,7 +52,7 @@ describe("launch composer", () => {
                 prompt: "Implement it",
                 cwd: "/canonical/repo",
                 sourceSessionId: "source-session",
-                isolation: { mode: "shared_directory", confirmedCwd: "/canonical/repo" },
+                isolation: { mode: "shared_directory", confirmedCwd: "/canonical/repo", ownerSessionIds: ["other"] },
                 model: defaults.model,
                 thinkingLevel: "high",
                 name: "dashboard task",

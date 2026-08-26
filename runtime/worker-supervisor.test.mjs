@@ -285,6 +285,20 @@ it("bounds complete frames by bytes and reports an oversized dropped frame", asy
   await supervisor.close();
 });
 
+it("classifies missing Pi discovery as a pre-child refusal", async () => {
+  const { runs, registry, ownership } = await setup();
+  const supervisor = new WorkerSupervisor({
+    registry,
+    ownership,
+    runsDirectory: runs,
+    resolveExecutableImpl: async () => { throw Object.assign(new Error("missing"), { code: "PI_EXECUTABLE_NOT_FOUND" }); },
+  });
+
+  await expect(supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "missing" })).rejects.toMatchObject({ code: "PI_EXECUTABLE_NOT_FOUND", preChild: true });
+  expect((await getRecord(registry, "one")).ownership).toBeUndefined();
+  expect(await readdir(runs)).toEqual([]);
+});
+
 it("refuses missing capabilities before ownership or run artifacts exist", async () => {
   const { runs, registry, ownership } = await setup();
   const executable = { realpath: "/fake/pi", device: "1", inode: "2", size: 3, modifiedTimeNs: "4" };
@@ -296,7 +310,7 @@ it("refuses missing capabilities before ownership or run artifacts exist", async
     probeCapabilitiesImpl: async () => ({ executable, reportedVersion: "old", rpcMode: true, jsonl: true, commands: ["get_state"], events: [], missingRequired: ["steer"] }),
   });
 
-  await expect(supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "unsupported" })).rejects.toMatchObject({ code: "UNSUPPORTED_PI_CAPABILITY", missingCapabilities: ["steer"] });
+  await expect(supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "unsupported" })).rejects.toMatchObject({ code: "UNSUPPORTED_PI_CAPABILITY", missingCapabilities: ["steer"], preChild: true });
   expect((await getRecord(registry, "one")).ownership).toBeUndefined();
   expect(await readdir(runs)).toEqual([]);
 });
@@ -314,7 +328,7 @@ it("refuses executable replacement after probing and before worker spawn", async
     assertExecutableImpl: async () => { throw Object.assign(new Error("replaced"), { code: "PI_EXECUTABLE_REPLACED" }); },
   });
 
-  await expect(supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "replaced" })).rejects.toMatchObject({ code: "PI_EXECUTABLE_REPLACED" });
+  await expect(supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "replaced" })).rejects.toMatchObject({ code: "PI_EXECUTABLE_REPLACED", preChild: true });
   expect((await getRecord(registry, "one")).ownership).toBeUndefined();
 });
 

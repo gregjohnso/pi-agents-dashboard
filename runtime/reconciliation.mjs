@@ -255,7 +255,7 @@ async function createViewerRecovery({ root, daemonEpoch, registry }) {
       processState: current.processState,
       outcome: current.outcome,
     });
-    return state.store.publishSnapshot(snapshot);
+    return state.store.publishSnapshot(snapshot, state.normalizer.checkpoint());
   }
 
   /** @param {any} state */
@@ -290,6 +290,8 @@ async function createViewerRecovery({ root, daemonEpoch, registry }) {
     if (snapshot !== undefined) normalizer.restore(snapshot);
     const replay = await store.replay(snapshot?.cursor);
     for (const event of replay) normalizer.applyViewerEvent(event);
+    const checkpoint = await store.getCheckpoint();
+    if (checkpoint !== undefined) normalizer.restoreCheckpoint(checkpoint);
     await readHistory(state);
     await publish(state);
     return state;

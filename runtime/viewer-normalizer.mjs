@@ -132,6 +132,20 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     throw new ViewerNormalizerError(code, error.message, sessionId);
   }
 
+  /** Return private restart state that is never part of the viewer v1 wire protocol. */
+  function checkpoint() {
+    return { activeAssistant: currentAssistant === undefined ? null : { itemId: currentAssistant.itemId, blocks: currentAssistant.blocks.flatMap((/** @type {any} */ block, /** @type {number} */ contentIndex) => block === undefined ? [] : [{ contentIndex, type: block.type, text: block.text }]) } };
+  }
+
+  /** @param {any} restored */
+  function restoreCheckpoint(restored) {
+    currentAssistant = undefined;
+    if (restored?.activeAssistant === null || restored?.activeAssistant === undefined) return;
+    const blocks = [];
+    for (const block of restored.activeAssistant.blocks) blocks[block.contentIndex] = { type: block.type, text: block.text };
+    currentAssistant = { itemId: restored.activeAssistant.itemId, blocks, delta: 0 };
+  }
+
   /** @param {Record<string, unknown>} payload @param {string} [preferredId] @param {string} [at] */
   function publish(payload, preferredId, at = now()) {
     const eventId = preferredId ?? deterministicId(String(payload.kind), { index: ++liveIndex, payload });
@@ -140,7 +154,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     if (prior === serialized) return [];
     if (prior !== undefined) incompatible("VIEWER_EVENT_ID_CONFLICT", `Stable viewer event ID ${eventId} was reused with changed content`);
     emitted.set(eventId, serialized);
-    return [{ eventId, timestamp: at, payload }];
+    return [{ eventId, timestamp: at, payload, internalCheckpoint: checkpoint() }];
   }
 
   /** @param {string} phase @param {string} label @param {string} sourceEventId @param {Record<string, unknown>} [optional] */
@@ -341,7 +355,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
         const partial = { kind: "assistant_message", itemId: currentAssistant.itemId, content: currentAssistant.blocks.filter(Boolean).map((/** @type {any} */ entry) => ({ ...entry })) };
         items.set(currentAssistant.itemId, partial);
         const deltaId = deterministicId("assistant-delta", { itemId: currentAssistant.itemId, contentIndex: update.contentIndex, type: update.type, cumulative: block.text });
-        output.push(...publish({ kind: "assistant_delta", itemId: currentAssistant.itemId, contentIndex: update.contentIndex, contentType: blockType, delta: bound(update.delta, MAX_TEXT_BYTES) }, deltaId, at));
+        output.push(...publish({ kind: "assistant_delta", itemId: currentAssistant.itemId, delta: bound(update.delta, MAX_TEXT_BYTES) }, deltaId, at));
         output.push(...replaceActivity(update.type === "thinking_delta" ? "thinking" : "assistant_streaming", update.type === "thinking_delta" ? "Thinking" : "Assistant streaming", deltaId));
       } else if (update.type === "toolcall_start") {
         if (typeof update.id !== "string" || typeof update.toolName !== "string") incompatible("PI_REQUIRED_SHAPE", "Pi tool-call start requires id and toolName");
@@ -357,9 +371,8 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       const itemId = currentAssistant?.itemId ?? deterministicId("live-assistant", { timestamp: timestamp(frame.message.timestamp) ?? at, content: frame.message.content });
       const overlap = fingerprint(frame.message, at);
       if (messageFingerprints.has(overlap)) { currentAssistant = undefined; return []; }
-      const output = consumeMessage(frame.message, itemId, at, `${itemId}:final`);
       currentAssistant = undefined;
-      return output;
+      return consumeMessage(frame.message, itemId, at, `${itemId}:final`);
     }
     if (["tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(frame.type)) {
       if (typeof frame.toolCallId !== "string" || typeof frame.toolName !== "string") incompatible("PI_REQUIRED_SHAPE", `Pi ${frame.type} requires toolCallId and toolName`);
@@ -434,13 +447,10 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     } else if (["image_placeholder", "file_placeholder"].includes(payload.kind)) items.set(payload.attachment.id, payload);
     else if (payload.kind === "unknown_pi_event") items.set(event.eventId, payload);
     else if (payload.kind === "assistant_delta") {
-      const contentIndex = Number.isSafeInteger(payload.contentIndex) && payload.contentIndex >= 0 ? payload.contentIndex : 0;
-      const contentType = ["text", "thinking"].includes(payload.contentType) ? payload.contentType : "text";
       if (currentAssistant?.itemId !== payload.itemId) currentAssistant = { itemId: payload.itemId, blocks: [], delta: 0 };
-      const block = currentAssistant.blocks[contentIndex] ?? { type: contentType, text: "" };
-      block.type = contentType;
+      const block = currentAssistant.blocks[0] ?? { type: "text", text: "" };
       block.text = bound(`${block.text}${payload.delta}`, MAX_TEXT_BYTES);
-      currentAssistant.blocks[contentIndex] = block;
+      currentAssistant.blocks[0] = block;
       currentAssistant.delta += 1;
       items.set(payload.itemId, { kind: "assistant_message", itemId: payload.itemId, content: currentAssistant.blocks.filter(Boolean).map((/** @type {any} */ entry) => ({ ...entry })) });
     } else if (["tool_started", "tool_updated", "tool_finished"].includes(payload.kind)) tools.set(payload.tool.id, payload.tool);
@@ -463,11 +473,8 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     thinkingLevel = restored.thinkingLevel;
     activity = restored.activity;
     currentAssistant = undefined;
-    if (restored.activeAssistant !== undefined && restored.activeAssistant !== null) {
-      const blocks = [];
-      for (const block of restored.activeAssistant.blocks) blocks[block.contentIndex] = { type: block.type, text: block.text };
-      currentAssistant = { itemId: restored.activeAssistant.itemId, blocks, delta: 0 };
-    } else if (restored.activeAssistant === undefined && ["assistant_streaming", "thinking"].includes(activity.phase)) {
+    if (restored.activeAssistant !== undefined) restoreCheckpoint({ activeAssistant: restored.activeAssistant });
+    else if (["assistant_streaming", "thinking"].includes(activity.phase)) {
       const assistants = restored.items.filter((/** @type {any} */ item) => item.kind === "assistant_message");
       const partial = assistants.at(-1);
       if (partial !== undefined) currentAssistant = { itemId: partial.itemId, blocks: partial.content.map((/** @type {any} */ block) => ({ ...block })), delta: 0 };
@@ -496,7 +503,6 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       activity,
       model: model ?? runtimeState.model ?? null,
       thinkingLevel: thinkingLevel ?? runtimeState.thinkingLevel ?? null,
-      activeAssistant: currentAssistant === undefined ? null : { itemId: currentAssistant.itemId, blocks: currentAssistant.blocks.flatMap((/** @type {any} */ block, /** @type {number} */ contentIndex) => block === undefined ? [] : [{ contentIndex, type: block.type, text: block.text }]) },
       items: [...items.values()],
       tools: [...tools.values()],
       pendingUi: [...pendingUi.values()],
@@ -504,5 +510,5 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     };
   }
 
-  return { consumeHistory, consumeFrame, applyViewerEvent, restore, consumeError, snapshot };
+  return { consumeHistory, consumeFrame, applyViewerEvent, restore, checkpoint, restoreCheckpoint, consumeError, snapshot };
 }

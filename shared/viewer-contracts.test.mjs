@@ -9,7 +9,7 @@ const tool = { id: "tool-1", name: "bash", state: "running", arguments: { comman
 const request = { id: "ui-1", method: "select", title: "Choose", options: ["a", "b"] };
 const payloads = [
   { kind: "user_message", itemId: "u1", content },
-  { kind: "assistant_delta", itemId: "a1", contentIndex: 1, contentType: "text", delta: "hel" },
+  { kind: "assistant_delta", itemId: "a1", delta: "hel" },
   { kind: "assistant_message", itemId: "a1", content },
   { kind: "system_message", itemId: "s1", text: "retrying", level: "warning" },
   { kind: "tool_started", tool }, { kind: "tool_updated", tool }, { kind: "tool_finished", tool: { ...tool, state: "completed", result: content, finishedAt: "2026-08-25T00:00:01Z" } },
@@ -25,6 +25,16 @@ it("accepts every frozen viewer payload and rejects unknown fields in each", () 
     expect(parseViewerEvent({ ...base, payload })).toEqual({ ...base, payload });
     expect(() => parseViewerEvent({ ...base, payload: { ...payload, unknown: true } })).toThrow(/unknown/i);
   }
+});
+
+it("rejects internal assistant checkpoint metadata on frozen v1 wire shapes", () => {
+  expect(() => parseViewerEvent({ ...base, payload: { kind: "assistant_delta", itemId: "a1", delta: "hel", contentIndex: 0, contentType: "text" } })).toThrow(/unknown/i);
+  const snapshot = {
+    version: 1, sessionId: "session-1", registryRevision: 1, cursor: base.cursor, runtime: null, role: "observer", taskState: "READY", processState: "SLEEPING", outcome: "NONE",
+    activity: { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "source", startedAt: base.timestamp }, model: null, thinkingLevel: null, items: [], tools: [], pendingUi: [], errors: [],
+    activeAssistant: { itemId: "a1", blocks: [{ contentIndex: 0, type: "text", text: "hel" }] },
+  };
+  expect(() => parseViewerSnapshot(snapshot)).toThrow(/unknown/i);
 });
 
 it("strictly validates nested content, tools, attachments, and UI requests", () => {
@@ -49,7 +59,7 @@ it("strictly parses the frozen version-1 viewer snapshot", () => {
     version: 1, sessionId: "session-1", registryRevision: 4, cursor: base.cursor, runtime: null, role: "observer",
     taskState: "READY", processState: "SLEEPING", outcome: "COMPLETED",
     activity: { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "snapshot-source", startedAt: "2026-08-25T00:00:00Z" },
-    model: null, thinkingLevel: null, activeAssistant: { itemId: "a1", blocks: [{ contentIndex: 0, type: "thinking", text: "reasoning" }, { contentIndex: 1, type: "text", text: "hel" }] }, items: [payloads[0]], tools: [tool], pendingUi: [request], errors: [{ code: "WARN", message: "bounded", retryable: false }],
+    model: null, thinkingLevel: null, items: [payloads[0]], tools: [tool], pendingUi: [request], errors: [{ code: "WARN", message: "bounded", retryable: false }],
   };
   expect(parseViewerSnapshot(snapshot)).toEqual(snapshot);
   expect(() => parseViewerSnapshot({ ...snapshot, unknown: true })).toThrow(/unknown/i);

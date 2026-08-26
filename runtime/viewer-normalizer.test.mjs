@@ -151,17 +151,21 @@ describe("viewer normalizer", () => {
     ];
     const snapshot = first.snapshot({ daemonEpoch: "epoch-1", sequence: "5", registryRevision: 1, runtime: null, role: "observer", taskState: "WORKING", processState: "LIVE", outcome: "NONE" });
     expect(snapshot.activity.phase).toBe("tool_running");
-    expect(snapshot.activeAssistant).toEqual({ itemId: drafts[0].payload.itemId, blocks: [{ contentIndex: 0, type: "thinking", text: "reason" }, { contentIndex: 2, type: "text", text: "ans" }] });
+    expect(snapshot).not.toHaveProperty("activeAssistant");
+    expect(first.checkpoint()).toEqual({ activeAssistant: { itemId: drafts[0].payload.itemId, blocks: [{ contentIndex: 0, type: "thinking", text: "reason" }, { contentIndex: 2, type: "text", text: "ans" }] } });
     expect(() => parseViewerSnapshot(snapshot)).not.toThrow();
+    for (const draft of drafts) expect(() => parseViewerEvent({ version: 1, sessionId: "session-1", eventId: draft.eventId, cursor: { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "1" }, timestamp: draft.timestamp, payload: draft.payload })).not.toThrow();
 
     const fromSnapshot = normalizer();
     fromSnapshot.restore(snapshot);
+    fromSnapshot.restoreCheckpoint(first.checkpoint());
     const replayed = normalizer();
     for (const [index, draft] of drafts.entries()) replayed.applyViewerEvent({ version: 1, sessionId: "session-1", eventId: draft.eventId, cursor: { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: String(index + 1) }, timestamp: draft.timestamp, payload: draft.payload });
+    replayed.restoreCheckpoint(drafts.at(-1)?.internalCheckpoint);
     for (const restored of [fromSnapshot, replayed]) {
       const continued = restored.consumeFrame({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 2, delta: "wer" } });
-      expect(continued[0].payload).toMatchObject({ kind: "assistant_delta", itemId: drafts[0].payload.itemId, contentIndex: 2, contentType: "text", delta: "wer" });
-      expect(restored.snapshot({ daemonEpoch: "epoch-1", sequence: "6", registryRevision: 1, runtime: null, role: "observer", taskState: "WORKING", processState: "LIVE", outcome: "NONE" }).activeAssistant).toEqual({ itemId: drafts[0].payload.itemId, blocks: [{ contentIndex: 0, type: "thinking", text: "reason" }, { contentIndex: 2, type: "text", text: "answer" }] });
+      expect(continued[0].payload).toEqual({ kind: "assistant_delta", itemId: drafts[0].payload.itemId, delta: "wer" });
+      expect(restored.checkpoint()).toEqual({ activeAssistant: { itemId: drafts[0].payload.itemId, blocks: [{ contentIndex: 0, type: "thinking", text: "reason" }, { contentIndex: 2, type: "text", text: "answer" }] } });
     }
   });
 

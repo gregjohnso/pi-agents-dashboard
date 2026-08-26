@@ -11,9 +11,9 @@ const menu = {
   thinkingLevel: "high",
 };
 
-it("lists built-in commands with discovery-backed argument completions before discovered commands", () => {
+it("names commands without the leading slash Pi re-adds when applying a completion", () => {
   const commands = sessionSlashCommands(menu);
-  expect(commands.map(({ name }) => name)).toEqual(["/model", "/thinking", "/compact", "/review", "/skill:notebook"]);
+  expect(commands.map(({ name }) => name)).toEqual(["model", "thinking", "compact", "review", "skill:notebook"]);
   expect(commands[0].description).toBe("Model: anthropic/claude-sonnet");
   expect(commands[0].getArgumentCompletions?.("open")).toEqual([{ value: "openai/gpt-5", label: "openai/gpt-5" }]);
   expect(commands[1].getArgumentCompletions?.("")).toEqual([{ value: "off", label: "off" }, { value: "high", label: "high" }]);

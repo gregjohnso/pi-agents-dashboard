@@ -17,18 +17,26 @@ function completions(prefix, values) {
   return values.filter((value) => value.toLowerCase().includes(needle)).map((value) => ({ value, label: value }));
 }
 
+/** @param {string} name */
+function bareName(name) {
+  return name.startsWith("/") ? name.slice(1) : name;
+}
+
 /**
- * Build the public slash-command menu shown by the viewer editor.
+ * Build the viewer editor's command list. Pi's autocomplete re-adds the leading slash,
+ * so every name here is bare.
  * @param {SessionMenu} menu
  * @returns {{name:string,description?:string,argumentHint?:string,source:string,getArgumentCompletions?:(prefix:string)=>{value:string,label:string}[]}[]}
  */
 export function sessionSlashCommands(menu) {
   const models = menu.models.map(modelValue);
   return [
-    { name: "/model", description: menu.model === null ? "Select the session model" : `Model: ${modelValue(menu.model)}`, argumentHint: "<provider/id>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, models) },
-    { name: "/thinking", description: menu.thinkingLevel === null ? "Set the thinking level" : `Thinking: ${menu.thinkingLevel}`, argumentHint: "<level>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, menu.thinkingLevels) },
-    { name: "/compact", description: "Compact the conversation", argumentHint: "[instructions]", source: BUILTIN_SOURCE },
-    ...menu.commands.filter((command) => !["/model", "/thinking", "/compact"].includes(command.name)),
+    { name: "model", description: menu.model === null ? "Select the session model" : `Model: ${modelValue(menu.model)}`, argumentHint: "<provider/id>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, models) },
+    { name: "thinking", description: menu.thinkingLevel === null ? "Set the thinking level" : `Thinking: ${menu.thinkingLevel}`, argumentHint: "<level>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, menu.thinkingLevels) },
+    { name: "compact", description: "Compact the conversation", argumentHint: "[instructions]", source: BUILTIN_SOURCE },
+    ...menu.commands
+      .map((command) => ({ ...command, name: bareName(command.name) }))
+      .filter((command) => !["model", "thinking", "compact"].includes(command.name)),
   ];
 }
 

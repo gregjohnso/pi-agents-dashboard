@@ -83,7 +83,7 @@ export class ViewerController {
     if (this.state === undefined) return Array.from({ length: height }, () => fit("Loading viewer…", width));
     const role = this.state.role.toUpperCase();
     const header = width >= 70
-      ? ` pi-dashboard · ${this.sessionId} · ${this.state.taskState}/${this.state.processState} · ${role} · ←/Esc list`
+      ? ` pi-dashboard · ${this.sessionId} · ${this.state.taskState}/${this.state.processState} · ${role} · ${this.state.working ? "Esc stop · ← list" : "←/Esc list"}`
       : width >= 50
         ? ` ${this.sessionId} · ${this.state.taskState}/${this.state.processState} · ${role} · ← list`
         : ` ${this.state.taskState}/${this.state.processState} · ${role} · ← list`;
@@ -160,6 +160,13 @@ export class ViewerController {
       this.historyUsed ||= this.history.length > 0;
       this.returnGesture.cancel();
       if (this.state.role === "composer") this.editor.handleInput(data);
+      this.requestRender();
+      return;
+    }
+    if (matchesKey(data, Key.escape) && this.state.role === "composer" && this.state.working) {
+      // Escape stops the running agent first; leaving the session needs a second Escape once it settles.
+      this.returnGesture.cancel();
+      void this.sendCommand("interrupt", {});
       this.requestRender();
       return;
     }

@@ -313,6 +313,28 @@ describe("viewer rendering and navigation", () => {
     await instance.close();
   });
 
+  it("stops a working agent with Escape and only leaves once the work is stopped", async () => {
+    const f = fixture({ snapshot: { taskState: "WORKING" } });
+    await f.instance.open();
+
+    f.instance.handleInput("\x1b");
+    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "interrupt", payload: { sessionId: "s" } }]));
+    expect(f.instance.onReturn).not.toHaveBeenCalled();
+
+    await f.emit({ version: 1, sessionId: "s", eventId: "settled", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "turn_state", working: false } });
+    f.instance.handleInput("\x1b");
+    expect(f.instance.onReturn).toHaveBeenCalledOnce();
+    expect(f.commands).toHaveLength(1);
+  });
+
+  it("leaves a working session with Left without stopping the agent", async () => {
+    const f = fixture({ snapshot: { taskState: "WORKING" } });
+    await f.instance.open();
+    f.instance.handleInput("\x1b[D");
+    expect(f.instance.onReturn).toHaveBeenCalledOnce();
+    expect(f.commands).toEqual([]);
+  });
+
   it("uses the exact clean and dirty Left/Escape return gesture", async () => {
     let now = 0;
     const f = fixture();

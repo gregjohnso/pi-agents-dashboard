@@ -38,7 +38,7 @@ exports[`viewer rendering and navigation > renders a bounded 55x16 Pi-style fixt
 
 exports[`viewer rendering and navigation > renders a bounded 80x24 Pi-style fixture 1`] = `
 [
-  " pi-dashboard · s · WORKING/LIVE · COMPOSER · ←/Esc list",
+  " pi-dashboard · s · WORKING/LIVE · COMPOSER · Esc stop · ← list",
   "",
   "",
   "",
@@ -67,7 +67,7 @@ exports[`viewer rendering and navigation > renders a bounded 80x24 Pi-style fixt
 
 exports[`viewer rendering and navigation > renders a bounded 120x32 Pi-style fixture 1`] = `
 [
-  " pi-dashboard · s · WORKING/LIVE · COMPOSER · ←/Esc list",
+  " pi-dashboard · s · WORKING/LIVE · COMPOSER · Esc stop · ← list",
   "",
   "",
   "",
@@ -104,7 +104,7 @@ exports[`viewer rendering and navigation > renders a bounded 120x32 Pi-style fix
 
 exports[`viewer rendering and navigation > renders a bounded 160x40 Pi-style fixture 1`] = `
 [
-  " pi-dashboard · s · WORKING/LIVE · COMPOSER · ←/Esc list",
+  " pi-dashboard · s · WORKING/LIVE · COMPOSER · Esc stop · ← list",
   "",
   "",
   "",
@@ -790,7 +790,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
 exports[`viewer rendering and navigation > snapshots the complete chat-state matrix at 80x24 1`] = `
 {
   "active": [
-    " pi-dashboard · s · WORKING/LIVE · COMPOSER · ←/Esc list",
+    " pi-dashboard · s · WORKING/LIVE · COMPOSER · Esc stop · ← list",
     "",
     "",
     "",
@@ -1341,7 +1341,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
 exports[`viewer rendering and navigation > snapshots the complete chat-state matrix at 120x32 1`] = `
 {
   "active": [
-    " pi-dashboard · s · WORKING/LIVE · COMPOSER · ←/Esc list",
+    " pi-dashboard · s · WORKING/LIVE · COMPOSER · Esc stop · ← list",
     "",
     "",
     "",
@@ -2060,7 +2060,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
 exports[`viewer rendering and navigation > snapshots the complete chat-state matrix at 160x40 1`] = `
 {
   "active": [
-    " pi-dashboard · s · WORKING/LIVE · COMPOSER · ←/Esc list",
+    " pi-dashboard · s · WORKING/LIVE · COMPOSER · Esc stop · ← list",
     "",
     "",
     "",

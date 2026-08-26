@@ -604,6 +604,8 @@ export async function createDaemonRuntime({
     const usedCommandIds = new Set();
     const launchingSessions = new Set();
     const sessionStarts = new Map();
+    /** Launch-channel handles for workers that have not yet reconnected over the control socket. @type {Map<string, any>} */
+    const sessionHandles = new Map();
     /** @type {Map<string, Map<net.Socket, { clientId: string, role: "composer" | "observer" }>>} */
     const attachmentClaims = new Map();
     /** @type {Map<string, { serialized: string, promise: Promise<any> }>} */
@@ -638,6 +640,7 @@ export async function createDaemonRuntime({
       },
       /** @param {any} handle */
       async activateWorker(handle) {
+        sessionHandles.set(handle.sessionId, handle);
         await router.register(handle);
         await context.recovery.viewer.ensure(handle.sessionId);
         handle.onFrame?.((/** @type {Record<string, unknown>} */ frame) => {
@@ -648,7 +651,7 @@ export async function createDaemonRuntime({
       },
       /** @param {string} sessionId */
       async ensureSessionWorker(sessionId) {
-        if (router.route(sessionId) !== undefined) return;
+        if (router.route(sessionId) !== undefined || sessionHandles.has(sessionId)) return;
         const pending = sessionStarts.get(sessionId);
         if (pending !== undefined) return pending;
         const start = (async () => {
@@ -963,12 +966,20 @@ export async function createDaemonRuntime({
         }
         if (request.op === "get_session_commands") {
           const route = router.route(request.payload.sessionId);
-          if (route?.connection === undefined || route.metadata?.token === undefined) throw Object.assign(new Error("No exact recovered worker owns this session"), { code: "WORKER_UNAVAILABLE" });
-          const { metadata, connection } = route;
-          const id = randomId();
-          if (typeof id !== "string" || id.length < 16 || usedCommandIds.has(id)) throw Object.assign(new Error("Command ID generator did not provide a unique restart-safe ID"), { code: "COMMAND_ID_COLLISION" });
-          usedCommandIds.add(id);
-          const record = await connection.request({ version: 1, type: "command", token: metadata.token, id, command: { clientId: request.clientId, requestId: request.requestId, op: request.op } }, { clientId: request.clientId, requestId: request.requestId, op: request.op, durableRequest: request, metadata, routeGeneration: route.routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
+          const handle = sessionHandles.get(request.payload.sessionId);
+          let record;
+          if (route?.connection !== undefined && route.metadata?.token !== undefined) {
+            const { metadata, connection } = route;
+            const id = randomId();
+            if (typeof id !== "string" || id.length < 16 || usedCommandIds.has(id)) throw Object.assign(new Error("Command ID generator did not provide a unique restart-safe ID"), { code: "COMMAND_ID_COLLISION" });
+            usedCommandIds.add(id);
+            record = await connection.request({ version: 1, type: "command", token: metadata.token, id, command: { clientId: request.clientId, requestId: request.requestId, op: request.op } }, { clientId: request.clientId, requestId: request.requestId, op: request.op, durableRequest: request, metadata, routeGeneration: route.routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
+          } else if (typeof handle?.request === "function") {
+            record = await handle.request(request.op);
+          } else if (handle !== undefined) {
+            sessionHandles.delete(request.payload.sessionId);
+            throw Object.assign(new Error("No exact recovered worker owns this session"), { code: "WORKER_UNAVAILABLE" });
+          } else throw Object.assign(new Error("No exact recovered worker owns this session"), { code: "WORKER_UNAVAILABLE" });
           const menu = record?.result ?? {};
           return {
             kind: "session_commands", sessionId: request.payload.sessionId,
@@ -990,7 +1001,11 @@ export async function createDaemonRuntime({
           const route = router.route(request.payload.sessionId);
           const connection = route?.connection;
           const metadata = route?.metadata;
-          if (WORKER_DELIVERED_COMMANDS.includes(request.op)) {
+          if (connection !== undefined) sessionHandles.delete(request.payload.sessionId);
+          const launchHandle = sessionHandles.get(request.payload.sessionId);
+          if (WORKER_DELIVERED_COMMANDS.includes(request.op) && connection === undefined && typeof launchHandle?.deliver === "function") {
+            status = await launchHandle.deliver(request, context.recovery.journal);
+          } else if (WORKER_DELIVERED_COMMANDS.includes(request.op)) {
             if (connection === undefined || metadata?.token === undefined) {
               status = await context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("WORKER_UNAVAILABLE", "No exact recovered worker owns this session"));
             } else {
@@ -1166,6 +1181,7 @@ export async function createDaemonRuntime({
             });
           }
         }
+        if (["stop", "delete"].includes(request.op) && status.stage === "COMPLETED") sessionHandles.delete(request.payload.sessionId);
         if (changed) {
           const publish = async () => {
             const event = await context.recovery.events.append({ kind: "command_changed", payload: { status } });

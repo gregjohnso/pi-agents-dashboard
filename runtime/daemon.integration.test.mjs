@@ -261,6 +261,64 @@ it("rejects worker mutations during reconciliation without touching unopened sto
   worker.close();
 });
 
+it("reaches a freshly launched worker over its launch channel before any socket reconnect", async () => {
+  const stateRoot = await root();
+  await mkdir(join(stateRoot, "sessions"), { mode: 0o700 });
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const createdAt = "2026-08-25T00:00:00.000Z";
+  const identity = { pid: 501, startIdentity: "fresh-worker", processGroupId: 501 };
+  /** @type {any[]} */
+  const requested = [];
+  /** @type {any[]} */
+  const deliveries = [];
+  const menu = { commands: [], models: [{ provider: "anthropic", id: "claude" }], thinkingLevels: ["off"], model: null, thinkingLevel: null };
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    hostProbe: async () => ({ blockers: [] }),
+    resolveLaunchRequest: async (/** @type {any} */ request) => ({
+      sessionId: "fresh", canonicalSessionFile: "/sessions/fresh.jsonl", cwd: "/repo", runId: "run-fresh", initialPrompt: request.payload.prompt,
+      sessionRecord: { schemaVersion: 1, revision: 0, sessionId: "fresh", sessionFile: "/sessions/fresh.jsonl", canonicalSessionFile: "/sessions/fresh.jsonl", cwd: "/repo", taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "launching", summary: "start", updatedAt: createdAt }, isolation: { mode: "shared_directory", canonicalCwd: "/repo" }, createdAt, updatedAt: createdAt },
+    }),
+    workerSupervisor: {
+      async launch() {
+        const current = await registry.get("fresh");
+        if (current === undefined) throw new Error("fresh record missing");
+        await registry.update("fresh", current.revision, { ownership: { kind: "managed", runId: "run-fresh", process: identity, acquiredAt: createdAt, heartbeatAt: createdAt }, latestRunId: "run-fresh", processState: "LIVE", updatedAt: createdAt });
+        return {
+          sessionId: "fresh", runId: "run-fresh", leaseId: "lease-fresh", generation: 1, identity, piChildIdentity: identity,
+          async request(/** @type {string} */ op) { requested.push(op); return { op, stage: "RPC_ACKNOWLEDGED", result: menu }; },
+          async deliver(/** @type {any} */ command, /** @type {any} */ journal) {
+            deliveries.push(command);
+            const accepted = await journal.accept(command);
+            if (accepted.stage !== "ACCEPTED") return accepted;
+            await journal.transition(command, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
+            await journal.transition(command, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
+            return journal.transition(command, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
+          },
+          onFrame() {},
+        };
+      },
+      async close() {},
+    },
+  });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
+  await client.ready;
+  client.send({ version: 1, clientId: "viewer", requestId: "launch-fresh", op: "launch", payload: { prompt: "start", cwd: "/repo", sourceSessionId: "source", isolation: { mode: "shared_directory", confirmedCwd: "/repo", ownerSessionIds: [] } } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "launched", sessionId: "fresh" } });
+  client.send({ version: 1, clientId: "viewer", requestId: "attach-fresh", op: "attach", payload: { sessionId: "fresh", role: "composer" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+
+  client.send({ version: 1, clientId: "viewer", requestId: "menu-fresh", op: "get_session_commands", payload: { sessionId: "fresh" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "session_commands", models: [{ provider: "anthropic", id: "claude" }] } });
+  client.send({ version: 1, clientId: "viewer", requestId: "prompt-fresh", op: "prompt", payload: { sessionId: "fresh", text: "hello" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  expect(requested).toEqual(["get_session_commands"]);
+  expect(deliveries.map((/** @type {any} */ command) => command.op)).toEqual(["prompt", "prompt"]);
+  client.close();
+});
+
 it("discovers slash commands and delivers one session command to the owning worker", async () => {
   const stateRoot = await root();
   for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });

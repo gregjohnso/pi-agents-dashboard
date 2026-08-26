@@ -658,6 +658,29 @@ it("does not charge an ownership-free stale LIVE record against managed capacity
   await expect(supervisor.launch({ sessionId: "two", canonicalSessionFile: (await getRecord(registry, "two")).canonicalSessionFile, cwd: "/repo", runId: "stale-live-cap" })).resolves.toMatchObject({ sessionId: "two" });
 });
 
+it("answers read-only worker requests and carries session command payloads over the launch channel", async () => {
+  /** @type {any[]} */
+  const delivered = [];
+  const { root, runs, registry, ownership } = await setup();
+  const workers = fakeWorkerFactory({
+    commandResponder: async (/** @type {any} */ command) => {
+      delivered.push(command);
+      return { ok: true, record: { clientId: command.clientId, requestId: command.requestId, op: command.op, stage: "RPC_ACKNOWLEDGED", at: new Date().toISOString(), result: command.op === "get_session_commands" ? { commands: [], models: [{ provider: "anthropic", id: "claude" }], thinkingLevels: ["off"], model: null, thinkingLevel: null } : null } };
+    },
+  });
+  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "request-token" });
+  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-request" });
+
+  await expect(launched.request("get_session_commands")).resolves.toMatchObject({ result: { models: [{ provider: "anthropic", id: "claude" }] } });
+
+  const journal = await createCommandJournal({ path: join(root, "commands.jsonl") });
+  const command = /** @type {import("../shared/contracts.mjs").ClientRequest} */ ({ version: 1, clientId: "client", requestId: "model", op: "session_command", payload: { sessionId: "one", command: "set_model", model: { provider: "anthropic", id: "claude" } } });
+  await expect(launched.deliver(command, journal)).resolves.toMatchObject({ stage: "COMPLETED" });
+  expect(delivered.at(-1)).toMatchObject({ op: "session_command", sessionCommand: { command: "set_model", model: { provider: "anthropic", id: "claude" } } });
+  await journal.close();
+  await supervisor.close();
+});
+
 it("journals exact command stages before delivery and preserves request identity", async () => {
   /** @type {string[]} */
   const order = [];

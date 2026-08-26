@@ -568,6 +568,19 @@ export class WorkerSupervisor {
       piChildIdentity: supervision.piChildIdentity,
       pid: identity.pid,
       processGroupId: identity.processGroupId,
+      /** Send one read-only worker request over the launch channel. @param {string} op */
+      async request(op) {
+        if (supervision.lifecycle !== "active" || supervision.exit.terminal) throw Object.assign(new Error("Worker request became ambiguous"), { code: "DELIVERY_UNKNOWN" });
+        const id = `${runId}:${++sequence}`;
+        const result = new Promise((resolveResult, rejectResult) => pending.set(id, { resolve: resolveResult, reject: rejectResult }));
+        try {
+          await sendMessage(child, { version: 1, type: "command", token, id, command: { clientId: `daemon-request:${runId}`, requestId: id, op } });
+        } catch (error) {
+          pending.delete(id);
+          throw error;
+        }
+        return result;
+      },
       /** @param {import("../shared/contracts.mjs").ClientRequest} command @param {any} journal */
       async deliver(command, journal) {
         if (supervision.lifecycle !== "active" || supervision.exit.terminal) {
@@ -581,8 +594,14 @@ export class WorkerSupervisor {
         const id = `${runId}:${++sequence}`;
         try {
           const result = new Promise((resolveResult, rejectResult) => pending.set(id, { resolve: resolveResult, reject: rejectResult }));
-          const payload = /** @type {{ text?: string, uiRequestId?: string, response?: unknown }} */ (command.payload);
-          await sendMessage(child, { version: 1, type: "command", token, id, command: { clientId: command.clientId, requestId: command.requestId, op: command.op, text: payload.text, response: command.op === "ui_response" ? { requestId: payload.uiRequestId, response: payload.response } : undefined, retryAtRisk } });
+          const payload = /** @type {{ text?: string, uiRequestId?: string, response?: unknown, command?: string, model?: unknown, level?: string, instructions?: string }} */ (command.payload);
+          const sessionCommand = command.op !== "session_command" ? undefined : {
+            command: payload.command,
+            ...(payload.model === undefined ? {} : { model: payload.model }),
+            ...(payload.level === undefined ? {} : { level: payload.level }),
+            ...(payload.instructions === undefined ? {} : { instructions: payload.instructions }),
+          };
+          await sendMessage(child, { version: 1, type: "command", token, id, command: { clientId: command.clientId, requestId: command.requestId, op: command.op, text: payload.text, response: command.op === "ui_response" ? { requestId: payload.uiRequestId, response: payload.response } : undefined, sessionCommand, retryAtRisk } });
           await result;
           await journal.transition(key, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
           return journal.transition(key, ["WORKER_ACKNOWLEDGED"], "COMPLETED");

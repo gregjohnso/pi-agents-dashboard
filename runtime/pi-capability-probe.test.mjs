@@ -81,7 +81,7 @@ it("rejects a delayed unknown-command response for extension UI responses", asyn
     executable,
     cache: new Map(),
     timeoutMs: 5_000,
-    env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_DELAYED_UNKNOWN_EXTENSION_UI_RESPONSE_MS: "20" },
+    env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_DELAYED_UNKNOWN_EXTENSION_UI_RESPONSE_MS: "5" },
   });
 
   expect(report.commands).not.toContain("extension_ui_response");

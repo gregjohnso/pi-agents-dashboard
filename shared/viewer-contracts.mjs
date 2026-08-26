@@ -4,7 +4,7 @@
 /** @typedef {Record<string, any>} ViewerSnapshot */
 
 const PHASES = ["idle", "thinking", "assistant_streaming", "tool_pending", "tool_running", "tool_streaming", "compacting", "retrying", "waiting", "interrupting", "stopping", "error"];
-const ITEM_KINDS = ["user_message", "assistant_message", "system_message", "image_placeholder", "file_placeholder", "unknown_pi_event"];
+const ITEM_KINDS = ["user_message", "assistant_message", "system_message", "image_placeholder", "file_placeholder", "unknown_pi_event", "tool"];
 
 /** @param {unknown} value @param {string} path @returns {Record<string, any>} */
 function record(value, path) {
@@ -66,6 +66,7 @@ function payload(value, path) {
     case "assistant_delta": exact(item, ["kind", "itemId", "delta"], [], path); string(item.itemId, `${path}.itemId`); if (typeof item.delta !== "string" || item.delta.length > 65536) throw new TypeError(`${path}.delta must be a bounded string`); break;
     case "system_message": exact(item, ["kind", "itemId", "text", "level"], [], path); string(item.itemId, `${path}.itemId`); if (typeof item.text !== "string" || item.text.length > 16384) throw new TypeError(`${path}.text must be a bounded string`); enumeration(item.level, ["info", "warning", "error"], `${path}.level`); break;
     case "tool_started": case "tool_updated": case "tool_finished": exact(item, ["kind", "tool"], [], path); tool(item.tool, `${path}.tool`); break;
+    case "tool": exact(item, ["kind", "itemId", "toolId"], [], path); string(item.itemId, `${path}.itemId`); string(item.toolId, `${path}.toolId`); break;
     case "turn_state": exact(item, ["kind", "working"], [], path); if (typeof item.working !== "boolean") throw new TypeError(`${path}.working must be boolean`); break;
     case "pending_ui_request": exact(item, ["kind", "request"], [], path); uiRequest(item.request, `${path}.request`); break;
     case "ui_resolved": exact(item, ["kind", "requestId"], [], path); string(item.requestId, `${path}.requestId`); break;

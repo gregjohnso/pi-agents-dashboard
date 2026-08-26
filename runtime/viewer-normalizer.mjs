@@ -102,6 +102,13 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
   if (typeof now !== "function") throw new TypeError("now must be a function");
   const items = new Map();
   const tools = new Map();
+
+  /** Record one tool and keep its first-seen position among the ordered items. @param {any} tool */
+  function noteTool(tool) {
+    tools.set(tool.id, tool);
+    const itemId = `tool:${tool.id}`;
+    if (!items.has(itemId)) items.set(itemId, { kind: "tool", itemId, toolId: tool.id });
+  }
   const pendingUi = new Map();
   /** @type {any[]} */
   const errors = [];
@@ -235,7 +242,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
         if (typeof block.id !== "string" || typeof block.name !== "string") incompatible("PI_REQUIRED_SHAPE", "Pi tool call requires id and name");
         /** @type {any} */
         const tool = { id: block.id, name: bound(block.name, 256), state: "pending", arguments: safeArguments(block.arguments), startedAt: at };
-        tools.set(tool.id, tool);
+        noteTool(tool);
         output.push(...publish({ kind: "tool_started", tool }, `${eventId}:tool:${tool.id}`, at));
       }
     } else if (message.role === "toolResult") {
@@ -244,7 +251,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       /** @type {any} */
       const tool = { id: message.toolCallId, name: bound(message.toolName, 256), state: message.isError === true ? "failed" : "completed", arguments: prior?.arguments ?? {}, startedAt: prior?.startedAt ?? at, result: normalized.content, finishedAt: at };
       if (message.isError === true) tool.error = bound(normalized.content.filter((/** @type {any} */ block) => block.type === "text").map((/** @type {any} */ block) => block.text).join("\n") || "Tool failed", MAX_SUMMARY_BYTES);
-      tools.set(tool.id, tool);
+      noteTool(tool);
       output.push(...publish({ kind: "tool_finished", tool }, eventId, at));
     } else {
       const text = normalized.content.filter((block) => ["text", "thinking"].includes(block.type)).map((block) => block.text).join("\n");
@@ -367,7 +374,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       } else if (update.type === "toolcall_start") {
         if (typeof update.id !== "string" || typeof update.toolName !== "string") incompatible("PI_REQUIRED_SHAPE", "Pi tool-call start requires id and toolName");
         const tool = { id: update.id, name: bound(update.toolName, 256), state: "pending", arguments: {}, startedAt: at };
-        tools.set(tool.id, tool);
+        noteTool(tool);
         output.push(...publish({ kind: "tool_started", tool }, `${sourceId}:tool:${tool.id}`, at));
         output.push(...replaceActivity("tool_pending", `Preparing ${tool.name}`, sourceId, { toolCallId: tool.id }));
       }
@@ -384,7 +391,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       const prior = tools.get(frame.toolCallId);
       if (frame.type === "tool_execution_start") {
         const tool = { id: frame.toolCallId, name: bound(frame.toolName, 256), state: "running", arguments: safeArguments(frame.args), startedAt: at };
-        tools.set(tool.id, tool);
+        noteTool(tool);
         return [...publish({ kind: "tool_started", tool }, `${sourceId}:tool:${tool.id}:started`, at), ...replaceActivity("tool_running", `Running ${tool.name}`, sourceId, { toolCallId: tool.id })];
       }
       const source = frame.type === "tool_execution_update" ? frame.partialResult?.content : frame.result?.content;
@@ -393,7 +400,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       const tool = { id: frame.toolCallId, name: bound(frame.toolName, 256), state: frame.type === "tool_execution_update" ? "streaming" : frame.isError === true ? "failed" : "completed", arguments: prior?.arguments ?? safeArguments(frame.args), startedAt: prior?.startedAt ?? at, result: normalized.content };
       if (frame.type === "tool_execution_end") tool.finishedAt = at;
       if (frame.isError === true) tool.error = bound(normalized.content.filter((/** @type {any} */ block) => block.type === "text").map((/** @type {any} */ block) => block.text).join("\n") || "Tool failed", MAX_SUMMARY_BYTES);
-      tools.set(tool.id, tool);
+      noteTool(tool);
       const kind = frame.type === "tool_execution_update" ? "tool_updated" : "tool_finished";
       const phase = frame.type === "tool_execution_update" ? "tool_streaming" : frame.isError === true ? "error" : "thinking";
       return [...publish({ kind, tool }, `${sourceId}:tool:${tool.id}:${kind}`, at), ...replaceActivity(phase, frame.isError === true ? `${tool.name} failed` : frame.type === "tool_execution_update" ? `Streaming ${tool.name}` : `${tool.name} completed`, sourceId, { toolCallId: tool.id })];
@@ -458,7 +465,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       currentAssistant.blocks[0] = block;
       currentAssistant.delta += 1;
       items.set(payload.itemId, { kind: "assistant_message", itemId: payload.itemId, content: currentAssistant.blocks.filter(Boolean).map((/** @type {any} */ entry) => ({ ...entry })) });
-    } else if (["tool_started", "tool_updated", "tool_finished"].includes(payload.kind)) tools.set(payload.tool.id, payload.tool);
+    } else if (["tool_started", "tool_updated", "tool_finished"].includes(payload.kind)) noteTool(payload.tool);
     else if (payload.kind === "pending_ui_request") pendingUi.set(payload.request.id, payload.request);
     else if (payload.kind === "ui_resolved") pendingUi.delete(payload.requestId);
     else if (payload.kind === "model_state") model = payload.provider === null || payload.model === null ? null : { provider: payload.provider, id: payload.model };
@@ -471,7 +478,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     if (restored?.sessionId !== sessionId) incompatible("VIEWER_SESSION_MISMATCH", "Viewer snapshot does not match the normalizer session");
     items.clear(); tools.clear(); pendingUi.clear(); errors.splice(0);
     for (const item of restored.items) items.set(item.itemId ?? item.attachment?.id ?? deterministicId("restored-item", item), item);
-    for (const tool of restored.tools) tools.set(tool.id, tool);
+    for (const tool of restored.tools) noteTool(tool);
     for (const request of restored.pendingUi) pendingUi.set(request.id, request);
     errors.push(...restored.errors);
     model = restored.model;

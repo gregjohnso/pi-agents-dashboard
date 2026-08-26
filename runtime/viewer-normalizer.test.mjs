@@ -87,6 +87,19 @@ describe("viewer normalizer", () => {
     assertPayloads([...thinking, ...text]);
   });
 
+  it("records each tool's chronological position between messages in the snapshot", () => {
+    const subject = normalizer();
+    subject.consumeFrame({ type: "message_end", message: { role: "user", content: "run it", timestamp: 1 } });
+    subject.consumeFrame({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "bash", args: { command: "pwd" } });
+    subject.consumeFrame({ type: "tool_execution_end", toolCallId: "tool-1", toolName: "bash", result: { content: [{ type: "text", text: "/repo" }] }, isError: false });
+    subject.consumeFrame({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], timestamp: 2 } });
+
+    const snapshot = subject.snapshot({ daemonEpoch: "epoch-1", sequence: "4", registryRevision: 1, runtime: null, role: "composer", taskState: "READY", processState: "LIVE", outcome: "NONE" });
+    expect(snapshot.items.map((/** @type {any} */ item) => item.kind)).toEqual(["user_message", "tool", "assistant_message"]);
+    expect(snapshot.items[1]).toMatchObject({ kind: "tool", toolId: "tool-1" });
+    expect(() => parseViewerSnapshot(snapshot)).not.toThrow();
+  });
+
   it("keeps tool, pending UI, model, thinking, and replacement activity continuity", () => {
     const subject = normalizer();
     const events = /** @type {any[]} */ ([

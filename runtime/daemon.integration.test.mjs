@@ -254,6 +254,30 @@ it("rejects worker mutations during reconciliation without touching unopened sto
   worker.close();
 });
 
+it("boots an exited session worker before granting its composer attachment", async () => {
+  const stateRoot = await root();
+  await mkdir(join(stateRoot, "sessions"), { mode: 0o700 });
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const now = "2026-08-25T00:00:00.000Z";
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "resume", sessionFile: "/sessions/resume.jsonl", canonicalSessionFile: "/sessions/resume.jsonl", cwd: "/repo", taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "assistant_final", summary: "Saved", updatedAt: now }, createdAt: now, updatedAt: now });
+  const identity = { pid: 321, startIdentity: "resumed-worker", processGroupId: 321 };
+  const launch = vi.fn(async (request) => {
+    const current = await registry.get("resume");
+    if (current === undefined) throw new Error("resume record missing");
+    await registry.update("resume", current.revision, { ownership: { kind: "managed", runId: request.runId, process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: request.runId, processState: "LIVE", updatedAt: now });
+    return { sessionId: "resume", runId: request.runId, leaseId: "resume-lease", generation: 1, identity, piChildIdentity: identity };
+  });
+  const runtime = await createDaemonRuntime({ root: stateRoot, hostProbe: async () => ({ blockers: [] }), workerSupervisor: { launch, async close() {} } });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await client.ready;
+  client.send({ version: 1, clientId: "client", requestId: "resume-attach", op: "attach", payload: { sessionId: "resume", role: "composer" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "attached", sessionId: "resume", role: "composer" } });
+  expect(launch).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "resume", canonicalSessionFile: "/sessions/resume.jsonl", cwd: "/repo", runId: expect.any(String) }));
+  client.close();
+});
+
 it("arbitrates one composer per session and persists release before observer takeover", async () => {
   const workerSupervisor = { close: vi.fn(), stop: vi.fn(), delete: vi.fn() };
   const runtime = await createDaemonRuntime({ root: await root(), workerSupervisor });

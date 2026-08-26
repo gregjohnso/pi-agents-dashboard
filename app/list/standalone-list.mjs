@@ -57,7 +57,11 @@ export function createDaemonViewerClient({ client, clientId }) {
   };
   return {
     replayFromOrigin: true,
-    async attach(sessionId) { return request("attach", { sessionId, role: "composer" }); },
+    async attach(sessionId) {
+      const attached = await request("attach", { sessionId, role: "composer" });
+      if (attached?.kind !== "attached" || attached.role !== "composer") throw Object.assign(new Error("Another frontend owns this session"), { code: "SESSION_IN_USE", retryable: false });
+      return attached;
+    },
     async detach(sessionId) { return request("detach", { sessionId }); },
     getSnapshot: (sessionId) => client.getViewerSnapshot(sessionId),
     subscribe(sessionId, cursor, next, onError) {

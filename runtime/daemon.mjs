@@ -595,6 +595,7 @@ export async function createDaemonRuntime({
     const recoveryController = new AbortController();
     const usedCommandIds = new Set();
     const launchingSessions = new Set();
+    const sessionStarts = new Map();
     /** @type {Map<string, Map<net.Socket, { clientId: string, role: "composer" | "observer" }>>} */
     const attachmentClaims = new Map();
     /** @type {Map<string, { serialized: string, promise: Promise<any> }>} */
@@ -627,15 +628,57 @@ export async function createDaemonRuntime({
       serializeAttachment(sessionId, operation) {
         return runSessionLifecycle(registry, sessionId, operation);
       },
+      /** @param {any} handle */
+      async activateWorker(handle) {
+        await router.register(handle);
+        await context.recovery.viewer.ensure(handle.sessionId);
+        handle.onFrame?.((/** @type {Record<string, unknown>} */ frame) => {
+          void runSessionLifecycle(registry, handle.sessionId, async () => {
+            await context.recovery.viewer.ingest(handle.sessionId, frame);
+          }).catch(() => {});
+        });
+      },
+      /** @param {string} sessionId */
+      async ensureSessionWorker(sessionId) {
+        if (router.route(sessionId) !== undefined) return;
+        const pending = sessionStarts.get(sessionId);
+        if (pending !== undefined) return pending;
+        const start = (async () => {
+          if (typeof workerSupervisor?.launch !== "function") return;
+          const record = await registry.get(sessionId);
+          if (record === undefined) throw Object.assign(new Error("Session does not exist"), { code: "SESSION_NOT_FOUND" });
+          if (router.metadata(sessionId) !== undefined || record.ownership !== undefined) throw Object.assign(new Error("Session worker is reconnecting"), { code: "WORKER_RECONNECTING", retryable: true });
+          launchingSessions.add(sessionId);
+          try {
+            const handle = await workerSupervisor.launch({
+              sessionId,
+              canonicalSessionFile: record.canonicalSessionFile,
+              cwd: record.cwd,
+              runId: randomUUID(),
+              ...(record.model === undefined ? {} : { model: record.model }),
+              ...(record.thinkingLevel === undefined ? {} : { thinkingLevel: record.thinkingLevel }),
+              ...(record.name === undefined ? {} : { name: record.name }),
+              daemonConnector: CONNECTOR_PATH,
+              daemonConnectConfig: { socketPath: join(daemonDirectory, "control.sock"), tokenPath, maxBytes },
+            });
+            await context.activateWorker(handle);
+          } finally {
+            launchingSessions.delete(sessionId);
+          }
+        })();
+        sessionStarts.set(sessionId, start);
+        try { await start; } finally { if (sessionStarts.get(sessionId) === start) sessionStarts.delete(sessionId); }
+      },
       /** @param {string} sessionId @param {string} clientId @param {"composer" | "observer"} role @param {boolean} attached */
       async appendAttachment(sessionId, clientId, role, attached) {
         if (context.recovery?.events === undefined) throw Object.assign(new Error("Attachment event store is unavailable"), { code: "RECOVERING" });
         return context.recovery.events.append({ kind: "attachment_changed", payload: { sessionId, clientId, role, attached } });
       },
       /** @param {any} request @param {net.Socket} socket @param {string} authenticatedClientId */
-      arbitrateAttachment(request, socket, authenticatedClientId) {
+      async arbitrateAttachment(request, socket, authenticatedClientId) {
         if (request.clientId !== authenticatedClientId) throw Object.assign(new Error("Attachment client identity changed"), { code: "CLIENT_IDENTITY_CONFLICT" });
         const sessionId = request.payload.sessionId;
+        if (request.op === "attach" && request.payload.role === "composer") await context.ensureSessionWorker(sessionId);
         let touched = attachmentSessions.get(socket);
         if (touched === undefined) {
           touched = new Set();
@@ -802,8 +845,7 @@ export async function createDaemonRuntime({
         if (request.op === "get_state") return { kind: "state", sessions: await registry.list() };
         if (context.state !== "READY" && !duringRecovery) throw Object.assign(new Error(context.state === "FAILED" ? context.stateError?.message ?? "Daemon recovery failed" : "Daemon recovery is still in progress"), { code: context.state === "FAILED" ? context.stateError?.code ?? "RECOVERY_FAILED" : "RECOVERING", retryable: context.state !== "FAILED" });
         if (request.op === "get_viewer_snapshot") {
-          const claimedRole = socket === undefined ? "observer" : attachmentClaims.get(request.payload.sessionId)?.get(socket)?.role ?? "observer";
-          const role = router.route(request.payload.sessionId) === undefined ? "observer" : claimedRole;
+          const role = socket === undefined ? "observer" : attachmentClaims.get(request.payload.sessionId)?.get(socket)?.role ?? "observer";
           return { kind: "viewer_snapshot", snapshot: await context.recovery.viewer.snapshot(request.payload.sessionId, role) };
         }
         if (request.op === "subscribe_viewer") {
@@ -866,13 +908,7 @@ export async function createDaemonRuntime({
               let handle;
               try {
                 handle = await workerSupervisor.launch({ ...launch, daemonConnector: CONNECTOR_PATH, daemonConnectConfig: { socketPath: join(daemonDirectory, "control.sock"), tokenPath, maxBytes } });
-                await router.register(handle);
-                await context.recovery.viewer.ensure(handle.sessionId);
-                handle.onFrame?.((/** @type {Record<string, unknown>} */ frame) => {
-                  void runSessionLifecycle(registry, handle.sessionId, async () => {
-                    await context.recovery.viewer.ingest(handle.sessionId, frame);
-                  }).catch(() => {});
-                });
+                await context.activateWorker(handle);
                 if (typeof launch.initialPrompt === "string") {
                   const promptRequest = {
                     version: 1,

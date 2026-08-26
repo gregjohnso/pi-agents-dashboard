@@ -44,6 +44,14 @@ it("adapts the installed daemon client to origin replay, mutation, ACK, and deta
   expect(requests.map(({ op }) => op)).toEqual(["attach", "interrupt", "detach"]);
 });
 
+it("refuses observer fallback instead of opening a read-only viewer", async () => {
+  const client = {
+    async request() { return { ok: true, result: { kind: "attached", sessionId: "session", role: "observer" } }; },
+  };
+  const viewer = createDaemonViewerClient({ client, clientId: "client" });
+  await expect(viewer.attach("session")).rejects.toMatchObject({ code: "SESSION_IN_USE" });
+});
+
 it("keeps the list open and does not signal when viewer attach fails", async () => {
   const attachError = new Error("attach failed");
   const viewerClient = { attach: vi.fn(async () => { throw attachError; }), detach: vi.fn(), command: vi.fn() };

@@ -824,6 +824,7 @@ export class DashboardController {
             ?? (data.length === 1 && data.charCodeAt(0) >= 32 ? data : undefined);
     }
     async launch(request) {
+        this.focus = "list";
         const outcome = await this.backend.launch(request, this.requestId());
         if (outcome.kind === "launched") {
             this.focus = "list";

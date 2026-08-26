@@ -25,18 +25,20 @@ describe("selectDashboardSessions", () => {
     it("defines Live, Done, and All membership from independent dimensions", () => {
         const sessions = [
             session("live", { processState: "LIVE", outcome: "NONE" }),
+            session("launching", { processState: "EXITED", outcome: "NONE", activity: { kind: "launching", summary: "Starting", updatedAt: timestamp } }),
             session("sleeping-done", { processState: "SLEEPING", outcome: "READY_FOR_REVIEW" }),
             session("exited-done"),
             session("failed", { taskState: "FAILED", processState: "EXITED", outcome: "NONE" }),
             session("stale", { processState: "STALE", outcome: "COMPLETED" }),
         ];
-        expect(selectDashboardSessions(sessions, { view: "live" }).map(({ sessionId }) => sessionId)).toEqual(["live"]);
+        expect(selectDashboardSessions(sessions, { view: "live" }).map(({ sessionId }) => sessionId)).toEqual(["live", "launching"]);
         expect(selectDashboardSessions(sessions, { view: "done" }).map(({ sessionId }) => sessionId)).toEqual([
             "sleeping-done",
             "exited-done",
         ]);
         expect(selectDashboardSessions(sessions, allQuery).map(({ sessionId }) => sessionId)).toEqual([
             "live",
+            "launching",
             "sleeping-done",
             "exited-done",
             "failed",

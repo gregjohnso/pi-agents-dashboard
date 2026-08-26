@@ -20,7 +20,7 @@ function isInView(session, view) {
     if (view === "all")
         return true;
     if (view === "live")
-        return session.processState === "LIVE";
+        return session.processState === "LIVE" || session.activity.kind === "launching";
     return ((session.outcome === "COMPLETED" || session.outcome === "READY_FOR_REVIEW")
         && (session.processState === "SLEEPING" || session.processState === "EXITED"));
 }

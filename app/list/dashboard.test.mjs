@@ -189,6 +189,21 @@ describe("dashboard controller", () => {
         await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith({ kind: "closed" }));
         expect(dashboard.composerDraft.prompt).toBe("draft");
     });
+    it("returns focus to the sessions list while launch startup is pending", async () => {
+        const backend = new FakeBackend([]);
+        let completeLaunch;
+        backend.launch = vi.fn(() => new Promise((resolve) => { completeLaunch = resolve; }));
+        const dashboard = controller(backend);
+        await dashboard.open();
+        dashboard.focusComposer();
+        dashboard.setComposerPrompt("Start now");
+
+        const submitting = dashboard.submitComposer();
+        await vi.waitFor(() => expect(backend.launch).toHaveBeenCalledTimes(1));
+        expect(dashboard.focus).toBe("list");
+        completeLaunch({ kind: "launched", sessionId: "started" });
+        await submitting;
+    });
     it("launches worktrees and requires exact canonical shared-directory confirmation", async () => {
         const backend = new FakeBackend([]);
         const dashboard = controller(backend);

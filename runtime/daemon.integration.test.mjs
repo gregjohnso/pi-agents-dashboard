@@ -1076,14 +1076,17 @@ it("journals launch before the irreversible call and refuses ambiguous duplicate
   client.close();
 });
 
-it("rolls back and fails a launch refused before any child process exists", async () => {
+it("retains a visible failed session when startup is refused before a child exists", async () => {
   const stateRoot = await root();
-  const rollbackLaunch = vi.fn(async () => {});
+  const createdAt = "2026-08-25T00:00:00.000Z";
   const runtime = await createDaemonRuntime({
     root: stateRoot,
     hostProbe: async () => ({ blockers: [] }),
-    resolveLaunchRequest: async () => ({ sessionId: "prepared", canonicalSessionFile: "/sessions/prepared.jsonl", sessionRecord: { isolation: { mode: "shared_directory", canonicalCwd: "/repo" } } }),
-    rollbackLaunch,
+    resolveLaunchRequest: async () => ({
+      sessionId: "prepared",
+      canonicalSessionFile: "/sessions/prepared.jsonl",
+      sessionRecord: { schemaVersion: 1, revision: 0, sessionId: "prepared", sessionFile: "/sessions/prepared.jsonl", canonicalSessionFile: "/sessions/prepared.jsonl", cwd: "/repo", taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "launching", summary: "go", updatedAt: createdAt }, isolation: { mode: "shared_directory", canonicalCwd: "/repo" }, createdAt, updatedAt: createdAt },
+    }),
     workerSupervisor: {
       async launch() { throw Object.assign(new Error("unsupported"), { code: "UNSUPPORTED_PI_CAPABILITY", preChild: true }); },
       async close() {},
@@ -1096,7 +1099,7 @@ it("rolls back and fails a launch refused before any child process exists", asyn
   const launch = { version: 1, clientId: "launcher", requestId: "pre-child", op: "launch", payload: { prompt: "go", cwd: "/repo", sourceSessionId: "source", isolation: { mode: "worktree" } } };
   client.send(launch);
   expect(await client.next()).toMatchObject({ ok: false, error: { code: "UNSUPPORTED_PI_CAPABILITY" } });
-  expect(rollbackLaunch).toHaveBeenCalledOnce();
+  expect(await new RegistryStore(join(stateRoot, "sessions")).get("prepared")).toMatchObject({ taskState: "FAILED", processState: "EXITED", activity: { kind: "launch_failed", summary: "unsupported" } });
   expect(await runtime.commandStatus(launch)).toMatchObject({ stage: "FAILED", error: { code: "UNSUPPORTED_PI_CAPABILITY" } });
   client.close();
 });

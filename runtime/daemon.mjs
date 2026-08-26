@@ -853,6 +853,11 @@ export async function createDaemonRuntime({
           let launch;
           try {
             launch = await resolveLaunchRequest(request);
+            if (launch.sessionRecord !== undefined && await registry.get(launch.sessionId) === undefined) {
+              const prepared = await registry.create(launch.sessionRecord);
+              const event = await context.recovery.events.append({ kind: "session_changed", payload: { session: prepared } });
+              context.broadcast(event);
+            }
             return await runSessionLifecycle(registry, launch.sessionId, async () => {
               if (launchingSessions.has(launch.sessionId)) throw Object.assign(new Error("A launch is already in flight for this session"), { code: "LAUNCH_IN_FLIGHT" });
               launchingSessions.add(launch.sessionId);
@@ -890,12 +895,16 @@ export async function createDaemonRuntime({
             const launchError = /** @type {any} */ (error);
             const current = await context.recovery.journal.get(request);
             if (current?.stage === "DELIVERY_ATTEMPTED" && launchError?.preChild === true && launch !== undefined) {
-              try {
-                await rollbackLaunch(launch, { registry });
-              } catch (rollbackError) {
-                await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-                await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "FAILED", dashboardError("LAUNCH_ROLLBACK_FAILED", rollbackError instanceof Error ? rollbackError.message : "Prepared launch rollback failed"));
-                throw Object.assign(new Error("Prepared launch rollback failed", { cause: rollbackError }), { code: "LAUNCH_ROLLBACK_FAILED" });
+              const prepared = await registry.get(launch.sessionId);
+              if (prepared !== undefined) {
+                const updated = await registry.update(prepared.sessionId, prepared.revision, {
+                  taskState: "FAILED",
+                  processState: "EXITED",
+                  activity: { kind: "launch_failed", summary: error instanceof Error ? error.message : "Launch failed", updatedAt: new Date().toISOString() },
+                  updatedAt: new Date().toISOString(),
+                });
+                const event = await context.recovery.events.append({ kind: "session_changed", payload: { session: updated } });
+                context.broadcast(event);
               }
               await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
               await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "FAILED", dashboardError(launchError.code ?? "LAUNCH_FAILED", error instanceof Error ? error.message : "Launch failed"));

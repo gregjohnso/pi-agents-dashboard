@@ -74,10 +74,15 @@ it("launches a distinct installed Pi child with exact structured argv and persis
   expect(handle.piChildIdentity.pid).not.toBe(handle.identity.pid);
   expect(handle.identity.processGroupId).toBe(handle.identity.pid);
   expect(handle.piChildIdentity.processGroupId).toBe(handle.identity.processGroupId);
-  const childStarts = (await readFile(log, "utf8")).trim().split("\n").map(JSON.parse).filter((entry) => entry.kind === "start" && entry.argv.includes(sessionFile));
+  const logEntries = (await readFile(log, "utf8")).trim().split("\n").map(JSON.parse);
+  const childStarts = logEntries.filter((entry) => entry.kind === "start" && entry.argv.includes(sessionFile));
   expect(childStarts).toEqual([expect.objectContaining({ argv: ["--mode", "rpc", "--session", sessionFile] })]);
   expect(childStarts[0].pid).toBe(handle.piChildIdentity.pid);
-  expect(childStarts.some((entry) => entry.providerInvocation)).toBe(false);
+  expect(logEntries.filter((entry) => entry.kind === "start" && entry.argv.includes("--help"))).toHaveLength(1);
+  expect(logEntries.filter((entry) => entry.kind === "command").map(({ command, providerInvocation }) => [command, providerInvocation])).toEqual(expect.arrayContaining([
+    ["get_state", false], ["prompt", false], ["follow_up", false], ["steer", false], ["abort", false], ["extension_ui_response", false],
+  ]));
+  expect(logEntries.some((entry) => entry.providerInvocation)).toBe(false);
   expect(await registry.get("one")).toMatchObject({
     ownership: { process: handle.identity },
     runtime: {

@@ -127,7 +127,7 @@ export async function loadCliClientIdentity({
     if (lockedExisting !== undefined) return lockedExisting;
     const generated = `cli-${randomId()}`;
     if (!exactId(generated)) throw new TypeError("CLI client ID generator returned an invalid identity");
-    const published = await publishPrivateFile(directory, path, `${generated}\n`, async () => identityFailpoint("identity_before_publish", { path, clientId: generated }), fsOps);
+    const published = await publishPrivateFile(directory, path, `${generated}\n`, async () => /** @type {any} */ (identityFailpoint)("identity_before_publish", { path, clientId: generated }), fsOps);
     if (published) return generated;
     const deadline = Date.now() + winnerReadTimeoutMs;
     for (let attempt = 0; attempt < winnerReadAttempts && Date.now() <= deadline; attempt += 1) {
@@ -178,8 +178,10 @@ function validateExpectedResult(op, payload, clientId, requestId, result) {
   }
 }
 
-/** Create one persistent authenticated request session for composer-scoped operations. */
-export async function createPersistentDaemonRequester({ root = runtimeRoot(), clientId, maxBytes = 1024 * 1024, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS }) {
+/** Create one persistent authenticated request session for composer-scoped operations.
+ * @param {{ root?: string, clientId?: string, maxBytes?: number, timeoutMs?: number }} [options]
+ */
+export async function createPersistentDaemonRequester({ root = runtimeRoot(), clientId, maxBytes = 1024 * 1024, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {}) {
   if (!exactId(clientId)) throw new TypeError("A stable CLI clientId is required");
   const token = (await fs.readFile(join(root, "daemon", "control.token"), "utf8")).trim();
   const client = createDaemonClient({ socketPath: join(root, "daemon", "control.sock"), token, maxBytes, clientId, reconnect: false });
@@ -210,7 +212,9 @@ export async function createPersistentDaemonRequester({ root = runtimeRoot(), cl
   };
 }
 
-/** Create one bounded authenticated requester; transport closure never signals workers. */
+/** Create one bounded authenticated requester; transport closure never signals workers.
+ * @param {{ root?: string, clientId?: string, maxBytes?: number, timeoutMs?: number, createConnection?: typeof net.createConnection }} [options]
+ */
 export function createDaemonRequester({ root = runtimeRoot(), clientId, maxBytes = 1024 * 1024, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, createConnection = net.createConnection } = {}) {
   if (!exactId(clientId)) throw new TypeError("A stable CLI clientId is required");
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new TypeError("timeoutMs must be a positive safe integer");

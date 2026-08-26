@@ -11,6 +11,6 @@
     "target": "ES2022",
     "types": ["node"]
   },
-  "include": ["app/**/*.mjs"],
-  "exclude": ["app/**/*.test.mjs"]
+  "include": ["app/**/*.mjs", "cli/**/*.mjs"],
+  "exclude": ["app/**/*.test.mjs", "cli/**/*.test.mjs"]
 }

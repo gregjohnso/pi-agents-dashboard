@@ -10,7 +10,8 @@ it("ships only the standalone executable", () => {
   expect(manifest.pi).toBeUndefined();
   expect(manifest.scripts.preinstall).toBeUndefined();
   expect(manifest.scripts.postinstall).toBeUndefined();
-  expect(manifest.files).toContain("app");
+  expect(manifest.files).toContain("app/**/*.mjs");
+  expect(manifest.files).toContain("!**/*.test.mjs");
   expect(manifest.files).not.toContain("extensions");
   expect(manifest.dependencies).toMatchObject({
     "@earendil-works/pi-coding-agent": "0.84.3",

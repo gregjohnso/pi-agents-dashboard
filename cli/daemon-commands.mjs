@@ -42,7 +42,7 @@ export async function probeDaemon(publication, { timeoutMs = 500 } = {}) {
     socket.once("connect", () => socket.write(encoder.encode({ version: 1, token })));
     socket.on("data", (chunk) => {
       try {
-        const frame = decoder.push(chunk)[0];
+        const frame = /** @type {any} */ (decoder.push(chunk)[0]);
         if (frame !== undefined) finish(frame?.version === 1 && frame?.kind === "authenticated" ? { reachable: true, state: frame.state, error: frame.error } : { reachable: false });
       } catch { finish({ reachable: false }); }
     });

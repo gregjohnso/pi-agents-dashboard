@@ -23,6 +23,14 @@ it("accepts only exact --pi-bin standalone syntax", async () => {
   expect(await runCli(["--pi-bin", "relative"], { cwd: "/repo", openApp, io: capture().io })).toBe(2);
 });
 
+it("prints standalone help without opening the app", async () => {
+  const output = capture();
+  const openApp = vi.fn(async () => {});
+  expect(await runCli(["--help"], { openApp, io: output.io })).toBe(0);
+  expect(output.stdout.join("")).toContain("With no arguments");
+  expect(openApp).not.toHaveBeenCalled();
+});
+
 it("prints exactly one JSON object and uses syntax exit code 2", async () => {
   const output = capture();
   const code = await runCli(["unknown", "--json"], { io: output.io });

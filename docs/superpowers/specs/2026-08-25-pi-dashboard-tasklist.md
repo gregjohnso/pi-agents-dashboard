@@ -2,7 +2,7 @@
 
 **Plan:** `docs/superpowers/specs/2026-08-25-pi-dashboard-execution-plan.md`
 **Spec:** `docs/superpowers/specs/2026-08-25-pi-dashboard-design.md`
-**Status:** T17, T18, and T20 are integrated and reviewed; T19 is the next integration gate.
+**Status:** T17-T20 are integrated and reviewed; T21 is the final acceptance gate.
 **Integrated baseline:** `5a36be230521610f2445f8947c4c92760e874872`
 
 ## Document responsibility
@@ -117,7 +117,7 @@ integrated baseline
 
   - Review gate: no executable identity time-of-check/time-of-use gap, inference during probe, same-process child identity, unbounded diagnostics, or process-lifetime regression.
 
-- [ ] **T19 Normalize canonical history and live frames into viewer snapshots/events**
+- [x] **T19 Normalize canonical history and live frames into viewer snapshots/events**
   - Owner: Normalization lane, one writer in an isolated worktree from merged T18.
   - Depends on: T18.
   - Can run in parallel with: remaining T20 work.
@@ -227,7 +227,7 @@ integrated baseline
 - [x] Historical T14 and T16 release direction superseded.
 - [x] T17 complete and reviewed.
 - [x] T18 complete and reviewed.
-- [ ] T19 complete and reviewed.
+- [x] T19 complete and reviewed.
 - [x] T20 complete and reviewed.
 - [ ] T21 complete and reviewed.
 - [ ] R1-R6 have no undispositioned finding.

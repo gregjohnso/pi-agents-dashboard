@@ -1,0 +1,15 @@
+**/*.test.mjs
+**/*.test.ts
+**/*.integration.test.mjs
+**/__snapshots__/**
+runtime/test-fixtures.mjs
+test/
+docs/
+.superpowers/
+.vscode/
+node_modules/.cache/
+*.log
+pixi.lock
+pixi.toml
+tsconfig*.json
+vitest.config.ts

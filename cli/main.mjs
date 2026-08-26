@@ -4,6 +4,13 @@ import { fileURLToPath } from "node:url";
 import { runDaemonCommand } from "./daemon-commands.mjs";
 import { runSessionCommand } from "./session-commands.mjs";
 
+const HELP = `Usage: pi-dashboard [--pi-bin /absolute/path/to/pi]
+       pi-dashboard daemon start|status|restart|recover|stop [--stop-workers --yes]
+       pi-dashboard session <command>
+
+With no arguments, pi-dashboard opens the machine-local session list.
+`;
+
 async function defaultOpenApp(options) {
   const { runDashboardApp } = await import(new URL("../app/standalone.mjs", import.meta.url).href);
   return runDashboardApp(options);
@@ -25,6 +32,10 @@ export async function runCli(argv = process.argv.slice(2), deps = {}) {
   let result;
   try {
     const standalone = args.length === 0 || (args.length === 2 && args[0] === "--pi-bin" && isAbsolute(args[1]));
+    if (args.length === 1 && ["--help", "-h"].includes(args[0])) {
+      io.stdout.write(HELP);
+      return 0;
+    }
     if (standalone) {
       await (deps.openApp ?? defaultOpenApp)({
         cwd: deps.cwd ?? process.cwd(), piBin: args[0] === "--pi-bin" ? args[1] : undefined,

@@ -65,6 +65,19 @@ it("uses approved waits and signals only the exact recorded process group", asyn
   expect(aliveGroups.has(777)).toBe(true);
 });
 
+it("uses the release 5,000 ms graceful and terminate waits before exact-group KILL", async () => {
+  const exited = Object.assign(new Error("gone"), { code: "ESRCH" });
+  const { deps, signaler, sleeper } = dependencies([ownership, ownership, ownership, ownership, exited]);
+
+  await expect(stopVerifiedProcessGroup(ownership, deps, loadDashboardConfig({}).stop)).resolves.toEqual({ disposition: "KILLED" });
+  expect(sleeper.calls).toEqual([5_000, 5_000]);
+  expect(signaler.calls).toEqual([
+    { type: "graceful", ownership },
+    { type: "signal", pgid: ownership.processGroupId, signal: "SIGTERM" },
+    { type: "signal", pgid: ownership.processGroupId, signal: "SIGKILL" },
+  ]);
+});
+
 it("reports KILL as requested, not observed, while the exact identity remains visible", async () => {
   const { deps, signaler } = dependencies([ownership, ownership, ownership, ownership, ownership]);
 

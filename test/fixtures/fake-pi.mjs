@@ -65,6 +65,9 @@ process.stdin.on("data", (chunk) => {
       continue;
     }
     process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: true })}\n`);
+    if (process.env.FAKE_PI_EVENT_AFTER_COMMAND === type) {
+      process.stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: `later:${sessionFile}` }], timestamp: Date.now() } })}\n`);
+    }
     if (process.env.FAKE_PI_EXIT_AFTER_COMMAND === type) process.exit(7);
   }
 });

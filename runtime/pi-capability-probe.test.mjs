@@ -49,6 +49,32 @@ it("probes recognized validation errors without a valid prompt or canonical sess
   expect(entries.filter((entry) => entry.kind === "start")).toHaveLength(2);
 });
 
+it("accepts stock Pi's one-way extension UI response protocol", async () => {
+  const { log, executable } = await setup();
+  const report = await probePiCapabilities({
+    executable,
+    cache: new Map(),
+    timeoutMs: 1_000,
+    env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_ONE_WAY_EXTENSION_UI_RESPONSE: "1" },
+  });
+
+  expect(report.missingRequired).toEqual([]);
+  expect(report.commands).toContain("extension_ui_response");
+});
+
+it("rejects a delayed unknown-command response for extension UI responses", async () => {
+  const { log, executable } = await setup();
+  const report = await probePiCapabilities({
+    executable,
+    cache: new Map(),
+    timeoutMs: 1_000,
+    env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_DELAYED_UNKNOWN_EXTENSION_UI_RESPONSE_MS: "20" },
+  });
+
+  expect(report.commands).not.toContain("extension_ui_response");
+  expect(report.missingRequired).toContain("extension_ui_response");
+});
+
 it.each([
   ["invalid UTF-8", { FAKE_PI_INVALID_UTF8: "1" }],
   ["an oversized frame", { FAKE_PI_OVERSIZED_FRAME: "1" }],

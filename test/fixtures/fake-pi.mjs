@@ -44,6 +44,10 @@ process.stdin.on("data", (chunk) => {
     const responseId = process.env.FAKE_PI_WRONG_RESPONSE_ID === type ? `wrong-${command.id}` : command.id;
     const validPrompt = ["prompt", "follow_up", "steer"].includes(type) && typeof command.message === "string";
     log({ kind: "command", command: type, message: validPrompt ? command.message : undefined, valid: validPrompt, providerInvocation: validPrompt });
+    if (type === "extension_ui_response" && process.env.FAKE_PI_DELAYED_UNKNOWN_EXTENSION_UI_RESPONSE_MS) {
+      setTimeout(() => process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: false, error: "unknown command" })}\n`), Number(process.env.FAKE_PI_DELAYED_UNKNOWN_EXTENSION_UI_RESPONSE_MS));
+      continue;
+    }
     if (type === "__pi_dashboard_unknown_command__") {
       process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: process.env.FAKE_PI_UNKNOWN_SUCCESS === "1", error: process.env.FAKE_PI_UNKNOWN_SUCCESS === "1" ? undefined : "unknown command" })}\n`);
       continue;
@@ -63,6 +67,7 @@ process.stdin.on("data", (chunk) => {
       process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: false, error: "message is required" })}\n`);
       continue;
     }
+    if (type === "extension_ui_response" && process.env.FAKE_PI_ONE_WAY_EXTENSION_UI_RESPONSE === "1") continue;
     if (type === "extension_ui_response" && typeof command.requestId !== "string") {
       process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: false, error: "requestId is required" })}\n`);
       continue;

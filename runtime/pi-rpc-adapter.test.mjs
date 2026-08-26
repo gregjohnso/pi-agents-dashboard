@@ -254,23 +254,19 @@ it("rejects malformed Pi output, retains stderr, and does not respawn", async ()
   await adapter.close();
 });
 
-it("forwards complete structured frames, records raw diagnostics, and sends UI responses", async () => {
+it("sends one-way UI responses without blocking the next correlated command", async () => {
+  /** @type {string[]} */
+  const commands = [];
   const child = fakeRpcProcess((command, process) => {
-    process.stdout.write(`${JSON.stringify({ type: "extension_ui_request", id: "ui-1" })}\n`);
-    process.stdout.write(`${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true })}\n`);
+    commands.push(command.type);
+    if (command.type === "get_state") process.stdout.write(`${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true, data: { sessionId: "session" } })}\n`);
   });
   const diagnostics = { append: vi.fn(async () => {}) };
   const adapter = PiRpcAdapter.connect({ input: child.stdin, output: child.stdout, diagnostics, maxRecordBytes: 1_024 });
-  /** @type {Record<string, unknown>[]} */
-  const frames = [];
-  adapter.onFrame((frame) => frames.push(frame));
 
   await expect(adapter.uiResponse({ requestId: "ui-1", response: true })).resolves.toBeUndefined();
-  expect(frames).toEqual([
-    { type: "extension_ui_request", id: "ui-1" },
-    expect.objectContaining({ type: "response", command: "extension_ui_response", success: true }),
-  ]);
-  expect(diagnostics.append).toHaveBeenCalledTimes(2);
+  await expect(adapter.getState()).resolves.toEqual({ sessionId: "session" });
+  expect(commands).toEqual(["extension_ui_response", "get_state"]);
   await adapter.close();
 });
 

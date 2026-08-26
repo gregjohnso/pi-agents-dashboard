@@ -184,6 +184,7 @@ export class PiRpcAdapter {
         }
         const pending = this.#pending.get(frame.id);
         if (pending === undefined) {
+          if (frame.command === "extension_ui_response") continue;
           this.#fail(new PiRpcError("MALFORMED_RPC_OUTPUT", "Pi emitted an unknown RPC response"));
           return;
         }
@@ -240,6 +241,19 @@ export class PiRpcAdapter {
     return result;
   }
 
+  /** @param {string} type @param {Record<string, unknown>} [fields] */
+  async #sendOneWay(type, fields = {}) {
+    if (this.#closed) throw new PiRpcError("RPC_CLOSED", "Pi RPC adapter is closed");
+    if (this.#failed !== undefined) throw this.#failed;
+    try {
+      await writeAll(this.#input, this.#encoder.encode({ id: randomUUID(), type, ...fields }));
+    } catch (cause) {
+      const error = new PiRpcError("RPC_WRITE_FAILED", "Pi RPC command write failed", { cause });
+      this.#fail(error);
+      throw error;
+    }
+  }
+
   /** @param {string} text */
   async prompt(text) { await this.#request("prompt", { message: text }); }
   /** @param {string} text */
@@ -248,7 +262,7 @@ export class PiRpcAdapter {
   async followUp(text) { await this.#request("follow_up", { message: text }); }
   async abort() { await this.#request("abort"); }
   /** @param {{ requestId: string, response: unknown }} response */
-  async uiResponse(response) { await this.#request("extension_ui_response", response); }
+  async uiResponse(response) { await this.#sendOneWay("extension_ui_response", response); }
   async getState() { return this.#request("get_state"); }
 
   /** @param {(frame: Record<string, unknown>) => void} listener */

@@ -9,6 +9,7 @@ import { assertPiExecutableIdentity, piExecutableCacheKey } from "./pi-executabl
 import { createViewerNormalizer } from "./viewer-normalizer.mjs";
 
 const PROBE_MAX_RECORD_BYTES = 65_536;
+const PROBE_DRAIN_MS = 50;
 const UNKNOWN_COMMAND = "__pi_dashboard_unknown_command__";
 const RPC_ADAPTER_VERSION = 1;
 /** @type {readonly ("get_state"|"prompt"|"follow_up"|"steer"|"abort"|"extension_ui_response")[]} */
@@ -68,19 +69,22 @@ async function probeRpc(executable, sessionFile, spawnImpl, timeoutMs, env) {
     let responseCount = 0;
     let correlationValid = true;
     let framingValid = true;
+    let remainingSent = false;
+    let completionScheduled = false;
     const commands = [
+      { type: "extension_ui_response" },
       { type: "get_state" },
       { type: "prompt" },
       { type: "follow_up" },
       { type: "steer" },
       { type: "abort" },
-      { type: "extension_ui_response" },
       { type: UNKNOWN_COMMAND },
     ].map((command) => {
       const id = randomUUID();
       ids.set(id, command.type);
       return { id, ...command };
     });
+
     const result = () => ({ jsonl: framingValid && responseCount > 0, correlationValid, responses, events });
     child.stdout?.on("data", (/** @type {Buffer} */ chunk) => {
       let frames;
@@ -105,13 +109,25 @@ async function probeRpc(executable, sessionFile, spawnImpl, timeoutMs, env) {
           events.push(candidate.type);
         }
       }
-      if (responseCount >= commands.length) finish(undefined, result());
+      if (!remainingSent && responses.has("get_state")) {
+        remainingSent = true;
+        for (const command of commands.slice(2)) child.stdin?.write(`${JSON.stringify(command)}\n`);
+      }
+      const expectedResponseCount = responses.has("extension_ui_response") ? commands.length : commands.length - 1;
+      if (remainingSent && responseCount >= expectedResponseCount && !completionScheduled) {
+        completionScheduled = true;
+        setTimeout(() => {
+          const drainedResponseCount = responses.has("extension_ui_response") ? commands.length : commands.length - 1;
+          if (responseCount >= drainedResponseCount) finish(undefined, result());
+          else completionScheduled = false;
+        }, PROBE_DRAIN_MS);
+      }
     });
     child.once("exit", () => {
       try { decoder.end(); } catch { framingValid = false; }
       finish(undefined, result());
     });
-    for (const command of commands) child.stdin?.write(`${JSON.stringify(command)}\n`);
+    for (const command of commands.slice(0, 2)) child.stdin?.write(`${JSON.stringify(command)}\n`);
   });
 }
 
@@ -154,6 +170,7 @@ export async function probePiCapabilities({ executable, spawnImpl = spawn, cache
     const rpc = await probeRpc(executable.realpath, temporarySessionFile, spawnImpl, timeoutMs, env);
     const commands = REQUIRED_COMMANDS.filter((command) => {
       const response = rpc.responses.get(command);
+      if (command === "extension_ui_response") return response === undefined || (typeof response.error === "string" && !/unknown command/iu.test(response.error));
       if (response === undefined) return false;
       if (command === "get_state") return response.success === true && typeof response.data === "object" && response.data !== null && typeof response.data.sessionId === "string" && response.data.sessionFile === temporarySessionFile;
       if (command === "abort") return response.success === true;

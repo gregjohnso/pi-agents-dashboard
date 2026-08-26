@@ -95,7 +95,7 @@ it("starts the production daemon with launch resolution and delivers the compose
   const log = join(root, "fake-pi.jsonl");
   await writeFile(executable, sourceFor("production"), { mode: 0o700 });
   await chmod(executable, 0o700);
-  const env = { ...process.env, FAKE_PI_LOG: log, FAKE_PI_EVENT_AFTER_COMMAND: "prompt" };
+  const env = { ...process.env, FAKE_PI_LOG: log, FAKE_PI_EVENT_AFTER_COMMAND: "prompt", FAKE_PI_ONE_WAY_EXTENSION_UI_RESPONSE: "1" };
   let client;
   try {
     const started = await runDaemonCommand("start", { root, piBin: executable, env });
@@ -110,6 +110,8 @@ it("starts the production daemon with launch resolution and delivers the compose
     }));
     if (!launched.ok) throw new Error(`Production launch failed: ${JSON.stringify(launched)}`);
     expect(launched).toMatchObject({ ok: true, result: { kind: "launched", sessionId: expect.any(String) } });
+    const state = await client.request(request("production-launch", "state-after-launch", "get_state", {}));
+    expect(state).toMatchObject({ ok: true, result: { kind: "state", sessions: [expect.objectContaining({ sessionId: launched.result.sessionId })] } });
     const records = await new RegistryStore(join(root, "sessions")).list();
     if (records[0]?.ownership?.process !== undefined) processGroups.set(records[0].ownership.process.pid, records[0].ownership.process);
     expect(records).toEqual([expect.objectContaining({ sessionId: launched.result.sessionId, cwd: root, isolation: { mode: "shared_directory", canonicalCwd: root }, processState: "LIVE" })]);

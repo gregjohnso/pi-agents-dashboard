@@ -84,10 +84,20 @@ describe("responsive dashboard layout", () => {
         expect(row).toContain("Fixes the coverage loader and reruns tests");
         expect(row).not.toContain("Pi assistant streaming");
     });
-    it("keeps the fixed list column order and never renders Model", () => {
-        expect(createDashboardLayout(160, 40).columns.map(({ key }) => key)).toEqual(["id", "state", "project", "activity", "age"]);
-        expect(stripVTControlCharacters(renderColumnHeader(createDashboardLayout(160, 40)))).not.toContain("MODEL");
-        expect(createDashboardLayout(120, 32).columns.map(({ key }) => key)).toEqual(["id", "state", "project", "activity", "age"]);
+    it("keeps the fixed list column order and never renders Model or Project", () => {
+        expect(createDashboardLayout(160, 40).columns.map(({ key }) => key)).toEqual(["id", "name", "state", "activity"]);
+        const header = stripVTControlCharacters(renderColumnHeader(createDashboardLayout(160, 40)));
+        expect(header).not.toContain("MODEL");
+        expect(header).not.toContain("PROJECT");
+        expect(header).toContain("NAME");
+        expect(createDashboardLayout(120, 32).columns.map(({ key }) => key)).toEqual(["id", "name", "state", "activity"]);
+    });
+    it("renders the session name and falls back when a session has none", () => {
+        const layout = createDashboardLayout(160, 40);
+        const named = stripVTControlCharacters(renderSessionRow(session("named", { name: "Coverage loader" }), layout, { now }));
+        expect(named).toContain("Coverage loader");
+        const unnamed = stripVTControlCharacters(renderSessionRow(session("unnamed"), layout, { now }));
+        expect(unnamed).toContain("—");
     });
     it("sanitizes untrusted controls to one line before applying renderer-owned ANSI", () => {
         const layout = createDashboardLayout(160, 20);

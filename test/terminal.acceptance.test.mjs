@@ -146,8 +146,9 @@ it.each(dimensions)("pins the complete list and viewer surfaces at %ix%i", async
   expect([...listLines, ...viewerLines].every((line) => visibleWidth(line) <= width)).toBe(true);
   if (width >= 72) {
     const header = listLines.map(stripVTControlCharacters).find((line) => line.includes("ID") && line.includes("STATE"));
-    expect(header).toMatch(/ID\s+STATE\s+PROJECT\s+ACTIVITY\s+AGE/u);
+    expect(header).toMatch(/ID\s+NAME\s+STATE\s+ACTIVITY/u);
     expect(header).not.toContain("MODEL");
+    expect(header).not.toContain("PROJECT");
   }
   expect({ list: listLines.map(stripVTControlCharacters), viewer: viewerLines.map(stripVTControlCharacters) }).toMatchSnapshot();
   await Promise.all([list.dashboard.close(), viewer.controller.close()]);

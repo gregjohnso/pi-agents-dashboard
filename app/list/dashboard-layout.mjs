@@ -4,9 +4,8 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { jobwatchTheme } from "./dashboard-theme.mjs";
 const COLUMN_LABELS = {
     id: "ID",
+    name: "NAME",
     state: "STATE",
-    age: "AGE",
-    project: "PROJECT",
     activity: "ACTIVITY",
 };
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu;
@@ -34,18 +33,17 @@ function columnsForWidth(width) {
     if (width >= 72) {
         return [
             { key: "id", width: 10 },
+            { key: "name", width: width >= 100 ? 28 : 22 },
             { key: "state", width: 9 },
-            { key: "project", width: width >= 100 ? 24 : 20 },
-            { key: "activity", width: width - (width >= 100 ? 54 : 50) },
-            { key: "age", width: 7 },
+            { key: "activity", width: width - (width >= 100 ? 51 : 45) },
         ];
     }
     if (width >= 52) {
         return [
             { key: "id", width: 9 },
+            { key: "name", width: 14 },
             { key: "state", width: 8 },
-            { key: "activity", width: width - 26 },
-            { key: "age", width: 6 },
+            { key: "activity", width: width - 34 },
         ];
     }
     if (width >= 28) {
@@ -117,12 +115,11 @@ function liveness(session) {
     }
 }
 function sessionValues(session, now) {
-    const project = basename(session.cwd) || session.cwd || "—";
     return {
         id: `${liveness(session)} ${truncateToWidth(plainText(session.sessionId), 8, "")}`,
+        name: (session.name ?? "").trim() || "—",
         state: session.taskState,
         age: age(session.updatedAt, now),
-        project,
         activity: (session.summary?.text ?? session.activity.summary).trim() || "—",
     };
 }

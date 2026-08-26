@@ -179,7 +179,7 @@ export async function probePiCapabilities({ executable, spawnImpl = spawn, cache
     const unknownResponse = rpc.responses.get(UNKNOWN_COMMAND);
     const unknownCommandValid = unknownResponse?.success === false && typeof unknownResponse.error === "string" && /unknown command/iu.test(unknownResponse.error);
     const temporarySessionValid = commands.includes("get_state");
-    const rpcMode = /--mode\s+rpc/iu.test(help);
+    const rpcMode = temporarySessionValid;
     const reportedVersion = /^pi\s+(.+)$/imu.exec(help)?.[1]?.trim() ?? null;
     const requiredLiveEvents = requiredEventProbe();
     const missingRequired = [

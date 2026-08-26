@@ -49,6 +49,19 @@ it("probes recognized validation errors without a valid prompt or canonical sess
   expect(entries.filter((entry) => entry.kind === "start")).toHaveLength(2);
 });
 
+it("recognizes RPC mode from the successful handshake instead of help formatting", async () => {
+  const { log, executable } = await setup();
+  const report = await probePiCapabilities({
+    executable,
+    cache: new Map(),
+    timeoutMs: 1_000,
+    env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_STOCK_HELP: "1", FAKE_PI_ONE_WAY_EXTENSION_UI_RESPONSE: "1" },
+  });
+
+  expect(report.rpcMode).toBe(true);
+  expect(report.missingRequired).toEqual([]);
+});
+
 it("accepts stock Pi's one-way extension UI response protocol", async () => {
   const { log, executable } = await setup();
   const report = await probePiCapabilities({

@@ -181,7 +181,6 @@ export async function createStandaloneList({ cwd, frontend }) {
       sessionId, viewerClient, controller,
       createViewer() {
         const editor = createPiEditor({ tui });
-        tui.setFocus(editor);
         let viewer;
         viewer = new ViewerController({
           sessionId, client: viewerClient, editor,
@@ -190,7 +189,7 @@ export async function createStandaloneList({ cwd, frontend }) {
         });
         return viewer;
       },
-      activateViewer(viewer) { activeViewer = viewer; active = viewer; },
+      activateViewer(viewer) { activeViewer = viewer; active = viewer; standaloneHost.focus(); },
       activateList() { activeViewer = undefined; active = controller; },
       restoreListFocus() { standaloneHost.focus(); },
       onRestoreClosed() { tui.stop(); resolveClosed(); },

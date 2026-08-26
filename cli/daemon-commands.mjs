@@ -107,7 +107,7 @@ export async function runDaemonCommand(command, options = {}) {
     const entry = await daemonEntryPoint();
     const child = (options.spawnDaemon ?? spawnDaemon)(entry, ["--root", root]);
     child.once?.("error", () => {});
-    const endpoint = await waitForStatus(root, ["HEALTHY", "CONFLICT", "UNHEALTHY"], { ...options, inspect, probe, inspectEndpoint, requireReady: true, child });
+    const endpoint = await waitForStatus(root, ["HEALTHY", "CONFLICT"], { ...options, inspect, probe, inspectEndpoint, requireReady: true, child });
     if (endpoint?.status === "HEALTHY") return { code: 0, result: { kind: "daemon_started", alreadyRunning: false, root, publication: endpoint.publication } };
     const ownershipConflict = endpoint?.status === "CONFLICT" || (endpoint?.status === "PROCESS_EXITED" && endpoint.exitCode === 5);
     return { code: ownershipConflict ? 5 : 1, error: { code: ownershipConflict ? "DAEMON_RECOVERY_CONFLICT" : "DAEMON_START_FAILED", message: ownershipConflict ? "Daemon recovery found an ownership conflict" : "Daemon did not become healthy before the startup deadline" } };

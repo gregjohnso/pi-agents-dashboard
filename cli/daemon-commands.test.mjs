@@ -19,6 +19,20 @@ it("discovers the daemon entry point relative to the package instead of PATH", a
   expect(await daemonEntryPoint()).toMatch(/runtime\/daemon\.mjs$/);
 });
 
+it("waits through transient unhealthy startup until the daemon is ready", async () => {
+  const endpoints = [
+    { status: "ABSENT" },
+    { status: "UNHEALTHY", daemonState: "STARTING" },
+    { status: "HEALTHY", daemonState: "READY", publication: { pid: 321 } },
+  ];
+  const result = await runDaemonCommand("start", {
+    root: "/state",
+    inspectEndpoint: async () => endpoints.shift() ?? { status: "UNHEALTHY" },
+    spawnDaemon: () => ({ once() {} }),
+  });
+  expect(result).toMatchObject({ code: 0, result: { kind: "daemon_started", alreadyRunning: false } });
+});
+
 it("stops only through the verified daemon process-group boundary", async () => {
   const publication = { pid: 321, startIdentity: "987654321", processGroupId: 654, tokenPath: "/state/daemon/control.token" };
   const endpoints = [{ status: "HEALTHY", daemonState: "READY", publication }, { status: "ABSENT" }];

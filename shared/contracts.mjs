@@ -227,6 +227,11 @@ function validateRuntimeIdentity(value, path) {
   validateProcess(runtime.supervisor, `${path}.supervisor`); validateProcess(runtime.piChild, `${path}.piChild`);
 }
 
+/** Validate one strict version-1 session record. @param {unknown} value @param {string} [path] */
+export function validateSessionRecord(value, path = "session") {
+  validateSession(value, path);
+}
+
 /** Parse one strict version-1 daemon response. @param {unknown} value @returns {DaemonResponse} */
 export function parseDaemonResponse(value) {
   const response = readRecord(value, "daemon response");

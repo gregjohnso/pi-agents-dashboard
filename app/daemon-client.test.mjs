@@ -254,7 +254,11 @@ describe("daemon client", () => {
         const directory = await mkdtemp(join(tmpdir(), "client-malformed-event-"));
         const socketPath = join(directory, "control.sock");
         let connections = 0;
-        const validEvent = { version: 1, cursor: { daemonEpoch: "epoch-1", sequence: "1" }, occurredAt: "2026-01-01T00:00:00.000Z", kind: "attachment_changed", payload: { sessionId: "s", clientId: "client-1", role: "observer", attached: true } };
+        const executable = { realpath: "/installed/pi", device: "1", inode: "2", size: 3, modifiedTimeNs: "4" };
+        const process = { pid: 10, startIdentity: "start", processGroupId: 10 };
+        const runtime = { executable, piVersion: "1.0.0", capabilities: { executable, reportedVersion: "1.0.0", rpcMode: true, jsonl: true, commands: ["get_state", "prompt", "follow_up", "steer", "abort", "extension_ui_response"], events: ["required_live_events"], missingRequired: [] }, rpcAdapterVersion: 1, viewerProtocolVersion: 1, supervisor: process, piChild: process };
+        const session = { schemaVersion: 1, revision: 1, sessionId: "s", sessionFile: "/sessions/s.jsonl", canonicalSessionFile: "/sessions/s.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "launching", summary: "Starting", updatedAt: "2026-01-01T00:00:00.000Z" }, runtime, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" };
+        const validEvent = { version: 1, cursor: { daemonEpoch: "epoch-1", sequence: "1" }, occurredAt: "2026-01-01T00:00:00.000Z", kind: "session_changed", payload: { session } };
         const server = net.createServer((socket) => {
             connections += 1;
             const connection = connections;
@@ -279,7 +283,7 @@ describe("daemon client", () => {
             });
         });
         await new Promise((resolve, reject) => server.listen(socketPath, resolve).once("error", reject));
-        const client = createDaemonClient({ socketPath, token: "secret", maxBytes: 1024, reconnectDelayMs: 1, clientId: "client-1" });
+        const client = createDaemonClient({ socketPath, token: "secret", maxBytes: 4096, reconnectDelayMs: 1, clientId: "client-1" });
         cleanups.push(async () => {
             await client.close();
             await new Promise((resolve) => server.close(() => resolve()));

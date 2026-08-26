@@ -1,7 +1,7 @@
 import net from "node:net";
 import { randomUUID } from "node:crypto";
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
-import { parseDaemonResponse } from "../shared/contracts.mjs";
+import { parseDaemonResponse, validateSessionRecord } from "../shared/contracts.mjs";
 import { parseViewerEvent, parseViewerSnapshot } from "../shared/viewer-contracts.mjs";
 export class DaemonClientError extends Error {
     code;
@@ -140,7 +140,7 @@ function parsePersistedEvent(value) {
     const payload = readRecord(event.payload, "persisted event.payload");
     if (kind === "session_changed") {
         requireKeys(payload, ["session"], [], "persisted event.payload");
-        validateSession(payload.session, "persisted event.payload.session");
+        validateSessionRecord(payload.session, "persisted event.payload.session");
     }
     else if (kind === "command_changed") {
         requireKeys(payload, ["status"], [], "persisted event.payload");

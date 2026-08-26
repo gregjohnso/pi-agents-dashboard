@@ -141,6 +141,30 @@ describe("viewer normalizer", () => {
     expect(restored.snapshot({ daemonEpoch: "epoch-1", sequence: "4", registryRevision: 1, runtime: null, role: "observer", taskState: "WORKING", processState: "LIVE", outcome: "NONE" }).items).toContainEqual({ kind: "assistant_message", itemId: partial.itemId, content: [{ type: "text", text: "hello" }] });
   });
 
+  it("preserves exact active assistant blocks through non-streaming snapshots and durable replay", () => {
+    const first = normalizer();
+    first.consumeFrame({ type: "message_start", message: { role: "assistant", content: [], timestamp: Date.parse(AT) } });
+    const drafts = [
+      ...first.consumeFrame({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "reason" } }),
+      ...first.consumeFrame({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 2, delta: "ans" } }),
+      ...first.consumeFrame({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "read", args: {} }),
+    ];
+    const snapshot = first.snapshot({ daemonEpoch: "epoch-1", sequence: "5", registryRevision: 1, runtime: null, role: "observer", taskState: "WORKING", processState: "LIVE", outcome: "NONE" });
+    expect(snapshot.activity.phase).toBe("tool_running");
+    expect(snapshot.activeAssistant).toEqual({ itemId: drafts[0].payload.itemId, blocks: [{ contentIndex: 0, type: "thinking", text: "reason" }, { contentIndex: 2, type: "text", text: "ans" }] });
+    expect(() => parseViewerSnapshot(snapshot)).not.toThrow();
+
+    const fromSnapshot = normalizer();
+    fromSnapshot.restore(snapshot);
+    const replayed = normalizer();
+    for (const [index, draft] of drafts.entries()) replayed.applyViewerEvent({ version: 1, sessionId: "session-1", eventId: draft.eventId, cursor: { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: String(index + 1) }, timestamp: draft.timestamp, payload: draft.payload });
+    for (const restored of [fromSnapshot, replayed]) {
+      const continued = restored.consumeFrame({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 2, delta: "wer" } });
+      expect(continued[0].payload).toMatchObject({ kind: "assistant_delta", itemId: drafts[0].payload.itemId, contentIndex: 2, contentType: "text", delta: "wer" });
+      expect(restored.snapshot({ daemonEpoch: "epoch-1", sequence: "6", registryRevision: 1, runtime: null, role: "observer", taskState: "WORKING", processState: "LIVE", outcome: "NONE" }).activeAssistant).toEqual({ itemId: drafts[0].payload.itemId, blocks: [{ contentIndex: 0, type: "thinking", text: "reason" }, { contentIndex: 2, type: "text", text: "answer" }] });
+    }
+  });
+
   it("maps documented model and thinking replacement frames", () => {
     const subject = normalizer();
     const events = [
@@ -154,6 +178,9 @@ describe("viewer normalizer", () => {
     ]);
     expect(events.filter((event) => event.payload.kind === "thinking_state").map((event) => event.payload.level)).toEqual(["high", "low"]);
     expect(subject.snapshot({ daemonEpoch: "epoch-1", sequence: "4", registryRevision: 1, runtime: null, role: "observer", taskState: "READY", processState: "LIVE", outcome: "NONE" })).toMatchObject({ model: { provider: "anthropic", id: "claude" }, thinkingLevel: "low" });
+    expect(subject.consumeFrame({ type: "response", command: "cycle_model", success: true, data: null })).toEqual([]);
+    expect(subject.snapshot({ daemonEpoch: "epoch-1", sequence: "4", registryRevision: 1, runtime: null, role: "observer", taskState: "READY", processState: "LIVE", outcome: "NONE" }).model).toEqual({ provider: "anthropic", id: "claude" });
+    expect(() => normalizer().consumeFrame({ type: "response", command: "cycle_model", success: true, data: null })).not.toThrow();
   });
 
   it("bounds unknown optional events and reports malformed required shapes as typed session errors", () => {

@@ -296,6 +296,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     const at = timestamp(frame.timestamp) ?? timestamp(frame.message?.timestamp) ?? now();
     if (frame.type === "response") {
       if (frame.success !== true || !["get_state", "set_model", "cycle_model"].includes(frame.command)) return [];
+      if (frame.command === "cycle_model" && frame.data === null) return [];
       const state = record(frame.data);
       if (state === undefined) incompatible("PI_REQUIRED_SHAPE", `Pi ${frame.command} response requires data`);
       const output = [];
@@ -330,7 +331,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       currentAssistant ??= { itemId: deterministicId("live-assistant", { at, index: liveIndex + 1 }), blocks: [], delta: 0 };
       const output = [];
       if (update.type === "text_delta" || update.type === "thinking_delta") {
-        if (typeof update.delta !== "string") incompatible("PI_REQUIRED_SHAPE", "Pi assistant delta requires delta text");
+        if (typeof update.delta !== "string" || !Number.isSafeInteger(update.contentIndex) || update.contentIndex < 0) incompatible("PI_REQUIRED_SHAPE", "Pi assistant delta requires text and a non-negative content index");
         currentAssistant.delta += 1;
         const blockType = update.type === "thinking_delta" ? "thinking" : "text";
         const block = currentAssistant.blocks[update.contentIndex] ?? { type: blockType, text: "" };
@@ -340,8 +341,8 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
         const partial = { kind: "assistant_message", itemId: currentAssistant.itemId, content: currentAssistant.blocks.filter(Boolean).map((/** @type {any} */ entry) => ({ ...entry })) };
         items.set(currentAssistant.itemId, partial);
         const deltaId = deterministicId("assistant-delta", { itemId: currentAssistant.itemId, contentIndex: update.contentIndex, type: update.type, cumulative: block.text });
-        output.push(...publish({ kind: "assistant_delta", itemId: currentAssistant.itemId, delta: bound(update.delta, MAX_TEXT_BYTES) }, deltaId, at));
-        output.push(...replaceActivity(update.type === "thinking_delta" ? "thinking" : "assistant_streaming", update.type === "thinking_delta" ? "Thinking" : "Assistant streaming", sourceId));
+        output.push(...publish({ kind: "assistant_delta", itemId: currentAssistant.itemId, contentIndex: update.contentIndex, contentType: blockType, delta: bound(update.delta, MAX_TEXT_BYTES) }, deltaId, at));
+        output.push(...replaceActivity(update.type === "thinking_delta" ? "thinking" : "assistant_streaming", update.type === "thinking_delta" ? "Thinking" : "Assistant streaming", deltaId));
       } else if (update.type === "toolcall_start") {
         if (typeof update.id !== "string" || typeof update.toolName !== "string") incompatible("PI_REQUIRED_SHAPE", "Pi tool-call start requires id and toolName");
         const tool = { id: update.id, name: bound(update.toolName, 256), state: "pending", arguments: {}, startedAt: at };
@@ -427,13 +428,21 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     if (event?.sessionId !== sessionId || typeof event.eventId !== "string" || record(event.payload) === undefined) incompatible("INVALID_VIEWER_EVENT", "Durable viewer event does not match the normalizer session");
     const payload = event.payload;
     emitted.set(event.eventId, canonical(payload));
-    if (["user_message", "assistant_message", "system_message"].includes(payload.kind)) items.set(payload.itemId, payload);
-    else if (["image_placeholder", "file_placeholder"].includes(payload.kind)) items.set(payload.attachment.id, payload);
+    if (["user_message", "assistant_message", "system_message"].includes(payload.kind)) {
+      items.set(payload.itemId, payload);
+      if (payload.kind === "assistant_message" && currentAssistant?.itemId === payload.itemId) currentAssistant = undefined;
+    } else if (["image_placeholder", "file_placeholder"].includes(payload.kind)) items.set(payload.attachment.id, payload);
     else if (payload.kind === "unknown_pi_event") items.set(event.eventId, payload);
     else if (payload.kind === "assistant_delta") {
-      const prior = items.get(payload.itemId);
-      const priorText = prior?.kind === "assistant_message" ? prior.content.filter((/** @type {any} */ block) => block.type === "text").map((/** @type {any} */ block) => block.text).join("") : "";
-      items.set(payload.itemId, { kind: "assistant_message", itemId: payload.itemId, content: [{ type: "text", text: bound(`${priorText}${payload.delta}`, MAX_TEXT_BYTES) }] });
+      const contentIndex = Number.isSafeInteger(payload.contentIndex) && payload.contentIndex >= 0 ? payload.contentIndex : 0;
+      const contentType = ["text", "thinking"].includes(payload.contentType) ? payload.contentType : "text";
+      if (currentAssistant?.itemId !== payload.itemId) currentAssistant = { itemId: payload.itemId, blocks: [], delta: 0 };
+      const block = currentAssistant.blocks[contentIndex] ?? { type: contentType, text: "" };
+      block.type = contentType;
+      block.text = bound(`${block.text}${payload.delta}`, MAX_TEXT_BYTES);
+      currentAssistant.blocks[contentIndex] = block;
+      currentAssistant.delta += 1;
+      items.set(payload.itemId, { kind: "assistant_message", itemId: payload.itemId, content: currentAssistant.blocks.filter(Boolean).map((/** @type {any} */ entry) => ({ ...entry })) });
     } else if (["tool_started", "tool_updated", "tool_finished"].includes(payload.kind)) tools.set(payload.tool.id, payload.tool);
     else if (payload.kind === "pending_ui_request") pendingUi.set(payload.request.id, payload.request);
     else if (payload.kind === "ui_resolved") pendingUi.delete(payload.requestId);
@@ -453,7 +462,12 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     model = restored.model;
     thinkingLevel = restored.thinkingLevel;
     activity = restored.activity;
-    if (["assistant_streaming", "thinking"].includes(activity.phase)) {
+    currentAssistant = undefined;
+    if (restored.activeAssistant !== undefined && restored.activeAssistant !== null) {
+      const blocks = [];
+      for (const block of restored.activeAssistant.blocks) blocks[block.contentIndex] = { type: block.type, text: block.text };
+      currentAssistant = { itemId: restored.activeAssistant.itemId, blocks, delta: 0 };
+    } else if (restored.activeAssistant === undefined && ["assistant_streaming", "thinking"].includes(activity.phase)) {
       const assistants = restored.items.filter((/** @type {any} */ item) => item.kind === "assistant_message");
       const partial = assistants.at(-1);
       if (partial !== undefined) currentAssistant = { itemId: partial.itemId, blocks: partial.content.map((/** @type {any} */ block) => ({ ...block })), delta: 0 };
@@ -482,6 +496,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       activity,
       model: model ?? runtimeState.model ?? null,
       thinkingLevel: thinkingLevel ?? runtimeState.thinkingLevel ?? null,
+      activeAssistant: currentAssistant === undefined ? null : { itemId: currentAssistant.itemId, blocks: currentAssistant.blocks.flatMap((/** @type {any} */ block, /** @type {number} */ contentIndex) => block === undefined ? [] : [{ contentIndex, type: block.type, text: block.text }]) },
       items: [...items.values()],
       tools: [...tools.values()],
       pendingUi: [...pendingUi.values()],

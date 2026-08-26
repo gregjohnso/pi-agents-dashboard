@@ -63,7 +63,7 @@ function payload(value, path) {
   const item = record(value, path); string(item.kind, `${path}.kind`);
   switch (item.kind) {
     case "user_message": case "assistant_message": exact(item, ["kind", "itemId", "content"], [], path); string(item.itemId, `${path}.itemId`); content(item.content, `${path}.content`); break;
-    case "assistant_delta": exact(item, ["kind", "itemId", "delta"], [], path); string(item.itemId, `${path}.itemId`); if (typeof item.delta !== "string" || item.delta.length > 65536) throw new TypeError(`${path}.delta must be a bounded string`); break;
+    case "assistant_delta": exact(item, ["kind", "itemId", "delta"], ["contentIndex", "contentType"], path); string(item.itemId, `${path}.itemId`); if (typeof item.delta !== "string" || item.delta.length > 65536) throw new TypeError(`${path}.delta must be a bounded string`); if (Object.hasOwn(item, "contentIndex") !== Object.hasOwn(item, "contentType") || (Object.hasOwn(item, "contentIndex") && (!Number.isSafeInteger(item.contentIndex) || item.contentIndex < 0 || !["text", "thinking"].includes(item.contentType)))) throw new TypeError(`${path} content block identity is invalid`); break;
     case "system_message": exact(item, ["kind", "itemId", "text", "level"], [], path); string(item.itemId, `${path}.itemId`); if (typeof item.text !== "string" || item.text.length > 16384) throw new TypeError(`${path}.text must be a bounded string`); enumeration(item.level, ["info", "warning", "error"], `${path}.level`); break;
     case "tool_started": case "tool_updated": case "tool_finished": exact(item, ["kind", "tool"], [], path); tool(item.tool, `${path}.tool`); break;
     case "turn_state": exact(item, ["kind", "working"], [], path); if (typeof item.working !== "boolean") throw new TypeError(`${path}.working must be boolean`); break;
@@ -77,6 +77,17 @@ function payload(value, path) {
     default: throw new TypeError(`${path}.kind is invalid`);
   }
   return item;
+}
+/** @param {unknown} value @param {string} path */
+function activeAssistant(value, path) {
+  const assistant = record(value, path); exact(assistant, ["itemId", "blocks"], [], path); string(assistant.itemId, `${path}.itemId`);
+  if (!Array.isArray(assistant.blocks)) throw new TypeError(`${path}.blocks must be an array`);
+  const indexes = new Set();
+  assistant.blocks.forEach((entry, index) => {
+    const block = record(entry, `${path}.blocks[${index}]`); exact(block, ["contentIndex", "type", "text"], [], `${path}.blocks[${index}]`);
+    if (!Number.isSafeInteger(block.contentIndex) || block.contentIndex < 0 || indexes.has(block.contentIndex)) throw new TypeError(`${path}.blocks[${index}].contentIndex is invalid`);
+    indexes.add(block.contentIndex); enumeration(block.type, ["text", "thinking"], `${path}.blocks[${index}].type`); if (typeof block.text !== "string" || block.text.length > 65536) throw new TypeError(`${path}.blocks[${index}].text must be bounded`);
+  });
 }
 /** @param {unknown} value @param {string} path */
 function processIdentity(value, path) { const item = record(value, path); exact(item, ["pid", "startIdentity", "processGroupId"], [], path); if (!Number.isSafeInteger(item.pid) || !Number.isSafeInteger(item.processGroupId)) throw new TypeError(`${path} process IDs are invalid`); string(item.startIdentity, `${path}.startIdentity`); }
@@ -100,10 +111,10 @@ export function parseViewerEvent(value) {
 
 /** Parse one strict normalized viewer snapshot. @param {unknown} value @returns {ViewerSnapshot} */
 export function parseViewerSnapshot(value) {
-  const snapshot = record(value, "viewer snapshot"); exact(snapshot, ["version", "sessionId", "registryRevision", "cursor", "runtime", "role", "taskState", "processState", "outcome", "activity", "model", "thinkingLevel", "items", "tools", "pendingUi", "errors"], [], "viewer snapshot"); if (snapshot.version !== 1) throw new TypeError("viewer snapshot.version must be 1");
+  const snapshot = record(value, "viewer snapshot"); exact(snapshot, ["version", "sessionId", "registryRevision", "cursor", "runtime", "role", "taskState", "processState", "outcome", "activity", "model", "thinkingLevel", "items", "tools", "pendingUi", "errors"], ["activeAssistant"], "viewer snapshot"); if (snapshot.version !== 1) throw new TypeError("viewer snapshot.version must be 1");
   string(snapshot.sessionId, "viewer snapshot.sessionId"); if (!Number.isSafeInteger(snapshot.registryRevision) || snapshot.registryRevision < 0) throw new TypeError("viewer snapshot.registryRevision is invalid"); const parsedCursor = cursor(snapshot.cursor, "viewer snapshot.cursor"); if (parsedCursor.sessionId !== snapshot.sessionId) throw new TypeError("viewer cursor session does not match snapshot session");
   if (snapshot.runtime !== null) runtime(snapshot.runtime, "viewer snapshot.runtime"); enumeration(snapshot.role, ["composer", "observer"], "viewer snapshot.role"); enumeration(snapshot.taskState, ["WORKING", "WAITING", "READY", "FAILED", "STOPPED"], "viewer snapshot.taskState"); enumeration(snapshot.processState, ["LIVE", "SLEEPING", "EXITED", "STALE"], "viewer snapshot.processState"); enumeration(snapshot.outcome, ["NONE", "COMPLETED", "READY_FOR_REVIEW"], "viewer snapshot.outcome");
   const activity = payload(snapshot.activity, "viewer snapshot.activity"); if (activity.kind !== "activity") throw new TypeError("viewer snapshot.activity must be activity");
-  if (snapshot.model !== null) { const model = record(snapshot.model, "viewer snapshot.model"); exact(model, ["provider", "id"], [], "viewer snapshot.model"); string(model.provider, "viewer snapshot.model.provider"); string(model.id, "viewer snapshot.model.id"); } string(snapshot.thinkingLevel, "viewer snapshot.thinkingLevel", true);
+  if (snapshot.model !== null) { const model = record(snapshot.model, "viewer snapshot.model"); exact(model, ["provider", "id"], [], "viewer snapshot.model"); string(model.provider, "viewer snapshot.model.provider"); string(model.id, "viewer snapshot.model.id"); } string(snapshot.thinkingLevel, "viewer snapshot.thinkingLevel", true); if (snapshot.activeAssistant !== undefined && snapshot.activeAssistant !== null) activeAssistant(snapshot.activeAssistant, "viewer snapshot.activeAssistant");
   if (!Array.isArray(snapshot.items) || !Array.isArray(snapshot.tools) || !Array.isArray(snapshot.pendingUi) || !Array.isArray(snapshot.errors)) throw new TypeError("viewer snapshot collections must be arrays"); snapshot.items.forEach((item, index) => { const parsed = payload(item, `viewer snapshot.items[${index}]`); if (!ITEM_KINDS.includes(parsed.kind)) throw new TypeError(`viewer snapshot.items[${index}] is not a viewer item`); }); snapshot.tools.forEach((item, index) => tool(item, `viewer snapshot.tools[${index}]`)); snapshot.pendingUi.forEach((item, index) => uiRequest(item, `viewer snapshot.pendingUi[${index}]`)); snapshot.errors.forEach((entry, index) => { const error = record(entry, `viewer snapshot.errors[${index}]`); exact(error, ["code", "message", "retryable"], [], `viewer snapshot.errors[${index}]`); string(error.code, `viewer snapshot.errors[${index}].code`); if (typeof error.message !== "string" || typeof error.retryable !== "boolean") throw new TypeError(`viewer snapshot.errors[${index}] is invalid`); }); return snapshot;
 }

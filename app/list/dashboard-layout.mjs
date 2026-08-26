@@ -67,7 +67,7 @@ function columnsForWidth(width) {
 export function createDashboardLayout(width, height) {
     const normalizedWidth = normalizedDimension(width);
     const normalizedHeight = normalizedDimension(height);
-    const listTop = Math.min(6, normalizedHeight);
+    const listTop = Math.min(5, normalizedHeight);
     return {
         width: normalizedWidth,
         height: normalizedHeight,

@@ -175,8 +175,8 @@ it("drives list navigation, search/filter/sort/group, metadata/help, composer, c
   f.dashboard.toggleHelp();
   f.dashboard.handleInput("n");
   expect(f.dashboard.focus).toBe("composer");
-  f.dashboard.handleInput("draft");
-  f.dashboard.handleInput("\x03");
+  for (const input of "draft") f.dashboard.handleInput(input);
+  f.dashboard.handleInput("\x1b");
   expect(f.dashboard.focus).toBe("list");
 
   f.dashboard.selectSession("live");
@@ -192,8 +192,11 @@ it("drives list navigation, search/filter/sort/group, metadata/help, composer, c
   f.dashboard.handleInput("y");
   await vi.waitFor(() => expect(f.backend.delete).toHaveBeenCalledWith("live", 5, "terminal-request"));
 
+  f.dashboard.handleInput("n");
+  expect(f.dashboard.focus).toBe("composer");
   f.dashboard.handleInput("\x03");
   await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith({ kind: "closed" }));
+  expect(f.dashboard.composerDraft.prompt).toBe("draft");
   expect(f.backend.stop).toHaveBeenCalledTimes(1);
   expect(f.backend.delete).toHaveBeenCalledTimes(1);
 });

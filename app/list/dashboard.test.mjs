@@ -1,6 +1,10 @@
+import { stripVTControlCharacters } from "node:util";
+
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
+
 import { DashboardController, createDaemonDashboardBackend, } from "./dashboard.mjs";
+import { JOBWATCH_ANSI } from "./dashboard-theme.mjs";
 const timestamp = "2026-08-25T12:00:00.000Z";
 function session(id, overrides = {}) {
     return {
@@ -99,6 +103,25 @@ describe("dashboard controller", () => {
         expect(dashboard.selectedSessionId).toBeDefined();
         expect(dashboard.render(80, 14).length).toBeLessThanOrEqual(14);
     });
+    it("renders Jobwatch-style surfaces, focus borders, selection, and key hints", async () => {
+        const dashboard = controller(new FakeBackend([session("a")]));
+        await dashboard.open();
+        const listFocused = dashboard.render(100, 16);
+        expect(listFocused[0]).toContain(JOBWATCH_ANSI.headerBackground);
+        expect(listFocused[1]).toContain(JOBWATCH_ANSI.surfaceBackground);
+        expect(listFocused[3]).toContain(JOBWATCH_ANSI.sky);
+        expect(stripVTControlCharacters(listFocused[3])).toContain("Sessions");
+        expect(listFocused.at(-4)).toContain(JOBWATCH_ANSI.gray);
+        expect(stripVTControlCharacters(listFocused.at(-4))).toContain("New Session");
+        expect(listFocused.at(-1)).toContain(JOBWATCH_ANSI.surfaceBackground);
+        expect(stripVTControlCharacters(listFocused.at(-1))).toContain("Ctrl+C quit");
+
+        dashboard.handleInput("\x1b[B");
+        const composerFocused = dashboard.render(100, 16);
+        expect(composerFocused[3]).toContain(JOBWATCH_ANSI.gray);
+        expect(composerFocused.at(-4)).toContain(JOBWATCH_ANSI.sky);
+        expect(composerFocused.at(-3)).toContain(JOBWATCH_ANSI.selectionBackground);
+    });
     it("applies search, task/project filters, grouping, and sort independently without changing selected ID", async () => {
         const waiting = session("waiting", { taskState: "WAITING", processState: "LIVE", outcome: "NONE", cwd: "/repo/a", activity: { kind: "ui", summary: "Need approval", updatedAt: timestamp } });
         const ready = session("ready", { cwd: "/repo/b" });
@@ -130,19 +153,41 @@ describe("dashboard controller", () => {
         reopened.handleInput("\x1b");
         expect(backend.unsubscribed).toBe(2);
     });
-    it("returns composer focus on Ctrl+C with draft intact and ignores blank Enter", async () => {
+    it.each([
+        ["an empty list", []],
+        ["the last row", [session("a")]],
+    ])("moves focus from %s to New Session with Down and back with Up", async (_label, sessions) => {
+        const dashboard = controller(new FakeBackend(sessions));
+        await dashboard.open();
+        dashboard.handleInput("\x1b[B");
+        expect(dashboard.focus).toBe("composer");
+        dashboard.handleInput("\x1b[A");
+        expect(dashboard.focus).toBe("list");
+    });
+    it("returns composer focus with Escape and ignores blank Enter", async () => {
         const backend = new FakeBackend([]);
         const dashboard = controller(backend);
         await dashboard.open();
         dashboard.focusComposer();
         dashboard.setComposerPrompt("draft");
-        dashboard.handleInput("\x03");
+        dashboard.handleInput("\x1b");
         expect(dashboard.focus).toBe("list");
         expect(dashboard.composerDraft.prompt).toBe("draft");
         dashboard.focusComposer();
         dashboard.setComposerPrompt("   ");
         await dashboard.submitComposer();
         expect(backend.requests).toEqual([]);
+    });
+    it("closes the list from New Session on Ctrl+C with its draft intact", async () => {
+        const backend = new FakeBackend([]);
+        const onClose = vi.fn();
+        const dashboard = controller(backend, { onClose });
+        await dashboard.open();
+        dashboard.focusComposer();
+        dashboard.setComposerPrompt("draft");
+        dashboard.handleInput("\x03");
+        await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith({ kind: "closed" }));
+        expect(dashboard.composerDraft.prompt).toBe("draft");
     });
     it("launches worktrees and requires exact canonical shared-directory confirmation", async () => {
         const backend = new FakeBackend([]);

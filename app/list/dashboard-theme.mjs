@@ -2,15 +2,16 @@ export const JOBWATCH_ANSI = {
     reset: "\x1b[0m",
     bold: "\x1b[1m",
     blackBackground: "\x1b[48;2;0;0;0m",
-    surfaceBackground: "\x1b[48;2;9;9;11m",
-    selectionBackground: "\x1b[48;2;39;39;42m",
-    text: "\x1b[38;2;228;228;231m",
-    sky: "\x1b[38;2;56;189;248m",
-    cyan: "\x1b[38;2;34;211;238m",
-    green: "\x1b[38;2;74;222;128m",
-    amber: "\x1b[38;2;251;191;36m",
-    rose: "\x1b[38;2;251;113;133m",
-    gray: "\x1b[38;2;113;113;122m",
+    surfaceBackground: "\x1b[48;2;17;17;17m",
+    headerBackground: "\x1b[48;2;2;132;199m",
+    selectionBackground: "\x1b[48;2;54;54;54m",
+    text: "\x1b[38;2;255;255;255m",
+    sky: "\x1b[38;2;125;211;252m",
+    cyan: "\x1b[38;2;125;211;252m",
+    green: "\x1b[38;2;110;231;183m",
+    amber: "\x1b[38;2;252;211;77m",
+    rose: "\x1b[38;2;253;164;175m",
+    gray: "\x1b[38;2;136;136;136m",
 };
 function paint(text, foreground, selected, background = JOBWATCH_ANSI.blackBackground) {
     const rowBackground = selected ? JOBWATCH_ANSI.selectionBackground : background;
@@ -32,8 +33,29 @@ function stateColor(session) {
 }
 /** Fixed Jobwatch-style colors used by the raw dashboard renderer. */
 export const jobwatchTheme = {
+    title(text) {
+        return paint(text, `${JOBWATCH_ANSI.bold}${JOBWATCH_ANSI.text}`, false, JOBWATCH_ANSI.headerBackground);
+    },
+    surface(text) {
+        return paint(text, JOBWATCH_ANSI.text, false, JOBWATCH_ANSI.surfaceBackground);
+    },
+    keyHints(text) {
+        return paint(text, JOBWATCH_ANSI.gray, false, JOBWATCH_ANSI.surfaceBackground);
+    },
+    focusBorder(text) {
+        return paint(text, JOBWATCH_ANSI.sky, false);
+    },
+    inactiveBorder(text) {
+        return paint(text, JOBWATCH_ANSI.gray, false);
+    },
+    panel(text, focused) {
+        return paint(text, JOBWATCH_ANSI.text, focused);
+    },
+    error(text) {
+        return paint(text, JOBWATCH_ANSI.rose, false);
+    },
     header(text) {
-        return paint(text, `${JOBWATCH_ANSI.bold}${JOBWATCH_ANSI.sky}`, false, JOBWATCH_ANSI.surfaceBackground);
+        return paint(text, `${JOBWATCH_ANSI.bold}${JOBWATCH_ANSI.gray}`, false, JOBWATCH_ANSI.surfaceBackground);
     },
     group(text) {
         return paint(text, JOBWATCH_ANSI.sky, false, JOBWATCH_ANSI.surfaceBackground);

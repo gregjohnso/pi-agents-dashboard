@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { stripVTControlCharacters } from "node:util";
+
 import { decodeKittyPrintable, Key, matchesKey, truncateToWidth, visibleWidth, } from "@earendil-works/pi-tui";
 import { countDashboardSessions, selectDashboardSessions, } from "./dashboard-state.mjs";
 import { createDashboardLayout, renderColumnHeader, } from "./dashboard-layout.mjs";
+import { jobwatchTheme } from "./dashboard-theme.mjs";
 import { confirmationMatchesSession, createDeliveryUnknownOverlay, createHelpOverlay, createMetadataOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, } from "./dashboard-overlays.mjs";
 import { createLaunchDraft, prepareLaunchRequest, } from "./launch-composer.mjs";
 import { VirtualSessionList } from "./virtual-session-list.mjs";
@@ -177,6 +180,14 @@ function cycleValue(values, current) {
 function fitLine(line, width) {
     const clipped = truncateToWidth(line.replace(/[\r\n\u2028\u2029]/gu, " "), Math.max(0, width), "");
     return clipped + " ".repeat(Math.max(0, width - visibleWidth(clipped)));
+}
+function paintPlainLine(text, width, paint) {
+    return paint(fitLine(stripVTControlCharacters(String(text)), width));
+}
+function sectionBorder(label, width, focused) {
+    const prefix = `╭─ ${label} `;
+    const line = prefix + "─".repeat(Math.max(0, width - visibleWidth(prefix)));
+    return paintPlainLine(line, width, focused ? jobwatchTheme.focusBorder : jobwatchTheme.inactiveBorder);
 }
 /** Own dashboard subscription, focus, selection, launch, rendering, and disposal. */
 export class DashboardController {
@@ -432,10 +443,14 @@ export class DashboardController {
         await this.openViewer(selected.sessionId);
     }
     handleInput(data) {
+        if (matchesKey(data, Key.ctrl("c")) && !(this.overlay?.kind === "session_confirmation" && this.overlay.submitting)) {
+            void this.close();
+            return;
+        }
         if (this.overlay?.kind === "session_confirmation") {
             if (this.overlay.submitting)
                 return;
-            if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c")) || data.toLowerCase() === "n") {
+            if (matchesKey(data, Key.escape) || data.toLowerCase() === "n") {
                 this.overlay = undefined;
                 return;
             }
@@ -445,7 +460,7 @@ export class DashboardController {
             return;
         }
         if (this.focus === "confirmation") {
-            if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+            if (matchesKey(data, Key.escape)) {
                 this.focus = "composer";
                 this.pendingShared = undefined;
                 this.confirmationText = "";
@@ -466,7 +481,7 @@ export class DashboardController {
             return;
         }
         if (this.focus === "search") {
-            if (matchesKey(data, Key.enter) || matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+            if (matchesKey(data, Key.enter) || matchesKey(data, Key.escape)) {
                 this.focus = "list";
                 return;
             }
@@ -480,7 +495,7 @@ export class DashboardController {
             return;
         }
         if (this.focus === "composer") {
-            if (matchesKey(data, Key.ctrl("c")) || matchesKey(data, Key.escape)) {
+            if (matchesKey(data, Key.escape) || matchesKey(data, Key.up)) {
                 this.focus = "list";
                 return;
             }
@@ -511,7 +526,7 @@ export class DashboardController {
                 this.editComposerField((value) => value + printable);
             return;
         }
-        if (matchesKey(data, Key.ctrl("c")) || matchesKey(data, Key.escape) || matchesKey(data, Key.left)) {
+        if (matchesKey(data, Key.escape) || matchesKey(data, Key.left)) {
             void this.close();
             return;
         }
@@ -527,8 +542,13 @@ export class DashboardController {
             void this.activateSelection();
             return;
         }
-        if (matchesKey(data, Key.down))
-            this.moveSelection(1);
+        if (matchesKey(data, Key.down)) {
+            const lastSessionRow = this.list.rows.findLastIndex((row) => row.kind === "session");
+            if (lastSessionRow < 0 || this.list.selectedRowIndex === lastSessionRow)
+                this.focusComposer();
+            else
+                this.moveSelection(1);
+        }
         else if (matchesKey(data, Key.up))
             this.moveSelection(-1);
         else if (matchesKey(data, Key.pageDown))
@@ -610,25 +630,29 @@ export class DashboardController {
             const counts = countDashboardSessions(this.sessions);
             const lines = Array.from({ length: this.height }, () => "");
             if (lines.length > 0)
-                lines[0] = " pi-dashboard";
+                lines[0] = paintPlainLine(" pi-dashboard", this.width, jobwatchTheme.title);
             if (lines.length > 1)
-                lines[1] = ` Working ${counts.working}  Ready ${counts.ready}  Failed ${counts.failed}  Sessions ${counts.sessions}  Processes ${counts.processes}`;
+                lines[1] = paintPlainLine(` Working ${counts.working}  Ready ${counts.ready}  Failed ${counts.failed}  Sessions ${counts.sessions}  Processes ${counts.processes}`, this.width, jobwatchTheme.surface);
             if (lines.length > 2)
-                lines[2] = ` ${this.controlSegments().join(" ")}`;
+                lines[2] = paintPlainLine(` ${this.controlSegments().join(" ")}`, this.width, jobwatchTheme.keyHints);
             if (lines.length > 3)
-                lines[3] = renderColumnHeader(layout);
+                lines[3] = sectionBorder("Sessions", this.width, this.focus === "list" || this.focus === "search");
+            if (lines.length > 4)
+                lines[4] = renderColumnHeader(layout);
             const rendered = this.list.renderViewport({ offset: this.viewportOffset, height: layout.listHeight, width: this.width });
             for (let index = 0; index < rendered.length; index += 1) {
                 const target = layout.listTop + index;
                 if (target < lines.length)
                     lines[target] = rendered[index].line;
             }
-            if (lines.length >= 3) {
-                const composerMarker = this.focus === "composer" ? `[${this.composerField}]` : "";
-                lines[lines.length - 3] = `❯${composerMarker} ${this.composerDraft.prompt || "describe a task for a new session"}`;
-                const form = `cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
-                lines[lines.length - 2] = this.status.kind === "error" ? `${this.status.code}: ${this.status.message}  ${form}` : form;
-                lines[lines.length - 1] = " ↑↓ nav Enter/→ open / search t/p/o/a/j filters s sort g group n form Tab fields ^X intent ? help";
+            if (lines.length >= 4) {
+                const composerFocused = this.focus === "composer" || this.focus === "confirmation";
+                const composerMarker = composerFocused ? `[${this.composerField}]` : "";
+                lines[lines.length - 4] = sectionBorder("New Session", this.width, composerFocused);
+                lines[lines.length - 3] = paintPlainLine(` ❯${composerMarker} ${this.composerDraft.prompt || "describe a task for a new session"}`, this.width, (text) => jobwatchTheme.panel(text, composerFocused));
+                const form = ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
+                lines[lines.length - 2] = paintPlainLine(this.status.kind === "error" ? ` ${this.status.code}: ${this.status.message}  ${form}` : form, this.width, this.status.kind === "error" ? jobwatchTheme.error : jobwatchTheme.surface);
+                lines[lines.length - 1] = paintPlainLine(" Ctrl+C quit  ↑↓ navigate  Enter/→ open  ←/Esc back  / search  n form  Tab fields  ^X action  ? help", this.width, jobwatchTheme.keyHints);
             }
             this.renderOverlay(lines);
             const result = lines.map((line) => fitLine(line, this.width));

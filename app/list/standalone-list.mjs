@@ -80,7 +80,7 @@ export function createDaemonViewerClient({ client, clientId }) {
 }
 
 /** Run one list-to-viewer transition and restore the list after any failure. @param {any} options */
-export async function runViewerTransition({ sessionId, viewerClient, controller, createViewer, activateViewer, activateList, clearFocus, shouldRestore }) {
+export async function runViewerTransition({ sessionId, viewerClient, controller, createViewer, activateViewer, activateList, restoreListFocus, onRestoreClosed, shouldRestore }) {
   let attached = false;
   let restoreList = false;
   let viewer;
@@ -99,11 +99,47 @@ export async function runViewerTransition({ sessionId, viewerClient, controller,
   } finally {
     await viewer?.close().catch(() => {});
     if (attached) await viewerClient.detach(sessionId).catch(() => {});
-    activateList();
-    clearFocus();
     if (restoreList && shouldRestore()) await controller.open();
+    if (shouldRestore()) {
+      if (controller.closed) onRestoreClosed?.();
+      else {
+        activateList();
+        restoreListFocus();
+      }
+    }
   }
   return failure === undefined ? { kind: "returned" } : { kind: "failed", error: failure };
+}
+
+/** Start the alternate-screen TUI and restore terminal state after partial startup. @param {any} tui */
+export function startStandaloneTui(tui) {
+  try {
+    tui.start();
+  } catch (error) {
+    try {
+      tui.stop({ preserveScreen: true });
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], "TUI startup and terminal restoration failed");
+    }
+    throw error;
+  }
+}
+
+/** Mount and focus the single input router used by the standalone list/viewer host. @param {any} options */
+export function mountStandaloneHost({ tui, getActive, getHeight }) {
+  const resolveHeight = getHeight ?? (() => tui.terminal.rows ?? 24);
+  const component = {
+    focused: false,
+    render(width) { return getActive().render(width, resolveHeight()); },
+    handleInput(data) { getActive().handleInput(data); tui.requestRender(); },
+    invalidate() {},
+  };
+  tui.addChild(component);
+  tui.setFocus(component);
+  return {
+    component,
+    focus() { tui.setFocus(component); },
+  };
 }
 
 /** Open the relocated list and real viewer in one package-root TUI. @param {any} options */
@@ -122,6 +158,7 @@ export async function createStandaloneList({ cwd, frontend }) {
   let switching = false;
   let activeViewer;
   let active;
+  let standaloneHost;
   const closed = new Promise((resolve) => { resolveClosed = resolve; });
   const openRealViewer = async (sessionId) => {
     if (switching || activeViewer !== undefined) return;
@@ -141,7 +178,8 @@ export async function createStandaloneList({ cwd, frontend }) {
       },
       activateViewer(viewer) { activeViewer = viewer; active = viewer; },
       activateList() { activeViewer = undefined; active = controller; },
-      clearFocus() { tui.setFocus(null); },
+      restoreListFocus() { standaloneHost.focus(); },
+      onRestoreClosed() { tui.stop(); resolveClosed(); },
       shouldRestore() { return closing === undefined; },
     });
     switching = false;
@@ -153,13 +191,9 @@ export async function createStandaloneList({ cwd, frontend }) {
     onClose: () => { if (!switching && activeViewer === undefined) { tui.stop(); resolveClosed(); } },
   });
   active = controller;
-  tui.addChild({
-    render(width) { return active.render(width, process.stdout.rows ?? 24); },
-    handleInput(data) { active.handleInput(data); tui.requestRender(); },
-    invalidate() {},
-  });
+  standaloneHost = mountStandaloneHost({ tui, getActive: () => active });
   await controller.open();
-  tui.start();
+  startStandaloneTui(tui);
   let closing;
   return {
     closed,

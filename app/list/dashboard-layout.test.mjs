@@ -101,13 +101,26 @@ describe("responsive dashboard layout", () => {
         expect(lines[0]).toContain(JOBWATCH_ANSI.cyan);
         expect(lines[1]).toContain(JOBWATCH_ANSI.sky);
     });
-    it("uses the Jobwatch palette for information, state, selection, and black surfaces", () => {
+    it("uses Jobwatch's exact surface, selection, accent, and semantic colors", () => {
+        expect(JOBWATCH_ANSI).toMatchObject({
+            blackBackground: "\x1b[48;2;0;0;0m",
+            surfaceBackground: "\x1b[48;2;17;17;17m",
+            headerBackground: "\x1b[48;2;2;132;199m",
+            selectionBackground: "\x1b[48;2;54;54;54m",
+            text: "\x1b[38;2;255;255;255m",
+            sky: "\x1b[38;2;125;211;252m",
+            cyan: "\x1b[38;2;125;211;252m",
+            green: "\x1b[38;2;110;231;183m",
+            amber: "\x1b[38;2;252;211;77m",
+            rose: "\x1b[38;2;253;164;175m",
+            gray: "\x1b[38;2;136;136;136m",
+        });
         const layout = createDashboardLayout(120, 20);
         const working = renderSessionRow(fixtures[0], layout, { now });
         const waitingSelected = renderSessionRow(fixtures[1], layout, { now, selected: true });
         const failed = renderSessionRow(fixtures[3], layout, { now });
         const completed = renderSessionRow(fixtures[6], layout, { now });
-        expect(renderColumnHeader(layout)).toContain(JOBWATCH_ANSI.sky);
+        expect(renderColumnHeader(layout)).toContain(JOBWATCH_ANSI.gray);
         expect(working).toContain(JOBWATCH_ANSI.green);
         expect(waitingSelected).toContain(JOBWATCH_ANSI.amber);
         expect(waitingSelected).toContain(JOBWATCH_ANSI.selectionBackground);

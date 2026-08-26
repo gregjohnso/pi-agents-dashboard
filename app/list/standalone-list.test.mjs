@@ -52,7 +52,7 @@ it("keeps the list open and does not signal when viewer attach fails", async () 
   const activateList = vi.fn();
   const result = await runViewerTransition({
     sessionId: "session", viewerClient, controller, createViewer,
-    activateViewer: vi.fn(), activateList, clearFocus: vi.fn(), shouldRestore: () => true,
+    activateViewer: vi.fn(), activateList, restoreListFocus: vi.fn(), shouldRestore: () => true,
   });
   expect(result).toEqual({ kind: "failed", error: attachError });
   expect(controller.close).not.toHaveBeenCalled();
@@ -69,37 +69,77 @@ it("detaches and reopens the same list when viewer construction fails", async ()
   const controller = { close: vi.fn(async () => {}), open: vi.fn(async () => {}) };
   const activateViewer = vi.fn();
   const activateList = vi.fn();
-  const clearFocus = vi.fn();
+  const restoreListFocus = vi.fn();
   const result = await runViewerTransition({
     sessionId: "session", viewerClient, controller,
     createViewer() { throw constructionError; },
-    activateViewer, activateList, clearFocus, shouldRestore: () => true,
+    activateViewer, activateList, restoreListFocus, shouldRestore: () => true,
   });
   expect(result).toEqual({ kind: "failed", error: constructionError });
   expect(viewerClient.detach).toHaveBeenCalledWith("session");
   expect(controller.open).toHaveBeenCalledOnce();
   expect(activateViewer).not.toHaveBeenCalled();
   expect(activateList).toHaveBeenCalledOnce();
-  expect(clearFocus).toHaveBeenCalledOnce();
+  expect(restoreListFocus).toHaveBeenCalledOnce();
   expect(viewerClient.command).not.toHaveBeenCalled();
 });
 
-it("replaces the active list with the viewer and returns in the same host", async () => {
+it("reopens the list before exposing and focusing it after the viewer returns", async () => {
   let resolveViewer;
+  let resolveOpen;
   const viewerClient = { attach: vi.fn(async () => {}), detach: vi.fn(async () => {}) };
-  const controller = { close: vi.fn(async () => {}), open: vi.fn(async () => {}) };
+  const controller = {
+    closed: false,
+    close: vi.fn(async () => { controller.closed = true; }),
+    open: vi.fn(() => new Promise((resolve) => { resolveOpen = () => { controller.closed = false; resolve(); }; })),
+  };
   const viewer = { open: vi.fn(async () => {}), closed: new Promise((resolve) => { resolveViewer = resolve; }), close: vi.fn(async () => {}) };
+  const activateList = vi.fn();
+  const restoreListFocus = vi.fn();
   let active = controller;
   const transition = runViewerTransition({
     sessionId: "session", viewerClient, controller, createViewer: () => viewer,
-    activateViewer(value) { active = value; }, activateList() { active = controller; }, clearFocus: vi.fn(), shouldRestore: () => true,
+    activateViewer(value) { active = value; }, activateList, restoreListFocus,
+    onRestoreClosed: vi.fn(), shouldRestore: () => true,
   });
   await vi.waitFor(() => expect(active).toBe(viewer));
   expect(controller.close).toHaveBeenCalledOnce();
   resolveViewer();
+  await vi.waitFor(() => expect(controller.open).toHaveBeenCalledOnce());
+  expect(activateList).not.toHaveBeenCalled();
+  expect(restoreListFocus).not.toHaveBeenCalled();
+  resolveOpen();
   await expect(transition).resolves.toEqual({ kind: "returned" });
-  expect(active).toBe(controller);
-  expect(controller.open).toHaveBeenCalledOnce();
+  expect(activateList).toHaveBeenCalledOnce();
+  expect(restoreListFocus).toHaveBeenCalledOnce();
+});
+
+it("reports a close during delayed list reopen instead of focusing a closed controller", async () => {
+  let resolveViewer;
+  let resolveOpen;
+  const viewerClient = { attach: vi.fn(async () => {}), detach: vi.fn(async () => {}) };
+  const controller = {
+    closed: false,
+    close: vi.fn(async () => { controller.closed = true; }),
+    open: vi.fn(() => new Promise((resolve) => { resolveOpen = resolve; })),
+  };
+  const viewer = { open: vi.fn(async () => {}), closed: new Promise((resolve) => { resolveViewer = resolve; }), close: vi.fn(async () => {}) };
+  const activateList = vi.fn();
+  const restoreListFocus = vi.fn();
+  const onRestoreClosed = vi.fn();
+  const transition = runViewerTransition({
+    sessionId: "session", viewerClient, controller, createViewer: () => viewer,
+    activateViewer: vi.fn(), activateList, restoreListFocus, onRestoreClosed, shouldRestore: () => true,
+  });
+  await vi.waitFor(() => expect(viewer.open).toHaveBeenCalledOnce());
+  resolveViewer();
+  await vi.waitFor(() => expect(controller.open).toHaveBeenCalledOnce());
+  controller.closed = true;
+  resolveOpen();
+  await expect(transition).resolves.toEqual({ kind: "returned" });
+  expect(onRestoreClosed).toHaveBeenCalledOnce();
+  expect(activateList).not.toHaveBeenCalled();
+  expect(restoreListFocus).not.toHaveBeenCalled();
 });
 
 it("disposes a failed viewer and restores the list without signaling", async () => {
@@ -110,7 +150,7 @@ it("disposes a failed viewer and restores the list without signaling", async () 
   let active = "list";
   const result = await runViewerTransition({
     sessionId: "session", viewerClient, controller, createViewer: () => viewer,
-    activateViewer() { active = "viewer"; }, activateList() { active = "list"; }, clearFocus: vi.fn(), shouldRestore: () => true,
+    activateViewer() { active = "viewer"; }, activateList() { active = "list"; }, restoreListFocus: vi.fn(), shouldRestore: () => true,
   });
   expect(result).toEqual({ kind: "failed", error: runError });
   expect(viewer.close).toHaveBeenCalledOnce();

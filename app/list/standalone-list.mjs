@@ -79,8 +79,35 @@ export function createDaemonViewerClient({ client, clientId }) {
   };
 }
 
+/** Run one list-to-viewer transition and restore the list after any failure. @param {any} options */
+export async function runViewerTransition({ sessionId, viewerClient, controller, createViewer, activateViewer, activateList, clearFocus, shouldRestore }) {
+  let attached = false;
+  let restoreList = false;
+  let viewer;
+  let failure;
+  try {
+    await viewerClient.attach(sessionId);
+    attached = true;
+    restoreList = true;
+    await controller.close();
+    viewer = createViewer();
+    activateViewer(viewer);
+    await viewer.open();
+    await viewer.closed;
+  } catch (error) {
+    failure = error;
+  } finally {
+    await viewer?.close().catch(() => {});
+    if (attached) await viewerClient.detach(sessionId).catch(() => {});
+    activateList();
+    clearFocus();
+    if (restoreList && shouldRestore()) await controller.open();
+  }
+  return failure === undefined ? { kind: "returned" } : { kind: "failed", error: failure };
+}
+
 /** Open the relocated list and real viewer in one package-root TUI. @param {any} options */
-export async function createStandaloneList({ cwd, frontend, openViewer }) {
+export async function createStandaloneList({ cwd, frontend }) {
   const token = (await fs.readFile(join(frontend.root, "daemon", "control.token"), "utf8")).trim();
   const client = createDaemonClient({ socketPath: join(frontend.root, "daemon", "control.sock"), token, maxBytes: 1024 * 1024, clientId: frontend.clientId });
   const backend = createDaemonDashboardBackend({
@@ -97,34 +124,30 @@ export async function createStandaloneList({ cwd, frontend, openViewer }) {
   let active;
   const closed = new Promise((resolve) => { resolveClosed = resolve; });
   const openRealViewer = async (sessionId) => {
+    if (switching || activeViewer !== undefined) return;
     switching = true;
-    await controller.close();
-    switching = false;
-    await viewerClient.attach(sessionId);
-    const editor = createPiEditor({ tui });
-    tui.setFocus(editor);
-    let viewer;
-    viewer = new ViewerController({
-      sessionId, client: viewerClient, editor,
-      persistence: { async load() { return viewerState.get(sessionId); }, async save(value) { viewerState.set(sessionId, structuredClone(value)); } },
-      requestRender: () => tui.requestRender(), onReturn: () => { void viewer.close(); },
+    await runViewerTransition({
+      sessionId, viewerClient, controller,
+      createViewer() {
+        const editor = createPiEditor({ tui });
+        tui.setFocus(editor);
+        let viewer;
+        viewer = new ViewerController({
+          sessionId, client: viewerClient, editor,
+          persistence: { async load() { return viewerState.get(sessionId); }, async save(value) { viewerState.set(sessionId, structuredClone(value)); } },
+          requestRender: () => tui.requestRender(), onReturn: () => { void viewer.close(); },
+        });
+        return viewer;
+      },
+      activateViewer(viewer) { activeViewer = viewer; active = viewer; },
+      activateList() { activeViewer = undefined; active = controller; },
+      clearFocus() { tui.setFocus(null); },
+      shouldRestore() { return closing === undefined; },
     });
-    activeViewer = viewer;
-    active = viewer;
-    try {
-      await viewer.open();
-      await viewer.closed;
-    } finally {
-      await viewer.close();
-      await viewerClient.detach(sessionId).catch(() => {});
-      activeViewer = undefined;
-      active = controller;
-      tui.setFocus(null);
-      if (closing === undefined) await controller.open();
-    }
+    switching = false;
   };
   const controller = new DashboardController({
-    backend, persistence: createFrontendPersistence(join(frontend.root, "frontend-state.json"), frontend.clientId), openViewer: openViewer ?? openRealViewer,
+    backend, persistence: createFrontendPersistence(join(frontend.root, "frontend-state.json"), frontend.clientId), openViewer: openRealViewer,
     clientId: frontend.clientId, sourceSessionId: `dashboard-${frontend.clientId}`,
     launchDefaults: { cwd }, requestRender: () => tui.requestRender(),
     onClose: () => { if (!switching && activeViewer === undefined) { tui.stop(); resolveClosed(); } },

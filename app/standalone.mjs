@@ -71,7 +71,6 @@ export async function runDashboardApp({
   migrate,
   connectOrStart,
   openList,
-  openViewer,
 }) {
   const roots = resolveDashboardRoots(env);
   await initialize();
@@ -89,9 +88,10 @@ export async function runDashboardApp({
   const frontend = connectOrStart === undefined
     ? await defaultConnectOrStart({ root: roots.destinationStateRoot, piBin, env })
     : await connectOrStart({ root: roots.destinationStateRoot, piBin, env });
+  const listOptions = { cwd, piBin, env, stdin, stdout, stderr, frontend };
   const list = openList === undefined
-    ? await createStandaloneList({ cwd, piBin, env, stdin, stdout, stderr, frontend, openViewer })
-    : await openList({ cwd, piBin, env, stdin, stdout, stderr, frontend, openViewer });
+    ? await createStandaloneList(listOptions)
+    : await openList(listOptions);
   try { await list.closed; } finally { await list.close(); await frontend.close(); }
 }
 

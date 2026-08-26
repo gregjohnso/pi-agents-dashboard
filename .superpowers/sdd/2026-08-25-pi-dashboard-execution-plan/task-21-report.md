@@ -133,3 +133,11 @@ All 15 accepted findings were addressed without changing public viewer protocol 
 | `git diff --check` | passed |
 
 No full suite, complete release gate, SLURM job, real inference, publication, Pi registration, or repository rename ran in this fix round.
+
+## Final installed-viewer wiring correction
+
+Normal `runDashboardApp` startup no longer accepts or forwards an `openViewer` override. `createStandaloneList` always binds Dashboard Enter/Right activation to its daemon-backed viewer client and replaces the active list controller behind the existing `TuiAltScreen`.
+
+The transition now attaches before closing the list. Attach failure leaves the existing list open. After attachment, viewer construction or run failure closes any constructed viewer, detaches the composer, clears viewer focus, restores the list as the active controller, and reopens its daemon subscription unless the app itself is closing. The failure path sends no worker command or process signal.
+
+Focused validation: `pixi run vitest run app/standalone.test.mjs app/list/standalone-list.test.mjs test/terminal.acceptance.test.mjs` passed 3 files and 19 tests. The single requested `pixi run typecheck` passed both TypeScript projects. The parent retains the complete release gate and required independent review.

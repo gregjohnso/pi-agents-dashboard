@@ -6,7 +6,6 @@ it("initializes, migrates, connects, and opens the standalone list in order", as
   const order = [];
   const closeFrontend = vi.fn(async () => { order.push("close_frontend"); });
   const signalProcess = vi.fn();
-  const openViewer = vi.fn();
   await runDashboardApp({
     cwd: "/repo",
     piBin: "/opt/pi",
@@ -15,8 +14,12 @@ it("initializes, migrates, connects, and opens the standalone list in order", as
     initialize: async () => { order.push("permissions"); },
     migrate: async (roots) => { order.push("migration"); expect(roots).toMatchObject({ legacyStateRoot: "/state/pi-agents-dashboard", legacyRuntimeRoot: "/state/pi-agents-dashboard", destinationStateRoot: "/state/pi-dashboard", destinationRuntimeRoot: "/state/pi-dashboard" }); },
     connectOrStart: async (options) => { order.push("daemon"); expect(options.piBin).toBe("/opt/pi"); return { close: closeFrontend }; },
-    openList: async (options) => { order.push("list"); expect(options.cwd).toBe("/repo"); expect(options.openViewer).toBe(openViewer); return { close: async () => { order.push("close_list"); } }; },
-    openViewer,
+    openList: async (options) => {
+      order.push("list");
+      expect(options.cwd).toBe("/repo");
+      expect(options).not.toHaveProperty("openViewer");
+      return { close: async () => { order.push("close_list"); } };
+    },
     signalProcess,
   });
   expect(order).toEqual(["permissions", "migration", "daemon", "list", "close_list", "close_frontend"]);

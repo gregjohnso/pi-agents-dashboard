@@ -2,9 +2,9 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 
-import { createDaemonViewerClient, createFrontendPersistence } from "./standalone-list.mjs";
+import { createDaemonViewerClient, createFrontendPersistence, runViewerTransition } from "./standalone-list.mjs";
 
 const roots = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
@@ -42,6 +42,82 @@ it("adapts the installed daemon client to origin replay, mutation, ACK, and deta
   unsubscribe();
   expect(received).toEqual([{ eventId: "one" }]);
   expect(requests.map(({ op }) => op)).toEqual(["attach", "interrupt", "detach"]);
+});
+
+it("keeps the list open and does not signal when viewer attach fails", async () => {
+  const attachError = new Error("attach failed");
+  const viewerClient = { attach: vi.fn(async () => { throw attachError; }), detach: vi.fn(), command: vi.fn() };
+  const controller = { close: vi.fn(), open: vi.fn() };
+  const createViewer = vi.fn();
+  const activateList = vi.fn();
+  const result = await runViewerTransition({
+    sessionId: "session", viewerClient, controller, createViewer,
+    activateViewer: vi.fn(), activateList, clearFocus: vi.fn(), shouldRestore: () => true,
+  });
+  expect(result).toEqual({ kind: "failed", error: attachError });
+  expect(controller.close).not.toHaveBeenCalled();
+  expect(controller.open).not.toHaveBeenCalled();
+  expect(createViewer).not.toHaveBeenCalled();
+  expect(viewerClient.detach).not.toHaveBeenCalled();
+  expect(viewerClient.command).not.toHaveBeenCalled();
+  expect(activateList).toHaveBeenCalledOnce();
+});
+
+it("detaches and reopens the same list when viewer construction fails", async () => {
+  const constructionError = new Error("viewer construction failed");
+  const viewerClient = { attach: vi.fn(async () => {}), detach: vi.fn(async () => {}), command: vi.fn() };
+  const controller = { close: vi.fn(async () => {}), open: vi.fn(async () => {}) };
+  const activateViewer = vi.fn();
+  const activateList = vi.fn();
+  const clearFocus = vi.fn();
+  const result = await runViewerTransition({
+    sessionId: "session", viewerClient, controller,
+    createViewer() { throw constructionError; },
+    activateViewer, activateList, clearFocus, shouldRestore: () => true,
+  });
+  expect(result).toEqual({ kind: "failed", error: constructionError });
+  expect(viewerClient.detach).toHaveBeenCalledWith("session");
+  expect(controller.open).toHaveBeenCalledOnce();
+  expect(activateViewer).not.toHaveBeenCalled();
+  expect(activateList).toHaveBeenCalledOnce();
+  expect(clearFocus).toHaveBeenCalledOnce();
+  expect(viewerClient.command).not.toHaveBeenCalled();
+});
+
+it("replaces the active list with the viewer and returns in the same host", async () => {
+  let resolveViewer;
+  const viewerClient = { attach: vi.fn(async () => {}), detach: vi.fn(async () => {}) };
+  const controller = { close: vi.fn(async () => {}), open: vi.fn(async () => {}) };
+  const viewer = { open: vi.fn(async () => {}), closed: new Promise((resolve) => { resolveViewer = resolve; }), close: vi.fn(async () => {}) };
+  let active = controller;
+  const transition = runViewerTransition({
+    sessionId: "session", viewerClient, controller, createViewer: () => viewer,
+    activateViewer(value) { active = value; }, activateList() { active = controller; }, clearFocus: vi.fn(), shouldRestore: () => true,
+  });
+  await vi.waitFor(() => expect(active).toBe(viewer));
+  expect(controller.close).toHaveBeenCalledOnce();
+  resolveViewer();
+  await expect(transition).resolves.toEqual({ kind: "returned" });
+  expect(active).toBe(controller);
+  expect(controller.open).toHaveBeenCalledOnce();
+});
+
+it("disposes a failed viewer and restores the list without signaling", async () => {
+  const runError = new Error("viewer open failed");
+  const viewerClient = { attach: vi.fn(async () => {}), detach: vi.fn(async () => {}), command: vi.fn() };
+  const controller = { close: vi.fn(async () => {}), open: vi.fn(async () => {}) };
+  const viewer = { open: vi.fn(async () => { throw runError; }), closed: Promise.resolve(), close: vi.fn(async () => {}) };
+  let active = "list";
+  const result = await runViewerTransition({
+    sessionId: "session", viewerClient, controller, createViewer: () => viewer,
+    activateViewer() { active = "viewer"; }, activateList() { active = "list"; }, clearFocus: vi.fn(), shouldRestore: () => true,
+  });
+  expect(result).toEqual({ kind: "failed", error: runError });
+  expect(viewer.close).toHaveBeenCalledOnce();
+  expect(viewerClient.detach).toHaveBeenCalledWith("session");
+  expect(controller.open).toHaveBeenCalledOnce();
+  expect(viewerClient.command).not.toHaveBeenCalled();
+  expect(active).toBe("list");
 });
 
 it("fsyncs the private cursor file and parent directory around atomic publication", async () => {

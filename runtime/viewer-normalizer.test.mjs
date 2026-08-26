@@ -162,6 +162,7 @@ describe("viewer normalizer", () => {
     const replayed = normalizer();
     for (const [index, draft] of drafts.entries()) replayed.applyViewerEvent({ version: 1, sessionId: "session-1", eventId: draft.eventId, cursor: { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: String(index + 1) }, timestamp: draft.timestamp, payload: draft.payload });
     replayed.restoreCheckpoint(drafts.at(-1)?.internalCheckpoint);
+    expect(replayed.snapshot({ daemonEpoch: "epoch-1", sequence: "5", registryRevision: 1, runtime: null, role: "observer", taskState: "WORKING", processState: "LIVE", outcome: "NONE" }).items).toContainEqual({ kind: "assistant_message", itemId: drafts[0].payload.itemId, content: [{ type: "thinking", text: "reason" }, { type: "text", text: "ans" }] });
     for (const restored of [fromSnapshot, replayed]) {
       const continued = restored.consumeFrame({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 2, delta: "wer" } });
       expect(continued[0].payload).toEqual({ kind: "assistant_delta", itemId: drafts[0].payload.itemId, delta: "wer" });

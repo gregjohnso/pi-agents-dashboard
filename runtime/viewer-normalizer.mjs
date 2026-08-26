@@ -143,7 +143,10 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     if (restored?.activeAssistant === null || restored?.activeAssistant === undefined) return;
     const blocks = [];
     for (const block of restored.activeAssistant.blocks) blocks[block.contentIndex] = { type: block.type, text: block.text };
-    currentAssistant = { itemId: restored.activeAssistant.itemId, blocks, delta: 0 };
+    const itemId = restored.activeAssistant.itemId;
+    currentAssistant = { itemId, blocks, delta: 0 };
+    const content = blocks.filter(Boolean).map((/** @type {any} */ block) => ({ ...block }));
+    if (content.length > 0 || items.has(itemId)) items.set(itemId, { kind: "assistant_message", itemId, content });
   }
 
   /** @param {Record<string, unknown>} payload @param {string} [preferredId] @param {string} [at] */

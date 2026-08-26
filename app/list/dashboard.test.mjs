@@ -138,20 +138,20 @@ describe("dashboard controller", () => {
         expect(dashboard.selectedSessionId).toBe("waiting");
         expect(dashboard.query).toMatchObject({ search: "approval", taskStates: ["WAITING"], projectPaths: ["/repo/a"], groupBy: "cwd", sort: { key: "activity", direction: "asc" } });
     });
-    it("closes list on Ctrl+C/Escape without stop, delete, abort, or worker signal", async () => {
+    it("closes the list only on Ctrl+C; Left and Escape are inert", async () => {
         const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
         const onClose = vi.fn();
         const dashboard = controller(backend, { onClose });
         await dashboard.open();
+        dashboard.handleInput("\x1b[D");
+        dashboard.handleInput("\x1b");
+        expect(onClose).not.toHaveBeenCalled();
+        expect(backend.unsubscribed).toBe(0);
         dashboard.handleInput("\x03");
         await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith({ kind: "closed" }));
         expect(backend.stop).not.toHaveBeenCalled();
         expect(backend.delete).not.toHaveBeenCalled();
         expect(backend.unsubscribed).toBe(1);
-        const reopened = controller(backend, { onClose });
-        await reopened.open();
-        reopened.handleInput("\x1b");
-        expect(backend.unsubscribed).toBe(2);
     });
     it.each([
         ["an empty list", []],

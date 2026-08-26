@@ -526,10 +526,7 @@ export class DashboardController {
                 this.editComposerField((value) => value + printable);
             return;
         }
-        if (matchesKey(data, Key.escape) || matchesKey(data, Key.left)) {
-            void this.close();
-            return;
-        }
+        if (matchesKey(data, Key.escape) || matchesKey(data, Key.left)) return;
         if (matchesKey(data, Key.ctrl("x"))) {
             const selected = this.selectedSession();
             if (selected !== undefined) {

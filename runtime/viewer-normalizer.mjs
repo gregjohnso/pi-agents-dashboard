@@ -106,7 +106,8 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
   /** @type {any[]} */
   const errors = [];
   const emitted = new Map();
-  const messageFingerprints = new Set();
+  /** @type {Map<string, { itemId: string, origin: "history" | "live" }[]>} */
+  const messageFingerprints = new Map();
   /** @type {any} */
   let model = null;
   /** @type {any} */
@@ -211,12 +212,14 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     return deterministicId("message-overlap", { role: message.role, content: message.content, timestamp: timestamp(message.timestamp) ?? at });
   }
 
-  /** @param {any} message @param {string} itemId @param {string} at @param {string} eventId */
-  function consumeMessage(message, itemId, at, eventId) {
+  /** @param {any} message @param {string} itemId @param {string} at @param {string} eventId @param {"history"|"live"} [origin] */
+  function consumeMessage(message, itemId, at, eventId, origin = "live") {
     if (typeof message?.role !== "string" || !Object.hasOwn(message, "content")) incompatible("PI_REQUIRED_SHAPE", "Pi message requires role and content");
     const overlap = fingerprint(message, at);
-    if (messageFingerprints.has(overlap)) return [];
-    messageFingerprints.add(overlap);
+    const prior = messageFingerprints.get(overlap) ?? [];
+    if (prior.some((entry) => entry.itemId === itemId) || (prior.length > 0 && (origin === "live" || prior.some((entry) => entry.origin === "live")))) return [];
+    prior.push({ itemId, origin });
+    messageFingerprints.set(overlap, prior);
     const normalized = normalizeContent(message.content, itemId);
     const output = [];
     if (message.role === "user") {
@@ -270,7 +273,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     const at = timestamp(entry.timestamp) ?? now();
     const sourceId = typeof entry.id === "string" && entry.id.length > 0 ? entry.id : deterministicId(entry.type, { position, entry });
     if (entry.type === "session" || entry.type === "custom" || entry.type === "label" || entry.type === "session_info") return [];
-    if (entry.type === "message") return consumeMessage(entry.message, sourceId, at, sourceId);
+    if (entry.type === "message") return consumeMessage(entry.message, sourceId, at, sourceId, "history");
     if (entry.type === "model_change") {
       if (typeof entry.provider !== "string" || typeof entry.modelId !== "string") incompatible("PI_REQUIRED_SHAPE", "Pi model change requires provider and modelId");
       model = { provider: entry.provider, id: entry.modelId };
@@ -359,6 +362,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
         items.set(currentAssistant.itemId, partial);
         const deltaId = deterministicId("assistant-delta", { itemId: currentAssistant.itemId, contentIndex: update.contentIndex, type: update.type, cumulative: block.text });
         output.push(...publish({ kind: "assistant_delta", itemId: currentAssistant.itemId, delta: bound(update.delta, MAX_TEXT_BYTES) }, deltaId, at));
+        output.push(...publish(partial, `${deltaId}:partial`, at));
         output.push(...replaceActivity(update.type === "thinking_delta" ? "thinking" : "assistant_streaming", update.type === "thinking_delta" ? "Thinking" : "Assistant streaming", deltaId));
       } else if (update.type === "toolcall_start") {
         if (typeof update.id !== "string" || typeof update.toolName !== "string") incompatible("PI_REQUIRED_SHAPE", "Pi tool-call start requires id and toolName");
@@ -372,8 +376,6 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     if (frame.type === "message_end") {
       if (frame.message?.role !== "assistant") return frame.message === undefined ? [] : consumeMessage(frame.message, deterministicId("live-message", frame.message), at, deterministicId("live-final", frame.message));
       const itemId = currentAssistant?.itemId ?? deterministicId("live-assistant", { timestamp: timestamp(frame.message.timestamp) ?? at, content: frame.message.content });
-      const overlap = fingerprint(frame.message, at);
-      if (messageFingerprints.has(overlap)) { currentAssistant = undefined; return []; }
       currentAssistant = undefined;
       return consumeMessage(frame.message, itemId, at, `${itemId}:final`);
     }

@@ -53,6 +53,7 @@ function dashboardFixture(sessions, overrides = {}) {
     launchDefaults: { cwd: "/repo", model: { provider: "", id: "" }, thinkingLevel: "", name: "" },
     requestRender: () => {},
   });
+  dashboard.list.now = Date.parse(timestamp) + 12 * 60 * 60 * 1_000;
   return { backend, dashboard, onClose, openViewer };
 }
 

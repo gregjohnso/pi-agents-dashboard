@@ -53,6 +53,25 @@ describe("viewer commands and role restrictions", () => {
     expect(f.commands.filter(({ operation }) => operation === "ui_response")).toHaveLength(1);
   });
 
+  it("routes Ctrl+C to interrupt while a working pending overlay retains focus", async () => {
+    const f = fixture({ snapshot: { taskState: "WORKING", pendingUi: [{ id: "ui-working", method: "confirm", title: "Continue?" }] } });
+    await f.instance.open();
+    const overlay = f.instance.overlay;
+    f.instance.handleInput("\x03");
+    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "interrupt", payload: { sessionId: "s" } }]));
+    expect(f.instance.overlay).toBe(overlay);
+  });
+
+  it("disposes a resolved overlay and restores focus before sending its response", async () => {
+    const f = fixture({ snapshot: { pendingUi: [{ id: "ui-dispose", method: "confirm", title: "Continue?" }] } });
+    await f.instance.open();
+    const dispose = vi.spyOn(f.instance.overlay, "dispose");
+    f.instance.handleInput("y");
+    await vi.waitFor(() => expect(f.commands.at(-1)?.operation).toBe("ui_response"));
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(f.instance.overlay).toBeUndefined();
+  });
+
   it.each([
     ["confirm", {}, "y", true],
     ["select", { options: ["one", "two"] }, "\r", "one"],
@@ -195,6 +214,40 @@ describe("viewer rendering and navigation", () => {
     matrix["paused-follow"] = paused.instance.render(width, height).map(stripVTControlCharacters);
     await paused.instance.close();
     expect(matrix).toMatchSnapshot();
+  });
+
+  it("replays from origin into exact message/tool chronology before continuing live without a gap", async () => {
+    const base = snapshot({
+      items: [
+        { kind: "user_message", itemId: "u1", content: [{ type: "text", text: "one" }] },
+        { kind: "assistant_message", itemId: "a1", content: [{ type: "text", text: "calling" }] },
+        { kind: "assistant_message", itemId: "a2", content: [{ type: "text", text: "done" }] },
+      ],
+      tools: [{ id: "tool", name: "bash", state: "completed", arguments: {}, result: [{ type: "text", text: "ok" }], startedAt: timestamp, finishedAt: timestamp }],
+      cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "4" },
+    });
+    const payloads = [
+      { kind: "user_message", itemId: "u1", content: [{ type: "text", text: "one" }] },
+      { kind: "assistant_message", itemId: "a1", content: [{ type: "text", text: "calling" }] },
+      { kind: "tool_finished", tool: base.tools[0] },
+      { kind: "assistant_message", itemId: "a2", content: [{ type: "text", text: "done" }] },
+      { kind: "system_message", itemId: "live", text: "live after snapshot", level: "info" },
+    ];
+    const client = {
+      replayFromOrigin: true,
+      async getSnapshot() { return base; },
+      async subscribe(_sessionId, cursor, next) {
+        expect(cursor.sequence).toBe("0");
+        for (const [index, payload] of payloads.entries()) await next({ version: 1, sessionId: "s", eventId: `ordered-${index + 1}`, cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: String(index + 1) }, timestamp, payload });
+        return () => {};
+      },
+      async ack() {}, async command() {},
+    };
+    const instance = new ViewerController({ sessionId: "s", client, editor: editor(), persistence: { async load() {}, async save() {} }, requestRender: async () => {} });
+    await instance.open();
+    expect(instance.state.items.map((item) => item.itemId)).toEqual(["u1", "a1", "tool:tool", "a2", "live"]);
+    expect(instance.state.cursor.sequence).toBe("5");
+    await instance.close();
   });
 
   it("uses the exact clean and dirty Left/Escape return gesture", async () => {

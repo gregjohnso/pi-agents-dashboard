@@ -49,6 +49,13 @@ it("rejects malformed RPC, releases ownership, and stops the exact child group",
   await expect(inspectProcessIdentity(childStart.pid)).rejects.toMatchObject({ code: expect.stringMatching(/ENOENT|ESRCH/u) });
 });
 
+it("rejects readiness when get_state reports a different canonical session file", async () => {
+  const { root, runs, registry, executable, sessionFile } = await setup();
+  const supervisor = new WorkerSupervisor({ registry, runsDirectory: runs, configuredPiPath: executable, env: { ...process.env, FAKE_PI_RUNTIME_STATE_SESSION_PATH: join(root, "wrong.jsonl") }, startTimeoutMs: 1_000 });
+  await expect(supervisor.launch({ sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-state-mismatch" })).rejects.toMatchObject({ code: "WORKER_PROCESS_EXITED" });
+  expect((await registry.get("one")).ownership).toBeUndefined();
+});
+
 it("buffers startup frames until worker and parent listeners are ready", async () => {
   const { root, runs, registry, executable, sessionFile } = await setup();
   const supervisor = new WorkerSupervisor({ registry, runsDirectory: runs, configuredPiPath: executable, env: { ...process.env, FAKE_PI_EVENT: "startup_notice", FAKE_PI_EXIT_MS: "700" }, startTimeoutMs: 2_000 });

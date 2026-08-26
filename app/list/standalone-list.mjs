@@ -6,6 +6,8 @@ import { dirname, join } from "node:path";
 import { ProcessTerminal, TuiAltScreen } from "@earendil-works/pi-tui";
 
 import { createDaemonClient } from "../daemon-client.mjs";
+import { createPiEditor } from "../viewer/pi-component-adapters.mjs";
+import { ViewerController } from "../viewer/viewer-controller.mjs";
 import { DashboardController, createDaemonDashboardBackend } from "./dashboard.mjs";
 import { validateFrontendState } from "./frontend-state.mjs";
 
@@ -45,8 +47,40 @@ export function createFrontendPersistence(path, clientId, options = {}) {
   };
 }
 
-/** Open the relocated list using only package-root TUI exports. @param {any} options */
-export async function createStandaloneList({ cwd, frontend, openViewer = async () => {} }) {
+/** Adapt one daemon client to the viewer controller's ordered public-v1 seam. */
+export function createDaemonViewerClient({ client, clientId }) {
+  const request = async (op, payload) => {
+    const response = await client.request({ version: 1, clientId, requestId: randomUUID(), op, payload });
+    if (!response.ok) throw Object.assign(new Error(response.error.message), response.error);
+    if (response.result?.kind === "command" && response.result.status.stage === "FAILED") throw Object.assign(new Error(response.result.status.error?.message ?? "Viewer command failed"), response.result.status.error);
+    return response.result;
+  };
+  return {
+    replayFromOrigin: true,
+    async attach(sessionId) { return request("attach", { sessionId, role: "composer" }); },
+    async detach(sessionId) { return request("detach", { sessionId }); },
+    getSnapshot: (sessionId) => client.getViewerSnapshot(sessionId),
+    subscribe(sessionId, cursor, next, onError) {
+      let active = true;
+      const iterator = client.subscribeViewer(sessionId, cursor)[Symbol.asyncIterator]();
+      void (async () => {
+        try {
+          while (active) {
+            const value = await iterator.next();
+            if (value.done || !active) return;
+            await next(value.value);
+          }
+        } catch (error) { if (active) onError(error); }
+      })();
+      return () => { active = false; void iterator.return?.(); };
+    },
+    command(operation, payload) { return request(operation, payload); },
+    ack(_sessionId, cursor) { return client.ackViewer(cursor); },
+  };
+}
+
+/** Open the relocated list and real viewer in one package-root TUI. @param {any} options */
+export async function createStandaloneList({ cwd, frontend, openViewer }) {
   const token = (await fs.readFile(join(frontend.root, "daemon", "control.token"), "utf8")).trim();
   const client = createDaemonClient({ socketPath: join(frontend.root, "daemon", "control.sock"), token, maxBytes: 1024 * 1024, clientId: frontend.clientId });
   const backend = createDaemonDashboardBackend({
@@ -55,17 +89,50 @@ export async function createStandaloneList({ cwd, frontend, openViewer = async (
   });
   const terminal = new ProcessTerminal();
   const tui = new TuiAltScreen(terminal);
+  const viewerClient = createDaemonViewerClient({ client, clientId: frontend.clientId });
+  const viewerState = new Map();
   let resolveClosed;
+  let switching = false;
+  let activeViewer;
+  let active;
   const closed = new Promise((resolve) => { resolveClosed = resolve; });
+  const openRealViewer = async (sessionId) => {
+    switching = true;
+    await controller.close();
+    switching = false;
+    await viewerClient.attach(sessionId);
+    const editor = createPiEditor({ tui });
+    tui.setFocus(editor);
+    let viewer;
+    viewer = new ViewerController({
+      sessionId, client: viewerClient, editor,
+      persistence: { async load() { return viewerState.get(sessionId); }, async save(value) { viewerState.set(sessionId, structuredClone(value)); } },
+      requestRender: () => tui.requestRender(), onReturn: () => { void viewer.close(); },
+    });
+    activeViewer = viewer;
+    active = viewer;
+    try {
+      await viewer.open();
+      await viewer.closed;
+    } finally {
+      await viewer.close();
+      await viewerClient.detach(sessionId).catch(() => {});
+      activeViewer = undefined;
+      active = controller;
+      tui.setFocus(null);
+      if (closing === undefined) await controller.open();
+    }
+  };
   const controller = new DashboardController({
-    backend, persistence: createFrontendPersistence(join(frontend.root, "frontend-state.json"), frontend.clientId), openViewer,
+    backend, persistence: createFrontendPersistence(join(frontend.root, "frontend-state.json"), frontend.clientId), openViewer: openViewer ?? openRealViewer,
     clientId: frontend.clientId, sourceSessionId: `dashboard-${frontend.clientId}`,
     launchDefaults: { cwd }, requestRender: () => tui.requestRender(),
-    onClose: () => { tui.stop(); resolveClosed(); },
+    onClose: () => { if (!switching && activeViewer === undefined) { tui.stop(); resolveClosed(); } },
   });
+  active = controller;
   tui.addChild({
-    render(width) { return controller.render(width, process.stdout.rows ?? 24); },
-    handleInput(data) { controller.handleInput(data); tui.requestRender(); },
+    render(width) { return active.render(width, process.stdout.rows ?? 24); },
+    handleInput(data) { active.handleInput(data); tui.requestRender(); },
     invalidate() {},
   });
   await controller.open();
@@ -74,7 +141,7 @@ export async function createStandaloneList({ cwd, frontend, openViewer = async (
   return {
     closed,
     close() {
-      closing ??= (async () => { await controller.close(); tui.stop(); await client.close(); resolveClosed(); })();
+      closing ??= (async () => { await activeViewer?.close(); await controller.close(); tui.stop(); await client.close(); resolveClosed(); })();
       return closing;
     },
   };

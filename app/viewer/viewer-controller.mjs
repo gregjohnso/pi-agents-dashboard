@@ -56,12 +56,15 @@ export class ViewerController {
       }
       this.restoring = false;
       const snapshot = parseViewerSnapshot(await this.client.getSnapshot(this.sessionId));
-      this.state = createTranscriptState(snapshot);
+      const replayFromOrigin = this.client.replayFromOrigin === true && snapshot.cursor.sequence !== "0";
+      this.replaySnapshot = replayFromOrigin ? snapshot : undefined;
+      const initial = replayFromOrigin ? { ...snapshot, cursor: { ...snapshot.cursor, sequence: "0" }, items: [], tools: [], pendingUi: [], errors: [] } : snapshot;
+      this.state = createTranscriptState(initial);
       this.editor.disableSubmit = snapshot.role !== "composer";
       this.editor.focused = snapshot.role === "composer";
       this.transcript = new TranscriptModel({ state: this.state, adapters: this.adapters });
       this.installOverlay();
-      const unsubscribe = await this.client.subscribe(this.sessionId, snapshot.cursor, (event) => this.processEvent(event), (error) => this.fail(error));
+      const unsubscribe = await this.client.subscribe(this.sessionId, initial.cursor, (event) => this.processEvent(event), (error) => this.fail(error));
       if (this.closedState) unsubscribe?.(); else this.unsubscribe = unsubscribe;
       await this.requestRender();
     } catch (error) {
@@ -108,6 +111,10 @@ export class ViewerController {
     if (this.closedState || this.state === undefined) return;
     if (this.overlay !== undefined) {
       this.returnGesture.cancel();
+      if (matchesKey(data, Key.ctrl("c")) && this.state.role === "composer" && this.state.working) {
+        void this.sendCommand("interrupt", {});
+        return;
+      }
       this.overlay.handleInput(data);
       this.requestRender();
       return;
@@ -255,6 +262,14 @@ export class ViewerController {
       const event = parseViewerEvent(value);
       if (event.sessionId !== this.sessionId) throw Object.assign(new Error("Viewer event session mismatch"), { code: "VIEWER_SESSION_MISMATCH" });
       this.state = applyViewerEvent(this.state, event);
+      if (this.replaySnapshot !== undefined && BigInt(event.cursor.sequence) >= BigInt(this.replaySnapshot.cursor.sequence)) {
+        const authoritative = this.replaySnapshot;
+        this.replaySnapshot = undefined;
+        const seenItems = new Set(this.state.items.map((item) => item.itemId ?? item.attachment?.id));
+        for (const item of authoritative.items) if (!seenItems.has(item.itemId ?? item.attachment?.id)) this.state.items.push(structuredClone(item));
+        for (const tool of authoritative.tools) if (!this.state.tools.has(tool.id)) this.state.tools.set(tool.id, structuredClone(tool));
+        this.state = { ...this.state, role: authoritative.role, taskState: authoritative.taskState, processState: authoritative.processState, outcome: authoritative.outcome, model: authoritative.model, thinkingLevel: authoritative.thinkingLevel, activity: authoritative.activity, pendingUi: structuredClone(authoritative.pendingUi), errors: structuredClone(authoritative.errors) };
+      }
       this.transcript.update(this.state);
       if (this.search !== undefined) {
         this.search.matches = [...this.transcript.searchMatches];
@@ -283,7 +298,9 @@ export class ViewerController {
       respond: (response) => {
         if (this.state?.role !== "composer") return;
         this.respondedUi.add(response.requestId);
+        const resolved = this.overlay;
         this.overlay = undefined;
+        resolved?.dispose();
         void this.sendCommand("ui_response", { uiRequestId: response.requestId, response: response.cancelled ? null : response.value });
       },
     });

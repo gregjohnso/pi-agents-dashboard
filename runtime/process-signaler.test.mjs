@@ -78,6 +78,25 @@ it("uses the release 5,000 ms graceful and terminate waits before exact-group KI
   ]);
 });
 
+it("pins exact inspect, wait, and signal interleaving through terminal KILL evidence", async () => {
+  /** @type {string[]} */
+  const order = [];
+  let inspections = 0;
+  const exited = Object.assign(new Error("gone"), { code: "ESRCH" });
+  const result = await stopVerifiedProcessGroup(ownership, {
+    async inspect(pid) { order.push(`inspect:${pid}:${++inspections}`); if (inspections === 5) throw exited; return ownership; },
+    async requestGraceful() { order.push("graceful"); },
+    async signalProcessGroup(pgid, signal) { order.push(`signal:${pgid}:${signal}`); },
+    async sleep(ms) { order.push(`sleep:${ms}`); },
+  }, { gracefulMs: 5_000, terminateMs: 5_000 });
+  expect(result).toEqual({ disposition: "KILLED" });
+  expect(order).toEqual([
+    "inspect:321:1", "inspect:321:2", "graceful", "sleep:5000",
+    "inspect:321:3", "signal:654:SIGTERM", "sleep:5000",
+    "inspect:321:4", "signal:654:SIGKILL", "inspect:321:5",
+  ]);
+});
+
 it("reports KILL as requested, not observed, while the exact identity remains visible", async () => {
   const { deps, signaler } = dependencies([ownership, ownership, ownership, ownership, ownership]);
 

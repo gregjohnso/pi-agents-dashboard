@@ -52,6 +52,15 @@ describe("viewer normalizer", () => {
     expect(first.consumeFrame({ type: "message_end", message: entry.message })).toEqual([]);
   });
 
+  it("keeps distinct stable canonical messages even when their content and timestamps match", () => {
+    const subject = normalizer();
+    const message = { role: "user", content: "same" };
+    const first = subject.consumeHistory({ type: "message", id: "stable-one", timestamp: AT, message }, position(20));
+    const second = subject.consumeHistory({ type: "message", id: "stable-two", timestamp: AT, message }, position(21));
+    expect([...first, ...second].filter((event) => event.payload.kind === "user_message").map((event) => event.payload.itemId)).toEqual(["stable-one", "stable-two"]);
+    expect(subject.consumeFrame({ type: "message_end", message })).toEqual([]);
+  });
+
   it("assembles assistant deltas into one stable item and treats final content as authoritative and idempotent", () => {
     const subject = normalizer();
     expect(subject.consumeFrame({ type: "message_start", message: { role: "assistant", content: [], timestamp: Date.parse(AT) } })).toEqual([]);
@@ -61,9 +70,21 @@ describe("viewer normalizer", () => {
     const final = subject.consumeFrame(finalFrame);
     expect(first[0].payload).toMatchObject({ kind: "assistant_delta", delta: "hel" });
     expect(second[0].payload).toMatchObject({ kind: "assistant_delta", itemId: first[0].payload.itemId, delta: "lo" });
+    expect(first[1].payload).toEqual({ kind: "assistant_message", itemId: first[0].payload.itemId, content: [{ type: "text", text: "hel" }] });
+    expect(second[1].payload).toEqual({ kind: "assistant_message", itemId: first[0].payload.itemId, content: [{ type: "text", text: "hello" }] });
     expect(final[0].payload).toEqual({ kind: "assistant_message", itemId: first[0].payload.itemId, content: [{ type: "text", text: "hello" }] });
     expect(subject.consumeFrame(finalFrame)).toEqual([]);
     assertPayloads([...first, ...second, ...final]);
+  });
+
+  it("publishes authoritative partial messages that preserve thinking and text block identity in frozen v1", () => {
+    const subject = normalizer();
+    subject.consumeFrame({ type: "message_start", message: { role: "assistant", content: [], timestamp: Date.parse(AT) } });
+    const thinking = subject.consumeFrame({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "reason" } });
+    const text = subject.consumeFrame({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 2, delta: "answer" } });
+    expect(thinking[1].payload).toEqual({ kind: "assistant_message", itemId: thinking[0].payload.itemId, content: [{ type: "thinking", text: "reason" }] });
+    expect(text[1].payload).toEqual({ kind: "assistant_message", itemId: thinking[0].payload.itemId, content: [{ type: "thinking", text: "reason" }, { type: "text", text: "answer" }] });
+    assertPayloads([...thinking, ...text]);
   });
 
   it("keeps tool, pending UI, model, thinking, and replacement activity continuity", () => {

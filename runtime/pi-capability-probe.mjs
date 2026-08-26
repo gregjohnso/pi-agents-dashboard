@@ -6,9 +6,11 @@ import { join } from "node:path";
 
 import { createJsonlDecoder } from "./jsonl.mjs";
 import { assertPiExecutableIdentity, piExecutableCacheKey } from "./pi-executable.mjs";
+import { createViewerNormalizer } from "./viewer-normalizer.mjs";
 
 const PROBE_MAX_RECORD_BYTES = 65_536;
 const UNKNOWN_COMMAND = "__pi_dashboard_unknown_command__";
+const RPC_ADAPTER_VERSION = 1;
 /** @type {readonly ("get_state"|"prompt"|"follow_up"|"steer"|"abort"|"extension_ui_response")[]} */
 const REQUIRED_COMMANDS = ["get_state", "prompt", "follow_up", "steer", "abort", "extension_ui_response"];
 
@@ -113,14 +115,36 @@ async function probeRpc(executable, sessionFile, spawnImpl, timeoutMs, env) {
   });
 }
 
+/** Execute the adapter's documented required live-event fixtures without invoking Pi. */
+export function probeRequiredLiveEventNormalization() {
+  try {
+    const normalizer = createViewerNormalizer({ sessionId: "capability-self-probe", protocolVersion: 1, now: () => "2026-08-25T00:00:00.000Z" });
+    const frames = [
+      { type: "agent_start" },
+      { type: "message_start", message: { role: "assistant", content: [], timestamp: 0 } },
+      { type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "bounded" } },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "bounded" } },
+      { type: "tool_execution_start", toolCallId: "probe-tool", toolName: "probe", args: {} },
+      { type: "tool_execution_update", toolCallId: "probe-tool", toolName: "probe", partialResult: { content: [{ type: "text", text: "bounded" }] } },
+      { type: "tool_execution_end", toolCallId: "probe-tool", toolName: "probe", result: { content: [{ type: "text", text: "bounded" }] }, isError: false },
+      { type: "extension_ui_request", id: "probe-ui", method: "confirm", title: "Bounded probe" },
+      { type: "agent_settled" },
+    ];
+    for (const frame of frames) normalizer.consumeFrame(frame);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Detect public Pi behavior without sending any valid inference command.
- * @param {{ executable: import("../shared/contracts.mjs").ExecutableIdentity, spawnImpl?: any, cache?: Map<string, import("../shared/contracts.mjs").PiCapabilityReport>, timeoutMs?: number, env?: NodeJS.ProcessEnv }} options
+ * @param {{ executable: import("../shared/contracts.mjs").ExecutableIdentity, spawnImpl?: any, cache?: Map<string, import("../shared/contracts.mjs").PiCapabilityReport>, timeoutMs?: number, env?: NodeJS.ProcessEnv, requiredEventProbe?: () => boolean }} options
  */
-export async function probePiCapabilities({ executable, spawnImpl = spawn, cache = new Map(), timeoutMs = 5_000, env = process.env }) {
+export async function probePiCapabilities({ executable, spawnImpl = spawn, cache = new Map(), timeoutMs = 5_000, env = process.env, requiredEventProbe = probeRequiredLiveEventNormalization }) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new TypeError("timeoutMs must be a positive integer");
   await assertPiExecutableIdentity(executable);
-  const key = piExecutableCacheKey(executable);
+  const key = `${piExecutableCacheKey(executable)}\0adapter:${RPC_ADAPTER_VERSION}`;
   const cached = cache.get(key);
   if (cached !== undefined) return cached;
   const help = /** @type {string} */ (await probeHelp(executable.realpath, spawnImpl, timeoutMs, env));
@@ -140,12 +164,14 @@ export async function probePiCapabilities({ executable, spawnImpl = spawn, cache
     const temporarySessionValid = commands.includes("get_state");
     const rpcMode = /--mode\s+rpc/iu.test(help);
     const reportedVersion = /^pi\s+(.+)$/imu.exec(help)?.[1]?.trim() ?? null;
+    const requiredLiveEvents = requiredEventProbe();
     const missingRequired = [
       ...(!rpcMode ? ["rpcMode"] : []),
       ...(!rpc.jsonl ? ["jsonl"] : []),
       ...(!rpc.correlationValid ? ["response_correlation"] : []),
       ...(!unknownCommandValid ? ["unknown_command_validation"] : []),
       ...(!temporarySessionValid ? ["temporary_session_isolation"] : []),
+      ...(!requiredLiveEvents ? ["required_live_events"] : []),
       ...REQUIRED_COMMANDS.filter((command) => !commands.includes(command)),
     ];
     const report = /** @type {import("../shared/contracts.mjs").PiCapabilityReport} */ ({
@@ -154,7 +180,7 @@ export async function probePiCapabilities({ executable, spawnImpl = spawn, cache
       rpcMode,
       jsonl: rpc.jsonl,
       commands,
-      events: rpc.events,
+      events: [...rpc.events, ...(requiredLiveEvents ? ["required_live_events"] : [])],
       missingRequired,
     });
     cache.set(key, report);

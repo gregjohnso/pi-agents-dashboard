@@ -4,6 +4,8 @@ import { join } from "node:path";
 
 import { expect, it } from "vitest";
 
+import { runDashboardApp } from "../app/standalone.mjs";
+import { runDaemonCommand } from "../cli/daemon-commands.mjs";
 import { migrateLegacyState } from "../runtime/state-migration.mjs";
 
 async function attempt(mutator, expectedCode) {
@@ -23,6 +25,30 @@ async function attempt(mutator, expectedCode) {
     await rm(parent, { recursive: true, force: true });
   }
 }
+
+it("publishes and reconciles exactly one real destination daemon", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "migration-real-daemon-"));
+  const legacyRoot = join(parent, "pi-agents-dashboard");
+  const destinationRoot = join(parent, "pi-dashboard");
+  await mkdir(legacyRoot, { mode: 0o700 });
+  await writeFile(join(legacyRoot, "dashboard.json"), JSON.stringify({ schemaVersion: 1 }), { mode: 0o600 });
+  try {
+    await runDashboardApp({
+      cwd: parent,
+      env: { HOME: parent, XDG_STATE_HOME: parent, XDG_RUNTIME_DIR: join(parent, "runtime") },
+      initialize: async () => {},
+      connectOrStart: async ({ root }) => ({ root, clientId: "migration-acceptance", async close() {} }),
+      openList: async () => ({ closed: Promise.resolve(), async close() {} }),
+    });
+    const status = await runDaemonCommand("status", { root: destinationRoot });
+    expect(status).toMatchObject({ code: 0, result: { publication: { pid: expect.any(Number) } } });
+    const secondStart = await runDaemonCommand("start", { root: destinationRoot });
+    expect(secondStart).toMatchObject({ code: 0, result: { alreadyRunning: true, publication: { pid: status.result.publication.pid } } });
+  } finally {
+    await runDaemonCommand("stop", { root: destinationRoot }).catch(() => {});
+    await rm(parent, { recursive: true, force: true });
+  }
+}, 15_000);
 
 it("fails closed on unsafe permissions", () => attempt(async ({ legacyRoot }) => {
   await (await import("node:fs/promises")).chmod(legacyRoot, 0o755);

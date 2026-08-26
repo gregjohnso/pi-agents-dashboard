@@ -1,4 +1,5 @@
 import net from "node:net";
+import { EventEmitter } from "node:events";
 import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -6,7 +7,7 @@ import { afterEach, expect, it, vi } from "vitest";
 
 import { connectDaemon } from "./daemon-connector.mjs";
 import { createJsonlDecoder, createJsonlEncoder } from "./jsonl.mjs";
-import { createDaemonRuntime } from "./daemon.mjs";
+import { createBoundedSocketWriter, createDaemonRuntime } from "./daemon.mjs";
 import { RegistryStore } from "./registry-store.mjs";
 
 /** @type {any[]} */
@@ -125,6 +126,33 @@ function startPersistentFakeWorker(config, worker) {
   workerLoops.push(loop);
   return loop;
 }
+
+it("orders bounded subscriber writes and waits for drain before advancing", () => {
+  const socket = /** @type {any} */ (new EventEmitter());
+  /** @type {{ value: string, callback: Function }[]} */
+  const writes = [];
+  socket.destroyed = false;
+  socket.write = (/** @type {Buffer} */ value, /** @type {Function} */ callback) => { writes.push({ value: value.toString(), callback }); return writes.length !== 1; };
+  socket.destroy = vi.fn(() => { socket.destroyed = true; });
+  const writer = createBoundedSocketWriter(socket, { maxPendingBytes: 16, maxPendingRecords: 2 });
+  expect(writer.enqueue(Buffer.from("one"))).toBe(true);
+  expect(writer.enqueue(Buffer.from("two"))).toBe(true);
+  expect(writes.map(({ value }) => value)).toEqual(["one"]);
+  writes[0].callback();
+  expect(writes).toHaveLength(1);
+  socket.emit("drain");
+  expect(writes.map(({ value }) => value)).toEqual(["one", "two"]);
+  writes[1].callback();
+
+  const blocked = /** @type {any} */ (new EventEmitter());
+  blocked.destroyed = false;
+  blocked.write = () => false;
+  blocked.destroy = vi.fn(() => { blocked.destroyed = true; });
+  const bounded = createBoundedSocketWriter(blocked, { maxPendingBytes: 4, maxPendingRecords: 1 });
+  expect(bounded.enqueue(Buffer.from("1234"))).toBe(true);
+  expect(bounded.enqueue(Buffer.from("x"))).toBe(false);
+  expect(blocked.destroy).toHaveBeenCalledWith(expect.objectContaining({ code: "SUBSCRIBER_BACKPRESSURE_LIMIT" }));
+});
 
 it("rejects every composer-only command before journaling for observers and unattached sockets", async () => {
   const runtime = await createDaemonRuntime({ root: await root() });

@@ -53,7 +53,10 @@ process.stdin.on("data", (chunk) => {
       continue;
     }
     if (type === "get_state") {
-      process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: true, data: { sessionId: "fake", sessionFile: process.env.FAKE_PI_STATE_SESSION_PATH ?? sessionFile, model: null, thinkingLevel: "off" } })}\n`);
+      const reportedSessionFile = process.env.FAKE_PI_RUNTIME_STATE_SESSION_PATH !== undefined && !sessionFile.includes("pi-dashboard-probe-")
+        ? process.env.FAKE_PI_RUNTIME_STATE_SESSION_PATH
+        : process.env.FAKE_PI_STATE_SESSION_PATH ?? sessionFile;
+      process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: true, data: { sessionId: "fake", sessionFile: reportedSessionFile, model: null, thinkingLevel: "off" } })}\n`);
       continue;
     }
     if (["prompt", "follow_up", "steer"].includes(type) && typeof command.message !== "string") {

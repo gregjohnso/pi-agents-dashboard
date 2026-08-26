@@ -1,10 +1,11 @@
-import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { chmod, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 
 import { afterEach, expect, it } from "vitest";
 
-import { assertPiExecutableIdentity, resolvePiExecutable } from "./pi-executable.mjs";
+import { assertPiExecutableIdentity, openPiExecutableBinding, resolvePiExecutable } from "./pi-executable.mjs";
 
 /** @type {string[]} */
 const cleanup = [];
@@ -43,6 +44,26 @@ it("rejects non-files, non-executable files, and missing PATH candidates", async
   await expect(resolvePiExecutable({ cliPath: root, pathEnv: "" })).rejects.toMatchObject({ code: "INVALID_PI_EXECUTABLE" });
   await expect(resolvePiExecutable({ cliPath: plain, pathEnv: "" })).rejects.toMatchObject({ code: "INVALID_PI_EXECUTABLE" });
   await expect(resolvePiExecutable({ pathEnv: join(root, "missing") })).rejects.toMatchObject({ code: "PI_EXECUTABLE_NOT_FOUND" });
+});
+
+it("executes the validated inode after its pathname is atomically replaced", async () => {
+  const root = await executableRoot();
+  const selected = join(root, "bound-pi");
+  const replacement = join(root, "replacement-pi");
+  await writeFile(selected, "#!/bin/sh\nprintf original", { mode: 0o700 });
+  const identity = await resolvePiExecutable({ cliPath: selected, pathEnv: "" });
+  const binding = await openPiExecutableBinding(identity);
+  await writeFile(replacement, "#!/bin/sh\nprintf replacement", { mode: 0o700 });
+  await rename(replacement, selected);
+  const output = await new Promise((resolveOutput, rejectOutput) => {
+    const child = spawn(binding.executionPath, [], { stdio: ["ignore", "pipe", "pipe", binding.handle.fd], shell: false });
+    let stdout = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    child.once("error", rejectOutput);
+    child.once("exit", (code) => code === 0 ? resolveOutput(stdout) : rejectOutput(new Error(`bound executable exited ${code}`)));
+  });
+  await binding.handle.close();
+  expect(output).toBe("original");
 });
 
 it("refuses replacement and symlink retargeting after resolution", async () => {

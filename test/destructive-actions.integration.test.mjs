@@ -145,6 +145,32 @@ it("journals Stop before exact-group escalation and leaves task/outcome independ
   workerSocket.close();
 });
 
+it("keeps stale ownership unresolved until exact terminal process evidence exists", async () => {
+  const root = await fixtureRoot();
+  const worker = { pid: 9301, startIdentity: "930100", processGroupId: 9301 };
+  const replacement = { ...worker, startIdentity: "930199" };
+  const registry = new RegistryStore(join(root, "sessions"));
+  const session = record(root, "stale-stop", { processState: "LIVE", ownership: { kind: "managed", runId: "run-stale", process: worker, acquiredAt: "2026-08-25T12:00:00.000Z", heartbeatAt: "2026-08-25T12:00:00.000Z" }, latestRunId: "run-stale" });
+  await writeFile(session.canonicalSessionFile, "session\n");
+  await registry.create(session);
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: session.sessionId, runId: "run-stale", leaseId: "lease-stale", generation: 1, identity: worker, piChildIdentity: worker }] })}\n`, { mode: 0o600 });
+  let stale = false;
+  const runtime = await createDaemonRuntime({ root, reconnectTimeoutMs: 1_000, inspect: async (pid) => pid === process.pid ? { pid, startIdentity: "1", processGroupId: process.pid } : stale ? replacement : worker });
+  runtimes.push(runtime);
+  const workerSocket = connect(runtime, "worker");
+  await workerSocket.next();
+  workerSocket.send({ version: 1, type: "worker_ready", token: "stale-token", sessionId: session.sessionId, runId: "run-stale", leaseId: "lease-stale", generation: 1, worker, piChild: worker });
+  await runtime.ready;
+  stale = true;
+  const frontend = connect(runtime);
+  await frontend.next();
+  frontend.send(request("client", "stale-stop-request", "stop", { sessionId: session.sessionId, revision: 0 }));
+  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "FAILED", error: { code: "STALE_IDENTITY" } } } });
+  expect(await registry.get(session.sessionId)).toMatchObject({ processState: "LIVE", ownership: { runId: "run-stale", process: worker } });
+  frontend.close();
+  workerSocket.close();
+});
+
 it("refuses observer, live, and symlink-replaced Delete targets without invoking trash", async () => {
   const root = await fixtureRoot();
   const registry = new RegistryStore(join(root, "sessions"));

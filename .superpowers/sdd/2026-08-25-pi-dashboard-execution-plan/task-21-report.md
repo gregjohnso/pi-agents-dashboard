@@ -12,10 +12,10 @@ The two production Pi UI dependencies are bundled so local/global/npx acceptance
 
 | Tarball evidence | Result |
 |---|---|
-| Compressed bytes | Built and consumed by acceptance; numeric value was not retained in the concise Vitest summary |
-| Unpacked bytes | Built and consumed by acceptance; numeric value was not retained in the concise Vitest summary |
-| Listed files | Entire tar listing audited by acceptance; numeric value was not retained in the concise Vitest summary |
-| Bundled dependency records | Production dependency tree bundled; root TypeScript, Vitest, and `@types/node` devDependencies excluded |
+| Compressed bytes | `22,643,288` |
+| Unpacked bytes | `103,956,852` |
+| Listed files | `12,761` |
+| Bundled dependency records | `4`; production dependency tree bundled; root TypeScript, Vitest, and `@types/node` devDependencies excluded |
 | Local absolute-path install | unrelated cwd, `--help`, exit 0 |
 | Global tarball install | disposable prefix, unrelated cwd, `--help`, exit 0 |
 | Cached npx | `--offline`, isolated cache, unrelated cwd, `--help`, exit 0 |
@@ -96,4 +96,40 @@ Stop journals before delivery, requests graceful shutdown, waits 5,000 ms, sends
 - No live provider/model request or stock-Pi inference acceptance was performed.
 - Stock Pi behavior beyond the pinned public package contracts and bounded fake installed executable remains unverified.
 - The private repository remote and primary checkout rename remains the post-acceptance gate; canonical Pi session files and managed worktrees must not be renamed.
-- Bundling the production Pi UI dependency tree makes the tarball larger in exchange for deterministic offline installation. The tarball was built and audited, but exact byte/file counts were not retained in the concise final Vitest output.
+- Bundling the production Pi UI dependency tree makes the tarball 22,643,288 compressed bytes in exchange for deterministic offline installation.
+
+## Accepted-finding fix round
+
+All 15 accepted findings were addressed without changing public viewer protocol version 1, canonical session/worktree paths, public package-root Pi imports, or destructive confirmation identities.
+
+| Finding | Resolution |
+|---:|---|
+| 1 | Local, global, and npx journeys now have distinct temporary roots, HOME, prefix, cache, unrelated cwd, state roots, and minimal per-journey PATH containing only `node` and `sh`. |
+| 2 | Migration integration now runs the production migration path, starts a real bounded destination daemon, verifies a second start returns the same PID as `alreadyRunning`, then stops it. |
+| 3 | Worker readiness validates `get_state.sessionFile` equals the canonical accepted session file; mismatch exits and releases ownership. |
+| 4 | The identity-and-adapter-version capability cache executes literal documented required live-event fixtures through the selected normalizer and records/refuses `required_live_events` without asking Pi to emit them or sending a valid prompt. |
+| 5 | The worker opens the validated executable inode with `O_NOFOLLOW` and executes the inherited handle through `/proc/self/fd/3`; atomic pathname replacement after binding still executes the original inode. |
+| 6 | Fingerprint overlap suppression now permits distinct stable canonical IDs while still suppressing history/live overlap and exact duplicate IDs. |
+| 7 | Installed viewer startup subscribes from cursor zero on the snapshot epoch, reduces ordered v1 events through the snapshot cursor, reconciles authoritative snapshot state, and continues live on the same subscription. |
+| 8 | Each v1 assistant delta is followed by an authoritative v1 `assistant_message` partial carrying exact thinking/text block continuity; no frozen field changed. |
+| 9 | Broadcast subscribers use an ordered queue bounded by bytes and records; writes advance only after callback and `drain`, and overflow closes the slow socket. |
+| 10 | Default installed list startup constructs the daemon-backed viewer, attaches through the same client, and swaps list/viewer controllers behind one `TuiAltScreen`. |
+| 11 | Ctrl+C on a working composer routes interrupt before a pending overlay handles input; observer and non-working restrictions remain. |
+| 12 | Resolved, replaced, and closed overlays call `dispose` and restore focus exactly once. |
+| 13 | `STALE_IDENTITY` is a failed unresolved Stop, or `DELIVERY_UNKNOWN` after prior signaling; only exact terminal evidence clears ownership. |
+| 14 | Signaler regression pins every inspect, graceful request, 5,000 ms wait, TERM, second wait, KILL, and terminal inspect in exact order. |
+| 15 | Package metrics are retained in `/tmp/pi-dashboard-task-21-package-evidence.json` by acceptance and copied above; command and test counts follow. |
+
+### Fix-round command and test evidence
+
+| Command | Result |
+|---|---|
+| Executable/probe/normalizer/viewer/list focused gate | initial: 4 files and 60 tests passed; one list test parse failure; corrected list rerun: 1 file and 4 tests passed |
+| Daemon/destructive/signaler/migration/installed focused gate | initial: 4 files and 75 tests passed; one installed-state expectation failed; corrected selected rerun: 1 passed, 4 skipped |
+| Normalizer/store/reconciliation/recovery/standalone/viewer gate | 7 files, 73 tests passed |
+| Package acceptance | initial: 1 passed, 1 failed because minimal PATH lacked `sh`; corrected selected rerun: 1 passed, 1 skipped |
+| Typecheck | initial strict-check run exposed new regression JSDoc gaps; correction run passed both TypeScript projects |
+| Final acceptance | initial run: 8 passed, 4 deterministic-age snapshot failures; focused terminal correction: 8 passed; fresh acceptance: 3 files, 12 tests passed in 68.01 seconds |
+| `git diff --check` | passed |
+
+No full suite, complete release gate, SLURM job, real inference, publication, Pi registration, or repository rename ran in this fix round.

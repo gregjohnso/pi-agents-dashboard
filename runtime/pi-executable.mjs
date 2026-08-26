@@ -64,6 +64,27 @@ export async function resolvePiExecutable({ cliPath, configuredPath, pathEnv = p
   throw new PiExecutableError("PI_EXECUTABLE_NOT_FOUND", "Could not find an executable Pi binary on PATH");
 }
 
+/** Open an inode-bound executable handle for `/proc/self/fd` execution.
+ * @param {import("../shared/contracts.mjs").ExecutableIdentity} expected
+ * @param {{ fsOps?: any }} [options]
+ */
+export async function openPiExecutableBinding(expected, { fsOps = fs } = {}) {
+  let handle;
+  try {
+    handle = await fsOps.open(expected.realpath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const metadata = await handle.stat({ bigint: true });
+    const current = identityFromStat(metadata, expected.realpath);
+    if (!metadata.isFile() || current.device !== expected.device || current.inode !== expected.inode || current.size !== expected.size || current.modifiedTimeNs !== expected.modifiedTimeNs) {
+      throw new PiExecutableError("PI_EXECUTABLE_REPLACED", "Pi executable changed before execution binding");
+    }
+    return { handle, childFd: 3, executionPath: "/proc/self/fd/3" };
+  } catch (cause) {
+    await handle?.close().catch(() => {});
+    if (cause instanceof PiExecutableError) throw cause;
+    throw new PiExecutableError("PI_EXECUTABLE_REPLACED", "Pi executable could not be bound to its validated identity", { cause });
+  }
+}
+
 /** Revalidate the exact file identity immediately before spawn. @param {import("../shared/contracts.mjs").ExecutableIdentity} expected @param {{ fsOps?: any }} [options] */
 export async function assertPiExecutableIdentity(expected, { fsOps = fs } = {}) {
   let current;

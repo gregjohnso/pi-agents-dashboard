@@ -270,11 +270,61 @@ export async function pumpViewerSubscription(subscription, write) {
   }
 }
 
+/** Create one ordered bounded socket writer that waits for callback and drain.
+ * @param {any} socket
+ * @param {{ maxPendingBytes: number, maxPendingRecords: number }} options
+ */
+export function createBoundedSocketWriter(socket, { maxPendingBytes, maxPendingRecords }) {
+  /** @type {Buffer[]} */
+  const queue = [];
+  let pendingBytes = 0;
+  let writing = false;
+  const pump = () => {
+    if (writing || socket.destroyed) return;
+    const next = queue[0];
+    if (next === undefined) return;
+    writing = true;
+    let callbackDone = false;
+    let drained = true;
+    const finish = () => {
+      if (!callbackDone || !drained || socket.destroyed) return;
+      queue.shift();
+      pendingBytes -= next.byteLength;
+      writing = false;
+      pump();
+    };
+    const accepted = socket.write(next, (/** @type {Error | null} */ error) => {
+      if (error) { socket.destroy(); return; }
+      callbackDone = true;
+      finish();
+    });
+    if (!accepted) {
+      drained = false;
+      socket.once("drain", () => { drained = true; finish(); });
+    }
+  };
+  return {
+    /** @param {Buffer} encoded */
+    enqueue(encoded) {
+      if (socket.destroyed) return false;
+      if (queue.length >= maxPendingRecords || pendingBytes + encoded.byteLength > maxPendingBytes) {
+        socket.destroy(Object.assign(new Error("Subscriber output queue exceeded its bound"), { code: "SUBSCRIBER_BACKPRESSURE_LIMIT" }));
+        return false;
+      }
+      queue.push(encoded);
+      pendingBytes += encoded.byteLength;
+      pump();
+      return true;
+    },
+  };
+}
+
 /** @param {{ socketPath: string, token: string, maxBytes: number, context: any }} options */
 function createSocketServer({ socketPath, token, maxBytes, context }) {
   const sockets = new Set();
   const subscribers = new Set();
   const viewerSubscriptions = new Map();
+  const broadcastWriters = new Map();
   const chains = new Set();
   let accepting = true;
   /** @type {Promise<void> | undefined} */
@@ -285,6 +335,7 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
       return;
     }
     sockets.add(socket);
+    broadcastWriters.set(socket, createBoundedSocketWriter(socket, { maxPendingBytes: Math.min(4 * maxBytes, 4 * 1024 * 1024), maxPendingRecords: 256 }));
     let authenticated = false;
     let role = "frontend";
     /** @type {string | undefined} */
@@ -328,6 +379,7 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
       context.markAttachmentClosing?.(socket);
       sockets.delete(socket);
       subscribers.delete(socket);
+      broadcastWriters.delete(socket);
       const activeViewerSubscriptions = viewerSubscriptions.get(socket) ?? [];
       viewerSubscriptions.delete(socket);
       for (const subscription of activeViewerSubscriptions) void subscription.return?.();
@@ -463,7 +515,7 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
     /** @param {any} event */
     broadcast(event) {
       const encoded = createJsonlEncoder({ maxBytes }).encode(event);
-      for (const socket of subscribers) if (!socket.destroyed) socket.write(encoded, () => {});
+      for (const socket of subscribers) broadcastWriters.get(socket)?.enqueue(encoded);
     },
 
     beginShutdown() {
@@ -898,11 +950,11 @@ export async function createDaemonRuntime({
                 if (current?.stage === "DELIVERY_ATTEMPTED") return context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
                 throw error;
               }
-              const observedTerminal = ["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "KILLED", "STALE_IDENTITY"].includes(disposition.disposition);
-              if (disposition.disposition === "KILL_REQUESTED" || (disposition.signaled === true && disposition.disposition !== "STALE_IDENTITY")) {
+              const observedTerminal = ["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "KILLED"].includes(disposition.disposition);
+              if (disposition.disposition === "KILL_REQUESTED" || disposition.signaled === true) {
                 return context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
               }
-              if (["AMBIGUOUS_IDENTITY", "CANCELLED"].includes(disposition.disposition)) {
+              if (["STALE_IDENTITY", "AMBIGUOUS_IDENTITY", "CANCELLED"].includes(disposition.disposition)) {
                 await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
                 return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "FAILED", dashboardError(disposition.disposition, `Stop refused at exact identity boundary: ${disposition.disposition}`));
               }

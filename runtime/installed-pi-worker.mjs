@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
-import { assertPiExecutableIdentity } from "./pi-executable.mjs";
+import { openPiExecutableBinding } from "./pi-executable.mjs";
 import { PiRpcAdapter } from "./pi-rpc-adapter.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { openRotatingDiagnostics } from "./rotating-diagnostics.mjs";
@@ -110,13 +110,18 @@ export async function runInstalledPiWorker(runtimeProcess, dependencies) {
   }));
   if (!matchesToken(activation?.token, token) || activation?.leaseId !== options.leaseId || activation?.generation !== options.generation) throw Object.assign(new Error("Worker activation mismatch"), { code: "WORKER_ACTIVATION_MISMATCH" });
 
-  await assertPiExecutableIdentity(options.executable);
+  const executableBinding = await openPiExecutableBinding(options.executable);
   const diagnostics = await openRotatingDiagnostics({ directory: options.diagnosticsDirectory });
   const argv = ["--mode", "rpc", "--session", options.canonicalSessionFile];
   if (options.model !== undefined) argv.push("--provider", options.model.provider, "--model", options.model.id);
   if (options.thinkingLevel !== undefined) argv.push("--thinking", options.thinkingLevel);
   if (options.name !== undefined) argv.push("--name", options.name);
-  const piChild = spawn(options.piExecutable, argv, { cwd: options.cwd, env: runtimeProcess.env, detached: false, shell: false, stdio: ["pipe", "pipe", "pipe"] });
+  let piChild;
+  try {
+    piChild = spawn(executableBinding.executionPath, argv, { cwd: options.cwd, env: runtimeProcess.env, detached: false, shell: false, stdio: ["pipe", "pipe", "pipe", executableBinding.handle.fd] });
+  } finally {
+    await executableBinding.handle.close();
+  }
   if (piChild.stdin === null || piChild.stdout === null || piChild.stderr === null || !Number.isSafeInteger(piChild.pid)) throw Object.assign(new Error("Pi child did not expose owned pipes"), { code: "RPC_PROCESS_FAILED" });
   piChild.stderr.on("data", (chunk) => { void diagnostics.stderr.append(chunk).catch(() => {}); });
   const adapter = PiRpcAdapter.connect({ input: piChild.stdin, output: piChild.stdout, diagnostics: diagnostics.rpc, process: piChild, maxRecordBytes: 16 * 1024 * 1024 });
@@ -139,7 +144,10 @@ export async function runInstalledPiWorker(runtimeProcess, dependencies) {
     runtimeProcess.once("disconnect", onDisconnect);
   });
 
-  await adapter.getState();
+  const initialState = await adapter.getState();
+  if (initialState?.sessionFile !== options.canonicalSessionFile) {
+    throw Object.assign(new Error("Installed Pi get_state did not retain the canonical session file"), { code: "CANONICAL_SESSION_MISMATCH" });
+  }
   const replay = await dependencies.createWorkerReplayStore({ path: options.replayPath });
   const dispatcher = dependencies.createWorkerCommandDispatcher({ replay, adapter });
   const reconnectController = new AbortController();

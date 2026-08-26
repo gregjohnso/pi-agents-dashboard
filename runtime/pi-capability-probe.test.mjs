@@ -41,6 +41,7 @@ it("probes recognized validation errors without a valid prompt or canonical sess
     missingRequired: [],
   });
   expect(report.commands).toEqual(["get_state", "prompt", "follow_up", "steer", "abort", "extension_ui_response"]);
+  expect(report.events).toContain("required_live_events");
   const entries = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
   expect(entries.some((entry) => entry.providerInvocation === true)).toBe(false);
   expect(entries.some((entry) => entry.valid === true)).toBe(false);
@@ -94,6 +95,15 @@ it("caches by complete executable identity and invalidates after replacement", a
 
   await writeFile(executable.realpath, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
   await expect(probePiCapabilities(options)).rejects.toMatchObject({ code: "PI_EXECUTABLE_REPLACED" });
+});
+
+it("refuses when the selected adapter cannot normalize documented required live events without prompting Pi", async () => {
+  const { log, executable } = await setup();
+  const report = await probePiCapabilities({ executable, cache: new Map(), timeoutMs: 1_000, env: { ...process.env, FAKE_PI_LOG: log }, requiredEventProbe: () => false });
+  expect(report.missingRequired).toContain("required_live_events");
+  expect(report.events).not.toContain("required_live_events");
+  const entries = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  expect(entries.some((entry) => entry.providerInvocation === true || entry.valid === true)).toBe(false);
 });
 
 it("reports missing required commands and malformed JSONL without inference", async () => {

@@ -802,7 +802,8 @@ export async function createDaemonRuntime({
         if (request.op === "get_state") return { kind: "state", sessions: await registry.list() };
         if (context.state !== "READY" && !duringRecovery) throw Object.assign(new Error(context.state === "FAILED" ? context.stateError?.message ?? "Daemon recovery failed" : "Daemon recovery is still in progress"), { code: context.state === "FAILED" ? context.stateError?.code ?? "RECOVERY_FAILED" : "RECOVERING", retryable: context.state !== "FAILED" });
         if (request.op === "get_viewer_snapshot") {
-          const role = socket === undefined ? "observer" : attachmentClaims.get(request.payload.sessionId)?.get(socket)?.role ?? "observer";
+          const claimedRole = socket === undefined ? "observer" : attachmentClaims.get(request.payload.sessionId)?.get(socket)?.role ?? "observer";
+          const role = router.route(request.payload.sessionId) === undefined ? "observer" : claimedRole;
           return { kind: "viewer_snapshot", snapshot: await context.recovery.viewer.snapshot(request.payload.sessionId, role) };
         }
         if (request.op === "subscribe_viewer") {

@@ -220,8 +220,7 @@ export class ViewerController {
       if (steer.length === 0) return;
       this.steerStatus = "sending";
       try {
-        await this.submitSteer(steer);
-        this.steerStatus = "queued";
+        this.steerStatus = await this.submitSteer(steer) ? "queued" : "failed";
       } catch (error) {
         this.steerStatus = "failed";
         throw error;
@@ -238,7 +237,7 @@ export class ViewerController {
     const prompt = text.trim();
     if (this.state?.role !== "composer" || prompt.length === 0) return;
     const operation = this.state.working ? "follow_up" : "prompt";
-    await this.sendCommand(operation, { text: prompt });
+    if (!await this.sendCommand(operation, { text: prompt })) return;
     this.history.push(prompt);
     this.editor.addToHistory?.(prompt);
     this.restoring = true; this.editor.setText(""); this.restoring = false;
@@ -246,14 +245,26 @@ export class ViewerController {
   }
 
   submitSteer(text) {
-    if (this.state?.role !== "composer" || text.trim().length === 0) return Promise.resolve();
+    if (this.state?.role !== "composer" || text.trim().length === 0) return Promise.resolve(false);
     return this.sendCommand("steer", { text: text.trim() });
   }
 
   async sendCommand(operation, payload) {
     const request = { sessionId: this.sessionId, ...payload };
-    if (typeof this.client.command === "function") await this.client.command(operation, request);
-    else await this.client.request(operation, request);
+    try {
+      if (typeof this.client.command === "function") await this.client.command(operation, request);
+      else await this.client.request(operation, request);
+      return true;
+    } catch (error) {
+      const typed = /** @type {any} */ (error);
+      const normalized = { code: typed?.code ?? "VIEWER_COMMAND_FAILED", message: error instanceof Error ? error.message : "Viewer command failed", retryable: typed?.retryable === true };
+      if (this.state !== undefined) {
+        this.state = { ...this.state, errors: [...this.state.errors, normalized].slice(-100) };
+        this.transcript?.update(this.state);
+      }
+      await this.requestRender();
+      return false;
+    }
   }
 
   async processEvent(value) {

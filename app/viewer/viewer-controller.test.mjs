@@ -25,7 +25,7 @@ function fixture(overrides = {}) {
   const client = {
     async getSnapshot() { return snapshot(overrides.snapshot); },
     subscribe(_sessionId, _cursor, next) { listener = next; return () => order.push("unsubscribe"); },
-    async command(operation, payload) { commands.push({ operation, payload }); },
+    async command(operation, payload) { commands.push({ operation, payload }); return overrides.command?.(operation, payload); },
     async ack(_sessionId, cursor) { order.push(`ack:${cursor.sequence}`); },
   };
   const persistence = { async load() { return overrides.persisted; }, async save(value) { await overrides.save?.(value); saved.push(structuredClone(value)); order.push(`persist:${value.cursor?.sequence ?? "draft"}`); } };
@@ -51,6 +51,17 @@ describe("viewer commands and role restrictions", () => {
     await f.emit({ version: 1, sessionId: "s", eventId: "e3", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "3" }, timestamp, payload: { kind: "turn_state", working: true } });
     f.instance.handleInput("y");
     expect(f.commands.filter(({ operation }) => operation === "ui_response")).toHaveLength(1);
+  });
+
+  it("renders command failures without closing the viewer process", async () => {
+    const failure = Object.assign(new Error("No exact recovered worker owns this session"), { code: "WORKER_UNAVAILABLE", retryable: false });
+    const f = fixture({ command: async () => { throw failure; } });
+    await f.instance.open();
+    f.instance.editor.setText("retry");
+    f.instance.handleInput("\r");
+
+    await vi.waitFor(() => expect(f.instance.state.errors).toContainEqual({ code: "WORKER_UNAVAILABLE", message: failure.message, retryable: false }));
+    expect(f.instance.closedState).toBe(false);
   });
 
   it("routes Ctrl+C to interrupt while a working pending overlay retains focus", async () => {

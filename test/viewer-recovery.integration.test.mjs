@@ -50,6 +50,31 @@ it("fails daemon reconciliation closed when durable viewer state is corrupt", as
   await daemon.close().catch(() => {});
 });
 
+it("keeps a published event authoritative when re-derived history content drifts", async () => {
+  const { root, sessionFile } = await setup();
+  const first = await open(root, "client-drift");
+  await first.client.getViewerSnapshot("session-1");
+  await first.client.close();
+  await first.daemon.close();
+
+  const viewerDirectory = join(root, "index", "viewer");
+  const eventsFile = (await readdir(viewerDirectory)).find((name) => name.endsWith(".events.jsonl"));
+  if (eventsFile === undefined) throw new Error("Viewer event store was not created");
+  const eventsPath = join(viewerDirectory, eventsFile);
+  const events = (await readFile(eventsPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  const drifted = events.map((event) => event.payload?.kind === "user_message"
+    ? { ...event, payload: { ...event.payload, content: [{ type: "text", text: "drifted transcript" }] } }
+    : event);
+  await writeFile(eventsPath, `${drifted.map((event) => JSON.stringify(event)).join("\n")}\n`, { mode: 0o600 });
+
+  const second = await open(root, "client-drift-2");
+  await expect(second.client.getViewerSnapshot("session-1")).resolves.toMatchObject({ sessionId: "session-1" });
+  const preserved = (await readFile(eventsPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  expect(preserved.filter((event) => event.payload?.kind === "user_message").map((event) => event.payload.content)).toEqual([[{ type: "text", text: "drifted transcript" }]]);
+  await second.client.close();
+  await second.daemon.close();
+});
+
 it("reconstructs normalized snapshots from canonical history and durable viewer events across daemon restart", async () => {
   const { root, sessionFile } = await setup();
   const original = await readFile(sessionFile);

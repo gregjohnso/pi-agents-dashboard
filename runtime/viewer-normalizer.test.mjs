@@ -87,6 +87,21 @@ describe("viewer normalizer", () => {
     assertPayloads([...thinking, ...text]);
   });
 
+  it("derives history tool events from the session file alone so replay stays byte-identical", () => {
+    const call = { type: "message", id: "call-1", timestamp: "2026-08-25T00:00:00.000Z", message: { role: "assistant", content: [{ type: "toolCall", id: "tool-1", name: "bash", arguments: { command: "pwd" } }], timestamp: 1 } };
+    const result = { type: "message", id: "result-1", timestamp: "2026-08-25T00:00:01.000Z", message: { role: "toolResult", toolCallId: "tool-1", toolName: "bash", content: [{ type: "text", text: "/repo" }], isError: false, timestamp: 2 } };
+
+    const cold = normalizer();
+    const coldEvents = [...cold.consumeHistory(call, position(1)), ...cold.consumeHistory(result, position(2))];
+
+    const warm = normalizer();
+    warm.consumeFrame({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "bash", args: { command: "pwd" } });
+    const warmEvents = [...warm.consumeHistory(call, position(1)), ...warm.consumeHistory(result, position(2))];
+
+    const payloads = (/** @type {any[]} */ events) => events.filter((event) => event.payload.kind.startsWith("tool_")).map((event) => [event.eventId, event.payload]);
+    expect(payloads(warmEvents)).toEqual(payloads(coldEvents));
+  });
+
   it("records each tool's chronological position between messages in the snapshot", () => {
     const subject = normalizer();
     subject.consumeFrame({ type: "message_end", message: { role: "user", content: "run it", timestamp: 1 } });

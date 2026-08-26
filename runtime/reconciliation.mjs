@@ -264,7 +264,14 @@ async function createViewerRecovery({ root, daemonEpoch, registry }) {
     for (const error of history.errors) state.normalizer.consumeError(error);
     for (const item of history.entries) {
       const drafts = state.normalizer.consumeHistory(item.entry, { ...item.position, sourceId: item.sourceId });
-      for (const draft of drafts) await state.store.append(draft);
+      for (const draft of drafts) {
+        try {
+          await state.store.append(draft);
+        } catch (error) {
+          // A published event is authoritative: frontends already consumed it at that cursor, so re-derived drift never rewrites history.
+          if (/** @type {any} */ (error)?.code !== "VIEWER_EVENT_ID_CONFLICT") throw error;
+        }
+      }
     }
   }
 

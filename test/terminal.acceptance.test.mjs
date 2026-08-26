@@ -201,7 +201,7 @@ it("drives list navigation, search/filter/sort/group, metadata/help, composer, c
   expect(f.backend.delete).toHaveBeenCalledTimes(1);
 });
 
-it("drives viewer prompt/follow-up/steer/interrupt, search, tools, pending UI, and observer restrictions", async () => {
+it("drives viewer prompt/follow-up/steer/interrupt, tools, pending UI, and read-only restrictions", async () => {
   const f = viewerFixture({ pendingUi: [], errors: [], tools: [{ id: "tool", name: "bash", state: "completed", arguments: {}, result: [{ type: "text", text: "needle result" }], startedAt: timestamp, finishedAt: timestamp }] });
   await f.controller.open();
   f.controller.editor.setText("first");
@@ -224,10 +224,6 @@ it("drives viewer prompt/follow-up/steer/interrupt, search, tools, pending UI, a
   await f.emit(event(2, { kind: "pending_ui_request", request: { id: "confirm", method: "confirm", title: "Continue?" } }));
   f.controller.handleInput("y");
   await vi.waitFor(() => expect(f.commands.at(-1)?.operation).toBe("ui_response"));
-  f.controller.handleInput("/");
-  for (const input of "needle") f.controller.handleInput(input);
-  expect(f.controller.search).toMatchObject({ query: "needle", matches: expect.any(Array) });
-  f.controller.handleInput("\x1b");
   f.controller.handleInput("\x0f");
   expect(f.controller.transcript.selectedToolId).toBe("tool");
   f.controller.handleInput("\x0f");

@@ -254,6 +254,36 @@ it("rejects malformed Pi output, retains stderr, and does not respawn", async ()
   await adapter.close();
 });
 
+it("discovers commands and applies model, thinking, and compaction changes", async () => {
+  /** @type {any[]} */
+  const sent = [];
+  /** @type {Record<string, any>} */
+  const data = {
+    get_commands: { commands: [{ name: "review", description: "Review", source: "extension" }] },
+    get_available_models: { models: [{ provider: "anthropic", id: "claude" }] },
+    get_available_thinking_levels: { levels: ["off", "high"] },
+    set_model: { provider: "anthropic", id: "claude" },
+    set_thinking_level: undefined,
+    compact: { compacted: true },
+  };
+  const child = fakeRpcProcess((command, process) => {
+    sent.push(command);
+    process.stdout.write(`${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true, data: data[command.type] })}\n`);
+  });
+  const adapter = PiRpcAdapter.connect({ input: child.stdin, output: child.stdout, maxRecordBytes: 4_096 });
+
+  await expect(adapter.getCommands()).resolves.toEqual(data.get_commands);
+  await expect(adapter.getAvailableModels()).resolves.toEqual(data.get_available_models);
+  await expect(adapter.getAvailableThinkingLevels()).resolves.toEqual(data.get_available_thinking_levels);
+  await expect(adapter.setModel({ provider: "anthropic", id: "claude" })).resolves.toEqual(data.set_model);
+  await expect(adapter.setThinkingLevel("high")).resolves.toBeUndefined();
+  await expect(adapter.compact("keep decisions")).resolves.toEqual(data.compact);
+  expect(sent.map(({ type }) => type)).toEqual(["get_commands", "get_available_models", "get_available_thinking_levels", "set_model", "set_thinking_level", "compact"]);
+  expect(sent[3]).toMatchObject({ provider: "anthropic", modelId: "claude" });
+  expect(sent[5]).toMatchObject({ customInstructions: "keep decisions" });
+  await adapter.close();
+});
+
 it("sends one-way UI responses without blocking the next correlated command", async () => {
   /** @type {string[]} */
   const commands = [];

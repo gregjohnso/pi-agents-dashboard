@@ -1,7 +1,8 @@
-import { decodeKittyPrintable, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { CombinedAutocompleteProvider, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 import { parseViewerEvent, parseViewerSnapshot } from "../../shared/viewer-contracts.mjs";
 import { createPiComponentAdapters } from "./pi-component-adapters.mjs";
+import { EMPTY_SESSION_MENU, parseSlashSubmission, sessionSlashCommands } from "./slash-commands.mjs";
 import { PendingUiOverlay, renderActivityLine, renderSystemCard } from "./overlays.mjs";
 import { ReturnGesture } from "./return-gesture.mjs";
 import { TranscriptModel, applyViewerEvent, createTranscriptState } from "./transcript.mjs";
@@ -16,7 +17,7 @@ function isPageDown(data) { return matchesKey(data, Key.pageDown); }
 
 /** Own one standalone normalized Pi chat subscription and its composer role. */
 export class ViewerController {
-  constructor({ sessionId, client, editor, persistence, requestRender, onReturn, now = Date.now, adapters = undefined }) {
+  constructor({ sessionId, client, editor, persistence, requestRender, onReturn, now = Date.now, adapters = undefined, cwd = process.cwd() }) {
     if (!sessionId || client === undefined || editor === undefined || persistence === undefined) throw new TypeError("sessionId, client, editor, and persistence are required");
     this.sessionId = sessionId;
     this.client = client;
@@ -26,6 +27,8 @@ export class ViewerController {
     this.onReturn = onReturn ?? (() => {});
     this.now = now;
     this.adapters = adapters ?? createPiComponentAdapters({ tui: editor.tui ?? { mode: "fullscreen", requestRender: () => this.requestRender(), setFocus() {} } });
+    this.cwd = cwd;
+    this.menu = EMPTY_SESSION_MENU;
     this.history = [];
     this.respondedUi = new Set();
     this.inputMode = "prompt";
@@ -64,6 +67,7 @@ export class ViewerController {
       this.editor.focused = snapshot.role === "composer";
       this.transcript = new TranscriptModel({ state: this.state, adapters: this.adapters });
       this.installOverlay();
+      await this.loadMenu();
       const unsubscribe = await this.client.subscribe(this.sessionId, initial.cursor, (event) => this.processEvent(event), (error) => this.fail(error));
       if (this.closedState) unsubscribe?.(); else this.unsubscribe = unsubscribe;
       await this.requestRender();
@@ -86,13 +90,12 @@ export class ViewerController {
     const footerParts = [this.state.model === null ? "model:default" : `model:${this.state.model.provider}/${this.state.model.id}`, `thinking:${this.state.thinkingLevel ?? "default"}`, `connection:${this.state.processState}`];
     const footer = footerParts.join(" · ");
     const activity = renderActivityLine(this.state.activity, width, this.now());
-    const editorLines = this.state.role === "composer" ? this.editor.render(width) : [" Observer mode · scroll/search/tool inspection only"];
+    const editorLines = this.state.role === "composer" ? this.editor.render(width) : [" Read-only session · scroll and tool inspection only"];
     const inputLabel = this.inputMode === "steer" ? [" Steer at next supported boundary"] : this.steerStatus === undefined ? [] : [` Steer ${this.steerStatus}`];
-    const searchLine = this.search === undefined ? [] : [` Search: ${this.search.query} [${this.search.matches.length === 0 ? 0 : this.search.matchIndex + 1}/${this.search.matches.length}]`];
     const selectedTool = this.transcript.selectedToolId === undefined ? undefined : this.state.tools.get(this.transcript.selectedToolId);
     const toolLine = selectedTool === undefined ? [] : [` tool:${selectedTool.name} ${selectedTool.state} ${this.transcript.expandedTools.has(selectedTool.id) ? "expanded" : "collapsed"}`];
     const errorLines = this.state.errors.slice(-1).flatMap((error) => renderSystemCard({ text: `${error.code}: ${error.message}`, level: "error" }, width));
-    const fixed = 2 + activity.length + editorLines.length + inputLabel.length + searchLine.length + toolLine.length + errorLines.length;
+    const fixed = 2 + activity.length + editorLines.length + inputLabel.length + toolLine.length + errorLines.length;
     const transcriptHeight = Math.max(0, height - fixed);
     let body = this.transcript.render(width, transcriptHeight);
     if (this.overlay !== undefined) {
@@ -102,7 +105,7 @@ export class ViewerController {
     }
     const thinking = `${this.state.thinkingLevel ?? "default"}/${this.hideThinking ? "hidden" : "visible"}`;
     const statusFooter = footer.replace(`thinking:${this.state.thinkingLevel ?? "default"}`, `thinking:${thinking}`);
-    const lines = [header, ...body, ...errorLines, ...activity, ...searchLine, ...toolLine, ...inputLabel, ...editorLines, statusFooter].map((line) => fit(line, width));
+    const lines = [header, ...body, ...errorLines, ...activity, ...toolLine, ...inputLabel, ...editorLines, statusFooter].map((line) => fit(line, width));
     while (lines.length < height) lines.splice(1, 0, "");
     return lines.slice(0, height);
   }
@@ -119,7 +122,6 @@ export class ViewerController {
       this.requestRender();
       return;
     }
-    if (this.search !== undefined) { this.handleSearchInput(data); return; }
     if (this.inputMode === "steer") {
       this.returnGesture.cancel();
       if (matchesKey(data, Key.escape)) this.finishSteer(); else this.editor.handleInput(data);
@@ -154,7 +156,6 @@ export class ViewerController {
       this.requestRender();
       return;
     }
-    if (data === "/") { this.search = { query: "", matches: [], matchIndex: -1 }; this.returnGesture.cancel(); this.requestRender(); return; }
     if (matchesKey(data, Key.left) || matchesKey(data, Key.escape)) {
       const key = matchesKey(data, Key.left) ? "left" : "escape";
       const clean = this.editor.getText().length === 0 && !this.edited && !this.historyUsed;
@@ -173,27 +174,22 @@ export class ViewerController {
     this.requestRender();
   }
 
-  handleSearchInput(data) {
-    if (matchesKey(data, Key.escape)) {
-      this.transcript.setSearch("");
-      this.search = undefined;
-      this.requestRender();
-      return;
+  /** Load and install the session's discovered slash-command menu. */
+  async loadMenu() {
+    if (typeof this.client.menu !== "function") return;
+    try {
+      const menu = await this.client.menu(this.sessionId);
+      this.menu = {
+        commands: Array.isArray(menu?.commands) ? menu.commands : [],
+        models: Array.isArray(menu?.models) ? menu.models : [],
+        thinkingLevels: Array.isArray(menu?.thinkingLevels) ? menu.thinkingLevels : [],
+        model: menu?.model ?? null,
+        thinkingLevel: menu?.thinkingLevel ?? null,
+      };
+    } catch {
+      this.menu = EMPTY_SESSION_MENU;
     }
-    if (matchesKey(data, Key.enter) || matchesKey(data, Key.ctrl("n")) || matchesKey(data, Key.ctrl("p"))) {
-      this.search.matchIndex = this.transcript.nextSearch(matchesKey(data, Key.ctrl("p")) ? -1 : 1);
-      this.requestRender();
-      return;
-    }
-    if (matchesKey(data, Key.backspace)) this.search.query = this.search.query.slice(0, -1);
-    else {
-      const printable = decodeKittyPrintable(data) ?? (data.length === 1 && data.charCodeAt(0) >= 32 ? data : undefined);
-      if (printable === undefined) return;
-      this.search.query += printable;
-    }
-    this.search.matches = this.transcript.setSearch(this.search.query);
-    this.search.matchIndex = this.search.matches.length === 0 ? -1 : 0;
-    this.requestRender();
+    this.editor.setAutocompleteProvider?.(new CombinedAutocompleteProvider(/** @type {any} */ (sessionSlashCommands(this.menu)), this.cwd));
   }
 
   beginSteer() {
@@ -236,8 +232,18 @@ export class ViewerController {
   async submitText(text) {
     const prompt = text.trim();
     if (this.state?.role !== "composer" || prompt.length === 0) return;
-    const operation = this.state.working ? "follow_up" : "prompt";
-    if (!await this.sendCommand(operation, { text: prompt })) return;
+    const submission = parseSlashSubmission(prompt, this.menu);
+    if (submission.kind === "rejected") {
+      this.recordError({ code: submission.code, message: submission.message, retryable: false });
+      return;
+    }
+    if (submission.kind === "session_command") {
+      if (!await this.sendCommand("session_command", submission.payload)) return;
+      await this.loadMenu();
+    } else {
+      const operation = this.state.working ? "follow_up" : "prompt";
+      if (!await this.sendCommand(operation, { text: submission.text })) return;
+    }
     this.history.push(prompt);
     this.editor.addToHistory?.(prompt);
     this.restoring = true; this.editor.setText(""); this.restoring = false;
@@ -257,14 +263,18 @@ export class ViewerController {
       return true;
     } catch (error) {
       const typed = /** @type {any} */ (error);
-      const normalized = { code: typed?.code ?? "VIEWER_COMMAND_FAILED", message: error instanceof Error ? error.message : "Viewer command failed", retryable: typed?.retryable === true };
-      if (this.state !== undefined) {
-        this.state = { ...this.state, errors: [...this.state.errors, normalized].slice(-100) };
-        this.transcript?.update(this.state);
-      }
-      await this.requestRender();
+      await this.recordError({ code: typed?.code ?? "VIEWER_COMMAND_FAILED", message: error instanceof Error ? error.message : "Viewer command failed", retryable: typed?.retryable === true });
       return false;
     }
+  }
+
+  /** @param {{code:string,message:string,retryable:boolean}} error */
+  async recordError(error) {
+    if (this.state !== undefined) {
+      this.state = { ...this.state, errors: [...this.state.errors, error].slice(-100) };
+      this.transcript?.update(this.state);
+    }
+    await this.requestRender();
   }
 
   async processEvent(value) {
@@ -282,10 +292,6 @@ export class ViewerController {
         this.state = { ...this.state, role: authoritative.role, taskState: authoritative.taskState, processState: authoritative.processState, outcome: authoritative.outcome, model: authoritative.model, thinkingLevel: authoritative.thinkingLevel, activity: authoritative.activity, pendingUi: structuredClone(authoritative.pendingUi), errors: structuredClone(authoritative.errors) };
       }
       this.transcript.update(this.state);
-      if (this.search !== undefined) {
-        this.search.matches = [...this.transcript.searchMatches];
-        this.search.matchIndex = this.search.matches.indexOf(this.transcript.selectedSearchItemId);
-      }
       this.editor.disableSubmit = this.state.role !== "composer";
       this.installOverlay();
       await this.requestRender();

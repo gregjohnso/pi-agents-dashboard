@@ -264,6 +264,15 @@ export class PiRpcAdapter {
   /** @param {{ requestId: string, response: unknown }} response */
   async uiResponse(response) { await this.#sendOneWay("extension_ui_response", response); }
   async getState() { return this.#request("get_state"); }
+  async getCommands() { return this.#request("get_commands"); }
+  async getAvailableModels() { return this.#request("get_available_models"); }
+  async getAvailableThinkingLevels() { return this.#request("get_available_thinking_levels"); }
+  /** @param {{ provider: string, id: string }} model */
+  async setModel(model) { return this.#request("set_model", { provider: model.provider, modelId: model.id }); }
+  /** @param {string} level */
+  async setThinkingLevel(level) { return this.#request("set_thinking_level", { level }); }
+  /** @param {string} [instructions] */
+  async compact(instructions) { return this.#request("compact", instructions === undefined ? {} : { customInstructions: instructions }); }
 
   /** @param {(frame: Record<string, unknown>) => void} listener */
   onFrame(listener) {

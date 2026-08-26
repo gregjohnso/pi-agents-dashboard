@@ -15,7 +15,7 @@ function snapshot(overrides = {}) {
 }
 function editor() {
   let text = "";
-  return { focused: false, disableSubmit: false, onSubmit: undefined, onChange: undefined, setText(value) { text = value; this.onChange?.(value); }, getText() { return text; }, addToHistory: vi.fn(), handleInput(data) { if (data === "\r") this.onSubmit?.(text); else if (data.length === 1 && data >= " ") { text += data; this.onChange?.(text); } }, render: () => [`> ${text}`] };
+  return { focused: false, disableSubmit: false, onSubmit: undefined, onChange: undefined, autocompleteProvider: undefined, setAutocompleteProvider(provider) { this.autocompleteProvider = provider; }, setText(value) { text = value; this.onChange?.(value); }, getText() { return text; }, addToHistory: vi.fn(), handleInput(data) { if (data === "\r") this.onSubmit?.(text); else if (data.length === 1 && data >= " ") { text += data; this.onChange?.(text); } }, render: () => [`> ${text}`] };
 }
 function fixture(overrides = {}) {
   let listener;
@@ -26,6 +26,7 @@ function fixture(overrides = {}) {
     async getSnapshot() { return snapshot(overrides.snapshot); },
     subscribe(_sessionId, _cursor, next) { listener = next; return () => order.push("unsubscribe"); },
     async command(operation, payload) { commands.push({ operation, payload }); return overrides.command?.(operation, payload); },
+    ...(overrides.menu === undefined ? {} : { menu: overrides.menu }),
     async ack(_sessionId, cursor) { order.push(`ack:${cursor.sequence}`); },
   };
   const persistence = { async load() { return overrides.persisted; }, async save(value) { await overrides.save?.(value); saved.push(structuredClone(value)); order.push(`persist:${value.cursor?.sequence ?? "draft"}`); } };
@@ -97,7 +98,34 @@ describe("viewer commands and role restrictions", () => {
     await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "ui_response", payload: { sessionId: "s", uiRequestId: `request-${method}`, response: expected } }]));
   });
 
-  it("observer mode disables every mutation but preserves scroll, search, and tool inspection", async () => {
+  it("discovers slash commands, applies model selection, and reloads the menu", async () => {
+    const menu = { commands: [{ name: "/review", source: "extension" }], models: [{ provider: "anthropic", id: "claude" }], thinkingLevels: ["off", "high"], model: null, thinkingLevel: "off" };
+    const loaded = [];
+    const f = fixture({ menu: async () => { loaded.push("menu"); return menu; } });
+    await f.instance.open();
+    expect(loaded).toEqual(["menu"]);
+    expect(f.instance.editor.autocompleteProvider).toBeDefined();
+
+    f.instance.editor.setText("/model anthropic/claude");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "session_command", payload: { sessionId: "s", command: "set_model", model: { provider: "anthropic", id: "claude" } } }]));
+    await vi.waitFor(() => expect(loaded).toEqual(["menu", "menu"]));
+
+    f.instance.editor.setText("/review the diff");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.commands.at(-1)).toEqual({ operation: "prompt", payload: { sessionId: "s", text: "/review the diff" } }));
+  });
+
+  it("rejects an unknown model locally without contacting the session", async () => {
+    const f = fixture({ menu: async () => ({ commands: [], models: [{ provider: "anthropic", id: "claude" }], thinkingLevels: [], model: null, thinkingLevel: null }) });
+    await f.instance.open();
+    f.instance.editor.setText("/model invented/model");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.instance.state.errors).toContainEqual({ code: "UNKNOWN_MODEL", message: "Unknown model: invented/model", retryable: false }));
+    expect(f.commands).toEqual([]);
+  });
+
+  it("observer mode disables every mutation but preserves scroll and tool inspection", async () => {
     const f = fixture({ snapshot: { role: "observer", tools: [{ id: "t", name: "bash", state: "completed", arguments: {}, result: [{ type: "text", text: "ok" }], startedAt: timestamp, finishedAt: timestamp }] } });
     await f.instance.open();
     f.instance.editor.setText("blocked");
@@ -107,7 +135,7 @@ describe("viewer commands and role restrictions", () => {
     expect(f.instance.render(55, 16).join("\n")).toContain("OBSERVER");
   });
 
-  it("supports transcript search/navigation, selected-tool inspection, explicit steer input, and thinking visibility", async () => {
+  it("supports selected-tool inspection, explicit steer input, and thinking visibility", async () => {
     const tool = (id) => ({ id, name: "future_tool", state: "completed", arguments: { id }, result: [{ type: "text", text: `result ${id}` }], startedAt: timestamp, finishedAt: timestamp });
     const f = fixture({ snapshot: {
       items: [
@@ -118,16 +146,6 @@ describe("viewer commands and role restrictions", () => {
       tools: [tool("tool-a"), tool("tool-b")], thinkingLevel: "high",
     } });
     await f.instance.open();
-    for (const input of ["/", ..."needle"]) f.instance.handleInput(input);
-    expect(f.instance.search).toMatchObject({ query: "needle", matchIndex: 0, matches: ["first", "second"] });
-    expect(f.instance.transcript.selectedSearchItemId).toBe("first");
-    f.instance.handleInput("\r");
-    expect(f.instance.transcript.selectedSearchItemId).toBe("second");
-    expect(f.instance.render(80, 24).join("\n")).toContain("Search: needle [2/2]");
-    f.instance.handleInput("\x10");
-    expect(f.instance.transcript.selectedSearchItemId).toBe("first");
-    f.instance.handleInput("\x1b");
-    expect(f.instance.search).toBeUndefined();
 
     f.instance.handleInput("\x0f");
     expect(f.instance.transcript.selectedToolId).toBe("tool-a");

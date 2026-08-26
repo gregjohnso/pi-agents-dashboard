@@ -64,6 +64,11 @@ export function createDaemonViewerClient({ client, clientId }) {
     },
     async detach(sessionId) { return request("detach", { sessionId }); },
     getSnapshot: (sessionId) => client.getViewerSnapshot(sessionId),
+    async menu(sessionId) {
+      const result = await request("get_session_commands", { sessionId });
+      if (result?.kind !== "session_commands") throw Object.assign(new Error("Daemon returned the wrong session command menu"), { code: "INVALID_RESPONSE" });
+      return result;
+    },
     subscribe(sessionId, cursor, next, onError) {
       let active = true;
       const iterator = client.subscribeViewer(sessionId, cursor)[Symbol.asyncIterator]();
@@ -183,7 +188,7 @@ export async function createStandaloneList({ cwd, frontend }) {
         const editor = createPiEditor({ tui });
         let viewer;
         viewer = new ViewerController({
-          sessionId, client: viewerClient, editor,
+          sessionId, client: viewerClient, editor, cwd,
           persistence: { async load() { return viewerState.get(sessionId); }, async save(value) { viewerState.set(sessionId, structuredClone(value)); } },
           requestRender: () => tui.requestRender(), onReturn: () => { void viewer.close(); },
         });

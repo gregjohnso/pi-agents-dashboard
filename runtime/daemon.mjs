@@ -26,7 +26,8 @@ initializeRuntimePermissions();
 
 const DEFAULT_MAX_BYTES = 1024 * 1024;
 const MAX_ATTACHMENT_REQUESTS = 4096;
-const DURABLE_COMMANDS = new Set(["prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response"]);
+const DURABLE_COMMANDS = new Set(["prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "session_command"]);
+const WORKER_DELIVERED_COMMANDS = ["prompt", "steer", "follow_up", "interrupt", "ui_response", "session_command"];
 const CONNECTOR_PATH = fileURLToPath(new URL("./daemon-connector.mjs", import.meta.url));
 const DEFAULT_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateMs: 5_000 });
 
@@ -244,6 +245,13 @@ async function createDeleteResultStore(path) {
 function validateWorkerSuccess(record, pending) {
   const allowed = ["clientId", "requestId", "op", "stage", "at", "result", "stderr"];
   if (typeof record !== "object" || record === null || Array.isArray(record) || Object.keys(record).some((key) => !allowed.includes(key)) || record.clientId !== pending.clientId || record.requestId !== pending.requestId || record.op !== pending.op || record.stage !== "RPC_ACKNOWLEDGED" || typeof record.at !== "string") throw Object.assign(new Error("Worker result does not match the pending durable command"), { code: "INVALID_WORKER_RESULT" });
+}
+
+/** Project one validated session_command payload onto its exact worker request. @param {any} payload */
+function sessionCommandPayload(payload) {
+  if (payload.command === "set_model") return { command: "set_model", model: { ...payload.model } };
+  if (payload.command === "set_thinking_level") return { command: "set_thinking_level", level: payload.level };
+  return payload.instructions === undefined ? { command: "compact" } : { command: "compact", instructions: payload.instructions };
 }
 
 /** @param {any} left @param {any} right */
@@ -953,6 +961,21 @@ export async function createDaemonRuntime({
           if (socket === undefined) throw new TypeError("Attachment requires a live socket");
           return context.arbitrateAttachment(request, socket, authenticatedClientId);
         }
+        if (request.op === "get_session_commands") {
+          const route = router.route(request.payload.sessionId);
+          if (route?.connection === undefined || route.metadata?.token === undefined) throw Object.assign(new Error("No exact recovered worker owns this session"), { code: "WORKER_UNAVAILABLE" });
+          const { metadata, connection } = route;
+          const id = randomId();
+          if (typeof id !== "string" || id.length < 16 || usedCommandIds.has(id)) throw Object.assign(new Error("Command ID generator did not provide a unique restart-safe ID"), { code: "COMMAND_ID_COLLISION" });
+          usedCommandIds.add(id);
+          const record = await connection.request({ version: 1, type: "command", token: metadata.token, id, command: { clientId: request.clientId, requestId: request.requestId, op: request.op } }, { clientId: request.clientId, requestId: request.requestId, op: request.op, durableRequest: request, metadata, routeGeneration: route.routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
+          const menu = record?.result ?? {};
+          return {
+            kind: "session_commands", sessionId: request.payload.sessionId,
+            commands: menu.commands ?? [], models: menu.models ?? [], thinkingLevels: menu.thinkingLevels ?? [],
+            model: menu.model ?? null, thinkingLevel: menu.thinkingLevel ?? null,
+          };
+        }
         if (!DURABLE_COMMANDS.has(request.op)) throw Object.assign(new Error(`Unsupported daemon operation: ${request.op}`), { code: "UNSUPPORTED_OPERATION" });
         if (!duringRecovery) {
           const claim = socket === undefined ? undefined : attachmentClaims.get(request.payload.sessionId)?.get(socket);
@@ -967,7 +990,7 @@ export async function createDaemonRuntime({
           const route = router.route(request.payload.sessionId);
           const connection = route?.connection;
           const metadata = route?.metadata;
-          if (["prompt", "steer", "follow_up", "interrupt"].includes(request.op)) {
+          if (WORKER_DELIVERED_COMMANDS.includes(request.op)) {
             if (connection === undefined || metadata?.token === undefined) {
               status = await context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("WORKER_UNAVAILABLE", "No exact recovered worker owns this session"));
             } else {
@@ -977,7 +1000,7 @@ export async function createDaemonRuntime({
               await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
               const retryAtRisk = (await context.recovery.journal.history(request)).some((/** @type {any} */ prior) => prior.stage === "DELIVERY_UNKNOWN");
               try {
-                await connection.request({ version: 1, type: "command", token: metadata.token, id, command: { clientId: request.clientId, requestId: request.requestId, op: request.op, text: request.payload.text, retryAtRisk } }, { clientId: request.clientId, requestId: request.requestId, op: request.op, durableRequest: request, metadata, routeGeneration: route.routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
+                await connection.request({ version: 1, type: "command", token: metadata.token, id, command: { clientId: request.clientId, requestId: request.requestId, op: request.op, text: request.payload.text, response: request.op === "ui_response" ? { requestId: request.payload.uiRequestId, response: request.payload.response } : undefined, sessionCommand: request.op === "session_command" ? sessionCommandPayload(request.payload) : undefined, retryAtRisk } }, { clientId: request.clientId, requestId: request.requestId, op: request.op, durableRequest: request, metadata, routeGeneration: route.routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
                 await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
                 status = await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
               } catch (error) {

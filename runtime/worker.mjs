@@ -13,7 +13,55 @@ import { runInstalledPiWorker } from "./installed-pi-worker.mjs";
 initializeRuntimePermissions();
 
 const MAX_REPLAY_RECORD_BYTES = 1024 * 1024;
-const WORKER_OPERATIONS = new Set(["prompt", "steer", "follow_up", "interrupt", "ui_response", "get_state"]);
+const WORKER_OPERATIONS = new Set(["prompt", "steer", "follow_up", "interrupt", "ui_response", "get_state", "get_session_commands", "session_command"]);
+const MAX_MENU_ENTRIES = 1_000;
+
+/** @param {any} value @param {string} fallbackSource */
+function menuCommand(value, fallbackSource) {
+  const name = typeof value?.name === "string" ? value.name.trim() : "";
+  if (name.length === 0) return undefined;
+  const source = ["extension", "prompt", "skill"].includes(value?.source) ? value.source : fallbackSource;
+  /** @type {Record<string, string>} */
+  const command = { name: name.startsWith("/") ? name : `/${name}`, source };
+  if (typeof value?.description === "string" && value.description.length > 0) command.description = value.description;
+  if (typeof value?.argumentHint === "string" && value.argumentHint.length > 0) command.argumentHint = value.argumentHint;
+  return command;
+}
+
+/** Collect one bounded, normalized slash-command menu from public Pi RPC discovery. @param {any} adapter */
+export async function collectSessionMenu(adapter) {
+  const state = await adapter.getState();
+  const discovered = typeof adapter.getCommands === "function" ? await adapter.getCommands().catch(() => undefined) : undefined;
+  const available = typeof adapter.getAvailableModels === "function" ? await adapter.getAvailableModels().catch(() => undefined) : undefined;
+  const levels = typeof adapter.getAvailableThinkingLevels === "function" ? await adapter.getAvailableThinkingLevels().catch(() => undefined) : undefined;
+  const commands = (Array.isArray(discovered?.commands) ? discovered.commands : [])
+    .map((/** @type {any} */ entry) => menuCommand(entry, "extension"))
+    .filter((/** @type {any} */ entry) => entry !== undefined)
+    .slice(0, MAX_MENU_ENTRIES);
+  const models = (Array.isArray(available?.models) ? available.models : [])
+    .filter((/** @type {any} */ model) => typeof model?.provider === "string" && model.provider.length > 0 && typeof model?.id === "string" && model.id.length > 0)
+    .map((/** @type {any} */ model) => ({ provider: model.provider, id: model.id }))
+    .slice(0, MAX_MENU_ENTRIES);
+  const thinkingLevels = (Array.isArray(levels?.levels) ? levels.levels : [])
+    .filter((/** @type {unknown} */ level) => typeof level === "string" && level.length > 0)
+    .slice(0, MAX_MENU_ENTRIES);
+  const model = typeof state?.model?.provider === "string" && typeof state?.model?.id === "string" ? { provider: state.model.provider, id: state.model.id } : null;
+  return { commands, models, thinkingLevels, model, thinkingLevel: typeof state?.thinkingLevel === "string" && state.thinkingLevel.length > 0 ? state.thinkingLevel : null };
+}
+
+/** @param {any} adapter @param {any} request */
+function applySessionCommand(adapter, request) {
+  if (request?.command === "set_model") {
+    if (typeof request.model?.provider !== "string" || typeof request.model?.id !== "string") throw Object.assign(new TypeError("session_command model is invalid"), { code: "INVALID_SESSION_COMMAND" });
+    return adapter.setModel({ provider: request.model.provider, id: request.model.id });
+  }
+  if (request?.command === "set_thinking_level") {
+    if (typeof request.level !== "string" || request.level.length === 0) throw Object.assign(new TypeError("session_command level is invalid"), { code: "INVALID_SESSION_COMMAND" });
+    return adapter.setThinkingLevel(request.level);
+  }
+  if (request?.command === "compact") return adapter.compact(typeof request.instructions === "string" && request.instructions.length > 0 ? request.instructions : undefined);
+  throw Object.assign(new TypeError("session_command is unsupported"), { code: "INVALID_SESSION_COMMAND" });
+}
 
 /** @param {string} value */
 function digest(value) {
@@ -82,7 +130,7 @@ export function replayDeliveryIsAmbiguous(replay, command) {
 export function createWorkerCommandDispatcher({ replay, adapter }) {
   let tail = Promise.resolve();
 
-  /** @param {{ clientId: string, requestId: string, op: string, text?: string, response?: unknown, retryAtRisk?: boolean }} command */
+  /** @param {{ clientId: string, requestId: string, op: string, text?: string, response?: unknown, sessionCommand?: any, retryAtRisk?: boolean }} command */
   function deliver(command) {
     const result = tail.then(async () => {
       if (typeof command?.clientId !== "string" || typeof command.requestId !== "string") {
@@ -115,6 +163,8 @@ export function createWorkerCommandDispatcher({ replay, adapter }) {
           case "interrupt": resultValue = await adapter.abort(); break;
           case "ui_response": resultValue = await adapter.uiResponse(command.response); break;
           case "get_state": resultValue = await adapter.getState(); break;
+          case "get_session_commands": resultValue = await collectSessionMenu(adapter); break;
+          case "session_command": resultValue = await applySessionCommand(adapter, command.sessionCommand); break;
         }
       } catch (cause) {
         const failure = /** @type {{ code?: unknown, acknowledged?: unknown }} */ (cause);

@@ -23,6 +23,10 @@ const variants = [
   ["subscribe_viewer", { sessionId: "session", after: { daemonEpoch: "epoch", sessionId: "session", sequence: "2" } }],
   ["ack_viewer", { cursor: { daemonEpoch: "epoch", sessionId: "session", sequence: "2" } }],
   ["resolve_delivery", { targetClientId: "client", targetRequestId: "request", resolution: "abandon" }],
+  ["get_session_commands", { sessionId: "session" }],
+  ["session_command", { sessionId: "session", command: "set_model", model: { provider: "anthropic", id: "claude" } }],
+  ["session_command", { sessionId: "session", command: "set_thinking_level", level: "high" }],
+  ["session_command", { sessionId: "session", command: "compact", instructions: "keep decisions" }],
 ];
 
 describe("command contracts", () => {
@@ -43,6 +47,19 @@ describe("command contracts", () => {
     for (const op of ["stop", "delete"]) {
       expect(() => parseClientRequest({ ...envelope, op, payload: { sessionId: "session" } })).toThrow(/revision/i);
     }
+  });
+
+  it("parses one bounded session command menu and rejects unknown menu fields", () => {
+    const result = {
+      kind: "session_commands", sessionId: "session",
+      commands: [{ name: "/compact", source: "builtin", description: "Compact", argumentHint: "[instructions]" }, { name: "/review", source: "extension" }],
+      models: [{ provider: "anthropic", id: "claude" }], thinkingLevels: ["off", "high"],
+      model: { provider: "anthropic", id: "claude" }, thinkingLevel: "high",
+    };
+    const response = { version: 1, requestId: "request", ok: true, result };
+    expect(parseDaemonResponse(response)).toEqual(response);
+    expect(() => parseDaemonResponse({ ...response, result: { ...result, unknown: true } })).toThrow(/unknown/i);
+    expect(() => parseDaemonResponse({ ...response, result: { ...result, commands: [{ name: "/x", source: "invented" }] } })).toThrow(/source/i);
   });
 
   it("strictly parses daemon failures", () => {

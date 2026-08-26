@@ -218,7 +218,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                        ",
     " hello                                  ",
     "                                        ",
-    " Observer mode · scroll/search/tool insp",
+    " Read-only session · scroll and tool ins",
     "model:default · thinking:default/visible",
   ],
   "paused-follow": [
@@ -511,7 +511,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                       ",
     " hello                                                 ",
     "                                                       ",
-    " Observer mode · scroll/search/tool inspection only",
+    " Read-only session · scroll and tool inspection only",
     "model:default · thinking:default/visible · connection:L",
   ],
   "paused-follow": [
@@ -942,7 +942,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                ",
     " hello                                                                          ",
     "                                                                                ",
-    " Observer mode · scroll/search/tool inspection only",
+    " Read-only session · scroll and tool inspection only",
     "model:default · thinking:default/visible · connection:LIVE",
   ],
   "paused-follow": [
@@ -1541,7 +1541,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                                                        ",
     " hello                                                                                                                  ",
     "                                                                                                                        ",
-    " Observer mode · scroll/search/tool inspection only",
+    " Read-only session · scroll and tool inspection only",
     "model:default · thinking:default/visible · connection:LIVE",
   ],
   "paused-follow": [
@@ -2308,7 +2308,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                                                                                                ",
     " hello                                                                                                                                                          ",
     "                                                                                                                                                                ",
-    " Observer mode · scroll/search/tool inspection only",
+    " Read-only session · scroll and tool inspection only",
     "model:default · thinking:default/visible · connection:LIVE",
   ],
   "paused-follow": [

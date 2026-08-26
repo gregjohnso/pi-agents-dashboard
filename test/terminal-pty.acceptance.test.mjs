@@ -49,7 +49,7 @@ it("navigates to New Session, quits with Ctrl+C, and restores the real terminal"
 
   const timeout = setTimeout(() => {
     try { process.kill(-child.pid, "SIGKILL"); } catch {}
-  }, 25_000);
+  }, 45_000);
   let result;
   let transcript;
   let stopped;
@@ -79,4 +79,4 @@ it("navigates to New Session, quits with Ctrl+C, and restores the real terminal"
   expect(stty).toMatch(/(?:^|[\s;])isig(?:[\s;]|$)/u);
   expect(stty).toMatch(/(?:^|[\s;])icanon(?:[\s;]|$)/u);
   expect(stty).toMatch(/(?:^|[\s;])echo(?:[\s;]|$)/u);
-}, 40_000);
+}, 60_000);

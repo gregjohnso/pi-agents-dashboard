@@ -73,6 +73,8 @@ function startPersistentFakeWorker(config, worker) {
   let commandCount = 0;
   /** @type {string[]} */
   const commandIds = [];
+  /** @type {any[]} */
+  const commands = [];
   /** @type {any} */
   let previousCommand;
   let alive = true;
@@ -87,6 +89,11 @@ function startPersistentFakeWorker(config, worker) {
           if (frame?.type !== "command") return;
           commandCount += 1;
           commandIds.push(frame.id);
+          commands.push(frame.command);
+          if (worker.results !== undefined) {
+            void connection.send({ version: 1, type: "command_result", token: worker.token, id: frame.id, ok: true, record: { clientId: frame.command.clientId, requestId: frame.command.requestId, op: frame.command.op, stage: "RPC_ACKNOWLEDGED", at: new Date().toISOString(), result: worker.results[frame.command.op] ?? null } });
+            return;
+          }
           if (frame.command.requestId === worker.malformedRequestId) {
             void connection.send({ version: 1, type: "command_result", token: worker.token, id: frame.id, ok: true, record: { stage: "RPC_ACKNOWLEDGED" } });
             return;
@@ -122,7 +129,7 @@ function startPersistentFakeWorker(config, worker) {
     }
     alive = false;
   })();
-  const loop = { pid: worker.identity.pid, get alive() { return alive; }, get connectionCount() { return connectionCount; }, get commandCount() { return commandCount; }, get commandIds() { return [...commandIds]; }, async stop() { controller.abort(); await run; } };
+  const loop = { pid: worker.identity.pid, get alive() { return alive; }, get connectionCount() { return connectionCount; }, get commandCount() { return commandCount; }, get commandIds() { return [...commandIds]; }, get commands() { return [...commands]; }, async stop() { controller.abort(); await run; } };
   workerLoops.push(loop);
   return loop;
 }
@@ -252,6 +259,34 @@ it("rejects worker mutations during reconciliation without touching unopened sto
   await expect(runtime.ready).rejects.toMatchObject({ code: "OWNERSHIP_CONFLICT" });
   await runtime.close();
   worker.close();
+});
+
+it("discovers slash commands and delivers one session command to the owning worker", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const identity = { pid: 401, startIdentity: "menu-worker", processGroupId: 401 };
+  const piChild = { pid: 402, startIdentity: "menu-pi", processGroupId: 401 };
+  const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === 401 ? identity : piChild;
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const now = "2026-08-25T12:00:00.000Z";
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "menu", sessionFile: "/sessions/menu.jsonl", canonicalSessionFile: "/sessions/menu.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-menu", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-menu", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "menu", runId: "run-menu", leaseId: "lease-menu", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  const runtime = await createDaemonRuntime({ root: stateRoot, inspect });
+  runtimes.push(runtime);
+  const menu = { commands: [{ name: "/review", source: "extension", description: "Review" }], models: [{ provider: "anthropic", id: "claude" }], thinkingLevels: ["off", "high"], model: { provider: "anthropic", id: "claude" }, thinkingLevel: "high" };
+  const worker = startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "menu", runId: "run-menu", leaseId: "lease-menu", generation: 1, identity, piChildIdentity: piChild, token: "menu-token", results: { get_session_commands: menu } });
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
+  await client.ready;
+  client.send({ version: 1, clientId: "viewer", requestId: "attach-menu", op: "attach", payload: { sessionId: "menu", role: "composer" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+  client.send({ version: 1, clientId: "viewer", requestId: "menu-request", op: "get_session_commands", payload: { sessionId: "menu" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "session_commands", sessionId: "menu", ...menu } });
+  client.send({ version: 1, clientId: "viewer", requestId: "model-request", op: "session_command", payload: { sessionId: "menu", command: "set_model", model: { provider: "anthropic", id: "claude" } } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  expect(worker.commands.map((/** @type {any} */ command) => command.op)).toEqual(["get_session_commands", "session_command"]);
+  expect(worker.commands[1].sessionCommand).toEqual({ command: "set_model", model: { provider: "anthropic", id: "claude" } });
+  client.close();
 });
 
 it("boots an exited session worker before granting its composer attachment", async () => {

@@ -261,6 +261,24 @@ it("rejects worker mutations during reconciliation without touching unopened sto
   worker.close();
 });
 
+it("clears a stale WORKING session when the reconnected worker reports an idle Pi", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const identity = { pid: 601, startIdentity: "stale-worker", processGroupId: 601 };
+  const piChild = { pid: 602, startIdentity: "stale-pi", processGroupId: 601 };
+  const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === 601 ? identity : piChild;
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const now = "2026-08-25T12:00:00.000Z";
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "stale", sessionFile: "/sessions/stale.jsonl", canonicalSessionFile: "/sessions/stale.jsonl", cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "assistant_stream", summary: "Pi assistant streaming", updatedAt: now }, ownership: { kind: "managed", runId: "run-stale", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-stale", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "stale", runId: "run-stale", leaseId: "lease-stale", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  const runtime = await createDaemonRuntime({ root: stateRoot, inspect });
+  runtimes.push(runtime);
+  startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "stale", runId: "run-stale", leaseId: "lease-stale", generation: 1, identity, piChildIdentity: piChild, token: "stale-token", results: { get_state: { sessionId: "stale", isStreaming: false } } });
+  await runtime.ready;
+
+  await vi.waitFor(async () => expect(await registry.get("stale")).toMatchObject({ taskState: "READY", processState: "LIVE" }), { timeout: 5_000 });
+});
+
 it("summarizes sessions only after the opt-in model is chosen and reuses cached summaries", async () => {
   const stateRoot = await root();
   for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });

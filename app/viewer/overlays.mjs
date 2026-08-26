@@ -17,7 +17,7 @@ export class PendingUiOverlay {
     tui.terminal ??= { rows: 24, columns: 80 };
     this.tui = tui;
     this.respond = respond;
-    this.returnFocus = returnFocus;
+    this.returnFocus = tui.getFocusedComponent?.() ?? returnFocus;
     this.resolved = false;
     this.border = new DynamicBorder((text) => text);
     if (request.method === "select") {
@@ -81,7 +81,7 @@ export class CommandSelectionOverlay {
     this.title = title;
     this.tui = tui;
     this.respond = respond;
-    this.returnFocus = returnFocus;
+    this.returnFocus = tui.getFocusedComponent?.() ?? returnFocus;
     this.resolved = false;
     this.border = new DynamicBorder((text) => text);
     this.control = new SelectList(items, maxVisible, getSelectListTheme());

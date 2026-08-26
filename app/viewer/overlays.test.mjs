@@ -1,7 +1,7 @@
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 
-import { PendingUiOverlay, renderActivityLine, renderSystemCard } from "./overlays.mjs";
+import { CommandSelectionOverlay, PendingUiOverlay, renderActivityLine, renderSystemCard } from "./overlays.mjs";
 
 const tui = { requestRender: vi.fn(), setFocus: vi.fn(), mode: "fullscreen" };
 
@@ -39,6 +39,23 @@ describe("pending Pi UI overlays", () => {
     expect(focused.at(-1)).toBe(returnFocus);
     expect(returnFocus.focused).toBe(true);
     expect(overlay.control.focused).toBe(false);
+  });
+
+  it("returns focus to the component that owned it before the overlay opened", () => {
+    const host = { focused: true };
+    const editor = { focused: false };
+    const focused = [];
+    let currentFocus = host;
+    const focusedTui = {
+      ...tui,
+      getFocusedComponent: () => currentFocus,
+      setFocus(component) { if (currentFocus !== null) currentFocus.focused = false; focused.push(component); currentFocus = component; if (currentFocus !== null) currentFocus.focused = true; },
+    };
+    const overlay = new CommandSelectionOverlay({ title: "Select a model", items: [{ value: "a/one", label: "a/one" }], tui: focusedTui, returnFocus: editor, respond: vi.fn() });
+    overlay.handleInput("\x1b");
+    expect(focused.at(-1)).toBe(host);
+    expect(host.focused).toBe(true);
+    expect(editor.focused).toBe(false);
   });
 
   it("transfers and restores input focus when Escape cancels before viewer navigation", () => {

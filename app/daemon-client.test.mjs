@@ -250,7 +250,43 @@ describe("daemon client", () => {
         await expect(within(client.request(ack))).resolves.toMatchObject({ ok: true, result: { kind: "acknowledged", cursor } });
         expect(connections).toBe(2);
     });
-    it("drops a malformed event and reconnects before dispatching a valid event", async () => {
+    it("coalesces superseded session updates instead of overflowing a slow list consumer", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "client-coalesce-"));
+  const socketPath = join(directory, "control.sock");
+  const executable = { realpath: "/installed/pi", device: "1", inode: "2", size: 3, modifiedTimeNs: "4" };
+  const session = (sessionId, sequence) => ({ schemaVersion: 1, revision: sequence, sessionId, sessionFile: `/sessions/${sessionId}.jsonl`, canonicalSessionFile: `/sessions/${sessionId}.jsonl`, cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "assistant_streaming", summary: `chunk ${sequence}`, updatedAt: "2026-01-01T00:00:00.000Z" }, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" });
+  const event = (sessionId, sequence) => ({ version: 1, cursor: { daemonEpoch: "epoch-1", sequence: String(sequence) }, occurredAt: "2026-01-01T00:00:00.000Z", kind: "session_changed", payload: { session: session(sessionId, sequence) } });
+  const server = net.createServer((socket) => {
+    const decoder = createJsonlDecoder({ maxBytes: 8192 });
+    let authed = false;
+    socket.on("data", (chunk) => {
+      for (const value of decoder.push(chunk)) {
+        if (!authed) { authed = true; socket.write(encodeJsonl({ version: 1, kind: "authenticated" })); continue; }
+        const incoming = value;
+        socket.write(encodeJsonl({ version: 1, requestId: incoming.requestId, ok: true, result: { kind: "subscribed", cursor: { daemonEpoch: "epoch-1", sequence: "0" } } }));
+        for (let sequence = 1; sequence <= 12; sequence += 1) socket.write(encodeJsonl(event("streaming", sequence)));
+        socket.write(encodeJsonl(event("other", 13)));
+      }
+    });
+  });
+  await new Promise((resolve, reject) => server.listen(socketPath, resolve).once("error", reject));
+  const client = createDaemonClient({ socketPath, token: "secret", maxBytes: 8192, reconnectDelayMs: 1, clientId: "client-1", subscriberLimit: 4, reconnect: false });
+  cleanups.push(async () => {
+    await client.close();
+    await new Promise((resolve) => server.close(() => resolve()));
+    await rm(directory, { recursive: true, force: true });
+  });
+  const iterator = client.subscribe({ daemonEpoch: "epoch-1", sequence: "0" })[Symbol.asyncIterator]();
+  const first = await within(iterator.next());
+  expect(first.value.payload.session.sessionId).toBe("streaming");
+  const second = await within(iterator.next());
+  expect(second.value.cursor.sequence).toBe("12");
+  const third = await within(iterator.next());
+  expect(third.value.payload.session.sessionId).toBe("other");
+  await iterator.return?.();
+});
+
+it("drops a malformed event and reconnects before dispatching a valid event", async () => {
         const directory = await mkdtemp(join(tmpdir(), "client-malformed-event-"));
         const socketPath = join(directory, "control.sock");
         let connections = 0;

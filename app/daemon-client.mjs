@@ -225,6 +225,7 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
         }
     };
     const dispatchEvent = (event) => {
+        const supersededSessionId = event.kind === "session_changed" ? event.payload.session.sessionId : undefined;
         for (const subscriber of subscribers) {
             if (subscriber.ended)
                 continue;
@@ -232,8 +233,15 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                 const waiter = subscriber.waiter;
                 subscriber.waiter = undefined;
                 waiter({ value: event, done: false });
+                continue;
             }
-            else if (subscriber.queue.length >= subscriberLimit) {
+            // One queued state per session: the newest record supersedes older ones and keeps cursors ascending.
+            if (supersededSessionId !== undefined) {
+                const superseded = subscriber.queue.findIndex((queued) => queued.kind === "session_changed" && queued.payload.session.sessionId === supersededSessionId);
+                if (superseded !== -1)
+                    subscriber.queue.splice(superseded, 1);
+            }
+            if (subscriber.queue.length >= subscriberLimit) {
                 subscriber.error = new DaemonClientError("SUBSCRIBER_OVERFLOW", "Client subscriber exceeded its bounded queue");
                 subscriber.ended = true;
                 subscribers.delete(subscriber);

@@ -116,10 +116,32 @@ describe("viewer commands and role restrictions", () => {
     await vi.waitFor(() => expect(f.commands.at(-1)).toEqual({ operation: "prompt", payload: { sessionId: "s", text: "/review the diff" } }));
   });
 
+  it("opens Pi's selection list for a bare built-in command and applies the choice", async () => {
+    const f = fixture({ menu: async () => ({ commands: [], models: [{ provider: "anthropic", id: "claude" }, { provider: "openai", id: "gpt-5" }], thinkingLevels: ["off", "high"], model: null, thinkingLevel: null }) });
+    await f.instance.open();
+
+    f.instance.editor.setText("/model");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
+    expect(f.instance.render(80, 24).join("\n")).toContain("anthropic/claude");
+    f.instance.handleInput("\x1b[B");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "session_command", payload: { sessionId: "s", command: "set_model", model: { provider: "openai", id: "gpt-5" } } }]));
+    expect(f.instance.selection).toBeUndefined();
+
+    f.instance.editor.setText("/thinking");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
+    f.instance.handleInput("\x1b");
+    expect(f.instance.selection).toBeUndefined();
+    expect(f.commands).toHaveLength(1);
+  });
+
   it("rejects an unknown model locally without contacting the session", async () => {
     const f = fixture({ menu: async () => ({ commands: [], models: [{ provider: "anthropic", id: "claude" }], thinkingLevels: [], model: null, thinkingLevel: null }) });
     await f.instance.open();
     f.instance.editor.setText("/model invented/model");
+    f.instance.now = () => 0;
     f.instance.handleInput("\r");
     await vi.waitFor(() => expect(f.instance.state.errors).toContainEqual({ code: "UNKNOWN_MODEL", message: "Unknown model: invented/model", retryable: false }));
     expect(f.commands).toEqual([]);

@@ -3,7 +3,7 @@ import { CombinedAutocompleteProvider, Key, matchesKey, truncateToWidth, visible
 import { parseViewerEvent, parseViewerSnapshot } from "../../shared/viewer-contracts.mjs";
 import { createPiComponentAdapters } from "./pi-component-adapters.mjs";
 import { EMPTY_SESSION_MENU, parseSlashSubmission, sessionSlashCommands } from "./slash-commands.mjs";
-import { PendingUiOverlay, renderActivityLine, renderSystemCard } from "./overlays.mjs";
+import { CommandSelectionOverlay, PendingUiOverlay, renderActivityLine, renderSystemCard } from "./overlays.mjs";
 import { ReturnGesture } from "./return-gesture.mjs";
 import { TranscriptModel, applyViewerEvent, createTranscriptState } from "./transcript.mjs";
 
@@ -98,8 +98,9 @@ export class ViewerController {
     const fixed = 2 + activity.length + editorLines.length + inputLabel.length + toolLine.length + errorLines.length;
     const transcriptHeight = Math.max(0, height - fixed);
     let body = this.transcript.render(width, transcriptHeight);
-    if (this.overlay !== undefined) {
-      const overlayLines = this.overlay.render(width).slice(0, transcriptHeight);
+    const activeOverlay = this.overlay ?? this.selection;
+    if (activeOverlay !== undefined) {
+      const overlayLines = activeOverlay.render(width).slice(0, transcriptHeight);
       const start = Math.max(0, body.length - overlayLines.length);
       body = [...body.slice(0, start), ...overlayLines];
     }
@@ -112,6 +113,12 @@ export class ViewerController {
 
   handleInput(data) {
     if (this.closedState || this.state === undefined) return;
+    if (this.overlay === undefined && this.selection !== undefined) {
+      this.returnGesture.cancel();
+      this.selection.handleInput(data);
+      this.requestRender();
+      return;
+    }
     if (this.overlay !== undefined) {
       this.returnGesture.cancel();
       if (matchesKey(data, Key.ctrl("c")) && this.state.role === "composer" && this.state.working) {
@@ -234,7 +241,7 @@ export class ViewerController {
     if (this.state?.role !== "composer" || prompt.length === 0) return;
     const submission = parseSlashSubmission(prompt, this.menu);
     if (submission.kind === "rejected") {
-      this.recordError({ code: submission.code, message: submission.message, retryable: false });
+      if (!this.openSelection(submission.code)) await this.recordError({ code: submission.code, message: submission.message, retryable: false });
       return;
     }
     if (submission.kind === "session_command") {
@@ -303,6 +310,34 @@ export class ViewerController {
     }
   }
 
+  /** Offer one Pi selection list for a built-in command submitted without its argument. @param {string} code */
+  openSelection(code) {
+    const picker = code === "MODEL_REQUIRED"
+      ? { title: "Select a model", items: this.menu.models.map((model) => ({ value: `${model.provider}/${model.id}`, label: `${model.provider}/${model.id}` })) }
+      : code === "THINKING_LEVEL_REQUIRED"
+        ? { title: "Select a thinking level", items: this.menu.thinkingLevels.map((level) => ({ value: level, label: level })) }
+        : undefined;
+    if (picker === undefined || picker.items.length === 0) return false;
+    const command = code === "MODEL_REQUIRED" ? "/model" : "/thinking";
+    this.selection?.dispose();
+    this.selection = new CommandSelectionOverlay({
+      title: picker.title, items: picker.items,
+      tui: this.editor.tui ?? { requestRender: () => this.requestRender(), setFocus() {} },
+      returnFocus: this.editor,
+      respond: (/** @type {string | undefined} */ value) => {
+        const resolved = this.selection;
+        this.selection = undefined;
+        resolved?.dispose();
+        if (value === undefined) { void this.requestRender(); return; }
+        void this.submitText(`${command} ${value}`);
+      },
+    });
+    this.restoring = true; this.editor.setText(""); this.restoring = false;
+    this.edited = false;
+    void this.requestRender();
+    return true;
+  }
+
   installOverlay() {
     const request = this.state?.pendingUi.find((candidate) => !this.respondedUi.has(candidate.id));
     if (request === undefined || this.state.role !== "composer") { this.overlay?.dispose(); this.overlay = undefined; return; }
@@ -334,6 +369,8 @@ export class ViewerController {
     } finally {
       this.overlay?.dispose();
       this.overlay = undefined;
+      this.selection?.dispose();
+      this.selection = undefined;
       this.resolveClosed?.();
     }
   }

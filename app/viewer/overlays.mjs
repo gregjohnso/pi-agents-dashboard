@@ -74,6 +74,45 @@ export class PendingUiOverlay {
   }
 }
 
+/** Bounded Pi SelectList picker for built-in commands that take one exact argument. */
+export class CommandSelectionOverlay {
+  constructor({ title, items, tui, respond, returnFocus = undefined, maxVisible = 8 }) {
+    tui.terminal ??= { rows: 24, columns: 80 };
+    this.title = title;
+    this.tui = tui;
+    this.respond = respond;
+    this.returnFocus = returnFocus;
+    this.resolved = false;
+    this.border = new DynamicBorder((text) => text);
+    this.control = new SelectList(items, maxVisible, getSelectListTheme());
+    this.control.onSelect = (/** @type {{value:string}} */ item) => this.resolve(item.value);
+  }
+  restoreFocus() {
+    if (this.focusRestored) return;
+    this.focusRestored = true;
+    this.tui.setFocus(this.returnFocus ?? null);
+  }
+  /** @param {string | undefined} value */
+  resolve(value) {
+    if (this.resolved) return;
+    this.resolved = true;
+    this.restoreFocus();
+    this.respond(value);
+  }
+  dispose() { this.restoreFocus(); /** @type {any} */ (this.control).dispose?.(); }
+  /** @param {string} data */
+  handleInput(data) {
+    if (this.resolved) return true;
+    if (data === "\x1b") { this.resolve(undefined); return true; }
+    /** @type {any} */ (this.control).handleInput?.(data);
+    return true;
+  }
+  /** @param {number} width */
+  render(width) {
+    return [...this.border.render(width), fit(` ${this.title}`, width), ...this.control.render(width), ...this.border.render(width)].map((line) => fit(line, width));
+  }
+}
+
 /** Render the currently active normalized phase with elapsed time. */
 export function renderActivityLine(activity, width, now = Date.now()) {
   if (activity === undefined || activity.phase === "idle") return [];

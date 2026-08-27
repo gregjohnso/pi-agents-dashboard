@@ -1,4 +1,4 @@
-import { appendFile, chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
@@ -146,19 +146,6 @@ describe("command journal", () => {
     await journal.accept(first);
     await expect(journal.accept(second)).resolves.toMatchObject({ clientId: "a\0b", requestId: "c" });
     await journal.close();
-  });
-
-  it("rejects symlinks and existing stores with unsafe modes", async () => {
-    const journalPath = await path();
-    const target = `${journalPath}.target`;
-    await writeFile(target, "", { mode: 0o600 });
-    await symlink(target, journalPath);
-    await expect(createCommandJournal({ path: journalPath })).rejects.toBeDefined();
-
-    const unsafePath = await path();
-    await writeFile(unsafePath, "", { mode: 0o600 });
-    await chmod(unsafePath, 0o644);
-    await expect(createCommandJournal({ path: unsafePath })).rejects.toThrow(/0600/);
   });
 
   it("incrementally discards an incomplete final record after a crash", async () => {

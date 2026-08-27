@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
 
-import { afterEach, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, expect, it, vi } from "vitest";
 
 import { cleanupOwnedWorktree } from "./cleanup.mjs";
 import { launchPreflight } from "./launch-preflight.mjs";
@@ -17,11 +17,6 @@ import {
 
 const execFileAsync = promisify(execFile);
 const noLiveOwnershipOptions = { readLiveOwnership: async () => null };
-/** @type {string[]} */
-const temporaryPaths = [];
-afterEach(async () => {
-  await Promise.all(temporaryPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })));
-});
 
 /** @param {string} cwd @param {string[]} args */
 async function git(cwd, ...args) {
@@ -34,47 +29,84 @@ async function configure(cwd) {
   await git(cwd, "config", "user.email", "dashboard@example.test");
 }
 
-async function fixture({ remote = false } = {}) {
-  const parent = await mkdtemp(join(tmpdir(), "dashboard-cleanup-"));
-  temporaryPaths.push(parent);
-  const piConfigRoot = join(parent, "pi-config");
-  await mkdir(piConfigRoot);
-  let root;
-  let bareRemote;
-  if (remote) {
-    bareRemote = join(parent, "remote.git");
-    await git(parent, "init", "--bare", bareRemote);
-    root = join(parent, "repo");
-    await git(parent, "clone", bareRemote, root);
-    await configure(root);
-    await git(root, "switch", "-c", "main");
-  } else {
-    root = join(parent, "repo");
-    await mkdir(root);
-    await git(root, "init", "-b", "main");
-    await configure(root);
-  }
-  await writeFile(join(root, "tracked.txt"), "base\n");
-  await git(root, "add", "tracked.txt");
-  await git(root, "commit", "-m", "base");
-  if (remote) {
-    await git(root, "push", "-u", "origin", "main");
-  }
-  root = await realpath(root);
-  const preflight = await launchPreflight(
+/** @param {string} root @param {string} piConfigRoot */
+async function worktreePreflight(root, piConfigRoot) {
+  return launchPreflight(
     {
       prompt: "Implement the task",
       cwd: root,
       sourceSessionId: "source-session",
       isolation: { mode: "worktree" },
     },
-    { piConfigRoot: await realpath(piConfigRoot) },
+    { piConfigRoot },
   );
-  const isolation = await createWorktree(preflight, { worktreeId: "cleanup-target" });
-  return { parent, root, bareRemote, isolation };
 }
 
-/** @param {any} isolation @param {string} name @param {string} contents */
+/**
+ * One local repository and one clone of a local bare remote, shared by every case in this file.
+ *
+ * Cases never change `main` in either repository; each takes its own dashboard-owned worktree and
+ * branch, so Git initialization stays out of the per-case cost.
+ */
+async function sharedRepositories() {
+  const parent = await mkdtemp(join(tmpdir(), "dashboard-cleanup-"));
+  const piConfigRoot = join(parent, "pi-config");
+  await mkdir(piConfigRoot);
+
+  const local = join(parent, "repo");
+  await mkdir(local);
+  await git(local, "init", "-b", "main");
+  await configure(local);
+  await writeFile(join(local, "tracked.txt"), "base\n");
+  await git(local, "add", "tracked.txt");
+  await git(local, "commit", "-m", "base");
+
+  const bareRemote = join(parent, "remote.git");
+  await git(parent, "init", "--bare", bareRemote);
+  const cloned = join(parent, "clone");
+  await git(parent, "clone", bareRemote, cloned);
+  await configure(cloned);
+  await git(cloned, "switch", "-c", "main");
+  await writeFile(join(cloned, "tracked.txt"), "base\n");
+  await git(cloned, "add", "tracked.txt");
+  await git(cloned, "commit", "-m", "base");
+  await git(cloned, "push", "-u", "origin", "main");
+
+  const canonicalPiConfigRoot = await realpath(piConfigRoot);
+  const [root, clone] = await Promise.all([realpath(local), realpath(cloned)]);
+  const [preflight, clonePreflight] = await Promise.all([
+    worktreePreflight(root, canonicalPiConfigRoot),
+    worktreePreflight(clone, canonicalPiConfigRoot),
+  ]);
+  return { parent, root, bareRemote, preflight, clonePreflight };
+}
+
+/** @type {Awaited<ReturnType<typeof sharedRepositories>>} */
+let shared;
+let worktreeSequence = 0;
+
+beforeAll(async () => {
+  shared = await sharedRepositories();
+});
+afterAll(async () => {
+  await rm(shared.parent, { recursive: true, force: true });
+});
+
+/** @param {{ remote?: boolean }} [options] */
+async function ownedWorktree({ remote = false } = {}) {
+  worktreeSequence += 1;
+  return createWorktree(remote ? shared.clonePreflight : shared.preflight, {
+    worktreeId: `cleanup-${worktreeSequence}`,
+  });
+}
+
+/** @param {{ worktreePath: string }} isolation @param {string} [file] */
+async function markerPath(isolation, file = WORKTREE_OWNERSHIP_FILE) {
+  const { stdout } = await git(isolation.worktreePath, "rev-parse", "--git-dir");
+  return join(stdout.trim(), file);
+}
+
+/** @param {{ worktreePath: string }} isolation @param {string} name @param {string} contents */
 async function commit(isolation, name, contents) {
   await writeFile(join(isolation.worktreePath, name), contents);
   await git(isolation.worktreePath, "add", name);
@@ -82,35 +114,25 @@ async function commit(isolation, name, contents) {
 }
 
 it("recognizes the legacy ownership marker during cleanup", async () => {
-  const { isolation } = await fixture();
-  const { stdout } = await git(isolation.worktreePath, "rev-parse", "--git-dir");
-  const gitDirectory = stdout.trim();
-  await rename(join(gitDirectory, WORKTREE_OWNERSHIP_FILE), join(gitDirectory, LEGACY_WORKTREE_OWNERSHIP_FILE));
+  const isolation = await ownedWorktree();
+  await rename(await markerPath(isolation), await markerPath(isolation, LEGACY_WORKTREE_OWNERSHIP_FILE));
   await expect(cleanupOwnedWorktree(isolation, noLiveOwnershipOptions)).resolves.toMatchObject({ disposition: "REMOVED" });
 });
 
-it("fails closed when the authoritative ownership reader is omitted", async () => {
-  const { isolation } = await fixture();
-
-  // @ts-expect-error Exercise runtime validation for omitted required options.
-  await expect(cleanupOwnedWorktree(isolation)).rejects.toThrow(
-    "readLiveOwnership must be a function",
-  );
-  await expect(access(isolation.worktreePath)).resolves.toBeUndefined();
-});
-
-it("does not accept a live ownership snapshot as an authoritative reader", async () => {
-  const { isolation } = await fixture();
+it.each([
+  ["omitted", undefined],
+  ["a live ownership snapshot", { liveOwnership: null }],
+])("fails closed when the authoritative ownership reader is %s", async (_label, options) => {
+  const isolation = await ownedWorktree();
 
   await expect(
-    // @ts-expect-error Exercise runtime rejection of the removed snapshot option.
-    cleanupOwnedWorktree(isolation, { liveOwnership: null }),
+    cleanupOwnedWorktree(isolation, /** @type {any} */ (options)),
   ).rejects.toThrow("readLiveOwnership must be a function");
   await expect(access(isolation.worktreePath)).resolves.toBeUndefined();
 });
 
 it("removes a clean dashboard-owned worktree still at its base without an upstream", async () => {
-  const { isolation } = await fixture();
+  const isolation = await ownedWorktree();
 
   const frozenIsolationRecord = {
     mode: isolation.mode,
@@ -124,7 +146,7 @@ it("removes a clean dashboard-owned worktree still at its base without an upstre
 });
 
 it("refuses cleanup while the session has live ownership", async () => {
-  const { isolation } = await fixture();
+  const isolation = await ownedWorktree();
 
   await expect(
     cleanupOwnedWorktree(isolation, {
@@ -134,59 +156,90 @@ it("refuses cleanup while the session has live ownership", async () => {
   await expect(access(isolation.worktreePath)).resolves.toBeUndefined();
 });
 
-it("refuses modified tracked files", async () => {
-  const { isolation } = await fixture();
-  await writeFile(join(isolation.worktreePath, "tracked.txt"), "dirty\n");
+it.each([
+  [
+    "a modified tracked file",
+    /** @param {string} worktreePath */ async (worktreePath) => {
+      await writeFile(join(worktreePath, "tracked.txt"), "dirty\n");
+    },
+    "DIRTY_WORKTREE",
+  ],
+  [
+    "an untracked file",
+    /** @param {string} worktreePath */ async (worktreePath) => {
+      await writeFile(join(worktreePath, "untracked.txt"), "keep\n");
+    },
+    "UNTRACKED_FILES",
+  ],
+  [
+    "an ignored untracked file",
+    /** @param {string} worktreePath */ async (worktreePath) => {
+      await writeFile(join(worktreePath, ".gitignore"), "ignored.txt\n");
+      await git(worktreePath, "add", ".gitignore");
+      await git(worktreePath, "commit", "-m", "ignore test artifact");
+      const ignored = join(worktreePath, "ignored.txt");
+      await writeFile(ignored, "keep\n");
+      return ignored;
+    },
+    "UNTRACKED_FILES",
+  ],
+])("refuses cleanup and keeps %s", async (_label, dirty, code) => {
+  const isolation = await ownedWorktree();
+  const preserved = await dirty(isolation.worktreePath);
 
   await expect(
     cleanupOwnedWorktree(isolation, noLiveOwnershipOptions),
-  ).rejects.toMatchObject({
-    code: "DIRTY_WORKTREE",
-  });
+  ).rejects.toMatchObject({ code });
+  await expect(access(preserved ?? isolation.worktreePath)).resolves.toBeUndefined();
 });
 
-it("refuses untracked files", async () => {
-  const { isolation } = await fixture();
-  await writeFile(join(isolation.worktreePath, "untracked.txt"), "keep\n");
-
-  await expect(
-    cleanupOwnedWorktree(isolation, noLiveOwnershipOptions),
-  ).rejects.toMatchObject({
-    code: "UNTRACKED_FILES",
-  });
-});
-
-it("classifies ignored untracked files as UNTRACKED_FILES", async () => {
-  const { isolation } = await fixture();
-  await writeFile(join(isolation.worktreePath, ".gitignore"), "ignored.txt\n");
-  await git(isolation.worktreePath, "add", ".gitignore");
-  await git(isolation.worktreePath, "commit", "-m", "ignore test artifact");
-  await writeFile(join(isolation.worktreePath, "ignored.txt"), "keep\n");
-
-  await expect(
-    cleanupOwnedWorktree(isolation, noLiveOwnershipOptions),
-  ).rejects.toMatchObject({
-    code: "UNTRACKED_FILES",
-  });
-  await expect(access(join(isolation.worktreePath, "ignored.txt"))).resolves.toBeUndefined();
-});
-
-it("rechecks live ownership immediately before worktree removal", async () => {
-  const { isolation } = await fixture();
+it.each([
+  [
+    "live ownership",
+    /** @param {any} _isolation */ async (_isolation) => ({ runId: "late-owner" }),
+    "LIVE_OWNERSHIP",
+  ],
+  [
+    "the ownership marker repository",
+    /** @param {any} isolation */ async (isolation) => {
+      const path = await markerPath(isolation);
+      const marker = JSON.parse(await readFile(path, "utf8"));
+      await writeFile(path, `${JSON.stringify({ ...marker, repositoryRoot: isolation.worktreePath })}\n`);
+      return null;
+    },
+    "IDENTITY_MISMATCH",
+  ],
+  [
+    "the branch",
+    /** @param {any} isolation */ async (isolation) => {
+      await git(isolation.worktreePath, "switch", "-c", `late-${basename(isolation.worktreePath)}`);
+      return null;
+    },
+    "IDENTITY_MISMATCH",
+  ],
+  [
+    "HEAD",
+    /** @param {any} isolation */ async (isolation) => {
+      await commit(isolation, "late.txt", "late commit\n");
+      return null;
+    },
+    "IDENTITY_MISMATCH",
+  ],
+])("rechecks %s immediately before worktree removal", async (_label, change, code) => {
+  const isolation = await ownedWorktree();
   const readLiveOwnership = vi
     .fn()
     .mockResolvedValueOnce(null)
-    .mockResolvedValueOnce({ runId: "late-owner" });
+    .mockImplementationOnce(() => change(isolation));
 
   await expect(
     cleanupOwnedWorktree(isolation, { readLiveOwnership }),
-  ).rejects.toMatchObject({ code: "LIVE_OWNERSHIP" });
-  expect(readLiveOwnership).toHaveBeenCalledTimes(2);
+  ).rejects.toMatchObject({ code });
   await expect(access(isolation.worktreePath)).resolves.toBeUndefined();
 });
 
 it("cleans up after a dashboard that died holding the ownership lock", async () => {
-  const { isolation } = await fixture();
+  const isolation = await ownedWorktree();
   const lockPath = `${isolation.worktreePath}.pi-dashboard-ownership.lock`;
   await mkdir(lockPath, { recursive: true, mode: 0o700 });
   await writeFile(
@@ -201,7 +254,7 @@ it("cleans up after a dashboard that died holding the ownership lock", async () 
 });
 
 it("holds the authoritative ownership lock throughout cleanup", async () => {
-  const { isolation } = await fixture();
+  const isolation = await ownedWorktree();
   const lock = await acquireWorktreeOwnershipLock(isolation.worktreePath);
 
   await expect(
@@ -215,59 +268,8 @@ it("holds the authoritative ownership lock throughout cleanup", async () => {
   ).resolves.toEqual({ disposition: "REMOVED" });
 });
 
-it("rechecks the ownership marker and repository immediately before worktree removal", async () => {
-  const { isolation } = await fixture();
-  const { stdout } = await git(isolation.worktreePath, "rev-parse", "--git-dir");
-  const markerPath = join(stdout.trim(), WORKTREE_OWNERSHIP_FILE);
-  const marker = JSON.parse(await readFile(markerPath, "utf8"));
-  const readLiveOwnership = vi
-    .fn()
-    .mockResolvedValueOnce(null)
-    .mockImplementationOnce(async () => {
-      await writeFile(markerPath, `${JSON.stringify({ ...marker, repositoryRoot: isolation.worktreePath })}\n`);
-      return null;
-    });
-
-  await expect(
-    cleanupOwnedWorktree(isolation, { readLiveOwnership }),
-  ).rejects.toMatchObject({ code: "IDENTITY_MISMATCH" });
-  await expect(access(isolation.worktreePath)).resolves.toBeUndefined();
-});
-
-it("rechecks the branch immediately before worktree removal", async () => {
-  const { isolation } = await fixture();
-  const readLiveOwnership = vi
-    .fn()
-    .mockResolvedValueOnce(null)
-    .mockImplementationOnce(async () => {
-      await git(isolation.worktreePath, "switch", "-c", "late-branch");
-      return null;
-    });
-
-  await expect(
-    cleanupOwnedWorktree(isolation, { readLiveOwnership }),
-  ).rejects.toMatchObject({ code: "IDENTITY_MISMATCH" });
-  await expect(access(isolation.worktreePath)).resolves.toBeUndefined();
-});
-
-it("rechecks HEAD immediately before worktree removal", async () => {
-  const { isolation } = await fixture();
-  const readLiveOwnership = vi
-    .fn()
-    .mockResolvedValueOnce(null)
-    .mockImplementationOnce(async () => {
-      await commit(isolation, "late.txt", "late commit\n");
-      return null;
-    });
-
-  await expect(
-    cleanupOwnedWorktree(isolation, { readLiveOwnership }),
-  ).rejects.toMatchObject({ code: "IDENTITY_MISMATCH" });
-  await expect(access(isolation.worktreePath)).resolves.toBeUndefined();
-});
-
 it("refuses unpushed commits against a local bare remote", async () => {
-  const { isolation } = await fixture({ remote: true });
+  const isolation = await ownedWorktree({ remote: true });
   await git(isolation.worktreePath, "push", "-u", "origin", isolation.branch);
   await commit(isolation, "local.txt", "unpushed\n");
 
@@ -279,7 +281,7 @@ it("refuses unpushed commits against a local bare remote", async () => {
 });
 
 it("refuses a changed HEAD with no upstream", async () => {
-  const { isolation } = await fixture();
+  const isolation = await ownedWorktree();
   await commit(isolation, "local.txt", "no upstream\n");
 
   await expect(
@@ -290,15 +292,12 @@ it("refuses a changed HEAD with no upstream", async () => {
 });
 
 it("refuses divergent local and upstream history", async () => {
-  const { parent, bareRemote, isolation } = await fixture({ remote: true });
+  const isolation = await ownedWorktree({ remote: true });
   await git(isolation.worktreePath, "push", "-u", "origin", isolation.branch);
   await commit(isolation, "local.txt", "local\n");
 
-  if (bareRemote === undefined) {
-    throw new Error("remote fixture did not create a bare repository");
-  }
-  const other = join(parent, "other-clone");
-  await git(parent, "clone", bareRemote, other);
+  const other = join(shared.parent, "divergent-clone");
+  await git(shared.parent, "clone", shared.bareRemote, other);
   await configure(other);
   await git(other, "checkout", isolation.branch);
   await writeFile(join(other, "remote.txt"), "remote\n");
@@ -315,11 +314,10 @@ it("refuses divergent local and upstream history", async () => {
 });
 
 it("refuses cleanup when the dashboard ownership identity is malformed", async () => {
-  const { isolation } = await fixture();
-  const { stdout } = await git(isolation.worktreePath, "rev-parse", "--git-dir");
-  const markerPath = join(stdout.trim(), WORKTREE_OWNERSHIP_FILE);
-  const marker = JSON.parse(await readFile(markerPath, "utf8"));
-  await writeFile(markerPath, `${JSON.stringify({ ...marker, ownershipId: "wrong" })}\n`);
+  const isolation = await ownedWorktree();
+  const path = await markerPath(isolation);
+  const marker = JSON.parse(await readFile(path, "utf8"));
+  await writeFile(path, `${JSON.stringify({ ...marker, ownershipId: "wrong" })}\n`);
 
   await expect(
     cleanupOwnedWorktree(isolation, noLiveOwnershipOptions),
@@ -329,10 +327,10 @@ it("refuses cleanup when the dashboard ownership identity is malformed", async (
 });
 
 it("refuses a non-dashboard-owned linked worktree", async () => {
-  const { parent, root, isolation } = await fixture();
-  const unmanagedPath = join(parent, "unmanaged");
+  const isolation = await ownedWorktree();
+  const unmanagedPath = join(shared.parent, "unmanaged");
   const unmanagedBranch = "manual-worktree";
-  await git(root, "worktree", "add", "-b", unmanagedBranch, unmanagedPath, isolation.baseCommit);
+  await git(shared.root, "worktree", "add", "-b", unmanagedBranch, unmanagedPath, isolation.baseCommit);
   const unmanaged = {
     ...isolation,
     worktreePath: await realpath(unmanagedPath),
@@ -349,7 +347,7 @@ it("refuses a non-dashboard-owned linked worktree", async () => {
 });
 
 it("refuses a record whose branch identity no longer matches", async () => {
-  const { isolation } = await fixture();
+  const isolation = await ownedWorktree();
 
   await expect(
     cleanupOwnedWorktree(
@@ -360,7 +358,7 @@ it("refuses a record whose branch identity no longer matches", async () => {
 });
 
 it("allows cleanup after changed commits are pushed to the configured upstream", async () => {
-  const { isolation } = await fixture({ remote: true });
+  const isolation = await ownedWorktree({ remote: true });
   await git(isolation.worktreePath, "push", "-u", "origin", isolation.branch);
   await commit(isolation, "pushed.txt", "pushed\n");
   await git(isolation.worktreePath, "push");

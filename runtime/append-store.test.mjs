@@ -1,4 +1,4 @@
-import { mkdtemp, open, rm } from "node:fs/promises";
+import { chmod, mkdtemp, open, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -19,6 +19,19 @@ afterEach(async () => {
 });
 
 describe("durable append store", () => {
+  it("rejects symlinks and existing stores with unsafe modes", async () => {
+    const storePath = await path();
+    const target = `${storePath}.target`;
+    await writeFile(target, "", { mode: 0o600 });
+    await symlink(target, storePath);
+    await expect(openDurableAppendStore({ path: storePath, maxRecordBytes: 1024 })).rejects.toBeDefined();
+
+    const unsafePath = await path();
+    await writeFile(unsafePath, "", { mode: 0o600 });
+    await chmod(unsafePath, 0o644);
+    await expect(openDurableAppendStore({ path: unsafePath, maxRecordBytes: 1024 })).rejects.toThrow(/0600/);
+  });
+
   it("rejects writes and syncs after an incomplete append", async () => {
     const storePath = await path();
     const probe = await open(storePath, "a", 0o600);

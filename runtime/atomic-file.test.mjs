@@ -57,70 +57,68 @@ it("publishes an exact mode-0600 file under a restrictive inherited umask", asyn
   expect((await lstat(target)).mode & 0o777).toBe(0o600);
 });
 
-it("keeps the previous file and removes a torn temporary write on pre-rename failure", async () => {
-  const { directory, target } = await makeTarget("state.json");
-  const fsOps = {
-    ...fs,
-    /** @param {string} path @param {any} flags @param {any} mode */
-    async open(path, flags, mode) {
-      const handle = await fs.open(path, flags, mode);
-      return {
-        /** @param {number} mode */
-        chmod: (mode) => handle.chmod(mode),
-        stat: () => handle.stat(),
-        /** @param {unknown} data */
-        async writeFile(data) {
-          await handle.writeFile(String(data).slice(0, 4));
-          throw new Error("torn write");
-        },
-        sync: () => handle.sync(),
-        close: () => handle.close(),
-      };
-    },
-  };
-
-  await expect(atomicWriteJson(target, { ready: true }, fsOps)).rejects.toThrow("torn write");
-
-  expect(await readFile(target, "utf8")).toBe('{"old":true}\n');
-  expect(await readdir(directory)).toEqual(["state.json"]);
-});
-
-it("keeps the previous file when rename fails and removes the temporary file", async () => {
-  const { directory, target } = await makeTarget("state.json");
-  const fsOps = { ...fs, rename: async () => { throw new Error("rename failed"); } };
-
-  await expect(atomicWriteJson(target, { ready: true }, fsOps)).rejects.toThrow("rename failed");
-
-  expect(await readFile(target, "utf8")).toBe('{"old":true}\n');
-  expect(await readdir(directory)).toEqual(["state.json"]);
-});
-
-it("reports a directory fsync failure after rename while leaving complete new JSON", async () => {
-  const { directory, target } = await makeTarget("state.json");
-  let openCount = 0;
-  const fsOps = {
-    ...fs,
-    /** @param {string} path @param {any} flags @param {any} mode */
-    async open(path, flags, mode) {
-      openCount += 1;
-      const handle = await fs.open(path, flags, mode);
-      if (openCount === 2) {
+it.each([
+  [
+    "a torn temporary write before rename",
+    () => ({
+      ...fs,
+      /** @param {string} path @param {any} flags @param {any} mode */
+      async open(path, flags, mode) {
+        const handle = await fs.open(path, flags, mode);
         return {
-          async sync() {
-            throw new Error("directory fsync failed");
+          /** @param {number} mode */
+          chmod: (mode) => handle.chmod(mode),
+          stat: () => handle.stat(),
+          /** @param {unknown} data */
+          async writeFile(data) {
+            await handle.writeFile(String(data).slice(0, 4));
+            throw new Error("torn write");
           },
+          sync: () => handle.sync(),
           close: () => handle.close(),
         };
-      }
-      return handle;
+      },
+    }),
+    "torn write",
+    { old: true },
+  ],
+  [
+    "a failed rename",
+    () => ({ ...fs, rename: async () => { throw new Error("rename failed"); } }),
+    "rename failed",
+    { old: true },
+  ],
+  [
+    "a directory fsync failure after rename",
+    () => {
+      let openCount = 0;
+      return {
+        ...fs,
+        /** @param {string} path @param {any} flags @param {any} mode */
+        async open(path, flags, mode) {
+          openCount += 1;
+          const handle = await fs.open(path, flags, mode);
+          if (openCount === 2) {
+            return {
+              async sync() {
+                throw new Error("directory fsync failed");
+              },
+              close: () => handle.close(),
+            };
+          }
+          return handle;
+        },
+      };
     },
-  };
-
-  await expect(atomicWriteJson(target, { ready: true }, fsOps)).rejects.toThrow(
     "directory fsync failed",
-  );
+    { ready: true },
+  ],
+])("reports %s and leaves one complete file behind", async (_label, makeFsOps, message, contents) => {
+  const { directory, target } = await makeTarget("state.json");
 
-  expect(JSON.parse(await readFile(target, "utf8"))).toEqual({ ready: true });
+  await expect(atomicWriteJson(target, { ready: true }, makeFsOps())).rejects.toThrow(message);
+
+  expect(JSON.parse(await readFile(target, "utf8"))).toEqual(contents);
   expect(await readdir(directory)).toEqual(["state.json"]);
 });
 

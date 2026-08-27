@@ -34,8 +34,8 @@ function columnsForWidth(width) {
         return [];
     if (width >= 72) {
         return [
-            { key: "name", width: width >= 100 ? 32 : 26 },
             { key: "spinner", width: 1 },
+            { key: "name", width: width >= 100 ? 32 : 26 },
             { key: "state", width: 9 },
             { key: "activity", width: width - (width >= 100 ? 54 : 48) },
             { key: "age", width: 7 },
@@ -43,8 +43,8 @@ function columnsForWidth(width) {
     }
     if (width >= 52) {
         return [
-            { key: "name", width: 18 },
             { key: "spinner", width: 1 },
+            { key: "name", width: 18 },
             { key: "state", width: 8 },
             { key: "activity", width: width - 37 },
             { key: "age", width: 6 },
@@ -52,8 +52,8 @@ function columnsForWidth(width) {
     }
     if (width >= 28) {
         return [
-            { key: "name", width: 10 },
             { key: "spinner", width: 1 },
+            { key: "name", width: 10 },
             { key: "state", width: 8 },
             { key: "activity", width: width - 23 },
         ];
@@ -110,21 +110,9 @@ function age(updatedAt, now) {
         return `${days}d`;
     return `${Math.floor(days / 7)}w`;
 }
-function liveness(session) {
-    switch (session.processState) {
-        case "LIVE":
-            return "▶";
-        case "SLEEPING":
-            return "◌";
-        case "STALE":
-            return "×";
-        case "EXITED":
-            return " ";
-    }
-}
 function sessionValues(session, now) {
     return {
-        name: `${liveness(session)} ${(session.name ?? "").trim() || truncateToWidth(plainText(session.sessionId), 8, "")}`,
+        name: (session.name ?? "").trim() || truncateToWidth(plainText(session.sessionId), 8, ""),
         spinner: displaySessionState(session) === "WORKING" ? spinnerFrame(now) : "",
         state: displaySessionState(session),
         age: age(session.updatedAt, now),

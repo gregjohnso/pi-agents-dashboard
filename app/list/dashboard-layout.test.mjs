@@ -94,12 +94,12 @@ describe("responsive dashboard layout", () => {
         expect(colorOf({ taskState: "READY", processState: "EXITED" })).toContain(JOBWATCH_ANSI.gray);
     });
     it("keeps the fixed list column order and never renders Model or Project", () => {
-        expect(createDashboardLayout(160, 40).columns.map(({ key }) => key)).toEqual(["name", "spinner", "state", "activity", "age"]);
+        expect(createDashboardLayout(160, 40).columns.map(({ key }) => key)).toEqual(["spinner", "name", "state", "activity", "age"]);
         const header = stripVTControlCharacters(renderColumnHeader(createDashboardLayout(160, 40)));
         expect(header).not.toContain("MODEL");
         expect(header).not.toContain("PROJECT");
         expect(header).toContain("NAME");
-        expect(createDashboardLayout(120, 32).columns.map(({ key }) => key)).toEqual(["name", "spinner", "state", "activity", "age"]);
+        expect(createDashboardLayout(120, 32).columns.map(({ key }) => key)).toEqual(["spinner", "name", "state", "activity", "age"]);
         expect(header).toContain("AGE");
         expect(header).not.toContain("ID");
     });
@@ -107,7 +107,8 @@ describe("responsive dashboard layout", () => {
         const layout = createDashboardLayout(160, 40);
         const named = stripVTControlCharacters(renderSessionRow(session("named", { name: "Coverage loader", processState: "LIVE" }), layout, { now }));
         expect(named).toContain("Coverage loader");
-        expect(named).toContain("▶");
+        // STATE reports liveness, so the row carries no separate marker.
+        expect(named).not.toContain("▶");
         const unnamed = stripVTControlCharacters(renderSessionRow(session("unnamed-session-id"), layout, { now }));
         expect(unnamed).toContain("unnamed-");
     });

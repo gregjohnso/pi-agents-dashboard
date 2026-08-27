@@ -355,7 +355,7 @@ describe("dashboard controller", () => {
             session("stopped", { processState: "EXITED", taskState: "STOPPED" }),
         ]));
         await dashboard.open();
-        const rows = () => dashboard.render(80, 24).map(stripVTControlCharacters).filter((line) => /^[\u25b6\u25cc\u00d7 ] \S/u.test(line));
+        const rows = () => dashboard.render(80, 24).map(stripVTControlCharacters).filter((line) => /^[\u280b-\u28ff ] \S/u.test(line) && !line.includes("NAME"));
         expect(rows()).toHaveLength(1);
         dashboard.setQuery({ view: "all" });
         expect(rows()).toHaveLength(3);

@@ -49,22 +49,30 @@ export async function collectSessionMenu(adapter) {
   return { commands, models, thinkingLevels, model, thinkingLevel: typeof state?.thinkingLevel === "string" && state.thinkingLevel.length > 0 ? state.thinkingLevel : null };
 }
 
-/** @param {any} adapter @param {any} request */
-function applySessionCommand(adapter, request) {
+/** Reject an unusable session command before any Pi write, so failures are never ambiguous. @param {any} request */
+function assertSessionCommand(request) {
+  const invalid = (/** @type {string} */ message) => Object.assign(new TypeError(message), { code: "INVALID_SESSION_COMMAND" });
   if (request?.command === "set_model") {
-    if (typeof request.model?.provider !== "string" || typeof request.model?.id !== "string") throw Object.assign(new TypeError("session_command model is invalid"), { code: "INVALID_SESSION_COMMAND" });
-    return adapter.setModel({ provider: request.model.provider, id: request.model.id });
+    if (typeof request.model?.provider !== "string" || typeof request.model?.id !== "string") throw invalid("session_command model is invalid");
+    return;
   }
   if (request?.command === "set_thinking_level") {
-    if (typeof request.level !== "string" || request.level.length === 0) throw Object.assign(new TypeError("session_command level is invalid"), { code: "INVALID_SESSION_COMMAND" });
-    return adapter.setThinkingLevel(request.level);
+    if (typeof request.level !== "string" || request.level.length === 0) throw invalid("session_command level is invalid");
+    return;
   }
   if (request?.command === "set_session_name") {
-    if (typeof request.name !== "string" || request.name.trim().length === 0) throw Object.assign(new TypeError("session_command name is invalid"), { code: "INVALID_SESSION_COMMAND" });
-    return adapter.setSessionName(request.name.trim());
+    if (typeof request.name !== "string" || request.name.trim().length === 0) throw invalid("session_command name is invalid");
+    return;
   }
-  if (request?.command === "compact") return adapter.compact(typeof request.instructions === "string" && request.instructions.length > 0 ? request.instructions : undefined);
-  throw Object.assign(new TypeError("session_command is unsupported"), { code: "INVALID_SESSION_COMMAND" });
+  if (request?.command !== "compact") throw invalid(`session_command is unsupported: ${request?.command ?? "missing"}`);
+}
+
+/** @param {any} adapter @param {any} request */
+function applySessionCommand(adapter, request) {
+  if (request.command === "set_model") return adapter.setModel({ provider: request.model.provider, id: request.model.id });
+  if (request.command === "set_thinking_level") return adapter.setThinkingLevel(request.level);
+  if (request.command === "set_session_name") return adapter.setSessionName(request.name.trim());
+  return adapter.compact(typeof request.instructions === "string" && request.instructions.length > 0 ? request.instructions : undefined);
 }
 
 /** @param {string} value */
@@ -155,6 +163,15 @@ export function createWorkerCommandDispatcher({ replay, adapter }) {
         const cause = Object.assign(new Error(`Unsupported worker operation: ${command.op}`), { code: "UNSUPPORTED_WORKER_OPERATION" });
         await replay.append({ ...base, stage: "FAILED", error: { code: cause.code, message: cause.message, retryable: false } });
         throw cause;
+      }
+      if (command.op === "session_command") {
+        try {
+          assertSessionCommand(command.sessionCommand);
+        } catch (cause) {
+          const failure = /** @type {any} */ (cause);
+          await replay.append({ ...base, stage: "FAILED", error: { code: failure.code, message: failure.message, retryable: false } });
+          throw cause;
+        }
       }
 
       await replay.append({ ...base, stage: "RPC_WRITE_STARTED" });

@@ -92,6 +92,19 @@ it("uses the public RPC entry with structured argv and an exact environment", as
   await adapter.close();
 });
 
+it("fails an unsupported session command deterministically instead of reporting ambiguity", async () => {
+  /** @type {string[]} */
+  const order = [];
+  const replay = await createWorkerReplayStore({ append: async (/** @type {any} */ record) => order.push(record.stage) });
+  const dispatcher = createWorkerCommandDispatcher({ replay, adapter: { async setModel() { throw new Error("never reached"); } } });
+
+  await expect(dispatcher.deliver({ clientId: "client", requestId: "unsupported", op: "session_command", sessionCommand: { command: "invented_command" } }))
+    .rejects.toMatchObject({ code: "INVALID_SESSION_COMMAND" });
+
+  expect(order).toEqual(["RECEIVED", "FAILED"]);
+  await dispatcher.close();
+});
+
 it("records the worker delivery boundary before and after the Pi acknowledgement", async () => {
   /** @type {string[]} */
   const order = [];

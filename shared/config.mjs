@@ -14,12 +14,6 @@ const DEFAULT_CONFIG = Object.freeze({
   stop: { gracefulMs: 5_000, terminateMs: 5_000 },
   diagnostics: { rpcSegmentBytes: 8_388_608, rpcSegments: 4, stderrBytes: 8_388_608 },
 });
-const KEYS = Object.freeze({
-  root: ["schemaVersion", "pi", "workers", "history", "daemon", "stop", "diagnostics"],
-  pi: ["executable"], workers: ["maxLive", "idleRetentionMs"], history: ["completedWindowHours", "indexRefreshMs"],
-  daemon: ["heartbeatMs", "staleAfterMs", "startTimeoutMs"], stop: ["gracefulMs", "terminateMs"],
-  diagnostics: ["rpcSegmentBytes", "rpcSegments", "stderrBytes"],
-});
 
 /** @param {unknown} value @param {string} path @returns {Record<string, unknown>} */
 function record(value, path) {
@@ -31,8 +25,12 @@ function exact(value, keys, path) {
   const unknown = Object.keys(value).find((key) => !keys.includes(key));
   if (unknown !== undefined) throw new TypeError(`Unknown ${path} key: ${unknown}`);
 }
-/** @param {Record<string, unknown>} root @param {string} key */
-function section(root, key) { return Object.hasOwn(root, key) ? record(root[key], key) : {}; }
+/** Read one optional section and refuse any key the defaults do not define. @param {Record<string, unknown>} root @param {keyof typeof DEFAULT_CONFIG} key */
+function section(root, key) {
+  const value = Object.hasOwn(root, key) ? record(root[key], key) : {};
+  exact(value, Object.keys(DEFAULT_CONFIG[key]), key);
+  return value;
+}
 /** @param {Record<string, unknown>} source @param {string} key @param {number} fallback */
 function positiveInteger(source, key, fallback) {
   const value = Object.hasOwn(source, key) ? source[key] : fallback;
@@ -50,12 +48,10 @@ function nullablePositive(source, key, fallback, integer = true) {
 /** Validate a partial schema-2 configuration and apply exact defaults. @param {unknown} input @returns {DashboardConfig} */
 export function loadDashboardConfig(input) {
   const root = record(input, "Dashboard configuration");
-  exact(root, KEYS.root, "dashboard configuration");
+  exact(root, Object.keys(DEFAULT_CONFIG), "dashboard configuration");
   if (Object.hasOwn(root, "schemaVersion") && root.schemaVersion !== 2) throw new TypeError("schemaVersion must be 2");
   const pi = section(root, "pi"); const workers = section(root, "workers"); const history = section(root, "history");
   const daemon = section(root, "daemon"); const stop = section(root, "stop"); const diagnostics = section(root, "diagnostics");
-  exact(pi, KEYS.pi, "pi"); exact(workers, KEYS.workers, "workers"); exact(history, KEYS.history, "history");
-  exact(daemon, KEYS.daemon, "daemon"); exact(stop, KEYS.stop, "stop"); exact(diagnostics, KEYS.diagnostics, "diagnostics");
   const executable = Object.hasOwn(pi, "executable") ? pi.executable : DEFAULT_CONFIG.pi.executable;
   if (executable !== null && (typeof executable !== "string" || !isAbsolute(executable))) throw new TypeError("pi.executable must be null or an absolute path");
   return {

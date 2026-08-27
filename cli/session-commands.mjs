@@ -54,7 +54,8 @@ function exactId(value) {
     !value.includes("/") && !value.includes("\0") && value !== "." && value !== "..";
 }
 
-function runtimeRoot(env = process.env) {
+/** Resolve the machine-local dashboard state root. @param {NodeJS.ProcessEnv} [env] */
+export function resolveRuntimeRoot(env = process.env) {
   const home = env.HOME ?? homedir();
   return resolve(env.PI_DASHBOARD_STATE_DIR ?? join(env.XDG_STATE_HOME ?? join(home, ".local", "state"), "pi-dashboard"));
 }
@@ -122,7 +123,7 @@ async function publishPrivateFile(directory, path, text, beforePublish = () => {
 
 /** Load or create the private stable identity shared by CLI invocations. */
 export async function loadCliClientIdentity({
-  root = runtimeRoot(),
+  root = resolveRuntimeRoot(),
   randomId = randomUUID,
   identityFailpoint = () => {},
   fsOps = fs,
@@ -205,7 +206,7 @@ function validateExpectedResult(op, payload, clientId, requestId, result) {
 /** Create one persistent authenticated request session for composer-scoped operations.
  * @param {{ root?: string, clientId?: string, maxBytes?: number, timeoutMs?: number }} [options]
  */
-export async function createPersistentDaemonRequester({ root = runtimeRoot(), clientId, maxBytes = 1024 * 1024, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {}) {
+export async function createPersistentDaemonRequester({ root = resolveRuntimeRoot(), clientId, maxBytes = 1024 * 1024, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {}) {
   if (!exactId(clientId)) throw new TypeError("A stable CLI clientId is required");
   const token = (await fs.readFile(join(root, "daemon", "control.token"), "utf8")).trim();
   const client = createDaemonClient({ socketPath: join(root, "daemon", "control.sock"), token, maxBytes, clientId, reconnect: false });
@@ -239,7 +240,7 @@ export async function createPersistentDaemonRequester({ root = runtimeRoot(), cl
 /** Create one bounded authenticated requester; transport closure never signals workers.
  * @param {{ root?: string, clientId?: string, maxBytes?: number, timeoutMs?: number, createConnection?: typeof net.createConnection }} [options]
  */
-export function createDaemonRequester({ root = runtimeRoot(), clientId, maxBytes = 1024 * 1024, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, createConnection = net.createConnection } = {}) {
+export function createDaemonRequester({ root = resolveRuntimeRoot(), clientId, maxBytes = 1024 * 1024, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, createConnection = net.createConnection } = {}) {
   if (!exactId(clientId)) throw new TypeError("A stable CLI clientId is required");
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new TypeError("timeoutMs must be a positive safe integer");
   return async (op, payload, requestId = randomUUID()) => {
@@ -446,11 +447,6 @@ async function withCliStateLock(directory, key, action, { timeoutMs = PENDING_LO
   try { return await action(); } finally { await lock.release(); }
 }
 
-/** @param {string} directory @param {string} key @param {() => Promise<any>} action */
-async function withPendingLock(directory, key, action) {
-  return withCliStateLock(directory, key, action);
-}
-
 /** @param {string} root @param {string} action @param {string} sessionId @param {number} revision */
 async function readPending(root, action, sessionId, revision) {
   const directory = await pendingDirectory(root);
@@ -469,7 +465,7 @@ async function putPending(root, entry, failpoint = () => {}) {
   const key = pendingKey(entry.action, entry.sessionId, entry.revision);
   const path = join(directory, `${key}.json`);
   const candidate = { schemaVersion: 1, ...entry };
-  return withPendingLock(directory, key, async () => {
+  return withCliStateLock(directory, key, async () => {
     await recoverPendingClear(directory, key, path, entry.action, entry.sessionId, entry.revision);
     const winner = await readPending(root, entry.action, entry.sessionId, entry.revision);
     if (winner.entry !== undefined) return winner;
@@ -516,7 +512,7 @@ async function clearPending(root, path, expected, failpoint = () => {}) {
   if (path === undefined || expected?.entry === undefined) return;
   const directory = await pendingDirectory(root);
   const key = pendingKey(expected.entry.action, expected.entry.sessionId, expected.entry.revision);
-  await withPendingLock(directory, key, async () => {
+  await withCliStateLock(directory, key, async () => {
     await recoverPendingClear(directory, key, path, expected.entry.action, expected.entry.sessionId, expected.entry.revision);
     const current = await readPending(root, expected.entry.action, expected.entry.sessionId, expected.entry.revision);
     if (current.path !== path || current.entry === undefined || JSON.stringify(current.entry) !== JSON.stringify(expected.entry) || !sameFileIdentity(current.identity, expected.identity)) return;
@@ -577,10 +573,10 @@ function classifyCommandResult(result) {
   if (result?.kind !== "command" || !["COMPLETED", "DELIVERY_UNKNOWN", "FAILED"].includes(result.status?.stage)) {
     return { code: 1, error: { code: "INVALID_RESPONSE", message: "Daemon returned an unexpected command result" } };
   }
-  if (result?.kind === "command" && result.status?.stage === "DELIVERY_UNKNOWN") {
+  if (result.status.stage === "DELIVERY_UNKNOWN") {
     return { code: 1, error: { code: "DELIVERY_UNKNOWN", message: "Delivery is ambiguous; use session resolve-delivery with the exact clientId/requestId", clientId: result.status.clientId, requestId: result.status.requestId }, result };
   }
-  if (result?.kind === "command" && result.status?.stage === "FAILED") {
+  if (result.status.stage === "FAILED") {
     return { code: 1, error: result.status.error ?? { code: "COMMAND_FAILED", message: "Command failed" }, result };
   }
   return { code: 0, result };
@@ -590,7 +586,7 @@ function classifyCommandResult(result) {
 export async function runSessionCommand(argv, options = {}) {
   const parsed = parse(argv);
   if ("error" in parsed) return { code: 2, error: { code: "INVALID_SYNTAX", message: parsed.error } };
-  const root = options.root ?? runtimeRoot(options.env);
+  const root = options.root ?? resolveRuntimeRoot(options.env);
 
   if (parsed.command === "resolve-delivery") {
     const clientId = await loadCliClientIdentity({ root, randomId: options.randomId });

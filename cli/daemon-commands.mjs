@@ -1,7 +1,6 @@
 import net from "node:net";
 import { spawn } from "node:child_process";
 import { readFile, realpath } from "node:fs/promises";
-import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -9,15 +8,12 @@ import { cleanupStaleDaemon, inspectDaemonEndpoint } from "../runtime/daemon-lif
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
 import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "../runtime/process-signaler.mjs";
-import { createDaemonRequester, createPersistentDaemonRequester, loadCliClientIdentity } from "./session-commands.mjs";
+import { createDaemonRequester, createPersistentDaemonRequester, loadCliClientIdentity, resolveRuntimeRoot } from "./session-commands.mjs";
+
+export { resolveRuntimeRoot };
 
 const STATUS_CODES = { HEALTHY: 0, UNHEALTHY: 1, STALE: 1, ABSENT: 3, CONFLICT: 5 };
 const DEFAULT_STOP_POLICY = Object.freeze({ gracefulMs: 500, terminateMs: 500 });
-
-export function resolveRuntimeRoot(env = process.env) {
-  const home = env.HOME ?? homedir();
-  return resolve(env.PI_DASHBOARD_STATE_DIR ?? join(env.XDG_STATE_HOME ?? join(home, ".local", "state"), "pi-dashboard"));
-}
 
 export async function daemonEntryPoint() {
   return realpath(resolve(dirname(fileURLToPath(import.meta.url)), "../runtime/daemon.mjs"));

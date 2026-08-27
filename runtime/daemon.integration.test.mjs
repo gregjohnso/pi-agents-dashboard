@@ -1640,3 +1640,36 @@ it("closes daemon and frontend sockets without signaling worker processes", asyn
   await runtime.close();
   expect(signals).toEqual([]);
 });
+
+it("colors a dead session without involving a Pi worker", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const now = "2026-08-25T12:00:00.000Z";
+  const sessionFile = join(stateRoot, "canonical.jsonl");
+  await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "colored", timestamp: now, cwd: stateRoot })}\n`, { mode: 0o600 });
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const created = await registry.create({ schemaVersion: 1, revision: 0, sessionId: "colored", sessionFile, canonicalSessionFile: sessionFile, cwd: stateRoot, taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "idle", summary: "Idle", updatedAt: now }, createdAt: now, updatedAt: now });
+  const runtime = await createDaemonRuntime({ root: stateRoot });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 16384 });
+  await client.ready;
+  client.send({ version: 1, clientId: "viewer", requestId: "subscribe-1", op: "subscribe", payload: {} });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "subscribed" } });
+
+  client.send({ version: 1, clientId: "viewer", requestId: "color-1", op: "set_session_color", payload: { sessionId: "colored", revision: created.revision, color: "amber" } });
+  const responses = [await client.next(), await client.next()];
+  expect(responses).toEqual(expect.arrayContaining([
+    expect.objectContaining({ ok: true, result: expect.objectContaining({ kind: "session_colored" }) }),
+    expect.objectContaining({ kind: "session_changed", payload: { session: expect.objectContaining({ color: "amber" }) } }),
+  ]));
+  const colored = await registry.get("colored");
+  expect(colored).toMatchObject({ color: "amber", processState: "EXITED" });
+  expect(colored?.revision).toBe(created.revision + 1);
+
+  client.send({ version: 1, clientId: "viewer", requestId: "color-stale", op: "set_session_color", payload: { sessionId: "colored", revision: created.revision, color: "rose" } });
+  await vi.waitFor(async () => expect((await client.next())).toMatchObject({ ok: false, error: { code: "REVISION_CONFLICT" } }));
+
+  client.send({ version: 1, clientId: "viewer", requestId: "color-clear", op: "set_session_color", payload: { sessionId: "colored", revision: colored?.revision, color: null } });
+  await vi.waitFor(async () => expect(await registry.get("colored")).not.toHaveProperty("color"));
+});

@@ -1,5 +1,6 @@
 import { CombinedAutocompleteProvider, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
+import { SESSION_COLORS } from "../../shared/contracts.mjs";
 import { parseViewerEvent, parseViewerSnapshot } from "../../shared/viewer-contracts.mjs";
 import { createPiComponentAdapters } from "./pi-component-adapters.mjs";
 import { EMPTY_SESSION_MENU, parseSlashSubmission, sessionSlashCommands } from "./slash-commands.mjs";
@@ -12,6 +13,15 @@ import { TranscriptModel, applyViewerEvent, createTranscriptState } from "./tran
 function fit(line, width) {
   const clipped = truncateToWidth(line.replace(/[\r\n\u2028\u2029]/gu, " "), Math.max(0, width), "");
   return visibleWidth(clipped) <= width ? clipped : "";
+}
+
+const COLOR_CODES = { sky: "\x1b[38;2;125;211;252m", cyan: "\x1b[38;2;125;211;252m", green: "\x1b[38;2;110;231;183m", amber: "\x1b[38;2;252;211;77m", rose: "\x1b[38;2;253;164;175m", gray: "\x1b[38;2;136;136;136m" };
+
+/** Tint the composer's prompt bar with the operator's session color. Untinted lines are returned unchanged. */
+function tintPromptBar(lines, color) {
+  const code = color === undefined ? undefined : COLOR_CODES[color];
+  if (code === undefined) return lines;
+  return lines.map((line) => `${code}${line}\x1b[0m`);
 }
 
 function isPageUp(data) { return matchesKey(data, Key.pageUp); }
@@ -123,7 +133,7 @@ export class ViewerController {
         ? ` ${this.sessionId} · ${this.state.taskState}/${this.state.processState} · ${role}`
         : ` ${this.state.taskState}/${this.state.processState} · ${role}`;
     let status = renderStatusIndicator(this.state.activity, width, this.now(), { working: this.state.working });
-    const editorLines = this.state.role === "composer" ? this.editor.render(width) : [" Read-only session · scroll and tool inspection only"];
+    const editorLines = tintPromptBar(this.state.role === "composer" ? this.editor.render(width) : [" Read-only session · scroll and tool inspection only"], this.sessionColor);
     const inputLabel = this.inputMode === "steer" ? [" Steer at next supported boundary"] : this.steerStatus === undefined ? [] : [` Steer ${this.steerStatus}`];
     const selectedTool = this.transcript.selectedToolId === undefined ? undefined : this.state.tools.get(this.transcript.selectedToolId);
     const toolLine = selectedTool === undefined ? [] : [` tool:${selectedTool.name} ${selectedTool.state} ${this.transcript.expandedTools.has(selectedTool.id) ? "expanded" : "collapsed"}`];
@@ -244,7 +254,9 @@ export class ViewerController {
         thinkingLevels: Array.isArray(menu?.thinkingLevels) ? menu.thinkingLevels : [],
         model: menu?.model ?? null,
         thinkingLevel: menu?.thinkingLevel ?? null,
+        color: menu?.color ?? null,
       };
+      if (Number.isSafeInteger(menu?.registryRevision)) this.registryRevision = menu.registryRevision;
     } catch (error) {
       this.menu = EMPTY_SESSION_MENU;
       const code = /** @type {any} */ (error)?.code;
@@ -320,7 +332,10 @@ export class ViewerController {
       this.clearEditor();
       return;
     }
-    if (submission.kind === "settings") {
+    if (submission.kind === "session_color") {
+      if (!await this.sendSessionColor(submission.color)) return;
+      await this.loadMenu();
+    } else if (submission.kind === "settings") {
       if (!await this.sendSettings(submission.payload)) return;
       await this.loadMenu();
     } else if (submission.kind === "session_command") {
@@ -430,6 +445,30 @@ export class ViewerController {
   }
 
   /** @param {Record<string, any>} payload */
+  /** Apply the dashboard's session color. Registry metadata only: no Pi worker is involved. @param {string | null} color */
+  async sendSessionColor(color) {
+    if (typeof this.client.setSessionColor !== "function") {
+      await this.recordError({ code: "SESSION_COLOR_UNAVAILABLE", message: "This frontend cannot change a session color", retryable: false });
+      return false;
+    }
+    const revision = this.registryRevision ?? this.state?.registryRevision;
+    if (!Number.isSafeInteger(revision)) {
+      await this.recordError({ code: "SESSION_COLOR_UNAVAILABLE", message: "This session has no known registry revision", retryable: false });
+      return false;
+    }
+    try {
+      const result = await this.client.setSessionColor(this.sessionId, revision, color);
+      if (Number.isSafeInteger(result?.revision)) this.registryRevision = result.revision;
+      this.sessionColor = result?.color ?? undefined;
+      this.clearEditor();
+      return true;
+    } catch (error) {
+      const typed = /** @type {any} */ (error);
+      await this.recordError({ code: typed?.code ?? "SESSION_COLOR_FAILED", message: error instanceof Error ? error.message : "Session color update failed", retryable: false });
+      return false;
+    }
+  }
+
   async sendSettings(payload) {
     if (typeof this.client.setSettings !== "function") {
       await this.recordError({ code: "SETTINGS_UNAVAILABLE", message: "This frontend cannot change dashboard settings", retryable: false });
@@ -490,9 +529,11 @@ export class ViewerController {
         ? { title: "Select a thinking level", items: this.menu.thinkingLevels.map((level) => ({ value: level, label: level })) }
         : code === "SUMMARY_MODEL_REQUIRED"
           ? { title: "Select a dashboard summary model", items: [{ value: "off", label: "off · disable summaries" }, ...models] }
-          : undefined;
+          : code === "SESSION_COLOR_REQUIRED"
+            ? { title: "Select a session color", items: [{ value: "default", label: "default · no tint" }, ...SESSION_COLORS.map((color) => ({ value: color, label: color }))] }
+            : undefined;
     if (picker === undefined || picker.items.length === 0) return false;
-    const command = code === "MODEL_REQUIRED" ? "/model" : code === "THINKING_LEVEL_REQUIRED" ? "/thinking" : "/model-summary";
+    const command = code === "MODEL_REQUIRED" ? "/model" : code === "THINKING_LEVEL_REQUIRED" ? "/thinking" : code === "SESSION_COLOR_REQUIRED" ? "/color" : "/model-summary";
     this.selection?.dispose();
     this.selection = new CommandSelectionOverlay({
       title: picker.title, items: picker.items,

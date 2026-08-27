@@ -88,6 +88,9 @@ export const jobwatchTheme = {
     text(text, selected) {
         return paint(text, JOBWATCH_ANSI.text, selected);
     },
+    name(text, selected, color) {
+        return paint(text, color === undefined ? JOBWATCH_ANSI.text : JOBWATCH_ANSI[color], selected);
+    },
     muted(text, selected) {
         return paint(text, JOBWATCH_ANSI.gray, selected);
     },

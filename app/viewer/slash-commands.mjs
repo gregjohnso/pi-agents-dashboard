@@ -1,9 +1,12 @@
+import { SESSION_COLORS } from "../../shared/contracts.mjs";
+
 /** @typedef {{name:string,source:string,description?:string,argumentHint?:string}} MenuCommand */
-/** @typedef {{commands:MenuCommand[],models:{provider:string,id:string}[],thinkingLevels:string[],model:{provider:string,id:string}|null,thinkingLevel:string|null,summaryModel?:{provider:string,id:string}|null,name?:string|null}} SessionMenu */
+/** @typedef {{commands:MenuCommand[],models:{provider:string,id:string}[],thinkingLevels:string[],model:{provider:string,id:string}|null,thinkingLevel:string|null,summaryModel?:{provider:string,id:string}|null,name?:string|null,color?:string|null}} SessionMenu */
 
 const BUILTIN_SOURCE = "builtin";
 const QUEUE_MODES = ["all", "one-at-a-time"];
 const TOGGLES = ["on", "off"];
+const DEFAULT_COLOR = "default";
 // Pi rebinds its running process to another session file for these; the dashboard binds one worker to one
 // canonical file, so it refuses by name rather than desynchronising the registry and the viewer stream.
 const REBIND_COMMANDS = { "/fork": "fork", "/clone": "clone", "/switch": "switch_session" };
@@ -40,6 +43,7 @@ export function sessionSlashCommands(menu) {
     { name: "thinking", description: menu.thinkingLevel === null ? "Set the thinking level" : `Thinking: ${menu.thinkingLevel}`, argumentHint: "<level>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, menu.thinkingLevels) },
     { name: "model-summary", description: menu.summaryModel == null ? "Dashboard summaries: off" : `Dashboard summaries: ${modelValue(menu.summaryModel)}`, argumentHint: "<provider/id|off>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, ["off", ...models]) },
     { name: "rename", description: menu.name == null ? "Name this session" : `Name: ${menu.name}`, argumentHint: "<name>", source: BUILTIN_SOURCE },
+    { name: "color", description: menu.color == null ? "Set this session's dashboard color" : `Color: ${menu.color}`, argumentHint: "<color>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, [DEFAULT_COLOR, ...SESSION_COLORS]) },
     { name: "compact", description: "Compact the conversation", argumentHint: "[instructions]", source: BUILTIN_SOURCE },
     { name: "stats", description: "Show this session's Pi statistics", source: BUILTIN_SOURCE },
     { name: "tree", description: "Show this session's entry tree", source: BUILTIN_SOURCE },
@@ -56,7 +60,7 @@ export function sessionSlashCommands(menu) {
     { name: "help", description: "List the viewer's commands and keys", source: BUILTIN_SOURCE },
     ...menu.commands
       .map((command) => ({ ...command, name: bareName(command.name) }))
-      .filter((command) => !["model", "thinking", "compact", "model-summary", "rename", "stats", "tree", "export", "auto-compact", "auto-retry", "steering", "follow-up", "abort-retry", "new", "resume", "fork", "clone", "help"].includes(command.name)),
+      .filter((command) => !["model", "thinking", "compact", "model-summary", "rename", "color", "stats", "tree", "export", "auto-compact", "auto-retry", "steering", "follow-up", "abort-retry", "new", "resume", "fork", "clone", "help"].includes(command.name)),
   ];
 }
 
@@ -64,7 +68,7 @@ export function sessionSlashCommands(menu) {
  * Resolve one submitted editor line into a prompt or an exact session command.
  * @param {string} text
  * @param {SessionMenu} menu
- * @returns {{kind:"prompt",text:string}|{kind:"session_command",payload:Record<string,any>}|{kind:"session_query",payload:Record<string,any>}|{kind:"settings",payload:Record<string,any>}|{kind:"dashboard",action:"new_session"|"session_list"}|{kind:"help"}|{kind:"rejected",code:string,message:string}}
+ * @returns {{kind:"prompt",text:string}|{kind:"session_command",payload:Record<string,any>}|{kind:"session_query",payload:Record<string,any>}|{kind:"settings",payload:Record<string,any>}|{kind:"session_color",color:string|null}|{kind:"dashboard",action:"new_session"|"session_list"}|{kind:"help"}|{kind:"rejected",code:string,message:string}}
  */
 export function parseSlashSubmission(text, menu) {
   const trimmed = text.trim();
@@ -94,6 +98,12 @@ export function parseSlashSubmission(text, menu) {
     if (argument.length === 0) return { kind: "rejected", code: "SESSION_NAME_REQUIRED", message: "Type a session name: /rename <name>" };
     if (argument.length > 128) return { kind: "rejected", code: "SESSION_NAME_TOO_LONG", message: "Session names are limited to 128 characters" };
     return { kind: "session_command", payload: { command: "set_session_name", name: argument } };
+  }
+  if (name === "/color") {
+    if (argument.length === 0) return { kind: "rejected", code: "SESSION_COLOR_REQUIRED", message: `Choose a color: ${[DEFAULT_COLOR, ...SESSION_COLORS].join(", ")}` };
+    if (argument === DEFAULT_COLOR) return { kind: "session_color", color: null };
+    if (!SESSION_COLORS.includes(argument)) return { kind: "rejected", code: "UNKNOWN_SESSION_COLOR", message: `Unknown color: ${argument}. Choose ${[DEFAULT_COLOR, ...SESSION_COLORS].join(", ")}` };
+    return { kind: "session_color", color: argument };
   }
   if (name === "/compact") {
     return { kind: "session_command", payload: argument.length === 0 ? { command: "compact" } : { command: "compact", instructions: argument } };

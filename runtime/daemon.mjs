@@ -18,7 +18,7 @@ import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "./process-signaler.mjs";
 import { RecoveredWorkerRouter, reconcileRuntime } from "./reconciliation.mjs";
 import { openSettingsStore, summarizePromptInput, summarizeWithPi } from "./summaries.mjs";
-import { RegistryStore, runSessionLifecycle } from "./registry-store.mjs";
+import { RegistryStore, applySessionColor, runSessionLifecycle } from "./registry-store.mjs";
 import { reduceSessionState } from "./state-reducer.mjs";
 import { WorkerSupervisor } from "./worker-supervisor.mjs";
 import { loadDashboardConfig } from "../shared/config.mjs";
@@ -962,10 +962,7 @@ export async function createDaemonRuntime({
         if (request.op === "set_settings") return { kind: "settings", ...(await settingsStore.setSummaryModel(request.payload.summaryModel)) };
         if (request.op === "set_session_color") {
           return runSessionLifecycle(registry, request.payload.sessionId, async () => {
-            const current = await registry.get(request.payload.sessionId);
-            if (current === undefined) throw Object.assign(new Error("Session does not exist"), { code: "SESSION_NOT_FOUND" });
-            if (current.revision !== request.payload.revision) throw Object.assign(new Error("Session revision changed before the color was set"), { code: "REVISION_CONFLICT" });
-            const updated = await registry.update(current.sessionId, current.revision, { color: request.payload.color ?? undefined, updatedAt: new Date().toISOString() });
+            const updated = await applySessionColor(registry, request.payload.sessionId, request.payload.color);
             const event = await context.recovery.events.append({ kind: "session_changed", payload: { session: updated } });
             context.broadcast(event);
             return { kind: "session_colored", sessionId: updated.sessionId, revision: updated.revision, color: updated.color ?? null };

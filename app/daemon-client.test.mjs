@@ -367,7 +367,7 @@ it("drops a malformed event and reconnects before dispatching a valid event", as
         expect(operations).toEqual(["get_viewer_snapshot", "subscribe_viewer", "ack_viewer"]);
         await iterator.return?.();
     });
-    it("sets a session color against an exact revision", async () => {
+    it("sets a session color without a revision precondition", async () => {
         const directory = await mkdtemp(join(tmpdir(), "client-color-"));
         const socketPath = join(directory, "daemon.sock");
         /** @type {any[]} */
@@ -379,21 +379,20 @@ it("drops a malformed event and reconnects before dispatching a valid event", as
                 for (const value of decoder.push(chunk)) {
                     if (!authed) { authed = true; socket.write(encodeJsonl({ version: 1, kind: "authenticated" })); continue; }
                     payloads.push({ op: value.op, payload: value.payload });
-                    socket.write(encodeJsonl({ version: 1, requestId: value.requestId, ok: true, result: { kind: "session_colored", sessionId: value.payload.sessionId, revision: value.payload.revision + 1, color: value.payload.color } }));
+                    socket.write(encodeJsonl({ version: 1, requestId: value.requestId, ok: true, result: { kind: "session_colored", sessionId: value.payload.sessionId, revision: payloads.length, color: value.payload.color } }));
                 }
             });
         });
         await new Promise((resolve, reject) => server.listen(socketPath, resolve).once("error", reject));
         const client = createDaemonClient({ socketPath, token: "secret", maxBytes: 4096, clientId: "client-1" });
         cleanups.push(async () => { await client.close(); await new Promise((resolve) => server.close(() => resolve())); await rm(directory, { recursive: true, force: true }); });
-        await expect(client.setSessionColor("session-1", 4, "amber")).resolves.toMatchObject({ kind: "session_colored", color: "amber", revision: 5 });
-        await expect(client.setSessionColor("session-1", 5, null)).resolves.toMatchObject({ color: null });
+        await expect(client.setSessionColor("session-1", "amber")).resolves.toMatchObject({ kind: "session_colored", color: "amber", revision: 1 });
+        await expect(client.setSessionColor("session-1", null)).resolves.toMatchObject({ color: null });
         expect(payloads).toEqual([
-            { op: "set_session_color", payload: { sessionId: "session-1", revision: 4, color: "amber" } },
-            { op: "set_session_color", payload: { sessionId: "session-1", revision: 5, color: null } },
+            { op: "set_session_color", payload: { sessionId: "session-1", color: "amber" } },
+            { op: "set_session_color", payload: { sessionId: "session-1", color: null } },
         ]);
-        await expect(client.setSessionColor("", 1, "amber")).rejects.toThrow(/sessionId/i);
-        await expect(client.setSessionColor("session-1", -1, "amber")).rejects.toThrow(/revision/i);
+        await expect(client.setSessionColor("", "amber")).rejects.toThrow(/sessionId/i);
     });
 
     it("finishes subscriptions created after the client closes", async () => {

@@ -7,7 +7,22 @@ import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, expect, it } from "vitest";
 
 import { atomicWriteJson } from "./atomic-file.mjs";
-import { RegistryStore, runNestedSessionLifecycle, runSessionLifecycle } from "./registry-store.mjs";
+import { RegistryStore, applySessionColor, runNestedSessionLifecycle, runSessionLifecycle } from "./registry-store.mjs";
+
+/** Replace one store's update with a version that lets background churn win the race first. @param {RegistryStore} store @param {string} sessionId @param {number} losses */
+function loseColorRaces(store, sessionId, losses) {
+  const real = store.update.bind(store);
+  const attempts = { count: 0 };
+  store.update = async (/** @type {string} */ id, /** @type {number} */ revision, /** @type {any} */ update) => {
+    attempts.count += 1;
+    if (attempts.count <= losses) {
+      const current = await store.get(sessionId);
+      await real(sessionId, /** @type {number} */ (current?.revision), { activity: { kind: "assistant_stream", summary: `churn ${attempts.count}`, updatedAt: "2026-08-25T12:00:02.000Z" } });
+    }
+    return real(id, revision, update);
+  };
+  return attempts;
+}
 
 /** @type {string[]} */
 const cleanup = [];
@@ -286,4 +301,38 @@ it("persists a session color and refuses one outside the palette", async () => {
   await expect(store.update("colored", updated.revision, { color: /** @type {any} */ ("chartreuse") })).rejects.toThrow(/color/i);
   const cleared = await store.update("colored", updated.revision, { color: undefined });
   expect(cleared.color).toBeUndefined();
+});
+
+it("applies a color write that loses a compare-and-swap race to background churn", async () => {
+  const { store } = await makeRegistry();
+  await store.create(record("colored"));
+  const attempts = loseColorRaces(store, "colored", 1);
+
+  await expect(applySessionColor(store, "colored", "amber")).resolves.toMatchObject({ color: "amber" });
+  expect(attempts.count).toBe(2);
+  expect(await store.get("colored")).toMatchObject({ color: "amber", activity: { summary: "churn 1" } });
+});
+
+it("clears a color that loses a compare-and-swap race to background churn", async () => {
+  const { store } = await makeRegistry();
+  await store.create(record("colored", { color: "rose" }));
+  loseColorRaces(store, "colored", 1);
+
+  expect((await applySessionColor(store, "colored", null)).color).toBeUndefined();
+  expect(await store.get("colored")).not.toHaveProperty("color");
+});
+
+it("bounds the color write retry instead of spinning against endless churn", async () => {
+  const { store } = await makeRegistry();
+  await store.create(record("colored"));
+  const attempts = loseColorRaces(store, "colored", Number.MAX_SAFE_INTEGER);
+
+  await expect(applySessionColor(store, "colored", "amber")).rejects.toMatchObject({ code: "REVISION_CONFLICT" });
+  expect(attempts.count).toBeGreaterThan(1);
+  expect(attempts.count).toBeLessThan(32);
+});
+
+it("reports a missing session rather than creating one when coloring", async () => {
+  const { store } = await makeRegistry();
+  await expect(applySessionColor(store, "absent", "amber")).rejects.toMatchObject({ code: "SESSION_NOT_FOUND" });
 });

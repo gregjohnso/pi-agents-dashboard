@@ -1657,7 +1657,7 @@ it("colors a dead session without involving a Pi worker", async () => {
   client.send({ version: 1, clientId: "viewer", requestId: "subscribe-1", op: "subscribe", payload: {} });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "subscribed" } });
 
-  client.send({ version: 1, clientId: "viewer", requestId: "color-1", op: "set_session_color", payload: { sessionId: "colored", revision: created.revision, color: "amber" } });
+  client.send({ version: 1, clientId: "viewer", requestId: "color-1", op: "set_session_color", payload: { sessionId: "colored", color: "amber" } });
   const responses = [await client.next(), await client.next()];
   expect(responses).toEqual(expect.arrayContaining([
     expect.objectContaining({ ok: true, result: expect.objectContaining({ kind: "session_colored" }) }),
@@ -1668,8 +1668,46 @@ it("colors a dead session without involving a Pi worker", async () => {
   expect(colored?.revision).toBe(created.revision + 1);
 
   client.send({ version: 1, clientId: "viewer", requestId: "color-stale", op: "set_session_color", payload: { sessionId: "colored", revision: created.revision, color: "rose" } });
-  await vi.waitFor(async () => expect((await client.next())).toMatchObject({ ok: false, error: { code: "REVISION_CONFLICT" } }));
+  await vi.waitFor(async () => expect(await registry.get("colored")).toMatchObject({ color: "rose" }));
 
-  client.send({ version: 1, clientId: "viewer", requestId: "color-clear", op: "set_session_color", payload: { sessionId: "colored", revision: colored?.revision, color: null } });
+  client.send({ version: 1, clientId: "viewer", requestId: "color-clear", op: "set_session_color", payload: { sessionId: "colored", color: null } });
   await vi.waitFor(async () => expect(await registry.get("colored")).not.toHaveProperty("color"));
+});
+
+it("colors a session across summary churn without a revision conflict", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const now = "2026-08-25T12:00:00.000Z";
+  const sessionFile = join(stateRoot, "canonical.jsonl");
+  await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "summary", timestamp: now, cwd: stateRoot })}\n${JSON.stringify({ type: "message", id: "user-1", parentId: null, timestamp: now, message: { role: "user", content: "fix the loader" } })}\n`, { mode: 0o600 });
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const created = await registry.create({ schemaVersion: 1, revision: 0, sessionId: "summary", sessionFile, canonicalSessionFile: sessionFile, cwd: stateRoot, taskState: "READY", processState: "SLEEPING", outcome: "NONE", activity: { kind: "idle", summary: "Idle", updatedAt: now }, createdAt: now, updatedAt: now });
+  /** @type {(value?: unknown) => void} */
+  let releaseSummary = () => {};
+  const summaryGate = new Promise((resolve) => { releaseSummary = resolve; });
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    summarizeSession: async () => { await summaryGate; return { name: "Loader repair", text: "Fixes the loader" }; },
+  });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 16384 });
+  await client.ready;
+
+  client.send({ version: 1, clientId: "viewer", requestId: "settings-1", op: "set_settings", payload: { summaryModel: { provider: "anthropic", id: "haiku" } } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "settings" } });
+  client.send({ version: 1, clientId: "viewer", requestId: "refresh-1", op: "refresh_summaries", payload: {} });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "summaries_refreshing", sessionIds: ["summary"] } });
+
+  client.send({ version: 1, clientId: "viewer", requestId: "color-1", op: "set_session_color", payload: { sessionId: "summary", revision: created.revision, color: "amber" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "session_colored", color: "amber" } });
+
+  releaseSummary();
+  await vi.waitFor(async () => expect((await registry.get("summary"))?.summary).toMatchObject({ text: "Fixes the loader" }));
+  expect(await registry.get("summary")).toMatchObject({ color: "amber", name: "Loader repair" });
+
+  client.send({ version: 1, clientId: "viewer", requestId: "color-2", op: "set_session_color", payload: { sessionId: "summary", revision: created.revision, color: "rose" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "session_colored", color: "rose" } });
+  expect(await registry.get("summary")).toMatchObject({ color: "rose", summary: { text: "Fixes the loader" } });
+  client.close();
 });

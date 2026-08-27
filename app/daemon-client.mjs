@@ -486,13 +486,11 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
             };
             return iterable;
         },
-        /** @param {string} sessionId @param {number} revision @param {string | null} color */
-        async setSessionColor(sessionId, revision, color) {
+        /** @param {string} sessionId @param {string | null} color */
+        async setSessionColor(sessionId, color) {
             if (typeof sessionId !== "string" || sessionId.length === 0)
                 throw new TypeError("sessionId is required");
-            if (!Number.isSafeInteger(revision) || revision < 0)
-                throw new TypeError("revision must be a non-negative safe integer");
-            const response = await this.request({ version: 1, clientId, requestId: randomUUID(), op: "set_session_color", payload: { sessionId, revision, color } });
+            const response = await this.request({ version: 1, clientId, requestId: randomUUID(), op: "set_session_color", payload: { sessionId, color } });
             if (!response.ok)
                 throw new DaemonClientError(response.error.code, response.error.message);
             return response.result;

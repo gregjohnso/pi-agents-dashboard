@@ -6,6 +6,9 @@ import { atomicWriteJson } from "./atomic-file.mjs";
 import { SessionCoordinator } from "./session-coordinator.mjs";
 
 const CREATE_COORDINATION_KEY = "\0registry-create";
+// Worker activity events and the summary pass rewrite records outside a color write's lock, so one lost
+// compare-and-swap is routine. The bound keeps the retry from spinning if a session churns without pause.
+const COLOR_WRITE_ATTEMPTS = 8;
 const TASK_STATES = new Set(["WORKING", "WAITING", "READY", "FAILED", "STOPPED"]);
 const PROCESS_STATES = new Set(["LIVE", "SLEEPING", "EXITED", "STALE"]);
 const OUTCOMES = new Set(["NONE", "COMPLETED", "READY_FOR_REVIEW"]);
@@ -35,6 +38,7 @@ const SESSION_RECORD_KEYS = [
 ];
 
 /** @typedef {import("../shared/contracts.mjs").SessionRecord} SessionRecord */
+/** @typedef {import("../shared/contracts.mjs").SessionColor} SessionColor */
 /** @typedef {{ coordinator: SessionCoordinator, lifecycle: SessionCoordinator }} RegistryCoordinationScope */
 
 /** @type {Map<string, RegistryCoordinationScope>} */
@@ -263,6 +267,27 @@ export function runSessionLifecycle(registry, sessionId, operation) {
 /** Run only a known nested lifecycle operation under its caller's exact session lock. @param {RegistryStore} registry @param {string} sessionId @param {() => any | Promise<any>} operation */
 export function runNestedSessionLifecycle(registry, sessionId, operation) {
   return registryCoordinationScope(registry).lifecycle.runNested(sessionId, operation);
+}
+
+/**
+ * Write one session's operator-chosen color, re-reading the record when a concurrent write wins the
+ * compare-and-swap. The color depends on nothing about the session, so metadata churn only costs a retry.
+ *
+ * @param {RegistryStore} registry
+ * @param {string} sessionId
+ * @param {SessionColor | null} color
+ * @returns {Promise<SessionRecord>}
+ */
+export async function applySessionColor(registry, sessionId, color) {
+  for (let attempt = 1; ; attempt += 1) {
+    const current = await registry.get(sessionId);
+    if (current === undefined) throw Object.assign(new Error("Session does not exist"), { code: "SESSION_NOT_FOUND" });
+    try {
+      return await registry.update(sessionId, current.revision, { color: color ?? undefined, updatedAt: new Date().toISOString() });
+    } catch (error) {
+      if (attempt >= COLOR_WRITE_ATTEMPTS || /** @type {any} */ (error)?.code !== "REVISION_CONFLICT") throw error;
+    }
+  }
 }
 
 /** Atomic, compare-and-swap storage for canonical session records. */

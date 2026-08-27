@@ -474,20 +474,14 @@ export class ViewerController {
     }
   }
 
-  /** @param {Record<string, any>} payload */
   /** Apply the dashboard's session color. Registry metadata only: no Pi worker is involved. @param {string | null} color */
   async sendSessionColor(color) {
     if (typeof this.client.setSessionColor !== "function") {
       await this.recordError({ code: "SESSION_COLOR_UNAVAILABLE", message: "This frontend cannot change a session color", retryable: false });
       return false;
     }
-    const revision = this.registryRevision ?? this.state?.registryRevision;
-    if (!Number.isSafeInteger(revision)) {
-      await this.recordError({ code: "SESSION_COLOR_UNAVAILABLE", message: "This session has no known registry revision", retryable: false });
-      return false;
-    }
     try {
-      const result = await this.client.setSessionColor(this.sessionId, revision, color);
+      const result = await this.client.setSessionColor(this.sessionId, color);
       if (Number.isSafeInteger(result?.revision)) this.registryRevision = result.revision;
       this.sessionColor = result?.color ?? undefined;
       this.clearEditor();

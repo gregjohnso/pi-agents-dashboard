@@ -170,11 +170,13 @@ export function parseClientRequest(value) {
   }
   if (op === "set_session_color") {
     const payload = readRecord(request.payload, "set_session_color payload");
+    // A color is dashboard metadata with no precondition on session state, so it carries no revision.
+    // Clients built against the original version-1 shape still send one: accept it, check its shape, and drop it.
     rejectUnknownKeys(payload, ["sessionId", "revision", "color"], "set_session_color payload");
-    const bound = readDestructivePayload({ sessionId: payload.sessionId, revision: payload.revision }, "set_session_color");
+    if (Object.hasOwn(payload, "revision") && (!Number.isSafeInteger(payload.revision) || payload.revision < 0)) throw new TypeError("set_session_color payload.revision must be a non-negative safe integer");
     if (!Object.hasOwn(payload, "color")) throw new TypeError("set_session_color payload.color is required");
     if (payload.color !== null && !SESSION_COLORS.includes(payload.color)) throw new TypeError(`set_session_color payload.color must be null or one of: ${SESSION_COLORS.join(", ")}`);
-    return { ...base, payload: { ...bound, color: payload.color } };
+    return { ...base, payload: { sessionId: readIdentifier(payload, "sessionId", "set_session_color payload.sessionId"), color: payload.color } };
   }
   if (op === "launch") return { ...base, payload: readLaunchRequest(request.payload) };
   if (op === "attach") {

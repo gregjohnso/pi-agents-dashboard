@@ -78,9 +78,9 @@ export function createDaemonViewerClient({ client, clientId }) {
         ...(record === undefined ? {} : { registryRevision: record.revision }),
       };
     },
-    /** @param {string} sessionId @param {number} revision @param {string | null} color */
-    async setSessionColor(sessionId, revision, color) {
-      return client.setSessionColor(sessionId, revision, color);
+    /** @param {string} sessionId @param {string | null} color */
+    async setSessionColor(sessionId, color) {
+      return client.setSessionColor(sessionId, color);
     },
     /** @param {string} sessionId @param {Record<string, any>} payload */
     async query(sessionId, payload) {

@@ -255,16 +255,16 @@ describe("viewer commands and role restrictions", () => {
     /** @type {any[]} */
     const colored = [];
     const f = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: null, registryRevision: 7 }) });
-    f.client.setSessionColor = async (/** @type {string} */ sessionId, /** @type {number} */ revision, /** @type {string | null} */ color) => {
-      colored.push({ sessionId, revision, color });
-      return { kind: "session_colored", sessionId, revision: revision + 1, color };
+    f.client.setSessionColor = async (/** @type {string} */ sessionId, /** @type {string | null} */ color) => {
+      colored.push({ sessionId, color });
+      return { kind: "session_colored", sessionId, revision: 8, color };
     };
     await f.instance.open();
     const plain = f.instance.render(80, 20);
 
     f.instance.editor.setText("/color amber");
     f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(colored).toEqual([{ sessionId: "s", revision: 7, color: "amber" }]));
+    await vi.waitFor(() => expect(colored).toEqual([{ sessionId: "s", color: "amber" }]));
     expect(f.commands).toEqual([]);
 
     const tinted = f.instance.render(80, 20);
@@ -289,14 +289,32 @@ describe("viewer commands and role restrictions", () => {
     expect(f.instance.state.errors).toEqual([]);
   });
 
+  it("colors a session whose registry revision the viewer never learned", async () => {
+    /** @type {any[]} */
+    const colored = [];
+    const f = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: null }) });
+    f.client.setSessionColor = async (/** @type {string} */ sessionId, /** @type {string | null} */ color) => {
+      colored.push({ sessionId, color });
+      return { kind: "session_colored", sessionId, revision: 3, color };
+    };
+    await f.instance.open();
+    f.instance.registryRevision = undefined;
+    f.instance.state.registryRevision = undefined;
+
+    f.instance.editor.setText("/color amber");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(colored).toEqual([{ sessionId: "s", color: "amber" }]));
+    expect(f.instance.state.errors).toEqual([]);
+  });
+
   it("reports a color failure as a viewer error without changing the prompt bar", async () => {
     const f = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: null, registryRevision: 4 }) });
-    f.client.setSessionColor = async () => { throw Object.assign(new Error("Session revision changed before the color was set"), { code: "REVISION_CONFLICT" }); };
+    f.client.setSessionColor = async () => { throw Object.assign(new Error("The session no longer exists"), { code: "SESSION_NOT_FOUND" }); };
     await f.instance.open();
     const plain = f.instance.render(80, 20);
     f.instance.editor.setText("/color rose");
     f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(f.instance.state.errors).toContainEqual(expect.objectContaining({ code: "REVISION_CONFLICT" })));
+    await vi.waitFor(() => expect(f.instance.state.errors).toContainEqual(expect.objectContaining({ code: "SESSION_NOT_FOUND" })));
     expect(f.instance.render(80, 20).at(-2)).toBe(plain.at(-2));
   });
 

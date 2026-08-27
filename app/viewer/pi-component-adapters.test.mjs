@@ -44,7 +44,7 @@ describe("public Pi component adapters", () => {
     }
   });
 
-  it("words normalized system, unknown, and attachment cards the way Pi does", () => {
+  it("words normalized system and unknown-event cards the way Pi does", () => {
     const adapters = createPiComponentAdapters({ tui, cwd: "/repo" });
     expect(adapters.component({ kind: "system_message", itemId: "s", text: "boom", level: "error" }).render(40)).toEqual(["", " Error: boom"]);
     expect(adapters.component({ kind: "system_message", itemId: "s", text: "careful", level: "warning" }).render(40)).toEqual(["", " Warning: careful"]);

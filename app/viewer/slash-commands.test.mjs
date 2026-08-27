@@ -35,6 +35,11 @@ it("gives every built-in a description and an argument hint where it takes one",
   expect(byName["steering"].getArgumentCompletions?.("")).toEqual([{ value: "all", label: "all" }, { value: "one-at-a-time", label: "one-at-a-time" }]);
   expect(byName["auto-retry"].getArgumentCompletions?.("of")).toEqual([{ value: "off", label: "off" }]);
   expect(byName["export"].argumentHint).toBe("[path]");
+  expect(byName["color"]).toMatchObject({ source: "builtin", argumentHint: "<color>" });
+  const colors = byName["color"].getArgumentCompletions?.("").map((/** @type {{ value: string }} */ item) => item.value) ?? [];
+  expect(colors).toContain("default");
+  expect(colors).toEqual(expect.arrayContaining([...SESSION_COLORS]));
+  expect(byName["color"].getArgumentCompletions?.("amb").map((/** @type {{ value: string }} */ item) => item.value)).toEqual(["amber"]);
 });
 
 it.each([
@@ -50,19 +55,19 @@ it.each([
   ["dashboard new session", "/new", { kind: "dashboard", action: "new_session" }],
   ["dashboard session list", "/resume", { kind: "dashboard", action: "session_list" }],
   ["viewer help", "/help", { kind: "help" }],
+  ["plain text", "explain this", { kind: "prompt", text: "explain this" }],
+  ["discovered command", "/review now", { kind: "prompt", text: "/review now" }],
+  ["model selection", "/model openai/gpt-5", { kind: "session_command", payload: { command: "set_model", model: { provider: "openai", id: "gpt-5" } } }],
+  ["thinking level", "/thinking off", { kind: "session_command", payload: { command: "set_thinking_level", level: "off" } }],
+  ["summary model opt-in", "/model-summary openai/gpt-5", { kind: "settings", payload: { summaryModel: { provider: "openai", id: "gpt-5" } } }],
+  ["summary opt-out", "/model-summary off", { kind: "settings", payload: { summaryModel: null } }],
+  ["session rename", "/rename Coverage loader", { kind: "session_command", payload: { command: "set_session_name", name: "Coverage loader" } }],
+  ["bare compaction", "/compact", { kind: "session_command", payload: { command: "compact" } }],
+  ["guided compaction", "/compact keep decisions", { kind: "session_command", payload: { command: "compact", instructions: "keep decisions" } }],
+  ["a palette color", "/color amber", { kind: "session_color", color: "amber" }],
+  ["the default clearing word", "/color default", { kind: "session_color", color: null }],
 ])("resolves %s", (_label, text, expected) => {
   expect(parseSlashSubmission(text, menu)).toEqual(expected);
-});
-
-it.each([
-  ["/fork", "SESSION_REBIND_UNSUPPORTED"],
-  ["/clone", "SESSION_REBIND_UNSUPPORTED"],
-  ["/auto-compact", "TOGGLE_REQUIRED"],
-  ["/auto-compact maybe", "TOGGLE_REQUIRED"],
-  ["/steering", "QUEUE_MODE_REQUIRED"],
-  ["/follow-up sideways", "QUEUE_MODE_REQUIRED"],
-])("refuses %s precisely", (text, code) => {
-  expect(parseSlashSubmission(text, menu)).toMatchObject({ kind: "rejected", code });
 });
 
 it("names the missing capability when refusing a rebind", () => {
@@ -73,20 +78,12 @@ it("names the missing capability when refusing a rebind", () => {
 });
 
 it.each([
-  ["plain text", "explain this", { kind: "prompt", text: "explain this" }],
-  ["discovered command", "/review now", { kind: "prompt", text: "/review now" }],
-  ["model selection", "/model openai/gpt-5", { kind: "session_command", payload: { command: "set_model", model: { provider: "openai", id: "gpt-5" } } }],
-  ["thinking level", "/thinking off", { kind: "session_command", payload: { command: "set_thinking_level", level: "off" } }],
-  ["summary model opt-in", "/model-summary openai/gpt-5", { kind: "settings", payload: { summaryModel: { provider: "openai", id: "gpt-5" } } }],
-  ["summary opt-out", "/model-summary off", { kind: "settings", payload: { summaryModel: null } }],
-  ["session rename", "/rename Coverage loader", { kind: "session_command", payload: { command: "set_session_name", name: "Coverage loader" } }],
-  ["bare compaction", "/compact", { kind: "session_command", payload: { command: "compact" } }],
-  ["guided compaction", "/compact keep decisions", { kind: "session_command", payload: { command: "compact", instructions: "keep decisions" } }],
-])("resolves %s", (_label, text, expected) => {
-  expect(parseSlashSubmission(text, menu)).toEqual(expected);
-});
-
-it.each([
+  ["/fork", "SESSION_REBIND_UNSUPPORTED"],
+  ["/clone", "SESSION_REBIND_UNSUPPORTED"],
+  ["/auto-compact", "TOGGLE_REQUIRED"],
+  ["/auto-compact maybe", "TOGGLE_REQUIRED"],
+  ["/steering", "QUEUE_MODE_REQUIRED"],
+  ["/follow-up sideways", "QUEUE_MODE_REQUIRED"],
   ["/model", "MODEL_REQUIRED"],
   ["/model invented/model", "UNKNOWN_MODEL"],
   ["/thinking", "THINKING_LEVEL_REQUIRED"],
@@ -96,23 +93,6 @@ it.each([
   ["/rename", "SESSION_NAME_REQUIRED"],
   ["/color", "SESSION_COLOR_REQUIRED"],
   ["/color chartreuse", "UNKNOWN_SESSION_COLOR"],
-])("rejects %s without contacting the session", (text, code) => {
+])("rejects %s with its own code and without contacting the session", (text, code) => {
   expect(parseSlashSubmission(text, menu)).toMatchObject({ kind: "rejected", code });
-});
-
-it.each([
-  ["a palette color", "/color amber", "amber"],
-  ["the default clearing word", "/color default", null],
-])("resolves %s as dashboard metadata", (_label, text, color) => {
-  expect(parseSlashSubmission(text, menu)).toEqual({ kind: "session_color", color });
-});
-
-it("offers every palette color plus default in autocomplete", () => {
-  const color = sessionSlashCommands(menu).find((command) => command.name === "color");
-  expect(color).toMatchObject({ source: "builtin", argumentHint: "<color>" });
-  const offered = color?.getArgumentCompletions?.("").map((item) => item.value) ?? [];
-  expect(offered).toContain("default");
-  expect(offered).toContain("amber");
-  expect(offered).toEqual(expect.arrayContaining([...SESSION_COLORS]));
-  expect(color?.getArgumentCompletions?.("amb").map((item) => item.value)).toEqual(["amber"]);
 });

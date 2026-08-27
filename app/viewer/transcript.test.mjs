@@ -38,17 +38,6 @@ describe("normalized transcript state", () => {
 });
 
 describe("virtual transcript", () => {
-  it("searches and navigates generic normalized items with stable viewer identities", () => {
-    const adapters = { component: vi.fn((item) => ({ render: () => [item.itemId ?? item.kind] })) };
-    let state = createTranscriptState(snapshot);
-    state = applyViewerEvent(state, event({ kind: "unknown_pi_event", piType: "future", summary: "Needle event" }, "2"));
-    const transcript = new TranscriptModel({ state, adapters });
-    expect(transcript.setSearch("needle")).toEqual(["unknown_pi_event:1"]);
-    expect(transcript.selectedSearchItemId).toBe("unknown_pi_event:1");
-    expect(transcript.nextSearch(-1)).toBe(0);
-    expect(transcript.render(40, 5).join("\n")).toContain("search match");
-  });
-
   it("starts every tool card collapsed the way Pi does", () => {
     const adapters = { component: vi.fn((item) => ({ render: () => [item.itemId ?? item.kind], setExpanded() {} })) };
     const state = createTranscriptState({ ...snapshot, tools: [{ id: "t", name: "bash", state: "failed", arguments: {}, error: "boom", startedAt: "2026-08-25T00:00:00Z", finishedAt: "2026-08-25T00:00:01Z" }] });

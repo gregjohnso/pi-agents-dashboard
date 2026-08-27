@@ -47,12 +47,12 @@ export function adaptAssistantMessage(item, options = {}) {
       : part.type === "text"
         ? { type: "text", text: part.text }
         : { type: "text", text: `[${part.type}: ${part.attachmentId}]` }),
-    api: options.api ?? "pi-dashboard-normalized",
+    api: "pi-dashboard-normalized",
     provider: options.provider ?? "pi-dashboard",
     model: options.model ?? "normalized-viewer",
     usage: { ...EMPTY_USAGE, cost: { ...EMPTY_USAGE.cost } },
-    stopReason: options.stopReason ?? (options.streaming ? "pending" : "stop"),
-    timestamp: options.timestamp ?? 0,
+    stopReason: options.streaming ? "pending" : "stop",
+    timestamp: 0,
   };
 }
 
@@ -83,14 +83,14 @@ export function createPiEditor({ tui }) {
 }
 
 /** Adapt normalized viewer records to pinned public Pi message and tool components. */
-export function createPiComponentAdapters({ tui, cwd = process.cwd(), hideThinking = false }) {
+export function createPiComponentAdapters({ tui, cwd = process.cwd() }) {
   const markdownTheme = getMarkdownTheme();
   return {
     user(item) {
       return new UserMessageComponent(textContent(item.content), markdownTheme, 1);
     },
     assistant(item, options = {}) {
-      const component = new AssistantMessageComponent(undefined, options.hideThinking ?? hideThinking, markdownTheme, PI_HIDDEN_THINKING_LABEL, 1);
+      const component = new AssistantMessageComponent(undefined, options.hideThinking ?? false, markdownTheme, PI_HIDDEN_THINKING_LABEL, 1);
       component.updateContent(/** @type {any} */ (adaptAssistantMessage(item, options)), options.streaming ?? false);
       return component;
     },

@@ -6,7 +6,6 @@ import { spinnerFrame } from "../spinner.mjs";
 
 initTheme(undefined, false);
 
-// Pi's Loader frames and 80 ms cadence, sampled from the render clock because the viewer renders on demand.
 const PI_WORKING_MESSAGE = "Working...";
 
 function fit(line, width) {

@@ -38,7 +38,7 @@ function bareName(name) {
  */
 export function sessionSlashCommands(menu) {
   const models = menu.models.map(modelValue);
-  return [
+  const builtins = [
     { name: "model", description: menu.model === null ? "Select the session model" : `Model: ${modelValue(menu.model)}`, argumentHint: "<provider/id>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, models) },
     { name: "thinking", description: menu.thinkingLevel === null ? "Set the thinking level" : `Thinking: ${menu.thinkingLevel}`, argumentHint: "<level>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, menu.thinkingLevels) },
     { name: "model-summary", description: menu.summaryModel == null ? "Dashboard summaries: off" : `Dashboard summaries: ${modelValue(menu.summaryModel)}`, argumentHint: "<provider/id|off>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, ["off", ...models]) },
@@ -58,9 +58,13 @@ export function sessionSlashCommands(menu) {
     { name: "fork", description: "Unavailable: forking rebinds Pi's session file", source: BUILTIN_SOURCE },
     { name: "clone", description: "Unavailable: cloning rebinds Pi's session file", source: BUILTIN_SOURCE },
     { name: "help", description: "List the viewer's commands and keys", source: BUILTIN_SOURCE },
+  ];
+  const builtinNames = new Set(builtins.map((command) => command.name));
+  return [
+    ...builtins,
     ...menu.commands
       .map((command) => ({ ...command, name: bareName(command.name) }))
-      .filter((command) => !["model", "thinking", "compact", "model-summary", "rename", "color", "stats", "tree", "export", "auto-compact", "auto-retry", "steering", "follow-up", "abort-retry", "new", "resume", "fork", "clone", "help"].includes(command.name)),
+      .filter((command) => !builtinNames.has(command.name)),
   ];
 }
 

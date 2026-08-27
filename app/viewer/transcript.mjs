@@ -64,20 +64,6 @@ function fit(line, width) {
   return visibleWidth(clipped) <= width ? clipped : "";
 }
 
-function itemIdentity(item, index) { return item.itemId ?? item.toolId ?? item.attachment?.id ?? `${item.kind}:${index}`; }
-
-function searchableText(item, tools) {
-  if (item.kind === "user_message" || item.kind === "assistant_message") return item.content.map((part) => part.text ?? part.attachmentId ?? "").join("\n");
-  if (item.kind === "system_message") return item.text;
-  if (item.kind === "unknown_pi_event") return `${item.piType} ${item.summary}`;
-  if (item.kind === "image_placeholder" || item.kind === "file_placeholder") return Object.values(item.attachment).join(" ");
-  if (item.kind === "tool") {
-    const tool = tools.get(item.toolId);
-    return tool === undefined ? "" : `${tool.name} ${JSON.stringify(tool.arguments)} ${tool.error ?? ""} ${JSON.stringify(tool.result ?? [])}`;
-  }
-  return "";
-}
-
 /** Block-virtualized chronological transcript with paused follow and activity marker state. */
 export class TranscriptModel {
   constructor({ state, adapters }) {
@@ -89,9 +75,6 @@ export class TranscriptModel {
     this.following = true;
     this.newActivity = false;
     this.hideThinking = false;
-    this.searchQuery = "";
-    this.searchMatches = [];
-    this.selectedSearchItemId = undefined;
     this.selectedToolId = undefined;
     this.expandedTools = new Set();
   }
@@ -101,31 +84,8 @@ export class TranscriptModel {
     this.state = state;
     if (grew && !this.following) this.newActivity = true;
     if (this.following) this.distanceFromEnd = 0;
-    if (this.searchQuery !== "") this.setSearch(this.searchQuery, this.selectedSearchItemId);
   }
   setThinkingHidden(hidden) { this.hideThinking = hidden; }
-  setSearch(query, preferredItemId = undefined) {
-    this.searchQuery = query;
-    const normalized = query.toLocaleLowerCase();
-    this.searchMatches = normalized === "" ? [] : this.state.items.flatMap((item, index) => searchableText(item, this.state.tools).toLocaleLowerCase().includes(normalized) ? [itemIdentity(item, index)] : []);
-    const preferredIndex = preferredItemId === undefined ? -1 : this.searchMatches.indexOf(preferredItemId);
-    this.selectSearch(preferredIndex >= 0 ? preferredIndex : 0);
-    return this.searchMatches;
-  }
-  selectSearch(index) {
-    if (this.searchMatches.length === 0) { this.selectedSearchItemId = undefined; return -1; }
-    const normalized = (index + this.searchMatches.length) % this.searchMatches.length;
-    this.selectedSearchItemId = this.searchMatches[normalized];
-    const itemIndex = this.state.items.findIndex((item, candidateIndex) => itemIdentity(item, candidateIndex) === this.selectedSearchItemId);
-    if (itemIndex >= 0) {
-      this.following = false;
-      this.distanceFromEnd = Math.max(0, this.state.items.length - itemIndex - 1);
-    }
-    return normalized;
-  }
-  nextSearch(direction = 1) {
-    return this.selectSearch(this.searchMatches.indexOf(this.selectedSearchItemId) + direction);
-  }
   selectNextTool(direction = 1) {
     const toolIds = this.state.items.filter((item) => item.kind === "tool").map((item) => item.toolId);
     if (toolIds.length === 0) { this.selectedToolId = undefined; return undefined; }
@@ -170,14 +130,12 @@ export class TranscriptModel {
       const item = visible[index];
       const renderedItem = item.kind === "tool" ? { ...item, tool: this.state.tools.get(item.toolId) } : item;
       if (renderedItem.kind === "tool" && renderedItem.tool === undefined) continue;
-      const component = this.adapters.component(renderedItem, { streaming: renderedItem.streaming, thinkingLevel: this.state.thinkingLevel, hideThinking: this.hideThinking, provider: this.state.model?.provider, model: this.state.model?.id });
+      const component = this.adapters.component(renderedItem, { streaming: renderedItem.streaming, hideThinking: this.hideThinking, provider: this.state.model?.provider, model: this.state.model?.id });
       if (renderedItem.kind === "tool") component.setExpanded?.(this.expandedTools.has(renderedItem.toolId));
       const markers = [];
       const itemIndex = this.state.items.indexOf(item);
       // Pi opens every user turn but the first with a spacer above the message box.
       if (renderedItem.kind === "user_message" && itemIndex > 0) markers.push("");
-      const itemId = itemIdentity(renderedItem, itemIndex);
-      if (this.selectedSearchItemId !== undefined && itemId === this.selectedSearchItemId) markers.push(fit("› search match", width));
       if (renderedItem.kind === "tool" && renderedItem.toolId === this.selectedToolId) markers.push(fit("› selected tool", width));
       lines = [...markers, ...component.render(width).map((line) => fit(line, width)), ...lines];
     }

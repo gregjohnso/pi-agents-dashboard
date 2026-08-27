@@ -659,18 +659,28 @@ export async function createDaemonRuntime({
       serializeAttachment(sessionId, operation) {
         return runSessionLifecycle(registry, sessionId, operation);
       },
+      /** Mint one worker command ID that no earlier command in this daemon has used. */
+      nextCommandId() {
+        const id = randomId();
+        if (typeof id !== "string" || id.length < 16 || usedCommandIds.has(id)) throw Object.assign(new Error("Command ID generator did not provide a unique restart-safe ID"), { code: "COMMAND_ID_COLLISION" });
+        usedCommandIds.add(id);
+        return id;
+      },
+      /** Send one command over an exact route, carrying the pending identity handleWorkerFrame checks the reply against. @param {any} route @param {string} id @param {any} durableRequest @param {Record<string, unknown>} [fields] */
+      sendWorkerCommand(route, id, durableRequest, fields = {}) {
+        const { metadata, connection, routeGeneration } = route;
+        const { clientId, requestId, op } = durableRequest;
+        return connection.request(
+          { version: 1, type: "command", token: metadata.token, id, command: { clientId, requestId, op, ...fields } },
+          { clientId, requestId, op, durableRequest, metadata, routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation },
+        );
+      },
       /** Ask this session's worker one non-durable question over whichever channel owns it. @param {any} request @param {Record<string, unknown>} [fields] */
       async askWorker(request, fields = {}) {
         const sessionId = request.payload.sessionId;
         const route = router.route(sessionId);
         const handle = sessionHandles.get(sessionId);
-        if (route?.connection !== undefined && route.metadata?.token !== undefined) {
-          const { metadata, connection } = route;
-          const id = randomId();
-          if (typeof id !== "string" || id.length < 16 || usedCommandIds.has(id)) throw Object.assign(new Error("Command ID generator did not provide a unique restart-safe ID"), { code: "COMMAND_ID_COLLISION" });
-          usedCommandIds.add(id);
-          return connection.request({ version: 1, type: "command", token: metadata.token, id, command: { clientId: request.clientId, requestId: request.requestId, op: request.op, ...fields } }, { clientId: request.clientId, requestId: request.requestId, op: request.op, durableRequest: request, metadata, routeGeneration: route.routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
-        }
+        if (route?.connection !== undefined && route.metadata?.token !== undefined) return context.sendWorkerCommand(route, context.nextCommandId(), request, fields);
         // The launch channel carries no extra command fields yet, so a parameterised ask waits for the socket route.
         if (typeof handle?.request === "function" && Object.keys(fields).length === 0) return handle.request(request.op);
         if (typeof handle?.request === "function") throw Object.assign(new Error("This session is still starting; retry once it is connected"), { code: "WORKER_RECONNECTING", retryable: true });
@@ -695,16 +705,14 @@ export async function createDaemonRuntime({
        * @param {any} route
        */
       async reconcileSessionActivity(route) {
-        const { metadata, connection, routeGeneration } = route;
+        const { metadata } = route;
         if (metadata?.token === undefined) return;
         const record = await registry.get(metadata.sessionId);
         if (record === undefined || (record.taskState !== "WORKING" && record.taskState !== "READY")) return;
-        const id = randomId();
-        if (typeof id !== "string" || id.length < 16 || usedCommandIds.has(id)) return;
-        usedCommandIds.add(id);
+        const id = context.nextCommandId();
         const clientId = `daemon-reconcile:${daemonEpoch}`;
         const durableRequest = { version: 1, clientId, requestId: id, op: "get_state", payload: { sessionId: metadata.sessionId } };
-        const result = await connection.request({ version: 1, type: "command", token: metadata.token, id, command: { clientId, requestId: id, op: "get_state" } }, { clientId, requestId: id, op: "get_state", durableRequest, metadata, routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
+        const result = await context.sendWorkerCommand(route, id, durableRequest);
         const streaming = result?.result?.isStreaming;
         if (typeof streaming !== "boolean") return;
         const derived = streaming ? "WORKING" : "READY";
@@ -1120,13 +1128,11 @@ export async function createDaemonRuntime({
             if (connection === undefined || metadata?.token === undefined) {
               status = await context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("WORKER_UNAVAILABLE", "No exact recovered worker owns this session"));
             } else {
-              const id = randomId();
-              if (typeof id !== "string" || id.length < 16 || usedCommandIds.has(id)) throw Object.assign(new Error("Command ID generator did not provide a unique restart-safe ID"), { code: "COMMAND_ID_COLLISION" });
-              usedCommandIds.add(id);
+              const id = context.nextCommandId();
               await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
               const retryAtRisk = (await context.recovery.journal.history(request)).some((/** @type {any} */ prior) => prior.stage === "DELIVERY_UNKNOWN");
               try {
-                await connection.request({ version: 1, type: "command", token: metadata.token, id, command: { clientId: request.clientId, requestId: request.requestId, op: request.op, text: request.payload.text, response: request.op === "ui_response" ? { requestId: request.payload.uiRequestId, response: request.payload.response } : undefined, sessionCommand: request.op === "session_command" ? sessionCommandPayload(request.payload) : undefined, retryAtRisk } }, { clientId: request.clientId, requestId: request.requestId, op: request.op, durableRequest: request, metadata, routeGeneration: route.routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
+                await context.sendWorkerCommand(route, id, request, { text: request.payload.text, response: request.op === "ui_response" ? { requestId: request.payload.uiRequestId, response: request.payload.response } : undefined, sessionCommand: request.op === "session_command" ? sessionCommandPayload(request.payload) : undefined, retryAtRisk });
                 await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
                 status = await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
               } catch (error) {

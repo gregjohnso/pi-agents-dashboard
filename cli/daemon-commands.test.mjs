@@ -113,36 +113,28 @@ it("claims composer on each exact worker before --stop-workers mutation", async 
   expect(operations).toEqual(["get_state", "attach", "stop", "detach"]);
 });
 
-it("keeps the daemon running when a worker Stop socket disconnects after submission", async () => {
-  const publication = { pid: 321, startIdentity: "987654321", processGroupId: 654, tokenPath: "/state/daemon/control.token" };
-  const operations = [];
-  const request = async (op) => {
-    operations.push(op);
+it.each([
+  ["the stop socket disconnects after submission", async (op) => {
     if (op === "get_state") return { kind: "state", sessions: [{ sessionId: "live", revision: 4, processState: "LIVE", ownership: { runId: "run" } }] };
     if (op === "attach") return { kind: "attached", sessionId: "live", role: "composer" };
     throw Object.assign(new Error("socket closed"), { code: "DELIVERY_UNKNOWN", submitted: true });
-  };
-  await expect(runDaemonCommand("stop", {
-    root: "/state", inspectEndpoint: async () => ({ status: "HEALTHY", daemonState: "READY", publication }), composerRequest: request,
-    stopWorkers: true, yes: true, stopProcessGroup: vi.fn(),
-  })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN" } });
-  expect(operations).toEqual(["get_state", "attach", "stop"]);
-});
-
-it("refuses daemon --stop-workers shutdown when any exact worker stop is not observed terminal", async () => {
+  }],
+  ["the stop status is not terminal", async (op) => {
+    if (op === "get_state") return { kind: "state", sessions: [{ sessionId: "still-live", revision: 4, processState: "LIVE", ownership: { runId: "run" } }] };
+    if (op === "attach") return { kind: "attached", sessionId: "still-live", role: "composer" };
+    return { kind: "command", status: { stage: "DELIVERY_UNKNOWN" } };
+  }],
+])("keeps the daemon running when %s", async (_name, respond) => {
   const publication = { pid: 321, startIdentity: "987654321", processGroupId: 654, tokenPath: "/state/daemon/control.token" };
-  const request = async (op) => op === "get_state"
-    ? { kind: "state", sessions: [{ sessionId: "still-live", revision: 4, processState: "LIVE", ownership: { runId: "run" } }] }
-    : { kind: "command", status: { stage: "DELIVERY_UNKNOWN" } };
-  const stopProcessGroup = async () => { throw new Error("daemon must remain running"); };
+  const operations = [];
+  const stopProcessGroup = vi.fn();
   await expect(runDaemonCommand("stop", {
-    root: "/state",
-    inspectEndpoint: async () => ({ status: "HEALTHY", daemonState: "READY", publication }),
-    request,
-    stopWorkers: true,
-    yes: true,
-    stopProcessGroup,
+    root: "/state", inspectEndpoint: async () => ({ status: "HEALTHY", daemonState: "READY", publication }),
+    composerRequest: async (op, ...rest) => { operations.push(op); return respond(op, ...rest); },
+    stopWorkers: true, yes: true, stopProcessGroup,
   })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN" } });
+  expect(operations.slice(0, 3)).toEqual(["get_state", "attach", "stop"]);
+  expect(stopProcessGroup).not.toHaveBeenCalled();
 });
 
 it("maps a daemon child recovery-conflict exit to CLI exit 5", async () => {

@@ -39,40 +39,30 @@ it("retains a marker at the smallest accepted rollover limits", async () => {
   expect((await stat(paths[0])).size).toBeLessThanOrEqual(160);
 });
 
-it("rolls segments, removes the oldest complete segment, and records truncation counts", async () => {
+it.each([
+  [
+    "removes the oldest complete segment",
+    [1, 2, 3, 4, 5, 6].map((id) => ({ id, payload: "x".repeat(100) })),
+    {},
+  ],
+  [
+    "drops an incoming record that cannot share its rollover segment",
+    ["old-1", "old-2", "incoming"].map((id) => ({ id, payload: "x".repeat(210) })),
+    { droppedIncomingBytes: expect.any(Number), droppedIncomingSha256: expect.stringMatching(/^[a-f0-9]{64}$/u) },
+  ],
+])("records a bounded truncation marker when rollover %s", async (_label, appended, droppedIncoming) => {
   const directory = await root();
   const writer = await openRotatingWriter({ directory, prefix: "rpc", segmentBytes: 300, segments: 2 });
-  for (const id of [1, 2, 3, 4, 5, 6]) await writer.append({ id, payload: "x".repeat(100) });
+  for (const record of appended) await writer.append(record);
   await writer.close();
 
   const paths = await files(directory, "rpc");
   expect(paths).toHaveLength(2);
   const records = (await Promise.all(paths.map((path) => readFile(path, "utf8")))).join("").trim().split("\n").map((line) => JSON.parse(line));
   const marker = records.find((record) => record.type === "diagnostic_truncation");
-  expect(marker).toMatchObject({ removedBytes: expect.any(Number), removedRecords: expect.any(Number) });
+  expect(marker).toMatchObject({ removedBytes: expect.any(Number), removedRecords: expect.any(Number), ...droppedIncoming });
   expect(marker.removedBytes).toBeGreaterThan(0);
   expect(marker.removedRecords).toBeGreaterThan(0);
-  expect((await Promise.all(paths.map((path) => stat(path)))).every((metadata) => metadata.size <= 300)).toBe(true);
-});
-
-it("always retains a bounded truncation marker when the incoming record cannot share its rollover segment", async () => {
-  const directory = await root();
-  const writer = await openRotatingWriter({ directory, prefix: "rpc", segmentBytes: 300, segments: 2 });
-  await writer.append({ id: "old-1", payload: "x".repeat(210) });
-  await writer.append({ id: "old-2", payload: "x".repeat(210) });
-  await writer.append({ id: "incoming", payload: "x".repeat(210) });
-  await writer.close();
-
-  const paths = await files(directory, "rpc");
-  const records = (await Promise.all(paths.map((path) => readFile(path, "utf8")))).join("").trim().split("\n").map((line) => JSON.parse(line));
-  const marker = records.find((record) => record.type === "diagnostic_truncation");
-  expect(marker).toMatchObject({
-    removedBytes: expect.any(Number),
-    removedRecords: expect.any(Number),
-    droppedIncomingBytes: expect.any(Number),
-    droppedIncomingSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
-  });
-  expect(paths).toHaveLength(2);
   expect((await Promise.all(paths.map((path) => stat(path)))).every((metadata) => metadata.size <= 300)).toBe(true);
 });
 

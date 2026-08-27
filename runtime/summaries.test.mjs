@@ -66,13 +66,7 @@ it("reads a title and summary from one model reply", async () => {
     .resolves.toEqual({ name: "Coverage loader fix", text: "Fixes the coverage loader and reruns tests" });
 });
 
-it("keeps the summary when the model omits a title", async () => {
-  const pi = fakePi({ stdout: "Fixes the coverage loader\n" });
-  await expect(summarizeWithPi({ executable: "/installed/pi", model: { provider: "anthropic", id: "haiku" }, transcript: "User: hi", spawnImpl: pi.spawnImpl, env: {} }))
-    .resolves.toEqual({ name: undefined, text: "Fixes the coverage loader" });
-});
-
-it("summarizes through stock Pi print mode without a session or tools", async () => {
+it("summarizes through stock Pi print mode without a session or tools, keeping an untitled reply", async () => {
   const pi = fakePi({ stdout: "  Fixes the coverage loader and reruns tests\n" });
   const summary = await summarizeWithPi({ executable: "/installed/pi", model: { provider: "anthropic", id: "haiku" }, transcript: "User: hi", spawnImpl: pi.spawnImpl, env: {} });
   expect(summary).toEqual({ name: undefined, text: "Fixes the coverage loader and reruns tests" });

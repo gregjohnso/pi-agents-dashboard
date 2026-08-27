@@ -4,8 +4,8 @@ exports[`responsive dashboard layout > renders a width-safe 40x10 snapshot 1`] =
 {
   "columns": [
     {
-      "key": "id",
-      "width": 9,
+      "key": "name",
+      "width": 10,
     },
     {
       "key": "state",
@@ -13,21 +13,21 @@ exports[`responsive dashboard layout > renders a width-safe 40x10 snapshot 1`] =
     },
     {
       "key": "activity",
-      "width": 21,
+      "width": 19,
     },
   ],
   "density": "minimal",
   "lines": [
-    "ID        STATE    ACTIVITY             ",
-    "▶ workin… WORKING  bash: pytest extensi…",
-    "▶ waitin… WAITING  Approve access to re…",
-    "◌ ready-… SLEEPING Activity ready-12345…",
-    "  failed… FAILED   provider 429: quota …",
-    "  stoppe… STOPPED  Activity stopped-123…",
-    "× stale-… STALE    Activity stale-12345…",
-    "  comple… EXITED   Release checks passed",
-    "▶ unicod… READY    検証中 🚀 résumé naï…",
-    "▶ no-act… READY    —                    ",
+    "NAME       STATE    ACTIVITY           ",
+    "▶ working- WORKING  bash: pytest exten…",
+    "▶ waiting- WAITING  Approve access to …",
+    "◌ ready-12 SLEEPING Activity ready-123…",
+    "  failed-1 FAILED   provider 429: quot…",
+    "  stopped- STOPPED  Activity stopped-1…",
+    "× stale-12 STALE    Activity stale-123…",
+    "  complete EXITED   Release checks pas…",
+    "▶ unicode- READY    検証中 🚀 résumé n…",
+    "▶ no-activ READY    —                  ",
   ],
   "listHeight": 1,
   "listTop": 5,
@@ -39,12 +39,8 @@ exports[`responsive dashboard layout > renders a width-safe 55x16 snapshot 1`] =
 {
   "columns": [
     {
-      "key": "id",
-      "width": 9,
-    },
-    {
       "key": "name",
-      "width": 14,
+      "width": 18,
     },
     {
       "key": "state",
@@ -52,7 +48,7 @@ exports[`responsive dashboard layout > renders a width-safe 55x16 snapshot 1`] =
     },
     {
       "key": "activity",
-      "width": 15,
+      "width": 20,
     },
     {
       "key": "age",
@@ -61,18 +57,18 @@ exports[`responsive dashboard layout > renders a width-safe 55x16 snapshot 1`] =
   ],
   "density": "compact",
   "lines": [
-    "ID        NAME           STATE    ACTIVITY        AGE  ",
-    "▶ workin… —              WORKING  bash: pytest e… 10m  ",
-    "▶ waitin… —              WAITING  Approve access… 10m  ",
-    "◌ ready-… —              SLEEPING Activity ready… 10m  ",
-    "  failed… —              FAILED   provider 429: … 10m  ",
-    "  stoppe… —              STOPPED  Activity stopp… 10m  ",
-    "× stale-… —              STALE    Activity stale… 10m  ",
-    "  comple… —              EXITED   Release checks… 10m  ",
-    "▶ unicod… —              READY    検証中 🚀 résu… 10m  ",
-    "▶ no-act… —              READY    —               10m  ",
+    "NAME               STATE    ACTIVITY             AGE   ",
+    "▶ working-         WORKING  bash: pytest extens… 10m   ",
+    "▶ waiting-         WAITING  Approve access to r… 10m   ",
+    "◌ ready-12         SLEEPING Activity ready-1234… 10m   ",
+    "  failed-1         FAILED   provider 429: quota… 10m   ",
+    "  stopped-         STOPPED  Activity stopped-12… 10m   ",
+    "× stale-12         STALE    Activity stale-1234… 10m   ",
+    "  complete         EXITED   Release checks pass… 10m   ",
+    "▶ unicode-         READY    検証中 🚀 résumé na… 10m   ",
+    "▶ no-activ         READY    —                    10m   ",
   ],
-  "listHeight": 7,
+  "listHeight": 6,
   "listTop": 5,
   "width": 55,
 }
@@ -82,12 +78,8 @@ exports[`responsive dashboard layout > renders a width-safe 80x24 snapshot 1`] =
 {
   "columns": [
     {
-      "key": "id",
-      "width": 10,
-    },
-    {
       "key": "name",
-      "width": 22,
+      "width": 26,
     },
     {
       "key": "state",
@@ -95,7 +87,7 @@ exports[`responsive dashboard layout > renders a width-safe 80x24 snapshot 1`] =
     },
     {
       "key": "activity",
-      "width": 28,
+      "width": 34,
     },
     {
       "key": "age",
@@ -104,18 +96,18 @@ exports[`responsive dashboard layout > renders a width-safe 80x24 snapshot 1`] =
   ],
   "density": "compact",
   "lines": [
-    "ID         NAME                   STATE     ACTIVITY                     AGE    ",
-    "▶ working- —                      WORKING   bash: pytest extensions/age… 10m    ",
-    "▶ waiting- —                      WAITING   Approve access to release c… 10m    ",
-    "◌ ready-12 —                      SLEEPING  Activity ready-12345678      10m    ",
-    "  failed-1 —                      FAILED    provider 429: quota exhaust… 10m    ",
-    "  stopped- —                      STOPPED   Activity stopped-123456      10m    ",
-    "× stale-12 —                      STALE     Activity stale-12345678      10m    ",
-    "  complete —                      EXITED    Release checks passed        10m    ",
-    "▶ unicode- —                      READY     検証中 🚀 résumé naïve café  10m    ",
-    "▶ no-activ —                      READY     —                            10m    ",
+    "NAME                       STATE     ACTIVITY                           AGE    ",
+    "▶ working-                 WORKING   bash: pytest extensions/agents-da… 10m    ",
+    "▶ waiting-                 WAITING   Approve access to release credent… 10m    ",
+    "◌ ready-12                 SLEEPING  Activity ready-12345678            10m    ",
+    "  failed-1                 FAILED    provider 429: quota exhausted      10m    ",
+    "  stopped-                 STOPPED   Activity stopped-123456            10m    ",
+    "× stale-12                 STALE     Activity stale-12345678            10m    ",
+    "  complete                 EXITED    Release checks passed              10m    ",
+    "▶ unicode-                 READY     検証中 🚀 résumé naïve café        10m    ",
+    "▶ no-activ                 READY     —                                  10m    ",
   ],
-  "listHeight": 15,
+  "listHeight": 14,
   "listTop": 5,
   "width": 80,
 }
@@ -125,12 +117,8 @@ exports[`responsive dashboard layout > renders a width-safe 120x32 snapshot 1`] 
 {
   "columns": [
     {
-      "key": "id",
-      "width": 10,
-    },
-    {
       "key": "name",
-      "width": 28,
+      "width": 32,
     },
     {
       "key": "state",
@@ -138,7 +126,7 @@ exports[`responsive dashboard layout > renders a width-safe 120x32 snapshot 1`] 
     },
     {
       "key": "activity",
-      "width": 62,
+      "width": 68,
     },
     {
       "key": "age",
@@ -147,18 +135,18 @@ exports[`responsive dashboard layout > renders a width-safe 120x32 snapshot 1`] 
   ],
   "density": "full",
   "lines": [
-    "ID         NAME                         STATE     ACTIVITY                                                       AGE    ",
-    "▶ working- —                            WORKING   bash: pytest extensions/agents-dashboard                       10m    ",
-    "▶ waiting- —                            WAITING   Approve access to release credentials?                         10m    ",
-    "◌ ready-12 —                            SLEEPING  Activity ready-12345678                                        10m    ",
-    "  failed-1 —                            FAILED    provider 429: quota exhausted                                  10m    ",
-    "  stopped- —                            STOPPED   Activity stopped-123456                                        10m    ",
-    "× stale-12 —                            STALE     Activity stale-12345678                                        10m    ",
-    "  complete —                            EXITED    Release checks passed                                          10m    ",
-    "▶ unicode- —                            READY     検証中 🚀 résumé naïve café                                    10m    ",
-    "▶ no-activ —                            READY     —                                                              10m    ",
+    "NAME                             STATE     ACTIVITY                                                             AGE    ",
+    "▶ working-                       WORKING   bash: pytest extensions/agents-dashboard                             10m    ",
+    "▶ waiting-                       WAITING   Approve access to release credentials?                               10m    ",
+    "◌ ready-12                       SLEEPING  Activity ready-12345678                                              10m    ",
+    "  failed-1                       FAILED    provider 429: quota exhausted                                        10m    ",
+    "  stopped-                       STOPPED   Activity stopped-123456                                              10m    ",
+    "× stale-12                       STALE     Activity stale-12345678                                              10m    ",
+    "  complete                       EXITED    Release checks passed                                                10m    ",
+    "▶ unicode-                       READY     検証中 🚀 résumé naïve café                                          10m    ",
+    "▶ no-activ                       READY     —                                                                    10m    ",
   ],
-  "listHeight": 23,
+  "listHeight": 22,
   "listTop": 5,
   "width": 120,
 }
@@ -168,12 +156,8 @@ exports[`responsive dashboard layout > renders a width-safe 160x40 snapshot 1`] 
 {
   "columns": [
     {
-      "key": "id",
-      "width": 10,
-    },
-    {
       "key": "name",
-      "width": 28,
+      "width": 32,
     },
     {
       "key": "state",
@@ -181,7 +165,7 @@ exports[`responsive dashboard layout > renders a width-safe 160x40 snapshot 1`] 
     },
     {
       "key": "activity",
-      "width": 102,
+      "width": 108,
     },
     {
       "key": "age",
@@ -190,18 +174,18 @@ exports[`responsive dashboard layout > renders a width-safe 160x40 snapshot 1`] 
   ],
   "density": "full",
   "lines": [
-    "ID         NAME                         STATE     ACTIVITY                                                                                               AGE    ",
-    "▶ working- —                            WORKING   bash: pytest extensions/agents-dashboard                                                               10m    ",
-    "▶ waiting- —                            WAITING   Approve access to release credentials?                                                                 10m    ",
-    "◌ ready-12 —                            SLEEPING  Activity ready-12345678                                                                                10m    ",
-    "  failed-1 —                            FAILED    provider 429: quota exhausted                                                                          10m    ",
-    "  stopped- —                            STOPPED   Activity stopped-123456                                                                                10m    ",
-    "× stale-12 —                            STALE     Activity stale-12345678                                                                                10m    ",
-    "  complete —                            EXITED    Release checks passed                                                                                  10m    ",
-    "▶ unicode- —                            READY     検証中 🚀 résumé naïve café                                                                            10m    ",
-    "▶ no-activ —                            READY     —                                                                                                      10m    ",
+    "NAME                             STATE     ACTIVITY                                                                                                     AGE    ",
+    "▶ working-                       WORKING   bash: pytest extensions/agents-dashboard                                                                     10m    ",
+    "▶ waiting-                       WAITING   Approve access to release credentials?                                                                       10m    ",
+    "◌ ready-12                       SLEEPING  Activity ready-12345678                                                                                      10m    ",
+    "  failed-1                       FAILED    provider 429: quota exhausted                                                                                10m    ",
+    "  stopped-                       STOPPED   Activity stopped-123456                                                                                      10m    ",
+    "× stale-12                       STALE     Activity stale-12345678                                                                                      10m    ",
+    "  complete                       EXITED    Release checks passed                                                                                        10m    ",
+    "▶ unicode-                       READY     検証中 🚀 résumé naïve café                                                                                  10m    ",
+    "▶ no-activ                       READY     —                                                                                                            10m    ",
   ],
-  "listHeight": 31,
+  "listHeight": 30,
   "listTop": 5,
   "width": 160,
 }

@@ -69,7 +69,7 @@ function validateProcessIdentity(value, path) {
 }
 function validateSession(value, path) {
     const session = readRecord(value, path);
-    requireKeys(session, ["schemaVersion", "revision", "sessionId", "sessionFile", "canonicalSessionFile", "cwd", "taskState", "processState", "outcome", "activity", "createdAt", "updatedAt"], ["name", "model", "thinkingLevel", "ownership", "isolation", "latestRunId"], path);
+    requireKeys(session, ["schemaVersion", "revision", "sessionId", "sessionFile", "canonicalSessionFile", "cwd", "taskState", "processState", "outcome", "activity", "createdAt", "updatedAt"], ["name", "nameGenerated", "model", "thinkingLevel", "ownership", "isolation", "latestRunId", "runtime", "summary"], path);
     if (session.schemaVersion !== 1 || !Number.isSafeInteger(session.revision))
         throw new TypeError(`${path} schema version or revision is invalid`);
     for (const key of ["sessionId", "sessionFile", "canonicalSessionFile", "cwd", "createdAt", "updatedAt"])

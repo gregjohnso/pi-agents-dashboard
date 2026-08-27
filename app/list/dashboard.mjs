@@ -201,6 +201,9 @@ const COMPOSER_FIELD_LABELS = {
     thinkingLevel: "thinking",
     name: "name",
 };
+function sectionFooter(width, focused) {
+    return paintPlainLine("─".repeat(Math.max(0, width)), width, focused ? jobwatchTheme.focusBorder : jobwatchTheme.text);
+}
 function sectionBorder(label, width, focused) {
     const prefix = `╭─ ${label} `;
     const line = prefix + "─".repeat(Math.max(0, width - visibleWidth(prefix)));
@@ -673,7 +676,7 @@ export class DashboardController {
             if (lines.length > 1)
                 lines[1] = paintPlainLine(` Working ${counts.working}  Ready ${counts.ready}  Done ${counts.exited}  Failed ${counts.failed}  Sessions ${counts.sessions}  Processes ${counts.processes}`, this.width, jobwatchTheme.surface);
             if (lines.length > 2)
-                lines[2] = paintPlainLine(` ${this.controlSegments().join(" ")}`, this.width, jobwatchTheme.keyHints);
+                lines[2] = paintPlainLine(this.contextSummary(), this.width, jobwatchTheme.keyHints);
             if (lines.length > 3)
                 lines[3] = sectionBorder("Sessions", this.width, this.focus === "list" || this.focus === "search");
             if (lines.length > 4)
@@ -685,12 +688,14 @@ export class DashboardController {
                     lines[target] = rendered[index].line;
             }
             if (lines.length >= 4) {
+                const dockTop = lines.length - layout.dockRows;
                 const composerFocused = this.focus === "composer" || this.focus === "confirmation";
                 const draftPrompt = this.composerDraft.prompt;
-                lines[lines.length - 4] = sectionBorder(composerFocused ? `New Session · ${COMPOSER_FIELD_LABELS[this.composerField]}` : "New Session", this.width, composerFocused);
-                lines[lines.length - 3] = paintPlainLine(` ❯ ${draftPrompt || "describe a task for a new session"}`, this.width, draftPrompt ? (text) => jobwatchTheme.text(text, false) : (text) => jobwatchTheme.muted(text, false));
+                lines[dockTop] = sectionBorder(composerFocused ? `New Session · ${COMPOSER_FIELD_LABELS[this.composerField]}` : "New Session", this.width, composerFocused);
+                lines[dockTop + 1] = paintPlainLine(` ❯ ${draftPrompt || "describe a task for a new session"}`, this.width, draftPrompt ? (text) => jobwatchTheme.text(text, false) : (text) => jobwatchTheme.muted(text, false));
                 const form = ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
-                lines[lines.length - 2] = paintPlainLine(this.status.kind === "error" ? ` ${this.status.code}: ${this.status.message}  ${form}` : form, this.width, this.status.kind === "error" ? jobwatchTheme.error : jobwatchTheme.surface);
+                lines[dockTop + 2] = paintPlainLine(this.status.kind === "error" ? ` ${this.status.code}: ${this.status.message}  ${form}` : form, this.width, this.status.kind === "error" ? jobwatchTheme.error : jobwatchTheme.surface);
+                if (layout.dockRows === 5) lines[dockTop + 3] = sectionFooter(this.width, composerFocused);
                 lines[lines.length - 1] = paintPlainLine(" Ctrl+C quit  ↑↓ navigate  Enter/→ open  ←/Esc back  / search  n form  Tab fields  ^X action  ? help", this.width, jobwatchTheme.keyHints);
             }
             this.renderOverlay(lines);
@@ -764,6 +769,29 @@ export class DashboardController {
     cycleView() {
         const next = this.query.view === "live" ? "done" : this.query.view === "done" ? "all" : "live";
         this.setView(next);
+    }
+    /** Show what the cursor is on, then any active filters. The keys themselves live in the footer and in Help. */
+    contextSummary() {
+        const selected = this.selectedSession();
+        const filters = this.activeFilterSummary().trim();
+        const cwd = selected === undefined ? "" : selected.cwd;
+        if (cwd === "" && filters === "") return "";
+        return ` ${[cwd, filters].filter((segment) => segment !== "").join("  ·  ")}`;
+    }
+    /** Show filter state only once something is filtered; the keys themselves live in the footer and in Help. */
+    activeFilterSummary() {
+        const active = [
+            this.query.search === undefined || this.query.search === "" ? undefined : `search:${this.query.search}`,
+            this.query.view === "live" ? undefined : `view:${this.query.view}`,
+            this.query.taskStates === undefined ? undefined : `state:${this.query.taskStates.join(",")}`,
+            this.query.processStates === undefined ? undefined : `process:${this.query.processStates.join(",")}`,
+            this.query.outcomes === undefined ? undefined : `outcome:${this.query.outcomes.join(",")}`,
+            this.query.activityKinds === undefined ? undefined : `activity:${this.query.activityKinds.join(",")}`,
+            this.query.projectPaths === undefined ? undefined : `project:${this.query.projectPaths.join(",")}`,
+            this.query.sort === undefined ? undefined : `sort:${this.query.sort.key}/${this.query.sort.direction}`,
+            this.query.groupBy === undefined ? undefined : `group:${this.query.groupBy}`,
+        ].filter((segment) => segment !== undefined);
+        return active.length === 0 ? "" : ` ${active.join("  ")}`;
     }
     controlSegments() {
         return [
@@ -895,7 +923,7 @@ export class DashboardController {
         const layout = createDashboardLayout(this.width, this.height);
         const areaTop = Math.min(layout.listTop, Math.max(0, lines.length - 1));
         // A short terminal leaves no list rows; the panel then borrows the space below it rather than covering the header.
-        const areaHeight = Math.max(1, Math.min(Math.max(layout.listHeight, described.rows.length + 2), lines.length - areaTop));
+        const areaHeight = Math.max(1, Math.min(Math.max(layout.listHeight, described.rows.length + 2), Math.max(1, lines.length - areaTop)));
         const panel = renderOverlayPanel(described, this.width, areaHeight);
         const start = areaTop + Math.max(0, Math.floor((areaHeight - panel.length) / 2));
         panel.forEach((line, index) => { if (start + index < lines.length)

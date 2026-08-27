@@ -7,10 +7,26 @@ import { atomicWriteJson } from "./atomic-file.mjs";
 const MAX_SUMMARY_CHARS = 240;
 const MAX_TRANSCRIPT_CHARS = 6_000;
 const SUMMARY_TIMEOUT_MS = 60_000;
+const MAX_NAME_CHARS = 48;
 const PROMPT = [
-  "Summarize what this coding session is doing and what it has produced so far.",
-  "Answer in one line under 20 words, no preamble, no quotes, present tense.",
+  "Describe this coding session for a dashboard.",
+  "Reply with exactly two lines and nothing else:",
+  "Title: <at most 5 words naming the task>",
+  "Summary: <one line under 20 words, present tense, no quotes>",
 ].join(" ");
+
+/** @param {string} text */
+function parseSummaryReply(text) {
+  const lines = text.split(/\r?\n/u).map((line) => line.trim()).filter((line) => line.length > 0);
+  const titleLine = lines.find((line) => /^title:/iu.test(line));
+  const summaryLine = lines.find((line) => /^summary:/iu.test(line)) ?? lines.find((line) => line !== titleLine);
+  const name = titleLine?.replace(/^title:\s*/iu, "").replace(/^["'`]|["'`]$/gu, "").trim();
+  const summary = (summaryLine ?? "").replace(/^summary:\s*/iu, "").trim();
+  return {
+    name: name === undefined || name.length === 0 ? undefined : name.slice(0, MAX_NAME_CHARS),
+    text: summary.length === 0 ? undefined : summary.slice(0, MAX_SUMMARY_CHARS),
+  };
+}
 
 /** Read and write the daemon's opt-in summary settings. @param {{ directory: string, fsOps?: any }} options */
 export async function openSettingsStore({ directory, fsOps = fs }) {
@@ -54,6 +70,7 @@ export function summarizePromptInput(items) {
 /**
  * Summarize one transcript with stock Pi's non-interactive print mode.
  * @param {{ executable: string, model: { provider: string, id: string }, transcript: string, env?: NodeJS.ProcessEnv, spawnImpl?: any, timeoutMs?: number }} options
+ * @returns {Promise<{ name?: string, text?: string } | undefined>}
  */
 export async function summarizeWithPi({ executable, model, transcript, env = process.env, spawnImpl = spawn, timeoutMs = SUMMARY_TIMEOUT_MS }) {
   if (transcript.trim().length === 0) return undefined;
@@ -63,7 +80,7 @@ export async function summarizeWithPi({ executable, model, transcript, env = pro
     const chunks = [];
     let bytes = 0;
     let settled = false;
-    const finish = (/** @type {string | undefined} */ value) => {
+    const finish = (/** @type {{ name?: string, text?: string } | undefined} */ value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -79,8 +96,8 @@ export async function summarizeWithPi({ executable, model, transcript, env = pro
     child.once("error", () => finish(undefined));
     child.once("exit", (/** @type {number | null} */ code) => {
       if (code !== 0) return finish(undefined);
-      const text = Buffer.concat(chunks).toString("utf8").replace(/\s+/gu, " ").trim();
-      finish(text.length === 0 ? undefined : text.slice(0, MAX_SUMMARY_CHARS));
+      const parsed = parseSummaryReply(Buffer.concat(chunks).toString("utf8"));
+      finish(parsed.text === undefined ? undefined : parsed);
     });
   });
 }

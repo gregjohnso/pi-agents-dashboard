@@ -60,10 +60,22 @@ it("builds a bounded transcript excerpt from normalized items", () => {
   expect(summarizePromptInput([])).toBe("");
 });
 
+it("reads a title and summary from one model reply", async () => {
+  const pi = fakePi({ stdout: "Title: Coverage loader fix\nSummary: Fixes the coverage loader and reruns tests\n" });
+  await expect(summarizeWithPi({ executable: "/installed/pi", model: { provider: "anthropic", id: "haiku" }, transcript: "User: hi", spawnImpl: pi.spawnImpl, env: {} }))
+    .resolves.toEqual({ name: "Coverage loader fix", text: "Fixes the coverage loader and reruns tests" });
+});
+
+it("keeps the summary when the model omits a title", async () => {
+  const pi = fakePi({ stdout: "Fixes the coverage loader\n" });
+  await expect(summarizeWithPi({ executable: "/installed/pi", model: { provider: "anthropic", id: "haiku" }, transcript: "User: hi", spawnImpl: pi.spawnImpl, env: {} }))
+    .resolves.toEqual({ name: undefined, text: "Fixes the coverage loader" });
+});
+
 it("summarizes through stock Pi print mode without a session or tools", async () => {
   const pi = fakePi({ stdout: "  Fixes the coverage loader and reruns tests\n" });
   const summary = await summarizeWithPi({ executable: "/installed/pi", model: { provider: "anthropic", id: "haiku" }, transcript: "User: hi", spawnImpl: pi.spawnImpl, env: {} });
-  expect(summary).toBe("Fixes the coverage loader and reruns tests");
+  expect(summary).toEqual({ name: undefined, text: "Fixes the coverage loader and reruns tests" });
   expect(pi.calls[0].argv.slice(0, 8)).toEqual(["--print", "--no-session", "--no-tools", "--provider", "anthropic", "--model", "haiku", "--"]);
   expect(pi.calls[0].options).toMatchObject({ shell: false });
 });

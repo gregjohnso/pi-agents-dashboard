@@ -145,8 +145,8 @@ it.each(dimensions)("pins the complete list and viewer surfaces at %ix%i", async
   expect(viewerLines).toHaveLength(height);
   expect([...listLines, ...viewerLines].every((line) => visibleWidth(line) <= width)).toBe(true);
   if (width >= 72) {
-    const header = listLines.map(stripVTControlCharacters).find((line) => line.includes("ID") && line.includes("STATE"));
-    expect(header).toMatch(/ID\s+NAME\s+STATE\s+ACTIVITY/u);
+    const header = listLines.map(stripVTControlCharacters).find((line) => line.includes("NAME") && line.includes("STATE"));
+    expect(header).toMatch(/NAME\s+STATE\s+ACTIVITY/u);
     expect(header).not.toContain("MODEL");
     expect(header).not.toContain("PROJECT");
   }

@@ -710,12 +710,16 @@ export async function createDaemonRuntime({
           summarizing.add(record.sessionId);
           void (async () => {
             try {
-              const text = await summarize({ model: summaryModel, transcript, executable: summaryExecutable, env: summaryEnv });
+              const written = await summarize({ model: summaryModel, transcript, executable: summaryExecutable, env: summaryEnv });
+              const text = typeof written === "string" ? written : written?.text;
+              const writtenName = typeof written === "string" ? undefined : written?.name;
               if (typeof text !== "string" || text.trim().length === 0) return;
               await runSessionLifecycle(registry, record.sessionId, async () => {
                 const current = await registry.get(record.sessionId);
                 if (current === undefined) return;
-                const updated = await registry.update(current.sessionId, current.revision, { summary: { text: text.trim().slice(0, 512), generatedAt: new Date().toISOString(), model: { ...summaryModel }, sourceCursor }, updatedAt: new Date().toISOString() });
+                // A name the operator chose outranks anything the summarizer writes.
+                const namesItself = typeof writtenName === "string" && writtenName.trim().length > 0 && (current.name === undefined || current.nameGenerated === true);
+                const updated = await registry.update(current.sessionId, current.revision, { summary: { text: text.trim().slice(0, 512), generatedAt: new Date().toISOString(), model: { ...summaryModel }, sourceCursor }, ...(namesItself ? { name: writtenName.trim().slice(0, 128), nameGenerated: true } : {}), updatedAt: new Date().toISOString() });
                 const event = await context.recovery.events.append({ kind: "session_changed", payload: { session: updated } });
                 context.broadcast(event);
               });
@@ -1280,7 +1284,7 @@ export async function createDaemonRuntime({
           await runSessionLifecycle(registry, request.payload.sessionId, async () => {
             const current = await registry.get(request.payload.sessionId);
             if (current === undefined || current.name === request.payload.name) return;
-            const updated = await registry.update(current.sessionId, current.revision, { name: request.payload.name, updatedAt: new Date().toISOString() });
+            const updated = await registry.update(current.sessionId, current.revision, { name: request.payload.name, nameGenerated: false, updatedAt: new Date().toISOString() });
             const event = await context.recovery.events.append({ kind: "session_changed", payload: { session: updated } });
             context.broadcast(event);
           });

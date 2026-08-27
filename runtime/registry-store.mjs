@@ -16,6 +16,7 @@ const SESSION_RECORD_KEYS = [
   "canonicalSessionFile",
   "cwd",
   "name",
+  "nameGenerated",
   "model",
   "thinkingLevel",
   "taskState",
@@ -207,6 +208,7 @@ export function validateSessionRecord(value) {
   if (value.latestRunId !== undefined) requireString(value, "latestRunId");
   if (value.runtime !== undefined) validateRuntime(value.runtime);
   if (value.summary !== undefined) validateSummary(value.summary);
+  if (value.nameGenerated !== undefined && typeof value.nameGenerated !== "boolean") throw new TypeError("nameGenerated must be a boolean");
   if (value.isolation !== undefined) validateIsolation(value.isolation);
   if (value.ownership !== undefined) {
     if (!isPlainObject(value.ownership) || value.ownership.kind !== "managed") {

@@ -410,7 +410,7 @@ it("summarizes sessions only after the opt-in model is chosen and reuses cached 
   const summarized = [];
   const runtime = await createDaemonRuntime({
     root: stateRoot,
-    summarizeSession: async (/** @type {any} */ options) => { summarized.push(options); return "Fixes the loader"; },
+    summarizeSession: async (/** @type {any} */ options) => { summarized.push(options); return { name: "Loader repair", text: "Fixes the loader" }; },
   });
   runtimes.push(runtime);
   await runtime.ready;
@@ -429,6 +429,8 @@ it("summarizes sessions only after the opt-in model is chosen and reuses cached 
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "summaries_refreshing", sessionIds: ["summary"] } });
   await vi.waitFor(async () => expect((await registry.get("summary"))?.summary).toMatchObject({ text: "Fixes the loader", model: { provider: "anthropic", id: "haiku" } }));
   expect(summarized[0]).toMatchObject({ model: { provider: "anthropic", id: "haiku" }, transcript: "User: fix the loader" });
+
+  expect(await registry.get("summary")).toMatchObject({ name: "Loader repair", nameGenerated: true });
 
   client.send({ version: 1, clientId: "viewer", requestId: "refresh-cached", op: "refresh_summaries", payload: {} });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "summaries_refreshing", sessionIds: [] } });

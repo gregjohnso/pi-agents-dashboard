@@ -13,7 +13,7 @@ import { parseViewerSnapshot } from "./viewer-contracts.mjs";
 /** @typedef {{kind:"managed",runId:string,process:ProcessIdentity,acquiredAt:string,heartbeatAt:string}} WorkerOwnership */
 /** @typedef {{mode:"worktree",worktreePath:string,branch:string}|{mode:"shared_directory",canonicalCwd:string}} IsolationRecord */
 /** @typedef {{text:string,generatedAt:string,model:{provider:string,id:string},sourceCursor:string}} SessionSummary */
-/** @typedef {{schemaVersion:1,revision:number,sessionId:string,sessionFile:string,canonicalSessionFile:string,cwd:string,name?:string,model?:{provider:string,id:string},thinkingLevel?:string,taskState:TaskState,processState:ProcessState,outcome:Outcome,activity:{kind:string,summary:string,updatedAt:string},ownership?:WorkerOwnership,isolation?:IsolationRecord,latestRunId?:string,runtime?:RunRuntimeIdentity,summary?:SessionSummary,createdAt:string,updatedAt:string}} SessionRecord */
+/** @typedef {{schemaVersion:1,revision:number,sessionId:string,sessionFile:string,canonicalSessionFile:string,cwd:string,name?:string,nameGenerated?:boolean,model?:{provider:string,id:string},thinkingLevel?:string,taskState:TaskState,processState:ProcessState,outcome:Outcome,activity:{kind:string,summary:string,updatedAt:string},ownership?:WorkerOwnership,isolation?:IsolationRecord,latestRunId?:string,runtime?:RunRuntimeIdentity,summary?:SessionSummary,createdAt:string,updatedAt:string}} SessionRecord */
 /** @typedef {{mode:"worktree"}|{mode:"shared_directory",confirmedCwd:string,ownerSessionIds:string[]}} LaunchIsolation */
 /** @typedef {{prompt:string,cwd:string,sourceSessionId:string,isolation:LaunchIsolation,model?:{provider:string,id:string},thinkingLevel?:string,name?:string}} LaunchRequest */
 /** @typedef {{daemonEpoch:string,sequence:string}} EventCursor */
@@ -240,7 +240,8 @@ function validateError(value, path) {
 /** @param {unknown} value @param {string} path */
 function validateSession(value, path) {
   const session = readRecord(value, path);
-  requireKeys(session, ["schemaVersion", "revision", "sessionId", "sessionFile", "canonicalSessionFile", "cwd", "taskState", "processState", "outcome", "activity", "createdAt", "updatedAt"], ["name", "model", "thinkingLevel", "ownership", "isolation", "latestRunId", "runtime", "summary"], path);
+  requireKeys(session, ["schemaVersion", "revision", "sessionId", "sessionFile", "canonicalSessionFile", "cwd", "taskState", "processState", "outcome", "activity", "createdAt", "updatedAt"], ["name", "nameGenerated", "model", "thinkingLevel", "ownership", "isolation", "latestRunId", "runtime", "summary"], path);
+  if (Object.hasOwn(session, "nameGenerated") && typeof session.nameGenerated !== "boolean") throw new TypeError(`${path}.nameGenerated must be a boolean`);
   if (Object.hasOwn(session, "summary")) {
     const summary = readRecord(session.summary, `${path}.summary`);
     requireKeys(summary, ["text", "generatedAt", "model", "sourceCursor"], [], `${path}.summary`);

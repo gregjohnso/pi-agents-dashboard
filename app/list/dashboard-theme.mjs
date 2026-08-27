@@ -1,3 +1,5 @@
+import { displaySessionState } from "./session-state.mjs";
+
 export const JOBWATCH_ANSI = {
     reset: "\x1b[0m",
     bold: "\x1b[1m",
@@ -18,18 +20,23 @@ function paint(text, foreground, selected, background = JOBWATCH_ANSI.blackBackg
     return `${rowBackground}${foreground}${text}${JOBWATCH_ANSI.reset}`;
 }
 function stateColor(session) {
-    if (session.taskState === "FAILED" || session.processState === "STALE")
-        return JOBWATCH_ANSI.rose;
-    if (session.taskState === "WORKING")
-        return JOBWATCH_ANSI.green;
-    if (session.taskState === "WAITING")
-        return JOBWATCH_ANSI.amber;
-    if (session.taskState === "STOPPED"
-        || session.outcome !== "NONE"
-        || session.processState === "EXITED") {
-        return JOBWATCH_ANSI.gray;
+    switch (displaySessionState(session)) {
+        case "FAILED":
+        case "STALE":
+            return JOBWATCH_ANSI.rose;
+        case "WORKING":
+            return JOBWATCH_ANSI.green;
+        case "WAITING":
+            return JOBWATCH_ANSI.amber;
+        case "STARTING":
+            return JOBWATCH_ANSI.cyan;
+        case "EXITED":
+        case "STOPPED":
+        case "SLEEPING":
+            return JOBWATCH_ANSI.gray;
+        default:
+            return JOBWATCH_ANSI.sky;
     }
-    return JOBWATCH_ANSI.sky;
 }
 /** Fixed Jobwatch-style colors used by the raw dashboard renderer. */
 export const jobwatchTheme = {

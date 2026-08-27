@@ -4,7 +4,6 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { jobwatchTheme } from "./dashboard-theme.mjs";
 import { displaySessionState } from "./session-state.mjs";
 const COLUMN_LABELS = {
-    id: "ID",
     name: "NAME",
     state: "STATE",
     activity: "ACTIVITY",
@@ -34,32 +33,30 @@ function columnsForWidth(width) {
         return [];
     if (width >= 72) {
         return [
-            { key: "id", width: 10 },
-            { key: "name", width: width >= 100 ? 28 : 22 },
+            { key: "name", width: width >= 100 ? 32 : 26 },
             { key: "state", width: 9 },
-            { key: "activity", width: width - (width >= 100 ? 58 : 52) },
+            { key: "activity", width: width - (width >= 100 ? 52 : 46) },
             { key: "age", width: 7 },
         ];
     }
     if (width >= 52) {
         return [
-            { key: "id", width: 9 },
-            { key: "name", width: 14 },
+            { key: "name", width: 18 },
             { key: "state", width: 8 },
-            { key: "activity", width: width - 40 },
+            { key: "activity", width: width - 35 },
             { key: "age", width: 6 },
         ];
     }
     if (width >= 28) {
         return [
-            { key: "id", width: 9 },
+            { key: "name", width: 10 },
             { key: "state", width: 8 },
-            { key: "activity", width: width - 19 },
+            { key: "activity", width: width - 21 },
         ];
     }
     if (width >= 12) {
         return [
-            { key: "id", width: 8 },
+            { key: "name", width: 8 },
             { key: "activity", width: width - 9 },
         ];
     }
@@ -70,12 +67,15 @@ export function createDashboardLayout(width, height) {
     const normalizedWidth = normalizedDimension(width);
     const normalizedHeight = normalizedDimension(height);
     const listTop = Math.min(5, normalizedHeight);
+    // The composer's closing border is decoration: a short terminal spends that row on the list instead.
+    const dockRows = normalizedHeight >= 14 ? 5 : 4;
     return {
         width: normalizedWidth,
         height: normalizedHeight,
         density: densityForWidth(normalizedWidth),
         listTop,
-        listHeight: Math.max(0, normalizedHeight - listTop - 4),
+        dockRows,
+        listHeight: Math.max(0, normalizedHeight - listTop - dockRows),
         columns: columnsForWidth(normalizedWidth),
     };
 }
@@ -120,8 +120,7 @@ function liveness(session) {
 }
 function sessionValues(session, now) {
     return {
-        id: `${liveness(session)} ${truncateToWidth(plainText(session.sessionId), 8, "")}`,
-        name: (session.name ?? "").trim() || "—",
+        name: `${liveness(session)} ${(session.name ?? "").trim() || truncateToWidth(plainText(session.sessionId), 8, "")}`,
         state: displaySessionState(session),
         age: age(session.updatedAt, now),
         activity: (session.summary?.text ?? session.activity.summary).trim() || "—",
@@ -133,8 +132,6 @@ export function renderSessionRow(session, layout, options) {
     const theme = options.theme ?? jobwatchTheme;
     const values = sessionValues(session, options.now);
     return joinCells(layout, values, (key, text) => {
-        if (key === "id")
-            return theme.id(text, selected);
         if (key === "state")
             return theme.state(session, text, selected);
         if (key === "age")

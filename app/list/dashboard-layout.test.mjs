@@ -84,21 +84,32 @@ describe("responsive dashboard layout", () => {
         expect(row).toContain("Fixes the coverage loader and reruns tests");
         expect(row).not.toContain("Pi assistant streaming");
     });
+    it("colors each displayed state with its Jobwatch semantic color", () => {
+        const layout = createDashboardLayout(160, 40);
+        const colorOf = (overrides) => renderSessionRow(session("colored", overrides), layout, { now });
+        expect(colorOf({ taskState: "WORKING", processState: "LIVE" })).toContain(JOBWATCH_ANSI.green);
+        expect(colorOf({ taskState: "WAITING", processState: "LIVE" })).toContain(JOBWATCH_ANSI.amber);
+        expect(colorOf({ taskState: "READY", processState: "LIVE" })).toContain(JOBWATCH_ANSI.sky);
+        expect(colorOf({ taskState: "FAILED", processState: "EXITED" })).toContain(JOBWATCH_ANSI.rose);
+        expect(colorOf({ taskState: "READY", processState: "EXITED" })).toContain(JOBWATCH_ANSI.gray);
+    });
     it("keeps the fixed list column order and never renders Model or Project", () => {
-        expect(createDashboardLayout(160, 40).columns.map(({ key }) => key)).toEqual(["id", "name", "state", "activity", "age"]);
+        expect(createDashboardLayout(160, 40).columns.map(({ key }) => key)).toEqual(["name", "state", "activity", "age"]);
         const header = stripVTControlCharacters(renderColumnHeader(createDashboardLayout(160, 40)));
         expect(header).not.toContain("MODEL");
         expect(header).not.toContain("PROJECT");
         expect(header).toContain("NAME");
-        expect(createDashboardLayout(120, 32).columns.map(({ key }) => key)).toEqual(["id", "name", "state", "activity", "age"]);
+        expect(createDashboardLayout(120, 32).columns.map(({ key }) => key)).toEqual(["name", "state", "activity", "age"]);
         expect(header).toContain("AGE");
+        expect(header).not.toContain("ID");
     });
     it("renders the session name and falls back when a session has none", () => {
         const layout = createDashboardLayout(160, 40);
-        const named = stripVTControlCharacters(renderSessionRow(session("named", { name: "Coverage loader" }), layout, { now }));
+        const named = stripVTControlCharacters(renderSessionRow(session("named", { name: "Coverage loader", processState: "LIVE" }), layout, { now }));
         expect(named).toContain("Coverage loader");
-        const unnamed = stripVTControlCharacters(renderSessionRow(session("unnamed"), layout, { now }));
-        expect(unnamed).toContain("—");
+        expect(named).toContain("▶");
+        const unnamed = stripVTControlCharacters(renderSessionRow(session("unnamed-session-id"), layout, { now }));
+        expect(unnamed).toContain("unnamed-");
     });
     it("sanitizes untrusted controls to one line before applying renderer-owned ANSI", () => {
         const layout = createDashboardLayout(160, 20);

@@ -111,18 +111,18 @@ describe("dashboard controller", () => {
         expect(listFocused[1]).toContain(JOBWATCH_ANSI.surfaceBackground);
         expect(listFocused[3]).toContain(JOBWATCH_ANSI.sky);
         expect(stripVTControlCharacters(listFocused[3])).toContain("Sessions");
-        expect(listFocused.at(-4)).toContain(JOBWATCH_ANSI.gray);
-        expect(stripVTControlCharacters(listFocused.at(-4))).toContain("New Session");
+        expect(listFocused.at(-5)).toContain(JOBWATCH_ANSI.gray);
+        expect(stripVTControlCharacters(listFocused.at(-5))).toContain("New Session");
         expect(listFocused.at(-1)).toContain(JOBWATCH_ANSI.surfaceBackground);
         expect(stripVTControlCharacters(listFocused.at(-1))).toContain("Ctrl+C quit");
 
         dashboard.handleInput("\x1b[B");
         const composerFocused = dashboard.render(100, 16);
         expect(composerFocused[3]).toContain(JOBWATCH_ANSI.gray);
-        expect(composerFocused.at(-4)).toContain(JOBWATCH_ANSI.sky);
-        expect(composerFocused.at(-3)).toBe(listFocused.at(-3));
+        expect(composerFocused.at(-5)).toContain(JOBWATCH_ANSI.sky);
+        expect(composerFocused.at(-4)).toBe(listFocused.at(-4));
         dashboard.handleInput("\t");
-        expect(stripVTControlCharacters(dashboard.render(100, 16).at(-4))).toContain("New Session · cwd");
+        expect(stripVTControlCharacters(dashboard.render(100, 16).at(-5))).toContain("New Session · cwd");
     });
     it("applies search, task/project filters, grouping, and sort independently without changing selected ID", async () => {
         const waiting = session("waiting", { taskState: "WAITING", processState: "LIVE", outcome: "NONE", cwd: "/repo/a", activity: { kind: "ui", summary: "Need approval", updatedAt: timestamp } });
@@ -160,7 +160,7 @@ describe("dashboard controller", () => {
     it("greys the composer placeholder and leaves the prompt line unchanged when focused", async () => {
         const dashboard = controller(new FakeBackend([]));
         await dashboard.open();
-        const promptLine = (rendered) => rendered[rendered.length - 3];
+        const promptLine = (rendered) => rendered[rendered.length - 4];
         const unfocused = promptLine(dashboard.render(80, 24));
         expect(stripVTControlCharacters(unfocused)).toContain("describe a task for a new session");
         expect(unfocused).toContain(JOBWATCH_ANSI.gray);
@@ -174,6 +174,34 @@ describe("dashboard controller", () => {
         expect(stripVTControlCharacters(typed)).not.toContain("describe a task");
         expect(typed).not.toContain(JOBWATCH_ANSI.gray);
         expect(stripVTControlCharacters(typed)).not.toContain("[prompt]");
+    });
+    it("closes the composer panel and shows filter state only when filters are set", async () => {
+        const dashboard = controller(new FakeBackend([session("a")]));
+        await dashboard.open();
+        const plain = dashboard.render(100, 16).map(stripVTControlCharacters);
+        expect(plain[2]).not.toContain("/search");
+        expect(plain[2]).not.toContain("v:live");
+        expect(plain.at(-2).trim()).toMatch(/^─+$/u);
+
+        dashboard.setSearch("needle");
+        const filtered = dashboard.render(100, 16).map(stripVTControlCharacters);
+        expect(filtered[2]).toContain("needle");
+    });
+    it("shows the selected session's working directory", async () => {
+        const dashboard = controller(new FakeBackend([
+            session("a", { cwd: "/repo/alpha" }),
+            session("b", { cwd: "/repo/beta" }),
+        ]));
+        await dashboard.open();
+        dashboard.selectSession("a");
+        expect(stripVTControlCharacters(dashboard.render(100, 16)[2])).toContain("/repo/alpha");
+        dashboard.selectSession("b");
+        expect(stripVTControlCharacters(dashboard.render(100, 16)[2])).toContain("/repo/beta");
+
+        dashboard.setSearch("beta");
+        const filtered = stripVTControlCharacters(dashboard.render(100, 16)[2]);
+        expect(filtered).toContain("/repo/beta");
+        expect(filtered).toContain("search:beta");
     });
     it("counts only the sessions the current view shows", async () => {
         const dashboard = controller(new FakeBackend([
@@ -392,6 +420,7 @@ describe("dashboard controller", () => {
         release?.();
     });
     describe("floating overlay panels", () => {
+        // The composer dock owns the last five rows, including its own closing border.
         const panelRows = (rendered) => rendered
             .map((line, index) => ({ line: stripVTControlCharacters(line), index }))
             .filter(({ line }) => /\u256d\u2500.*\u256e\s*$|^\s*\u2502.*\u2502\s*$|\u2570\u2500+\u256f\s*$/u.test(line));

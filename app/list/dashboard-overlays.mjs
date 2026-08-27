@@ -82,6 +82,56 @@ export function confirmationMatchesSession(confirmation, session) {
         confirmation.ownershipFingerprint === ownershipFingerprint(session) &&
         confirmation.action === destructiveAction(session);
 }
+/**
+ * Describe one overlay as a title and plain content rows for the floating panel.
+ * `emphasis` marks rows the panel renders as muted guidance rather than data.
+ */
+export function describeOverlay(overlay, options = {}) {
+    if (overlay.kind === "help") {
+        const keyWidth = Math.max(...overlay.bindings.map((binding) => binding.keys.length));
+        return {
+            title: "Help",
+            rows: overlay.bindings.map((binding) => ({ text: `${binding.keys.padEnd(keyWidth)}  ${binding.action}` })),
+        };
+    }
+    if (overlay.kind === "metadata") {
+        const fields = Object.entries(overlay.fields);
+        const keyWidth = Math.max(...fields.map(([key]) => key.length));
+        return {
+            title: "Session",
+            rows: [
+                { text: overlay.sessionId, emphasis: true },
+                ...fields.map(([key, value]) => ({ text: `${key.padEnd(keyWidth)}  ${value}` })),
+            ],
+        };
+    }
+    if (overlay.kind === "session_confirmation") {
+        return {
+            title: `Confirm ${overlay.action.toUpperCase()}`,
+            rows: [
+                { text: overlay.sessionId },
+                { text: overlay.submitting ? "Submitting…" : "Press y/Enter to confirm; n/Escape to cancel.", emphasis: true },
+            ],
+        };
+    }
+    if (overlay.kind === "shared_directory_confirmation") {
+        return {
+            title: "Shared directory",
+            rows: [
+                { text: "This session shares a directory with other owners.", emphasis: true },
+                { text: `Type exactly: ${overlay.canonicalCwd}` },
+                { text: `> ${options.confirmationText ?? ""}` },
+            ],
+        };
+    }
+    return {
+        title: "Delivery unknown",
+        rows: [
+            { text: "The daemon cannot prove this command was delivered.", emphasis: true },
+            { text: `Choose ${overlay.actions.join(" or ")}; no automatic retry.` },
+        ],
+    };
+}
 /** Return explicit resolution choices for an ambiguous durable command. */
 export function createDeliveryUnknownOverlay(clientId, requestId) {
     return {

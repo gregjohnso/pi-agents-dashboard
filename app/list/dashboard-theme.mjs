@@ -51,6 +51,18 @@ export const jobwatchTheme = {
     panel(text, focused) {
         return paint(text, JOBWATCH_ANSI.text, focused);
     },
+    overlayBorder(text) {
+        return paint(text, JOBWATCH_ANSI.sky, false, JOBWATCH_ANSI.surfaceBackground);
+    },
+    overlayTitle(text) {
+        return paint(text, `${JOBWATCH_ANSI.bold}${JOBWATCH_ANSI.text}`, false, JOBWATCH_ANSI.surfaceBackground);
+    },
+    overlayText(text) {
+        return paint(text, JOBWATCH_ANSI.text, false, JOBWATCH_ANSI.surfaceBackground);
+    },
+    overlayMuted(text) {
+        return paint(text, JOBWATCH_ANSI.gray, false, JOBWATCH_ANSI.surfaceBackground);
+    },
     error(text) {
         return paint(text, JOBWATCH_ANSI.rose, false);
     },

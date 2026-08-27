@@ -5,7 +5,7 @@ import { decodeKittyPrintable, Key, matchesKey, truncateToWidth, visibleWidth, }
 import { countDashboardSessions, selectDashboardSessions, } from "./dashboard-state.mjs";
 import { createDashboardLayout, renderColumnHeader, } from "./dashboard-layout.mjs";
 import { jobwatchTheme } from "./dashboard-theme.mjs";
-import { confirmationMatchesSession, createDeliveryUnknownOverlay, createHelpOverlay, createMetadataOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, } from "./dashboard-overlays.mjs";
+import { confirmationMatchesSession, createDeliveryUnknownOverlay, createHelpOverlay, createMetadataOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, describeOverlay, } from "./dashboard-overlays.mjs";
 import { createLaunchDraft, prepareLaunchRequest, } from "./launch-composer.mjs";
 import { VirtualSessionList } from "./virtual-session-list.mjs";
 function cursorAfter(left, right) {
@@ -196,6 +196,27 @@ function sectionBorder(label, width, focused) {
     const prefix = `╭─ ${label} `;
     const line = prefix + "─".repeat(Math.max(0, width - visibleWidth(prefix)));
     return paintPlainLine(line, width, focused ? jobwatchTheme.focusBorder : jobwatchTheme.inactiveBorder);
+}
+function overlayRow(content, innerWidth, indent, paintContent) {
+    const body = fitLine(stripVTControlCharacters(String(content)), innerWidth);
+    return `${" ".repeat(indent)}${jobwatchTheme.overlayBorder("│")}${paintContent(` ${body} `)}${jobwatchTheme.overlayBorder("│")}`;
+}
+/** Render one centered Jobwatch-style floating panel bounded by the dashboard width and list height. */
+function renderOverlayPanel(described, width, areaHeight) {
+    const frameCost = 4;
+    const contentWidth = Math.max(visibleWidth(described.title) + 3, ...described.rows.map((row) => visibleWidth(row.text)));
+    const innerWidth = Math.max(1, Math.min(contentWidth, width - frameCost));
+    const outerWidth = Math.min(width, innerWidth + frameCost);
+    const indent = Math.max(0, Math.floor((width - outerWidth) / 2));
+    const visibleRows = described.rows.slice(0, Math.max(1, areaHeight - 2));
+    const titlePrefix = `╭─ ${truncateToWidth(stripVTControlCharacters(described.title), Math.max(0, outerWidth - 5), "")} `;
+    const top = `${" ".repeat(indent)}${jobwatchTheme.overlayBorder(titlePrefix + "─".repeat(Math.max(0, outerWidth - visibleWidth(titlePrefix) - 1)) + "╮")}`;
+    const bottom = `${" ".repeat(indent)}${jobwatchTheme.overlayBorder("╰" + "─".repeat(Math.max(0, outerWidth - 2)) + "╯")}`;
+    return [
+        top,
+        ...visibleRows.map((row) => overlayRow(row.text, innerWidth, indent, row.emphasis === true ? jobwatchTheme.overlayMuted : jobwatchTheme.overlayText)),
+        bottom,
+    ];
 }
 /** Own dashboard subscription, focus, selection, launch, rendering, and disposal. */
 export class DashboardController {
@@ -452,17 +473,18 @@ export class DashboardController {
         await this.openViewer(selected.sessionId);
     }
     handleInput(data) {
-        if (matchesKey(data, Key.ctrl("c")) && !(this.overlay?.kind === "session_confirmation" && this.overlay.submitting)) {
+        if (matchesKey(data, Key.ctrl("c"))) {
             void this.close();
             return;
         }
         if (this.overlay?.kind === "session_confirmation") {
-            if (this.overlay.submitting)
-                return;
-            if (matchesKey(data, Key.escape) || data.toLowerCase() === "n") {
+            // Escape always dismisses so a stuck destructive request never wedges the dashboard.
+            if (matchesKey(data, Key.escape) || (!this.overlay.submitting && data.toLowerCase() === "n")) {
                 this.overlay = undefined;
                 return;
             }
+            if (this.overlay.submitting)
+                return;
             if (matchesKey(data, Key.enter) || data.toLowerCase() === "y") {
                 void this.confirmSession(this.overlay);
             }
@@ -860,20 +882,15 @@ export class DashboardController {
         const overlay = this.overlay;
         if (overlay === undefined || lines.length === 0)
             return;
-        let details;
-        if (overlay.kind === "metadata")
-            details = Object.entries(overlay.fields).map(([key, value]) => `${key}: ${value}`);
-        else if (overlay.kind === "help")
-            details = overlay.bindings.map((binding) => `${binding.keys}  ${binding.action}`);
-        else if (overlay.kind === "shared_directory_confirmation")
-            details = ["Shared directory warning", `Type exactly: ${overlay.canonicalCwd}`, `> ${this.confirmationText}`];
-        else if (overlay.kind === "session_confirmation")
-            details = [`Confirm ${overlay.action.toUpperCase()} for ${overlay.sessionId}?`, overlay.submitting ? "Submitting…" : "Press y/Enter to confirm; n/Escape to cancel."];
-        else
-            details = ["DELIVERY_UNKNOWN", "Choose retry_at_risk or abandon; no automatic retry."];
-        const start = Math.max(0, Math.floor((lines.length - details.length) / 2));
-        details.forEach((detail, index) => { if (start + index < lines.length)
-            lines[start + index] = detail; });
+        const described = describeOverlay(overlay, { confirmationText: this.confirmationText });
+        const layout = createDashboardLayout(this.width, this.height);
+        const areaTop = Math.min(layout.listTop, Math.max(0, lines.length - 1));
+        // A short terminal leaves no list rows; the panel then borrows the space below it rather than covering the header.
+        const areaHeight = Math.max(1, Math.min(Math.max(layout.listHeight, described.rows.length + 2), lines.length - areaTop));
+        const panel = renderOverlayPanel(described, this.width, areaHeight);
+        const start = areaTop + Math.max(0, Math.floor((areaHeight - panel.length) / 2));
+        panel.forEach((line, index) => { if (start + index < lines.length)
+            lines[start + index] = line; });
     }
     trackEvent(update, generation) {
         const operation = this.eventOperations.size === 0

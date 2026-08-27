@@ -342,6 +342,118 @@ describe("dashboard controller", () => {
         expect(backend.stop).toHaveBeenCalledTimes(1);
         release?.();
     });
+    it("dismisses a submitting confirmation with Escape instead of wedging input", async () => {
+        let release;
+        const backend = new FakeBackend([session("a")]);
+        backend.stop = vi.fn(() => new Promise((resolve) => { release = resolve; }));
+        const dashboard = controller(backend);
+        await dashboard.open();
+        dashboard.handleInput("\x18");
+        dashboard.handleInput("y");
+        expect(dashboard.overlay).toMatchObject({ kind: "session_confirmation", submitting: true });
+        dashboard.handleInput("\x1b");
+        expect(dashboard.overlay).toBeUndefined();
+        dashboard.handleInput("\x1b[B");
+        expect(dashboard.focus).toBe("composer");
+        expect(backend.stop).toHaveBeenCalledTimes(1);
+        release?.();
+    });
+    it("closes the dashboard with Ctrl+C while a confirmation is submitting", async () => {
+        let release;
+        const backend = new FakeBackend([session("a")]);
+        backend.stop = vi.fn(() => new Promise((resolve) => { release = resolve; }));
+        const onClose = vi.fn();
+        const dashboard = controller(backend, { onClose });
+        await dashboard.open();
+        dashboard.handleInput("\x18");
+        dashboard.handleInput("y");
+        dashboard.handleInput("\x03");
+        await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith({ kind: "closed" }));
+        release?.();
+    });
+    describe("floating overlay panels", () => {
+        const panelRows = (rendered) => rendered
+            .map((line, index) => ({ line: stripVTControlCharacters(line), index }))
+            .filter(({ line }) => /\u256d\u2500.*\u256e\s*$|^\s*\u2502.*\u2502\s*$|\u2570\u2500+\u256f\s*$/u.test(line));
+        const panelLines = (rendered) => panelRows(rendered).map(({ line }) => line);
+        it.each([[40, 10], [55, 16], [80, 24], [120, 32], [160, 40]])("frames the help panel inside %ix%i", async (width, height) => {
+            const dashboard = controller(new FakeBackend([session("a")]));
+            await dashboard.open();
+            dashboard.toggleHelp();
+            const rendered = dashboard.render(width, height);
+            for (const line of rendered)
+                expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+            const framed = panelLines(rendered);
+            expect(framed.length).toBeGreaterThan(2);
+            expect(framed[0]).toContain("Help");
+            expect(framed[0]).toMatch(/\u256d\u2500/u);
+            expect(framed.at(-1)).toMatch(/\u2570\u2500+\u256f/u);
+        });
+        it("centers the panel within the list area and paints a focus border", async () => {
+            const dashboard = controller(new FakeBackend([session("a")]));
+            await dashboard.open();
+            dashboard.toggleHelp();
+            const rendered = dashboard.render(80, 24);
+            const framedRows = panelRows(rendered);
+            expect(framedRows[0].index).toBeGreaterThan(4);
+            expect(framedRows.at(-1).index).toBeLessThan(20);
+            const indent = framedRows[0].line.search(/\S/u);
+            for (const { line } of framedRows)
+                expect(line.search(/\S/u)).toBe(indent);
+            expect(rendered[framedRows[0].index]).toContain(JOBWATCH_ANSI.sky);
+        });
+        it.each([
+            ["help", (dashboard) => dashboard.toggleHelp(), "Help", "metadata / help"],
+            ["metadata", (dashboard) => dashboard.toggleMetadata(), "Session", "taskState"],
+            ["session confirmation", (dashboard) => dashboard.handleInput("\x18"), "Confirm STOP", "y/Enter"],
+        ])("titles the %s panel and keeps its content", async (_label, open, title, content) => {
+            const dashboard = controller(new FakeBackend([session("a", { processState: "LIVE" })]));
+            await dashboard.open();
+            open(dashboard);
+            const rendered = dashboard.render(120, 32).map(stripVTControlCharacters);
+            expect(rendered.some((line) => line.includes(title))).toBe(true);
+            expect(rendered.some((line) => line.includes(content))).toBe(true);
+        });
+        it("frames the delivery-unknown choices without overflowing a narrow terminal", async () => {
+            const backend = new FakeBackend([]);
+            backend.launch = vi.fn(async () => ({ kind: "delivery_unknown", clientId: "stable-client", requestId: "launch-unknown" }));
+            const dashboard = controller(backend);
+            await dashboard.open();
+            dashboard.setComposerPrompt("Implement it");
+            await dashboard.submitComposer();
+            const rendered = dashboard.render(40, 10);
+            for (const line of rendered)
+                expect(visibleWidth(line)).toBeLessThanOrEqual(40);
+            const plain = rendered.map(stripVTControlCharacters);
+            expect(plain.some((line) => line.includes("Delivery unknown"))).toBe(true);
+            expect(plain.some((line) => line.includes("retry_at_risk"))).toBe(true);
+        });
+        it("centers a narrow panel horizontally inside a wide terminal", async () => {
+            const dashboard = controller(new FakeBackend([session("a", { processState: "LIVE" })]));
+            await dashboard.open();
+            dashboard.handleInput("\x18");
+            const rendered = dashboard.render(160, 40);
+            const framed = panelRows(rendered);
+            const indent = framed[0].line.search(/\S/u);
+            expect(indent).toBeGreaterThan(0);
+            for (const { line } of framed) {
+                expect(line.search(/\S/u)).toBe(indent);
+                expect(visibleWidth(line.trimEnd())).toBeLessThanOrEqual(160);
+            }
+        });
+        it("frames the shared-directory confirmation with its typed echo", async () => {
+            const dashboard = controller(new FakeBackend([]));
+            await dashboard.open();
+            dashboard.setComposerPrompt("Shared change");
+            dashboard.setIsolationMode("shared_directory");
+            await dashboard.submitComposer();
+            dashboard.handleInput("/");
+            dashboard.handleInput("r");
+            const rendered = dashboard.render(80, 24).map(stripVTControlCharacters);
+            expect(rendered.some((line) => line.includes("Shared directory"))).toBe(true);
+            expect(rendered.some((line) => line.includes("> /r"))).toBe(true);
+        });
+    });
     it("closes and surfaces a typed malformed-frame state without signaling workers", async () => {
         const backend = new FakeBackend([session("a")]);
         const onClose = vi.fn();

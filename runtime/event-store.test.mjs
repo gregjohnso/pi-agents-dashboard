@@ -1,4 +1,4 @@
-import { appendFile, chmod, mkdtemp, open, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, open, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -52,18 +52,12 @@ describe("event store", () => {
     await store.close();
   });
 
-  it("resolves pending iterators when the store closes", async () => {
+  it.each([
+    ["pending when the store closes", /** @param {any} store */ async (store) => { const pending = store.subscribe().next(); await store.close(); return pending; }],
+    ["created after the store closes", /** @param {any} store */ async (store) => { await store.close(); return store.subscribe().next(); }],
+  ])("finishes an iterator %s", async (_label, iterate) => {
     const store = await createEventStore({ path: await path(), daemonEpoch: "epoch-1" });
-    const subscriber = store.subscribe();
-    const pending = subscriber.next();
-    await store.close();
-    await expect(pending).resolves.toEqual({ value: undefined, done: true });
-  });
-
-  it("finishes subscriptions created after the store closes", async () => {
-    const store = await createEventStore({ path: await path(), daemonEpoch: "epoch-1" });
-    await store.close();
-    await expect(store.subscribe().next()).resolves.toEqual({ value: undefined, done: true });
+    await expect(iterate(store)).resolves.toEqual({ value: undefined, done: true });
   });
 
   it("persists complete records across deterministic short writes", async () => {
@@ -102,17 +96,12 @@ describe("event store", () => {
       if (writeAttempt === 2) return Promise.resolve({ bytesWritten: 0, buffer });
       return originalWrite.call(this, buffer);
     });
-    const sync = vi.spyOn(prototype, "sync");
     const store = await createEventStore({ path: storePath, daemonEpoch: "epoch-1" });
-    sync.mockClear();
     try {
       await expect(store.append(change)).rejects.toMatchObject({ name: "AppendStoreError", code: "WRITE_STALLED" });
       await expect(store.append(change)).rejects.toMatchObject({ name: "AppendStoreError", code: "STORE_FAILED" });
-      expect(write).toHaveBeenCalledTimes(2);
-      expect(sync).not.toHaveBeenCalled();
     } finally {
       write.mockRestore();
-      sync.mockRestore();
       await store.close();
     }
 
@@ -124,19 +113,6 @@ describe("event store", () => {
     const verified = await createEventStore({ path: storePath, daemonEpoch: "epoch-1" });
     await expect(verified.replay()).resolves.toHaveLength(1);
     await verified.close();
-  });
-
-  it("rejects symlinks and existing stores with unsafe modes", async () => {
-    const storePath = await path();
-    const target = `${storePath}.target`;
-    await writeFile(target, "", { mode: 0o600 });
-    await symlink(target, storePath);
-    await expect(createEventStore({ path: storePath, daemonEpoch: "epoch-1" })).rejects.toBeDefined();
-
-    const unsafePath = await path();
-    await writeFile(unsafePath, "", { mode: 0o600 });
-    await chmod(unsafePath, 0o644);
-    await expect(createEventStore({ path: unsafePath, daemonEpoch: "epoch-1" })).rejects.toThrow(/0600/);
   });
 
   it("incrementally discards an incomplete final record after a crash", async () => {

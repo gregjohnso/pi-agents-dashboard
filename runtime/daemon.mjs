@@ -741,7 +741,8 @@ export async function createDaemonRuntime({
           const snapshot = await context.recovery.viewer.snapshot(record.sessionId, "observer").catch(() => undefined);
           if (snapshot === undefined) continue;
           const sourceCursor = snapshot.cursor.sequence;
-          if (record.summary?.sourceCursor === sourceCursor && record.summary.model.provider === summaryModel.provider && record.summary.model.id === summaryModel.id) continue;
+          const summary = record.summary;
+          if (summary !== undefined && summary.sourceCursor === sourceCursor && summary.model.provider === summaryModel.provider && summary.model.id === summaryModel.id) continue;
           const transcript = summarizePromptInput(snapshot.items);
           if (transcript.length === 0) continue;
           refreshed.push(record.sessionId);

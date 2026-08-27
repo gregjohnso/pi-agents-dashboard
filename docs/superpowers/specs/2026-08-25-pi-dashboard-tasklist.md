@@ -259,12 +259,14 @@ Landed since the last daemon restart:
 - Destructive confirmations survive summary/name revision churn and cancel only when the session changes what it admits (`1be3bd6`).
 
 Open, in order:
-- [ ] Standard Pi commands (`/new`, `/resume`, `/stats`, `/tree`, `/export`, auto-compact/auto-retry/steering toggles) wired to Pi's own RPC implementations. `new_session`/`switch_session`/`fork`/`clone` rebind the running Pi to a different session file, so the daemon must follow the rebind (registry, viewer store, broadcast) or refuse honestly — never silently rebind.
-- [ ] `/color <name>`: dashboard-owned session color, set through a daemon op (works on dead sessions), tinting the viewer prompt bar and the NAME cell.
-- [ ] Arrow-key transcript scrolling, Jobwatch style, with follow-the-tail, new-activity marker and Home/End, plus a documented rule for sharing Up/Down with Pi's prompt history.
-- [ ] Two-finger/wheel scrolling. Root cause found: the mounted host component forwards only `handleInput`, so wheel events never reach either surface and `DashboardController.handleMouse` is currently dead code.
-- [ ] `Ctrl+X` stops a session; a second `Ctrl+X` within 500 ms clears it.
-- [ ] Fast-forward `master` (55 commits behind) so a fresh clone is not stale.
-- [ ] CLI destructive commands time out before the stop policy completes, reporting failure for a stop that succeeded.
+- [x] Standard Pi commands (`/new`, `/resume`, `/stats`, `/tree`, `/export`, auto-compact/auto-retry/steering toggles) wired to Pi's own RPC implementations. `new_session`/`switch_session`/`fork`/`clone` rebind the running Pi to a different session file, so the daemon must follow the rebind (registry, viewer store, broadcast) or refuse honestly — never silently rebind.
+- [x] `/color <name>`: dashboard-owned session color, set through a daemon op (works on dead sessions), tinting the viewer prompt bar and the NAME cell.
+- [x] Arrow-key transcript scrolling, Jobwatch style, with follow-the-tail, new-activity marker and Home/End, plus a documented rule for sharing Up/Down with Pi's prompt history.
+- [x] Arrow and wheel scrolling (`1f7fcfc`). The root cause recorded earlier was wrong: pi-tui 0.84.3's `Component` has no mouse seam at all, mouse capture is already on, and `handleViewportInput` consumes wheel bytes before any child dispatch, then scrolls its own `ScrollView`s, which our full-screen surfaces never use. Host forwarding could not have worked. `app/mouse-input.mjs` therefore reads wheel bytes ahead of the TUI through a Proxy over the public `Terminal`, with two canary tests that fail loudly, naming 0.84.3, if pi-tui grows a real seam or stops consuming wheel bytes. Two-finger trackpad scrolling arrives as ordinary wheel events, so it rides the same path. Arrows scroll only when the editor has neither draft text nor prompt history to offer.
+- [x] `Ctrl+X` stops a session; a second `Ctrl+X` within 500 ms clears it.
+- [x] Fast-forward `master` (55 commits behind) so a fresh clone is not stale.
+- [x] CLI destructive commands time out before the stop policy completes, reporting failure for a stop that succeeded.
 
 Three subagents for the first three items died when their runner process disappeared; their worktrees produced no commits. Relaunch from a clean tree.
+
+All seven items above landed by `9808eca`: 920 tests across 75 files, typecheck clean. Known residual risks: the wheel tap depends on pi-tui input ordering that is an implementation detail rather than a documented contract, guarded by the canaries; `DashboardController.handleMouse`'s click branches are tested but unreachable in production because pi-tui consumes clicks for its own selection; and two-finger scrolling is unverified in a real TTY, which no test can cover.

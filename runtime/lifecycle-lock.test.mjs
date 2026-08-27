@@ -40,14 +40,15 @@ async function readTokenEntry(path, token) {
   return JSON.parse(await readFile(join(path, token), "utf8"));
 }
 
-const staleRecord = JSON.stringify({ token: "stale-token", owner: { operation: "worktree_ownership" }, holder: deadHolder });
+const staleHolder = { token: "stale-token", owner: { operation: "worktree_ownership" }, holder: deadHolder };
+const staleRecord = JSON.stringify(staleHolder);
 
 it.each([
   ["process is gone", inspectDead],
   ["pid was reused by a different process", async (/** @type {number} */ pid) => ({ pid, processGroupId: 4242, startIdentity: "7777" })],
 ])("reclaims a lock whose holder %s", async (_label, inspect) => {
   const path = await makeLockPath();
-  await writeSoleRecord(path, JSON.parse(staleRecord));
+  await writeSoleRecord(path, staleHolder);
 
   const lock = await acquireLifecycleLock(path, { operation: "worktree_ownership" }, fs, { inspect });
 

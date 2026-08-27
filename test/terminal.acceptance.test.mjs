@@ -167,9 +167,10 @@ it("drives list navigation, search/filter/sort/group, metadata/help, composer, c
   f.dashboard.handleInput("\r");
   f.dashboard.handleInput("\x1b[C");
   await vi.waitFor(() => expect(openViewer).toHaveBeenCalledTimes(2));
-  // Ctrl+F opens search, the letters type into it, then the Ctrl chords cycle each facet.
-  for (const input of ["\x06", "l", "i", "v", "e", "\r", "\x14", "\x10", "\x0f", "\x01", "\x13", "\x02"]) f.dashboard.handleInput(input);
-  expect(f.dashboard.query).toMatchObject({ search: "live", taskStates: ["WORKING"], processStates: ["LIVE"], outcomes: ["NONE"], sort: { key: "age", direction: "asc" }, groupBy: "taskState" });
+  // Ctrl+F opens search and the letters type into it; app/list/dashboard.test.mjs owns the
+  // full chord-to-query table for every filter, sort and group facet.
+  for (const input of ["\x06", "l", "i", "v", "e", "\r"]) f.dashboard.handleInput(input);
+  expect(f.dashboard.query).toMatchObject({ search: "live" });
   f.dashboard.clearFilters();
   f.dashboard.handleInput("\x05");
   expect(f.dashboard.overlay?.kind).toBe("metadata");

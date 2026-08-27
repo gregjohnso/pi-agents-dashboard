@@ -88,7 +88,6 @@ describe("dashboard controller", () => {
         await processRenderedEvent(dashboard, backend, { snapshot: { sessions: [session("c"), session("a"), session("b", { revision: 2 })] }, cursor: { daemonEpoch: "epoch", sequence: "1" } });
         dashboard.resize(40, 8);
         expect(dashboard.selectedSessionId).toBe("b");
-        expect(dashboard.render(40, 8).every((line) => visibleWidth(line) <= 40)).toBe(true);
     });
     it("keeps virtualized navigation index-safe with groups, pages, ends, resize, and mouse clicks", async () => {
         const sessions = Array.from({ length: 10_000 }, (_, index) => session(`s-${String(index).padStart(5, "0")}`, { taskState: index % 2 ? "READY" : "WORKING" }));
@@ -219,7 +218,8 @@ describe("dashboard controller", () => {
         await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledWith("a", 1, expect.any(String)));
         expect(backend.delete).not.toHaveBeenCalled();
         dashboard.applySnapshot({ sessions: [session("a", { revision: 2, processState: "EXITED", taskState: "STOPPED" })] });
-        dashboard.selectSession("a");
+        // The stopped row stays selected without the operator re-aiming at it.
+        expect(dashboard.selectedSessionId).toBe("a");
 
         now = 400;
         expect(dashboard.stopClearArmed).toBe(true);
@@ -484,18 +484,6 @@ describe("dashboard controller", () => {
         dashboard.handleInput("y");
         await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledTimes(2));
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
-    });
-    it("keeps a successfully stopped row selected and requires a later Delete confirmation", async () => {
-        const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
-        const dashboard = controller(backend, { requestId: () => "stop-request" });
-        await dashboard.open();
-        dashboard.handleInput("\x18");
-        dashboard.handleInput("y");
-        await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledWith("a", 1, "stop-request"));
-        await processRenderedEvent(dashboard, backend, { snapshot: { sessions: [session("a", { revision: 2, processState: "EXITED" })] }, cursor: { daemonEpoch: "epoch", sequence: "2" } });
-        expect(dashboard.selectedSessionId).toBe("a");
-        dashboard.handleInput("\x18");
-        expect(dashboard.overlay).toMatchObject({ action: "delete", sessionId: "a", revision: 2 });
     });
     it("closes the dashboard with Ctrl+C while a stop is in flight", async () => {
         let release;

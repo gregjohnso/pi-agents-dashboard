@@ -243,3 +243,28 @@ integrated baseline
 ## Backlog
 
 - [ ] List: `Ctrl+X` stops the selected session; a second `Ctrl+X` within 500 ms clears it. Same-key double-press window as the viewer's return gesture, no confirmation overlay for the stop, and the clear still refuses when the session is live or another frontend is attached.
+
+## Work in progress (2026-08-27)
+
+Branch `standalone-dashboard`, last commit `1be3bd6`, 862 tests and typecheck green. Daemon is running an older build; restart it to pick up everything below.
+
+Landed since the last daemon restart:
+- Delete works in production. Without a Pi trash seam it now forgets the dashboard record and leaves the session file and worktree untouched (`43951e7`).
+- Attach no longer resurrects a dead session; only the viewer sets `activate: true` (`43951e7`).
+- Delete reclaims worker leases whose process is provably gone (`32abf80`).
+- Daemon start sweeps worktree ownership locks left by dead daemons (`63a5a25`).
+- One derived state per row, Jobwatch-colored; header counts the same states (`8f30cb6`, `f6a05fc`).
+- List shows NAME/STATE/ACTIVITY/AGE, no ID column; selected row's cwd on the context line; composer has a closing rule (`f6a05fc`).
+- Summary pass writes a session name as well as a summary; `/rename` marks a name operator-owned (`f6a05fc`).
+- Destructive confirmations survive summary/name revision churn and cancel only when the session changes what it admits (`1be3bd6`).
+
+Open, in order:
+- [ ] Standard Pi commands (`/new`, `/resume`, `/stats`, `/tree`, `/export`, auto-compact/auto-retry/steering toggles) wired to Pi's own RPC implementations. `new_session`/`switch_session`/`fork`/`clone` rebind the running Pi to a different session file, so the daemon must follow the rebind (registry, viewer store, broadcast) or refuse honestly — never silently rebind.
+- [ ] `/color <name>`: dashboard-owned session color, set through a daemon op (works on dead sessions), tinting the viewer prompt bar and the NAME cell.
+- [ ] Arrow-key transcript scrolling, Jobwatch style, with follow-the-tail, new-activity marker and Home/End, plus a documented rule for sharing Up/Down with Pi's prompt history.
+- [ ] Two-finger/wheel scrolling. Root cause found: the mounted host component forwards only `handleInput`, so wheel events never reach either surface and `DashboardController.handleMouse` is currently dead code.
+- [ ] `Ctrl+X` stops a session; a second `Ctrl+X` within 500 ms clears it.
+- [ ] Fast-forward `master` (55 commits behind) so a fresh clone is not stale.
+- [ ] CLI destructive commands time out before the stop policy completes, reporting failure for a stop that succeeded.
+
+Three subagents for the first three items died when their runner process disappeared; their worktrees produced no commits. Relaunch from a clean tree.

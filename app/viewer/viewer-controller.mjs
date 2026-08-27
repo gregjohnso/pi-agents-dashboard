@@ -37,12 +37,6 @@ function framePromptBox(lines, color, width) {
   return [rule("╭", "╮"), ...padded, rule("╰", "╯")];
 }
 
-function isPageUp(data) { return matchesKey(data, Key.pageUp); }
-function isPageDown(data) { return matchesKey(data, Key.pageDown); }
-function isHome(data) { return matchesKey(data, Key.home); }
-function isEnd(data) { return matchesKey(data, Key.end); }
-
-/** Lines moved per wheel notch, matching Jobwatch's three-line step. */
 // One line per wheel notch leaves acceleration to the terminal and the OS, which already
 // translate a trackpad swipe into a notch count.
 const WHEEL_SCROLL_LINES = 1;
@@ -77,6 +71,25 @@ function renderKeyHints({ role, working }, width) {
   }
   return "";
 }
+
+/** @param {{ models: { provider: string, id: string }[] }} menu */
+function modelItems(menu) {
+  return menu.models.map((model) => ({ value: `${model.provider}/${model.id}`, label: `${model.provider}/${model.id}` }));
+}
+
+/**
+ * One Pi selection list per rejection code a bare built-in command can raise. `command` is undefined
+ * where the submitted name is itself the command, so /steering and /follow-up share one entry.
+ * @type {Record<string, { command?: string, title: (submitted?: string) => string, items: (menu: any) => { value: string, label: string }[] }>}
+ */
+const SELECTION_PICKERS = {
+  MODEL_REQUIRED: { command: "/model", title: () => "Select a model", items: modelItems },
+  THINKING_LEVEL_REQUIRED: { command: "/thinking", title: () => "Select a thinking level", items: (menu) => menu.thinkingLevels.map((/** @type {string} */ level) => ({ value: level, label: level })) },
+  SUMMARY_MODEL_REQUIRED: { command: "/model-summary", title: () => "Select a dashboard summary model", items: (menu) => [{ value: "off", label: "off · disable summaries" }, ...modelItems(menu)] },
+  SESSION_COLOR_REQUIRED: { command: "/color", title: () => "Select a session color", items: () => [{ value: "default", label: "default · no tint" }, ...SESSION_COLORS.map((color) => ({ value: color, label: color }))] },
+  QUEUE_MODE_REQUIRED: { title: (submitted) => `Select a ${submitted === "/steering" ? "steering" : "follow-up"} delivery mode`, items: () => [{ value: "all", label: "all · deliver every queued message" }, { value: "one-at-a-time", label: "one-at-a-time · deliver one per turn" }] },
+  TOGGLE_REQUIRED: { title: (submitted) => `Turn ${submitted === "/auto-retry" ? "automatic retry" : "automatic compaction"} on or off`, items: () => [{ value: "on", label: "on" }, { value: "off", label: "off" }] },
+};
 
 /** Own one standalone normalized Pi chat subscription and its composer role. */
 export class ViewerController {
@@ -226,10 +239,10 @@ export class ViewerController {
       return;
     }
     if (matchesKey(data, Key.ctrl("o"))) { this.transcript.selectNextTool(1); this.returnGesture.cancel(); this.requestRender(); return; }
-    if (isHome(data)) { this.transcript.scrollToStart(); this.returnGesture.cancel(); this.requestRender(); return; }
-    if (isEnd(data)) { this.transcript.scrollToEnd(); this.returnGesture.cancel(); this.requestRender(); return; }
-    if (isPageUp(data) || (this.state.role === "observer" && matchesKey(data, Key.up))) { this.transcript.scrollBy(-1); this.requestRender(); return; }
-    if (isPageDown(data) || (this.state.role === "observer" && matchesKey(data, Key.down))) { this.transcript.scrollBy(1); this.requestRender(); return; }
+    if (matchesKey(data, Key.home)) { this.transcript.scrollToStart(); this.returnGesture.cancel(); this.requestRender(); return; }
+    if (matchesKey(data, Key.end)) { this.transcript.scrollToEnd(); this.returnGesture.cancel(); this.requestRender(); return; }
+    if (matchesKey(data, Key.pageUp) || (this.state.role === "observer" && matchesKey(data, Key.up))) { this.transcript.scrollBy(-1); this.requestRender(); return; }
+    if (matchesKey(data, Key.pageDown) || (this.state.role === "observer" && matchesKey(data, Key.down))) { this.transcript.scrollBy(1); this.requestRender(); return; }
     // Arrows scroll only when the editor has nothing to offer: no draft to move within and no prompt
     // history to recall. Either one hands them back to Pi's editor, which keeps history reachable and
     // keeps the Left double-press gesture honest about a dirty prompt.
@@ -564,30 +577,14 @@ export class ViewerController {
 
   /** Offer one Pi selection list for a built-in command submitted without its argument. @param {string} code @param {string} [submitted] */
   openSelection(code, submitted) {
-    const models = this.menu.models.map((model) => ({ value: `${model.provider}/${model.id}`, label: `${model.provider}/${model.id}` }));
-    const picker = code === "MODEL_REQUIRED"
-      ? { title: "Select a model", items: models }
-      : code === "THINKING_LEVEL_REQUIRED"
-        ? { title: "Select a thinking level", items: this.menu.thinkingLevels.map((level) => ({ value: level, label: level })) }
-        : code === "SUMMARY_MODEL_REQUIRED"
-          ? { title: "Select a dashboard summary model", items: [{ value: "off", label: "off · disable summaries" }, ...models] }
-          : code === "SESSION_COLOR_REQUIRED"
-            ? { title: "Select a session color", items: [{ value: "default", label: "default · no tint" }, ...SESSION_COLORS.map((color) => ({ value: color, label: color }))] }
-            : code === "QUEUE_MODE_REQUIRED"
-              ? { title: `Select a ${submitted === "/steering" ? "steering" : "follow-up"} delivery mode`, items: [{ value: "all", label: "all · deliver every queued message" }, { value: "one-at-a-time", label: "one-at-a-time · deliver one per turn" }] }
-              : code === "TOGGLE_REQUIRED"
-                ? { title: `Turn ${submitted === "/auto-retry" ? "automatic retry" : "automatic compaction"} on or off`, items: [{ value: "on", label: "on" }, { value: "off", label: "off" }] }
-                : undefined;
-    if (picker === undefined || picker.items.length === 0) return false;
-    const command = code === "MODEL_REQUIRED" ? "/model"
-      : code === "THINKING_LEVEL_REQUIRED" ? "/thinking"
-        : code === "SESSION_COLOR_REQUIRED" ? "/color"
-          : code === "QUEUE_MODE_REQUIRED" || code === "TOGGLE_REQUIRED" ? submitted
-            : "/model-summary";
-    if (command === undefined) return false;
+    const picker = SELECTION_PICKERS[code];
+    if (picker === undefined) return false;
+    const command = picker.command ?? submitted;
+    const items = picker.items(this.menu);
+    if (command === undefined || items.length === 0) return false;
     this.selection?.dispose();
     this.selection = new CommandSelectionOverlay({
-      title: picker.title, items: picker.items,
+      title: picker.title(submitted), items,
       tui: this.editor.tui ?? { requestRender: () => this.requestRender(), setFocus() {} },
       returnFocus: this.editor,
       respond: (/** @type {string | undefined} */ value) => {

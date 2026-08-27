@@ -88,9 +88,10 @@ export const jobwatchTheme = {
     name(text, selected, color) {
         if (color === undefined)
             return paint(text, JOBWATCH_ANSI.text, selected);
-        // A colour is a label, so it fills the cell and the name inverts to black. Selection still
-        // wins, because the cursor row must stay findable whatever colour it carries.
-        return paint(text, selected ? JOBWATCH_ANSI[color] : JOBWATCH_ANSI.black, selected, backgroundFor(color));
+        // A colour is a label the operator chose, so selection must not repaint it. The row keeps the
+        // colour behind black text either way; selection adds weight only.
+        const bold = selected ? JOBWATCH_ANSI.bold : "";
+        return `${backgroundFor(color)}${JOBWATCH_ANSI.black}${bold}${text}${JOBWATCH_ANSI.reset}`;
     },
     muted(text, selected) {
         return paint(text, JOBWATCH_ANSI.gray, selected);

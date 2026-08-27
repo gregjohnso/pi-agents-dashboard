@@ -197,6 +197,23 @@ it("bolds the selected row without altering its colors", () => {
     expect(stripVTControlCharacters(selected)).toBe(stripVTControlCharacters(plain));
 });
 
+it("keeps a colored name highlighted when the row is selected, adding only weight", () => {
+    const layout = createDashboardLayout(120, 20);
+    const amberBackground = "\u001b[48;2;252;211;77m";
+    const black = "\u001b[38;2;0;0;0m";
+    const colored = renderSessionRow(session("c", { color: "amber" }), layout, { now });
+    const selected = renderSessionRow(session("c", { color: "amber" }), layout, { now, selected: true });
+
+    // Selection adds bold and changes nothing about the color the operator chose.
+    expect(colored).toContain(amberBackground);
+    expect(colored).toContain(black);
+    expect(selected).toContain(amberBackground);
+    expect(selected).toContain(black);
+    expect(selected).toContain(JOBWATCH_ANSI.bold);
+    expect(colored).not.toContain(JOBWATCH_ANSI.bold);
+    expect(stripVTControlCharacters(selected)).toBe(stripVTControlCharacters(colored));
+});
+
 it("spins an unlabelled column left of STATE so the state text never shifts", () => {
     const layout = createDashboardLayout(100, 24);
     const spinner = /[\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f]/u;

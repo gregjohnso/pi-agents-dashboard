@@ -192,6 +192,15 @@ function fitLine(line, width) {
 function paintPlainLine(text, width, paint) {
     return paint(fitLine(stripVTControlCharacters(String(text)), width));
 }
+const COMPOSER_FIELD_LABELS = {
+    prompt: "prompt",
+    cwd: "cwd",
+    isolationMode: "isolation",
+    modelProvider: "model provider",
+    modelId: "model id",
+    thinkingLevel: "thinking",
+    name: "name",
+};
 function sectionBorder(label, width, focused) {
     const prefix = `╭─ ${label} `;
     const line = prefix + "─".repeat(Math.max(0, width - visibleWidth(prefix)));
@@ -677,9 +686,9 @@ export class DashboardController {
             }
             if (lines.length >= 4) {
                 const composerFocused = this.focus === "composer" || this.focus === "confirmation";
-                const composerMarker = composerFocused ? `[${this.composerField}]` : "";
-                lines[lines.length - 4] = sectionBorder("New Session", this.width, composerFocused);
-                lines[lines.length - 3] = paintPlainLine(` ❯${composerMarker} ${this.composerDraft.prompt || "describe a task for a new session"}`, this.width, (text) => jobwatchTheme.panel(text, composerFocused));
+                const draftPrompt = this.composerDraft.prompt;
+                lines[lines.length - 4] = sectionBorder(composerFocused ? `New Session · ${COMPOSER_FIELD_LABELS[this.composerField]}` : "New Session", this.width, composerFocused);
+                lines[lines.length - 3] = paintPlainLine(` ❯ ${draftPrompt || "describe a task for a new session"}`, this.width, draftPrompt ? (text) => jobwatchTheme.text(text, false) : (text) => jobwatchTheme.muted(text, false));
                 const form = ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
                 lines[lines.length - 2] = paintPlainLine(this.status.kind === "error" ? ` ${this.status.code}: ${this.status.message}  ${form}` : form, this.width, this.status.kind === "error" ? jobwatchTheme.error : jobwatchTheme.surface);
                 lines[lines.length - 1] = paintPlainLine(" Ctrl+C quit  ↑↓ navigate  Enter/→ open  ←/Esc back  / search  n form  Tab fields  ^X action  ? help", this.width, jobwatchTheme.keyHints);

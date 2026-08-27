@@ -9,7 +9,7 @@ const ENTER_ALT_SCREEN = Buffer.from("\x1b[?1049h");
 const EXIT_ALT_SCREEN = Buffer.from("\x1b[?1049l");
 const SHOW_CURSOR = Buffer.from("\x1b[?25h");
 const ENABLE_AUTOWRAP = Buffer.from("\x1b[?7h");
-const FOCUSED_PROMPT = Buffer.from("\x1b[48;2;54;54;54m\x1b[38;2;255;255;255m ❯[prompt]");
+const FOCUSED_COMPOSER = Buffer.from("New Session · prompt");
 
 it("navigates to New Session, quits with Ctrl+C, and restores the real terminal", async () => {
   const temporaryRoot = await mkdtemp(join(tmpdir(), "pi-dashboard-pty-"));
@@ -36,10 +36,10 @@ it("navigates to New Session, quits with Ctrl+C, and restores the real terminal"
     if (stage === "startup" && output.includes(Buffer.from("New Session"))) {
       stage = "down";
       child.stdin.write("\x1b[B");
-    } else if (stage === "down" && output.includes(FOCUSED_PROMPT)) {
+    } else if (stage === "down" && output.includes(FOCUSED_COMPOSER)) {
       stage = "typing";
       child.stdin.write("x");
-    } else if (stage === "typing" && output.includes(Buffer.from("❯[prompt] x"))) {
+    } else if (stage === "typing" && output.includes(Buffer.from("❯ x"))) {
       stage = "quit";
       child.stdin.write("\x03");
     }
@@ -71,7 +71,7 @@ it("navigates to New Session, quits with Ctrl+C, and restores the real terminal"
   expect(transcript.includes(EXIT_ALT_SCREEN)).toBe(true);
   expect(transcript.includes(SHOW_CURSOR)).toBe(true);
   expect(transcript.includes(ENABLE_AUTOWRAP)).toBe(true);
-  expect(transcript.includes(Buffer.from("❯[prompt] x"))).toBe(true);
+  expect(transcript.includes(Buffer.from("❯ x"))).toBe(true);
 
   const sttyMarker = transcript.indexOf(Buffer.from("__STTY__"));
   expect(sttyMarker).toBeGreaterThanOrEqual(0);

@@ -120,7 +120,9 @@ describe("dashboard controller", () => {
         const composerFocused = dashboard.render(100, 16);
         expect(composerFocused[3]).toContain(JOBWATCH_ANSI.gray);
         expect(composerFocused.at(-4)).toContain(JOBWATCH_ANSI.sky);
-        expect(composerFocused.at(-3)).toContain(JOBWATCH_ANSI.selectionBackground);
+        expect(composerFocused.at(-3)).toBe(listFocused.at(-3));
+        dashboard.handleInput("\t");
+        expect(stripVTControlCharacters(dashboard.render(100, 16).at(-4))).toContain("New Session · cwd");
     });
     it("applies search, task/project filters, grouping, and sort independently without changing selected ID", async () => {
         const waiting = session("waiting", { taskState: "WAITING", processState: "LIVE", outcome: "NONE", cwd: "/repo/a", activity: { kind: "ui", summary: "Need approval", updatedAt: timestamp } });
@@ -154,6 +156,24 @@ describe("dashboard controller", () => {
         await dashboard.open();
         await vi.waitFor(() => expect(backend.refreshSummaries).toHaveBeenCalled());
         expect(dashboard.status).toEqual({ kind: "ready" });
+    });
+    it("greys the composer placeholder and leaves the prompt line unchanged when focused", async () => {
+        const dashboard = controller(new FakeBackend([]));
+        await dashboard.open();
+        const promptLine = (rendered) => rendered[rendered.length - 3];
+        const unfocused = promptLine(dashboard.render(80, 24));
+        expect(stripVTControlCharacters(unfocused)).toContain("describe a task for a new session");
+        expect(unfocused).toContain(JOBWATCH_ANSI.gray);
+
+        dashboard.focusComposer();
+        expect(promptLine(dashboard.render(80, 24))).toBe(unfocused);
+
+        dashboard.setComposerPrompt("ship it");
+        const typed = promptLine(dashboard.render(80, 24));
+        expect(stripVTControlCharacters(typed)).toContain("ship it");
+        expect(stripVTControlCharacters(typed)).not.toContain("describe a task");
+        expect(typed).not.toContain(JOBWATCH_ANSI.gray);
+        expect(stripVTControlCharacters(typed)).not.toContain("[prompt]");
     });
     it("counts only the sessions the current view shows", async () => {
         const dashboard = controller(new FakeBackend([

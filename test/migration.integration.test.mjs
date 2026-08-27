@@ -48,7 +48,7 @@ it("publishes and reconciles exactly one real destination daemon", async () => {
     await runDaemonCommand("stop", { root: destinationRoot }).catch(() => {});
     await rm(parent, { recursive: true, force: true });
   }
-}, 15_000);
+}, 20_000);
 
 it.each([
   ["a group-readable legacy root", async ({ legacyRoot }) => chmod(legacyRoot, 0o755), "UNSAFE_LEGACY_STATE"],

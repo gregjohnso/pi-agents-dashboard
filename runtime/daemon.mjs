@@ -257,6 +257,16 @@ function sessionCommandPayload(payload) {
   return payload.instructions === undefined ? { command: "compact" } : { command: "compact", instructions: payload.instructions };
 }
 
+/** Report whether an exact recorded process identity is provably gone. @param {any} identity @param {(pid: number) => Promise<any>} inspect */
+async function processIsGone(identity, inspect) {
+  if (identity?.pid === undefined) return false;
+  try {
+    return !sameProcessIdentity(await inspect(identity.pid), identity);
+  } catch (error) {
+    return ["ENOENT", "ESRCH"].includes(/** @type {NodeJS.ErrnoException} */ (error)?.code ?? "");
+  }
+}
+
 /** @param {any} left @param {any} right */
 function sameProcessIdentity(left, right) {
   return left?.pid === right?.pid && left?.startIdentity === right?.startIdentity && left?.processGroupId === right?.processGroupId;
@@ -1161,7 +1171,7 @@ export async function createDaemonRuntime({
             const history = await context.recovery.journal.history(request);
             const retryAtRisk = history.some((/** @type {any} */ prior, /** @type {number} */ index) => prior.stage === "DELIVERY_UNKNOWN" && history[index + 1]?.stage === "ACCEPTED");
             const reconciliationOnly = accepted.stage === "DELIVERY_UNKNOWN";
-            status = await router.runSession(request.payload.sessionId, async (/** @type {any} */ { metadata: lockedMetadata, route: lockedRoute }) => {
+            status = await router.runSession(request.payload.sessionId, async (/** @type {any} */ { metadata: lockedMetadata, route: lockedRoute, forget }) => {
               const complete = async () => {
                 await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
                 await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
@@ -1213,6 +1223,11 @@ export async function createDaemonRuntime({
               }
               if (record === undefined) return refuse("SESSION_NOT_FOUND", "The exact session does not exist");
               if (record.ownership !== undefined || ["LIVE", "SLEEPING"].includes(record.processState)) return refuse("SESSION_LIVE", "Delete refuses a live or owned session");
+              // A lease whose worker process is provably gone cannot be authoritative; reclaim it instead of refusing forever.
+              if (lockedMetadata !== undefined && lockedRoute === undefined && await processIsGone(lockedMetadata.identity, inspect)) {
+                await forget();
+                lockedMetadata = undefined;
+              }
               if (lockedMetadata !== undefined || lockedRoute !== undefined || launchingSessions.has(record.sessionId)) return refuse("OWNERSHIP_CONFLICT", "A worker lease, route, or launch is still authoritative");
               const claims = attachmentClaims.get(record.sessionId);
               if (claims !== undefined && [...claims.keys()].some((candidate) => candidate !== socket)) return refuse("SESSION_ATTACHED", "Delete refuses another attached frontend");

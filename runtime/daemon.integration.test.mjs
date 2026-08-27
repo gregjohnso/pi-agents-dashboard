@@ -261,6 +261,34 @@ it("rejects worker mutations during reconciliation without touching unopened sto
   worker.close();
 });
 
+it("forgets a session whose worker lease points at a dead process", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const now = "2026-08-25T12:00:00.000Z";
+  const identity = { pid: 909, startIdentity: "90901", processGroupId: 909 };
+  const sessionFile = join(stateRoot, "leased.jsonl");
+  await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "leased", timestamp: now, cwd: stateRoot })}\n`, { mode: 0o600 });
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "leased", sessionFile, canonicalSessionFile: sessionFile, cwd: stateRoot, taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "assistant_final", summary: "done", updatedAt: now }, latestRunId: "run-leased", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "leased", runId: "run-leased", leaseId: "lease-leased", generation: 1, identity, piChildIdentity: identity }] })}\n`, { mode: 0o600 });
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    inspect: async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : Promise.reject(Object.assign(new Error("gone"), { code: "ESRCH" })),
+    reconnectTimeoutMs: 200,
+  });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
+  await client.ready;
+
+  client.send({ version: 1, clientId: "viewer", requestId: "attach-leased", op: "attach", payload: { sessionId: "leased", role: "composer" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+  client.send({ version: 1, clientId: "viewer", requestId: "forget-leased", op: "delete", payload: { sessionId: "leased", revision: 0 } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  expect(await registry.get("leased")).toBeUndefined();
+  client.close();
+});
+
 it("forgets a dead session without touching its Pi session file, and never resurrects it on attach", async () => {
   const stateRoot = await root();
   for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });

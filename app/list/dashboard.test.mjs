@@ -99,7 +99,7 @@ describe("dashboard controller", () => {
         dashboard.handleInput("\x1b[F");
         expect(dashboard.selectedSessionId).toBe("s-09999");
         dashboard.handleMouse({ row: 6, column: 2, button: "left" });
-        expect(dashboard.selectedSessionId).toBeDefined();
+        expect(dashboard.selectedSessionId).not.toBe("s-09999");
         expect(dashboard.render(80, 14).length).toBeLessThanOrEqual(14);
     });
     it("renders Jobwatch-style surfaces, focus borders, selection, and key hints", async () => {

@@ -1746,3 +1746,59 @@ it("reports the counts idle exit depends on", async () => {
   client.socket.destroy();
   await vi.waitFor(() => expect(runtime.attachedFrontends()).toBe(0));
 });
+
+it("repairs a session whose supervisor and Pi child are both gone and reaches READY", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const now = "2026-08-25T12:00:00.000Z";
+  const identity = { pid: 701, startIdentity: "dead-supervisor", processGroupId: 701 };
+  const piChild = { pid: 702, startIdentity: "dead-pi", processGroupId: 701 };
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "recovered", sessionFile: "/sessions/recovered.jsonl", canonicalSessionFile: "/sessions/recovered.jsonl", cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-recovered", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-recovered", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "recovered", runId: "run-recovered", leaseId: "lease-recovered", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    inspect: async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : Promise.reject(Object.assign(new Error("gone"), { code: "ESRCH" })),
+  });
+  runtimes.push(runtime);
+
+  await runtime.ready;
+  expect(runtime.status()).toMatchObject({ state: "READY" });
+  const repaired = await registry.get("recovered");
+  expect(repaired).toMatchObject({ processState: "EXITED" });
+  expect(repaired?.ownership).toBeUndefined();
+  expect(JSON.parse(await readFile(join(stateRoot, "daemon", "workers.json"), "utf8")).workers).toEqual([]);
+});
+
+it("admits no second writer when a dead supervisor leaves a live Pi child", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const now = "2026-08-25T12:00:00.000Z";
+  const identity = { pid: 711, startIdentity: "gone-supervisor", processGroupId: 711 };
+  const piChild = { pid: 712, startIdentity: "live-pi", processGroupId: 711 };
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "orphaned", sessionFile: "/sessions/orphaned.jsonl", canonicalSessionFile: "/sessions/orphaned.jsonl", cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-orphaned", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-orphaned", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "orphaned", runId: "run-orphaned", leaseId: "lease-orphaned", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  let launches = 0;
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    inspect: async (/** @type {number} */ pid) => {
+      if (pid === process.pid) return { pid, startIdentity: "daemon", processGroupId: process.pid };
+      if (pid === piChild.pid) return piChild;
+      throw Object.assign(new Error("gone"), { code: "ESRCH" });
+    },
+    hostProbe: async () => ({ blockers: [] }),
+    resolveLaunchRequest: async () => ({ sessionId: "orphaned" }),
+    workerSupervisor: { async launch() { launches += 1; return {}; }, async close() {} },
+  });
+  runtimes.push(runtime);
+
+  await expect(runtime.ready).rejects.toMatchObject({ code: "OWNERSHIP_CONFLICT", conflicts: [expect.objectContaining({ sessionId: "orphaned", reason: "PI_CHILD_ORPHANED" })] });
+  expect((await registry.get("orphaned"))?.ownership).toMatchObject({ runId: "run-orphaned" });
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
+  await client.ready;
+  client.send({ version: 1, clientId: "launcher", requestId: "second-writer", op: "launch", payload: { prompt: "go", cwd: "/repo", sourceSessionId: "orphaned", isolation: { mode: "shared_directory", confirmedCwd: "/repo", ownerSessionIds: [] } } });
+  expect(await client.next()).toMatchObject({ ok: false, error: { code: "OWNERSHIP_CONFLICT" } });
+  expect(launches).toBe(0);
+  client.close();
+});

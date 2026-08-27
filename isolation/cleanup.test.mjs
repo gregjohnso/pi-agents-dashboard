@@ -185,6 +185,21 @@ it("rechecks live ownership immediately before worktree removal", async () => {
   await expect(access(isolation.worktreePath)).resolves.toBeUndefined();
 });
 
+it("cleans up after a dashboard that died holding the ownership lock", async () => {
+  const { isolation } = await fixture();
+  const lockPath = `${isolation.worktreePath}.pi-dashboard-ownership.lock`;
+  await mkdir(lockPath, { recursive: true, mode: 0o700 });
+  await writeFile(
+    join(lockPath, "dead-token"),
+    `${JSON.stringify({ token: "dead-token", owner: { operation: "worktree_ownership", worktreePath: isolation.worktreePath }, holder: { pid: 4242, processGroupId: 4242, startIdentity: "9001" } })}\n`,
+    { mode: 0o600 },
+  );
+
+  await expect(
+    cleanupOwnedWorktree(isolation, noLiveOwnershipOptions),
+  ).resolves.toEqual({ disposition: "REMOVED" });
+});
+
 it("holds the authoritative ownership lock throughout cleanup", async () => {
   const { isolation } = await fixture();
   const lock = await acquireWorktreeOwnershipLock(isolation.worktreePath);

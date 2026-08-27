@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import { afterEach, expect, it } from "vitest";
 
 import { launchPreflight } from "./launch-preflight.mjs";
-import { createWorktree, WORKTREE_OWNERSHIP_FILE } from "./worktree.mjs";
+import { acquireWorktreeOwnershipLock, createWorktree, WORKTREE_OWNERSHIP_FILE } from "./worktree.mjs";
 
 const execFileAsync = promisify(execFile);
 /** @type {string[]} */
@@ -52,6 +52,62 @@ async function preflight(paths, cwd = paths.root) {
     { piConfigRoot: paths.piConfigRoot },
   );
 }
+
+it("reclaims an ownership lock abandoned by a dead dashboard process", async () => {
+  const paths = await fixture();
+  const worktreePath = join(paths.piConfigRoot, "pi-dashboard", "worktrees", "run-stale");
+  const lockPath = `${worktreePath}.pi-dashboard-ownership.lock`;
+  await mkdir(lockPath, { recursive: true, mode: 0o700 });
+  await writeFile(
+    join(lockPath, "dead-token"),
+    `${JSON.stringify({ token: "dead-token", owner: { operation: "worktree_ownership", worktreePath }, holder: { pid: 4242, processGroupId: 4242, startIdentity: "9001" } })}\n`,
+    { mode: 0o600 },
+  );
+
+  const lock = await acquireWorktreeOwnershipLock(worktreePath);
+
+  expect(await stat(join(lockPath, "dead-token")).catch((error) => error.code)).toBe("ENOENT");
+  await expect(lock.release()).resolves.toBeUndefined();
+});
+
+it("reclaims an identity-free legacy lock only when its worktree is gone", async () => {
+  const paths = await fixture();
+  const worktreesRoot = join(paths.piConfigRoot, "pi-dashboard", "worktrees");
+  const worktreePath = join(worktreesRoot, "run-legacy");
+  const lockPath = `${worktreePath}.pi-dashboard-ownership.lock`;
+  const writeLegacyLock = async () => {
+    await mkdir(lockPath, { recursive: true, mode: 0o700 });
+    await writeFile(
+      join(lockPath, "legacy-token"),
+      `${JSON.stringify({ token: "legacy-token", owner: { operation: "worktree_ownership", worktreePath } })}\n`,
+      { mode: 0o600 },
+    );
+  };
+
+  await mkdir(worktreePath, { recursive: true, mode: 0o700 });
+  await writeLegacyLock();
+  await expect(acquireWorktreeOwnershipLock(worktreePath)).rejects.toMatchObject({
+    code: "WORKTREE_OWNERSHIP_LOCKED",
+  });
+
+  await rm(worktreePath, { recursive: true, force: true });
+  await writeLegacyLock();
+  const lock = await acquireWorktreeOwnershipLock(worktreePath);
+  await expect(lock.release()).resolves.toBeUndefined();
+});
+
+it("refuses an ownership lock held by a live dashboard process", async () => {
+  const paths = await fixture();
+  const worktreePath = join(paths.piConfigRoot, "pi-dashboard", "worktrees", "run-live");
+  await mkdir(join(paths.piConfigRoot, "pi-dashboard", "worktrees"), { recursive: true, mode: 0o700 });
+  const held = await acquireWorktreeOwnershipLock(worktreePath);
+
+  await expect(acquireWorktreeOwnershipLock(worktreePath)).rejects.toMatchObject({
+    code: "WORKTREE_OWNERSHIP_LOCKED",
+  });
+
+  await held.release();
+});
 
 it("creates an owned branch worktree and preserves the source subdirectory", async () => {
   const paths = await fixture();

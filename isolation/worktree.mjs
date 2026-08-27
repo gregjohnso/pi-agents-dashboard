@@ -56,7 +56,12 @@ export async function acquireWorktreeOwnershipLock(worktreePath) {
     const lockPaths = [`${worktreePath}${WORKTREE_LOCK_SUFFIX}`];
     try { await lstat(`${worktreePath}${LEGACY_WORKTREE_LOCK_SUFFIX}`); lockPaths.push(`${worktreePath}${LEGACY_WORKTREE_LOCK_SUFFIX}`); }
     catch (error) { if (/** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT") throw error; }
-    for (const lockPath of lockPaths.sort()) locks.push(await acquireLifecycleLock(lockPath, { operation: "worktree_ownership", worktreePath }));
+    // Locks written before holder identity existed carry no way to test liveness, so they may be
+    // reclaimed only once the worktree they guard is gone and no live operation can still need them.
+    let reclaimIdentityFreeLock = false;
+    try { await lstat(worktreePath); }
+    catch (error) { reclaimIdentityFreeLock = /** @type {NodeJS.ErrnoException} */ (error).code === "ENOENT"; }
+    for (const lockPath of lockPaths.sort()) locks.push(await acquireLifecycleLock(lockPath, { operation: "worktree_ownership", worktreePath }, undefined, { reclaimIdentityFreeLock }));
     return { release: async () => { for (const lock of locks.reverse()) await lock.release(); } };
   } catch (cause) {
     for (const lock of locks.reverse()) await lock.release().catch(() => {});

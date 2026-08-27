@@ -7,6 +7,22 @@ import { afterEach, expect, it } from "vitest";
 
 import { acquireLifecycleLock } from "./lifecycle-lock.mjs";
 
+/** @param {string} path */
+async function readSoleRecord(path) {
+  const [entry] = await fs.readdir(path);
+  return JSON.parse(await readFile(join(path, entry), "utf8"));
+}
+
+/** @param {string} path @param {unknown} record */
+async function writeSoleRecord(path, record) {
+  await fs.mkdir(path, { mode: 0o700 });
+  const token = "stale-token";
+  await writeFile(join(path, token), `${JSON.stringify(record)}\n`, { mode: 0o600 });
+}
+
+const deadHolder = { pid: 4242, processGroupId: 4242, startIdentity: "9001" };
+const inspectDead = async () => { throw Object.assign(new Error("no such process"), { code: "ESRCH" }); };
+
 /** @type {string[]} */
 const cleanup = [];
 afterEach(async () => {
@@ -24,13 +40,117 @@ async function readTokenEntry(path, token) {
   return JSON.parse(await readFile(join(path, token), "utf8"));
 }
 
+it("records the holder process identity in its own lock entry", async () => {
+  const path = await makeLockPath();
+
+  const lock = await acquireLifecycleLock(path, { operation: "worktree_ownership" });
+
+  expect(await readTokenEntry(path, lock.token)).toMatchObject({
+    token: lock.token,
+    owner: { operation: "worktree_ownership" },
+    holder: { pid: process.pid, processGroupId: expect.any(Number), startIdentity: expect.any(String) },
+  });
+});
+
+it("reclaims a lock whose holder process is gone", async () => {
+  const path = await makeLockPath();
+  await writeSoleRecord(path, { token: "stale-token", owner: { operation: "worktree_ownership" }, holder: deadHolder });
+
+  const lock = await acquireLifecycleLock(path, { operation: "worktree_ownership" }, fs, { inspect: inspectDead });
+
+  expect(await readSoleRecord(path)).toMatchObject({ token: lock.token, holder: { pid: process.pid } });
+  expect((await stat(path)).mode & 0o777).toBe(0o700);
+  expect((await stat(join(path, lock.token))).mode & 0o777).toBe(0o600);
+});
+
+it("reclaims a lock whose holder pid was reused by a different process", async () => {
+  const path = await makeLockPath();
+  await writeSoleRecord(path, { token: "stale-token", owner: { operation: "worktree_ownership" }, holder: deadHolder });
+  const inspectReused = async (/** @type {number} */ pid) => ({ pid, processGroupId: 4242, startIdentity: "7777" });
+
+  const lock = await acquireLifecycleLock(path, { operation: "worktree_ownership" }, fs, { inspect: inspectReused });
+
+  expect(await readSoleRecord(path)).toMatchObject({ token: lock.token });
+});
+
+it("refuses a lock whose holder process is still alive", async () => {
+  const path = await makeLockPath();
+  await writeSoleRecord(path, { token: "stale-token", owner: { operation: "worktree_ownership" }, holder: deadHolder });
+  const inspectAlive = async (/** @type {number} */ pid) => ({ pid, processGroupId: 4242, startIdentity: "9001" });
+
+  await expect(acquireLifecycleLock(path, { operation: "x" }, fs, { inspect: inspectAlive })).rejects.toMatchObject({ code: "LOCK_HELD" });
+  expect(await readSoleRecord(path)).toMatchObject({ token: "stale-token" });
+});
+
+it.each([
+  ["an unreadable record", "{ not json"],
+  ["a record without holder identity", JSON.stringify({ token: "stale-token", owner: { operation: "worktree_ownership" } })],
+  ["a record with an incomplete holder", JSON.stringify({ token: "stale-token", owner: {}, holder: { pid: 4242 } })],
+  ["a token mismatch", JSON.stringify({ token: "other-token", owner: {}, holder: deadHolder })],
+])("fails closed for %s", async (_label, contents) => {
+  const path = await makeLockPath();
+  await fs.mkdir(path, { mode: 0o700 });
+  await writeFile(join(path, "stale-token"), `${contents}\n`, { mode: 0o600 });
+
+  await expect(acquireLifecycleLock(path, { operation: "x" }, fs, { inspect: inspectDead })).rejects.toMatchObject({ code: "LOCK_HELD" });
+  expect(await fs.readdir(path)).toEqual(["stale-token"]);
+});
+
+it("fails closed when holder liveness cannot be determined", async () => {
+  const path = await makeLockPath();
+  await writeSoleRecord(path, { token: "stale-token", owner: {}, holder: deadHolder });
+  const inspectUnknown = async () => { throw Object.assign(new Error("permission denied"), { code: "EACCES" }); };
+
+  await expect(acquireLifecycleLock(path, { operation: "x" }, fs, { inspect: inspectUnknown })).rejects.toMatchObject({ code: "LOCK_HELD" });
+  expect(await fs.readdir(path)).toEqual(["stale-token"]);
+});
+
+it("fails closed when several holders share the lock directory", async () => {
+  const path = await makeLockPath();
+  await writeSoleRecord(path, { token: "stale-token", owner: {}, holder: deadHolder });
+  await writeFile(join(path, "second-token"), `${JSON.stringify({ token: "second-token", owner: {}, holder: deadHolder })}\n`, { mode: 0o600 });
+
+  await expect(acquireLifecycleLock(path, { operation: "x" }, fs, { inspect: inspectDead })).rejects.toMatchObject({ code: "LOCK_HELD" });
+  expect((await fs.readdir(path)).sort()).toEqual(["second-token", "stale-token"]);
+});
+
+it("keeps a live holder's lock when the record changes during reclamation", async () => {
+  const path = await makeLockPath();
+  await writeSoleRecord(path, { token: "stale-token", owner: {}, holder: deadHolder });
+  const fsOps = {
+    ...fs,
+    /** @param {string} entryPath @param {BufferEncoding} encoding */
+    async readFile(entryPath, encoding) {
+      const contents = await fs.readFile(entryPath, encoding);
+      if (entryPath === join(path, "stale-token")) {
+        await fs.writeFile(entryPath, `${JSON.stringify({ token: "stale-token", owner: {}, holder: { ...deadHolder, pid: 5150 } })}\n`, { mode: 0o600 });
+      }
+      return contents;
+    },
+  };
+
+  await expect(acquireLifecycleLock(path, { operation: "x" }, fsOps, { inspect: inspectDead })).rejects.toMatchObject({ code: "LOCK_HELD" });
+  expect(await readSoleRecord(path)).toMatchObject({ holder: { pid: 5150 } });
+});
+
+it("reclaims an identity-free legacy lock only when the caller proves it is unowned", async () => {
+  const path = await makeLockPath();
+  const legacy = { token: "stale-token", owner: { operation: "worktree_ownership", worktreePath: "/tmp/example" } };
+  await writeSoleRecord(path, legacy);
+
+  await expect(acquireLifecycleLock(path, { operation: "x" }, fs, { inspect: inspectDead })).rejects.toMatchObject({ code: "LOCK_HELD" });
+
+  const lock = await acquireLifecycleLock(path, { operation: "x" }, fs, { inspect: inspectDead, reclaimIdentityFreeLock: true });
+  expect(await readSoleRecord(path)).toMatchObject({ token: lock.token, holder: { pid: process.pid } });
+});
+
 it("acquires an exclusive token-entry lock directory and releases its own token", async () => {
   const path = await makeLockPath();
   const owner = { pid: 42, startTimeTicks: "9001", operation: "start" };
 
   const lock = await acquireLifecycleLock(path, owner);
 
-  expect(await readTokenEntry(path, lock.token)).toEqual({ token: lock.token, owner });
+  expect(await readTokenEntry(path, lock.token)).toMatchObject({ token: lock.token, owner });
   expect(lock.token).toMatch(/^[0-9a-f-]{36}$/);
   expect((await stat(path)).mode & 0o777).toBe(0o700);
   expect((await stat(join(path, lock.token))).mode & 0o777).toBe(0o600);
@@ -93,7 +213,7 @@ it("keeps B public while stale A releases and C attempts acquisition", async () 
   await expect(aLock.release()).resolves.toBe(false);
   expect(cLock).toBeUndefined();
   expect(cError).toMatchObject({ code: "LOCK_HELD" });
-  expect(await readTokenEntry(path, bLock.token)).toEqual({
+  expect(await readTokenEntry(path, bLock.token)).toMatchObject({
     token: bLock.token,
     owner: { pid: 99, holder: "B" },
   });
@@ -143,7 +263,7 @@ it("returns the holder when staging cleanup fails after publication", async () =
 
   const lock = await acquireLifecycleLock(path, { pid: 42 }, fsOps);
 
-  expect(await readTokenEntry(path, lock.token)).toEqual({ token: lock.token, owner: { pid: 42 } });
+  expect(await readTokenEntry(path, lock.token)).toMatchObject({ token: lock.token, owner: { pid: 42 } });
   await expect(lock.release()).resolves.toBe(true);
 });
 
@@ -179,7 +299,7 @@ it("failed acquisition cleans only its staging directory", async () => {
   });
 
   expect(removed).not.toContain(path);
-  expect(await readTokenEntry(path, replacement.token)).toEqual({
+  expect(await readTokenEntry(path, replacement.token)).toMatchObject({
     token: replacement.token,
     owner: { pid: 99 },
   });

@@ -69,7 +69,18 @@ export function createDaemonViewerClient({ client, clientId }) {
       const result = await request("get_session_commands", { sessionId });
       if (result?.kind !== "session_commands") throw Object.assign(new Error("Daemon returned the wrong session command menu"), { code: "INVALID_RESPONSE" });
       const settings = await request("get_settings", {}).catch(() => undefined);
-      return { ...result, summaryModel: settings?.kind === "settings" ? settings.summaryModel : null };
+      const state = await request("get_state", {}).catch(() => undefined);
+      const record = state?.kind === "state" ? state.sessions.find((/** @type {any} */ session) => session.sessionId === sessionId) : undefined;
+      return {
+        ...result,
+        summaryModel: settings?.kind === "settings" ? settings.summaryModel : null,
+        color: record?.color ?? null,
+        ...(record === undefined ? {} : { registryRevision: record.revision }),
+      };
+    },
+    /** @param {string} sessionId @param {number} revision @param {string | null} color */
+    async setSessionColor(sessionId, revision, color) {
+      return client.setSessionColor(sessionId, revision, color);
     },
     /** @param {string} sessionId @param {Record<string, any>} payload */
     async query(sessionId, payload) {

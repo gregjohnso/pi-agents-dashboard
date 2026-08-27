@@ -13,7 +13,7 @@ import { parseViewerSnapshot } from "./viewer-contracts.mjs";
 /** @typedef {{kind:"managed",runId:string,process:ProcessIdentity,acquiredAt:string,heartbeatAt:string}} WorkerOwnership */
 /** @typedef {{mode:"worktree",worktreePath:string,branch:string}|{mode:"shared_directory",canonicalCwd:string}} IsolationRecord */
 /** @typedef {{text:string,generatedAt:string,model:{provider:string,id:string},sourceCursor:string}} SessionSummary */
-/** @typedef {{schemaVersion:1,revision:number,sessionId:string,sessionFile:string,canonicalSessionFile:string,cwd:string,name?:string,nameGenerated?:boolean,model?:{provider:string,id:string},thinkingLevel?:string,taskState:TaskState,processState:ProcessState,outcome:Outcome,activity:{kind:string,summary:string,updatedAt:string},ownership?:WorkerOwnership,isolation?:IsolationRecord,latestRunId?:string,runtime?:RunRuntimeIdentity,summary?:SessionSummary,createdAt:string,updatedAt:string}} SessionRecord */
+/** @typedef {{schemaVersion:1,revision:number,sessionId:string,sessionFile:string,canonicalSessionFile:string,cwd:string,name?:string,nameGenerated?:boolean,color?:SessionColor,model?:{provider:string,id:string},thinkingLevel?:string,taskState:TaskState,processState:ProcessState,outcome:Outcome,activity:{kind:string,summary:string,updatedAt:string},ownership?:WorkerOwnership,isolation?:IsolationRecord,latestRunId?:string,runtime?:RunRuntimeIdentity,summary?:SessionSummary,createdAt:string,updatedAt:string}} SessionRecord */
 /** @typedef {{mode:"worktree"}|{mode:"shared_directory",confirmedCwd:string,ownerSessionIds:string[]}} LaunchIsolation */
 /** @typedef {{prompt:string,cwd:string,sourceSessionId:string,isolation:LaunchIsolation,model?:{provider:string,id:string},thinkingLevel?:string,name?:string}} LaunchRequest */
 /** @typedef {{daemonEpoch:string,sequence:string}} EventCursor */
@@ -26,7 +26,11 @@ import { parseViewerSnapshot } from "./viewer-contracts.mjs";
 /** @typedef {{version:1,cursor:EventCursor,occurredAt:string,kind:"session_changed"|"command_changed"|"attachment_changed",payload:any}} PersistedEvent */
 
 const ENVELOPE_KEYS = ["version", "clientId", "requestId", "op", "payload"];
-const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "session_query", "get_settings", "set_settings", "refresh_summaries"];
+/** Operator-chosen row tints, named for the Jobwatch palette. Dashboard metadata; Pi never sees them. */
+export const SESSION_COLORS = ["sky", "green", "amber", "rose", "cyan", "gray"];
+/** @typedef {"sky"|"green"|"amber"|"rose"|"cyan"|"gray"} SessionColor */
+
+const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "session_query", "get_settings", "set_settings", "refresh_summaries", "set_session_color"];
 const SESSION_COMMANDS = ["set_model", "set_thinking_level", "compact", "set_session_name", "set_auto_compaction", "set_auto_retry", "abort_retry", "set_steering_mode", "set_follow_up_mode"];
 // Pi's own vocabulary for both queue modes; anything else is refused before it reaches a worker.
 const QUEUE_MODES = ["all", "one-at-a-time"];
@@ -164,6 +168,14 @@ export function parseClientRequest(value) {
     rejectUnknownKeys(model, ["provider", "id"], "set_settings payload.summaryModel");
     return { ...base, payload: { summaryModel: { provider: readIdentifier(model, "provider", "set_settings payload.summaryModel.provider"), id: readIdentifier(model, "id", "set_settings payload.summaryModel.id") } } };
   }
+  if (op === "set_session_color") {
+    const payload = readRecord(request.payload, "set_session_color payload");
+    rejectUnknownKeys(payload, ["sessionId", "revision", "color"], "set_session_color payload");
+    const bound = readDestructivePayload({ sessionId: payload.sessionId, revision: payload.revision }, "set_session_color");
+    if (!Object.hasOwn(payload, "color")) throw new TypeError("set_session_color payload.color is required");
+    if (payload.color !== null && !SESSION_COLORS.includes(payload.color)) throw new TypeError(`set_session_color payload.color must be null or one of: ${SESSION_COLORS.join(", ")}`);
+    return { ...base, payload: { ...bound, color: payload.color } };
+  }
   if (op === "launch") return { ...base, payload: readLaunchRequest(request.payload) };
   if (op === "attach") {
     const payload = readRecord(request.payload, "attach payload"); rejectUnknownKeys(payload, ["sessionId", "role", "activate"], "attach payload");
@@ -268,8 +280,9 @@ function validateError(value, path) {
 /** @param {unknown} value @param {string} path */
 function validateSession(value, path) {
   const session = readRecord(value, path);
-  requireKeys(session, ["schemaVersion", "revision", "sessionId", "sessionFile", "canonicalSessionFile", "cwd", "taskState", "processState", "outcome", "activity", "createdAt", "updatedAt"], ["name", "nameGenerated", "model", "thinkingLevel", "ownership", "isolation", "latestRunId", "runtime", "summary"], path);
+  requireKeys(session, ["schemaVersion", "revision", "sessionId", "sessionFile", "canonicalSessionFile", "cwd", "taskState", "processState", "outcome", "activity", "createdAt", "updatedAt"], ["name", "nameGenerated", "color", "model", "thinkingLevel", "ownership", "isolation", "latestRunId", "runtime", "summary"], path);
   if (Object.hasOwn(session, "nameGenerated") && typeof session.nameGenerated !== "boolean") throw new TypeError(`${path}.nameGenerated must be a boolean`);
+  if (Object.hasOwn(session, "color") && !SESSION_COLORS.includes(session.color)) throw new TypeError(`${path}.color must be one of: ${SESSION_COLORS.join(", ")}`);
   if (Object.hasOwn(session, "summary")) {
     const summary = readRecord(session.summary, `${path}.summary`);
     requireKeys(summary, ["text", "generatedAt", "model", "sourceCursor"], [], `${path}.summary`);
@@ -349,7 +362,7 @@ export function parseDaemonResponse(value) {
   if (!response.ok) { requireKeys(response, ["version", "requestId", "ok", "error"], [], "daemon response"); validateError(response.error, "daemon response.error"); return response; }
   requireKeys(response, ["version", "requestId", "ok", "result"], [], "daemon response");
   const result = readRecord(response.result, "daemon response.result");
-  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "subscribed", "acknowledged", "viewer_snapshot", "viewer_subscribed", "viewer_acknowledged", "session_commands", "session_query", "settings", "summaries_refreshing"], "daemon response.result.kind");
+  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "subscribed", "acknowledged", "viewer_snapshot", "viewer_subscribed", "viewer_acknowledged", "session_commands", "session_query", "settings", "summaries_refreshing", "session_colored"], "daemon response.result.kind");
   if (kind === "state") { requireKeys(result, ["kind", "sessions"], [], "daemon response.result"); if (!Array.isArray(result.sessions)) throw new TypeError("sessions must be an array"); result.sessions.forEach((session, index) => validateSession(session, `daemon response.result.sessions[${index}]`)); }
   else if (["launched", "detached"].includes(kind)) { requireKeys(result, ["kind", "sessionId"], [], "daemon response.result"); readIdentifier(result, "sessionId"); }
   else if (kind === "attached") { requireKeys(result, ["kind", "sessionId", "role"], [], "daemon response.result"); readIdentifier(result, "sessionId"); readEnum(result, "role", ["composer", "observer"]); }
@@ -372,6 +385,12 @@ export function parseDaemonResponse(value) {
       readIdentifier(model, "provider", "daemon response.result.summaryModel.provider");
       readIdentifier(model, "id", "daemon response.result.summaryModel.id");
     }
+  }
+  else if (kind === "session_colored") {
+    requireKeys(result, ["kind", "sessionId", "revision", "color"], [], "daemon response.result");
+    readIdentifier(result, "sessionId", "daemon response.result.sessionId");
+    if (!Number.isSafeInteger(result.revision) || result.revision < 0) throw new TypeError("daemon response.result.revision must be a non-negative safe integer");
+    if (result.color !== null && !SESSION_COLORS.includes(result.color)) throw new TypeError(`daemon response.result.color must be null or one of: ${SESSION_COLORS.join(", ")}`);
   }
   else if (kind === "summaries_refreshing") { requireKeys(result, ["kind", "sessionIds"], [], "daemon response.result"); if (!Array.isArray(result.sessionIds)) throw new TypeError("daemon response.result.sessionIds must be an array"); result.sessionIds.forEach((/** @type {unknown} */ sessionId, /** @type {number} */ index) => { if (typeof sessionId !== "string" || sessionId.length === 0) throw new TypeError(`daemon response.result.sessionIds[${index}] must be a non-empty string`); }); }
   else if (kind === "viewer_snapshot") { requireKeys(result, ["kind", "snapshot"], [], "daemon response.result"); parseViewerSnapshot(result.snapshot); }

@@ -251,6 +251,55 @@ describe("viewer commands and role restrictions", () => {
     await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "session_command", payload: { sessionId: "s", command: "set_auto_compaction", enabled: false } }]));
   });
 
+  it("sets a session color through the daemon and tints the prompt bar", async () => {
+    /** @type {any[]} */
+    const colored = [];
+    const f = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: null, registryRevision: 7 }) });
+    f.client.setSessionColor = async (/** @type {string} */ sessionId, /** @type {number} */ revision, /** @type {string | null} */ color) => {
+      colored.push({ sessionId, revision, color });
+      return { kind: "session_colored", sessionId, revision: revision + 1, color };
+    };
+    await f.instance.open();
+    const plain = f.instance.render(80, 20);
+
+    f.instance.editor.setText("/color amber");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(colored).toEqual([{ sessionId: "s", revision: 7, color: "amber" }]));
+    expect(f.commands).toEqual([]);
+
+    const tinted = f.instance.render(80, 20);
+    expect(tinted).not.toEqual(plain);
+    expect(tinted.join("\n")).toContain("\x1b[38;2;252;211;77m");
+    expect(tinted.map(stripVTControlCharacters)).toEqual(plain.map(stripVTControlCharacters));
+    for (const width of [40, 55, 80, 120, 160]) {
+      for (const line of f.instance.render(width, 20)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+    }
+  });
+
+  it("offers a color picker when /color arrives without a color", async () => {
+    const f = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: null, registryRevision: 2 }) });
+    f.client.setSessionColor = async () => ({ kind: "session_colored", sessionId: "s", revision: 3, color: "rose" });
+    await f.instance.open();
+    f.instance.editor.setText("/color");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
+    const rendered = f.instance.render(80, 20).map(stripVTControlCharacters).join("\n");
+    expect(rendered).toContain("amber");
+    expect(rendered).toContain("default");
+    expect(f.instance.state.errors).toEqual([]);
+  });
+
+  it("reports a color failure as a viewer error without changing the prompt bar", async () => {
+    const f = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: null, registryRevision: 4 }) });
+    f.client.setSessionColor = async () => { throw Object.assign(new Error("Session revision changed before the color was set"), { code: "REVISION_CONFLICT" }); };
+    await f.instance.open();
+    const plain = f.instance.render(80, 20);
+    f.instance.editor.setText("/color rose");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.instance.state.errors).toContainEqual(expect.objectContaining({ code: "REVISION_CONFLICT" })));
+    expect(f.instance.render(80, 20).at(-2)).toBe(plain.at(-2));
+  });
+
   it("rejects an unknown model locally without contacting the session", async () => {
     const f = fixture({ menu: async () => ({ commands: [], models: [{ provider: "anthropic", id: "claude" }], thinkingLevels: [], model: null, thinkingLevel: null }) });
     await f.instance.open();

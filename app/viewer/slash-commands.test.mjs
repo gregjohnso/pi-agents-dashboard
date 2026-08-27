@@ -1,5 +1,6 @@
 import { expect, it } from "vitest";
 
+import { SESSION_COLORS } from "../../shared/contracts.mjs";
 import { parseSlashSubmission, sessionSlashCommands } from "./slash-commands.mjs";
 
 /** @type {import("./slash-commands.mjs").SessionMenu} */
@@ -13,7 +14,7 @@ const menu = {
 
 it("names commands without the leading slash Pi re-adds when applying a completion", () => {
   const commands = sessionSlashCommands(menu);
-  expect(commands.map(({ name }) => name)).toEqual(["model", "thinking", "model-summary", "rename", "compact", "stats", "tree", "export", "auto-compact", "auto-retry", "steering", "follow-up", "abort-retry", "new", "resume", "fork", "clone", "help", "review", "skill:notebook"]);
+  expect(commands.map(({ name }) => name)).toEqual(["model", "thinking", "model-summary", "rename", "color", "compact", "stats", "tree", "export", "auto-compact", "auto-retry", "steering", "follow-up", "abort-retry", "new", "resume", "fork", "clone", "help", "review", "skill:notebook"]);
   expect(commands[2].getArgumentCompletions?.("")).toEqual([
     { value: "off", label: "off" },
     { value: "anthropic/claude-sonnet", label: "anthropic/claude-sonnet" },
@@ -93,6 +94,25 @@ it.each([
   ["/model-summary", "SUMMARY_MODEL_REQUIRED"],
   ["/model-summary invented/model", "UNKNOWN_MODEL"],
   ["/rename", "SESSION_NAME_REQUIRED"],
+  ["/color", "SESSION_COLOR_REQUIRED"],
+  ["/color chartreuse", "UNKNOWN_SESSION_COLOR"],
 ])("rejects %s without contacting the session", (text, code) => {
   expect(parseSlashSubmission(text, menu)).toMatchObject({ kind: "rejected", code });
+});
+
+it.each([
+  ["a palette color", "/color amber", "amber"],
+  ["the default clearing word", "/color default", null],
+])("resolves %s as dashboard metadata", (_label, text, color) => {
+  expect(parseSlashSubmission(text, menu)).toEqual({ kind: "session_color", color });
+});
+
+it("offers every palette color plus default in autocomplete", () => {
+  const color = sessionSlashCommands(menu).find((command) => command.name === "color");
+  expect(color).toMatchObject({ source: "builtin", argumentHint: "<color>" });
+  const offered = color?.getArgumentCompletions?.("").map((item) => item.value) ?? [];
+  expect(offered).toContain("default");
+  expect(offered).toContain("amber");
+  expect(offered).toEqual(expect.arrayContaining([...SESSION_COLORS]));
+  expect(color?.getArgumentCompletions?.("amb").map((item) => item.value)).toEqual(["amber"]);
 });

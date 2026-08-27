@@ -134,6 +134,22 @@ describe("responsive dashboard layout", () => {
         expect(lines[0]).toContain(JOBWATCH_ANSI.cyan);
         expect(lines[1]).toContain(JOBWATCH_ANSI.sky);
     });
+    it("tints only the name cell for a colored session", () => {
+        const layout = createDashboardLayout(120, 20);
+        const plain = renderSessionRow(fixtures[0], layout, { now });
+        const colored = renderSessionRow({ ...fixtures[0], color: "amber" }, layout, { now });
+        expect(colored).not.toBe(plain);
+        expect(colored).toContain(JOBWATCH_ANSI.amber);
+        // The state cell keeps its derived color; only the name cell carries the operator's choice.
+        expect(colored).toContain(JOBWATCH_ANSI.green);
+        expect(stripVTControlCharacters(colored)).toBe(stripVTControlCharacters(plain));
+    });
+
+    it("renders an uncolored session byte-identically to today", () => {
+        const layout = createDashboardLayout(120, 20);
+        expect(renderSessionRow({ ...fixtures[0], color: undefined }, layout, { now })).toBe(renderSessionRow(fixtures[0], layout, { now }));
+    });
+
     it("uses Jobwatch's exact surface, selection, accent, and semantic colors", () => {
         expect(JOBWATCH_ANSI).toMatchObject({
             blackBackground: "\x1b[48;2;0;0;0m",

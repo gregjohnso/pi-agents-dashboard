@@ -275,3 +275,15 @@ it("refuses update attempts that replace the canonical identity", async () => {
   ).rejects.toMatchObject({ code: "IMMUTABLE_SESSION_IDENTITY" });
   await expect(store.get("one")).resolves.toEqual(record("one"));
 });
+
+it("persists a session color and refuses one outside the palette", async () => {
+  const { store } = await makeRegistry();
+  const created = await store.create(record("colored"));
+  const updated = await store.update("colored", created.revision, { color: "amber" });
+  expect(updated.color).toBe("amber");
+  expect((await store.get("colored"))?.color).toBe("amber");
+
+  await expect(store.update("colored", updated.revision, { color: /** @type {any} */ ("chartreuse") })).rejects.toThrow(/color/i);
+  const cleared = await store.update("colored", updated.revision, { color: undefined });
+  expect(cleared.color).toBeUndefined();
+});

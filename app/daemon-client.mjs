@@ -11,7 +11,7 @@ export class DaemonClientError extends Error {
         this.code = code;
     }
 }
-const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command"];
+const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "set_session_color"];
 const COMMAND_STAGES = ["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED", "DELIVERY_UNKNOWN", "FAILED"];
 function readRecord(value, path) {
     if (typeof value !== "object" || value === null || Array.isArray(value))
@@ -485,6 +485,17 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                 },
             };
             return iterable;
+        },
+        /** @param {string} sessionId @param {number} revision @param {string | null} color */
+        async setSessionColor(sessionId, revision, color) {
+            if (typeof sessionId !== "string" || sessionId.length === 0)
+                throw new TypeError("sessionId is required");
+            if (!Number.isSafeInteger(revision) || revision < 0)
+                throw new TypeError("revision must be a non-negative safe integer");
+            const response = await this.request({ version: 1, clientId, requestId: randomUUID(), op: "set_session_color", payload: { sessionId, revision, color } });
+            if (!response.ok)
+                throw new DaemonClientError(response.error.code, response.error.message);
+            return response.result;
         },
         async getViewerSnapshot(sessionId) {
             if (typeof sessionId !== "string" || sessionId.length === 0)

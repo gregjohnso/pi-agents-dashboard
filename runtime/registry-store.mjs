@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 
+import { SESSION_COLORS } from "../shared/contracts.mjs";
 import { atomicWriteJson } from "./atomic-file.mjs";
 import { SessionCoordinator } from "./session-coordinator.mjs";
 
@@ -17,6 +18,7 @@ const SESSION_RECORD_KEYS = [
   "cwd",
   "name",
   "nameGenerated",
+  "color",
   "model",
   "thinkingLevel",
   "taskState",
@@ -209,6 +211,7 @@ export function validateSessionRecord(value) {
   if (value.runtime !== undefined) validateRuntime(value.runtime);
   if (value.summary !== undefined) validateSummary(value.summary);
   if (value.nameGenerated !== undefined && typeof value.nameGenerated !== "boolean") throw new TypeError("nameGenerated must be a boolean");
+  if (value.color !== undefined && !SESSION_COLORS.includes(value.color)) throw new TypeError(`color must be one of: ${SESSION_COLORS.join(", ")}`);
   if (value.isolation !== undefined) validateIsolation(value.isolation);
   if (value.ownership !== undefined) {
     if (!isPlainObject(value.ownership) || value.ownership.kind !== "managed") {

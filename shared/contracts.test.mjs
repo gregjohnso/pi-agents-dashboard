@@ -28,6 +28,8 @@ const variants = [
   ["set_settings", { summaryModel: { provider: "anthropic", id: "haiku" } }],
   ["set_settings", { summaryModel: null }],
   ["refresh_summaries", {}],
+  ["set_session_color", { sessionId: "session", revision: 3, color: "amber" }],
+  ["set_session_color", { sessionId: "session", revision: 3, color: null }],
   ["session_command", { sessionId: "session", command: "set_model", model: { provider: "anthropic", id: "claude" } }],
   ["session_command", { sessionId: "session", command: "set_thinking_level", level: "high" }],
   ["session_command", { sessionId: "session", command: "compact", instructions: "keep decisions" }],
@@ -54,6 +56,14 @@ describe("command contracts", () => {
     for (const [op, payload] of variants) {
       expect(() => parseClientRequest({ ...envelope, op, payload: { ...payload, unknown: true } })).toThrow(/unknown/i);
     }
+  });
+
+  it("binds a session color to a palette name and an exact revision", () => {
+    const payload = { sessionId: "session", revision: 3, color: "amber" };
+    expect(() => parseClientRequest({ ...envelope, op: "set_session_color", payload: { sessionId: "session", color: "amber" } })).toThrow(/revision/i);
+    expect(() => parseClientRequest({ ...envelope, op: "set_session_color", payload: { ...payload, color: "chartreuse" } })).toThrow(/color/i);
+    expect(() => parseClientRequest({ ...envelope, op: "set_session_color", payload: { ...payload, color: "" } })).toThrow(/color/i);
+    expect(parseClientRequest({ ...envelope, op: "set_session_color", payload })).toEqual({ ...envelope, op: "set_session_color", payload });
   });
 
   it("keeps Stop and Delete bound to exact revisions", () => {

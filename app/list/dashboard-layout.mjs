@@ -136,6 +136,8 @@ export function renderSessionRow(session, layout, options) {
             return theme.state(session, text, selected);
         if (key === "age")
             return theme.muted(text, selected);
+        if (key === "name" && typeof theme.name === "function")
+            return theme.name(text, selected, session.color);
         return theme.text(text, selected);
     }, (text) => theme.separator(text, selected));
 }

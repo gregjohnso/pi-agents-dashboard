@@ -4,8 +4,8 @@ import { parseClientRequest, parseDaemonResponse } from "./contracts.mjs";
 
 const envelope = { version: 1, clientId: "client-1", requestId: "request-1" };
 
-/** @type {Array<[string, Record<string, any>]>} */
-const variants = [
+/** Every request payload the frozen version-1 wire accepts, one row per operation variant. @type {Array<[string, Record<string, any>]>} */
+const acceptedRequests = [
   ["get_state", {}],
   ["launch", { prompt: "Run tests", cwd: "/repo", sourceSessionId: "source", isolation: { mode: "worktree" } }],
   ["attach", { sessionId: "session", role: "composer" }],
@@ -44,87 +44,89 @@ const variants = [
   ["session_query", { sessionId: "session", query: "export_html", outputPath: "/tmp/session.html" }],
 ];
 
+/** Every request the wire must refuse, beyond the per-variant unknown-field matrix. @type {Array<[string, string, Record<string, any>, RegExp]>} */
+const rejectedRequests = [
+  ["color outside the palette", "set_session_color", { sessionId: "session", color: "chartreuse" }, /color/iu],
+  ["empty color", "set_session_color", { sessionId: "session", color: "" }, /color/iu],
+  ["color without a session", "set_session_color", { color: "amber" }, /sessionId/iu],
+  ["negative legacy revision", "set_session_color", { sessionId: "session", revision: -1, color: "amber" }, /revision/iu],
+  ["non-integer legacy revision", "set_session_color", { sessionId: "session", revision: "3", color: "amber" }, /revision/iu],
+  ["stop without a revision", "stop", { sessionId: "session" }, /revision/iu],
+  ["delete without a revision", "delete", { sessionId: "session" }, /revision/iu],
+  ["session rebinding through new_session", "session_command", { sessionId: "session", command: "new_session" }, /command/iu],
+  ["session rebinding through switch_session", "session_command", { sessionId: "session", command: "switch_session", sessionPath: "/other.jsonl" }, /command/iu],
+  ["session rebinding through fork", "session_command", { sessionId: "session", command: "fork", entryId: "entry" }, /command/iu],
+  ["steering mode outside Pi's vocabulary", "session_command", { sessionId: "session", command: "set_steering_mode", mode: "invented" }, /mode/iu],
+  ["non-boolean auto retry", "session_command", { sessionId: "session", command: "set_auto_retry", enabled: "yes" }, /enabled/iu],
+  ["transcript-reading query", "session_query", { sessionId: "session", query: "get_messages" }, /query/iu],
+];
+
+const sessionRecord = { schemaVersion: 1, revision: 1, sessionId: "s", sessionFile: "/s.jsonl", canonicalSessionFile: "/s.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "idle", summary: "Idle", updatedAt: "2026-01-01T00:00:00.000Z" }, summary: { text: "Refactored the loader and ran tests", generatedAt: "2026-01-01T00:00:00.000Z", model: { provider: "anthropic", id: "haiku" }, sourceCursor: "42" }, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" };
+const menu = {
+  kind: "session_commands", sessionId: "session",
+  commands: [{ name: "/compact", source: "builtin", description: "Compact", argumentHint: "[instructions]" }, { name: "/review", source: "extension" }],
+  models: [{ provider: "anthropic", id: "claude" }], thinkingLevels: ["off", "high"],
+  model: { provider: "anthropic", id: "claude" }, thinkingLevel: "high",
+};
+const queryResult = { kind: "session_query", sessionId: "session", query: "get_session_stats", rows: ["messages: 12", "tokens: 3400"] };
+
+/** @param {Record<string, any>} result */
+const ok = (result) => ({ version: 1, requestId: "request", ok: true, result });
+
+/** Every daemon response shape the frozen version-1 wire accepts. @type {Array<[string, Record<string, any>]>} */
+const acceptedResponses = [
+  ["session command menu", ok(menu)],
+  ["summary settings", ok({ kind: "settings", summaryModel: { provider: "anthropic", id: "haiku" } })],
+  ["summaries disabled", ok({ kind: "settings", summaryModel: null })],
+  ["session state carrying a bounded summary", ok({ kind: "state", sessions: [sessionRecord] })],
+  ["session query rows", ok(queryResult)],
+  ["typed failure", { version: 1, requestId: "request", ok: false, error: { code: "DENIED", message: "denied", retryable: false } }],
+];
+
+/** Every daemon response the wire must refuse. @type {Array<[string, Record<string, any>, RegExp]>} */
+const rejectedResponses = [
+  ["unknown menu field", ok({ ...menu, unknown: true }), /unknown/iu],
+  ["invented menu command source", ok({ ...menu, commands: [{ name: "/x", source: "invented" }] }), /source/iu],
+  ["empty session summary text", ok({ kind: "state", sessions: [{ ...sessionRecord, summary: { ...sessionRecord.summary, text: "" } }] }), /summary\.text/u],
+  ["unknown query result field", ok({ ...queryResult, unknown: true }), /unknown/iu],
+  ["non-string query rows", ok({ ...queryResult, rows: [{ nested: true }] }), /rows/iu],
+  ["unknown field on a failure", { version: 1, requestId: "request", ok: false, error: { code: "DENIED", message: "denied", retryable: false }, unknown: true }, /unknown/iu],
+];
+
 describe("command contracts", () => {
   it("accepts every exact request payload variant", () => {
-    for (const [op, payload] of variants) {
+    for (const [op, payload] of acceptedRequests) {
       const request = { ...envelope, op, payload };
-      expect(parseClientRequest(request)).toEqual(request);
+      expect(parseClientRequest(request), `${op} ${JSON.stringify(payload)}`).toEqual(request);
     }
   });
 
   it("rejects unknown fields in every request payload variant", () => {
-    for (const [op, payload] of variants) {
-      expect(() => parseClientRequest({ ...envelope, op, payload: { ...payload, unknown: true } })).toThrow(/unknown/i);
+    for (const [op, payload] of acceptedRequests) {
+      expect(() => parseClientRequest({ ...envelope, op, payload: { ...payload, unknown: true } }), `${op} ${JSON.stringify(payload)}`).toThrow(/unknown/iu);
     }
   });
 
-  it("binds a session color to a palette name without any revision precondition", () => {
-    const payload = { sessionId: "session", color: "amber" };
-    expect(parseClientRequest({ ...envelope, op: "set_session_color", payload })).toEqual({ ...envelope, op: "set_session_color", payload });
-    expect(() => parseClientRequest({ ...envelope, op: "set_session_color", payload: { ...payload, color: "chartreuse" } })).toThrow(/color/i);
-    expect(() => parseClientRequest({ ...envelope, op: "set_session_color", payload: { ...payload, color: "" } })).toThrow(/color/i);
-    expect(() => parseClientRequest({ ...envelope, op: "set_session_color", payload: { color: "amber" } })).toThrow(/sessionId/i);
+  it("rejects every out-of-contract request payload", () => {
+    for (const [name, op, payload, message] of rejectedRequests) {
+      expect(() => parseClientRequest({ ...envelope, op, payload }), name).toThrow(message);
+    }
   });
 
   it("tolerates a revision from an older client and drops it before the daemon sees it", () => {
     expect(parseClientRequest({ ...envelope, op: "set_session_color", payload: { sessionId: "session", revision: 3, color: "amber" } }))
       .toEqual({ ...envelope, op: "set_session_color", payload: { sessionId: "session", color: "amber" } });
-    expect(() => parseClientRequest({ ...envelope, op: "set_session_color", payload: { sessionId: "session", revision: -1, color: "amber" } })).toThrow(/revision/i);
-    expect(() => parseClientRequest({ ...envelope, op: "set_session_color", payload: { sessionId: "session", revision: "3", color: "amber" } })).toThrow(/revision/i);
   });
 
-  it("keeps Stop and Delete bound to exact revisions", () => {
-    for (const op of ["stop", "delete"]) {
-      expect(() => parseClientRequest({ ...envelope, op, payload: { sessionId: "session" } })).toThrow(/revision/i);
+  it("accepts every exact daemon response variant", () => {
+    for (const [name, response] of acceptedResponses) {
+      expect(parseDaemonResponse(response), name).toEqual(response);
     }
   });
 
-  it("parses one bounded session command menu and rejects unknown menu fields", () => {
-    const result = {
-      kind: "session_commands", sessionId: "session",
-      commands: [{ name: "/compact", source: "builtin", description: "Compact", argumentHint: "[instructions]" }, { name: "/review", source: "extension" }],
-      models: [{ provider: "anthropic", id: "claude" }], thinkingLevels: ["off", "high"],
-      model: { provider: "anthropic", id: "claude" }, thinkingLevel: "high",
-    };
-    const response = { version: 1, requestId: "request", ok: true, result };
-    expect(parseDaemonResponse(response)).toEqual(response);
-    expect(() => parseDaemonResponse({ ...response, result: { ...result, unknown: true } })).toThrow(/unknown/i);
-    expect(() => parseDaemonResponse({ ...response, result: { ...result, commands: [{ name: "/x", source: "invented" }] } })).toThrow(/source/i);
-  });
-
-  it("parses the summary settings result and a bounded session summary", () => {
-    const settings = { version: 1, requestId: "request", ok: true, result: { kind: "settings", summaryModel: { provider: "anthropic", id: "haiku" } } };
-    expect(parseDaemonResponse(settings)).toEqual(settings);
-    expect(parseDaemonResponse({ ...settings, result: { kind: "settings", summaryModel: null } })).toBeTruthy();
-    const session = { schemaVersion: 1, revision: 1, sessionId: "s", sessionFile: "/s.jsonl", canonicalSessionFile: "/s.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "idle", summary: "Idle", updatedAt: "2026-01-01T00:00:00.000Z" }, summary: { text: "Refactored the loader and ran tests", generatedAt: "2026-01-01T00:00:00.000Z", model: { provider: "anthropic", id: "haiku" }, sourceCursor: "42" }, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" };
-    expect(parseDaemonResponse({ version: 1, requestId: "request", ok: true, result: { kind: "state", sessions: [session] } })).toBeTruthy();
-    expect(() => parseDaemonResponse({ version: 1, requestId: "request", ok: true, result: { kind: "state", sessions: [{ ...session, summary: { ...session.summary, text: "" } }] } })).toThrow(/summary.text/);
-  });
-
-  it("refuses a session command or query Pi cannot serve safely", () => {
-    for (const payload of [
-      { sessionId: "session", command: "new_session" },
-      { sessionId: "session", command: "switch_session", sessionPath: "/other.jsonl" },
-      { sessionId: "session", command: "fork", entryId: "entry" },
-      { sessionId: "session", command: "set_steering_mode", mode: "invented" },
-      { sessionId: "session", command: "set_auto_retry", enabled: "yes" },
-    ]) {
-      expect(() => parseClientRequest({ ...envelope, op: "session_command", payload })).toThrow();
+  it("rejects every out-of-contract daemon response", () => {
+    for (const [name, response, message] of rejectedResponses) {
+      expect(() => parseDaemonResponse(response), name).toThrow(message);
     }
-    expect(() => parseClientRequest({ ...envelope, op: "session_query", payload: { sessionId: "session", query: "get_messages" } })).toThrow();
-  });
-
-  it("parses one bounded session query result", () => {
-    const result = { kind: "session_query", sessionId: "session", query: "get_session_stats", rows: ["messages: 12", "tokens: 3400"] };
-    const response = { version: 1, requestId: "request", ok: true, result };
-    expect(parseDaemonResponse(response)).toEqual(response);
-    expect(() => parseDaemonResponse({ ...response, result: { ...result, unknown: true } })).toThrow(/unknown/i);
-    expect(() => parseDaemonResponse({ ...response, result: { ...result, rows: [{ nested: true }] } })).toThrow(/rows/i);
-  });
-
-  it("strictly parses daemon failures", () => {
-    const response = { version: 1, requestId: "request", ok: false, error: { code: "DENIED", message: "denied", retryable: false } };
-    expect(parseDaemonResponse(response)).toEqual(response);
-    expect(() => parseDaemonResponse({ ...response, unknown: true })).toThrow(/unknown/i);
   });
 });

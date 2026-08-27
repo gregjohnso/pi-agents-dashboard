@@ -20,38 +20,30 @@ const payloads = [
   { kind: "unknown_pi_event", piType: "future", summary: "Unsupported Pi event" },
 ];
 
+/** Every event shape the frozen version-1 viewer wire must refuse. @type {Array<[string, Record<string, any>, RegExp]>} */
+const rejectedEvents = [
+  ["internal assistant checkpoint metadata", { ...base, payload: { kind: "assistant_delta", itemId: "a1", delta: "hel", contentIndex: 0, contentType: "text" } }, /unknown/iu],
+  ["unknown field inside message content", { ...base, payload: { kind: "user_message", itemId: "u", content: [{ type: "text", text: "x", unknown: true }] } }, /unknown/iu],
+  ["invalid tool state", { ...base, payload: { kind: "tool_started", tool: { ...tool, state: "invalid" } } }, /state/iu],
+  ["unknown UI request method", { ...base, payload: { kind: "pending_ui_request", request: { ...request, method: "unknown" } } }, /method/iu],
+  ["activity without source identity", { ...base, payload: { kind: "activity", phase: "thinking", label: "Thinking", startedAt: base.timestamp } }, /sourceEventId/iu],
+  ["activity label over 256 characters", { ...base, payload: { kind: "activity", phase: "thinking", label: "x".repeat(257), sourceEventId: "source", startedAt: base.timestamp } }, /label/iu],
+  ["activity detail over 4096 characters", { ...base, payload: { kind: "activity", phase: "thinking", label: "Thinking", detail: "x".repeat(4097), sourceEventId: "source", startedAt: base.timestamp } }, /detail/iu],
+  ["cursor bound to another session", { ...base, cursor: { ...base.cursor, sessionId: "other" }, payload: payloads[0] }, /session/iu],
+  ["non-canonical cursor sequence", { ...base, cursor: { ...base.cursor, sequence: "03" }, payload: payloads[0] }, /sequence/iu],
+];
+
 it("accepts every frozen viewer payload and rejects unknown fields in each", () => {
   for (const payload of payloads) {
     expect(parseViewerEvent({ ...base, payload })).toEqual({ ...base, payload });
-    expect(() => parseViewerEvent({ ...base, payload: { ...payload, unknown: true } })).toThrow(/unknown/i);
+    expect(() => parseViewerEvent({ ...base, payload: { ...payload, unknown: true } }), `${payload.kind} with an unknown field`).toThrow(/unknown/iu);
   }
 });
 
-it("rejects internal assistant checkpoint metadata on frozen v1 wire shapes", () => {
-  expect(() => parseViewerEvent({ ...base, payload: { kind: "assistant_delta", itemId: "a1", delta: "hel", contentIndex: 0, contentType: "text" } })).toThrow(/unknown/i);
-  const snapshot = {
-    version: 1, sessionId: "session-1", registryRevision: 1, cursor: base.cursor, runtime: null, role: "observer", taskState: "READY", processState: "SLEEPING", outcome: "NONE",
-    activity: { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "source", startedAt: base.timestamp }, model: null, thinkingLevel: null, items: [], tools: [], pendingUi: [], errors: [],
-    activeAssistant: { itemId: "a1", blocks: [{ contentIndex: 0, type: "text", text: "hel" }] },
-  };
-  expect(() => parseViewerSnapshot(snapshot)).toThrow(/unknown/i);
-});
-
-it("strictly validates nested content, tools, attachments, and UI requests", () => {
-  expect(() => parseViewerEvent({ ...base, payload: { kind: "user_message", itemId: "u", content: [{ type: "text", text: "x", unknown: true }] } })).toThrow(/unknown/i);
-  expect(() => parseViewerEvent({ ...base, payload: { kind: "tool_started", tool: { ...tool, state: "invalid" } } })).toThrow(/state/i);
-  expect(() => parseViewerEvent({ ...base, payload: { kind: "pending_ui_request", request: { ...request, method: "unknown" } } })).toThrow(/method/i);
-});
-
-it("requires source identity and bounds viewer activity text", () => {
-  expect(() => parseViewerEvent({ ...base, payload: { kind: "activity", phase: "thinking", label: "Thinking", startedAt: base.timestamp } })).toThrow(/sourceEventId/i);
-  expect(() => parseViewerEvent({ ...base, payload: { kind: "activity", phase: "thinking", label: "x".repeat(257), sourceEventId: "source", startedAt: base.timestamp } })).toThrow(/label/i);
-  expect(() => parseViewerEvent({ ...base, payload: { kind: "activity", phase: "thinking", label: "Thinking", detail: "x".repeat(4097), sourceEventId: "source", startedAt: base.timestamp } })).toThrow(/detail/i);
-});
-
-it("binds every cursor to the exact viewer session", () => {
-  expect(() => parseViewerEvent({ ...base, cursor: { ...base.cursor, sessionId: "other" }, payload: payloads[0] })).toThrow(/session/i);
-  expect(() => parseViewerEvent({ ...base, cursor: { ...base.cursor, sequence: "03" }, payload: payloads[0] })).toThrow(/sequence/i);
+it("rejects every invalid viewer event shape", () => {
+  for (const [name, event, message] of rejectedEvents) {
+    expect(() => parseViewerEvent(event), name).toThrow(message);
+  }
 });
 
 it("strictly parses the frozen version-1 viewer snapshot", () => {
@@ -62,5 +54,6 @@ it("strictly parses the frozen version-1 viewer snapshot", () => {
     model: null, thinkingLevel: null, items: [payloads[0]], tools: [tool], pendingUi: [request], errors: [{ code: "WARN", message: "bounded", retryable: false }],
   };
   expect(parseViewerSnapshot(snapshot)).toEqual(snapshot);
-  expect(() => parseViewerSnapshot({ ...snapshot, unknown: true })).toThrow(/unknown/i);
+  expect(() => parseViewerSnapshot({ ...snapshot, unknown: true })).toThrow(/unknown/iu);
+  expect(() => parseViewerSnapshot({ ...snapshot, activeAssistant: { itemId: "a1", blocks: [{ contentIndex: 0, type: "text", text: "hel" }] } }), "internal assistant checkpoint state").toThrow(/unknown/iu);
 });

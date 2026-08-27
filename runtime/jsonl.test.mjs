@@ -28,27 +28,16 @@ describe("JSONL decoder", () => {
     expect(decoder.push(Buffer.from('{"ok":true}\r\n'))).toEqual([{ ok: true }]);
   });
 
-  it("returns typed errors for malformed JSON without returning a partial message", () => {
-    const decoder = createJsonlDecoder({ maxBytes: 1024 });
+  // FRAME_TOO_LARGE must win over MALFORMED_JSON: the limit is enforced before JSON parsing.
+  it.each([
+    ["malformed JSON", 1024, Buffer.from('{"partial":\n'), "MALFORMED_JSON"],
+    ["malformed UTF-8", 1024, Buffer.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xc3, 0x28, 0x22, 0x7d, 0x0a]), "INVALID_UTF8"],
+    ["oversized frame", 7, Buffer.from("not-json\n"), "FRAME_TOO_LARGE"],
+  ])("returns a typed error without a partial message for %s", (_name, maxBytes, bytes, code) => {
+    const decoder = createJsonlDecoder({ maxBytes });
 
-    expect(() => decoder.push(Buffer.from('{"partial":\n'))).toThrowError(
-      expect.objectContaining({ name: "JsonlFramingError", code: "MALFORMED_JSON" }),
-    );
-  });
-
-  it("returns typed errors for malformed UTF-8", () => {
-    const decoder = createJsonlDecoder({ maxBytes: 1024 });
-
-    expect(() => decoder.push(Buffer.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xc3, 0x28, 0x22, 0x7d, 0x0a]))).toThrowError(
-      expect.objectContaining({ name: "JsonlFramingError", code: "INVALID_UTF8" }),
-    );
-  });
-
-  it("enforces the frame byte limit before JSON parsing", () => {
-    const decoder = createJsonlDecoder({ maxBytes: 7 });
-
-    expect(() => decoder.push(Buffer.from("not-json\n"))).toThrowError(
-      expect.objectContaining({ name: "JsonlFramingError", code: "FRAME_TOO_LARGE" }),
+    expect(() => decoder.push(bytes)).toThrowError(
+      expect.objectContaining({ name: "JsonlFramingError", code }),
     );
   });
 

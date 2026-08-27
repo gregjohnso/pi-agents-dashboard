@@ -389,6 +389,67 @@ describe("dashboard controller", () => {
         dashboard.handleInput("h");
         expect(dashboard.composerDraft.prompt).toBe("h");
     });
+    it("keeps retrying a stop against the newest revision instead of failing on churn", async () => {
+        const backend = new FakeBackend([session("a", { processState: "LIVE", revision: 4 })]);
+        backend.stop = vi.fn(async (_sessionId, revision) => {
+            // A working session's record churns constantly, so the revision moves under the request.
+            if (revision === 4) throw Object.assign(new Error("Session revision changed before Stop"), { code: "REVISION_CONFLICT" });
+            return { accepted: true };
+        });
+        const dashboard = controller(backend);
+        await dashboard.open();
+        dashboard.selectSession("a");
+        dashboard.handleInput("\x18");
+        dashboard.handleInput("y");
+        dashboard.applySnapshot({ sessions: [session("a", { processState: "LIVE", revision: 9 })] });
+        await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledWith("a", 9, expect.any(String)));
+        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
+    });
+    it("gives up a stop that keeps conflicting and says so", async () => {
+        const backend = new FakeBackend([session("a", { processState: "LIVE", revision: 4 })]);
+        backend.stop = vi.fn(async () => { throw Object.assign(new Error("Session revision changed before Stop"), { code: "REVISION_CONFLICT" }); });
+        const dashboard = controller(backend, { stopRetryLimit: 3 });
+        await dashboard.open();
+        dashboard.selectSession("a");
+        dashboard.handleInput("\x18");
+        dashboard.handleInput("y");
+        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "REVISION_CONFLICT" }));
+        expect(backend.stop).toHaveBeenCalledTimes(3);
+    });
+    it("clears the prompt and shows a STARTING row before the daemon answers", async () => {
+        let release = () => {};
+        const backend = new FakeBackend([]);
+        backend.launch = vi.fn(() => new Promise((resolve) => { release = () => resolve({ kind: "launched", sessionId: "new-session" }); }));
+        const dashboard = controller(backend);
+        await dashboard.open();
+        for (const character of "ship it") dashboard.handleInput(character);
+        expect(dashboard.composerDraft.prompt).toBe("ship it");
+        dashboard.handleInput("\r");
+        await vi.waitFor(() => expect(backend.launch).toHaveBeenCalledTimes(1));
+
+        // The prompt is gone and the pending session is visible before the daemon replies.
+        expect(dashboard.composerDraft.prompt).toBe("");
+        const rendered = dashboard.render(100, 24).map(stripVTControlCharacters);
+        expect(rendered.some((line) => line.includes("STARTING") && line.includes("ship it"))).toBe(true);
+
+        // A second Enter cannot launch the same prompt twice.
+        dashboard.handleInput("\r");
+        expect(backend.launch).toHaveBeenCalledTimes(1);
+        release();
+        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
+    });
+    it("restores the draft and drops the pending row when a launch fails", async () => {
+        const backend = new FakeBackend([]);
+        backend.launch = vi.fn(async () => ({ kind: "error", error: { code: "LAUNCH_UNAVAILABLE", message: "no worker slots" } }));
+        const dashboard = controller(backend);
+        await dashboard.open();
+        for (const character of "retry me") dashboard.handleInput(character);
+        dashboard.handleInput("\r");
+        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "LAUNCH_UNAVAILABLE" }));
+        // The operator keeps their text and the phantom row is gone.
+        expect(dashboard.composerDraft.prompt).toBe("retry me");
+        expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("STARTING"))).toBe(false);
+    });
     it("launches with Enter when the prompt has text and opens the session when it is empty", async () => {
         const backend = new FakeBackend([session("a")]);
         const opened = [];

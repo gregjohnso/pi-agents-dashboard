@@ -3,6 +3,7 @@ import { stripVTControlCharacters } from "node:util";
 
 import { decodeKittyPrintable, Key, matchesKey, truncateToWidth, visibleWidth, } from "@earendil-works/pi-tui";
 import { pastedText } from "./dashboard-input.mjs";
+import { sessionNameFromPrompt } from "../../runtime/launch-resolver.mjs";
 import { SPINNER_INTERVAL_MS } from "../spinner.mjs";
 import { countDashboardSessions, selectDashboardSessions, } from "./dashboard-state.mjs";
 import { createDashboardLayout, renderColumnHeader, } from "./dashboard-layout.mjs";
@@ -224,6 +225,21 @@ const COMPOSER_FIELD_LABELS = {
 function sectionFooter(width, focused) {
     return paintPlainLine("─".repeat(Math.max(0, width)), width, focused ? jobwatchTheme.focusBorder : jobwatchTheme.text);
 }
+/**
+ * A launch the daemon has not answered yet, shaped like a session record so the list can draw it.
+ * It disappears as soon as the daemon replies, replaced by the real record arriving over the subscription.
+ * @param {{ sessionId: string, prompt: string, cwd: string, createdAt: string }} pending
+ */
+function pendingSessionRecord(pending) {
+    return {
+        schemaVersion: 1, revision: 0,
+        sessionId: pending.sessionId, sessionFile: "", canonicalSessionFile: "", cwd: pending.cwd,
+        name: sessionNameFromPrompt(pending.prompt),
+        taskState: "READY", processState: "EXITED", outcome: "NONE",
+        activity: { kind: "launching", summary: pending.prompt, updatedAt: pending.createdAt },
+        createdAt: pending.createdAt, updatedAt: pending.createdAt,
+    };
+}
 function sectionBorder(label, width, focused) {
     const prefix = label === "" ? "╭─" : `╭─ ${label} `;
     const line = prefix + "─".repeat(Math.max(0, width - visibleWidth(prefix)));
@@ -285,6 +301,9 @@ export class DashboardController {
     renderWaiters = new Map();
     stopClearGesture;
     animationTimer;
+    /** Launches sent but not yet answered, shown as STARTING rows so a prompt never looks lost. */
+    pendingLaunches = [];
+    stopRetryLimit;
     query = defaultQuery();
     focus = "list";
     composerField = "prompt";
@@ -304,6 +323,7 @@ export class DashboardController {
         this.onSessionIntent = options.onSessionIntent;
         this.requestRender = options.requestRender;
         this.now = options.now ?? Date.now;
+        this.stopRetryLimit = options.stopRetryLimit ?? 8;
         this.stopClearGesture = new StopClearGesture({ now: options.now });
         this.composerDraft = createLaunchDraft({
             ...options.launchDefaults,
@@ -438,13 +458,19 @@ export class DashboardController {
         this.scheduleUiSave();
     }
     async submitComposer() {
-        if (this.composerDraft.prompt.trim().length === 0)
+        const submitted = { ...this.composerDraft, model: { ...this.composerDraft.model } };
+        const prompt = submitted.prompt;
+        if (prompt.trim().length === 0)
             return;
+        // Clear the draft on the keystroke that sent it: a prompt still sitting in the box invites a
+        // second Enter, which launches the same work twice while the daemon is still starting the first.
+        this.composerDraft = { ...this.composerDraft, prompt: "" };
+        this.requestRender?.();
         try {
-            const preflight = await this.backend.preflightLaunch(this.composerDraft);
-            const prepared = prepareLaunchRequest(this.composerDraft, preflight);
+            const preflight = await this.backend.preflightLaunch(submitted);
+            const prepared = prepareLaunchRequest(submitted, preflight);
             if (prepared.kind === "confirmation_required") {
-                this.pendingShared = { draft: { ...this.composerDraft, model: { ...this.composerDraft.model } }, preflight };
+                this.pendingShared = { draft: submitted, preflight };
                 this.confirmationText = "";
                 this.focus = "confirmation";
                 this.overlay = createSharedDirectoryOverlay(prepared.canonicalCwd, prepared.ownerSessionIds);
@@ -454,6 +480,7 @@ export class DashboardController {
                 await this.launch(prepared.request);
         }
         catch (error) {
+            this.restoreDraft(prompt);
             this.setError(error, "LAUNCH_PREFLIGHT_FAILED");
         }
     }
@@ -504,7 +531,22 @@ export class DashboardController {
         }
         this.requestRender();
         try {
-            await this.backend[action](sessionId, revision, requestId);
+            // A working session's record churns while the request travels, so a revision conflict means
+            // "the record moved", not "do not do this". Re-aim at the newest revision and send again.
+            let attemptRevision = revision;
+            for (let attempt = 1; ; attempt += 1) {
+                try {
+                    await this.backend[action](sessionId, attemptRevision, requestId);
+                    break;
+                }
+                catch (error) {
+                    const current = this.sessions.find((candidate) => candidate.sessionId === sessionId);
+                    if (error?.code !== "REVISION_CONFLICT" || attempt >= this.stopRetryLimit || current === undefined || destructiveAction(current) !== action)
+                        throw error;
+                    attemptRevision = current.revision;
+                    await new Promise((resolve) => setTimeout(resolve, 25));
+                }
+            }
             // Arm only after the stop landed, so a single press can never remove a running session.
             if (action === "stop")
                 this.stopClearGesture.armAfterStop(sessionId);
@@ -758,9 +800,14 @@ export class DashboardController {
                 this.setError(Object.assign(new Error(`Session became ${destructiveAction(current) === "stop" ? "live" : "inactive"} before ${action.toUpperCase()}`), { code: destructiveAction(current) === "stop" ? "SESSION_LIVE" : "SESSION_INACTIVE" }), "SESSION_CHANGED");
         }
     }
+    /** Put a failed launch's text back so the operator does not retype it. */
+    restoreDraft(prompt) {
+        if (this.composerDraft.prompt.trim() === "")
+            this.composerDraft = { ...this.composerDraft, prompt };
+    }
     rebuildList() {
         const selected = this.preferredSelectionId ?? this.list.selectedSessionId;
-        const visible = selectDashboardSessions(this.sessions, this.query);
+        const visible = [...selectDashboardSessions(this.sessions, this.query), ...this.pendingLaunches.map((entry) => pendingSessionRecord(entry))];
         this.list.setSessions(visible, { groupBy: this.query.groupBy });
         if (selected !== undefined && visible.some((session) => session.sessionId === selected)) {
             this.list.selectSession(selected);
@@ -885,14 +932,20 @@ export class DashboardController {
         // Show the list before the daemon answers: startup takes seconds and the session row arrives by subscription.
         this.focus = "list";
         this.status = { kind: "ready" };
+        const pending = { sessionId: `pending:${this.requestId()}`, prompt: request.prompt, cwd: request.cwd, createdAt: new Date(this.now()).toISOString() };
+        this.pendingLaunches = [...this.pendingLaunches, pending];
+        this.rebuildList();
         this.requestRender?.();
         const outcome = await this.backend.launch(request, this.requestId());
+        this.pendingLaunches = this.pendingLaunches.filter((entry) => entry !== pending);
+        this.rebuildList();
         if (outcome.kind === "launched") {
-            this.composerDraft = { ...this.composerDraft, prompt: "" };
             this.scheduleUiSave();
             this.requestRender?.();
             return;
         }
+        if (outcome.kind === "error")
+            this.restoreDraft(request.prompt);
         if (outcome.kind === "delivery_unknown") {
             this.focus = "list";
             this.overlay = createDeliveryUnknownOverlay(outcome.clientId, outcome.requestId);

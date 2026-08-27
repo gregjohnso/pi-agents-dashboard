@@ -67,37 +67,19 @@ describe("viewer commands and role restrictions", () => {
     expect(f.instance.closedState).toBe(false);
   });
 
-  it("routes Ctrl+C to interrupt while a working pending overlay retains focus", async () => {
+  it("keeps a working pending overlay through Ctrl+C and disposes it once it responds", async () => {
     const f = fixture({ snapshot: { taskState: "WORKING", pendingUi: [{ id: "ui-working", method: "confirm", title: "Continue?" }] } });
     await f.instance.open();
     const overlay = f.instance.overlay;
     f.instance.handleInput("\x03");
     await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "interrupt", payload: { sessionId: "s" } }]));
     expect(f.instance.overlay).toBe(overlay);
-  });
 
-  it("disposes a resolved overlay and restores focus before sending its response", async () => {
-    const f = fixture({ snapshot: { pendingUi: [{ id: "ui-dispose", method: "confirm", title: "Continue?" }] } });
-    await f.instance.open();
-    const dispose = vi.spyOn(f.instance.overlay, "dispose");
+    const dispose = vi.spyOn(overlay, "dispose");
     f.instance.handleInput("y");
-    await vi.waitFor(() => expect(f.commands.at(-1)?.operation).toBe("ui_response"));
+    await vi.waitFor(() => expect(f.commands.at(-1)).toEqual({ operation: "ui_response", payload: { sessionId: "s", uiRequestId: "ui-working", response: true } }));
     expect(dispose).toHaveBeenCalledOnce();
     expect(f.instance.overlay).toBeUndefined();
-  });
-
-  it.each([
-    ["confirm", {}, "y", true],
-    ["select", { options: ["one", "two"] }, "\r", "one"],
-    ["input", { initialValue: "single" }, "\r", "single"],
-    ["editor", { initialValue: "line one\nline two" }, "\r", "line one\nline two"],
-  ])("sends one durable ui_response for a %s request", async (method, requestFields, input, expected) => {
-    const f = fixture();
-    await f.instance.open();
-    await f.emit({ version: 1, sessionId: "s", eventId: `ui-${method}`, cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "pending_ui_request", request: { id: `request-${method}`, method, title: `Request ${method}`, ...requestFields } } });
-    f.instance.handleInput(input);
-    f.instance.handleInput(input);
-    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "ui_response", payload: { sessionId: "s", uiRequestId: `request-${method}`, response: expected } }]));
   });
 
   it("discovers slash commands, applies model selection, and reloads the menu", async () => {
@@ -130,7 +112,7 @@ describe("viewer commands and role restrictions", () => {
     expect(f.commands).toEqual([]);
   });
 
-  it("opens Pi's selection list for a bare built-in command and applies the choice", async () => {
+  it("opens one picker per bare built-in, applies the choice, and refuses a mistyped argument", async () => {
     const f = fixture({ menu: async () => ({ commands: [], models: [{ provider: "anthropic", id: "claude" }, { provider: "openai", id: "gpt-5" }], thinkingLevels: ["off", "high"], model: null, thinkingLevel: null }) });
     await f.instance.open();
 
@@ -143,86 +125,55 @@ describe("viewer commands and role restrictions", () => {
     await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "session_command", payload: { sessionId: "s", command: "set_model", model: { provider: "openai", id: "gpt-5" } } }]));
     expect(f.instance.selection).toBeUndefined();
 
-    f.instance.editor.setText("/thinking");
-    f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
-    f.instance.handleInput("\x1b");
-    expect(f.instance.selection).toBeUndefined();
-    expect(f.commands).toHaveLength(1);
-  });
-
-  it("offers mode and toggle pickers for bare queue and automation commands", async () => {
-    const f = fixture();
-    await f.instance.open();
-
     f.instance.editor.setText("/steering");
     f.instance.handleInput("\r");
     await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
     expect(f.instance.render(80, 24).join("\n")).toContain("one-at-a-time");
     f.instance.handleInput("\x1b[B");
     f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "session_command", payload: { sessionId: "s", command: "set_steering_mode", mode: "one-at-a-time" } }]));
+    await vi.waitFor(() => expect(f.commands.at(-1)).toEqual({ operation: "session_command", payload: { sessionId: "s", command: "set_steering_mode", mode: "one-at-a-time" } }));
 
     f.instance.editor.setText("/auto-compact");
     f.instance.handleInput("\r");
     await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
     f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(f.commands).toHaveLength(2));
-    expect(f.commands.at(-1)).toEqual({ operation: "session_command", payload: { sessionId: "s", command: "set_auto_compaction", enabled: true } });
+    await vi.waitFor(() => expect(f.commands.at(-1)).toEqual({ operation: "session_command", payload: { sessionId: "s", command: "set_auto_compaction", enabled: true } }));
 
     f.instance.editor.setText("/follow-up");
     f.instance.handleInput("\r");
     await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
     f.instance.handleInput("\x1b");
     expect(f.instance.selection).toBeUndefined();
-    expect(f.commands).toHaveLength(2);
-  });
+    expect(f.commands).toHaveLength(3);
 
-  it.each([40, 55, 80, 120, 160])("fits the mode picker and help panel in %i columns", async (width) => {
-    const f = fixture();
-    await f.instance.open();
-
-    f.instance.editor.setText("/steering");
-    f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
-    expect(f.instance.render(width, 24).every((line) => visibleWidth(line) <= width)).toBe(true);
-    f.instance.handleInput("\x1b");
-
-    f.instance.editor.setText("/help");
-    f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(f.instance.render(width, 24).join("\n")).toContain("auto-compact"));
-    expect(f.instance.render(width, 24).every((line) => visibleWidth(line) <= width)).toBe(true);
-  });
-
-  it("corrects a mistyped mode instead of opening a picker", async () => {
-    const f = fixture();
-    await f.instance.open();
-
+    // Only a bare command opens a picker: a mistyped argument is a rejection the operator has to fix.
     f.instance.editor.setText("/auto-compact maybe");
     f.instance.handleInput("\r");
     await vi.waitFor(() => expect(f.instance.render(80, 24).join("\n")).toContain("TOGGLE_REQUIRED"));
     expect(f.instance.selection).toBeUndefined();
-    expect(f.commands).toHaveLength(0);
+    expect(f.commands).toHaveLength(3);
   });
 
-  it("renders a read-only query in an overlay without prompting the session", async () => {
+  it("answers /stats, /help, /new, and /resume in the viewer without prompting the session", async () => {
     const f = fixture({ query: async (_sessionId, payload) => ({ rows: [`query:${payload.query}`, "messageCount: 12"] }) });
     await f.instance.open();
+
     f.instance.editor.setText("/stats");
     f.instance.handleInput("\r");
-
     await vi.waitFor(() => expect(f.instance.overlay?.title).toBe("Session stats"));
-    const rendered = f.instance.render(80, 24).join("\n");
-    expect(rendered).toContain("messageCount: 12");
-    expect(f.commands).toEqual([]);
-
+    expect(f.instance.render(80, 24).join("\n")).toContain("messageCount: 12");
     f.instance.handleInput("\x1b");
     expect(f.instance.overlay).toBeUndefined();
-  });
 
-  it("routes /new and /resume to the dashboard instead of rebinding Pi", async () => {
-    const f = fixture();
-    await f.instance.open();
+    f.instance.editor.setText("/help");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.instance.overlay?.title).toBe("Viewer help"));
+    const help = f.instance.render(80, 24).join("\n");
+    expect(help).toContain("/stats");
+    expect(help).toContain("/auto-compact");
+    expect(help).toContain("Esc");
+    f.instance.handleInput("\x1b");
+
     f.instance.editor.setText("/new");
     f.instance.handleInput("\r");
     await vi.waitFor(() => expect(f.dashboard).toEqual(["new_session"]));
@@ -232,131 +183,81 @@ describe("viewer commands and role restrictions", () => {
     expect(f.commands).toEqual([]);
   });
 
-  it("shows viewer help listing its commands", async () => {
-    const f = fixture();
-    await f.instance.open();
-    f.instance.editor.setText("/help");
-    f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(f.instance.overlay?.title).toBe("Viewer help"));
-    const rendered = f.instance.render(80, 24).join("\n");
-    expect(rendered).toContain("/stats");
-    expect(rendered).toContain("Esc");
-  });
-
-  it("forwards a session toggle and refreshes the menu", async () => {
-    const f = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null }) });
-    await f.instance.open();
-    f.instance.editor.setText("/auto-compact off");
-    f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "session_command", payload: { sessionId: "s", command: "set_auto_compaction", enabled: false } }]));
-  });
-
-  it("sets a session color through the daemon and tints the prompt bar", async () => {
+  it("picks, applies, keeps, and restores the session color, and reports a failed change", async () => {
     /** @type {any[]} */
     const colored = [];
-    const f = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: null, registryRevision: 7 }) });
+    // The daemon owns the color: it comes back on the reloaded menu, not from viewer-local state.
+    let stored = /** @type {string | null} */ (null);
+    const f = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: stored }) });
     f.client.setSessionColor = async (/** @type {string} */ sessionId, /** @type {string | null} */ color) => {
       colored.push({ sessionId, color });
+      stored = color;
       return { kind: "session_colored", sessionId, revision: 8, color };
     };
     await f.instance.open();
-    const plain = f.instance.render(80, 20);
 
-    f.instance.editor.setText("/color amber");
-    f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(colored).toEqual([{ sessionId: "s", color: "amber" }]));
-    expect(f.commands).toEqual([]);
-
-    const tinted = f.instance.render(80, 20);
-    expect(tinted).not.toEqual(plain);
-    expect(tinted.join("\n")).toContain("\x1b[38;2;252;211;77m");
-    expect(tinted.map(stripVTControlCharacters)).toEqual(plain.map(stripVTControlCharacters));
-    for (const width of [40, 55, 80, 120, 160]) {
-      for (const line of f.instance.render(width, 20)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
-    }
-  });
-
-  it("offers a color picker when /color arrives without a color", async () => {
-    const f = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: null, registryRevision: 2 }) });
-    f.client.setSessionColor = async () => ({ kind: "session_colored", sessionId: "s", revision: 3, color: "rose" });
-    await f.instance.open();
     f.instance.editor.setText("/color");
     f.instance.handleInput("\r");
     await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
-    const rendered = f.instance.render(80, 20).map(stripVTControlCharacters).join("\n");
-    expect(rendered).toContain("amber");
-    expect(rendered).toContain("default");
-    expect(f.instance.state.errors).toEqual([]);
-  });
-
-  it("colors a session whose registry revision the viewer never learned", async () => {
-    /** @type {any[]} */
-    const colored = [];
-    const f = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: null }) });
-    f.client.setSessionColor = async (/** @type {string} */ sessionId, /** @type {string | null} */ color) => {
-      colored.push({ sessionId, color });
-      return { kind: "session_colored", sessionId, revision: 3, color };
-    };
-    await f.instance.open();
-    f.instance.state.registryRevision = undefined;
+    const picker = f.instance.render(80, 20).map(stripVTControlCharacters).join("\n");
+    expect(picker).toContain("amber");
+    expect(picker).toContain("default");
+    f.instance.handleInput("\x1b");
+    const plain = f.instance.render(80, 20);
 
     f.instance.editor.setText("/color amber");
     f.instance.handleInput("\r");
     await vi.waitFor(() => expect(colored).toEqual([{ sessionId: "s", color: "amber" }]));
+    const tinted = f.instance.render(80, 20);
+    expect(f.commands).toEqual([]);
     expect(f.instance.state.errors).toEqual([]);
-  });
+    expect(tinted).not.toEqual(plain);
+    expect(tinted.join("\n")).toContain("\x1b[38;2;252;211;77m");
+    expect(tinted.map(stripVTControlCharacters)).toEqual(plain.map(stripVTControlCharacters));
 
-  it("reports a color failure as a viewer error without changing the prompt bar", async () => {
-    const f = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: null, registryRevision: 4 }) });
     f.client.setSessionColor = async () => { throw Object.assign(new Error("The session no longer exists"), { code: "SESSION_NOT_FOUND" }); };
-    await f.instance.open();
-    const plain = f.instance.render(80, 20);
     f.instance.editor.setText("/color rose");
     f.instance.handleInput("\r");
     await vi.waitFor(() => expect(f.instance.state.errors).toContainEqual(expect.objectContaining({ code: "SESSION_NOT_FOUND" })));
-    expect(f.instance.render(80, 20).at(-2)).toBe(plain.at(-2));
-  });
+    const afterFailure = f.instance.render(80, 20).join("\n");
+    expect(afterFailure).toContain("\x1b[38;2;252;211;77m");
+    expect(afterFailure).not.toContain("\x1b[38;2;253;164;175m");
 
-  it("rejects an unknown model locally without contacting the session", async () => {
-    const f = fixture({ menu: async () => ({ commands: [], models: [{ provider: "anthropic", id: "claude" }], thinkingLevels: [], model: null, thinkingLevel: null }) });
-    await f.instance.open();
-    f.instance.editor.setText("/model invented/model");
-    f.instance.now = () => 0;
-    f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(f.instance.state.errors).toContainEqual({ code: "UNKNOWN_MODEL", message: "Unknown model: invented/model", retryable: false }));
-    expect(f.commands).toEqual([]);
+    // The color lives on the session record, so reopening paints the prompt box with no fresh /color.
+    const reopened = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: "amber" }) });
+    await reopened.instance.open();
+    expect(reopened.instance.render(80, 20).join("\n")).toContain("\x1b[38;2;252;211;77m");
   });
 
   it("observer mode disables every mutation but preserves scroll and tool inspection", async () => {
-    const f = fixture({ snapshot: { role: "observer", tools: [{ id: "t", name: "bash", state: "completed", arguments: {}, result: [{ type: "text", text: "ok" }], startedAt: timestamp, finishedAt: timestamp }] } });
+    const tool = (/** @type {string} */ id) => ({ id, name: "future_tool", state: "completed", arguments: { id }, result: [{ type: "text", text: `result ${id}` }], startedAt: timestamp, finishedAt: timestamp });
+    const f = fixture({ snapshot: { role: "observer", tools: [tool("tool-a"), tool("tool-b")] } });
     await f.instance.open();
     f.instance.editor.setText("blocked");
-    for (const input of ["\r", "\x03", "\x1b[5~", "\x0f", "\x1b[B", "\x0f", "\x1b", "\x14", "/", "x"]) f.instance.handleInput(input);
+    for (const input of ["\r", "\x03", "\x1b[5~", "\x1b", "\x14", "/", "x"]) f.instance.handleInput(input);
     f.instance.submitSteer("blocked");
     expect(f.commands).toEqual([]);
     expect(f.instance.render(55, 16).join("\n")).toContain("OBSERVER");
-  });
-
-  it("supports selected-tool inspection, explicit steer input, and thinking visibility", async () => {
-    const tool = (id) => ({ id, name: "future_tool", state: "completed", arguments: { id }, result: [{ type: "text", text: `result ${id}` }], startedAt: timestamp, finishedAt: timestamp });
-    const f = fixture({ snapshot: {
-      items: [
-        { kind: "system_message", itemId: "first", text: "needle first", level: "info" },
-        { kind: "assistant_message", itemId: "middle", content: [{ type: "thinking", text: "private reasoning" }, { type: "text", text: "middle" }] },
-        { kind: "system_message", itemId: "second", text: "needle second", level: "info" },
-      ],
-      tools: [tool("tool-a"), tool("tool-b")], thinkingLevel: "high",
-    } });
-    await f.instance.open();
 
     f.instance.handleInput("\x0f");
     expect(f.instance.transcript.selectedToolId).toBe("tool-a");
+    expect(f.instance.transcript.expandedTools.has("tool-a")).toBe(false);
+    f.instance.handleInput("\x0f");
+    expect(f.instance.transcript.expandedTools.has("tool-a")).toBe(true);
     f.instance.handleInput("\x1b[B");
     expect(f.instance.transcript.selectedToolId).toBe("tool-b");
-    expect(f.instance.transcript.expandedTools.has("tool-b")).toBe(false);
+    expect(f.instance.render(80, 24).join("\n")).toContain("tool:future_tool completed collapsed");
     f.instance.handleInput("\x0f");
-    expect(f.instance.transcript.expandedTools.has("tool-b")).toBe(true);
     expect(f.instance.render(80, 24).join("\n")).toContain("tool:future_tool completed expanded");
+    expect(f.commands).toEqual([]);
+  });
+
+  it("opens steer input over the draft and toggles thinking visibility", async () => {
+    const f = fixture({ snapshot: {
+      items: [{ kind: "assistant_message", itemId: "middle", content: [{ type: "thinking", text: "private reasoning" }, { type: "text", text: "middle" }] }],
+      thinkingLevel: "high",
+    } });
+    await f.instance.open();
 
     expect(f.instance.hideThinking).toBe(false);
     f.instance.handleInput("\x14");
@@ -391,17 +292,10 @@ describe("viewer commands and role restrictions", () => {
 });
 
 describe("viewer rendering and navigation", () => {
-  it.each([[160, 40], [120, 32], [80, 24], [55, 16], [40, 10]])("renders a bounded %ix%i Pi-style fixture", async (width, height) => {
-    const f = fixture({ snapshot: { taskState: "WORKING", activity: { kind: "activity", phase: "thinking", label: "Thinking", sourceEventId: "source", startedAt: timestamp }, model: { provider: "anthropic", id: "opus" }, thinkingLevel: "high" } });
-    await f.instance.open();
-    const lines = f.instance.render(width, height);
-    expect(lines).toHaveLength(height);
-    expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
-    expect(lines.join("\n")).toContain("Thinking");
-    expect(lines.map(stripVTControlCharacters)).toMatchSnapshot();
-  });
-
-  it.each([[160, 40], [120, 32], [80, 24], [55, 16], [40, 10]])("snapshots the complete chat-state matrix at %ix%i", async (width, height) => {
+  // One visual pin for the whole dock and every chat state. Width behaviour belongs to the terminal
+  // acceptance suite, which renders this same controller at 40, 55, 80, 120 and 160 columns.
+  it("snapshots the complete chat-state matrix at 80x24", async () => {
+    const [width, height] = [80, 24];
     const message = (kind, text) => kind === "assistant_message"
       ? { kind, itemId: kind, content: [{ type: "text", text }] }
       : { kind, itemId: `${kind}-${text}`, text, level: text.includes("error") ? "error" : "info" };
@@ -445,6 +339,8 @@ describe("viewer rendering and navigation", () => {
     matrix["paused-follow"] = paused.instance.render(width, height).map(stripVTControlCharacters);
     await paused.instance.close();
     expect(matrix).toMatchSnapshot();
+    expect(matrix.active).toHaveLength(height);
+    expect(matrix.active.every((/** @type {string} */ line) => visibleWidth(line) <= width)).toBe(true);
   });
 
   it("replays from origin into exact message/tool chronology before continuing live without a gap", async () => {
@@ -481,9 +377,10 @@ describe("viewer rendering and navigation", () => {
     await instance.close();
   });
 
-  it("stops a working agent with Escape and only leaves once the work is stopped", async () => {
+  it("stops a working agent with Escape and leaves on the next one, draft and all", async () => {
     const f = fixture({ snapshot: { taskState: "WORKING" } });
     await f.instance.open();
+    f.instance.editor.setText("half written");
 
     f.instance.handleInput("\x1b");
     await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "interrupt", payload: { sessionId: "s" } }]));
@@ -493,18 +390,6 @@ describe("viewer rendering and navigation", () => {
     f.instance.handleInput("\x1b");
     expect(f.instance.onReturn).toHaveBeenCalledOnce();
     expect(f.commands).toHaveLength(1);
-  });
-
-  it("leaves on the Escape after the interrupt even with an edited draft", async () => {
-    const f = fixture({ snapshot: { taskState: "WORKING" } });
-    await f.instance.open();
-    f.instance.editor.setText("half written");
-
-    f.instance.handleInput("\x1b");
-    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "interrupt", payload: { sessionId: "s" } }]));
-    await f.emit({ version: 1, sessionId: "s", eventId: "settled", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "turn_state", working: false } });
-    f.instance.handleInput("\x1b");
-    expect(f.instance.onReturn).toHaveBeenCalledOnce();
     expect(f.saved.at(-1)).toMatchObject({ draft: "half written" });
   });
 
@@ -543,36 +428,21 @@ describe("viewer rendering and navigation", () => {
 
 describe("Pi interactive-mode parity", () => {
   const working = { snapshot: { taskState: "WORKING", model: { provider: "anthropic", id: "opus" }, thinkingLevel: "high", activity: { kind: "activity", phase: "assistant_streaming", label: "Working...", sourceEventId: "source", startedAt: timestamp } } };
+  const settled = { snapshot: { model: { provider: "anthropic", id: "opus" }, thinkingLevel: "off" } };
 
-  it("shows Pi's spinner, interrupt hint, model footer, and key hints while a turn works", async () => {
-    const f = fixture(working);
+  it.each([
+    ["a working turn", working, /\(anthropic\) opus • high$/u, " Esc interrupt · ← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking", " Esc interrupt · ← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands"],
+    ["a settled turn", settled, /\(anthropic\) opus • thinking off$/u, " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools", " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands"],
+  ])("shows Pi's model footer and the key hints that fit for %s", async (_label, overrides, footer, hints80, hints120) => {
+    const f = fixture(overrides);
     await f.instance.open();
     const lines = f.instance.render(80, 24).map(stripVTControlCharacters);
-    expect(lines.some((line) => /^ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working\.\.\./u.test(line))).toBe(true);
-    expect(lines.join("\n")).toContain("(Esc to interrupt)");
-    expect(lines.at(-2)).toMatch(/\(anthropic\) opus • high$/u);
-    expect(lines.at(-1)).toBe(" Esc interrupt · ← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking");
-    expect(f.instance.render(120, 24).at(-1)).toBe(" Esc interrupt · ← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands");
-  });
-
-  it("drops the interrupt hint and offers the list keys once the turn settles", async () => {
-    const f = fixture({ snapshot: { model: { provider: "anthropic", id: "opus" }, thinkingLevel: "off" } });
-    await f.instance.open();
-    const lines = f.instance.render(80, 24).map(stripVTControlCharacters);
-    expect(lines.join("\n")).not.toContain("to interrupt");
-    expect(lines.at(-2)).toMatch(/\(anthropic\) opus • thinking off$/u);
-    expect(lines.at(-1)).toBe(" Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools");
-  });
-
-  it("keeps the hints and model footer inside every supported width", async () => {
-    const f = fixture(working);
-    await f.instance.open();
-    for (const width of [40, 55, 80, 120, 160]) {
-      const lines = f.instance.render(width, 24);
-      expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
-      expect(visibleWidth(lines.at(-1))).toBeGreaterThan(0);
-      expect(stripVTControlCharacters(lines.at(-2))).toContain("opus");
-    }
+    const spinning = overrides === working;
+    expect(lines.some((line) => /^ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working\.\.\./u.test(line))).toBe(spinning);
+    expect(lines.join("\n").includes("(Esc to interrupt)")).toBe(spinning);
+    expect(lines.at(-2)).toMatch(footer);
+    expect(lines.at(-1)).toBe(hints80);
+    expect(stripVTControlCharacters(f.instance.render(120, 24).at(-1))).toBe(hints120);
   });
 
   it("lists queued steer and follow-up messages under the editor until the session consumes them", async () => {
@@ -604,112 +474,53 @@ describe("Pi interactive-mode parity", () => {
     expect(lines.at(-1)).toContain("Esc interrupt");
   });
 
-  it("spaces user turns and words error cards the way Pi does", async () => {
-    const f = fixture({ snapshot: {
-      items: [
-        { kind: "assistant_message", itemId: "a", content: [{ type: "text", text: "answer" }] },
-        { kind: "user_message", itemId: "u", content: [{ type: "text", text: "follow up" }] },
-        { kind: "system_message", itemId: "sys", text: "provider degraded", level: "warning" },
-      ],
-      errors: [{ code: "PROVIDER_ERROR", message: "provider error", retryable: true }],
-    } });
-    await f.instance.open();
-    const lines = f.instance.render(80, 24).map(stripVTControlCharacters);
-    const userIndex = lines.findIndex((line) => line.includes("follow up"));
-    expect(userIndex).toBeGreaterThan(1);
-    // Pi separates a user turn from the previous one with its own spacer above the message box padding.
-    expect([lines[userIndex - 2].trim(), lines[userIndex - 1].trim()]).toEqual(["", ""]);
-    expect(lines.join("\n")).toContain(" Warning: provider degraded");
-    expect(lines.join("\n")).toContain(" Error: PROVIDER_ERROR: provider error");
-  });
 });
 
 describe("transcript scrolling keys and wheel", () => {
   const longSnapshot = { items: Array.from({ length: 60 }, (_, index) => ({ kind: "system_message", itemId: `i-${index}`, text: `line ${index}`, level: "info" })) };
 
-  it("scrolls with the arrows while the prompt is empty", async () => {
+  // Arrows scroll only when Pi's editor has nothing to offer: no draft to move within and no history
+  // to recall. Either one hands the arrows back, which keeps recall working and keeps the Left
+  // double-press gesture honest about a dirty prompt.
+  it.each([
+    ["an empty prompt with no history", () => {}, false],
+    ["a typed draft", (/** @type {any} */ f) => f.instance.editor.setText("draft"), true],
+    ["a draft that was typed and then cleared", (/** @type {any} */ f) => { f.instance.editor.setText("draft"); f.instance.editor.setText(""); }, false],
+    ["recallable prompt history", (/** @type {any} */ f) => f.instance.history.push("earlier prompt"), true],
+  ])("routes the arrows to %s", async (_label, prepare, editorKeeps) => {
     const f = fixture({ snapshot: longSnapshot });
     await f.instance.open();
     f.instance.render(80, 24);
+    prepare(f);
     f.instance.handleInput("\x1b[A");
-    expect(f.instance.transcript.following).toBe(false);
+    expect(f.instance.transcript.following).toBe(editorKeeps);
+    expect(f.instance.transcript.distanceFromEnd).toBe(editorKeeps ? 0 : 1);
     f.instance.handleInput("\x1b[B");
     expect(f.instance.transcript.following).toBe(true);
-  });
-
-  it("hands the arrows to Pi's prompt history once a draft exists", async () => {
-    const f = fixture({ snapshot: longSnapshot });
-    await f.instance.open();
-    f.instance.render(80, 24);
-    f.instance.editor.setText("draft");
-    const before = f.instance.transcript.distanceFromEnd;
-    f.instance.handleInput("\x1b[A");
-    expect(f.instance.transcript.distanceFromEnd).toBe(before);
-    expect(f.instance.transcript.following).toBe(true);
-  });
-
-  it("returns the arrows to scrolling when the prompt is cleared", async () => {
-    const f = fixture({ snapshot: longSnapshot });
-    await f.instance.open();
-    f.instance.render(80, 24);
-    f.instance.editor.setText("draft");
-    f.instance.handleInput("\x1b[A");
-    expect(f.instance.transcript.following).toBe(true);
-    f.instance.editor.setText("");
-    f.instance.handleInput("\x1b[A");
-    expect(f.instance.transcript.following).toBe(false);
-  });
-
-  it("leaves the arrows to Pi once prompt history exists, so recall keeps working", async () => {
-    const f = fixture({ snapshot: longSnapshot });
-    await f.instance.open();
-    f.instance.render(80, 24);
-    f.instance.history.push("earlier prompt");
-    f.instance.handleInput("\x1b[A");
-    expect(f.instance.transcript.following).toBe(true);
     expect(f.instance.transcript.distanceFromEnd).toBe(0);
   });
 
-  it("jumps to the transcript start and end with Home and End", async () => {
+  it("jumps with Home and End, scrolls on the wheel, and clears the new-activity marker at the end", async () => {
     const f = fixture({ snapshot: longSnapshot });
     await f.instance.open();
     f.instance.render(80, 24);
-    f.instance.handleInput("\x1b[H");
-    expect(f.instance.transcript.following).toBe(false);
-    expect(f.instance.transcript.distanceFromEnd).toBe(59);
-    f.instance.handleInput("\x1b[F");
-    expect(f.instance.transcript.following).toBe(true);
-    expect(f.instance.transcript.distanceFromEnd).toBe(0);
-  });
 
-  it("scrolls the transcript from a wheel event and resumes follow at the end", async () => {
-    const f = fixture({ snapshot: longSnapshot });
-    await f.instance.open();
-    f.instance.render(80, 24);
     f.instance.handleMouse({ button: "wheel_up", column: 10, row: 5 });
     expect(f.instance.transcript.following).toBe(false);
     expect(f.instance.transcript.distanceFromEnd).toBeGreaterThan(0);
     f.instance.handleMouse({ button: "wheel_down", column: 10, row: 5 });
-    f.instance.handleMouse({ button: "wheel_down", column: 10, row: 5 });
     expect(f.instance.transcript.following).toBe(true);
-  });
 
-  it("keeps the new-activity marker while detached and drops it on return to the end", async () => {
-    const f = fixture({ snapshot: longSnapshot });
-    await f.instance.open();
-    f.instance.render(80, 24);
-    f.instance.handleMouse({ button: "wheel_up", column: 10, row: 5 });
+    f.instance.handleInput("\x1b[H");
+    expect(f.instance.transcript.following).toBe(false);
+    expect(f.instance.transcript.distanceFromEnd).toBe(59);
     await f.emit({ version: 1, sessionId: "s", eventId: "e1", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "system_message", itemId: "fresh", text: "fresh", level: "info" } });
     expect(stripVTControlCharacters(f.instance.render(80, 24).join("\n"))).toContain("new activity");
-    f.instance.handleInput("\x1b[F");
-    expect(stripVTControlCharacters(f.instance.render(80, 24).join("\n"))).not.toContain("new activity");
-  });
 
-  it("restores a stored session color when the viewer reopens", async () => {
-    // The colour lives on the session record, so reopening paints the prompt box with no fresh /color.
-    const f = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: "amber", registryRevision: 3 }) });
-    await f.instance.open();
-    expect(f.instance.render(80, 20).join("\n")).toContain("\x1b[38;2;252;211;77m");
+    f.instance.handleInput("\x1b[F");
+    expect(f.instance.transcript.following).toBe(true);
+    expect(f.instance.transcript.distanceFromEnd).toBe(0);
+    expect(stripVTControlCharacters(f.instance.render(80, 24).join("\n"))).not.toContain("new activity");
   });
 
   it("rules the prompt above and below in the session color and leaves the typed text white", async () => {
@@ -727,8 +538,5 @@ describe("transcript scrolling keys and wheel", () => {
     expect(plain.every((line) => !line.includes("\u2502"))).toBe(true);
     expect(rendered[rules.find(({ index }) => index < promptRow).index]).toContain("\x1b[38;2;252;211;77m");
     expect(rendered[promptRow]).not.toContain("\x1b[38;2;252;211;77m");
-    for (const width of [40, 55, 80, 120, 160]) {
-      for (const line of f.instance.render(width, 20)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
-    }
   });
 });

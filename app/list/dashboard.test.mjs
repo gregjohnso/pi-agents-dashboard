@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { DashboardController, createDaemonDashboardBackend, } from "./dashboard.mjs";
 import { JOBWATCH_ANSI } from "./dashboard-theme.mjs";
+import { createSessionConfirmation, describeOverlay } from "./dashboard-overlays.mjs";
 const timestamp = "2026-08-25T12:00:00.000Z";
 function session(id, overrides = {}) {
     return {
@@ -229,6 +230,74 @@ describe("dashboard controller", () => {
         dashboard.handleInput("y");
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "SESSION_LIVE" }));
         expect(backend.stop).not.toHaveBeenCalled();
+    });
+    it("titles the clear-after-stop confirmation distinctly", () => {
+        const stopped = session("a", { processState: "EXITED", taskState: "STOPPED" });
+        const described = describeOverlay({ ...createSessionConfirmation(stopped), clearingStopped: true });
+        expect(described.title).toBe("Clear stopped session");
+        expect(describeOverlay(createSessionConfirmation(stopped)).title).toBe("Confirm DELETE");
+    });
+    it("stops a live session on the first Ctrl+X and never deletes it", async () => {
+        const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
+        let now = 0;
+        const dashboard = controller(backend, { now: () => now });
+        await dashboard.open();
+        dashboard.selectSession("a");
+        dashboard.handleInput("\x18");
+        expect(dashboard.overlay).toMatchObject({ kind: "session_confirmation", action: "stop" });
+        dashboard.handleInput("y");
+        await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledWith("a", 1, expect.any(String)));
+        expect(backend.delete).not.toHaveBeenCalled();
+    });
+    it("clears with a second Ctrl+X inside the window, still asking to confirm", async () => {
+        const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
+        let now = 0;
+        const dashboard = controller(backend, { now: () => now });
+        await dashboard.open();
+        dashboard.selectSession("a");
+        dashboard.handleInput("\x18");
+        dashboard.handleInput("y");
+        await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledOnce());
+        dashboard.applySnapshot({ sessions: [session("a", { revision: 2, processState: "EXITED", taskState: "STOPPED" })] });
+        dashboard.selectSession("a");
+
+        now = 400;
+        expect(dashboard.stopClearArmed).toBe(true);
+        dashboard.handleInput("\x18");
+        expect(dashboard.overlay).toMatchObject({ kind: "session_confirmation", action: "delete", clearingStopped: true });
+        expect(backend.delete).not.toHaveBeenCalled();
+        dashboard.handleInput("y");
+        await vi.waitFor(() => expect(backend.delete).toHaveBeenCalledWith("a", 2, expect.any(String)));
+    });
+    it("reopens the ordinary confirmation once the clear window lapses", async () => {
+        const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
+        let now = 0;
+        const dashboard = controller(backend, { now: () => now });
+        await dashboard.open();
+        dashboard.selectSession("a");
+        dashboard.handleInput("\x18");
+        dashboard.handleInput("y");
+        await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledOnce());
+        dashboard.applySnapshot({ sessions: [session("a", { revision: 2, processState: "EXITED", taskState: "STOPPED" })] });
+        dashboard.selectSession("a");
+
+        now = 900;
+        dashboard.handleInput("\x18");
+        expect(dashboard.overlay).toMatchObject({ kind: "session_confirmation", action: "delete" });
+        expect(dashboard.stopClearArmed).toBe(false);
+    });
+    it("forgets the stop gesture when the operator moves the selection", async () => {
+        const backend = new FakeBackend([session("a", { processState: "LIVE" }), session("b", { processState: "LIVE" })]);
+        let now = 0;
+        const dashboard = controller(backend, { now: () => now });
+        await dashboard.open();
+        dashboard.selectSession("a");
+        dashboard.handleInput("\x18");
+        dashboard.handleInput("y");
+        await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledOnce());
+        expect(dashboard.stopClearArmed).toBe(true);
+        dashboard.selectSession("b");
+        expect(dashboard.stopClearArmed).toBe(false);
     });
     it("counts only the sessions the current view shows", async () => {
         const dashboard = controller(new FakeBackend([

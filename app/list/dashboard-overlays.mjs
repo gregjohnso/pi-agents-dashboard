@@ -27,7 +27,7 @@ export function createHelpOverlay() {
             { keys: "mouse controls/form", action: "focus or cycle the clicked search, filter, sort, group, or launch field" },
             { keys: "i / ?", action: "metadata / help" },
             { keys: "Ctrl+C / Escape", action: "close dashboard" },
-            { keys: "Ctrl+X", action: "request Task 15 confirmation" },
+            { keys: "Ctrl+X", action: "stop the session; press again within 500 ms to clear it" },
         ],
     };
 }
@@ -108,7 +108,7 @@ export function describeOverlay(overlay, options = {}) {
     }
     if (overlay.kind === "session_confirmation") {
         return {
-            title: `Confirm ${overlay.action.toUpperCase()}`,
+            title: overlay.clearingStopped === true ? "Clear stopped session" : `Confirm ${overlay.action.toUpperCase()}`,
             rows: [
                 { text: overlay.sessionId },
                 { text: overlay.submitting ? "Submitting…" : "Press y/Enter to confirm; n/Escape to cancel.", emphasis: true },

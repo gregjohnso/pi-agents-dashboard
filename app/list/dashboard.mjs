@@ -5,6 +5,7 @@ import { decodeKittyPrintable, Key, matchesKey, truncateToWidth, visibleWidth, }
 import { countDashboardSessions, selectDashboardSessions, } from "./dashboard-state.mjs";
 import { createDashboardLayout, renderColumnHeader, } from "./dashboard-layout.mjs";
 import { jobwatchTheme } from "./dashboard-theme.mjs";
+import { StopClearGesture } from "./stop-clear-gesture.mjs";
 import { destructiveAction, confirmationMatchesSession, createDeliveryUnknownOverlay, createHelpOverlay, createMetadataOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, describeOverlay, } from "./dashboard-overlays.mjs";
 import { createLaunchDraft, prepareLaunchRequest, } from "./launch-composer.mjs";
 import { VirtualSessionList } from "./virtual-session-list.mjs";
@@ -262,6 +263,7 @@ export class DashboardController {
     saveAdmissionGeneration = 0;
     renderRequestGeneration = 0;
     renderWaiters = new Map();
+    stopClearGesture;
     query = defaultQuery();
     focus = "list";
     composerField = "prompt";
@@ -280,6 +282,7 @@ export class DashboardController {
         this.onClose = options.onClose;
         this.onSessionIntent = options.onSessionIntent;
         this.requestRender = options.requestRender;
+        this.stopClearGesture = new StopClearGesture({ now: options.now });
         this.composerDraft = createLaunchDraft({
             ...options.launchDefaults,
             sourceSessionId: options.sourceSessionId,
@@ -344,7 +347,13 @@ export class DashboardController {
         this.height = Math.max(0, Math.floor(height));
         this.ensureSelectionVisible();
     }
+    get stopClearArmed() {
+        const selected = this.list.selectedSessionId;
+        return selected !== undefined && this.stopClearGesture.armedFor(selected);
+    }
     selectSession(sessionId) {
+        if (sessionId !== this.list.selectedSessionId)
+            this.stopClearGesture.cancel();
         this.preferredSelectionId = sessionId;
         const selected = this.list.selectSession(sessionId);
         this.ensureSelectionVisible();
@@ -468,6 +477,8 @@ export class DashboardController {
             if (confirmation.action === "stop") {
                 this.setView("all");
                 this.selectSession(confirmation.sessionId);
+                // Arm only after the stop landed, so a single press can never remove a running session.
+                this.stopClearGesture.armAfterStop(confirmation.sessionId);
             }
             if (this.overlay?.kind === "session_confirmation" && this.overlay.sessionId === confirmation.sessionId) {
                 this.overlay = undefined;
@@ -580,7 +591,8 @@ export class DashboardController {
         if (matchesKey(data, Key.ctrl("x"))) {
             const selected = this.selectedSession();
             if (selected !== undefined) {
-                this.overlay = createSessionConfirmation(selected);
+                const clearingStopped = this.stopClearGesture.pressWouldClear(selected.sessionId);
+                this.overlay = { ...createSessionConfirmation(selected), clearingStopped };
                 this.onSessionIntent?.(createSessionIntent(selected));
             }
             return;
@@ -760,6 +772,7 @@ export class DashboardController {
         return selectedId === undefined ? undefined : this.sessions.find((session) => session.sessionId === selectedId);
     }
     moveSelection(delta) {
+        this.stopClearGesture.cancel();
         this.list.moveSelection(delta);
         this.preferredSelectionId = this.list.selectedSessionId;
         this.ensureSelectionVisible();

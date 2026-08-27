@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
-import { createDaemonRequester, loadCliClientIdentity, runSessionCommand } from "./session-commands.mjs";
+import { DEFAULT_STOP_ESCALATION_MS, createDaemonRequester, destructiveRequestTimeoutMs, loadCliClientIdentity, runSessionCommand } from "./session-commands.mjs";
 
 const roots = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
@@ -696,4 +696,44 @@ it("resolves delivery only for exact full client/request IDs and clears abandone
   await expect(runSessionCommand(["resolve-delivery", "target-client-full", destructiveRequestId, "abandon", "--yes"], { request, root })).resolves.toMatchObject({ code: 0 });
   expect(request).toHaveBeenCalledTimes(2);
   await expect(runSessionCommand(["resolve-delivery", "target", destructiveRequestId, "abandon", "--yes", "extra"], { request, root })).resolves.toMatchObject({ code: 2 });
+});
+
+it("derives the destructive deadline from the daemon stop policy, not a constant", async () => {
+  const root = await stateRoot();
+  await writeFile(join(root, "dashboard.json"), JSON.stringify({ stop: { gracefulMs: 7_000, terminateMs: 3_000 } }), { mode: 0o600 });
+  await expect(destructiveRequestTimeoutMs(root)).resolves.toBe(7_000 + 3_000 + 1_000);
+});
+
+it("never shortens the destructive deadline below the escalation the daemon performs", async () => {
+  const root = await stateRoot();
+  await expect(destructiveRequestTimeoutMs(root, undefined, 200)).resolves.toBe(DEFAULT_STOP_ESCALATION_MS);
+  expect(DEFAULT_STOP_ESCALATION_MS).toBeGreaterThan(200);
+});
+
+it("reports a stop that answers inside the escalation window as success", async () => {
+  const root = await stateRoot();
+  const request = vi.fn(async (op) => {
+    if (op === "attach") return { kind: "attached", sessionId: "exact-session-id", role: "composer" };
+    if (op === "detach") return { kind: "detached", sessionId: "exact-session-id" };
+    return { kind: "command", status: { stage: "COMPLETED" } };
+  });
+  await expect(runSessionCommand(["stop", "exact-session-id", "--revision", "4", "--yes"], { root, composerRequest: request })).resolves.toMatchObject({ code: 0 });
+});
+
+it("reports an unknown delivery when a stop outlasts the escalation window", async () => {
+  const root = await stateRoot();
+  const request = vi.fn(async (op) => {
+    if (op === "attach") return { kind: "attached", sessionId: "exact-session-id", role: "composer" };
+    if (op === "detach") return { kind: "detached", sessionId: "exact-session-id" };
+    throw Object.assign(new Error("Daemon request timed out"), { code: "DELIVERY_UNKNOWN" });
+  });
+  await expect(runSessionCommand(["stop", "exact-session-id", "--revision", "4", "--yes"], { root, composerRequest: request })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN" } });
+});
+
+it("keeps the CLI fallback policy equal to the daemon's own default", async () => {
+  const daemonDefault = /gracefulMs: (\d[\d_]*), terminateMs: (\d[\d_]*)/u.exec(await readFile(new URL("../runtime/daemon.mjs", import.meta.url), "utf8"));
+  const graceful = Number(daemonDefault[1].replaceAll("_", ""));
+  const terminate = Number(daemonDefault[2].replaceAll("_", ""));
+  expect(DEFAULT_STOP_ESCALATION_MS).toBeGreaterThan(graceful + terminate);
+  await expect(destructiveRequestTimeoutMs(await stateRoot())).resolves.toBe(DEFAULT_STOP_ESCALATION_MS);
 });

@@ -239,3 +239,7 @@ integrated baseline
 - [x] Full release gate exits 0 on a clean checkout.
 - [ ] Private repository remote and primary checkout renamed after acceptance.
 - [x] npm remains unpublished until separate release approval.
+
+## Backlog
+
+- [ ] List: `Ctrl+X` stops the selected session; a second `Ctrl+X` within 500 ms clears it. Same-key double-press window as the viewer's return gesture, no confirmation overlay for the stop, and the clear still refuses when the session is live or another frontend is attached.

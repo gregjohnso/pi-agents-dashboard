@@ -28,8 +28,29 @@ afterEach(async () => {
   }
   processGroups.clear();
   await new Promise((resolve) => setTimeout(resolve, 30));
+  // Stop detached daemons before their roots disappear: a daemon whose publication is deleted can no longer be stopped by identity.
+  for (const root of roots) await stopDetachedDaemon(root);
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
+
+/** Stop one root's detached daemon, then verify its exact published process group is gone. @param {string} root */
+async function stopDetachedDaemon(root) {
+  /** @type {any} */
+  let publication;
+  try {
+    publication = JSON.parse(await readFile(join(root, "daemon", "pid.json"), "utf8"));
+  } catch {
+    return;
+  }
+  await runDaemonCommand("stop", { root, allowLiveWorkers: true, stopWorkers: true, yes: true }).catch(() => {});
+  try {
+    const actual = await inspectProcessIdentity(publication.pid);
+    if (actual.pid === publication.pid && actual.startIdentity === publication.startIdentity && actual.processGroupId === publication.processGroupId) {
+      process.kill(-publication.processGroupId, "SIGTERM");
+    }
+  } catch {
+  }
+}
 
 function sourceFor(version) {
   return fakePiSource.replace('process.env.FAKE_PI_VERSION ?? "1.0.0"', JSON.stringify(version));

@@ -314,7 +314,6 @@ export class ViewerController {
       };
       // The colour is stored on the session record, so adopt it on every open, not only when /color runs.
       this.sessionColor = this.menu.color ?? undefined;
-      if (Number.isSafeInteger(menu?.registryRevision)) this.registryRevision = menu.registryRevision;
     } catch (error) {
       this.menu = EMPTY_SESSION_MENU;
       const code = /** @type {any} */ (error)?.code;
@@ -513,7 +512,6 @@ export class ViewerController {
     }
     try {
       const result = await this.client.setSessionColor(this.sessionId, color);
-      if (Number.isSafeInteger(result?.revision)) this.registryRevision = result.revision;
       this.sessionColor = result?.color ?? undefined;
       this.clearEditor();
       return true;

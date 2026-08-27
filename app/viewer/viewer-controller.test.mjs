@@ -298,7 +298,6 @@ describe("viewer commands and role restrictions", () => {
       return { kind: "session_colored", sessionId, revision: 3, color };
     };
     await f.instance.open();
-    f.instance.registryRevision = undefined;
     f.instance.state.registryRevision = undefined;
 
     f.instance.editor.setText("/color amber");

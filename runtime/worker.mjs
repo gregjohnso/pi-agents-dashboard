@@ -176,6 +176,27 @@ export function replayDeliveryIsAmbiguous(replay, command) {
 export function createWorkerCommandDispatcher({ replay, adapter }) {
   let tail = Promise.resolve();
 
+  /**
+   * Persist the ambiguous boundary and build the failure the caller sees. Persisting it can itself
+   * fail; that failure becomes the reported `cause` but never replaces DELIVERY_UNKNOWN, because
+   * only Pi can say whether the write landed.
+   * @param {any} record @param {unknown} cause
+   */
+  async function deliveryUnknownError(record, cause) {
+    let appendFailure;
+    try {
+      await replay.append(record);
+    } catch (persistenceCause) {
+      appendFailure = persistenceCause;
+    }
+    return Object.assign(new Error("Pi delivery is ambiguous", { cause: appendFailure ?? cause }), {
+      code: "DELIVERY_UNKNOWN",
+      deliveryUnknown: true,
+      rpcCause: cause,
+      appendFailure,
+    });
+  }
+
   /** @param {{ clientId: string, requestId: string, op: string, text?: string, response?: unknown, sessionCommand?: any, sessionQuery?: any, retryAtRisk?: boolean }} command */
   function deliver(command) {
     const result = tail.then(async () => {
@@ -235,34 +256,12 @@ export function createWorkerCommandDispatcher({ replay, adapter }) {
           await replay.append({ ...base, stage: "FAILED", error, stderr });
           throw cause;
         }
-        let appendFailure;
-        try {
-          await replay.append({ ...base, stage: "DELIVERY_UNKNOWN", error, stderr });
-        } catch (persistenceCause) {
-          appendFailure = persistenceCause;
-        }
-        throw Object.assign(new Error("Pi delivery is ambiguous", { cause: appendFailure ?? cause }), {
-          code: "DELIVERY_UNKNOWN",
-          deliveryUnknown: true,
-          rpcCause: cause,
-          appendFailure,
-        });
+        throw await deliveryUnknownError({ ...base, stage: "DELIVERY_UNKNOWN", error, stderr }, cause);
       }
       try {
         return await replay.append({ ...base, stage: "RPC_ACKNOWLEDGED", result: resultValue });
       } catch (cause) {
-        let appendFailure;
-        try {
-          await replay.append({ ...base, stage: "DELIVERY_UNKNOWN", error: { code: "ACK_PERSISTENCE_FAILED", message: cause instanceof Error ? cause.message : "Pi acknowledgement persistence failed", retryable: false } });
-        } catch (persistenceCause) {
-          appendFailure = persistenceCause;
-        }
-        throw Object.assign(new Error("Pi delivery is ambiguous", { cause: appendFailure ?? cause }), {
-          code: "DELIVERY_UNKNOWN",
-          deliveryUnknown: true,
-          rpcCause: cause,
-          appendFailure,
-        });
+        throw await deliveryUnknownError({ ...base, stage: "DELIVERY_UNKNOWN", error: { code: "ACK_PERSISTENCE_FAILED", message: cause instanceof Error ? cause.message : "Pi acknowledgement persistence failed", retryable: false } }, cause);
       }
     });
     tail = result.then(() => {}, () => {});

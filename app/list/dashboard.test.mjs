@@ -117,11 +117,9 @@ describe("dashboard controller", () => {
         expect(listFocused.at(-1)).toContain(JOBWATCH_ANSI.surfaceBackground);
         expect(stripVTControlCharacters(listFocused.at(-1))).toContain("Ctrl+C quit");
 
+        // The list keeps focus: the composer is a destination for text, never a focus stop.
         dashboard.handleInput("\x1b[B");
-        const composerFocused = dashboard.render(100, 16);
-        expect(composerFocused[3]).toContain(JOBWATCH_ANSI.gray);
-        expect(composerFocused.at(-6)).toContain(JOBWATCH_ANSI.sky);
-        expect(composerFocused.at(-5)).toBe(listFocused.at(-5));
+        expect(dashboard.render(100, 16)[3]).toContain(JOBWATCH_ANSI.sky);
         dashboard.handleInput("\t");
         expect(stripVTControlCharacters(dashboard.render(100, 16).at(-6))).toContain("cwd");
     });
@@ -379,15 +377,31 @@ describe("dashboard controller", () => {
     it.each([
         ["an empty list", []],
         ["the last row", [session("a")]],
-    ])("moves focus from %s to New Session with Down and back with Up", async (_label, sessions) => {
+    ])("keeps arrows inside the list from %s, because the composer is not a focus target", async (_label, sessions) => {
         const dashboard = controller(new FakeBackend(sessions));
         await dashboard.open();
         dashboard.handleInput("\x1b[B");
-        expect(dashboard.focus).toBe("composer");
+        expect(dashboard.focus).toBe("list");
         dashboard.handleInput("\x1b[A");
         expect(dashboard.focus).toBe("list");
+        // Typing still reaches the prompt without any focus move.
+        dashboard.handleInput("h");
+        expect(dashboard.composerDraft.prompt).toBe("h");
     });
-    it("returns composer focus with Escape and ignores blank Enter", async () => {
+    it("launches with Enter when the prompt has text and opens the session when it is empty", async () => {
+        const backend = new FakeBackend([session("a")]);
+        const opened = [];
+        const dashboard = controller(backend, { onOpenSession: (sessionId) => opened.push(sessionId) });
+        await dashboard.open();
+        dashboard.handleInput("\r");
+        expect(backend.requests).toEqual([]);
+        dashboard.handleInput("g");
+        dashboard.handleInput("o");
+        dashboard.handleInput("\r");
+        await vi.waitFor(() => expect(backend.requests).toHaveLength(1));
+        expect(backend.requests[0]).toMatchObject({ prompt: "go" });
+    });
+    it("keeps a draft through Escape and ignores a blank submit", async () => {
         const backend = new FakeBackend([]);
         const dashboard = controller(backend);
         await dashboard.open();
@@ -552,7 +566,7 @@ describe("dashboard controller", () => {
         // Nothing waits on the daemon, so navigation works while the stop is still travelling.
         expect(dashboard.overlay).toBeUndefined();
         dashboard.handleInput("\x1b[B");
-        expect(dashboard.focus).toBe("composer");
+        expect(dashboard.focus).toBe("list");
         expect(backend.stop).toHaveBeenCalledTimes(1);
         release?.();
     });
@@ -890,7 +904,7 @@ describe("dashboard controller", () => {
         const dashboard = controller(new FakeBackend([session("a")]), { onSessionIntent });
         await dashboard.open();
         dashboard.focusComposer();
-        expect(dashboard.focus).toBe("composer");
+        expect(dashboard.focus).toBe("list");
         dashboard.handleInput("\x1b");
         dashboard.handleInput("\x18");
         expect(onSessionIntent).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "a" }));

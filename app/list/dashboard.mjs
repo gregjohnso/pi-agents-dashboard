@@ -408,8 +408,9 @@ export class DashboardController {
     toggleHelp() {
         this.overlay = this.overlay?.kind === "help" ? undefined : createHelpOverlay();
     }
+    /** Aim typed text at the prompt. The composer is not a focus stop, so this leaves focus on the list. */
     focusComposer() {
-        this.focus = "composer";
+        this.focus = "list";
         this.composerField = "prompt";
     }
     setComposerPrompt(prompt) {
@@ -531,7 +532,7 @@ export class DashboardController {
         }
         if (this.focus === "confirmation") {
             if (matchesKey(data, Key.escape)) {
-                this.focus = "composer";
+                this.focus = "list";
                 this.pendingShared = undefined;
                 this.confirmationText = "";
                 this.overlay = undefined;
@@ -564,36 +565,20 @@ export class DashboardController {
                 this.setSearch((this.query.search ?? "") + printable);
             return;
         }
-        if (this.focus === "composer") {
-            if (matchesKey(data, Key.escape) || matchesKey(data, Key.up)) {
-                this.focus = "list";
-                return;
-            }
-            if (matchesKey(data, Key.tab)) {
-                this.cycleComposerField(1);
-                return;
-            }
-            if (matchesKey(data, "shift+tab")) {
-                this.cycleComposerField(-1);
-                return;
-            }
-            if (matchesKey(data, Key.enter)) {
-                void this.submitComposer();
-                return;
-            }
-            if (this.composerField === "isolationMode") {
-                if (matchesKey(data, Key.left) || matchesKey(data, Key.right) || data === " ") {
-                    this.setIsolationMode(this.composerDraft.isolationMode === "worktree" ? "shared_directory" : "worktree");
-                }
-                return;
-            }
-            if (matchesKey(data, Key.backspace)) {
-                this.editComposerField((value) => value.slice(0, -1));
-                return;
-            }
-            const printable = this.printable(data);
-            if (printable !== undefined)
-                this.editComposerField((value) => value + printable);
+        if (matchesKey(data, Key.tab)) {
+            this.cycleComposerField(1);
+            return;
+        }
+        if (matchesKey(data, "shift+tab")) {
+            this.cycleComposerField(-1);
+            return;
+        }
+        if (this.composerField === "isolationMode" && (matchesKey(data, Key.left) || matchesKey(data, Key.right) || data === " ")) {
+            this.setIsolationMode(this.composerDraft.isolationMode === "worktree" ? "shared_directory" : "worktree");
+            return;
+        }
+        if (matchesKey(data, Key.backspace)) {
+            this.editComposerField((value) => value.slice(0, -1));
             return;
         }
         if (matchesKey(data, Key.escape) || matchesKey(data, Key.left)) return;
@@ -606,17 +591,19 @@ export class DashboardController {
             }
             return;
         }
-        if (matchesKey(data, Key.enter) || matchesKey(data, Key.right)) {
+        if (matchesKey(data, Key.enter)) {
+            if (this.composerDraft.prompt.trim() !== "")
+                void this.submitComposer();
+            else
+                void this.activateSelection();
+            return;
+        }
+        if (matchesKey(data, Key.right)) {
             void this.activateSelection();
             return;
         }
-        if (matchesKey(data, Key.down)) {
-            const lastSessionRow = this.list.rows.findLastIndex((row) => row.kind === "session");
-            if (lastSessionRow < 0 || this.list.selectedRowIndex === lastSessionRow)
-                this.focusComposer();
-            else
-                this.moveSelection(1);
-        }
+        if (matchesKey(data, Key.down))
+            this.moveSelection(1);
         else if (matchesKey(data, Key.up))
             this.moveSelection(-1);
         else if (matchesKey(data, Key.pageDown))
@@ -659,7 +646,6 @@ export class DashboardController {
             // Typed and pasted text always composes a prompt, wherever the cursor sits in the list.
             const printable = this.printable(data);
             if (printable !== undefined) {
-                this.focusComposer();
                 this.composerField = "prompt";
                 this.editComposerField((value) => value + printable);
             }
@@ -697,7 +683,6 @@ export class DashboardController {
             return;
         }
         if (Math.floor(event.row) === this.height - 2) {
-            this.focus = "composer";
             this.composerField = COMPOSER_FIELDS[1 + Math.min(COMPOSER_FIELDS.length - 2, Math.floor(Math.max(0, event.column) * (COMPOSER_FIELDS.length - 1) / Math.max(1, this.width)))];
             return;
         }
@@ -733,9 +718,9 @@ export class DashboardController {
             }
             if (lines.length >= 4) {
                 const dockTop = lines.length - layout.dockRows;
-                const composerFocused = this.focus === "composer" || this.focus === "confirmation";
+                const composerFocused = this.focus === "confirmation";
                 const draftPrompt = this.composerDraft.prompt;
-                lines[dockTop] = sectionBorder(composerFocused ? COMPOSER_FIELD_LABELS[this.composerField] : "", this.width, composerFocused);
+                lines[dockTop] = sectionBorder(this.composerField === "prompt" ? "" : COMPOSER_FIELD_LABELS[this.composerField], this.width, composerFocused);
                 lines[dockTop + 1] = paintPlainLine(` ❯ ${draftPrompt || "describe a task for a new session"}`, this.width, draftPrompt ? (text) => jobwatchTheme.text(text, false) : (text) => jobwatchTheme.muted(text, false));
                 const form = ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
                 lines[dockTop + 2] = paintPlainLine(this.status.kind === "error" ? ` ${this.status.code}: ${this.status.message}  ${form}` : form, this.width, this.status.kind === "error" ? jobwatchTheme.error : jobwatchTheme.surface);

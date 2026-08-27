@@ -175,9 +175,10 @@ it("drives list navigation, search/filter/sort/group, metadata/help, composer, c
   f.dashboard.handleInput("\x07");
   expect(f.dashboard.overlay?.kind).toBe("help");
   f.dashboard.toggleHelp();
-  // Typing anywhere in the list composes a prompt, so the first character focuses the composer.
+  // Typing anywhere in the list composes a prompt without moving focus off the list.
   for (const input of "draft") f.dashboard.handleInput(input);
-  expect(f.dashboard.focus).toBe("composer");
+  expect(f.dashboard.focus).toBe("list");
+  expect(f.dashboard.composerDraft.prompt).toBe("draft");
   f.dashboard.handleInput("\x1b");
   expect(f.dashboard.focus).toBe("list");
 
@@ -195,7 +196,7 @@ it("drives list navigation, search/filter/sort/group, metadata/help, composer, c
   await vi.waitFor(() => expect(f.backend.delete).toHaveBeenCalledWith("live", 5, "terminal-request"));
 
   f.dashboard.handleInput("\t");
-  expect(f.dashboard.focus).toBe("composer");
+  expect(f.dashboard.composerField).toBe("cwd");
   f.dashboard.handleInput("\x03");
   await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith({ kind: "closed" }));
   expect(f.dashboard.composerDraft.prompt).toBe("draft");

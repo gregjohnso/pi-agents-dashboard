@@ -9,7 +9,6 @@ const ENTER_ALT_SCREEN = Buffer.from("\x1b[?1049h");
 const EXIT_ALT_SCREEN = Buffer.from("\x1b[?1049l");
 const SHOW_CURSOR = Buffer.from("\x1b[?25h");
 const ENABLE_AUTOWRAP = Buffer.from("\x1b[?7h");
-const FOCUSED_COMPOSER = Buffer.from("\u256d\u2500 prompt ");
 
 it("navigates to New Session, quits with Ctrl+C, and restores the real terminal", async () => {
   const temporaryRoot = await mkdtemp(join(tmpdir(), "pi-dashboard-pty-"));
@@ -34,9 +33,7 @@ it("navigates to New Session, quits with Ctrl+C, and restores the real terminal"
   const onOutput = (chunk) => {
     output = Buffer.concat([output, Buffer.from(chunk)]);
     if (stage === "startup" && output.includes(Buffer.from("describe a task for a new session"))) {
-      stage = "down";
-      child.stdin.write("\x1b[B");
-    } else if (stage === "down" && output.includes(FOCUSED_COMPOSER)) {
+      // Typing needs no navigation: the composer is not a focus stop.
       stage = "typing";
       child.stdin.write("x");
     } else if (stage === "typing" && output.includes(Buffer.from("❯ x"))) {

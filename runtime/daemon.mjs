@@ -1311,6 +1311,7 @@ export async function createDaemonRuntime({
         context.launchResults = await createLaunchResultStore(join(daemonDirectory, "launch-results.json"));
         context.attachmentResults = await createAttachmentResultStore({ path: join(daemonDirectory, "attachment-results.jsonl") });
         context.deleteResults = await createDeleteResultStore(join(daemonDirectory, "delete-results.json"));
+        for (const event of context.recovery.repairedSessions ?? []) context.broadcast(event);
         for (const entry of context.attachmentResults.entries()) await context.recovery.journal.reconcileAttachment(entry.request, entry.phase);
         for (const action of context.recovery.recoveryActions) {
           if (action.action === "SAFE_REDELIVERY" && !["attach", "detach"].includes(action.command.op)) await context.handleRequest(action.command, undefined, new Set(), action.command.clientId, true);

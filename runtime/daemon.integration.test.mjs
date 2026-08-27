@@ -261,6 +261,34 @@ it("rejects worker mutations during reconciliation without touching unopened sto
   worker.close();
 });
 
+it("repairs an abandoned launch to FAILED and leaves finished sessions untouched", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const now = "2026-08-25T12:00:00.000Z";
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "abandoned", sessionFile: "/sessions/abandoned.jsonl", canonicalSessionFile: "/sessions/abandoned.jsonl", cwd: "/repo", taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "launching", summary: "hello?", updatedAt: now }, createdAt: now, updatedAt: now });
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "finished", sessionFile: "/sessions/finished.jsonl", canonicalSessionFile: "/sessions/finished.jsonl", cwd: "/repo", taskState: "READY", processState: "EXITED", outcome: "COMPLETED", activity: { kind: "assistant_final", summary: "Pi assistant response received", updatedAt: now }, createdAt: now, updatedAt: now });
+
+  const runtime = await createDaemonRuntime({ root: stateRoot });
+  runtimes.push(runtime);
+  await runtime.ready;
+
+  expect(await registry.get("abandoned")).toMatchObject({ taskState: "FAILED", processState: "EXITED", activity: { kind: "launch_failed" } });
+  expect(await registry.get("finished")).toMatchObject({ taskState: "READY", outcome: "COMPLETED", activity: { kind: "assistant_final", summary: "Pi assistant response received" } });
+
+  const published = (await readFile(join(stateRoot, "index", "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  expect(published.filter((event) => event.kind === "session_changed").map((event) => event.payload.session)).toEqual([
+    expect.objectContaining({ sessionId: "abandoned", taskState: "FAILED", activity: expect.objectContaining({ kind: "launch_failed" }) }),
+  ]);
+
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 16384 });
+  await client.ready;
+  client.send({ version: 1, clientId: "watcher", requestId: "replay", op: "subscribe", payload: {} });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "subscribed" } });
+  expect(await client.next()).toMatchObject({ kind: "session_changed", payload: { session: { sessionId: "abandoned", taskState: "FAILED" } } });
+  client.close();
+});
+
 it("clears a stale WORKING session when the reconnected worker reports an idle Pi", async () => {
   const stateRoot = await root();
   for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });

@@ -42,6 +42,18 @@ describe("reduceSessionState", () => {
     expect(reduceSessionState(baseRecord, { type, at: now, summary: type })).toMatchObject(expected);
   });
 
+  it("marks an abandoned launch failed with a launch_failed activity", () => {
+    /** @type {SessionRecord} */
+    const launching = { ...baseRecord, taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "launching", summary: "hello?", updatedAt: now } };
+
+    expect(reduceSessionState(launching, { type: "LAUNCH_ABANDONED", at: now })).toMatchObject({
+      taskState: "FAILED",
+      processState: "EXITED",
+      outcome: "NONE",
+      activity: { kind: "launch_failed", summary: "Launch did not start before the daemon exited", updatedAt: now },
+    });
+  });
+
   it("keeps READY independent from LIVE, SLEEPING, and EXITED process states", () => {
     const ready = reduceSessionState(baseRecord, { type: "TURN_COMPLETED", at: now });
     const sleeping = reduceSessionState(ready, { type: "WORKER_SLEEPING", at: now });

@@ -6,6 +6,7 @@ import { createCommandJournal } from "./command-journal.mjs";
 import { createEventStore } from "./event-store.mjs";
 import { RegistryStore, registryCoordinationScope } from "./registry-store.mjs";
 import { createSessionHistoryReader, SessionHistoryError } from "./session-history.mjs";
+import { reduceSessionState } from "./state-reducer.mjs";
 import { createViewerNormalizer } from "./viewer-normalizer.mjs";
 import { createViewerStore } from "./viewer-store.mjs";
 
@@ -24,6 +25,15 @@ function validateWorkerMetadata(worker) {
   const allowed = ["sessionId", "runId", "leaseId", "generation", "identity", "piChildIdentity", "token"];
   if (typeof worker !== "object" || worker === null || Array.isArray(worker) || Object.keys(worker).some((key) => !allowed.includes(key)) || [worker.sessionId, worker.runId, worker.leaseId].some((value) => typeof value !== "string" || value.length === 0) || !Number.isSafeInteger(worker.generation) || worker.generation <= 0 || !validIdentity(worker.identity) || !validIdentity(worker.piChildIdentity) || (worker.token !== undefined && (typeof worker.token !== "string" || worker.token.length === 0))) throw new TypeError("Worker recovery metadata record is invalid");
   return worker;
+}
+
+/**
+ * A launch never outlives the daemon that ran it, so a still-"launching" record with no owning
+ * worker at startup is provably abandoned rather than in flight.
+ * @param {any} record
+ */
+export function abandonedLaunch(record) {
+  return record?.activity?.kind === "launching" && record.ownership === undefined && record.processState === "EXITED";
 }
 
 /** @param {unknown} error */
@@ -371,6 +381,22 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReco
     await onViewerReady(viewer);
     cancelled();
     /** @type {any[]} */
+    const repairedSessions = [];
+    for (const record of await registry.list()) {
+      cancelled();
+      if (!abandonedLaunch(record)) continue;
+      const next = reduceSessionState(record, { type: "LAUNCH_ABANDONED", at: new Date().toISOString() });
+      const updated = await registry.update(record.sessionId, record.revision, {
+        taskState: next.taskState,
+        processState: next.processState,
+        outcome: next.outcome,
+        activity: next.activity,
+        updatedAt: next.updatedAt,
+      });
+      repairedSessions.push(await events.append({ kind: "session_changed", payload: { session: updated } }));
+    }
+    cancelled();
+    /** @type {any[]} */
     const liveWorkers = [];
     /** @type {any[]} */
     const conflicts = [];
@@ -432,6 +458,7 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReco
       router,
       liveWorkers,
       conflicts,
+      repairedSessions,
       recoveryActions,
       viewer,
       async close() {

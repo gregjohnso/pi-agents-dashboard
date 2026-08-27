@@ -4,7 +4,7 @@
 
 /**
  * @typedef {object} SessionStateEvent
- * @property {"WORKER_READY" | "TURN_STARTED" | "TURN_COMPLETED" | "TURN_READY_FOR_REVIEW" | "WORKER_SLEEPING" | "WORKER_EXITED" | "USER_STOPPED" | "PI_CHILD_CRASHED" | "WORKER_CRASHED" | "IDENTITY_STALE" | "UI_REQUESTED" | "UI_RESPONDED" | "ACTIVITY_SNAPSHOT" | "FRONTEND_DETACHED"} type
+ * @property {"WORKER_READY" | "TURN_STARTED" | "TURN_COMPLETED" | "TURN_READY_FOR_REVIEW" | "WORKER_SLEEPING" | "WORKER_EXITED" | "USER_STOPPED" | "PI_CHILD_CRASHED" | "WORKER_CRASHED" | "IDENTITY_STALE" | "UI_REQUESTED" | "UI_RESPONDED" | "ACTIVITY_SNAPSHOT" | "LAUNCH_ABANDONED" | "FRONTEND_DETACHED"} type
  * @property {string} at
  * @property {string} [summary]
  * @property {ActivitySignal} [blockingRequest]
@@ -139,6 +139,17 @@ export function reduceSessionState(record, event) {
         activity: {
           kind: "worker",
           summary: event.summary ?? "User response received",
+          updatedAt: event.at,
+        },
+      });
+    case "LAUNCH_ABANDONED":
+      return transition(record, event.at, {
+        taskState: "FAILED",
+        processState: "EXITED",
+        outcome: "NONE",
+        activity: {
+          kind: "launch_failed",
+          summary: event.summary ?? "Launch did not start before the daemon exited",
           updatedAt: event.at,
         },
       });

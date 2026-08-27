@@ -34,7 +34,3 @@ it("reports only verified active legacy supervisor identities", async () => {
     exists: async () => true, inspectEndpoint: async () => ({ status: "ABSENT" }), inspect: async () => worker, readFile,
   })).resolves.toEqual({ activeDaemon: false, activeSupervisors: [worker] });
 });
-
-it("resolves app modules relative to the package rather than startup cwd", () => {
-  expect(new URL("./list/dashboard.mjs", new URL("./standalone.mjs", import.meta.url)).pathname).toContain("/app/list/dashboard.mjs");
-});

@@ -5,7 +5,7 @@ import { decodeKittyPrintable, Key, matchesKey, truncateToWidth, visibleWidth, }
 import { countDashboardSessions, selectDashboardSessions, } from "./dashboard-state.mjs";
 import { createDashboardLayout, renderColumnHeader, } from "./dashboard-layout.mjs";
 import { jobwatchTheme } from "./dashboard-theme.mjs";
-import { confirmationMatchesSession, createDeliveryUnknownOverlay, createHelpOverlay, createMetadataOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, describeOverlay, } from "./dashboard-overlays.mjs";
+import { destructiveAction, confirmationMatchesSession, createDeliveryUnknownOverlay, createHelpOverlay, createMetadataOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, describeOverlay, } from "./dashboard-overlays.mjs";
 import { createLaunchDraft, prepareLaunchRequest, } from "./launch-composer.mjs";
 import { VirtualSessionList } from "./virtual-session-list.mjs";
 function cursorAfter(left, right) {
@@ -449,15 +449,22 @@ export class DashboardController {
     async confirmSession(confirmation) {
         if (confirmation.submitting)
             return;
-        const selected = this.selectedSession();
-        if (!confirmationMatchesSession(confirmation, selected)) {
+        const selected = this.sessions.find((session) => session.sessionId === confirmation.sessionId);
+        if (selected === undefined) {
             this.overlay = undefined;
             return;
         }
+        // Background metadata (summaries, names, activity) bumps the revision while the prompt is open;
+        // only a change in what makes the session destructible cancels the confirmation.
+        if (confirmation.action !== destructiveAction(selected)) {
+            this.overlay = undefined;
+            this.setError(Object.assign(new Error("The session changed before the action ran"), { code: selected.processState === "LIVE" || selected.ownership !== undefined ? "SESSION_LIVE" : "SESSION_CHANGED" }), "SESSION_CHANGED");
+            return;
+        }
         const requestId = this.requestId();
-        this.overlay = { ...confirmation, submitting: true };
+        this.overlay = { ...confirmation, revision: selected.revision, submitting: true };
         try {
-            await this.backend[confirmation.action](confirmation.sessionId, confirmation.revision, requestId);
+            await this.backend[confirmation.action](confirmation.sessionId, selected.revision, requestId);
             if (confirmation.action === "stop") {
                 this.setView("all");
                 this.selectSession(confirmation.sessionId);
@@ -721,8 +728,16 @@ export class DashboardController {
         this.invalidateSessionConfirmation();
     }
     invalidateSessionConfirmation() {
-        if (this.overlay?.kind === "session_confirmation" && !confirmationMatchesSession(this.overlay, this.selectedSession())) {
+        if (this.overlay?.kind !== "session_confirmation")
+            return;
+        // Summaries, names and activity churn the revision constantly; only a change in what the session
+        // admits (stop versus delete, or the session disappearing) invalidates an open confirmation.
+        const current = this.sessions.find((session) => session.sessionId === this.overlay.sessionId);
+        if (current === undefined || destructiveAction(current) !== this.overlay.action) {
+            const action = this.overlay.action;
             this.overlay = undefined;
+            if (current !== undefined)
+                this.setError(Object.assign(new Error(`Session became ${destructiveAction(current) === "stop" ? "live" : "inactive"} before ${action.toUpperCase()}`), { code: destructiveAction(current) === "stop" ? "SESSION_LIVE" : "SESSION_INACTIVE" }), "SESSION_CHANGED");
         }
     }
     rebuildList() {

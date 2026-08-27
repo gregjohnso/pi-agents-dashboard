@@ -267,6 +267,39 @@ it("rejects malformed Pi output, retains stderr, and does not respawn", async ()
   await adapter.close();
 });
 
+it("forwards read-only queries and session toggles with Pi's own parameter names", async () => {
+  /** @type {any[]} */
+  const sent = [];
+  /** @type {Record<string, any>} */
+  const data = {
+    get_session_stats: { messageCount: 12, totalTokens: 3400 },
+    get_tree: { tree: { id: "root" }, leafId: "leaf-1" },
+    export_html: { path: "/tmp/session.html" },
+  };
+  const child = fakeRpcProcess((command, process) => {
+    sent.push(command);
+    process.stdout.write(`${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true, data: data[command.type] })}\n`);
+  });
+  const adapter = PiRpcAdapter.connect({ input: child.stdin, output: child.stdout, maxRecordBytes: 4_096 });
+
+  await expect(adapter.getSessionStats()).resolves.toEqual(data.get_session_stats);
+  await expect(adapter.getTree()).resolves.toEqual(data.get_tree);
+  await expect(adapter.exportHtml("/tmp/session.html")).resolves.toEqual(data.export_html);
+  await expect(adapter.setAutoCompaction(false)).resolves.toBeUndefined();
+  await expect(adapter.setAutoRetry(true)).resolves.toBeUndefined();
+  await expect(adapter.abortRetry()).resolves.toBeUndefined();
+  await expect(adapter.setSteeringMode("all")).resolves.toBeUndefined();
+  await expect(adapter.setFollowUpMode("one-at-a-time")).resolves.toBeUndefined();
+
+  expect(sent.map(({ type }) => type)).toEqual(["get_session_stats", "get_tree", "export_html", "set_auto_compaction", "set_auto_retry", "abort_retry", "set_steering_mode", "set_follow_up_mode"]);
+  expect(sent[2]).toMatchObject({ outputPath: "/tmp/session.html" });
+  expect(sent[3]).toMatchObject({ enabled: false });
+  expect(sent[4]).toMatchObject({ enabled: true });
+  expect(sent[6]).toMatchObject({ mode: "all" });
+  expect(sent[7]).toMatchObject({ mode: "one-at-a-time" });
+  await adapter.close();
+});
+
 it("discovers commands and applies model, thinking, and compaction changes", async () => {
   /** @type {any[]} */
   const sent = [];

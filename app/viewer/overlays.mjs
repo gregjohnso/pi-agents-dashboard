@@ -118,6 +118,53 @@ export class CommandSelectionOverlay {
   }
 }
 
+/** Bounded scrollable text panel for read-only Pi results and viewer help. */
+export class TextPanelOverlay {
+  /** @param {{ title: string, rows: string[], tui: any, respond: () => void, returnFocus?: any, maxVisible?: number }} options */
+  constructor({ title, rows, tui, respond, returnFocus = undefined, maxVisible = 12 }) {
+    tui.terminal ??= { rows: 24, columns: 80 };
+    this.title = title;
+    this.rows = rows.length === 0 ? ["(nothing reported)"] : rows;
+    this.tui = tui;
+    this.respond = respond;
+    this.returnFocus = tui.getFocusedComponent?.() ?? returnFocus;
+    this.maxVisible = Math.max(1, maxVisible);
+    this.offset = 0;
+    this.resolved = false;
+    this.border = new DynamicBorder((text) => text);
+  }
+  restoreFocus() {
+    if (this.focusRestored) return;
+    this.focusRestored = true;
+    this.tui.setFocus(this.returnFocus ?? null);
+  }
+  resolve() {
+    if (this.resolved) return;
+    this.resolved = true;
+    this.restoreFocus();
+    this.respond();
+  }
+  dispose() { this.restoreFocus(); }
+  /** @param {string} data */
+  handleInput(data) {
+    if (this.resolved) return true;
+    if (data === "\x1b" || data === "\r" || data === "q") { this.resolve(); return true; }
+    const maxOffset = Math.max(0, this.rows.length - this.maxVisible);
+    if (data === "\x1b[A") this.offset = Math.max(0, this.offset - 1);
+    else if (data === "\x1b[B") this.offset = Math.min(maxOffset, this.offset + 1);
+    else if (data === "\x1b[5~") this.offset = Math.max(0, this.offset - this.maxVisible);
+    else if (data === "\x1b[6~") this.offset = Math.min(maxOffset, this.offset + this.maxVisible);
+    return true;
+  }
+  /** @param {number} width */
+  render(width) {
+    const visible = this.rows.slice(this.offset, this.offset + this.maxVisible);
+    const more = this.rows.length > this.offset + visible.length ? [` … ${this.rows.length - this.offset - visible.length} more · ↑↓ scroll · Esc close`] : [" Esc close"];
+    return [...this.border.render(width), fit(` ${this.title}`, width), ...visible.map((row) => fit(` ${row}`, width)), ...more.map((row) => fit(row, width)), ...this.border.render(width)]
+      .map((line) => fit(line, width));
+  }
+}
+
 /** Render Pi's status indicator: a blank separator, the spinner frame, the active phase, and the interrupt key. */
 export function renderStatusIndicator(activity, width, now = Date.now(), { working = false } = {}) {
   const idle = activity === undefined || activity.phase === "idle";

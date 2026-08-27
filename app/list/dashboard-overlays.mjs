@@ -40,7 +40,8 @@ export function createSharedDirectoryOverlay(canonicalCwd, ownerSessionIds) {
         requiredInput: canonicalCwd,
     };
 }
-function destructiveAction(session) {
+/** Which destructive action a session currently admits. @param {any} session */
+export function destructiveAction(session) {
     return session.processState === "LIVE" || session.processState === "SLEEPING" ||
         (session.processState === "STALE" && session.ownership !== undefined)
         ? "stop"

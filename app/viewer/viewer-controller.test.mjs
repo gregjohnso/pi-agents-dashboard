@@ -26,12 +26,14 @@ function fixture(overrides = {}) {
     async getSnapshot() { return snapshot(overrides.snapshot); },
     subscribe(_sessionId, _cursor, next) { listener = next; return () => order.push("unsubscribe"); },
     async command(operation, payload) { commands.push({ operation, payload }); return overrides.command?.(operation, payload); },
+    ...(overrides.query === undefined ? {} : { query: overrides.query }),
     ...(overrides.menu === undefined ? {} : { menu: overrides.menu }),
     async ack(_sessionId, cursor) { order.push(`ack:${cursor.sequence}`); },
   };
   const persistence = { async load() { return overrides.persisted; }, async save(value) { await overrides.save?.(value); saved.push(structuredClone(value)); order.push(`persist:${value.cursor?.sequence ?? "draft"}`); } };
-  const instance = new ViewerController({ sessionId: "s", client, editor: editor(), persistence, requestRender: async () => { order.push("render"); }, onReturn: vi.fn(), now: () => 0 });
-  return { instance, client, commands, order, saved, emit: (event) => listener(event) };
+  const dashboard = [];
+  const instance = new ViewerController({ sessionId: "s", client, editor: editor(), persistence, requestRender: async () => { order.push("render"); }, onReturn: vi.fn(), now: () => 0, onDashboardAction: (action) => dashboard.push(action) });
+  return { instance, client, commands, order, saved, dashboard, emit: (event) => listener(event) };
 }
 
 describe("viewer commands and role restrictions", () => {
@@ -147,6 +149,52 @@ describe("viewer commands and role restrictions", () => {
     f.instance.handleInput("\x1b");
     expect(f.instance.selection).toBeUndefined();
     expect(f.commands).toHaveLength(1);
+  });
+
+  it("renders a read-only query in an overlay without prompting the session", async () => {
+    const f = fixture({ query: async (_sessionId, payload) => ({ rows: [`query:${payload.query}`, "messageCount: 12"] }) });
+    await f.instance.open();
+    f.instance.editor.setText("/stats");
+    f.instance.handleInput("\r");
+
+    await vi.waitFor(() => expect(f.instance.overlay?.title).toBe("Session stats"));
+    const rendered = f.instance.render(80, 24).join("\n");
+    expect(rendered).toContain("messageCount: 12");
+    expect(f.commands).toEqual([]);
+
+    f.instance.handleInput("\x1b");
+    expect(f.instance.overlay).toBeUndefined();
+  });
+
+  it("routes /new and /resume to the dashboard instead of rebinding Pi", async () => {
+    const f = fixture();
+    await f.instance.open();
+    f.instance.editor.setText("/new");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.dashboard).toEqual(["new_session"]));
+    f.instance.editor.setText("/resume");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.dashboard).toEqual(["new_session", "session_list"]));
+    expect(f.commands).toEqual([]);
+  });
+
+  it("shows viewer help listing its commands", async () => {
+    const f = fixture();
+    await f.instance.open();
+    f.instance.editor.setText("/help");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.instance.overlay?.title).toBe("Viewer help"));
+    const rendered = f.instance.render(80, 24).join("\n");
+    expect(rendered).toContain("/stats");
+    expect(rendered).toContain("Esc");
+  });
+
+  it("forwards a session toggle and refreshes the menu", async () => {
+    const f = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null }) });
+    await f.instance.open();
+    f.instance.editor.setText("/auto-compact off");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "session_command", payload: { sessionId: "s", command: "set_auto_compaction", enabled: false } }]));
   });
 
   it("rejects an unknown model locally without contacting the session", async () => {

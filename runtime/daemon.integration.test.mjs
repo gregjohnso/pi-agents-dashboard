@@ -496,6 +496,40 @@ it("reaches a freshly launched worker over its launch channel before any socket 
   client.close();
 });
 
+it("serves read-only session queries and session toggles from the owning worker", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const identity = { pid: 431, startIdentity: "query-worker", processGroupId: 431 };
+  const piChild = { pid: 432, startIdentity: "query-pi", processGroupId: 431 };
+  const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === 431 ? identity : piChild;
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const now = "2026-08-25T12:00:00.000Z";
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "query", sessionFile: "/sessions/query.jsonl", canonicalSessionFile: "/sessions/query.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-query", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-query", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "query", runId: "run-query", leaseId: "lease-query", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  const runtime = await createDaemonRuntime({ root: stateRoot, inspect });
+  runtimes.push(runtime);
+  const worker = startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "query", runId: "run-query", leaseId: "lease-query", generation: 1, identity, piChildIdentity: piChild, token: "query-token", results: { session_query: ["messageCount: 12", "totalTokens: 3400"] } });
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
+  await client.ready;
+  client.send({ version: 1, clientId: "viewer", requestId: "attach-query", op: "attach", payload: { sessionId: "query", role: "composer" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+
+  client.send({ version: 1, clientId: "viewer", requestId: "stats-request", op: "session_query", payload: { sessionId: "query", query: "get_session_stats" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "session_query", sessionId: "query", query: "get_session_stats", rows: ["messageCount: 12", "totalTokens: 3400"] } });
+
+  client.send({ version: 1, clientId: "viewer", requestId: "auto-compact", op: "session_command", payload: { sessionId: "query", command: "set_auto_compaction", enabled: false } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  client.send({ version: 1, clientId: "viewer", requestId: "steering", op: "session_command", payload: { sessionId: "query", command: "set_steering_mode", mode: "one-at-a-time" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+
+  const delivered = worker.commands.filter((/** @type {any} */ command) => command.op !== "get_session_commands");
+  expect(delivered[0]).toMatchObject({ op: "session_query", sessionQuery: { query: "get_session_stats" } });
+  expect(delivered[1].sessionCommand).toEqual({ command: "set_auto_compaction", enabled: false });
+  expect(delivered[2].sessionCommand).toEqual({ command: "set_steering_mode", mode: "one-at-a-time" });
+  client.close();
+});
+
 it("discovers slash commands and delivers one session command to the owning worker", async () => {
   const stateRoot = await root();
   for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });

@@ -2,6 +2,11 @@
 /** @typedef {{commands:MenuCommand[],models:{provider:string,id:string}[],thinkingLevels:string[],model:{provider:string,id:string}|null,thinkingLevel:string|null,summaryModel?:{provider:string,id:string}|null,name?:string|null}} SessionMenu */
 
 const BUILTIN_SOURCE = "builtin";
+const QUEUE_MODES = ["all", "one-at-a-time"];
+const TOGGLES = ["on", "off"];
+// Pi rebinds its running process to another session file for these; the dashboard binds one worker to one
+// canonical file, so it refuses by name rather than desynchronising the registry and the viewer stream.
+const REBIND_COMMANDS = { "/fork": "fork", "/clone": "clone", "/switch": "switch_session" };
 
 /** @type {SessionMenu} */
 export const EMPTY_SESSION_MENU = { commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, summaryModel: null };
@@ -36,9 +41,22 @@ export function sessionSlashCommands(menu) {
     { name: "model-summary", description: menu.summaryModel == null ? "Dashboard summaries: off" : `Dashboard summaries: ${modelValue(menu.summaryModel)}`, argumentHint: "<provider/id|off>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, ["off", ...models]) },
     { name: "rename", description: menu.name == null ? "Name this session" : `Name: ${menu.name}`, argumentHint: "<name>", source: BUILTIN_SOURCE },
     { name: "compact", description: "Compact the conversation", argumentHint: "[instructions]", source: BUILTIN_SOURCE },
+    { name: "stats", description: "Show this session's Pi statistics", source: BUILTIN_SOURCE },
+    { name: "tree", description: "Show this session's entry tree", source: BUILTIN_SOURCE },
+    { name: "export", description: "Export this session to HTML", argumentHint: "[path]", source: BUILTIN_SOURCE },
+    { name: "auto-compact", description: "Turn automatic compaction on or off", argumentHint: "<on|off>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, TOGGLES) },
+    { name: "auto-retry", description: "Turn automatic retry on or off", argumentHint: "<on|off>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, TOGGLES) },
+    { name: "steering", description: "How queued steering messages are delivered", argumentHint: "<all|one-at-a-time>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, QUEUE_MODES) },
+    { name: "follow-up", description: "How queued follow-up messages are delivered", argumentHint: "<all|one-at-a-time>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, QUEUE_MODES) },
+    { name: "abort-retry", description: "Stop the current retry loop", source: BUILTIN_SOURCE },
+    { name: "new", description: "Open the dashboard's New Session composer", source: BUILTIN_SOURCE },
+    { name: "resume", description: "Return to the dashboard session list", source: BUILTIN_SOURCE },
+    { name: "fork", description: "Unavailable: forking rebinds Pi's session file", source: BUILTIN_SOURCE },
+    { name: "clone", description: "Unavailable: cloning rebinds Pi's session file", source: BUILTIN_SOURCE },
+    { name: "help", description: "List the viewer's commands and keys", source: BUILTIN_SOURCE },
     ...menu.commands
       .map((command) => ({ ...command, name: bareName(command.name) }))
-      .filter((command) => !["model", "thinking", "compact", "model-summary", "rename"].includes(command.name)),
+      .filter((command) => !["model", "thinking", "compact", "model-summary", "rename", "stats", "tree", "export", "auto-compact", "auto-retry", "steering", "follow-up", "abort-retry", "new", "resume", "fork", "clone", "help"].includes(command.name)),
   ];
 }
 
@@ -46,7 +64,7 @@ export function sessionSlashCommands(menu) {
  * Resolve one submitted editor line into a prompt or an exact session command.
  * @param {string} text
  * @param {SessionMenu} menu
- * @returns {{kind:"prompt",text:string}|{kind:"session_command",payload:Record<string,any>}|{kind:"settings",payload:Record<string,any>}|{kind:"rejected",code:string,message:string}}
+ * @returns {{kind:"prompt",text:string}|{kind:"session_command",payload:Record<string,any>}|{kind:"session_query",payload:Record<string,any>}|{kind:"settings",payload:Record<string,any>}|{kind:"dashboard",action:"new_session"|"session_list"}|{kind:"help"}|{kind:"rejected",code:string,message:string}}
  */
 export function parseSlashSubmission(text, menu) {
   const trimmed = text.trim();
@@ -79,6 +97,27 @@ export function parseSlashSubmission(text, menu) {
   }
   if (name === "/compact") {
     return { kind: "session_command", payload: argument.length === 0 ? { command: "compact" } : { command: "compact", instructions: argument } };
+  }
+  if (name === "/stats") return { kind: "session_query", payload: { query: "get_session_stats" } };
+  if (name === "/tree") return { kind: "session_query", payload: { query: "get_tree" } };
+  if (name === "/export") return { kind: "session_query", payload: argument.length === 0 ? { query: "export_html" } : { query: "export_html", outputPath: argument } };
+  if (name === "/auto-compact" || name === "/auto-retry") {
+    if (!TOGGLES.includes(argument)) return { kind: "rejected", code: "TOGGLE_REQUIRED", message: `Use ${name} on or ${name} off` };
+    return { kind: "session_command", payload: { command: name === "/auto-compact" ? "set_auto_compaction" : "set_auto_retry", enabled: argument === "on" } };
+  }
+  if (name === "/steering" || name === "/follow-up") {
+    if (!QUEUE_MODES.includes(argument)) return { kind: "rejected", code: "QUEUE_MODE_REQUIRED", message: `Choose a mode: ${QUEUE_MODES.join(", ")}` };
+    return { kind: "session_command", payload: { command: name === "/steering" ? "set_steering_mode" : "set_follow_up_mode", mode: argument } };
+  }
+  if (name === "/abort-retry") return { kind: "session_command", payload: { command: "abort_retry" } };
+  if (name === "/new") return { kind: "dashboard", action: "new_session" };
+  if (name === "/resume") return { kind: "dashboard", action: "session_list" };
+  if (name === "/help") return { kind: "help" };
+  if (Object.hasOwn(REBIND_COMMANDS, name)) {
+    return {
+      kind: "rejected", code: "SESSION_REBIND_UNSUPPORTED",
+      message: `${name} needs Pi's ${REBIND_COMMANDS[name]}, which rebinds this process to a different session file. The dashboard binds one worker to one session file, so it would lose track of this session. Use /new for a fresh session.`,
+    };
   }
   return { kind: "prompt", text: trimmed };
 }

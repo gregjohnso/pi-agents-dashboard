@@ -254,6 +254,9 @@ function sessionCommandPayload(payload) {
   if (payload.command === "set_model") return { command: "set_model", model: { ...payload.model } };
   if (payload.command === "set_thinking_level") return { command: "set_thinking_level", level: payload.level };
   if (payload.command === "set_session_name") return { command: "set_session_name", name: payload.name };
+  if (payload.command === "set_auto_compaction" || payload.command === "set_auto_retry") return { command: payload.command, enabled: payload.enabled };
+  if (payload.command === "set_steering_mode" || payload.command === "set_follow_up_mode") return { command: payload.command, mode: payload.mode };
+  if (payload.command === "abort_retry") return { command: "abort_retry" };
   return payload.instructions === undefined ? { command: "compact" } : { command: "compact", instructions: payload.instructions };
 }
 
@@ -658,6 +661,24 @@ export async function createDaemonRuntime({
       serializeAttachment(sessionId, operation) {
         return runSessionLifecycle(registry, sessionId, operation);
       },
+      /** Ask this session's worker one non-durable question over whichever channel owns it. @param {any} request @param {Record<string, unknown>} [fields] */
+      async askWorker(request, fields = {}) {
+        const sessionId = request.payload.sessionId;
+        const route = router.route(sessionId);
+        const handle = sessionHandles.get(sessionId);
+        if (route?.connection !== undefined && route.metadata?.token !== undefined) {
+          const { metadata, connection } = route;
+          const id = randomId();
+          if (typeof id !== "string" || id.length < 16 || usedCommandIds.has(id)) throw Object.assign(new Error("Command ID generator did not provide a unique restart-safe ID"), { code: "COMMAND_ID_COLLISION" });
+          usedCommandIds.add(id);
+          return connection.request({ version: 1, type: "command", token: metadata.token, id, command: { clientId: request.clientId, requestId: request.requestId, op: request.op, ...fields } }, { clientId: request.clientId, requestId: request.requestId, op: request.op, durableRequest: request, metadata, routeGeneration: route.routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
+        }
+        // The launch channel carries no extra command fields yet, so a parameterised ask waits for the socket route.
+        if (typeof handle?.request === "function" && Object.keys(fields).length === 0) return handle.request(request.op);
+        if (typeof handle?.request === "function") throw Object.assign(new Error("This session is still starting; retry once it is connected"), { code: "WORKER_RECONNECTING", retryable: true });
+        if (handle !== undefined) sessionHandles.delete(sessionId);
+        throw Object.assign(new Error("No exact recovered worker owns this session"), { code: "WORKER_UNAVAILABLE" });
+      },
       /** @param {any} handle */
       async activateWorker(handle) {
         sessionHandles.set(handle.sessionId, handle);
@@ -1050,27 +1071,17 @@ export async function createDaemonRuntime({
           return context.arbitrateAttachment(request, socket, authenticatedClientId);
         }
         if (request.op === "get_session_commands") {
-          const route = router.route(request.payload.sessionId);
-          const handle = sessionHandles.get(request.payload.sessionId);
-          let record;
-          if (route?.connection !== undefined && route.metadata?.token !== undefined) {
-            const { metadata, connection } = route;
-            const id = randomId();
-            if (typeof id !== "string" || id.length < 16 || usedCommandIds.has(id)) throw Object.assign(new Error("Command ID generator did not provide a unique restart-safe ID"), { code: "COMMAND_ID_COLLISION" });
-            usedCommandIds.add(id);
-            record = await connection.request({ version: 1, type: "command", token: metadata.token, id, command: { clientId: request.clientId, requestId: request.requestId, op: request.op } }, { clientId: request.clientId, requestId: request.requestId, op: request.op, durableRequest: request, metadata, routeGeneration: route.routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
-          } else if (typeof handle?.request === "function") {
-            record = await handle.request(request.op);
-          } else if (handle !== undefined) {
-            sessionHandles.delete(request.payload.sessionId);
-            throw Object.assign(new Error("No exact recovered worker owns this session"), { code: "WORKER_UNAVAILABLE" });
-          } else throw Object.assign(new Error("No exact recovered worker owns this session"), { code: "WORKER_UNAVAILABLE" });
-          const menu = record?.result ?? {};
+          const menu = (await context.askWorker(request))?.result ?? {};
           return {
             kind: "session_commands", sessionId: request.payload.sessionId,
             commands: menu.commands ?? [], models: menu.models ?? [], thinkingLevels: menu.thinkingLevels ?? [],
             model: menu.model ?? null, thinkingLevel: menu.thinkingLevel ?? null,
           };
+        }
+        if (request.op === "session_query") {
+          const sessionQuery = { query: request.payload.query, ...(request.payload.outputPath === undefined ? {} : { outputPath: request.payload.outputPath }) };
+          const rows = (await context.askWorker(request, { sessionQuery }))?.result ?? [];
+          return { kind: "session_query", sessionId: request.payload.sessionId, query: request.payload.query, rows: Array.isArray(rows) ? rows : [] };
         }
         if (!DURABLE_COMMANDS.has(request.op)) throw Object.assign(new Error(`Unsupported daemon operation: ${request.op}`), { code: "UNSUPPORTED_OPERATION" });
         if (!duringRecovery) {

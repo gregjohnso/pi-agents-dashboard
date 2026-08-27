@@ -3,7 +3,9 @@ import { CombinedAutocompleteProvider, Key, matchesKey, truncateToWidth, visible
 import { parseViewerEvent, parseViewerSnapshot } from "../../shared/viewer-contracts.mjs";
 import { createPiComponentAdapters } from "./pi-component-adapters.mjs";
 import { EMPTY_SESSION_MENU, parseSlashSubmission, sessionSlashCommands } from "./slash-commands.mjs";
-import { CommandSelectionOverlay, PendingUiOverlay, renderStatusIndicator, renderSystemCard } from "./overlays.mjs";
+
+const QUERY_TITLES = { get_session_stats: "Session stats", get_tree: "Session tree", export_html: "Session export" };
+import { CommandSelectionOverlay, PendingUiOverlay, TextPanelOverlay, renderStatusIndicator, renderSystemCard } from "./overlays.mjs";
 import { ReturnGesture } from "./return-gesture.mjs";
 import { TranscriptModel, applyViewerEvent, createTranscriptState } from "./transcript.mjs";
 
@@ -48,7 +50,7 @@ function renderKeyHints({ role, working }, width) {
 
 /** Own one standalone normalized Pi chat subscription and its composer role. */
 export class ViewerController {
-  constructor({ sessionId, client, editor, persistence, requestRender, onReturn, now = Date.now, adapters = undefined, cwd = process.cwd() }) {
+  constructor({ sessionId, client, editor, persistence, requestRender, onReturn, onDashboardAction = undefined, now = Date.now, adapters = undefined, cwd = process.cwd() }) {
     if (!sessionId || client === undefined || editor === undefined || persistence === undefined) throw new TypeError("sessionId, client, editor, and persistence are required");
     this.sessionId = sessionId;
     this.client = client;
@@ -56,6 +58,7 @@ export class ViewerController {
     this.persistence = persistence;
     this.requestRender = requestRender ?? (() => {});
     this.onReturn = onReturn ?? (() => {});
+    this.onDashboardAction = onDashboardAction;
     this.now = now;
     this.adapters = adapters ?? createPiComponentAdapters({ tui: editor.tui ?? { mode: "fullscreen", requestRender: () => this.requestRender(), setFocus() {} } });
     this.cwd = cwd;
@@ -297,6 +300,26 @@ export class ViewerController {
       if (!this.openSelection(submission.code)) await this.recordError({ code: submission.code, message: submission.message, retryable: false });
       return;
     }
+    if (submission.kind === "help") {
+      this.openTextPanel("Viewer help", this.helpRows());
+      this.clearEditor();
+      return;
+    }
+    if (submission.kind === "dashboard") {
+      this.clearEditor();
+      if (typeof this.onDashboardAction !== "function") {
+        await this.recordError({ code: "DASHBOARD_ACTION_UNAVAILABLE", message: "This frontend cannot open the dashboard from the viewer", retryable: false });
+        return;
+      }
+      this.onDashboardAction(submission.action);
+      return;
+    }
+    if (submission.kind === "session_query") {
+      const rows = await this.runQuery(submission.payload);
+      if (rows !== undefined) this.openTextPanel(QUERY_TITLES[submission.payload.query] ?? "Session", rows);
+      this.clearEditor();
+      return;
+    }
     if (submission.kind === "settings") {
       if (!await this.sendSettings(submission.payload)) return;
       await this.loadMenu();
@@ -349,6 +372,60 @@ export class ViewerController {
       const typed = /** @type {any} */ (error);
       await this.recordError({ code: typed?.code ?? "VIEWER_COMMAND_FAILED", message: error instanceof Error ? error.message : "Viewer command failed", retryable: typed?.retryable === true });
       return false;
+    }
+  }
+
+  /** Clear the composer after a command that never becomes a transcript message. */
+  clearEditor() {
+    this.restoring = true;
+    this.editor.setText("");
+    this.restoring = false;
+    this.edited = false;
+    this.requestRender();
+  }
+
+  /** @param {string} title @param {string[]} rows */
+  openTextPanel(title, rows) {
+    this.overlay?.dispose();
+    this.overlay = new TextPanelOverlay({
+      title, rows,
+      tui: this.editor.tui ?? { requestRender: () => this.requestRender(), setFocus() {} },
+      returnFocus: this.editor,
+      respond: () => {
+        const resolved = this.overlay;
+        this.overlay = undefined;
+        resolved?.dispose();
+        void this.requestRender();
+      },
+    });
+    void this.requestRender();
+  }
+
+  helpRows() {
+    return [
+      ...sessionSlashCommands(this.menu)
+        .filter((command) => command.source === "builtin")
+        .map((command) => `/${command.name}${command.argumentHint === undefined ? "" : ` ${command.argumentHint}`}  ${command.description ?? ""}`.trim()),
+      "",
+      "Esc  interrupt a running turn, then return to the list",
+      "←  return to the list",
+      "Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · Ctrl+C interrupt",
+    ];
+  }
+
+  /** @param {Record<string, any>} payload */
+  async runQuery(payload) {
+    if (typeof this.client.query !== "function") {
+      await this.recordError({ code: "SESSION_QUERY_UNAVAILABLE", message: "This frontend cannot run session queries", retryable: false });
+      return undefined;
+    }
+    try {
+      const result = await this.client.query(this.sessionId, payload);
+      return Array.isArray(result?.rows) ? result.rows : [];
+    } catch (error) {
+      const typed = /** @type {any} */ (error);
+      await this.recordError({ code: typed?.code ?? "SESSION_QUERY_FAILED", message: error instanceof Error ? error.message : "Session query failed", retryable: typed?.retryable === true });
+      return undefined;
     }
   }
 

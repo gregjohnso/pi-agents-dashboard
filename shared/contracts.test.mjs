@@ -31,6 +31,15 @@ const variants = [
   ["session_command", { sessionId: "session", command: "set_model", model: { provider: "anthropic", id: "claude" } }],
   ["session_command", { sessionId: "session", command: "set_thinking_level", level: "high" }],
   ["session_command", { sessionId: "session", command: "compact", instructions: "keep decisions" }],
+  ["session_command", { sessionId: "session", command: "set_auto_compaction", enabled: true }],
+  ["session_command", { sessionId: "session", command: "set_auto_retry", enabled: false }],
+  ["session_command", { sessionId: "session", command: "abort_retry" }],
+  ["session_command", { sessionId: "session", command: "set_steering_mode", mode: "all" }],
+  ["session_command", { sessionId: "session", command: "set_follow_up_mode", mode: "one-at-a-time" }],
+  ["session_query", { sessionId: "session", query: "get_session_stats" }],
+  ["session_query", { sessionId: "session", query: "get_tree" }],
+  ["session_query", { sessionId: "session", query: "export_html" }],
+  ["session_query", { sessionId: "session", query: "export_html", outputPath: "/tmp/session.html" }],
 ];
 
 describe("command contracts", () => {
@@ -73,6 +82,27 @@ describe("command contracts", () => {
     const session = { schemaVersion: 1, revision: 1, sessionId: "s", sessionFile: "/s.jsonl", canonicalSessionFile: "/s.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "idle", summary: "Idle", updatedAt: "2026-01-01T00:00:00.000Z" }, summary: { text: "Refactored the loader and ran tests", generatedAt: "2026-01-01T00:00:00.000Z", model: { provider: "anthropic", id: "haiku" }, sourceCursor: "42" }, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" };
     expect(parseDaemonResponse({ version: 1, requestId: "request", ok: true, result: { kind: "state", sessions: [session] } })).toBeTruthy();
     expect(() => parseDaemonResponse({ version: 1, requestId: "request", ok: true, result: { kind: "state", sessions: [{ ...session, summary: { ...session.summary, text: "" } }] } })).toThrow(/summary.text/);
+  });
+
+  it("refuses a session command or query Pi cannot serve safely", () => {
+    for (const payload of [
+      { sessionId: "session", command: "new_session" },
+      { sessionId: "session", command: "switch_session", sessionPath: "/other.jsonl" },
+      { sessionId: "session", command: "fork", entryId: "entry" },
+      { sessionId: "session", command: "set_steering_mode", mode: "invented" },
+      { sessionId: "session", command: "set_auto_retry", enabled: "yes" },
+    ]) {
+      expect(() => parseClientRequest({ ...envelope, op: "session_command", payload })).toThrow();
+    }
+    expect(() => parseClientRequest({ ...envelope, op: "session_query", payload: { sessionId: "session", query: "get_messages" } })).toThrow();
+  });
+
+  it("parses one bounded session query result", () => {
+    const result = { kind: "session_query", sessionId: "session", query: "get_session_stats", rows: ["messages: 12", "tokens: 3400"] };
+    const response = { version: 1, requestId: "request", ok: true, result };
+    expect(parseDaemonResponse(response)).toEqual(response);
+    expect(() => parseDaemonResponse({ ...response, result: { ...result, unknown: true } })).toThrow(/unknown/i);
+    expect(() => parseDaemonResponse({ ...response, result: { ...result, rows: [{ nested: true }] } })).toThrow(/rows/i);
   });
 
   it("strictly parses daemon failures", () => {

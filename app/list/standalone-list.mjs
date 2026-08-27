@@ -70,6 +70,12 @@ export function createDaemonViewerClient({ client, clientId }) {
       const settings = await request("get_settings", {}).catch(() => undefined);
       return { ...result, summaryModel: settings?.kind === "settings" ? settings.summaryModel : null };
     },
+    /** @param {string} sessionId @param {Record<string, any>} payload */
+    async query(sessionId, payload) {
+      const result = await request("session_query", { sessionId, ...payload });
+      if (result?.kind !== "session_query") throw Object.assign(new Error("Daemon returned the wrong session query result"), { code: "INVALID_RESPONSE" });
+      return result;
+    },
     /** @param {Record<string, any>} payload */
     async setSettings(payload) {
       const result = await request("set_settings", payload);
@@ -184,6 +190,8 @@ export async function createStandaloneList({ cwd, frontend }) {
   let switching = false;
   let activeViewer;
   let active;
+  /** @type {string | undefined} */
+  let pendingDashboardAction;
   let standaloneHost;
   const closed = new Promise((resolve) => { resolveClosed = resolve; });
   const openRealViewer = async (sessionId) => {
@@ -198,11 +206,20 @@ export async function createStandaloneList({ cwd, frontend }) {
           sessionId, client: viewerClient, editor, cwd,
           persistence: { async load() { return viewerState.get(sessionId); }, async save(value) { viewerState.set(sessionId, structuredClone(value)); } },
           requestRender: () => tui.requestRender(), onReturn: () => { void viewer.close(); },
+          onDashboardAction: (/** @type {string} */ action) => {
+            pendingDashboardAction = action;
+            void viewer.close();
+          },
         });
         return viewer;
       },
       activateViewer(viewer) { activeViewer = viewer; active = viewer; standaloneHost.focus(); },
-      activateList() { activeViewer = undefined; active = controller; },
+      activateList() {
+        activeViewer = undefined;
+        active = controller;
+        if (pendingDashboardAction === "new_session") controller.focusComposer();
+        pendingDashboardAction = undefined;
+      },
       restoreListFocus() { standaloneHost.focus(); },
       onRestoreClosed() { tui.stop(); resolveClosed(); },
       shouldRestore() { return closing === undefined; },

@@ -26,8 +26,13 @@ import { parseViewerSnapshot } from "./viewer-contracts.mjs";
 /** @typedef {{version:1,cursor:EventCursor,occurredAt:string,kind:"session_changed"|"command_changed"|"attachment_changed",payload:any}} PersistedEvent */
 
 const ENVELOPE_KEYS = ["version", "clientId", "requestId", "op", "payload"];
-const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries"];
-const SESSION_COMMANDS = ["set_model", "set_thinking_level", "compact", "set_session_name"];
+const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "session_query", "get_settings", "set_settings", "refresh_summaries"];
+const SESSION_COMMANDS = ["set_model", "set_thinking_level", "compact", "set_session_name", "set_auto_compaction", "set_auto_retry", "abort_retry", "set_steering_mode", "set_follow_up_mode"];
+// Pi's own vocabulary for both queue modes; anything else is refused before it reaches a worker.
+const QUEUE_MODES = ["all", "one-at-a-time"];
+// Read-only Pi commands the dashboard may serve. Session-rebinding commands are deliberately absent.
+const SESSION_QUERIES = ["get_session_stats", "get_tree", "export_html"];
+const MAX_QUERY_ROWS = 500;
 const MAX_MENU_ENTRIES = 1_000;
 
 /** @param {unknown} value @param {string} path @returns {Record<string, any>} */
@@ -186,6 +191,16 @@ export function parseClientRequest(value) {
     return { ...base, payload: { cursor: readCursor(payload.cursor, "ack payload.cursor") } };
   }
   if (["get_viewer_snapshot", "get_session_commands"].includes(op)) return { ...base, payload: readSessionPayload(request.payload, op) };
+  if (op === "session_query") {
+    const payload = readRecord(request.payload, "session_query payload");
+    const query = readEnum(payload, "query", SESSION_QUERIES, "session_query payload.query");
+    const sessionId = readIdentifier(payload, "sessionId", "session_query payload.sessionId");
+    rejectUnknownKeys(payload, query === "export_html" ? ["sessionId", "query", "outputPath"] : ["sessionId", "query"], "session_query payload");
+    if (query === "export_html" && Object.hasOwn(payload, "outputPath")) {
+      return { ...base, payload: { sessionId, query, outputPath: readIdentifier(payload, "outputPath", "session_query payload.outputPath") } };
+    }
+    return { ...base, payload: { sessionId, query } };
+  }
   if (op === "session_command") {
     const payload = readRecord(request.payload, "session_command payload");
     const command = readEnum(payload, "command", SESSION_COMMANDS, "session_command payload.command");
@@ -205,6 +220,19 @@ export function parseClientRequest(value) {
       const name = readText(payload, "name", "session_command payload.name");
       if (name.length > 128) throw new TypeError("session_command payload.name must be at most 128 characters");
       return { ...base, payload: { sessionId, command, name } };
+    }
+    if (command === "set_auto_compaction" || command === "set_auto_retry") {
+      rejectUnknownKeys(payload, ["sessionId", "command", "enabled"], "session_command payload");
+      if (typeof payload.enabled !== "boolean") throw new TypeError("session_command payload.enabled must be a boolean");
+      return { ...base, payload: { sessionId, command, enabled: payload.enabled } };
+    }
+    if (command === "set_steering_mode" || command === "set_follow_up_mode") {
+      rejectUnknownKeys(payload, ["sessionId", "command", "mode"], "session_command payload");
+      return { ...base, payload: { sessionId, command, mode: readEnum(payload, "mode", QUEUE_MODES, "session_command payload.mode") } };
+    }
+    if (command === "abort_retry") {
+      rejectUnknownKeys(payload, ["sessionId", "command"], "session_command payload");
+      return { ...base, payload: { sessionId, command } };
     }
     rejectUnknownKeys(payload, ["sessionId", "command", "instructions"], "session_command payload");
     return { ...base, payload: Object.hasOwn(payload, "instructions") ? { sessionId, command, instructions: readText(payload, "instructions", "session_command payload.instructions") } : { sessionId, command } };
@@ -321,12 +349,21 @@ export function parseDaemonResponse(value) {
   if (!response.ok) { requireKeys(response, ["version", "requestId", "ok", "error"], [], "daemon response"); validateError(response.error, "daemon response.error"); return response; }
   requireKeys(response, ["version", "requestId", "ok", "result"], [], "daemon response");
   const result = readRecord(response.result, "daemon response.result");
-  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "subscribed", "acknowledged", "viewer_snapshot", "viewer_subscribed", "viewer_acknowledged", "session_commands", "settings", "summaries_refreshing"], "daemon response.result.kind");
+  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "subscribed", "acknowledged", "viewer_snapshot", "viewer_subscribed", "viewer_acknowledged", "session_commands", "session_query", "settings", "summaries_refreshing"], "daemon response.result.kind");
   if (kind === "state") { requireKeys(result, ["kind", "sessions"], [], "daemon response.result"); if (!Array.isArray(result.sessions)) throw new TypeError("sessions must be an array"); result.sessions.forEach((session, index) => validateSession(session, `daemon response.result.sessions[${index}]`)); }
   else if (["launched", "detached"].includes(kind)) { requireKeys(result, ["kind", "sessionId"], [], "daemon response.result"); readIdentifier(result, "sessionId"); }
   else if (kind === "attached") { requireKeys(result, ["kind", "sessionId", "role"], [], "daemon response.result"); readIdentifier(result, "sessionId"); readEnum(result, "role", ["composer", "observer"]); }
   else if (kind === "command") { requireKeys(result, ["kind", "status"], [], "daemon response.result"); const status = readRecord(result.status, "status"); requireKeys(status, ["clientId", "requestId", "operation", "stage", "acceptedAt", "updatedAt"], ["error"], "status"); for (const key of ["clientId", "requestId", "acceptedAt", "updatedAt"]) readIdentifier(status, key, `status.${key}`); readEnum(status, "operation", OPERATIONS, "status.operation"); readEnum(status, "stage", ["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED", "DELIVERY_UNKNOWN", "FAILED"], "status.stage"); if (Object.hasOwn(status, "error")) validateError(status.error, "status.error"); }
   else if (kind === "session_commands") validateSessionCommands(result);
+  else if (kind === "session_query") {
+    requireKeys(result, ["kind", "sessionId", "query", "rows"], [], "daemon response.result");
+    readIdentifier(result, "sessionId", "daemon response.result.sessionId");
+    readEnum(result, "query", SESSION_QUERIES, "daemon response.result.query");
+    if (!Array.isArray(result.rows) || result.rows.length > MAX_QUERY_ROWS) throw new TypeError("daemon response.result.rows must be a bounded array");
+    result.rows.forEach((/** @type {unknown} */ row, /** @type {number} */ index) => {
+      if (typeof row !== "string" || row.length > 2_000) throw new TypeError(`daemon response.result.rows[${index}] must be a bounded string`);
+    });
+  }
   else if (kind === "settings") {
     requireKeys(result, ["kind", "summaryModel"], [], "daemon response.result");
     if (result.summaryModel !== null) {

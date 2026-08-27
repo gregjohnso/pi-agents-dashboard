@@ -203,6 +203,33 @@ describe("dashboard controller", () => {
         expect(filtered).toContain("/repo/beta");
         expect(filtered).toContain("search:beta");
     });
+    it("confirms a destructive action against the revision current at confirm time", async () => {
+        const backend = new FakeBackend([session("a", { revision: 4 })]);
+        const dashboard = controller(backend);
+        await dashboard.open();
+        dashboard.selectSession("a");
+        dashboard.handleInput("\x18");
+        expect(dashboard.overlay).toMatchObject({ kind: "session_confirmation", revision: 4 });
+
+        dashboard.applySnapshot({ sessions: [session("a", { revision: 9, summary: { text: "summarized", generatedAt: timestamp, model: { provider: "p", id: "m" }, sourceCursor: "3" } })] });
+        dashboard.selectSession("a");
+        dashboard.handleInput("y");
+        await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledWith("a", 9, expect.any(String)));
+    });
+    it("cancels a destructive confirmation when the session comes back to life", async () => {
+        const backend = new FakeBackend([session("a", { revision: 2, processState: "EXITED" })]);
+        const dashboard = controller(backend);
+        await dashboard.open();
+        dashboard.setView("all");
+        dashboard.selectSession("a");
+        dashboard.handleInput("\x18");
+        expect(dashboard.overlay).toMatchObject({ kind: "session_confirmation", action: "delete" });
+        dashboard.applySnapshot({ sessions: [session("a", { revision: 3, processState: "LIVE", ownership: { kind: "managed", runId: "r", process: { pid: 5, startIdentity: "5", processGroupId: 5 }, acquiredAt: timestamp, heartbeatAt: timestamp } })] });
+        dashboard.selectSession("a");
+        dashboard.handleInput("y");
+        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "SESSION_LIVE" }));
+        expect(backend.stop).not.toHaveBeenCalled();
+    });
     it("counts only the sessions the current view shows", async () => {
         const dashboard = controller(new FakeBackend([
             session("live", { processState: "LIVE" }),
@@ -341,6 +368,8 @@ describe("dashboard controller", () => {
         expect(backend.stop).not.toHaveBeenCalled();
         dashboard.handleInput("\x18");
         await processRenderedEvent(dashboard, backend, { snapshot: { sessions: [session("a", { revision: 2, processState: "LIVE" }), session("b", { processState: "EXITED" })] }, cursor: { daemonEpoch: "epoch", sequence: "1" } });
+        expect(dashboard.overlay).toMatchObject({ kind: "session_confirmation", action: "stop", sessionId: "a" });
+        await processRenderedEvent(dashboard, backend, { snapshot: { sessions: [session("a", { revision: 3, processState: "EXITED" }), session("b", { processState: "EXITED" })] }, cursor: { daemonEpoch: "epoch", sequence: "2" } });
         expect(dashboard.overlay).toBeUndefined();
         dashboard.setView("all");
         dashboard.selectSession("b");

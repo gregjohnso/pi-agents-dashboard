@@ -13,8 +13,10 @@ import { runInstalledPiWorker } from "./installed-pi-worker.mjs";
 initializeRuntimePermissions();
 
 const MAX_REPLAY_RECORD_BYTES = 1024 * 1024;
-const WORKER_OPERATIONS = new Set(["prompt", "steer", "follow_up", "interrupt", "ui_response", "get_state", "get_session_commands", "session_command"]);
+const WORKER_OPERATIONS = new Set(["prompt", "steer", "follow_up", "interrupt", "ui_response", "get_state", "get_session_commands", "session_command", "session_query"]);
 const MAX_MENU_ENTRIES = 1_000;
+const MAX_QUERY_ROWS = 500;
+const QUEUE_MODES = ["all", "one-at-a-time"];
 
 /** @param {any} value @param {string} fallbackSource */
 function menuCommand(value, fallbackSource) {
@@ -64,6 +66,15 @@ function assertSessionCommand(request) {
     if (typeof request.name !== "string" || request.name.trim().length === 0) throw invalid("session_command name is invalid");
     return;
   }
+  if (request?.command === "set_auto_compaction" || request?.command === "set_auto_retry") {
+    if (typeof request.enabled !== "boolean") throw invalid("session_command enabled is invalid");
+    return;
+  }
+  if (request?.command === "set_steering_mode" || request?.command === "set_follow_up_mode") {
+    if (!QUEUE_MODES.includes(request.mode)) throw invalid("session_command mode is invalid");
+    return;
+  }
+  if (request?.command === "abort_retry") return;
   if (request?.command !== "compact") throw invalid(`session_command is unsupported: ${request?.command ?? "missing"}`);
 }
 
@@ -72,7 +83,44 @@ function applySessionCommand(adapter, request) {
   if (request.command === "set_model") return adapter.setModel({ provider: request.model.provider, id: request.model.id });
   if (request.command === "set_thinking_level") return adapter.setThinkingLevel(request.level);
   if (request.command === "set_session_name") return adapter.setSessionName(request.name.trim());
+  if (request.command === "set_auto_compaction") return adapter.setAutoCompaction(request.enabled);
+  if (request.command === "set_auto_retry") return adapter.setAutoRetry(request.enabled);
+  if (request.command === "abort_retry") return adapter.abortRetry();
+  if (request.command === "set_steering_mode") return adapter.setSteeringMode(request.mode);
+  if (request.command === "set_follow_up_mode") return adapter.setFollowUpMode(request.mode);
   return adapter.compact(typeof request.instructions === "string" && request.instructions.length > 0 ? request.instructions : undefined);
+}
+
+/** @param {unknown} value @param {string} label @param {string[]} rows @param {number} depth */
+function flattenRows(value, label, rows, depth = 0) {
+  if (rows.length >= MAX_QUERY_ROWS) return rows;
+  if (value === null || typeof value !== "object") {
+    rows.push(`${label}: ${String(value)}`.slice(0, 2_000));
+    return rows;
+  }
+  if (depth >= 3) {
+    rows.push(`${label}: ${Array.isArray(value) ? `${value.length} entries` : "…"}`.slice(0, 2_000));
+    return rows;
+  }
+  const entries = Array.isArray(value)
+    ? value.slice(0, MAX_QUERY_ROWS).map((/** @type {unknown} */ entry, /** @type {number} */ index) => [`${label}[${index}]`, entry])
+    : Object.entries(value).map(([key, entry]) => [label === "" ? key : `${label}.${key}`, entry]);
+  for (const [childLabel, entry] of entries) flattenRows(entry, /** @type {string} */ (childLabel), rows, depth + 1);
+  return rows;
+}
+
+/** Render one read-only Pi query as bounded display rows. @param {any} adapter @param {any} request */
+async function runSessionQuery(adapter, request) {
+  if (request?.query === "get_session_stats") return flattenRows(await adapter.getSessionStats(), "", []);
+  if (request?.query === "get_tree") {
+    const tree = await adapter.getTree();
+    return flattenRows({ leafId: tree?.leafId ?? null, tree: tree?.tree ?? null }, "", []);
+  }
+  if (request?.query === "export_html") {
+    const exported = await adapter.exportHtml(typeof request.outputPath === "string" && request.outputPath.length > 0 ? request.outputPath : undefined);
+    return [`Exported to ${exported?.path ?? "an unreported path"}`];
+  }
+  throw Object.assign(new TypeError(`session_query is unsupported: ${request?.query ?? "missing"}`), { code: "INVALID_SESSION_QUERY" });
 }
 
 /** @param {string} value */
@@ -142,7 +190,7 @@ export function replayDeliveryIsAmbiguous(replay, command) {
 export function createWorkerCommandDispatcher({ replay, adapter }) {
   let tail = Promise.resolve();
 
-  /** @param {{ clientId: string, requestId: string, op: string, text?: string, response?: unknown, sessionCommand?: any, retryAtRisk?: boolean }} command */
+  /** @param {{ clientId: string, requestId: string, op: string, text?: string, response?: unknown, sessionCommand?: any, sessionQuery?: any, retryAtRisk?: boolean }} command */
   function deliver(command) {
     const result = tail.then(async () => {
       if (typeof command?.clientId !== "string" || typeof command.requestId !== "string") {
@@ -186,6 +234,7 @@ export function createWorkerCommandDispatcher({ replay, adapter }) {
           case "get_state": resultValue = await adapter.getState(); break;
           case "get_session_commands": resultValue = await collectSessionMenu(adapter); break;
           case "session_command": resultValue = await applySessionCommand(adapter, command.sessionCommand); break;
+          case "session_query": resultValue = await runSessionQuery(adapter, command.sessionQuery); break;
         }
       } catch (cause) {
         const failure = /** @type {{ code?: unknown, acknowledged?: unknown }} */ (cause);

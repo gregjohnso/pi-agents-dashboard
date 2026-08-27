@@ -722,7 +722,7 @@ export class DashboardController {
                 const form = ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
                 lines[dockTop + 2] = paintPlainLine(this.status.kind === "error" ? ` ${this.status.code}: ${this.status.message}  ${form}` : form, this.width, this.status.kind === "error" ? jobwatchTheme.error : jobwatchTheme.surface);
                 if (layout.dockRows >= 5) lines[dockTop + 3] = sectionFooter(this.width, confirmingSharedLaunch);
-                if (layout.dockRows >= 6) lines[dockTop + 4] = paintPlainLine(this.contextSummary(), this.width, jobwatchTheme.keyHints);
+                if (layout.dockRows >= 6) lines[dockTop + 4] = paintPlainLine(this.selectedCwdLine(), this.width, jobwatchTheme.keyHints);
                 lines[lines.length - 1] = paintPlainLine(" Ctrl+C quit  ↑↓ navigate  Enter/→ open  ←/Esc back  type to compose  Tab fields  ^X action  ^G help", this.width, jobwatchTheme.keyHints);
             }
             this.renderOverlay(lines);
@@ -807,8 +807,7 @@ export class DashboardController {
         const next = this.query.view === "live" ? "done" : this.query.view === "done" ? "all" : "live";
         this.setView(next);
     }
-    /** Show what the cursor is on, then any active filters. The keys themselves live in the footer and in Help. */
-    contextSummary() {
+    selectedCwdLine() {
         const selected = this.selectedSession();
         return selected === undefined ? "" : ` ${selected.cwd}`;
     }

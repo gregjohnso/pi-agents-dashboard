@@ -705,4 +705,11 @@ describe("transcript scrolling keys and wheel", () => {
     f.instance.handleInput("\x1b[F");
     expect(stripVTControlCharacters(f.instance.render(80, 24).join("\n"))).not.toContain("new activity");
   });
+
+  it("restores a stored session color when the viewer reopens", async () => {
+    // The colour lives on the session record, so reopening paints the prompt bar with no fresh /color.
+    const f = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: "amber", registryRevision: 3 }) });
+    await f.instance.open();
+    expect(f.instance.render(80, 20).join("\n")).toContain("\x1b[38;2;252;211;77m");
+  });
 });

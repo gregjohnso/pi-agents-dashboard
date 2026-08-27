@@ -283,6 +283,8 @@ export class ViewerController {
         thinkingLevel: menu?.thinkingLevel ?? null,
         color: menu?.color ?? null,
       };
+      // The colour is stored on the session record, so adopt it on every open, not only when /color runs.
+      this.sessionColor = this.menu.color ?? undefined;
       if (Number.isSafeInteger(menu?.registryRevision)) this.registryRevision = menu.registryRevision;
     } catch (error) {
       this.menu = EMPTY_SESSION_MENU;

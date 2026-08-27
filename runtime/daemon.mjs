@@ -20,6 +20,7 @@ import { RecoveredWorkerRouter, reconcileRuntime } from "./reconciliation.mjs";
 import { openSettingsStore, summarizePromptInput, summarizeWithPi } from "./summaries.mjs";
 import { RegistryStore, applySessionColor, runSessionLifecycle } from "./registry-store.mjs";
 import { reduceSessionState } from "./state-reducer.mjs";
+import { createIdleExit } from "./idle-exit.mjs";
 import { WorkerSupervisor } from "./worker-supervisor.mjs";
 import { loadDashboardConfig } from "../shared/config.mjs";
 import { parseClientRequest } from "../shared/contracts.mjs";
@@ -1387,6 +1388,10 @@ export async function createDaemonRuntime({
       ready,
       stopRequested,
       status() { return { ...context.publicStatus(), connectedWorkers: router.connectedSessionIds(), closeState }; },
+      /** Frontend sockets currently attached, which is what idle exit must never interrupt. */
+      attachedFrontends() { return socketServer.sockets.size; },
+      /** Workers whose supervisor and Pi child are still recorded as live. */
+      liveWorkers() { return router.connectedSessionIds().length; },
       /** @param {any} key */
       async commandStatus(key) { await ready; return context.recovery.journal.get(key); },
       close() {
@@ -1482,6 +1487,8 @@ async function runMain() {
   const piBinFlag = argv.indexOf("--pi-bin");
   const root = rootFlag >= 0 ? argv[rootFlag + 1] : defaultRuntimeRoot();
   const piBin = piBinFlag >= 0 ? argv[piBinFlag + 1] : undefined;
+  const idleFlag = argv.indexOf("--idle-exit-ms");
+  const idleMs = idleFlag >= 0 ? Number(argv[idleFlag + 1]) : Number(process.env.PI_DASHBOARD_IDLE_EXIT_MS ?? 0);
   const runtime = await createDefaultDaemonRuntime({ root, piBin });
   try {
     await runtime.ready;
@@ -1490,6 +1497,10 @@ async function runMain() {
       new Promise((resolveStop) => {
         process.once("SIGTERM", resolveStop);
         process.once("SIGINT", resolveStop);
+        if (!Number.isFinite(idleMs) || idleMs <= 0) return;
+        const idle = createIdleExit({ idleMs, now: () => Date.now(), onIdle: () => resolveStop(undefined), frontends: () => runtime.attachedFrontends(), workers: () => runtime.liveWorkers() });
+        const timer = setInterval(() => idle.check(), Math.max(250, Math.min(idleMs, 5_000)));
+        timer.unref?.();
       }),
     ]);
   } finally {

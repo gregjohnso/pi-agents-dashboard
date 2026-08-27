@@ -1711,3 +1711,17 @@ it("colors a session across summary churn without a revision conflict", async ()
   expect(await registry.get("summary")).toMatchObject({ color: "rose", summary: { text: "Fixes the loader" } });
   client.close();
 });
+
+it("reports the counts idle exit depends on", async () => {
+  const runtime = await createDaemonRuntime({ root: await root() });
+  runtimes.push(runtime);
+  await runtime.ready;
+  // Idle exit may only end the process when both counts are zero.
+  expect(runtime.attachedFrontends()).toBe(0);
+  expect(runtime.liveWorkers()).toBe(0);
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await client.ready;
+  expect(runtime.attachedFrontends()).toBeGreaterThan(0);
+  client.socket.destroy();
+  await vi.waitFor(() => expect(runtime.attachedFrontends()).toBe(0));
+});

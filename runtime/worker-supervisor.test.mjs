@@ -737,6 +737,29 @@ it("discards a queued worker event after exit and removes listeners before durab
   expect(listenersAtRelease).toBe(0);
 });
 
+it("records a Pi-child crash that races the supervisor exit it caused", async () => {
+  const { runs, registry, ownership } = await setup();
+  const world = processWorld();
+  const workers = fakeWorkerFactory({ world });
+  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, randomId: () => "pi-crash-token", ...world.seams });
+  await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-pi-crash" });
+
+  workers.children[0].emit("message", {
+    type: "worker_event",
+    token: "pi-crash-token",
+    sessionId: "one",
+    event: { type: "PI_CHILD_CRASHED", at: "2026-08-25T12:04:00.000Z", summary: "Pi exited unexpectedly (SIGSEGV)" },
+  });
+  workers.exitGroup(workers.children[0]);
+
+  await waitUntil(async () => (await getRecord(registry, "one")).ownership === undefined);
+  expect(await getRecord(registry, "one")).toMatchObject({
+    taskState: "FAILED",
+    processState: "EXITED",
+    activity: { kind: "process_error", summary: "Pi exited unexpectedly (SIGSEGV)" },
+  });
+});
+
 it("finishes terminal reconciliation after an event races its registry write", async () => {
   const { runs, registry, ownership } = await setup();
   const world = processWorld();

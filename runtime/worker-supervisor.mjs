@@ -558,7 +558,11 @@ export class WorkerSupervisor {
   /** @param {any} supervision @param {any} event @param {"launching" | "active"} lifecycle */
   async #writeWorkerEventLocked(supervision, event, lifecycle) {
     const launchEvent = lifecycle === "launching";
-    if (supervision.exit.terminal || supervision.lifecycle !== lifecycle || !this.#supervisions.has(supervision)) {
+    // A crashed Pi child only moves the record toward EXITED, and its report races the supervisor exit it
+    // caused, so it stays writable until the lease is released.
+    const afterExit = event?.type === "PI_CHILD_CRASHED" && !launchEvent && supervision.lifecycle !== "reconciled";
+    const writable = () => afterExit || (!supervision.exit.terminal && supervision.lifecycle === lifecycle);
+    if (!writable() || !this.#supervisions.has(supervision)) {
       if (launchEvent) throw new WorkerSupervisorError("WORKER_PROCESS_EXITED", "Worker exited before readiness persistence");
       return undefined;
     }
@@ -571,7 +575,7 @@ export class WorkerSupervisor {
       if (launchEvent) throw new WorkerSupervisorError("STALE_LEASE", "Worker readiness no longer owns the session");
       return undefined;
     }
-    if (supervision.exit.terminal || supervision.lifecycle !== lifecycle) {
+    if (!writable()) {
       if (launchEvent) throw new WorkerSupervisorError("WORKER_PROCESS_EXITED", "Worker exited before readiness persistence");
       return undefined;
     }

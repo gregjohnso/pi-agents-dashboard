@@ -134,6 +134,24 @@ it("starts two bounded workers as distinct process-group leaders and opens sessi
   await Promise.all([waitForOwnershipRelease(registry, "one"), waitForOwnershipRelease(registry, "two")]);
 });
 
+it("fails the session with a process error when the Pi child exits unexpectedly", async () => {
+  const { root, runs, registry, fakeEntry } = await setup(["one"]);
+  const supervisor = new WorkerSupervisor({
+    registry,
+    ownership: new OwnershipManager(registry),
+    runsDirectory: runs,
+    env: { ...process.env, PI_DASHBOARD_TEST_EXIT_MS: "300" },
+    startTimeoutMs: 2_000,
+    launchStopPolicy: { gracefulMs: 100, terminateMs: 100 },
+  });
+  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-pi-crash", piPath: fakeEntry });
+
+  await waitForExit(launched.identity.pid);
+  await waitForOwnershipRelease(registry, "one");
+  expect(await registry.get("one")).toMatchObject({ taskState: "FAILED", processState: "EXITED", activity: { kind: "process_error" } });
+  await supervisor.close();
+});
+
 it("refuses a second writer for one canonical session", async () => {
   const { root, runs, registry, fakeEntry } = await setup(["one"]);
   const supervisor = new WorkerSupervisor({

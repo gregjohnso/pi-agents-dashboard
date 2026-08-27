@@ -42,7 +42,7 @@ describe("viewer normalizer", () => {
     assertPayloads(events);
   });
 
-  it("creates deterministic bounded fallback IDs and deduplicates history/live overlap", () => {
+  it("derives identity from Pi IDs, falls back deterministically, and deduplicates history/live overlap", () => {
     const entry = { type: "message", timestamp: AT, message: { role: "user", content: "same" } };
     const first = normalizer();
     const second = normalizer();
@@ -50,15 +50,14 @@ describe("viewer normalizer", () => {
     expect(second.consumeHistory(entry, position(8))).toEqual(history);
     expect(history[0].eventId).toMatch(/^viewer-/u);
     expect(first.consumeFrame({ type: "message_end", message: entry.message })).toEqual([]);
-  });
 
-  it("keeps distinct stable canonical messages even when their content and timestamps match", () => {
-    const subject = normalizer();
+    // Two canonical entries with identical content and timestamps stay distinct items, not one deduplicated item.
+    const stable = normalizer();
     const message = { role: "user", content: "same" };
-    const first = subject.consumeHistory({ type: "message", id: "stable-one", timestamp: AT, message }, position(20));
-    const second = subject.consumeHistory({ type: "message", id: "stable-two", timestamp: AT, message }, position(21));
-    expect([...first, ...second].filter((event) => event.payload.kind === "user_message").map((event) => event.payload.itemId)).toEqual(["stable-one", "stable-two"]);
-    expect(subject.consumeFrame({ type: "message_end", message })).toEqual([]);
+    const one = stable.consumeHistory({ type: "message", id: "stable-one", timestamp: AT, message }, position(20));
+    const two = stable.consumeHistory({ type: "message", id: "stable-two", timestamp: AT, message }, position(21));
+    expect([...one, ...two].filter((event) => event.payload.kind === "user_message").map((event) => event.payload.itemId)).toEqual(["stable-one", "stable-two"]);
+    expect(stable.consumeFrame({ type: "message_end", message })).toEqual([]);
   });
 
   it("assembles assistant deltas into one stable item and treats final content as authoritative and idempotent", () => {
@@ -74,17 +73,15 @@ describe("viewer normalizer", () => {
     expect(second[1].payload).toEqual({ kind: "assistant_message", itemId: first[0].payload.itemId, content: [{ type: "text", text: "hello" }] });
     expect(final[0].payload).toEqual({ kind: "assistant_message", itemId: first[0].payload.itemId, content: [{ type: "text", text: "hello" }] });
     expect(subject.consumeFrame(finalFrame)).toEqual([]);
-    assertPayloads([...first, ...second, ...final]);
-  });
 
-  it("publishes authoritative partial messages that preserve thinking and text block identity in frozen v1", () => {
-    const subject = normalizer();
-    subject.consumeFrame({ type: "message_start", message: { role: "assistant", content: [], timestamp: Date.parse(AT) } });
-    const thinking = subject.consumeFrame({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "reason" } });
-    const text = subject.consumeFrame({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 2, delta: "answer" } });
+    // Thinking and text blocks keep their own identity in the authoritative partial the viewer replays.
+    const blocks = normalizer();
+    blocks.consumeFrame({ type: "message_start", message: { role: "assistant", content: [], timestamp: Date.parse(AT) } });
+    const thinking = blocks.consumeFrame({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "reason" } });
+    const text = blocks.consumeFrame({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 2, delta: "answer" } });
     expect(thinking[1].payload).toEqual({ kind: "assistant_message", itemId: thinking[0].payload.itemId, content: [{ type: "thinking", text: "reason" }] });
     expect(text[1].payload).toEqual({ kind: "assistant_message", itemId: thinking[0].payload.itemId, content: [{ type: "thinking", text: "reason" }, { type: "text", text: "answer" }] });
-    assertPayloads([...thinking, ...text]);
+    assertPayloads([...first, ...second, ...final, ...thinking, ...text]);
   });
 
   it("derives history tool events from the session file alone so replay stays byte-identical", () => {

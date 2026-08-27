@@ -68,7 +68,7 @@ describe("durable per-session viewer store", () => {
     await recovered.close();
   });
 
-  it("keeps assistant recovery checkpoints durable and outside public v1 events and snapshots", async () => {
+  it("keeps recovery checkpoints outside public v1, and keeps the prior snapshot when publication fails", async () => {
     const directory = await location();
     const checkpoint = { activeAssistant: { itemId: "assistant-1", blocks: [{ contentIndex: 0, type: "thinking", text: "reason" }, { contentIndex: 2, type: "text", text: "ans" }] } };
     const store = await createViewerStore({ directory, sessionId: "session-1", daemonEpoch: "epoch-1" });
@@ -82,15 +82,6 @@ describe("durable per-session viewer store", () => {
     expect(await recovered.getCheckpoint()).toEqual(checkpoint);
     expect((await recovered.replay())[0].payload).toEqual({ kind: "assistant_delta", itemId: "assistant-1", delta: "ans" });
     await recovered.close();
-  });
-
-  it("publishes crash-safe snapshots and retains the prior snapshot when publication fails", async () => {
-    const directory = await location();
-    const store = await createViewerStore({ directory, sessionId: "session-1", daemonEpoch: "epoch-1" });
-    await store.append(draft);
-    await store.publishSnapshot(snapshot(1));
-    expect(await store.getSnapshot()).toEqual(snapshot(1));
-    await store.close();
 
     const failing = await createViewerStore({ directory, sessionId: "session-1", daemonEpoch: "epoch-1", failpoint(phase) { if (phase === "before_snapshot_publish") throw new Error("snapshot crash"); } });
     await expect(failing.publishSnapshot(snapshot(1, "changed"))).rejects.toThrow("snapshot crash");

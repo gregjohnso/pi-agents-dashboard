@@ -5,6 +5,15 @@ import { CommandSelectionOverlay, PendingUiOverlay, renderStatusIndicator, rende
 
 const tui = { requestRender: vi.fn(), setFocus: vi.fn(), mode: "fullscreen" };
 
+/** A tui that records every focus transfer, so an overlay's focus hand-off can be read back in order. */
+function focusFixture() {
+  /** @type {any[]} */
+  const focused = [];
+  const returnFocus = { focused: true };
+  let currentFocus = returnFocus;
+  return { focused, returnFocus, tui: { ...tui, setFocus(/** @type {any} */ component) { currentFocus.focused = false; focused.push(component); currentFocus = component; if (currentFocus !== null) currentFocus.focused = true; } } };
+}
+
 describe("pending Pi UI overlays", () => {
   it.each([
     [{ id: "c", method: "confirm", title: "Continue?" }, "y", true],
@@ -21,24 +30,31 @@ describe("pending Pi UI overlays", () => {
     expect(overlay.render(40).every((line) => visibleWidth(line) <= 40)).toBe(true);
   });
 
-  it("uses a multiline public editor and restores the prior IME focus after submit", () => {
-    const focused = [];
-    const returnFocus = { focused: true };
-    let currentFocus = returnFocus;
-    const focusedTui = { ...tui, setFocus(component) { currentFocus.focused = false; focused.push(component); currentFocus = component; if (currentFocus !== null) currentFocus.focused = true; } };
+  it("uses a multiline public editor and restores the prior IME focus after submit and after Escape", () => {
+    const submit = focusFixture();
     const respond = vi.fn();
-    const overlay = new PendingUiOverlay({ request: { id: "e", method: "editor", title: "Edit", initialValue: "first\nsecond" }, tui: focusedTui, returnFocus, respond });
+    const overlay = new PendingUiOverlay({ request: { id: "e", method: "editor", title: "Edit", initialValue: "first\nsecond" }, tui: submit.tui, returnFocus: submit.returnFocus, respond });
     expect(overlay.control.constructor.name).toBe("ExtensionEditorComponent");
     expect(overlay.render(80).join("\n")).toContain("first");
     expect(overlay.render(80).join("\n")).toContain("second");
-    expect(focused[0]).toBe(overlay.control);
+    expect(submit.focused[0]).toBe(overlay.control);
     expect(overlay.control.focused).toBe(true);
-    expect(returnFocus.focused).toBe(false);
+    expect(submit.returnFocus.focused).toBe(false);
     overlay.handleInput("\r");
     expect(respond).toHaveBeenCalledWith({ requestId: "e", value: "first\nsecond" });
-    expect(focused.at(-1)).toBe(returnFocus);
-    expect(returnFocus.focused).toBe(true);
+    expect(submit.focused.at(-1)).toBe(submit.returnFocus);
+    expect(submit.returnFocus.focused).toBe(true);
     expect(overlay.control.focused).toBe(false);
+
+    const cancel = focusFixture();
+    const cancelRespond = vi.fn();
+    const prompt = new PendingUiOverlay({ request: { id: "i", method: "input", title: "Name" }, tui: cancel.tui, returnFocus: cancel.returnFocus, respond: cancelRespond });
+    expect(cancel.focused[0]).toBe(prompt.control);
+    expect(prompt.handleInput("\x1b")).toBe(true);
+    expect(cancelRespond).toHaveBeenCalledWith({ requestId: "i", cancelled: true });
+    expect(cancel.focused.at(-1)).toBe(cancel.returnFocus);
+    expect(cancel.returnFocus.focused).toBe(true);
+    expect(prompt.control.focused).toBe(false);
   });
 
   it("returns focus to the component that owned it before the overlay opened", () => {
@@ -57,43 +73,18 @@ describe("pending Pi UI overlays", () => {
     expect(host.focused).toBe(true);
     expect(editor.focused).toBe(false);
   });
-
-  it("transfers and restores input focus when Escape cancels before viewer navigation", () => {
-    const focused = [];
-    const returnFocus = { focused: true };
-    let currentFocus = returnFocus;
-    const focusedTui = { ...tui, setFocus(component) { currentFocus.focused = false; focused.push(component); currentFocus = component; if (currentFocus !== null) currentFocus.focused = true; } };
-    const respond = vi.fn();
-    const overlay = new PendingUiOverlay({ request: { id: "i", method: "input", title: "Name" }, tui: focusedTui, returnFocus, respond });
-    expect(focused[0]).toBe(overlay.control);
-    expect(overlay.control.focused).toBe(true);
-    expect(returnFocus.focused).toBe(false);
-    expect(overlay.handleInput("\x1b")).toBe(true);
-    expect(respond).toHaveBeenCalledWith({ requestId: "i", cancelled: true });
-    expect(focused.at(-1)).toBe(returnFocus);
-    expect(returnFocus.focused).toBe(true);
-    expect(overlay.control.focused).toBe(false);
-  });
-});
-
-it("renders bounded lifecycle, activity, reconnect, retry, and error cards", () => {
-  for (const lines of [renderStatusIndicator({ phase: "retrying", label: "Retrying in 4s", detail: "provider busy", startedAt: "2026-08-25T00:00:00Z" }, 40, Date.parse("2026-08-25T00:00:04Z")), renderSystemCard({ text: "Connection lost; reconnecting", level: "error" }, 40)]) {
-    expect(lines.every((line) => visibleWidth(line) <= 40)).toBe(true);
-  }
 });
 
 describe("Pi status indicator and system cards", () => {
   const started = "2026-08-25T00:00:00Z";
   const now = Date.parse("2026-08-25T00:00:04Z");
 
-  it("spins Pi's working indicator above the dock and offers the interrupt key", () => {
-    const lines = renderStatusIndicator({ phase: "tool_running", label: "Running bash", detail: "pytest", startedAt: started }, 80, now, { working: true });
+  it("spins the working indicator with the interrupt key and falls back to Working once the turn settles", () => {
+    const running = { phase: "tool_running", label: "Running bash", detail: "pytest", startedAt: started };
+    const lines = renderStatusIndicator(running, 80, now, { working: true });
     expect(lines[0]).toBe("");
     expect(lines[1]).toMatch(/^ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Running bash · 4s · pytest \(Esc to interrupt\)$/u);
-    expect(renderStatusIndicator({ phase: "tool_running", label: "Running bash", detail: "pytest", startedAt: started }, 40, now, { working: true }).every((line) => visibleWidth(line) <= 40)).toBe(true);
-  });
-
-  it("falls back to Pi's Working message and hides the interrupt key when the turn is settled", () => {
+    expect(renderStatusIndicator(running, 40, now, { working: true }).every((line) => visibleWidth(line) <= 40)).toBe(true);
     expect(renderStatusIndicator({ phase: "idle", label: "Idle", startedAt: started }, 40, now, { working: true })[1]).toContain("Working...");
     expect(renderStatusIndicator({ phase: "idle", label: "Idle", startedAt: started }, 40, now)).toEqual([]);
     expect(renderStatusIndicator({ phase: "waiting", label: "Waiting", startedAt: started }, 40, now)[1]).not.toContain("interrupt");

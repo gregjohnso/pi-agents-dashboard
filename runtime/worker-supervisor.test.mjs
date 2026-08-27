@@ -677,6 +677,10 @@ it("answers read-only worker requests and carries session command payloads over 
   const command = /** @type {import("../shared/contracts.mjs").ClientRequest} */ ({ version: 1, clientId: "client", requestId: "model", op: "session_command", payload: { sessionId: "one", command: "set_model", model: { provider: "anthropic", id: "claude" } } });
   await expect(launched.deliver(command, journal)).resolves.toMatchObject({ stage: "COMPLETED" });
   expect(delivered.at(-1)).toMatchObject({ op: "session_command", sessionCommand: { command: "set_model", model: { provider: "anthropic", id: "claude" } } });
+
+  const rename = /** @type {import("../shared/contracts.mjs").ClientRequest} */ ({ version: 1, clientId: "client", requestId: "rename", op: "session_command", payload: { sessionId: "one", command: "set_session_name", name: "Coverage loader" } });
+  await expect(launched.deliver(rename, journal)).resolves.toMatchObject({ stage: "COMPLETED" });
+  expect(delivered.at(-1)).toMatchObject({ sessionCommand: { command: "set_session_name", name: "Coverage loader" } });
   await journal.close();
   await supervisor.close();
 });

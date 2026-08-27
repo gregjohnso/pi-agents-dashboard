@@ -594,11 +594,12 @@ export class WorkerSupervisor {
         const id = `${runId}:${++sequence}`;
         try {
           const result = new Promise((resolveResult, rejectResult) => pending.set(id, { resolve: resolveResult, reject: rejectResult }));
-          const payload = /** @type {{ text?: string, uiRequestId?: string, response?: unknown, command?: string, model?: unknown, level?: string, instructions?: string }} */ (command.payload);
+          const payload = /** @type {{ text?: string, uiRequestId?: string, response?: unknown, command?: string, model?: unknown, level?: string, name?: string, instructions?: string }} */ (command.payload);
           const sessionCommand = command.op !== "session_command" ? undefined : {
             command: payload.command,
             ...(payload.model === undefined ? {} : { model: payload.model }),
             ...(payload.level === undefined ? {} : { level: payload.level }),
+            ...(payload.name === undefined ? {} : { name: payload.name }),
             ...(payload.instructions === undefined ? {} : { instructions: payload.instructions }),
           };
           await sendMessage(child, { version: 1, type: "command", token, id, command: { clientId: command.clientId, requestId: command.requestId, op: command.op, text: payload.text, response: command.op === "ui_response" ? { requestId: payload.uiRequestId, response: payload.response } : undefined, sessionCommand, retryAtRisk } });

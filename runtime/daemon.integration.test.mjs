@@ -261,6 +261,32 @@ it("rejects worker mutations during reconciliation without touching unopened sto
   worker.close();
 });
 
+it("forgets a dead session without touching its Pi session file, and never resurrects it on attach", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const now = "2026-08-25T12:00:00.000Z";
+  const sessionFile = join(stateRoot, "forgotten.jsonl");
+  await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "forgotten", timestamp: now, cwd: stateRoot })}\n`, { mode: 0o600 });
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "forgotten", sessionFile, canonicalSessionFile: sessionFile, cwd: stateRoot, taskState: "STOPPED", processState: "EXITED", outcome: "NONE", activity: { kind: "assistant_final", summary: "done", updatedAt: now }, createdAt: now, updatedAt: now });
+  const launch = vi.fn();
+  const runtime = await createDaemonRuntime({ root: stateRoot, hostProbe: async () => ({ blockers: [] }), workerSupervisor: { launch, async close() {} } });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
+  await client.ready;
+
+  client.send({ version: 1, clientId: "viewer", requestId: "attach-forget", op: "attach", payload: { sessionId: "forgotten", role: "composer" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+  expect(launch).not.toHaveBeenCalled();
+
+  client.send({ version: 1, clientId: "viewer", requestId: "forget", op: "delete", payload: { sessionId: "forgotten", revision: 0 } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  expect(await registry.get("forgotten")).toBeUndefined();
+  expect(await readFile(sessionFile, "utf8")).toContain("\"type\":\"session\"");
+  client.close();
+});
+
 it("marks a stopped session STOPPED rather than leaving it ready", async () => {
   const stateRoot = await root();
   for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
@@ -490,7 +516,7 @@ it("boots an exited session worker before granting its composer attachment", asy
   await runtime.ready;
   const client = connect({ socketPath: runtime.socketPath, token: runtime.token });
   await client.ready;
-  client.send({ version: 1, clientId: "client", requestId: "resume-attach", op: "attach", payload: { sessionId: "resume", role: "composer" } });
+  client.send({ version: 1, clientId: "client", requestId: "resume-attach", op: "attach", payload: { sessionId: "resume", role: "composer", activate: true } });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "attached", sessionId: "resume", role: "composer" } });
   expect(launch).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "resume", canonicalSessionFile: "/sessions/resume.jsonl", cwd: "/repo", runId: expect.any(String) }));
   client.close();

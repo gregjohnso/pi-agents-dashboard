@@ -206,7 +206,7 @@ it("refuses observer, live, and symlink-replaced Delete targets without invoking
   frontend.close();
 });
 
-it("refuses Delete without a public trash capability and preserves session and worktree paths", async () => {
+it("forgets a session without a trash capability and preserves session and worktree paths", async () => {
   const root = await fixtureRoot();
   const worktreePath = join(root, "managed-worktree");
   await mkdir(worktreePath, { mode: 0o700 });
@@ -222,10 +222,10 @@ it("refuses Delete without a public trash capability and preserves session and w
   await frontend.next();
 
   frontend.send(request("client", "delete-without-trash", "delete", { sessionId: session.sessionId, revision: 0 }));
-  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "FAILED", error: { code: "TRASH_CAPABILITY_UNAVAILABLE" } } } });
+  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "COMPLETED" } } });
   await expect(readFile(session.canonicalSessionFile, "utf8")).resolves.toBe("session\n");
   await expect(readFile(join(worktreePath, "sentinel"), "utf8")).resolves.toBe("keep\n");
-  expect(await registry.get(session.sessionId)).toBeDefined();
+  expect(await registry.get(session.sessionId)).toBeUndefined();
   frontend.close();
 });
 

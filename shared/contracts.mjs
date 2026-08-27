@@ -161,8 +161,10 @@ export function parseClientRequest(value) {
   }
   if (op === "launch") return { ...base, payload: readLaunchRequest(request.payload) };
   if (op === "attach") {
-    const payload = readRecord(request.payload, "attach payload"); rejectUnknownKeys(payload, ["sessionId", "role"], "attach payload");
-    return { ...base, payload: { sessionId: readIdentifier(payload, "sessionId", "attach payload.sessionId"), role: readEnum(payload, "role", ["composer", "observer"], "attach payload.role") } };
+    const payload = readRecord(request.payload, "attach payload"); rejectUnknownKeys(payload, ["sessionId", "role", "activate"], "attach payload");
+    if (Object.hasOwn(payload, "activate") && typeof payload.activate !== "boolean") throw new TypeError("attach payload.activate must be a boolean");
+    const parsed = { sessionId: readIdentifier(payload, "sessionId", "attach payload.sessionId"), role: readEnum(payload, "role", ["composer", "observer"], "attach payload.role") };
+    return { ...base, payload: payload.activate === true ? { ...parsed, activate: true } : parsed };
   }
   if (["detach", "interrupt"].includes(op)) return { ...base, payload: readSessionPayload(request.payload, op) };
   if (["stop", "delete"].includes(op)) return { ...base, payload: readDestructivePayload(request.payload, op) };

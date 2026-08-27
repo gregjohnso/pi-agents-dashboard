@@ -757,7 +757,7 @@ export async function createDaemonRuntime({
       async arbitrateAttachment(request, socket, authenticatedClientId) {
         if (request.clientId !== authenticatedClientId) throw Object.assign(new Error("Attachment client identity changed"), { code: "CLIENT_IDENTITY_CONFLICT" });
         const sessionId = request.payload.sessionId;
-        if (request.op === "attach" && request.payload.role === "composer") await context.ensureSessionWorker(sessionId);
+        if (request.op === "attach" && request.payload.role === "composer" && request.payload.activate === true) await context.ensureSessionWorker(sessionId);
         let touched = attachmentSessions.get(socket);
         if (touched === undefined) {
           touched = new Set();
@@ -1216,7 +1216,13 @@ export async function createDaemonRuntime({
               if (lockedMetadata !== undefined || lockedRoute !== undefined || launchingSessions.has(record.sessionId)) return refuse("OWNERSHIP_CONFLICT", "A worker lease, route, or launch is still authoritative");
               const claims = attachmentClaims.get(record.sessionId);
               if (claims !== undefined && [...claims.keys()].some((candidate) => candidate !== socket)) return refuse("SESSION_ATTACHED", "Delete refuses another attached frontend");
-              if (trashSessionFile === undefined) return refuse("TRASH_CAPABILITY_UNAVAILABLE", "Pi exposes no approved public session-trash seam");
+              if (trashSessionFile === undefined) {
+                // Without an approved trash seam, Delete forgets the dashboard record and leaves Pi's session file and worktree untouched.
+                await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
+                await registry.remove(record.sessionId, record.revision);
+                await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
+                return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
+              }
               let original;
               try {
                 original = recovery?.identity ?? await inspectSessionFile(record.canonicalSessionFile);

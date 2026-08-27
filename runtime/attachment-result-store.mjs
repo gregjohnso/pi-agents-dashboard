@@ -32,7 +32,10 @@ function exactKeys(value, allowed) {
 /** @param {any} request */
 function validRequest(request) {
   if (!exactKeys(request, ["version", "clientId", "requestId", "op", "payload"]) || request.version !== 1 || typeof request.clientId !== "string" || request.clientId.length === 0 || typeof request.requestId !== "string" || request.requestId.length === 0) return false;
-  if (request.op === "attach") return exactKeys(request.payload, ["sessionId", "role"]) && typeof request.payload.sessionId === "string" && request.payload.sessionId.length > 0 && ["composer", "observer"].includes(request.payload.role);
+  if (request.op === "attach") {
+    const allowed = Object.hasOwn(request.payload ?? {}, "activate") ? ["sessionId", "role", "activate"] : ["sessionId", "role"];
+    return exactKeys(request.payload, allowed) && typeof request.payload.sessionId === "string" && request.payload.sessionId.length > 0 && ["composer", "observer"].includes(request.payload.role) && (allowed.length === 2 || request.payload.activate === true);
+  }
   return request.op === "detach" && exactKeys(request.payload, ["sessionId"]) && typeof request.payload.sessionId === "string" && request.payload.sessionId.length > 0;
 }
 

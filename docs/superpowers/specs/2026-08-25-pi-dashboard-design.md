@@ -163,7 +163,7 @@ The dashboard owns only the Jobwatch list, standalone viewer controller, normali
 
 Ctrl+X on a live session opens Stop confirmation. Confirmation is bound to session ID, revision, process state, ownership, and action. Stop requests graceful shutdown, waits 5,000 ms, requests termination, waits 5,000 ms, then requests kill if the exact process group remains. A request completes only after terminal process state is observed.
 
-Ctrl+X on an inactive, unowned session opens Delete confirmation. Delete requires the confirmed revision and uses Pi's public trash behavior when available. Without that capability it returns `TRASH_CAPABILITY_UNAVAILABLE`. Delete never unlinks a session file directly and never removes a worktree.
+Ctrl+X on an inactive, unowned session opens Delete confirmation. Delete requires the confirmed revision and uses Pi's public trash behavior when available. Without that capability Delete forgets the dashboard record instead: the row disappears while Pi's session file stays resumable. Delete never unlinks a session file directly and never removes a worktree.
 
 Worktree cleanup is a separate full-ID confirmed action. It refuses live ownership, dirty changes, unpushed commits, replaced paths, or failed identity checks.
 

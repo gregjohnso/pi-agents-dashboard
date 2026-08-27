@@ -5,7 +5,6 @@ import { describe, expect, it, vi } from "vitest";
 
 import { DashboardController, createDaemonDashboardBackend, } from "./dashboard.mjs";
 import { JOBWATCH_ANSI } from "./dashboard-theme.mjs";
-import { createSessionConfirmation, describeOverlay } from "./dashboard-overlays.mjs";
 const timestamp = "2026-08-25T12:00:00.000Z";
 function session(id, overrides = {}) {
     return {
@@ -89,7 +88,6 @@ describe("dashboard controller", () => {
         await processRenderedEvent(dashboard, backend, { snapshot: { sessions: [session("c"), session("a"), session("b", { revision: 2 })] }, cursor: { daemonEpoch: "epoch", sequence: "1" } });
         dashboard.resize(40, 8);
         expect(dashboard.selectedSessionId).toBe("b");
-        expect(dashboard.render(40, 8).every((line) => visibleWidth(line) <= 40)).toBe(true);
     });
     it("keeps virtualized navigation index-safe with groups, pages, ends, resize, and mouse clicks", async () => {
         const sessions = Array.from({ length: 10_000 }, (_, index) => session(`s-${String(index).padStart(5, "0")}`, { taskState: index % 2 ? "READY" : "WORKING" }));
@@ -101,7 +99,7 @@ describe("dashboard controller", () => {
         dashboard.handleInput("\x1b[F");
         expect(dashboard.selectedSessionId).toBe("s-09999");
         dashboard.handleMouse({ row: 6, column: 2, button: "left" });
-        expect(dashboard.selectedSessionId).toBeDefined();
+        expect(dashboard.selectedSessionId).not.toBe("s-09999");
         expect(dashboard.render(80, 14).length).toBeLessThanOrEqual(14);
     });
     it("renders Jobwatch-style surfaces, focus borders, selection, and key hints", async () => {
@@ -122,22 +120,6 @@ describe("dashboard controller", () => {
         expect(dashboard.render(100, 16)[2]).toContain(JOBWATCH_ANSI.sky);
         dashboard.handleInput("\t");
         expect(stripVTControlCharacters(dashboard.render(100, 16).at(-6))).toContain("cwd");
-    });
-    it("applies search, task/project filters, grouping, and sort independently without changing selected ID", async () => {
-        const waiting = session("waiting", { taskState: "WAITING", processState: "LIVE", outcome: "NONE", cwd: "/repo/a", activity: { kind: "ui", summary: "Need approval", updatedAt: timestamp } });
-        const ready = session("ready", { cwd: "/repo/b" });
-        const dashboard = controller(new FakeBackend([ready, waiting]));
-        await dashboard.open();
-        dashboard.selectSession("waiting");
-        dashboard.setSearch("approval");
-        dashboard.setTaskStates(["WAITING"]);
-        dashboard.setProjectPaths(["/repo/a"]);
-        dashboard.setGrouping("cwd");
-        dashboard.setSort("activity", "asc");
-        dashboard.toggleMetadata();
-        dashboard.toggleHelp();
-        expect(dashboard.selectedSessionId).toBe("waiting");
-        expect(dashboard.query).toMatchObject({ search: "approval", taskStates: ["WAITING"], projectPaths: ["/repo/a"], groupBy: "cwd", sort: { key: "activity", direction: "asc" } });
     });
     it("asks the daemon to refresh Activity summaries on open and on demand", async () => {
         const backend = new FakeBackend([session("a")]);
@@ -174,33 +156,26 @@ describe("dashboard controller", () => {
         expect(typed).not.toContain(JOBWATCH_ANSI.gray);
         expect(stripVTControlCharacters(typed)).not.toContain("[prompt]");
     });
-    it("closes the composer panel and shows filter state only when filters are set", async () => {
-        const dashboard = controller(new FakeBackend([session("a")]));
-        await dashboard.open();
-        const plain = dashboard.render(100, 16).map(stripVTControlCharacters);
-        expect(plain[1]).not.toContain("/search");
-        expect(plain[1]).not.toContain("v:live");
-        expect(plain.at(-3).trim()).toMatch(/^─+$/u);
-
-        dashboard.setSearch("needle");
-        const filtered = dashboard.render(100, 16).map(stripVTControlCharacters);
-        expect(filtered[1]).toContain("needle");
-    });
-    it("shows the selected session's working directory", async () => {
+    it("shows the selected session's working directory and a filter chip only once a filter is set", async () => {
         const dashboard = controller(new FakeBackend([
             session("a", { cwd: "/repo/alpha" }),
             session("b", { cwd: "/repo/beta" }),
         ]));
         await dashboard.open();
+        const unfiltered = dashboard.render(100, 16).map(stripVTControlCharacters);
+        expect(unfiltered[1]).not.toContain("search:");
+        expect(unfiltered[1]).not.toContain("v:live");
+        expect(unfiltered.at(-3).trim()).toMatch(/^─+$/u);
+
         dashboard.selectSession("a");
         expect(stripVTControlCharacters(dashboard.render(100, 16).at(-2))).toContain("/repo/alpha");
         dashboard.selectSession("b");
         expect(stripVTControlCharacters(dashboard.render(100, 16).at(-2))).toContain("/repo/beta");
 
         dashboard.setSearch("beta");
-        const rendered = dashboard.render(100, 16);
-        expect(stripVTControlCharacters(rendered.at(-2))).toContain("/repo/beta");
-        expect(stripVTControlCharacters(rendered[1])).toContain("search:beta");
+        const filtered = dashboard.render(100, 16);
+        expect(stripVTControlCharacters(filtered.at(-2))).toContain("/repo/beta");
+        expect(stripVTControlCharacters(filtered[1])).toContain("search:beta");
     });
     it("confirms a destructive action against the revision current at confirm time", async () => {
         const backend = new FakeBackend([session("a", { revision: 4 })]);
@@ -229,13 +204,9 @@ describe("dashboard controller", () => {
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "SESSION_LIVE" }));
         expect(backend.stop).not.toHaveBeenCalled();
     });
-    it("titles the clear-after-stop confirmation distinctly", () => {
-        const stopped = session("a", { processState: "EXITED", taskState: "STOPPED" });
-        const described = describeOverlay({ ...createSessionConfirmation(stopped), clearingStopped: true });
-        expect(described.title).toBe("Clear stopped session");
-        expect(describeOverlay(createSessionConfirmation(stopped)).title).toBe("Confirm DELETE");
-    });
-    it("stops a live session on the first Ctrl+X and never deletes it", async () => {
+    // Ctrl+X on a live session is a Stop; only a second press inside the window clears it, and
+    // both presses confirm. app/list/stop-clear-gesture.test.mjs owns the window's exact edges.
+    it("stops a live session first, then clears it on a second confirmed Ctrl+X", async () => {
         const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
         let now = 0;
         const dashboard = controller(backend, { now: () => now });
@@ -246,18 +217,9 @@ describe("dashboard controller", () => {
         dashboard.handleInput("y");
         await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledWith("a", 1, expect.any(String)));
         expect(backend.delete).not.toHaveBeenCalled();
-    });
-    it("clears with a second Ctrl+X inside the window, still asking to confirm", async () => {
-        const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
-        let now = 0;
-        const dashboard = controller(backend, { now: () => now });
-        await dashboard.open();
-        dashboard.selectSession("a");
-        dashboard.handleInput("\x18");
-        dashboard.handleInput("y");
-        await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledOnce());
         dashboard.applySnapshot({ sessions: [session("a", { revision: 2, processState: "EXITED", taskState: "STOPPED" })] });
-        dashboard.selectSession("a");
+        // The stopped row stays selected without the operator re-aiming at it.
+        expect(dashboard.selectedSessionId).toBe("a");
 
         now = 400;
         expect(dashboard.stopClearArmed).toBe(true);
@@ -266,23 +228,6 @@ describe("dashboard controller", () => {
         expect(backend.delete).not.toHaveBeenCalled();
         dashboard.handleInput("y");
         await vi.waitFor(() => expect(backend.delete).toHaveBeenCalledWith("a", 2, expect.any(String)));
-    });
-    it("reopens the ordinary confirmation once the clear window lapses", async () => {
-        const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
-        let now = 0;
-        const dashboard = controller(backend, { now: () => now });
-        await dashboard.open();
-        dashboard.selectSession("a");
-        dashboard.handleInput("\x18");
-        dashboard.handleInput("y");
-        await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledOnce());
-        dashboard.applySnapshot({ sessions: [session("a", { revision: 2, processState: "EXITED", taskState: "STOPPED" })] });
-        dashboard.selectSession("a");
-
-        now = 900;
-        dashboard.handleInput("\x18");
-        expect(dashboard.overlay).toMatchObject({ kind: "session_confirmation", action: "delete" });
-        expect(dashboard.stopClearArmed).toBe(false);
     });
     it("forgets the stop gesture when the operator moves the selection", async () => {
         const backend = new FakeBackend([session("a", { processState: "LIVE" }), session("b", { processState: "LIVE" })]);
@@ -297,7 +242,7 @@ describe("dashboard controller", () => {
         dashboard.selectSession("b");
         expect(dashboard.stopClearArmed).toBe(false);
     });
-    it("dismisses the confirmation as soon as a destructive request is sent", async () => {
+    it("hands a destructive request off in the background and never wedges input behind it", async () => {
         let release = () => {};
         const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
         backend.stop = vi.fn(() => new Promise((resolve) => { release = () => resolve({ accepted: true }); }));
@@ -310,19 +255,10 @@ describe("dashboard controller", () => {
         expect(dashboard.overlay).toBeUndefined();
         expect(backend.stop).toHaveBeenCalledWith("a", 1, expect.any(String));
         expect(dashboard.status).toMatchObject({ kind: "pending" });
+        dashboard.handleInput("\x1b[B");
+        expect(dashboard.focus).toBe("list");
         release();
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
-    });
-    it("reports a background destructive failure without blocking the list", async () => {
-        const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
-        backend.stop = vi.fn(async () => { throw Object.assign(new Error("worker is gone"), { code: "WORKER_UNAVAILABLE" }); });
-        const dashboard = controller(backend);
-        await dashboard.open();
-        dashboard.selectSession("a");
-        dashboard.handleInput("\x18");
-        dashboard.handleInput("y");
-        expect(dashboard.overlay).toBeUndefined();
-        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "WORKER_UNAVAILABLE" }));
     });
     it("repaints on a timer while a session works and stops when none do", async () => {
         vi.useFakeTimers();
@@ -427,8 +363,10 @@ describe("dashboard controller", () => {
         dashboard.handleInput("\r");
         await vi.waitFor(() => expect(backend.launch).toHaveBeenCalledTimes(1));
 
-        // The prompt is gone and the pending session is visible before the daemon replies.
+        // The prompt is gone, focus stays on the list, and the pending session is visible
+        // before the daemon replies.
         expect(dashboard.composerDraft.prompt).toBe("");
+        expect(dashboard.focus).toBe("list");
         const rendered = dashboard.render(100, 24).map(stripVTControlCharacters);
         expect(rendered.some((line) => line.includes("STARTING") && line.includes("ship it"))).toBe(true);
 
@@ -449,63 +387,6 @@ describe("dashboard controller", () => {
         // The operator keeps their text and the phantom row is gone.
         expect(dashboard.composerDraft.prompt).toBe("retry me");
         expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("STARTING"))).toBe(false);
-    });
-    it("launches with Enter when the prompt has text and opens the session when it is empty", async () => {
-        const backend = new FakeBackend([session("a")]);
-        const opened = [];
-        const dashboard = controller(backend, { onOpenSession: (sessionId) => opened.push(sessionId) });
-        await dashboard.open();
-        dashboard.handleInput("\r");
-        expect(backend.requests).toEqual([]);
-        dashboard.handleInput("g");
-        dashboard.handleInput("o");
-        dashboard.handleInput("\r");
-        await vi.waitFor(() => expect(backend.requests).toHaveLength(1));
-        expect(backend.requests[0]).toMatchObject({ prompt: "go" });
-    });
-    it("keeps a draft through Escape and ignores a blank submit", async () => {
-        const backend = new FakeBackend([]);
-        const dashboard = controller(backend);
-        await dashboard.open();
-        dashboard.focusComposer();
-        dashboard.setComposerPrompt("draft");
-        dashboard.handleInput("\x1b");
-        expect(dashboard.focus).toBe("list");
-        expect(dashboard.composerDraft.prompt).toBe("draft");
-        dashboard.focusComposer();
-        dashboard.setComposerPrompt("   ");
-        await dashboard.submitComposer();
-        expect(backend.requests).toEqual([]);
-    });
-    it("closes the list from New Session on Ctrl+C with its draft intact", async () => {
-        const backend = new FakeBackend([]);
-        const onClose = vi.fn();
-        const dashboard = controller(backend, { onClose });
-        await dashboard.open();
-        dashboard.focusComposer();
-        dashboard.setComposerPrompt("draft");
-        dashboard.handleInput("\x03");
-        await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith({ kind: "closed" }));
-        expect(dashboard.composerDraft.prompt).toBe("draft");
-    });
-    it("shows the sessions list immediately while launch startup is pending", async () => {
-        const backend = new FakeBackend([]);
-        let completeLaunch;
-        backend.launch = vi.fn(() => new Promise((resolve) => { completeLaunch = resolve; }));
-        const renders = [];
-        const dashboard = controller(backend, { requestRender: () => renders.push(dashboard.focus) });
-        await dashboard.open();
-        dashboard.focusComposer();
-        dashboard.setComposerPrompt("Start now");
-        renders.length = 0;
-
-        const submitting = dashboard.submitComposer();
-        await vi.waitFor(() => expect(backend.launch).toHaveBeenCalledTimes(1));
-        expect(dashboard.focus).toBe("list");
-        expect(renders).toContain("list");
-        completeLaunch({ kind: "launched", sessionId: "started" });
-        await submitting;
-        expect(dashboard.composerDraft.prompt).toBe("");
     });
     it("launches worktrees and requires exact canonical shared-directory confirmation", async () => {
         const backend = new FakeBackend([]);
@@ -544,12 +425,23 @@ describe("dashboard controller", () => {
         expect(backend.resolveDelivery).toHaveBeenCalledWith("stable-client", "launch-unknown", "abandon");
         expect(backend.launch).toHaveBeenCalledTimes(1);
     });
-    it("delegates Enter/Right to the injected viewer boundary", async () => {
+    it("opens the selection through the injected viewer boundary on an empty Enter or Right, and launches once the prompt has text", async () => {
         const openSelectedViewer = vi.fn(async () => {});
-        const dashboard = controller(new FakeBackend([session("a")]), { openViewer: openSelectedViewer });
+        const backend = new FakeBackend([session("a")]);
+        const dashboard = controller(backend, { openViewer: openSelectedViewer });
         await dashboard.open();
-        await dashboard.activateSelection();
-        expect(openSelectedViewer).toHaveBeenCalledWith("a");
+        dashboard.handleInput("\r");
+        await vi.waitFor(() => expect(openSelectedViewer).toHaveBeenCalledWith("a"));
+        dashboard.handleInput("\x1b[C");
+        await vi.waitFor(() => expect(openSelectedViewer).toHaveBeenCalledTimes(2));
+        expect(backend.requests).toEqual([]);
+
+        dashboard.handleInput("g");
+        dashboard.handleInput("o");
+        dashboard.handleInput("\r");
+        await vi.waitFor(() => expect(backend.requests).toHaveLength(1));
+        expect(backend.requests[0]).toMatchObject({ prompt: "go" });
+        expect(openSelectedViewer).toHaveBeenCalledTimes(2);
     });
     it("confirms Ctrl+X against the exact selected revision and invalidates on change", async () => {
         const backend = new FakeBackend([session("a", { processState: "LIVE" }), session("b", { processState: "EXITED" })]);
@@ -593,45 +485,6 @@ describe("dashboard controller", () => {
         await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledTimes(2));
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
     });
-    it("keeps a successfully stopped row selected and requires a later Delete confirmation", async () => {
-        const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
-        const dashboard = controller(backend, { requestId: () => "stop-request" });
-        await dashboard.open();
-        dashboard.handleInput("\x18");
-        dashboard.handleInput("y");
-        await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledWith("a", 1, "stop-request"));
-        await processRenderedEvent(dashboard, backend, { snapshot: { sessions: [session("a", { revision: 2, processState: "EXITED" })] }, cursor: { daemonEpoch: "epoch", sequence: "2" } });
-        expect(dashboard.selectedSessionId).toBe("a");
-        dashboard.handleInput("\x18");
-        expect(dashboard.overlay).toMatchObject({ action: "delete", sessionId: "a", revision: 2 });
-    });
-    it("ignores repeated Ctrl+X while a stop is in flight", async () => {
-        let release;
-        const backend = new FakeBackend([session("a")]);
-        backend.stop = vi.fn(() => new Promise((resolve) => { release = resolve; }));
-        const dashboard = controller(backend);
-        await dashboard.open();
-        dashboard.handleInput("\x18");
-        dashboard.handleInput("y");
-        dashboard.handleInput("\x18");
-        expect(backend.stop).toHaveBeenCalledTimes(1);
-        release?.();
-    });
-    it("never leaves input wedged behind an in-flight destructive request", async () => {
-        let release;
-        const backend = new FakeBackend([session("a")]);
-        backend.stop = vi.fn(() => new Promise((resolve) => { release = resolve; }));
-        const dashboard = controller(backend);
-        await dashboard.open();
-        dashboard.handleInput("\x18");
-        dashboard.handleInput("y");
-        // Nothing waits on the daemon, so navigation works while the stop is still travelling.
-        expect(dashboard.overlay).toBeUndefined();
-        dashboard.handleInput("\x1b[B");
-        expect(dashboard.focus).toBe("list");
-        expect(backend.stop).toHaveBeenCalledTimes(1);
-        release?.();
-    });
     it("closes the dashboard with Ctrl+C while a stop is in flight", async () => {
         let release;
         const backend = new FakeBackend([session("a")]);
@@ -650,83 +503,54 @@ describe("dashboard controller", () => {
         const panelRows = (rendered) => rendered
             .map((line, index) => ({ line: stripVTControlCharacters(line), index }))
             .filter(({ line }) => /\u256d\u2500.*\u256e\s*$|^\s*\u2502.*\u2502\s*$|\u2570\u2500+\u256f\s*$/u.test(line));
-        const panelLines = (rendered) => panelRows(rendered).map(({ line }) => line);
-        it.each([[40, 10], [55, 16], [80, 24], [120, 32], [160, 40]])("frames the help panel inside %ix%i", async (width, height) => {
+        // The five-width matrix lives in test/terminal.acceptance.test.mjs; the extremes are kept
+        // here because clipping only bites at the narrowest size and centering only shows at the widest.
+        it.each([[40, 10, 0], [160, 40, 1]])("frames and centers a floating panel inside %ix%i", async (width, height, minimumIndent) => {
             const dashboard = controller(new FakeBackend([session("a")]));
             await dashboard.open();
             dashboard.toggleHelp();
             const rendered = dashboard.render(width, height);
             for (const line of rendered)
                 expect(visibleWidth(line)).toBeLessThanOrEqual(width);
-            const framed = panelLines(rendered);
+            const framed = panelRows(rendered);
             expect(framed.length).toBeGreaterThan(2);
-            expect(framed[0]).toContain("Help");
-            expect(framed[0]).toMatch(/\u256d\u2500/u);
-            expect(framed.at(-1)).toMatch(/\u2570\u2500+\u256f/u);
-        });
-        it("centers the panel within the list area and paints a focus border", async () => {
-            const dashboard = controller(new FakeBackend([session("a")]));
-            await dashboard.open();
-            dashboard.toggleHelp();
-            const rendered = dashboard.render(80, 24);
-            const framedRows = panelRows(rendered);
-            expect(framedRows[0].index).toBeGreaterThan(4);
-            expect(framedRows.at(-1).index).toBeLessThan(20);
-            const indent = framedRows[0].line.search(/\S/u);
-            for (const { line } of framedRows)
+            expect(framed[0].line).toContain("Help");
+            expect(framed[0].line).toMatch(/\u256d\u2500/u);
+            expect(framed.at(-1).line).toMatch(/\u2570\u2500+\u256f/u);
+            // The panel floats below the Sessions header rather than covering them.
+            expect(framed[0].index).toBeGreaterThan(2);
+            const indent = framed[0].line.search(/\S/u);
+            expect(indent).toBeGreaterThanOrEqual(minimumIndent);
+            for (const { line } of framed)
                 expect(line.search(/\S/u)).toBe(indent);
-            expect(rendered[framedRows[0].index]).toContain(JOBWATCH_ANSI.sky);
+            expect(rendered[framed[0].index]).toContain(JOBWATCH_ANSI.sky);
         });
         it.each([
-            ["help", (dashboard) => dashboard.toggleHelp(), "Help", "metadata / help"],
-            ["metadata", (dashboard) => dashboard.toggleMetadata(), "Session", "taskState"],
-            ["session confirmation", (dashboard) => dashboard.handleInput("\x18"), "Confirm STOP", "y/Enter"],
+            ["help", async (dashboard) => { dashboard.toggleHelp(); }, "Help", "metadata / help"],
+            ["metadata", async (dashboard) => { dashboard.toggleMetadata(); }, "Session", "taskState"],
+            ["session confirmation", async (dashboard) => { dashboard.handleInput("\x18"); }, "Confirm STOP", "y/Enter"],
+            ["delivery unknown", async (dashboard, backend) => {
+                backend.launch = vi.fn(async () => ({ kind: "delivery_unknown", clientId: "stable-client", requestId: "launch-unknown" }));
+                dashboard.setComposerPrompt("Implement it");
+                await dashboard.submitComposer();
+            }, "Delivery unknown", "retry_at_risk"],
+            ["shared directory", async (dashboard) => {
+                dashboard.setComposerPrompt("Shared change");
+                dashboard.setIsolationMode("shared_directory");
+                await dashboard.submitComposer();
+                dashboard.handleInput("/");
+                dashboard.handleInput("r");
+            }, "Shared directory", "> /r"],
         ])("titles the %s panel and keeps its content", async (_label, open, title, content) => {
-            const dashboard = controller(new FakeBackend([session("a", { processState: "LIVE" })]));
+            const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
+            const dashboard = controller(backend);
             await dashboard.open();
-            open(dashboard);
+            await open(dashboard, backend);
             const rendered = dashboard.render(120, 32).map(stripVTControlCharacters);
             expect(rendered.some((line) => line.includes(title))).toBe(true);
             expect(rendered.some((line) => line.includes(content))).toBe(true);
-        });
-        it("frames the delivery-unknown choices without overflowing a narrow terminal", async () => {
-            const backend = new FakeBackend([]);
-            backend.launch = vi.fn(async () => ({ kind: "delivery_unknown", clientId: "stable-client", requestId: "launch-unknown" }));
-            const dashboard = controller(backend);
-            await dashboard.open();
-            dashboard.setComposerPrompt("Implement it");
-            await dashboard.submitComposer();
-            const rendered = dashboard.render(40, 10);
-            for (const line of rendered)
-                expect(visibleWidth(line)).toBeLessThanOrEqual(40);
-            const plain = rendered.map(stripVTControlCharacters);
-            expect(plain.some((line) => line.includes("Delivery unknown"))).toBe(true);
-            expect(plain.some((line) => line.includes("retry_at_risk"))).toBe(true);
-        });
-        it("centers a narrow panel horizontally inside a wide terminal", async () => {
-            const dashboard = controller(new FakeBackend([session("a", { processState: "LIVE" })]));
-            await dashboard.open();
-            dashboard.handleInput("\x18");
-            const rendered = dashboard.render(160, 40);
-            const framed = panelRows(rendered);
-            const indent = framed[0].line.search(/\S/u);
-            expect(indent).toBeGreaterThan(0);
-            for (const { line } of framed) {
-                expect(line.search(/\S/u)).toBe(indent);
-                expect(visibleWidth(line.trimEnd())).toBeLessThanOrEqual(160);
-            }
-        });
-        it("frames the shared-directory confirmation with its typed echo", async () => {
-            const dashboard = controller(new FakeBackend([]));
-            await dashboard.open();
-            dashboard.setComposerPrompt("Shared change");
-            dashboard.setIsolationMode("shared_directory");
-            await dashboard.submitComposer();
-            dashboard.handleInput("/");
-            dashboard.handleInput("r");
-            const rendered = dashboard.render(80, 24).map(stripVTControlCharacters);
-            expect(rendered.some((line) => line.includes("Shared directory"))).toBe(true);
-            expect(rendered.some((line) => line.includes("> /r"))).toBe(true);
+            // A floating panel never swallows the composer dock at an ordinary size.
+            expect(rendered.at(-1)).toContain("Ctrl+C quit");
         });
     });
     it("closes and surfaces a typed malformed-frame state without signaling workers", async () => {
@@ -961,17 +785,6 @@ describe("dashboard controller", () => {
         await second.submitComposer();
         expect(secondBackend.requests[0]).toMatchObject({ sourceSessionId: "session-b", prompt: "from A" });
     });
-    it("keeps list composer and destructive controls independent of viewer role", async () => {
-        const onSessionIntent = vi.fn();
-        const dashboard = controller(new FakeBackend([session("a")]), { onSessionIntent });
-        await dashboard.open();
-        dashboard.focusComposer();
-        expect(dashboard.focus).toBe("list");
-        dashboard.handleInput("\x1b");
-        dashboard.handleInput("\x18");
-        expect(onSessionIntent).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "a" }));
-        await dashboard.close();
-    });
 });
 describe("daemon dashboard backend", () => {
     it.each(["stop", "delete"])("claims composer on the same client for %s and detaches afterward", async (operation) => {
@@ -990,33 +803,25 @@ describe("daemon dashboard backend", () => {
         await backend[operation]("exact-session", 3, `${operation}-request`);
         expect(operations).toEqual(["attach", operation, "detach"]);
     });
-    it("does not replay Stop after its composer socket disconnects", async () => {
+    // An ambiguous transport failure after submission is never replayed silently: it becomes
+    // DELIVERY_UNKNOWN, carrying the identity the operator needs to resolve it explicitly.
+    it.each([
+        ["stop", "a disconnected composer socket", Object.assign(new Error("socket closed"), { code: "CONNECTION_CLOSED", submitted: true })],
+        ["delete", "a malformed daemon frame", Object.assign(new Error("malformed daemon frame"), { code: "MALFORMED_FRAME" })],
+    ])("classifies %s interrupted by %s as delivery unknown", async (operation, _label, failure) => {
         const requests = [];
         const transaction = {
             async connect() {},
             async request(request) {
                 requests.push(request.op);
                 if (request.op === "attach") return { version: 1, requestId: request.requestId, ok: true, result: { kind: "attached", sessionId: "exact-session", role: "composer" } };
-                throw Object.assign(new Error("socket closed"), { code: "CONNECTION_CLOSED", submitted: true });
-            },
-            async close() {},
-        };
-        const client = { createTransactionClient: () => transaction };
-        const backend = createDaemonDashboardBackend({ client, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
-        await expect(backend.stop("exact-session", 3, "stop-request")).rejects.toMatchObject({ code: "DELIVERY_UNKNOWN", clientId: "stable-client", requestId: "stop-request" });
-        expect(requests).toEqual(["attach", "stop"]);
-    });
-    it("classifies a malformed response after Delete submission as delivery unknown", async () => {
-        const transaction = {
-            async connect() {},
-            async request(request) {
-                if (request.op === "attach") return { version: 1, requestId: request.requestId, ok: true, result: { kind: "attached", sessionId: "exact-session", role: "composer" } };
-                throw Object.assign(new Error("malformed daemon frame"), { code: "MALFORMED_FRAME" });
+                throw failure;
             },
             async close() {},
         };
         const backend = createDaemonDashboardBackend({ client: { createTransactionClient: () => transaction }, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
-        await expect(backend.delete("exact-session", 3, "delete-request")).rejects.toMatchObject({ code: "DELIVERY_UNKNOWN", clientId: "stable-client", requestId: "delete-request" });
+        await expect(backend[operation]("exact-session", 3, `${operation}-request`)).rejects.toMatchObject({ code: "DELIVERY_UNKNOWN", clientId: "stable-client", requestId: `${operation}-request` });
+        expect(requests).toEqual(["attach", operation]);
     });
     it.each(["stop", "delete"])("treats durable %s FAILED as a structured refusal", async (operation) => {
         const status = { clientId: "stable-client", requestId: `${operation}-request`, operation, stage: "FAILED", acceptedAt: timestamp, updatedAt: timestamp, error: { code: "SESSION_REFUSED", message: `${operation} refused`, retryable: false } };

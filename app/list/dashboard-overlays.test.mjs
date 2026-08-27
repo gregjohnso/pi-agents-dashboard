@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createDeliveryUnknownOverlay, createHelpOverlay, createMetadataOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, } from "./dashboard-overlays.mjs";
+import { createDeliveryUnknownOverlay, createHelpOverlay, createMetadataOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, describeOverlay, } from "./dashboard-overlays.mjs";
 const session = {
     schemaVersion: 1,
     revision: 2,
@@ -56,7 +56,11 @@ describe("dashboard overlays", () => {
         };
         expect(createSessionConfirmation(staleOwned).action).toBe("stop");
         expect(createSessionConfirmation({ ...staleOwned, ownership: undefined }).action).toBe("delete");
-        expect(createSessionConfirmation({ ...session, processState: "EXITED" }).action).toBe("delete");
+        const exited = createSessionConfirmation({ ...session, processState: "EXITED" });
+        expect(exited.action).toBe("delete");
+        // Clearing a session the operator just stopped reads differently from an unprompted Delete.
+        expect(describeOverlay({ ...exited, clearingStopped: true }).title).toBe("Clear stopped session");
+        expect(describeOverlay(exited).title).toBe("Confirm DELETE");
     });
     it("keeps the Task 13 intent seam aligned with the bound confirmation", () => {
         expect(createSessionIntent(session)).toEqual({ kind: "session_intent", action: "stop", sessionId: "session-1", revision: 2 });

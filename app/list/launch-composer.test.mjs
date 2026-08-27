@@ -18,22 +18,26 @@ const shared = {
     ownerSessionIds: ["other"],
 };
 describe("launch composer", () => {
-    it("defaults to a worktree and emits the exact LaunchRequest without piConfigRoot", () => {
-        const draft = createLaunchDraft(defaults);
-        const result = prepareLaunchRequest({ ...draft, prompt: "Implement it" }, worktree);
-        expect(result).toEqual({
-            kind: "ready",
-            request: {
-                prompt: "Implement it",
-                cwd: "/repo",
-                sourceSessionId: "source-session",
-                isolation: { mode: "worktree" },
-                model: defaults.model,
-                thinkingLevel: "high",
-                name: "dashboard task",
-            },
-        });
-        expect(result.kind === "ready" && Object.hasOwn(result.request, "piConfigRoot")).toBe(false);
+    it.each([
+        ["every default selected", defaults, {
+            prompt: "Implement it",
+            cwd: "/repo",
+            sourceSessionId: "source-session",
+            isolation: { mode: "worktree" },
+            model: defaults.model,
+            thinkingLevel: "high",
+            name: "dashboard task",
+        }],
+        ["model, thinking level, and name unselected", { cwd: "/repo" }, {
+            prompt: "Implement it",
+            cwd: "/repo",
+            sourceSessionId: "source-session",
+            isolation: { mode: "worktree" },
+        }],
+    ])("defaults to a worktree and emits the exact LaunchRequest with %s", (_label, draftDefaults, request) => {
+        const result = prepareLaunchRequest({ ...createLaunchDraft(draftDefaults), prompt: "Implement it" }, worktree);
+        expect(result).toEqual({ kind: "ready", request });
+        expect(Object.hasOwn(result.request, "piConfigRoot")).toBe(false);
     });
     it("does not launch blank input and preserves a draft when Ctrl+C returns list focus", () => {
         let state = reduceLaunchComposer({ focus: "composer", draft: createLaunchDraft(defaults) }, { type: "changed", prompt: "  " });
@@ -65,13 +69,6 @@ describe("launch composer", () => {
     ])("rejects an incomplete %s field", (_name, override) => {
         const draft = { ...createLaunchDraft(defaults), ...override, prompt: "Implement it" };
         expect(() => prepareLaunchRequest(draft, worktree)).toThrow();
-    });
-    it("omits model, thinking level, and display name until selected", () => {
-        const draft = { ...createLaunchDraft({ cwd: "/repo" }), prompt: "Implement it" };
-        expect(prepareLaunchRequest(draft, worktree)).toEqual({
-            kind: "ready",
-            request: { prompt: "Implement it", cwd: "/repo", sourceSessionId: "source-session", isolation: { mode: "worktree" } },
-        });
     });
     it("represents DELIVERY_UNKNOWN with retry-at-risk and abandon actions without automatic retry", () => {
         const state = reduceLaunchComposer({ focus: "composer", draft: { ...createLaunchDraft(defaults), prompt: "Implement it" } }, { type: "deliveryUnknown", clientId: "stable-client", requestId: "launch-1" });

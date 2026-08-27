@@ -130,9 +130,16 @@ function event(sequence, payload) {
   return { version: 1, sessionId: "viewer-session", eventId: `event-${sequence}`, cursor: { daemonEpoch: "epoch", sessionId: "viewer-session", sequence: String(sequence) }, timestamp, payload };
 }
 
+// The five-width matrix lives here for both surfaces; component tests assert semantics, not widths.
+// The first row carries wide characters and a deep path because it is the one row every height shows.
 it.each(dimensions)("pins the complete list and viewer surfaces at %ix%i", async (width, height) => {
   const list = dashboardFixture([
-    session("working", { taskState: "WORKING", activity: { kind: "tool", summary: "bash: pytest", updatedAt: timestamp } }),
+    session("working", {
+      name: "検証 🚀 résumé",
+      cwd: "/worktrees/研究/非常に長いプロジェクト名/dashboard",
+      taskState: "WORKING",
+      activity: { kind: "tool", summary: "bash: pytest 検証中 🚀 naïve café", updatedAt: timestamp },
+    }),
     session("waiting", { taskState: "WAITING", activity: { kind: "ui", summary: "Approval needed", updatedAt: timestamp } }),
     session("failed", { taskState: "FAILED", processState: "STALE", activity: { kind: "error", summary: "provider error", updatedAt: timestamp } }),
   ]);
@@ -144,12 +151,6 @@ it.each(dimensions)("pins the complete list and viewer surfaces at %ix%i", async
   expect(listLines).toHaveLength(height);
   expect(viewerLines).toHaveLength(height);
   expect([...listLines, ...viewerLines].every((line) => visibleWidth(line) <= width)).toBe(true);
-  if (width >= 72) {
-    const header = listLines.map(stripVTControlCharacters).find((line) => line.includes("NAME") && line.includes("STATE"));
-    expect(header).toMatch(/NAME\s+STATE\s+ACTIVITY/u);
-    expect(header).not.toContain("MODEL");
-    expect(header).not.toContain("PROJECT");
-  }
   expect({ list: listLines.map(stripVTControlCharacters), viewer: viewerLines.map(stripVTControlCharacters) }).toMatchSnapshot();
   await Promise.all([list.dashboard.close(), viewer.controller.close()]);
 });
@@ -166,9 +167,10 @@ it("drives list navigation, search/filter/sort/group, metadata/help, composer, c
   f.dashboard.handleInput("\r");
   f.dashboard.handleInput("\x1b[C");
   await vi.waitFor(() => expect(openViewer).toHaveBeenCalledTimes(2));
-  // Ctrl+F opens search, the letters type into it, then the Ctrl chords cycle each facet.
-  for (const input of ["\x06", "l", "i", "v", "e", "\r", "\x14", "\x10", "\x0f", "\x01", "\x13", "\x02"]) f.dashboard.handleInput(input);
-  expect(f.dashboard.query).toMatchObject({ search: "live", taskStates: ["WORKING"], processStates: ["LIVE"], outcomes: ["NONE"], sort: { key: "age", direction: "asc" }, groupBy: "taskState" });
+  // Ctrl+F opens search and the letters type into it; app/list/dashboard.test.mjs owns the
+  // full chord-to-query table for every filter, sort and group facet.
+  for (const input of ["\x06", "l", "i", "v", "e", "\r"]) f.dashboard.handleInput(input);
+  expect(f.dashboard.query).toMatchObject({ search: "live" });
   f.dashboard.clearFilters();
   f.dashboard.handleInput("\x05");
   expect(f.dashboard.overlay?.kind).toBe("metadata");

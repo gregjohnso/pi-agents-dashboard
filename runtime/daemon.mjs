@@ -12,6 +12,7 @@ import { atomicWriteJson } from "./atomic-file.mjs";
 import { claimDaemonLifecycle, releaseDaemonLifecycle, updateDaemonLifecycleState } from "./daemon-lifecycle.mjs";
 import { createJsonlDecoder, createJsonlEncoder, JsonlFramingError } from "./jsonl.mjs";
 import { createLaunchResolver, rollbackPreparedLaunch } from "./launch-resolver.mjs";
+import { sweepStaleWorktreeLocks } from "../isolation/lock-sweep.mjs";
 import { ensurePrivateDirectory, initializeRuntimePermissions } from "./permissions.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "./process-signaler.mjs";
@@ -1404,6 +1405,7 @@ export async function createDefaultDaemonRuntime({ root, piBin, env = process.en
   const piConfigPath = resolve(getAgentDir());
   await ensurePrivateDirectory(piConfigPath);
   const piConfigRoot = await fs.realpath(piConfigPath);
+  await sweepStaleWorktreeLocks({ worktreesRoot: join(piConfigRoot, "pi-dashboard", "worktrees"), startedAt: new Date().toISOString() }).catch(() => []);
   const workerSupervisor = new WorkerSupervisor({
     registry,
     runsDirectory: join(root, "runs"),

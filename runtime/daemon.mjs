@@ -11,7 +11,7 @@ import { createAttachmentResultStore } from "./attachment-result-store.mjs";
 import { atomicWriteJson } from "./atomic-file.mjs";
 import { claimDaemonLifecycle, releaseDaemonLifecycle, updateDaemonLifecycleState } from "./daemon-lifecycle.mjs";
 import { createJsonlDecoder, createJsonlEncoder, JsonlFramingError } from "./jsonl.mjs";
-import { createLaunchResolver, rollbackPreparedLaunch } from "./launch-resolver.mjs";
+import { createLaunchResolver } from "./launch-resolver.mjs";
 import { sweepStaleWorktreeLocks } from "../isolation/lock-sweep.mjs";
 import { ensurePrivateDirectory, initializeRuntimePermissions } from "./permissions.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
@@ -406,18 +406,16 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
       });
     });
     socket.on("close", () => {
-      context.markAttachmentClosing?.(socket);
+      context.markAttachmentClosing(socket);
       sockets.delete(socket);
       subscribers.delete(socket);
       broadcastWriters.delete(socket);
       const activeViewerSubscriptions = viewerSubscriptions.get(socket) ?? [];
       viewerSubscriptions.delete(socket);
       for (const subscription of activeViewerSubscriptions) void subscription.return?.();
-      const attachmentRelease = context.releaseAttachments?.(socket, frontendClientId);
-      if (attachmentRelease !== undefined) {
-        chains.add(attachmentRelease);
-        void attachmentRelease.finally(() => chains.delete(attachmentRelease)).catch(() => {});
-      }
+      const attachmentRelease = context.releaseAttachments(socket, frontendClientId);
+      chains.add(attachmentRelease);
+      void attachmentRelease.finally(() => chains.delete(attachmentRelease)).catch(() => {});
       resolveClosed(undefined);
       for (const [id, pending] of context.workerPending) {
         if (pending.connection === workerConnection && context.workerPending.get(id) === pending) {
@@ -463,7 +461,7 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
               const route = await context.router.adopt(frame, workerConnection);
               workerMetadata = route.metadata;
               workerRouteGeneration = route.routeGeneration;
-              void context.reconcileSessionActivity?.(route).catch(() => {});
+              void context.reconcileSessionActivity(route).catch(() => {});
               return;
             }
             await context.handleWorkerFrame(frame, workerConnection, workerMetadata, workerRouteGeneration);
@@ -515,7 +513,7 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
       }
     });
     socket.on("end", () => {
-      context.markAttachmentClosing?.(socket);
+      context.markAttachmentClosing(socket);
       /** @type {{ code?: string, message?: string } | undefined} */
       let framingError;
       try {
@@ -582,7 +580,6 @@ export async function createDaemonRuntime({
   summarizeSession,
   summaryExecutable = "pi",
   summaryEnv = process.env,
-  rollbackLaunch = rollbackPreparedLaunch,
   randomId = randomUUID,
   responseWriter = async (/** @type {any} */ { value, write }) => write(value),
   closeFailpoint = async () => {},
@@ -597,7 +594,7 @@ export async function createDaemonRuntime({
   if (typeof root !== "string" || resolve(root) !== root) throw new TypeError("Daemon runtime root must be an absolute canonical path");
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 128) throw new TypeError("maxBytes must be at least 128");
   if (typeof randomId !== "function") throw new TypeError("randomId must be a function");
-  if (typeof responseWriter !== "function" || typeof closeFailpoint !== "function" || typeof attachmentFailpoint !== "function" || typeof destructiveFailpoint !== "function" || typeof signalProcessGroupImpl !== "function" || typeof sleepImpl !== "function" || typeof rollbackLaunch !== "function") throw new TypeError("Daemon runtime seams must be functions");
+  if (typeof responseWriter !== "function" || typeof closeFailpoint !== "function" || typeof attachmentFailpoint !== "function" || typeof destructiveFailpoint !== "function" || typeof signalProcessGroupImpl !== "function" || typeof sleepImpl !== "function") throw new TypeError("Daemon runtime seams must be functions");
   if (!Number.isSafeInteger(stopPolicy?.gracefulMs) || stopPolicy.gracefulMs <= 0 || !Number.isSafeInteger(stopPolicy?.terminateMs) || stopPolicy.terminateMs <= 0) throw new TypeError("stopPolicy must contain approved positive integer waits");
   if (trashSessionFile !== undefined && typeof trashSessionFile !== "function") throw new TypeError("trashSessionFile must be a function when supplied");
   await ensureLayout(root);
@@ -1254,7 +1251,6 @@ export async function createDaemonRuntime({
                 if (record === undefined) return refuse("SESSION_NOT_FOUND", "The exact session does not exist");
                 if (record.revision !== request.payload.revision) return refuse("REVISION_CONFLICT", "Session revision changed before Delete");
               }
-              if (record === undefined) return refuse("SESSION_NOT_FOUND", "The exact session does not exist");
               if (record.ownership !== undefined || ["LIVE", "SLEEPING"].includes(record.processState)) return refuse("SESSION_LIVE", "Delete refuses a live or owned session");
               // A lease whose worker process is provably gone cannot be authoritative; reclaim it instead of refusing forever.
               if (lockedMetadata !== undefined && lockedRoute === undefined && await processIsGone(lockedMetadata.identity, inspect)) {

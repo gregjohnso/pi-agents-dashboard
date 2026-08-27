@@ -230,11 +230,6 @@ export class RecoveredWorkerRouter {
     });
   }
 
-  /** @param {string} sessionId */
-  connection(sessionId) {
-    return this.#routes.get(sessionId)?.connection;
-  }
-
   async close() {
     const routes = [...this.#routes.values()];
     this.#routes.clear();

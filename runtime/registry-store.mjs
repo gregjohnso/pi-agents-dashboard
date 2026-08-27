@@ -264,11 +264,6 @@ export function runSessionLifecycle(registry, sessionId, operation) {
   return registryCoordinationScope(registry).lifecycle.run(sessionId, operation);
 }
 
-/** Run only a known nested lifecycle operation under its caller's exact session lock. @param {RegistryStore} registry @param {string} sessionId @param {() => any | Promise<any>} operation */
-export function runNestedSessionLifecycle(registry, sessionId, operation) {
-  return registryCoordinationScope(registry).lifecycle.runNested(sessionId, operation);
-}
-
 /**
  * Write one session's operator-chosen color, re-reading the record when a concurrent write wins the
  * compare-and-swap. The color depends on nothing about the session, so metadata churn only costs a retry.

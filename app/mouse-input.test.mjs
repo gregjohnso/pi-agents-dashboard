@@ -4,48 +4,30 @@ import { Component, TuiAltScreen } from "@earendil-works/pi-tui";
 import { createWheelInputTap, parseWheelInput } from "./mouse-input.mjs";
 
 describe("wheel input parsing", () => {
-  it("reads SGR wheel-up and wheel-down with zero-based coordinates", () => {
-    expect(parseWheelInput("\x1b[<64;13;5M")).toEqual({ events: [{ button: "wheel_up", column: 12, row: 4 }], passThrough: "", pending: "" });
-    expect(parseWheelInput("\x1b[<65;1;1M")).toEqual({ events: [{ button: "wheel_down", column: 0, row: 0 }], passThrough: "", pending: "" });
+  const x10 = (button, column, row) => `\x1b[M${String.fromCharCode(button + 32, column + 32, row + 32)}`;
+
+  it.each([
+    ["SGR wheel-up with zero-based coordinates", "\x1b[<64;13;5M", { events: [{ button: "wheel_up", column: 12, row: 4 }], passThrough: "", pending: "" }],
+    ["SGR wheel-down with zero-based coordinates", "\x1b[<65;1;1M", { events: [{ button: "wheel_down", column: 0, row: 0 }], passThrough: "", pending: "" }],
+    ["X10 wheel-up", x10(64, 4, 9), { events: [{ button: "wheel_up", column: 3, row: 8 }], passThrough: "", pending: "" }],
+    ["X10 wheel-down", x10(65, 4, 9), { events: [{ button: "wheel_down", column: 3, row: 8 }], passThrough: "", pending: "" }],
+    ["a printable keystroke", "q", { events: [], passThrough: "q", pending: "" }],
+    ["an arrow key", "\x1b[A", { events: [], passThrough: "\x1b[A", pending: "" }],
+    ["a control byte", "\x03", { events: [], passThrough: "\x03", pending: "" }],
+    // pi-tui keeps selection and clicks, so a non-wheel mouse report must reach it untouched.
+    ["a non-wheel mouse report", "\x1b[<0;5;5M", { events: [], passThrough: "\x1b[<0;5;5M", pending: "" }],
+    ["a wheel event surrounded by keystrokes", "ab\x1b[<65;2;3Mcd", { events: [{ button: "wheel_down", column: 1, row: 2 }], passThrough: "abcd", pending: "" }],
+  ])("reads %s", (_label, input, expected) => {
+    expect(parseWheelInput(input)).toEqual(expected);
   });
 
-  it("reads X10 wheel encoding", () => {
-    const x10 = (button, column, row) => `\x1b[M${String.fromCharCode(button + 32, column + 32, row + 32)}`;
-    expect(parseWheelInput(x10(64, 4, 9)).events).toEqual([{ button: "wheel_up", column: 3, row: 8 }]);
-    expect(parseWheelInput(x10(65, 4, 9)).events).toEqual([{ button: "wheel_down", column: 3, row: 8 }]);
-  });
-
-  it("passes through keystrokes untouched", () => {
-    expect(parseWheelInput("q")).toEqual({ events: [], passThrough: "q", pending: "" });
-    expect(parseWheelInput("\x1b[A")).toEqual({ events: [], passThrough: "\x1b[A", pending: "" });
-    expect(parseWheelInput("\x03")).toEqual({ events: [], passThrough: "\x03", pending: "" });
-  });
-
-  it("passes through non-wheel mouse reports so pi-tui keeps selection and clicks", () => {
-    expect(parseWheelInput("\x1b[<0;5;5M").passThrough).toBe("\x1b[<0;5;5M");
-    expect(parseWheelInput("\x1b[<0;5;5M").events).toEqual([]);
-  });
-
-  it("separates wheel events from surrounding keystrokes without dropping bytes", () => {
-    const result = parseWheelInput("ab\x1b[<65;2;3Mcd");
-    expect(result.events).toEqual([{ button: "wheel_down", column: 1, row: 2 }]);
-    expect(result.passThrough).toBe("abcd");
-  });
-
-  it("holds a split sequence as pending instead of dropping or corrupting it", () => {
-    const first = parseWheelInput("\x1b[<65;2");
-    expect(first).toEqual({ events: [], passThrough: "", pending: "\x1b[<65;2" });
-    const second = parseWheelInput(`${first.pending};3M`);
-    expect(second.events).toEqual([{ button: "wheel_down", column: 1, row: 2 }]);
-    expect(second.passThrough).toBe("");
-  });
-
-  it("releases a pending prefix that turns out not to be a mouse report", () => {
-    const first = parseWheelInput("\x1b[");
-    expect(first.pending).toBe("\x1b[");
-    const second = parseWheelInput(`${first.pending}A`);
-    expect(second.passThrough).toBe("\x1b[A");
-    expect(second.events).toEqual([]);
+  it.each([
+    ["a split wheel report", "\x1b[<65;2", ";3M", { events: [{ button: "wheel_down", column: 1, row: 2 }], passThrough: "", pending: "" }],
+    ["a prefix that turns out not to be a mouse report", "\x1b[", "A", { events: [], passThrough: "\x1b[A", pending: "" }],
+  ])("holds %s as pending instead of dropping or corrupting it", (_label, first, rest, expected) => {
+    const held = parseWheelInput(first);
+    expect(held).toEqual({ events: [], passThrough: "", pending: first });
+    expect(parseWheelInput(`${held.pending}${rest}`)).toEqual(expected);
   });
 });
 
@@ -63,24 +45,16 @@ describe("wheel input tap", () => {
     return terminal;
   };
 
-  it("dispatches wheel events and withholds them from the wrapped terminal", () => {
+  it("dispatches wheel events, withholds them, and forwards every other byte", () => {
     const terminal = fakeTerminal();
     const onWheel = vi.fn();
     const tapped = createWheelInputTap(terminal, onWheel);
     const forwarded = [];
     tapped.start((data) => forwarded.push(data), () => {});
     terminal.started.onInput("\x1b[<64;3;7M");
-    expect(onWheel).toHaveBeenCalledWith({ button: "wheel_up", column: 2, row: 6 });
-    expect(forwarded).toEqual([]);
-  });
-
-  it("forwards every non-wheel byte to the wrapped input handler", () => {
-    const terminal = fakeTerminal();
-    const tapped = createWheelInputTap(terminal, () => {});
-    const forwarded = [];
-    tapped.start((data) => forwarded.push(data), () => {});
     terminal.started.onInput("hello");
     terminal.started.onInput("\x1b[B");
+    expect(onWheel).toHaveBeenCalledWith({ button: "wheel_up", column: 2, row: 6 });
     expect(forwarded).toEqual(["hello", "\x1b[B"]);
   });
 
@@ -99,15 +73,13 @@ describe("wheel input tap", () => {
 describe("installed pi-tui mouse assumptions", () => {
   const upgradeNotice = "pi-tui changed its mouse handling since the verified 0.84.3. Delete app/mouse-input.mjs and its terminal tap, and route wheel events through pi-tui's real seam instead.";
 
-  it("still exposes no component mouse seam", () => {
+  it("still exposes no component mouse seam and still consumes wheel bytes", () => {
     // The tap exists only because a component cannot receive mouse events.
     const componentKeys = Object.keys(Component ?? {});
     expect(componentKeys.some((key) => /mouse/i.test(key)), upgradeNotice).toBe(false);
     const altScreenMethods = Object.getOwnPropertyNames(TuiAltScreen.prototype);
     expect(altScreenMethods.includes("setMouseHandler") || altScreenMethods.includes("onMouse"), upgradeNotice).toBe(false);
-  });
 
-  it("still consumes wheel bytes instead of dispatching them to a focused component", () => {
     let deliver;
     const terminal = {
       start(onInput) { deliver = onInput; }, stop() {}, write() {},

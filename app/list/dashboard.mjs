@@ -3,9 +3,11 @@ import { stripVTControlCharacters } from "node:util";
 
 import { decodeKittyPrintable, Key, matchesKey, truncateToWidth, visibleWidth, } from "@earendil-works/pi-tui";
 import { pastedText } from "./dashboard-input.mjs";
+import { SPINNER_INTERVAL_MS } from "../spinner.mjs";
 import { countDashboardSessions, selectDashboardSessions, } from "./dashboard-state.mjs";
 import { createDashboardLayout, renderColumnHeader, } from "./dashboard-layout.mjs";
 import { jobwatchTheme } from "./dashboard-theme.mjs";
+import { displaySessionState } from "./session-state.mjs";
 import { StopClearGesture } from "./stop-clear-gesture.mjs";
 import { destructiveAction, confirmationMatchesSession, createDeliveryUnknownOverlay, createHelpOverlay, createMetadataOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, describeOverlay, } from "./dashboard-overlays.mjs";
 import { createLaunchDraft, prepareLaunchRequest, } from "./launch-composer.mjs";
@@ -265,6 +267,7 @@ export class DashboardController {
     renderRequestGeneration = 0;
     renderWaiters = new Map();
     stopClearGesture;
+    animationTimer;
     query = defaultQuery();
     focus = "list";
     composerField = "prompt";
@@ -341,6 +344,7 @@ export class DashboardController {
         }
     }
     close() {
+        this.stopAnimation();
         return this.beginClose();
     }
     resize(width, height) {
@@ -737,6 +741,7 @@ export class DashboardController {
                 lines[lines.length - 1] = paintPlainLine(" Ctrl+C quit  ↑↓ navigate  Enter/→ open  ←/Esc back  type to compose  Tab fields  ^X action  ^G help", this.width, jobwatchTheme.keyHints);
             }
             this.renderOverlay(lines);
+            this.syncAnimation();
             const result = lines.map((line) => fitLine(line, this.width));
             this.completeHostRender(renderedGeneration);
             return result;
@@ -999,6 +1004,27 @@ export class DashboardController {
             this.fail(typed);
             throw Object.assign(new Error(typed.message), { code: typed.code });
         }
+    }
+    /**
+     * Keep one repaint timer alive exactly while a visible session is working. Without it the
+     * spinner frame only advances when some other event happens to redraw the list.
+     */
+    syncAnimation() {
+        const working = this.list.rows.some((row) => row.kind === "session" && displaySessionState(row.session) === "WORKING");
+        if (!working || this.requestRender === undefined) {
+            this.stopAnimation();
+            return;
+        }
+        if (this.animationTimer !== undefined)
+            return;
+        this.animationTimer = setInterval(() => this.requestRender?.(), SPINNER_INTERVAL_MS);
+        this.animationTimer.unref?.();
+    }
+    stopAnimation() {
+        if (this.animationTimer === undefined)
+            return;
+        clearInterval(this.animationTimer);
+        this.animationTimer = undefined;
     }
     awaitHostRender() {
         if (this.requestRender === undefined)

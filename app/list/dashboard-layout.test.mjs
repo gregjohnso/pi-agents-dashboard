@@ -94,12 +94,12 @@ describe("responsive dashboard layout", () => {
         expect(colorOf({ taskState: "READY", processState: "EXITED" })).toContain(JOBWATCH_ANSI.gray);
     });
     it("keeps the fixed list column order and never renders Model or Project", () => {
-        expect(createDashboardLayout(160, 40).columns.map(({ key }) => key)).toEqual(["name", "state", "activity", "age"]);
+        expect(createDashboardLayout(160, 40).columns.map(({ key }) => key)).toEqual(["name", "spinner", "state", "activity", "age"]);
         const header = stripVTControlCharacters(renderColumnHeader(createDashboardLayout(160, 40)));
         expect(header).not.toContain("MODEL");
         expect(header).not.toContain("PROJECT");
         expect(header).toContain("NAME");
-        expect(createDashboardLayout(120, 32).columns.map(({ key }) => key)).toEqual(["name", "state", "activity", "age"]);
+        expect(createDashboardLayout(120, 32).columns.map(({ key }) => key)).toEqual(["name", "spinner", "state", "activity", "age"]);
         expect(header).toContain("AGE");
         expect(header).not.toContain("ID");
     });
@@ -181,13 +181,20 @@ describe("responsive dashboard layout", () => {
     });
 });
 
-it("spins the state cell while a session works, in step with the viewer's spinner", () => {
+it("spins an unlabelled column left of STATE so the state text never shifts", () => {
     const layout = createDashboardLayout(100, 24);
-    const working = session("spinning", { taskState: "WORKING", processState: "LIVE" });
-    const frameAt = (now) => stripVTControlCharacters(renderSessionRow(working, layout, { now })).match(/[\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f]/u)?.[0];
-    const first = frameAt(0);
-    expect(first).toBeDefined();
-    expect(frameAt(80)).not.toBe(first);
-    expect(frameAt(800)).toBe(first);
-    expect(stripVTControlCharacters(renderSessionRow(session("still", { taskState: "READY", processState: "LIVE" }), layout, { now: 0 }))).not.toMatch(/[\u280b\u2819]/u);
+    const spinner = /[\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f]/u;
+    const rowAt = (now, overrides) => stripVTControlCharacters(renderSessionRow(session("spinning", overrides), layout, { now }));
+
+    const working = rowAt(0, { taskState: "WORKING", processState: "LIVE" });
+    expect(working).toMatch(spinner);
+    expect(working.indexOf(working.match(spinner)[0])).toBeLessThan(working.indexOf("WORKING"));
+    expect(rowAt(80, { taskState: "WORKING", processState: "LIVE" }).match(spinner)[0]).not.toBe(working.match(spinner)[0]);
+
+    // A still session leaves the column blank, and STATE keeps its position either way.
+    const ready = rowAt(0, { taskState: "READY", processState: "LIVE" });
+    expect(ready).not.toMatch(spinner);
+    expect(ready.indexOf("READY")).toBe(working.indexOf("WORKING"));
+    // The header labels nothing above the spinner.
+    expect(stripVTControlCharacters(renderColumnHeader(layout))).toMatch(/NAME\s+STATE\s+ACTIVITY/u);
 });

@@ -326,6 +326,30 @@ describe("dashboard controller", () => {
         expect(dashboard.overlay).toBeUndefined();
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "WORKER_UNAVAILABLE" }));
     });
+    it("repaints on a timer while a session works and stops when none do", async () => {
+        vi.useFakeTimers();
+        try {
+            const backend = new FakeBackend([session("a", { taskState: "WORKING", processState: "LIVE" })]);
+            const requestRender = vi.fn();
+            const dashboard = controller(backend, { requestRender });
+            await dashboard.open();
+            dashboard.render(100, 24);
+            const before = requestRender.mock.calls.length;
+            await vi.advanceTimersByTimeAsync(400);
+            // The throbber only moves if something asks for a frame.
+            expect(requestRender.mock.calls.length).toBeGreaterThan(before);
+
+            dashboard.applySnapshot({ sessions: [session("a", { taskState: "READY", processState: "LIVE" })] });
+            dashboard.render(100, 24);
+            const settled = requestRender.mock.calls.length;
+            await vi.advanceTimersByTimeAsync(400);
+            expect(requestRender.mock.calls.length).toBe(settled);
+            await dashboard.close();
+        }
+        finally {
+            vi.useRealTimers();
+        }
+    });
     it("counts only the sessions the current view shows", async () => {
         const dashboard = controller(new FakeBackend([
             session("live", { processState: "LIVE" }),

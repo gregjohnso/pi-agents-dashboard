@@ -33,8 +33,8 @@ function live(sessionId, overrides = {}) {
     };
 }
 describe("mergeSessionIndex", () => {
-    it("projects saved Pi sessions without inferring an outcome", () => {
-        expect(mergeSessionIndex([saved("saved", "/sessions/a/../saved.jsonl", { name: "Saved name" })], [], lexicalSessionFileIdentity)).toEqual([
+    it("projects saved Pi sessions without inferring an outcome from message count", () => {
+        expect(mergeSessionIndex([saved("saved", "/sessions/a/../saved.jsonl", { name: "Saved name", messageCount: 9 })], [], lexicalSessionFileIdentity)).toEqual([
             expect.objectContaining({
                 schemaVersion: 1,
                 revision: 0,
@@ -56,50 +56,22 @@ describe("mergeSessionIndex", () => {
             }),
         ]);
     });
-    it("does not treat saved messageCount as explicit success evidence", () => {
-        const [record] = mergeSessionIndex([saved("interrupted", undefined, { messageCount: 9 })], [], lexicalSessionFileIdentity);
-        expect(record.outcome).toBe("NONE");
-    });
-    it("merges canonical path aliases into the authoritative live record", () => {
-        const liveRecord = live("live-id", {
-            sessionFile: "/alias/sessions/one.jsonl",
-            canonicalSessionFile: "/real/sessions/one.jsonl",
-            name: undefined,
-        });
-        const savedRecord = saved("saved-id", "/real/sessions/../sessions/one.jsonl", {
-            name: "Name from Pi",
-        });
-        expect(mergeSessionIndex([savedRecord], [liveRecord], lexicalSessionFileIdentity)).toEqual([
-            expect.objectContaining({
-                sessionId: "live-id",
-                sessionFile: "/alias/sessions/one.jsonl",
-                canonicalSessionFile: "/real/sessions/one.jsonl",
-                name: "Name from Pi",
-                processState: "LIVE",
-            }),
-        ]);
-    });
-    it("merges different saved and live paths and IDs by injected canonical identity", () => {
-        const savedPath = "/aliases/saved-session.jsonl";
-        const livePath = "/display/live-session.jsonl";
-        const canonicalPath = "/real/sessions/session.jsonl";
-        const identities = new Map([
-            [savedPath, canonicalPath],
-            [livePath, canonicalPath],
-            [canonicalPath, canonicalPath],
-        ]);
-        const sessionFileIdentity = (sessionFile) => identities.get(sessionFile) ?? sessionFile;
-        const liveRecord = live("live-id", {
-            sessionFile: livePath,
-            canonicalSessionFile: canonicalPath,
-            name: undefined,
-        });
-        expect(mergeSessionIndex([saved("saved-id", savedPath, { name: "Saved alias name" })], [liveRecord], sessionFileIdentity)).toEqual([
+    // One worker per canonical session file: a saved alias and a live record naming the same
+    // canonical file must collapse to the single live record, whatever spells the identity.
+    it.each([
+        ["lexical path normalization", "/real/sessions/../sessions/one.jsonl", "/alias/sessions/one.jsonl", "/real/sessions/one.jsonl", lexicalSessionFileIdentity],
+        ["an injected canonical identity", "/aliases/saved-session.jsonl", "/display/live-session.jsonl", "/real/sessions/session.jsonl", undefined],
+    ])("merges a saved alias into the authoritative live record by %s", (_label, savedPath, livePath, canonicalPath, identity) => {
+        const identities = new Map([[savedPath, canonicalPath], [livePath, canonicalPath], [canonicalPath, canonicalPath]]);
+        const sessionFileIdentity = identity ?? ((sessionFile) => identities.get(sessionFile) ?? sessionFile);
+        const liveRecord = live("live-id", { sessionFile: livePath, canonicalSessionFile: canonicalPath, name: undefined });
+        expect(mergeSessionIndex([saved("saved-id", savedPath, { name: "Name from Pi" })], [liveRecord], sessionFileIdentity)).toEqual([
             expect.objectContaining({
                 sessionId: "live-id",
                 sessionFile: livePath,
                 canonicalSessionFile: canonicalPath,
-                name: "Saved alias name",
+                name: "Name from Pi",
+                processState: "LIVE",
             }),
         ]);
     });

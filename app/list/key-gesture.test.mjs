@@ -55,22 +55,13 @@ describe("Left dashboard gesture", () => {
     it("cancels an armed gesture on another key and resets after successful submit", () => {
         const dirty = reduceLeftGesture(createLeftGestureState(), { type: "historyNavigated" }).state;
         const armed = reduceLeftGesture(dirty, left(100)).state;
-        const cancelled = reduceLeftGesture(armed, { ...left(200), key: "down" }).state;
+        const other = reduceLeftGesture(armed, { ...left(200), key: "down" });
+        // Every key the gesture does not claim reaches the editor untouched.
+        expect(other).toMatchObject({ openDashboard: false, passThrough: true });
+        const cancelled = other.state;
         expect(reduceLeftGesture(cancelled, left(300))).toMatchObject({ openDashboard: false, passThrough: true });
         const submitted = reduceLeftGesture(cancelled, { type: "submitted" }).state;
         expect(reduceLeftGesture(submitted, left(400))).toMatchObject({ openDashboard: true, passThrough: false });
-    });
-    it("delegates every non-activation key to an existing editor", () => {
-        const delegate = vi.fn();
-        let state = reduceLeftGesture(createLeftGestureState(), { type: "editorChanged", text: "draft" }).state;
-        const first = reduceLeftGesture(state, left(100, { editorText: "draft" }));
-        state = first.state;
-        if (first.passThrough)
-            delegate("left");
-        const other = reduceLeftGesture(state, { ...left(200), key: "a" });
-        if (other.passThrough)
-            delegate("a");
-        expect(delegate.mock.calls).toEqual([["left"], ["a"]]);
     });
     it("delegates an empty unfocused Left and opens only after public focus is restored", () => {
         const tui = { requestRender: vi.fn() };

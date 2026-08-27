@@ -398,6 +398,25 @@ it("clears a stale WORKING session when the reconnected worker reports an idle P
   await vi.waitFor(async () => expect(await registry.get("stale")).toMatchObject({ taskState: "READY", processState: "LIVE" }), { timeout: 5_000 });
 });
 
+it("marks a ready session working when the reconnected worker reports a streaming Pi", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const identity = { pid: 611, startIdentity: "resumed-worker", processGroupId: 611 };
+  const piChild = { pid: 612, startIdentity: "resumed-pi", processGroupId: 611 };
+  const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === 611 ? identity : piChild;
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const now = "2026-08-25T12:00:00.000Z";
+  // A turn that starts while the worker is disconnected drops its agent_start, so the row reads READY.
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "resumed", sessionFile: "/sessions/resumed.jsonl", canonicalSessionFile: "/sessions/resumed.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "assistant_final", summary: "done", updatedAt: now }, ownership: { kind: "managed", runId: "run-resumed", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-resumed", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "resumed", runId: "run-resumed", leaseId: "lease-resumed", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  const runtime = await createDaemonRuntime({ root: stateRoot, inspect });
+  runtimes.push(runtime);
+  startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "resumed", runId: "run-resumed", leaseId: "lease-resumed", generation: 1, identity, piChildIdentity: piChild, token: "resumed-token", results: { get_state: { sessionId: "resumed", isStreaming: true } } });
+  await runtime.ready;
+
+  await vi.waitFor(async () => expect(await registry.get("resumed")).toMatchObject({ taskState: "WORKING", processState: "LIVE" }), { timeout: 5_000 });
+});
+
 it("summarizes sessions only after the opt-in model is chosen and reuses cached summaries", async () => {
   const stateRoot = await root();
   for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
@@ -523,7 +542,8 @@ it("serves read-only session queries and session toggles from the owning worker"
   client.send({ version: 1, clientId: "viewer", requestId: "steering", op: "session_command", payload: { sessionId: "query", command: "set_steering_mode", mode: "one-at-a-time" } });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
 
-  const delivered = worker.commands.filter((/** @type {any} */ command) => command.op !== "get_session_commands");
+  // get_state is the daemon's own reconnect probe, not a frontend request.
+  const delivered = worker.commands.filter((/** @type {any} */ command) => !["get_session_commands", "get_state"].includes(command.op));
   expect(delivered[0]).toMatchObject({ op: "session_query", sessionQuery: { query: "get_session_stats" } });
   expect(delivered[1].sessionCommand).toEqual({ command: "set_auto_compaction", enabled: false });
   expect(delivered[2].sessionCommand).toEqual({ command: "set_steering_mode", mode: "one-at-a-time" });
@@ -556,9 +576,10 @@ it("discovers slash commands and delivers one session command to the owning work
   client.send({ version: 1, clientId: "viewer", requestId: "rename-request", op: "session_command", payload: { sessionId: "menu", command: "set_session_name", name: "Coverage loader" } });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
   await vi.waitFor(async () => expect(await new RegistryStore(join(stateRoot, "sessions")).get("menu")).toMatchObject({ name: "Coverage loader" }));
-  expect(worker.commands.map((/** @type {any} */ command) => command.op)).toEqual(["get_session_commands", "session_command", "session_command"]);
-  expect(worker.commands[1].sessionCommand).toEqual({ command: "set_model", model: { provider: "anthropic", id: "claude" } });
-  expect(worker.commands[2].sessionCommand).toEqual({ command: "set_session_name", name: "Coverage loader" });
+  const delivered = worker.commands.filter((/** @type {any} */ command) => command.op !== "get_state");
+  expect(delivered.map((/** @type {any} */ command) => command.op)).toEqual(["get_session_commands", "session_command", "session_command"]);
+  expect(delivered[1].sessionCommand).toEqual({ command: "set_model", model: { provider: "anthropic", id: "claude" } });
+  expect(delivered[2].sessionCommand).toEqual({ command: "set_session_name", name: "Coverage loader" });
   client.close();
 });
 

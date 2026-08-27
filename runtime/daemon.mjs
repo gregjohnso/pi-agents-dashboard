@@ -691,23 +691,31 @@ export async function createDaemonRuntime({
           }).catch(() => {});
         });
       },
-      /** Re-derive task state from Pi after a reconnect: a turn can finish while the daemon is down. @param {any} route */
+      /**
+       * Re-derive task state from Pi after a reconnect: a turn can both finish and start while the
+       * daemon is down, and the worker drops the state events it emits with no connection to send them
+       * on. WAITING, STOPPED and FAILED mean something Pi does not report, so they are left alone.
+       * @param {any} route
+       */
       async reconcileSessionActivity(route) {
         const { metadata, connection, routeGeneration } = route;
         if (metadata?.token === undefined) return;
         const record = await registry.get(metadata.sessionId);
-        if (record?.taskState !== "WORKING") return;
+        if (record === undefined || (record.taskState !== "WORKING" && record.taskState !== "READY")) return;
         const id = randomId();
         if (typeof id !== "string" || id.length < 16 || usedCommandIds.has(id)) return;
         usedCommandIds.add(id);
         const clientId = `daemon-reconcile:${daemonEpoch}`;
         const durableRequest = { version: 1, clientId, requestId: id, op: "get_state", payload: { sessionId: metadata.sessionId } };
         const result = await connection.request({ version: 1, type: "command", token: metadata.token, id, command: { clientId, requestId: id, op: "get_state" } }, { clientId, requestId: id, op: "get_state", durableRequest, metadata, routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
-        if (result?.result?.isStreaming !== false) return;
+        const streaming = result?.result?.isStreaming;
+        if (typeof streaming !== "boolean") return;
+        const derived = streaming ? "WORKING" : "READY";
         await runSessionLifecycle(registry, metadata.sessionId, async () => {
           const current = await registry.get(metadata.sessionId);
-          if (current?.taskState !== "WORKING" || current.ownership?.runId !== metadata.runId) return;
-          const next = reduceSessionState(current, { type: "TURN_COMPLETED", at: new Date().toISOString() });
+          if (current === undefined || current.ownership?.runId !== metadata.runId) return;
+          if (current.taskState === derived || (current.taskState !== "WORKING" && current.taskState !== "READY")) return;
+          const next = reduceSessionState(current, { type: streaming ? "TURN_STARTED" : "TURN_COMPLETED", at: new Date().toISOString() });
           const updated = await registry.update(current.sessionId, current.revision, { taskState: next.taskState, processState: next.processState, outcome: next.outcome, activity: next.activity, updatedAt: next.updatedAt });
           const event = await context.recovery.events.append({ kind: "session_changed", payload: { session: updated } });
           context.broadcast(event);

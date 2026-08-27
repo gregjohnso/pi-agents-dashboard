@@ -245,6 +245,7 @@ export class DashboardController {
     onClose;
     onSessionIntent;
     requestRender;
+    now;
     unsubscribe;
     sessions = [];
     list = new VirtualSessionList([]);
@@ -286,6 +287,7 @@ export class DashboardController {
         this.onClose = options.onClose;
         this.onSessionIntent = options.onSessionIntent;
         this.requestRender = options.requestRender;
+        this.now = options.now ?? Date.now;
         this.stopClearGesture = new StopClearGesture({ now: options.now });
         this.composerDraft = createLaunchDraft({
             ...options.launchDefaults,
@@ -344,7 +346,6 @@ export class DashboardController {
         }
     }
     close() {
-        this.stopAnimation();
         return this.beginClose();
     }
     resize(width, height) {
@@ -709,6 +710,8 @@ export class DashboardController {
         const renderedGeneration = this.renderRequestGeneration;
         try {
             this.resize(width, height);
+            // Rows cache their rendered line; without a fresh reading the spinner frame and age never move.
+            this.list.setNow(this.now());
             const layout = createDashboardLayout(this.width, this.height);
             const counts = countDashboardSessions(selectDashboardSessions(this.sessions, this.query));
             const lines = Array.from({ length: this.height }, () => "");
@@ -1011,7 +1014,7 @@ export class DashboardController {
      */
     syncAnimation() {
         const working = this.list.rows.some((row) => row.kind === "session" && displaySessionState(row.session) === "WORKING");
-        if (!working || this.requestRender === undefined) {
+        if (!working || this.closed || this.requestRender === undefined) {
             this.stopAnimation();
             return;
         }
@@ -1088,6 +1091,7 @@ export class DashboardController {
     beginClose(initialError) {
         if (this.closePromise !== undefined)
             return this.closePromise;
+        this.stopAnimation();
         this.closed = true;
         this.openGeneration += 1;
         this.saveAdmissionGeneration += 1;

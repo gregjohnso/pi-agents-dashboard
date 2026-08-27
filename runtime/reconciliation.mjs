@@ -391,6 +391,41 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReco
       repairedSessions.push(await events.append({ kind: "session_changed", payload: { session: updated } }));
     }
     cancelled();
+    /**
+     * The Pi child, not the supervisor, holds the canonical session file open. A supervisor that is gone
+     * or replaced only frees the lease once its recorded child is gone or replaced too.
+     * @param {any} record @param {string} supervisorReason
+     */
+    const reclaimOrConflict = async (record, supervisorReason) => {
+      const metadata = router.metadata(record.sessionId);
+      if (metadata === undefined) return { reason: supervisorReason, ownership: record.ownership };
+      try {
+        if (sameIdentity(await inspect(metadata.piChildIdentity.pid), metadata.piChildIdentity)) {
+          return { reason: "PI_CHILD_ORPHANED", ownership: record.ownership, metadata };
+        }
+      } catch (error) {
+        if (!exited(error)) return { reason: "PI_CHILD_IDENTITY_AMBIGUOUS", ownership: record.ownership, metadata };
+      }
+      return router.runSession(record.sessionId, async (/** @type {any} */ { forget }) => {
+        const current = await registry.get(record.sessionId);
+        if (current === undefined || current.revision !== record.revision || current.ownership === undefined) {
+          return { reason: supervisorReason, ownership: record.ownership, metadata };
+        }
+        const next = reduceSessionState(current, { type: "WORKER_EXITED", at: new Date().toISOString() });
+        const updated = await registry.update(current.sessionId, current.revision, {
+          taskState: next.taskState,
+          processState: next.processState,
+          outcome: next.outcome,
+          activity: next.activity,
+          updatedAt: next.updatedAt,
+          ownership: undefined,
+        });
+        // Worker metadata is what lets a later daemon find this child again, so it is forgotten only now.
+        await forget();
+        repairedSessions.push(await events.append({ kind: "session_changed", payload: { session: updated } }));
+        return undefined;
+      });
+    };
     /** @type {any[]} */
     const liveWorkers = [];
     /** @type {any[]} */
@@ -402,11 +437,17 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReco
       try {
         actual = await inspect(record.ownership.process.pid);
       } catch (error) {
-        conflicts.push({ sessionId: record.sessionId, reason: exited(error) ? "WORKER_EXITED" : "PROCESS_IDENTITY_AMBIGUOUS", ownership: record.ownership });
+        if (!exited(error)) {
+          conflicts.push({ sessionId: record.sessionId, reason: "PROCESS_IDENTITY_AMBIGUOUS", ownership: record.ownership });
+          continue;
+        }
+        const unresolved = await reclaimOrConflict(record, "WORKER_EXITED");
+        if (unresolved !== undefined) conflicts.push({ sessionId: record.sessionId, ...unresolved });
         continue;
       }
       if (!sameIdentity(actual, record.ownership.process)) {
-        conflicts.push({ sessionId: record.sessionId, reason: "PROCESS_IDENTITY_MISMATCH", ownership: record.ownership, actual });
+        const unresolved = await reclaimOrConflict(record, "PROCESS_IDENTITY_MISMATCH");
+        if (unresolved !== undefined) conflicts.push({ sessionId: record.sessionId, actual, ...unresolved });
         continue;
       }
       const metadata = router.metadata(record.sessionId);

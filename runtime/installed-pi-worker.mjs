@@ -10,6 +10,8 @@ import { sessionEventForPiEvent } from "./session-event-mapping.mjs";
 import { createWorkerCommandDispatcher, createWorkerReplayStore, maintainDaemonConnection, replayDeliveryIsAmbiguous } from "./worker.mjs";
 
 const MAX_PENDING_PARENT_MESSAGES = 256;
+/** A crash report must not outlive its own exit: stop waiting for the channel and leave. */
+const CRASH_REPORT_TIMEOUT_MS = 1_000;
 
 /** @param {unknown} supplied @param {string} expected */
 function matchesToken(supplied, expected) {
@@ -185,7 +187,19 @@ export async function runInstalledPiWorker(runtimeProcess) {
       }).catch(() => {});
     });
   }
-  piChild.once("exit", () => { if (!shuttingDown) void diagnostics.close().finally(() => runtimeProcess.exit(0)); });
+  /** @param {number | null} code @param {NodeJS.Signals | null} signal */
+  const reportPiChildExit = async (code, signal) => {
+    const event = { type: "PI_CHILD_CRASHED", at: new Date().toISOString(), summary: `Pi exited unexpectedly (${signal ?? code ?? "unknown"})` };
+    const message = { version: 1, type: "worker_event", token, sessionId: options.sessionId, event };
+    const delivered = runtimeProcess.connected
+      ? new Promise((resolveSend) => { runtimeProcess.send?.(message, () => resolveSend(undefined)); })
+      : Promise.resolve(sendToDaemon?.(message));
+    await Promise.race([delivered, new Promise((resolveTimeout) => setTimeout(resolveTimeout, CRASH_REPORT_TIMEOUT_MS))]);
+  };
+  piChild.once("exit", (code, signal) => {
+    if (shuttingDown) return;
+    void reportPiChildExit(code, signal).catch(() => {}).finally(() => diagnostics.close().catch(() => {}).finally(() => runtimeProcess.exit(0)));
+  });
   const testExitMs = Number(runtimeProcess.env.PI_DASHBOARD_TEST_EXIT_MS);
   if (Number.isSafeInteger(testExitMs) && testExitMs > 0) setTimeout(() => piChild.kill("SIGTERM"), testExitMs);
 }

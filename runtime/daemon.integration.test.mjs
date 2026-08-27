@@ -1746,3 +1746,124 @@ it("reports the counts idle exit depends on", async () => {
   client.socket.destroy();
   await vi.waitFor(() => expect(runtime.attachedFrontends()).toBe(0));
 });
+
+it("repairs a session whose supervisor and Pi child are both gone and reaches READY", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const now = "2026-08-25T12:00:00.000Z";
+  const identity = { pid: 701, startIdentity: "dead-supervisor", processGroupId: 701 };
+  const piChild = { pid: 702, startIdentity: "dead-pi", processGroupId: 701 };
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "recovered", sessionFile: "/sessions/recovered.jsonl", canonicalSessionFile: "/sessions/recovered.jsonl", cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-recovered", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-recovered", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "recovered", runId: "run-recovered", leaseId: "lease-recovered", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    inspect: async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : Promise.reject(Object.assign(new Error("gone"), { code: "ESRCH" })),
+  });
+  runtimes.push(runtime);
+
+  await runtime.ready;
+  expect(runtime.status()).toMatchObject({ state: "READY" });
+  const repaired = await registry.get("recovered");
+  expect(repaired).toMatchObject({ processState: "EXITED" });
+  expect(repaired?.ownership).toBeUndefined();
+  expect(JSON.parse(await readFile(join(stateRoot, "daemon", "workers.json"), "utf8")).workers).toEqual([]);
+});
+
+it("admits no second writer when a dead supervisor leaves a live Pi child", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const now = "2026-08-25T12:00:00.000Z";
+  const identity = { pid: 711, startIdentity: "gone-supervisor", processGroupId: 711 };
+  const piChild = { pid: 712, startIdentity: "live-pi", processGroupId: 711 };
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "orphaned", sessionFile: "/sessions/orphaned.jsonl", canonicalSessionFile: "/sessions/orphaned.jsonl", cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-orphaned", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-orphaned", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "orphaned", runId: "run-orphaned", leaseId: "lease-orphaned", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  let launches = 0;
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    inspect: async (/** @type {number} */ pid) => {
+      if (pid === process.pid) return { pid, startIdentity: "daemon", processGroupId: process.pid };
+      if (pid === piChild.pid) return piChild;
+      throw Object.assign(new Error("gone"), { code: "ESRCH" });
+    },
+    hostProbe: async () => ({ blockers: [] }),
+    resolveLaunchRequest: async () => ({ sessionId: "orphaned" }),
+    workerSupervisor: { async launch() { launches += 1; return {}; }, async close() {} },
+  });
+  runtimes.push(runtime);
+
+  await expect(runtime.ready).rejects.toMatchObject({ code: "OWNERSHIP_CONFLICT", conflicts: [expect.objectContaining({ sessionId: "orphaned", reason: "PI_CHILD_ORPHANED" })] });
+  expect((await registry.get("orphaned"))?.ownership).toMatchObject({ runId: "run-orphaned" });
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
+  await client.ready;
+  client.send({ version: 1, clientId: "launcher", requestId: "second-writer", op: "launch", payload: { prompt: "go", cwd: "/repo", sourceSessionId: "orphaned", isolation: { mode: "shared_directory", confirmedCwd: "/repo", ownerSessionIds: [] } } });
+  expect(await client.next()).toMatchObject({ ok: false, error: { code: "OWNERSHIP_CONFLICT" } });
+  expect(launches).toBe(0);
+  client.close();
+});
+
+it("relaunches a stopped session whose recorded worker processes are both gone", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const now = "2026-08-25T00:00:00.000Z";
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "stopped", sessionFile: "/sessions/stopped.jsonl", canonicalSessionFile: "/sessions/stopped.jsonl", cwd: "/repo", taskState: "STOPPED", processState: "EXITED", outcome: "NONE", activity: { kind: "assistant_final", summary: "Saved", updatedAt: now }, latestRunId: "run-stopped", createdAt: now, updatedAt: now });
+  const stale = { pid: 811, startIdentity: "stopped-supervisor", processGroupId: 811 };
+  const stalePiChild = { pid: 812, startIdentity: "stopped-pi", processGroupId: 811 };
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "stopped", runId: "run-stopped", leaseId: "lease-stopped", generation: 1, identity: stale, piChildIdentity: stalePiChild }] })}\n`, { mode: 0o600 });
+  const identity = { pid: 821, startIdentity: "fresh-supervisor", processGroupId: 821 };
+  const launch = vi.fn(async (/** @type {any} */ request) => {
+    const current = await registry.get("stopped");
+    if (current === undefined) throw new Error("stopped record missing");
+    await registry.update("stopped", current.revision, { ownership: { kind: "managed", runId: request.runId, process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: request.runId, processState: "LIVE", updatedAt: now });
+    return { sessionId: "stopped", runId: request.runId, leaseId: "fresh-lease", generation: 2, identity, piChildIdentity: { pid: 822, startIdentity: "fresh-pi", processGroupId: 821 } };
+  });
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    hostProbe: async () => ({ blockers: [] }),
+    inspect: async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : Promise.reject(Object.assign(new Error("gone"), { code: "ESRCH" })),
+    workerSupervisor: { launch, async close() {} },
+  });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await client.ready;
+
+  client.send({ version: 1, clientId: "client", requestId: "reopen", op: "attach", payload: { sessionId: "stopped", role: "composer", activate: true } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "attached", sessionId: "stopped", role: "composer" } });
+  expect(launch).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "stopped" }));
+  client.close();
+});
+
+it("refuses an activating attach while the recorded Pi child of a gone supervisor is alive", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const now = "2026-08-25T00:00:00.000Z";
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "orphan-writer", sessionFile: "/sessions/orphan-writer.jsonl", canonicalSessionFile: "/sessions/orphan-writer.jsonl", cwd: "/repo", taskState: "STOPPED", processState: "EXITED", outcome: "NONE", activity: { kind: "assistant_final", summary: "Saved", updatedAt: now }, latestRunId: "run-orphan-writer", createdAt: now, updatedAt: now });
+  const stale = { pid: 831, startIdentity: "orphan-supervisor", processGroupId: 831 };
+  const livePiChild = { pid: 832, startIdentity: "orphan-pi", processGroupId: 831 };
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "orphan-writer", runId: "run-orphan-writer", leaseId: "lease-orphan-writer", generation: 1, identity: stale, piChildIdentity: livePiChild }] })}\n`, { mode: 0o600 });
+  const launch = vi.fn();
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    hostProbe: async () => ({ blockers: [] }),
+    inspect: async (/** @type {number} */ pid) => {
+      if (pid === process.pid) return { pid, startIdentity: "daemon", processGroupId: process.pid };
+      if (pid === livePiChild.pid) return livePiChild;
+      throw Object.assign(new Error("gone"), { code: "ESRCH" });
+    },
+    workerSupervisor: { launch, async close() {} },
+  });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await client.ready;
+
+  client.send({ version: 1, clientId: "client", requestId: "reopen-orphan", op: "attach", payload: { sessionId: "orphan-writer", role: "composer", activate: true } });
+  expect(await client.next()).toMatchObject({ ok: false, error: { code: "WORKER_STILL_LIVE", retryable: false } });
+  expect(launch).not.toHaveBeenCalled();
+  expect(JSON.parse(await readFile(join(stateRoot, "daemon", "workers.json"), "utf8")).workers).toHaveLength(1);
+  client.close();
+});

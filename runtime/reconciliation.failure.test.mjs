@@ -360,3 +360,65 @@ it("retains exact ownership conflicts fail-closed for live matches, dead workers
   expect((await registry.get("reused"))?.ownership).toBeDefined();
   await recovered.close();
 });
+
+it("reclaims a session whose supervisor and recorded Pi child are both gone or replaced", async () => {
+  const root = await fixture();
+  const registry = new RegistryStore(join(root, "sessions"));
+  const deadWorker = { pid: 201, startIdentity: "dead-worker", processGroupId: 201 };
+  const deadChild = { pid: 202, startIdentity: "dead-child", processGroupId: 201 };
+  const replacedWorker = { pid: 211, startIdentity: "old-worker", processGroupId: 211 };
+  const replacedChild = { pid: 212, startIdentity: "old-child", processGroupId: 211 };
+  await registry.create(record("dead-pair", deadWorker));
+  await registry.create(record("replaced-pair", replacedWorker));
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [
+    { sessionId: "dead-pair", runId: "run-dead-pair", leaseId: "lease-dead", generation: 1, identity: deadWorker, piChildIdentity: deadChild },
+    { sessionId: "replaced-pair", runId: "run-replaced-pair", leaseId: "lease-replaced", generation: 1, identity: replacedWorker, piChildIdentity: replacedChild },
+  ] })}\n`, { mode: 0o600 });
+
+  const recovered = await reconcileRuntime({
+    root,
+    daemonEpoch: "epoch",
+    inspect: async (pid) => {
+      if (pid === 211) return { ...replacedWorker, startIdentity: "new-worker" };
+      if (pid === 212) return { ...replacedChild, startIdentity: "new-child" };
+      throw Object.assign(new Error("gone"), { code: "ESRCH" });
+    },
+  });
+
+  expect(recovered.conflicts).toEqual([]);
+  expect(recovered.router.metadata("dead-pair")).toBeUndefined();
+  expect(recovered.router.metadata("replaced-pair")).toBeUndefined();
+  for (const sessionId of ["dead-pair", "replaced-pair"]) {
+    const repaired = await registry.get(sessionId);
+    expect(repaired).toMatchObject({ processState: "EXITED", taskState: "READY" });
+    expect(repaired?.ownership).toBeUndefined();
+  }
+  expect(recovered.repairedSessions.map((event) => event.payload.session.sessionId).sort()).toEqual(["dead-pair", "replaced-pair"]);
+  await recovered.close();
+});
+
+it.each([
+  ["live", async () => ({ pid: 302, startIdentity: "orphan-child", processGroupId: 301 }), "PI_CHILD_ORPHANED"],
+  ["unreadable", async () => { throw Object.assign(new Error("unreadable"), { code: "AMBIGUOUS_IDENTITY" }); }, "PI_CHILD_IDENTITY_AMBIGUOUS"],
+])("retains ownership when a dead supervisor leaves a %s Pi child", async (_name, inspectChild, reason) => {
+  const root = await fixture();
+  const registry = new RegistryStore(join(root, "sessions"));
+  const worker = { pid: 301, startIdentity: "orphan-worker", processGroupId: 301 };
+  const piChild = { pid: 302, startIdentity: "orphan-child", processGroupId: 301 };
+  await registry.create(record("orphaned", worker));
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "orphaned", runId: "run-orphaned", leaseId: "lease-orphaned", generation: 1, identity: worker, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+
+  const recovered = await reconcileRuntime({
+    root,
+    daemonEpoch: "epoch",
+    inspect: async (pid) => {
+      if (pid === piChild.pid) return inspectChild();
+      throw Object.assign(new Error("gone"), { code: "ESRCH" });
+    },
+  });
+
+  expect(recovered.conflicts.map(({ sessionId, reason: conflictReason }) => [sessionId, conflictReason])).toEqual([["orphaned", reason]]);
+  expect((await registry.get("orphaned"))?.ownership).toMatchObject({ runId: "run-orphaned" });
+  expect(recovered.router.metadata("orphaned")).toMatchObject({ sessionId: "orphaned" });
+  await recovered.close();
+});

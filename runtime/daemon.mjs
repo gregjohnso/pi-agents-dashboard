@@ -778,7 +778,22 @@ export async function createDaemonRuntime({
           if (typeof workerSupervisor?.launch !== "function") return;
           const record = await registry.get(sessionId);
           if (record === undefined) throw Object.assign(new Error("Session does not exist"), { code: "SESSION_NOT_FOUND" });
-          if (router.metadata(sessionId) !== undefined || record.ownership !== undefined) throw Object.assign(new Error("Session worker is reconnecting"), { code: "WORKER_RECONNECTING", retryable: true });
+          await router.runSession(sessionId, async (/** @type {any} */ { metadata, route, forget }) => {
+            const current = await registry.get(sessionId);
+            if (metadata !== undefined) {
+              if (route !== undefined || !(await processIsGone(metadata.identity, inspect))) {
+                throw Object.assign(new Error("Session worker is reconnecting"), { code: "WORKER_RECONNECTING", retryable: true });
+              }
+              // A Pi child outliving its supervisor is the second-writer case, and no retry clears it.
+              if (!(await processIsGone(metadata.piChildIdentity, inspect))) {
+                throw Object.assign(new Error("A worker is still running for this session"), { code: "WORKER_STILL_LIVE", retryable: false });
+              }
+              // Metadata whose supervisor and Pi child are both provably gone cannot be authoritative, and a
+              // lease this daemon still holds keeps its metadata so recovery can find that worker again.
+              if (current?.ownership === undefined) await forget();
+            }
+            if (current?.ownership !== undefined) throw Object.assign(new Error("Session worker is reconnecting"), { code: "WORKER_RECONNECTING", retryable: true });
+          });
           launchingSessions.add(sessionId);
           try {
             const handle = await workerSupervisor.launch({

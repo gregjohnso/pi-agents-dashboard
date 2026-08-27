@@ -671,7 +671,7 @@ export class DashboardController {
             if (lines.length > 0)
                 lines[0] = paintPlainLine(" pi-dashboard", this.width, jobwatchTheme.title);
             if (lines.length > 1)
-                lines[1] = paintPlainLine(` Working ${counts.working}  Ready ${counts.ready}  Failed ${counts.failed}  Sessions ${counts.sessions}  Processes ${counts.processes}`, this.width, jobwatchTheme.surface);
+                lines[1] = paintPlainLine(` Working ${counts.working}  Ready ${counts.ready}  Done ${counts.exited}  Failed ${counts.failed}  Sessions ${counts.sessions}  Processes ${counts.processes}`, this.width, jobwatchTheme.surface);
             if (lines.length > 2)
                 lines[2] = paintPlainLine(` ${this.controlSegments().join(" ")}`, this.width, jobwatchTheme.keyHints);
             if (lines.length > 3)

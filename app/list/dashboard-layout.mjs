@@ -2,6 +2,7 @@ import { basename } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { jobwatchTheme } from "./dashboard-theme.mjs";
+import { displaySessionState } from "./session-state.mjs";
 const COLUMN_LABELS = {
     id: "ID",
     name: "NAME",
@@ -121,7 +122,7 @@ function sessionValues(session, now) {
     return {
         id: `${liveness(session)} ${truncateToWidth(plainText(session.sessionId), 8, "")}`,
         name: (session.name ?? "").trim() || "—",
-        state: session.taskState,
+        state: displaySessionState(session),
         age: age(session.updatedAt, now),
         activity: (session.summary?.text ?? session.activity.summary).trim() || "—",
     };

@@ -112,21 +112,27 @@ describe("selectDashboardSessions", () => {
     });
 });
 describe("countDashboardSessions", () => {
-    it("returns deterministic task and process counts", () => {
+    it("counts the state each row displays, not the raw task state", () => {
         expect(countDashboardSessions([
             session("working", { taskState: "WORKING", processState: "LIVE" }),
             session("waiting", { taskState: "WAITING", processState: "LIVE" }),
-            session("ready", { taskState: "READY", processState: "SLEEPING" }),
+            session("ready", { taskState: "READY", processState: "LIVE" }),
+            session("sleeping", { taskState: "READY", processState: "SLEEPING" }),
+            session("done", { taskState: "READY", processState: "EXITED" }),
             session("failed", { taskState: "FAILED", processState: "EXITED" }),
             session("stopped", { taskState: "STOPPED", processState: "EXITED" }),
         ])).toEqual({
             working: 1,
             waiting: 1,
             ready: 1,
+            starting: 0,
+            sleeping: 1,
+            exited: 1,
+            stale: 0,
             failed: 1,
             stopped: 1,
-            sessions: 5,
-            processes: 2,
+            sessions: 7,
+            processes: 3,
         });
     });
 });

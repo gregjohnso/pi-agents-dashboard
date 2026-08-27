@@ -4,7 +4,7 @@ exports[`pins the complete list and viewer surfaces at 40x10 1`] = `
 {
   "list": [
     " pi-dashboard                           ",
-    " Working 1  Ready 0  Failed 0  Sessions ",
+    " Working 1  Ready 0  Done 0  Failed 0  S",
     " /search: v:live t:all p:all o:all a:all",
     "╭─ Sessions ────────────────────────────",
     "ID        STATE    ACTIVITY             ",
@@ -33,7 +33,7 @@ exports[`pins the complete list and viewer surfaces at 55x16 1`] = `
 {
   "list": [
     " pi-dashboard                                          ",
-    " Working 1  Ready 0  Failed 0  Sessions 2  Processes 2 ",
+    " Working 1  Ready 0  Done 0  Failed 0  Sessions 2  Proc",
     " /search: v:live t:all p:all o:all a:all j:all s:none g",
     "╭─ Sessions ───────────────────────────────────────────",
     "ID        NAME           STATE    ACTIVITY        AGE  ",
@@ -74,7 +74,7 @@ exports[`pins the complete list and viewer surfaces at 80x24 1`] = `
 {
   "list": [
     " pi-dashboard                                                                   ",
-    " Working 1  Ready 0  Failed 0  Sessions 2  Processes 2                          ",
+    " Working 1  Ready 0  Done 0  Failed 0  Sessions 2  Processes 2                  ",
     " /search: v:live t:all p:all o:all a:all j:all s:none g:none                    ",
     "╭─ Sessions ────────────────────────────────────────────────────────────────────",
     "ID         NAME                   STATE     ACTIVITY                     AGE    ",
@@ -131,7 +131,7 @@ exports[`pins the complete list and viewer surfaces at 120x32 1`] = `
 {
   "list": [
     " pi-dashboard                                                                                                           ",
-    " Working 1  Ready 0  Failed 0  Sessions 2  Processes 2                                                                  ",
+    " Working 1  Ready 0  Done 0  Failed 0  Sessions 2  Processes 2                                                          ",
     " /search: v:live t:all p:all o:all a:all j:all s:none g:none                                                            ",
     "╭─ Sessions ────────────────────────────────────────────────────────────────────────────────────────────────────────────",
     "ID         NAME                         STATE     ACTIVITY                                                       AGE    ",
@@ -204,7 +204,7 @@ exports[`pins the complete list and viewer surfaces at 160x40 1`] = `
 {
   "list": [
     " pi-dashboard                                                                                                                                                   ",
-    " Working 1  Ready 0  Failed 0  Sessions 2  Processes 2                                                                                                          ",
+    " Working 1  Ready 0  Done 0  Failed 0  Sessions 2  Processes 2                                                                                                  ",
     " /search: v:live t:all p:all o:all a:all j:all s:none g:none                                                                                                    ",
     "╭─ Sessions ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
     "ID         NAME                         STATE     ACTIVITY                                                                                               AGE    ",

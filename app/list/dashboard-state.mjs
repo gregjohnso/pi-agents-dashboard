@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { displaySessionState } from "./session-state.mjs";
 const TASK_STATE_ORDER = {
     WORKING: 0,
     WAITING: 1,
@@ -119,13 +120,19 @@ export function countDashboardSessions(sessions) {
         working: 0,
         waiting: 0,
         ready: 0,
+        starting: 0,
+        sleeping: 0,
+        exited: 0,
+        stale: 0,
         failed: 0,
         stopped: 0,
         sessions: sessions.length,
         processes: 0,
     };
     for (const session of sessions) {
-        counts[session.taskState.toLowerCase()] += 1;
+        const state = displaySessionState(session).toLowerCase();
+        if (state in counts)
+            counts[state] += 1;
         if (session.processState === "LIVE")
             counts.processes += 1;
     }

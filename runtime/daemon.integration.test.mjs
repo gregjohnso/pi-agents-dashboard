@@ -261,6 +261,43 @@ it("rejects worker mutations during reconciliation without touching unopened sto
   worker.close();
 });
 
+it("marks a stopped session STOPPED rather than leaving it ready", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const now = "2026-08-25T12:00:00.000Z";
+  const identity = { pid: 701, startIdentity: "77001", processGroupId: 701 };
+  const piChild = { pid: 702, startIdentity: "77002", processGroupId: 701 };
+  let workerAlive = true;
+  const inspect = async (/** @type {number} */ pid) => {
+    if (pid === process.pid) return { pid, startIdentity: "daemon", processGroupId: process.pid };
+    if (!workerAlive) throw Object.assign(new Error("gone"), { code: "ENOENT" });
+    return pid === 701 ? identity : piChild;
+  };
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "stopping", sessionFile: "/sessions/stopping.jsonl", canonicalSessionFile: "/sessions/stopping.jsonl", cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "assistant_stream", summary: "streaming", updatedAt: now }, ownership: { kind: "managed", runId: "run-stopping", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-stopping", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "stopping", runId: "run-stopping", leaseId: "lease-stopping", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  const runtime = await createDaemonRuntime({
+    root: stateRoot, inspect,
+    signalProcessGroupImpl: async () => {},
+    stopPolicy: { gracefulMs: 200, terminateMs: 200 },
+  });
+  runtimes.push(runtime);
+  startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "stopping", runId: "run-stopping", leaseId: "lease-stopping", generation: 1, identity, piChildIdentity: piChild, token: "stopping-token", results: { get_state: { sessionId: "stopping", isStreaming: true } } });
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
+  await client.ready;
+  client.send({ version: 1, clientId: "viewer", requestId: "attach-stop", op: "attach", payload: { sessionId: "stopping", role: "composer" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+  const current = await registry.get("stopping");
+  if (current === undefined) throw new Error("stopping record missing");
+  setTimeout(() => { workerAlive = false; }, 20);
+  client.send({ version: 1, clientId: "viewer", requestId: "stop-request", op: "stop", payload: { sessionId: "stopping", revision: current.revision } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+
+  expect(await registry.get("stopping")).toMatchObject({ taskState: "STOPPED", processState: "EXITED", outcome: "NONE" });
+  client.close();
+});
+
 it("repairs an abandoned launch to FAILED and leaves finished sessions untouched", async () => {
   const stateRoot = await root();
   for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });

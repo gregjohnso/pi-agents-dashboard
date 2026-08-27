@@ -1145,7 +1145,9 @@ export async function createDaemonRuntime({
               if (observedTerminal) {
                 const latest = await registry.get(request.payload.sessionId);
                 if (latest?.revision === exactRecord.revision && latest.ownership?.runId === exactRecord.ownership.runId) {
-                  const updated = await registry.update(latest.sessionId, latest.revision, { ownership: undefined, processState: "EXITED", updatedAt: new Date().toISOString() });
+                  // Stop is a task-state verdict; a reviewable outcome the session already earned stays intact.
+                  const stopped = reduceSessionState(latest, { type: "USER_STOPPED", at: new Date().toISOString() });
+                  const updated = await registry.update(latest.sessionId, latest.revision, { ownership: undefined, taskState: stopped.taskState, processState: stopped.processState, outcome: latest.outcome, activity: stopped.activity, updatedAt: stopped.updatedAt });
                   const event = await context.recovery.events.append({ kind: "session_changed", payload: { session: updated } });
                   context.broadcast(event);
                 }

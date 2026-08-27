@@ -137,7 +137,7 @@ it("journals Stop before exact-group escalation and leaves task/outcome independ
   frontend.send(request("client", "stop-request", "stop", { sessionId: session.sessionId, revision: 0 }));
   expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
   const stopped = await registry.get(session.sessionId);
-  expect(stopped).toMatchObject({ processState: "EXITED", taskState: "READY", outcome: "READY_FOR_REVIEW" });
+  expect(stopped).toMatchObject({ processState: "EXITED", taskState: "STOPPED", outcome: "READY_FOR_REVIEW" });
   expect(stopped.ownership).toBeUndefined();
   const journal = await readFile(join(root, "queue", "commands.jsonl"), "utf8");
   expect(journal.indexOf('"stage":"DELIVERY_ATTEMPTED"')).toBeLessThan(journal.lastIndexOf('"stage":"WORKER_ACKNOWLEDGED"'));

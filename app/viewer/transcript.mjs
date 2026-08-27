@@ -149,6 +149,12 @@ export class TranscriptModel {
     }
   }
   scrollToEnd() { this.distanceFromEnd = 0; this.following = true; this.newActivity = false; }
+  scrollToStart() {
+    // `distanceFromEnd` counts items hidden below the window, so the oldest item stays visible
+    // only when at least one screenful remains above it.
+    this.distanceFromEnd = Math.max(0, this.state.items.length - 1);
+    this.following = false;
+  }
   toggleTool(toolId) {
     if (this.expandedTools.has(toolId)) this.expandedTools.delete(toolId); else this.expandedTools.add(toolId);
   }

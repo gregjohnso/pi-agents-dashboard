@@ -912,3 +912,16 @@ describe("daemon dashboard backend", () => {
         expect(requests).toEqual(expect.arrayContaining([expect.objectContaining({ op: "ack", payload: { cursor: one } })]));
     });
 });
+
+describe("wheel scrolling", () => {
+    it("moves the selection up and down from wheel events", async () => {
+        const dashboard = controller(new FakeBackend([session("a"), session("b"), session("c"), session("d"), session("e")]));
+        await dashboard.open();
+        dashboard.render(80, 24);
+        dashboard.selectSession("a");
+        dashboard.handleMouse({ button: "wheel_down", column: 5, row: 7 });
+        expect(dashboard.selectedSessionId).toBe("d");
+        dashboard.handleMouse({ button: "wheel_up", column: 5, row: 7 });
+        expect(dashboard.selectedSessionId).toBe("a");
+    });
+});

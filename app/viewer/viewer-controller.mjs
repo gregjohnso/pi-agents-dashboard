@@ -16,6 +16,11 @@ function fit(line, width) {
 
 function isPageUp(data) { return matchesKey(data, Key.pageUp); }
 function isPageDown(data) { return matchesKey(data, Key.pageDown); }
+function isHome(data) { return matchesKey(data, Key.home); }
+function isEnd(data) { return matchesKey(data, Key.end); }
+
+/** Lines moved per wheel notch, matching Jobwatch's three-line step. */
+const WHEEL_SCROLL_LINES = 3;
 
 const QUEUED_MESSAGE_ROWS = 3;
 const MIN_TRANSCRIPT_ROWS = 3;
@@ -39,8 +44,8 @@ function renderKeyHints({ role, working }, width) {
   const segments = role !== "composer"
     ? ["Esc/← list", "↑↓ scroll", "Ctrl+T thinking", "Ctrl+O tools"]
     : working
-      ? ["Esc interrupt", "← list", "Ctrl+S steer", "Ctrl+T thinking", "Ctrl+O tools", "/ commands"]
-      : ["Esc/← list", "Ctrl+S steer", "Ctrl+T thinking", "Ctrl+O tools", "/ commands"];
+      ? ["Esc interrupt", "← list", "↑↓ scroll", "Ctrl+S steer", "Ctrl+T thinking", "Ctrl+O tools", "/ commands"]
+      : ["Esc/← list", "↑↓ scroll", "Ctrl+S steer", "Ctrl+T thinking", "Ctrl+O tools", "/ commands"];
   for (let count = segments.length; count > 0; count -= 1) {
     const line = ` ${segments.slice(0, count).join(" · ")}`;
     if (visibleWidth(line) <= width) return line;
@@ -193,8 +198,19 @@ export class ViewerController {
       return;
     }
     if (matchesKey(data, Key.ctrl("o"))) { this.transcript.selectNextTool(1); this.returnGesture.cancel(); this.requestRender(); return; }
+    if (isHome(data)) { this.transcript.scrollToStart(); this.returnGesture.cancel(); this.requestRender(); return; }
+    if (isEnd(data)) { this.transcript.scrollToEnd(); this.returnGesture.cancel(); this.requestRender(); return; }
     if (isPageUp(data) || (this.state.role === "observer" && matchesKey(data, Key.up))) { this.transcript.scrollBy(-1); this.requestRender(); return; }
     if (isPageDown(data) || (this.state.role === "observer" && matchesKey(data, Key.down))) { this.transcript.scrollBy(1); this.requestRender(); return; }
+    // Arrows scroll only when the editor has nothing to offer: no draft to move within and no prompt
+    // history to recall. Either one hands them back to Pi's editor, which keeps history reachable and
+    // keeps the Left double-press gesture honest about a dirty prompt.
+    if ((matchesKey(data, Key.up) || matchesKey(data, Key.down)) && this.editor.getText().length === 0 && this.history.length === 0) {
+      this.transcript.scrollBy(matchesKey(data, Key.up) ? -1 : 1);
+      this.returnGesture.cancel();
+      this.requestRender();
+      return;
+    }
     if (matchesKey(data, Key.up) || matchesKey(data, Key.down)) {
       this.historyUsed ||= this.history.length > 0;
       this.returnGesture.cancel();
@@ -230,6 +246,15 @@ export class ViewerController {
     }
     if (this.state.role !== "composer") return;
     this.editor.handleInput(data);
+    this.requestRender();
+  }
+
+  /** @param {{ button: string, column: number, row: number }} event */
+  handleMouse(event) {
+    if (this.closedState || this.state === undefined) return;
+    if (event.button === "wheel_up") this.transcript.scrollBy(-WHEEL_SCROLL_LINES);
+    else if (event.button === "wheel_down") this.transcript.scrollBy(WHEEL_SCROLL_LINES);
+    else return;
     this.requestRender();
   }
 
@@ -409,6 +434,8 @@ export class ViewerController {
       "",
       "Esc  interrupt a running turn, then return to the list",
       "←  return to the list",
+      "↑↓  scroll the transcript while the prompt is empty, else recall prompt history",
+      "Home/End  jump to the start or end · wheel scrolls",
       "Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · Ctrl+C interrupt",
     ];
   }

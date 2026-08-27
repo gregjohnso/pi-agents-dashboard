@@ -635,6 +635,11 @@ export class DashboardController {
         else if (data === "g")
             this.setGrouping(cycleValue(GROUPS, this.query.groupBy));
     }
+    /**
+     * Only wheel events arrive in production: the terminal tap in app/mouse-input.mjs forwards
+     * wheel notches and passes clicks through to pi-tui's own selection handling. The click
+     * branches below stay covered by tests but are unreachable until pi-tui exposes a click seam.
+     */
     handleMouse(event) {
         if (event.button === "wheel_up") {
             this.moveSelection(-3);

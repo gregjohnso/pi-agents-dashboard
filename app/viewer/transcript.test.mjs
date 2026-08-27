@@ -78,3 +78,41 @@ describe("virtual transcript", () => {
     expect(adapters.component).toHaveBeenCalledTimes(4);
   });
 });
+
+describe("transcript scroll anchors", () => {
+  const adapters = { component: vi.fn((item) => ({ render: () => [item.itemId ?? item.kind] })) };
+  const longState = () => createTranscriptState({ ...snapshot, items: Array.from({ length: 50 }, (_, index) => ({ kind: "system_message", itemId: `i-${index}`, text: `line ${index}`, level: "info" })) });
+
+  it("jumps to the start and detaches follow", () => {
+    const transcript = new TranscriptModel({ state: longState(), adapters });
+    transcript.setViewport(80, 5);
+    transcript.scrollToStart();
+    expect(transcript.following).toBe(false);
+    expect(transcript.distanceFromEnd).toBe(49);
+    const atStart = transcript.render(80, 5).map(stripVTControlCharacters);
+    expect(atStart.join("\n")).toContain("i-0");
+    expect(atStart.join("\n")).not.toContain("i-49");
+  });
+
+  it("jumps to the end, resumes follow, and clears the activity marker", () => {
+    const transcript = new TranscriptModel({ state: longState(), adapters });
+    transcript.setViewport(80, 5);
+    transcript.scrollToStart();
+    transcript.update(applyViewerEvent(transcript.state, event({ kind: "system_message", itemId: "fresh", text: "fresh", level: "info" })));
+    expect(transcript.newActivity).toBe(true);
+    transcript.scrollToEnd();
+    expect(transcript.following).toBe(true);
+    expect(transcript.newActivity).toBe(false);
+    expect(stripVTControlCharacters(transcript.render(80, 5).join("\n"))).not.toContain("new activity");
+  });
+
+  it("resumes follow when scrolling back down to the end", () => {
+    const transcript = new TranscriptModel({ state: longState(), adapters });
+    transcript.setViewport(80, 5);
+    transcript.scrollBy(-4);
+    expect(transcript.following).toBe(false);
+    transcript.scrollBy(4);
+    expect(transcript.following).toBe(true);
+    expect(transcript.distanceFromEnd).toBe(0);
+  });
+});

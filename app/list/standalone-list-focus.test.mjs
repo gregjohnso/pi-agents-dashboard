@@ -1,3 +1,4 @@
+import { createWheelInputTap } from "../mouse-input.mjs";
 import { TuiAltScreen } from "@earendil-works/pi-tui";
 import { expect, it, vi } from "vitest";
 
@@ -46,4 +47,21 @@ it("focuses the mounted list host so real TUI input reaches the active controlle
   terminal.input?.("\x1b[B");
   expect(active.handleInput).toHaveBeenCalledWith("\x1b[B");
   tui.stop({ preserveScreen: true });
+});
+
+it("routes wheel events past pi-tui to the active surface", () => {
+  const terminal = createWheelInputTap(new FakeTerminal());
+  const tui = new TuiAltScreen(terminal, false, undefined, { mouse: false });
+  const active = { render: vi.fn(() => ["dashboard"]), handleInput: vi.fn(), handleMouse: vi.fn() };
+  const host = standaloneList.mountStandaloneHost({ tui, getActive: () => active, terminal });
+
+  tui.start();
+  terminal.input?.("\x1b[<64;4;9M");
+  expect(active.handleMouse).toHaveBeenCalledWith({ button: "wheel_up", column: 3, row: 8 });
+  expect(active.handleInput).not.toHaveBeenCalled();
+
+  terminal.input?.("\x1b[B");
+  expect(active.handleInput).toHaveBeenCalledWith("\x1b[B");
+  tui.stop({ preserveScreen: true });
+  expect(host.component).toBeDefined();
 });

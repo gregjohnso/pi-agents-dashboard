@@ -431,8 +431,8 @@ describe("Pi interactive-mode parity", () => {
     expect(lines.some((line) => /^ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working\.\.\./u.test(line))).toBe(true);
     expect(lines.join("\n")).toContain("(Esc to interrupt)");
     expect(lines.at(-2)).toMatch(/\(anthropic\) opus • high$/u);
-    expect(lines.at(-1)).toBe(" Esc interrupt · ← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools");
-    expect(f.instance.render(120, 24).at(-1)).toBe(" Esc interrupt · ← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands");
+    expect(lines.at(-1)).toBe(" Esc interrupt · ← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking");
+    expect(f.instance.render(120, 24).at(-1)).toBe(" Esc interrupt · ← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands");
   });
 
   it("drops the interrupt hint and offers the list keys once the turn settles", async () => {
@@ -441,7 +441,7 @@ describe("Pi interactive-mode parity", () => {
     const lines = f.instance.render(80, 24).map(stripVTControlCharacters);
     expect(lines.join("\n")).not.toContain("to interrupt");
     expect(lines.at(-2)).toMatch(/\(anthropic\) opus • thinking off$/u);
-    expect(lines.at(-1)).toBe(" Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands");
+    expect(lines.at(-1)).toBe(" Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools");
   });
 
   it("keeps the hints and model footer inside every supported width", async () => {
@@ -501,5 +501,87 @@ describe("Pi interactive-mode parity", () => {
     expect([lines[userIndex - 2].trim(), lines[userIndex - 1].trim()]).toEqual(["", ""]);
     expect(lines.join("\n")).toContain(" Warning: provider degraded");
     expect(lines.join("\n")).toContain(" Error: PROVIDER_ERROR: provider error");
+  });
+});
+
+describe("transcript scrolling keys and wheel", () => {
+  const longSnapshot = { items: Array.from({ length: 60 }, (_, index) => ({ kind: "system_message", itemId: `i-${index}`, text: `line ${index}`, level: "info" })) };
+
+  it("scrolls with the arrows while the prompt is empty", async () => {
+    const f = fixture({ snapshot: longSnapshot });
+    await f.instance.open();
+    f.instance.render(80, 24);
+    f.instance.handleInput("\x1b[A");
+    expect(f.instance.transcript.following).toBe(false);
+    f.instance.handleInput("\x1b[B");
+    expect(f.instance.transcript.following).toBe(true);
+  });
+
+  it("hands the arrows to Pi's prompt history once a draft exists", async () => {
+    const f = fixture({ snapshot: longSnapshot });
+    await f.instance.open();
+    f.instance.render(80, 24);
+    f.instance.editor.setText("draft");
+    const before = f.instance.transcript.distanceFromEnd;
+    f.instance.handleInput("\x1b[A");
+    expect(f.instance.transcript.distanceFromEnd).toBe(before);
+    expect(f.instance.transcript.following).toBe(true);
+  });
+
+  it("returns the arrows to scrolling when the prompt is cleared", async () => {
+    const f = fixture({ snapshot: longSnapshot });
+    await f.instance.open();
+    f.instance.render(80, 24);
+    f.instance.editor.setText("draft");
+    f.instance.handleInput("\x1b[A");
+    expect(f.instance.transcript.following).toBe(true);
+    f.instance.editor.setText("");
+    f.instance.handleInput("\x1b[A");
+    expect(f.instance.transcript.following).toBe(false);
+  });
+
+  it("leaves the arrows to Pi once prompt history exists, so recall keeps working", async () => {
+    const f = fixture({ snapshot: longSnapshot });
+    await f.instance.open();
+    f.instance.render(80, 24);
+    f.instance.history.push("earlier prompt");
+    f.instance.handleInput("\x1b[A");
+    expect(f.instance.transcript.following).toBe(true);
+    expect(f.instance.transcript.distanceFromEnd).toBe(0);
+  });
+
+  it("jumps to the transcript start and end with Home and End", async () => {
+    const f = fixture({ snapshot: longSnapshot });
+    await f.instance.open();
+    f.instance.render(80, 24);
+    f.instance.handleInput("\x1b[H");
+    expect(f.instance.transcript.following).toBe(false);
+    expect(f.instance.transcript.distanceFromEnd).toBe(59);
+    f.instance.handleInput("\x1b[F");
+    expect(f.instance.transcript.following).toBe(true);
+    expect(f.instance.transcript.distanceFromEnd).toBe(0);
+  });
+
+  it("scrolls the transcript from a wheel event and resumes follow at the end", async () => {
+    const f = fixture({ snapshot: longSnapshot });
+    await f.instance.open();
+    f.instance.render(80, 24);
+    f.instance.handleMouse({ button: "wheel_up", column: 10, row: 5 });
+    expect(f.instance.transcript.following).toBe(false);
+    expect(f.instance.transcript.distanceFromEnd).toBeGreaterThan(0);
+    f.instance.handleMouse({ button: "wheel_down", column: 10, row: 5 });
+    f.instance.handleMouse({ button: "wheel_down", column: 10, row: 5 });
+    expect(f.instance.transcript.following).toBe(true);
+  });
+
+  it("keeps the new-activity marker while detached and drops it on return to the end", async () => {
+    const f = fixture({ snapshot: longSnapshot });
+    await f.instance.open();
+    f.instance.render(80, 24);
+    f.instance.handleMouse({ button: "wheel_up", column: 10, row: 5 });
+    await f.emit({ version: 1, sessionId: "s", eventId: "e1", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "system_message", itemId: "fresh", text: "fresh", level: "info" } });
+    expect(stripVTControlCharacters(f.instance.render(80, 24).join("\n"))).toContain("new activity");
+    f.instance.handleInput("\x1b[F");
+    expect(stripVTControlCharacters(f.instance.render(80, 24).join("\n"))).not.toContain("new activity");
   });
 });

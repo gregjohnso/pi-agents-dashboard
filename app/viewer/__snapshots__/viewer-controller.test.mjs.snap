@@ -11,7 +11,7 @@ exports[`viewer rendering and navigation > renders a bounded 40x10 Pi-style fixt
   " ⠋ Thinking · 0s (Esc to interrupt)",
   "> ",
   "                 (anthropic) opus • high",
-  " Esc interrupt · ← list · Ctrl+S steer",
+  " Esc interrupt · ← list · ↑↓ scroll",
 ]
 `;
 
@@ -32,7 +32,7 @@ exports[`viewer rendering and navigation > renders a bounded 55x16 Pi-style fixt
   " ⠋ Thinking · 0s (Esc to interrupt)",
   "> ",
   "                                (anthropic) opus • high",
-  " Esc interrupt · ← list · Ctrl+S steer",
+  " Esc interrupt · ← list · ↑↓ scroll · Ctrl+S steer",
 ]
 `;
 
@@ -61,7 +61,7 @@ exports[`viewer rendering and navigation > renders a bounded 80x24 Pi-style fixt
   " ⠋ Thinking · 0s (Esc to interrupt)",
   "> ",
   "                                                         (anthropic) opus • high",
-  " Esc interrupt · ← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+  " Esc interrupt · ← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking",
 ]
 `;
 
@@ -98,7 +98,7 @@ exports[`viewer rendering and navigation > renders a bounded 120x32 Pi-style fix
   " ⠋ Thinking · 0s (Esc to interrupt)",
   "> ",
   "                                                                                                 (anthropic) opus • high",
-  " Esc interrupt · ← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+  " Esc interrupt · ← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
 ]
 `;
 
@@ -143,7 +143,7 @@ exports[`viewer rendering and navigation > renders a bounded 160x40 Pi-style fix
   " ⠋ Thinking · 0s (Esc to interrupt)",
   "> ",
   "                                                                                                                                         (anthropic) opus • high",
-  " Esc interrupt · ← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+  " Esc interrupt · ← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
 ]
 `;
 
@@ -159,7 +159,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " ⠋ Running bash · 0s · pytest (Esc to in",
     "> ",
     "                                no-model",
-    " Esc interrupt · ← list · Ctrl+S steer",
+    " Esc interrupt · ← list · ↑↓ scroll",
   ],
   "assistant": [
     " READY/LIVE · COMPOSER",
@@ -171,7 +171,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " - item                                 ",
     "> ",
     "                                no-model",
-    " Esc/← list · Ctrl+S steer",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "compaction": [
     " READY/LIVE · COMPOSER",
@@ -183,7 +183,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Compacting context",
     "> ",
     "                                no-model",
-    " Esc/← list · Ctrl+S steer",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "error": [
     " READY/LIVE · COMPOSER",
@@ -195,7 +195,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Error: PROVIDER_ERROR: provider error",
     "> ",
     "                                no-model",
-    " Esc/← list · Ctrl+S steer",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "model-thinking": [
     " READY/LIVE · COMPOSER",
@@ -207,7 +207,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                        ",
     "> ",
     "                 (anthropic) opus • high",
-    " Esc/← list · Ctrl+S steer",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "observer": [
     " READY/LIVE · OBSERVER",
@@ -231,7 +231,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "↓ new activity",
     "> ",
     "                                no-model",
-    " Esc/← list · Ctrl+S steer",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "pending-ui": [
     " WAITING/LIVE · COMPOSER",
@@ -243,7 +243,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "line one                                ",
     "> ",
     "                                no-model",
-    " Esc/← list · Ctrl+S steer",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "placeholders": [
     " READY/LIVE · COMPOSER",
@@ -255,7 +255,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " File: safe.txt 12 bytes",
     "> ",
     "                                no-model",
-    " Esc/← list · Ctrl+S steer",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "reconnect": [
     " READY/LIVE · COMPOSER",
@@ -267,7 +267,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Connection lost; reconnecting",
     "> ",
     "                                no-model",
-    " Esc/← list · Ctrl+S steer",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "retry": [
     " READY/LIVE · COMPOSER",
@@ -279,7 +279,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Retrying in 4s",
     "> ",
     "                                no-model",
-    " Esc/← list · Ctrl+S steer",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "streaming": [
     " READY/LIVE · COMPOSER",
@@ -291,7 +291,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Streaming **markdown                   ",
     "> ",
     "                                no-model",
-    " Esc/← list · Ctrl+S steer",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "thinking-hidden": [
     " READY/LIVE · COMPOSER",
@@ -303,7 +303,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Answer                                 ",
     "> ",
     " Thinking blocks: hidden  no-model • hig",
-    " Esc/← list · Ctrl+S steer",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "thinking-visible": [
     " READY/LIVE · COMPOSER",
@@ -315,7 +315,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Answer                                 ",
     "> ",
     "                         no-model • high",
-    " Esc/← list · Ctrl+S steer",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "tool-completed": [
     " READY/LIVE · COMPOSER",
@@ -327,7 +327,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                        ",
     "> ",
     "                                no-model",
-    " Esc/← list · Ctrl+S steer",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "tool-failed": [
     " READY/LIVE · COMPOSER",
@@ -339,7 +339,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                        ",
     "> ",
     "                                no-model",
-    " Esc/← list · Ctrl+S steer",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "tool-pending": [
     " READY/LIVE · COMPOSER",
@@ -351,7 +351,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                        ",
     "> ",
     "                                no-model",
-    " Esc/← list · Ctrl+S steer",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "tool-running": [
     " READY/LIVE · COMPOSER",
@@ -363,7 +363,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                        ",
     "> ",
     "                                no-model",
-    " Esc/← list · Ctrl+S steer",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "tool-streaming": [
     " READY/LIVE · COMPOSER",
@@ -375,7 +375,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                        ",
     "> ",
     "                                no-model",
-    " Esc/← list · Ctrl+S steer",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "unknown": [
     " READY/LIVE · COMPOSER",
@@ -387,7 +387,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Activity (future): Future Pi event",
     "> ",
     "                                no-model",
-    " Esc/← list · Ctrl+S steer",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "user": [
     " READY/LIVE · COMPOSER",
@@ -399,7 +399,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                        ",
     "> ",
     "                                no-model",
-    " Esc/← list · Ctrl+S steer",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
 }
 `;
@@ -422,7 +422,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " ⠋ Running bash · 0s · pytest (Esc to interrupt)",
     "> ",
     "                                               no-model",
-    " Esc interrupt · ← list · Ctrl+S steer",
+    " Esc interrupt · ← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "assistant": [
     " s · READY/LIVE · COMPOSER",
@@ -440,7 +440,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " - item                                                ",
     "> ",
     "                                               no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "compaction": [
     " s · READY/LIVE · COMPOSER",
@@ -458,7 +458,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Compacting context",
     "> ",
     "                                               no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "error": [
     " s · READY/LIVE · COMPOSER",
@@ -476,7 +476,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Error: PROVIDER_ERROR: provider error",
     "> ",
     "                                               no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "model-thinking": [
     " s · READY/LIVE · COMPOSER",
@@ -494,7 +494,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                       ",
     "> ",
     "                                (anthropic) opus • high",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "observer": [
     " s · READY/LIVE · OBSERVER",
@@ -530,7 +530,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "↓ new activity",
     "> ",
     "                                               no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "pending-ui": [
     " s · WAITING/LIVE · COMPOSER",
@@ -548,7 +548,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "",
     "> ",
     "                                               no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "placeholders": [
     " s · READY/LIVE · COMPOSER",
@@ -566,7 +566,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " File: safe.txt 12 bytes",
     "> ",
     "                                               no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "reconnect": [
     " s · READY/LIVE · COMPOSER",
@@ -584,7 +584,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Connection lost; reconnecting",
     "> ",
     "                                               no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "retry": [
     " s · READY/LIVE · COMPOSER",
@@ -602,7 +602,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Retrying in 4s",
     "> ",
     "                                               no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "streaming": [
     " s · READY/LIVE · COMPOSER",
@@ -620,7 +620,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Streaming **markdown                                  ",
     "> ",
     "                                               no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "thinking-hidden": [
     " s · READY/LIVE · COMPOSER",
@@ -638,7 +638,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Answer                                                ",
     "> ",
     " Thinking blocks: hidden                no-model • high",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "thinking-visible": [
     " s · READY/LIVE · COMPOSER",
@@ -656,7 +656,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Answer                                                ",
     "> ",
     "                                        no-model • high",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "tool-completed": [
     " s · READY/LIVE · COMPOSER",
@@ -674,7 +674,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                       ",
     "> ",
     "                                               no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "tool-failed": [
     " s · READY/LIVE · COMPOSER",
@@ -692,7 +692,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                       ",
     "> ",
     "                                               no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "tool-pending": [
     " s · READY/LIVE · COMPOSER",
@@ -710,7 +710,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                       ",
     "> ",
     "                                               no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "tool-running": [
     " s · READY/LIVE · COMPOSER",
@@ -728,7 +728,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                       ",
     "> ",
     "                                               no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "tool-streaming": [
     " s · READY/LIVE · COMPOSER",
@@ -746,7 +746,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                       ",
     "> ",
     "                                               no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "unknown": [
     " s · READY/LIVE · COMPOSER",
@@ -764,7 +764,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Activity (future): Future Pi event",
     "> ",
     "                                               no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
   "user": [
     " s · READY/LIVE · COMPOSER",
@@ -782,7 +782,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                       ",
     "> ",
     "                                               no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer",
   ],
 }
 `;
@@ -813,7 +813,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " ⠋ Running bash · 0s · pytest (Esc to interrupt)",
     "> ",
     "                                                                        no-model",
-    " Esc interrupt · ← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+    " Esc interrupt · ← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking",
   ],
   "assistant": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -839,7 +839,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " - item                                                                         ",
     "> ",
     "                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "compaction": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -865,7 +865,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Compacting context",
     "> ",
     "                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "error": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -891,7 +891,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Error: PROVIDER_ERROR: provider error",
     "> ",
     "                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "model-thinking": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -917,7 +917,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                ",
     "> ",
     "                                                         (anthropic) opus • high",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "observer": [
     " pi-dashboard · s · READY/LIVE · OBSERVER",
@@ -969,7 +969,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "↓ new activity",
     "> ",
     "                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "pending-ui": [
     " pi-dashboard · s · WAITING/LIVE · COMPOSER",
@@ -995,7 +995,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "────────────────────────────────────────────────────────────────────────────────",
     "> ",
     "                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "placeholders": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1021,7 +1021,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " File: safe.txt 12 bytes",
     "> ",
     "                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "reconnect": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1047,7 +1047,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Connection lost; reconnecting",
     "> ",
     "                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "retry": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1073,7 +1073,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Retrying in 4s",
     "> ",
     "                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "streaming": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1099,7 +1099,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Streaming **markdown                                                           ",
     "> ",
     "                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "thinking-hidden": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1125,7 +1125,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Answer                                                                         ",
     "> ",
     " Thinking blocks: hidden                                         no-model • high",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "thinking-visible": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1151,7 +1151,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Answer                                                                         ",
     "> ",
     "                                                                 no-model • high",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "tool-completed": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1177,7 +1177,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                ",
     "> ",
     "                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "tool-failed": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1203,7 +1203,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                ",
     "> ",
     "                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "tool-pending": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1229,7 +1229,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                ",
     "> ",
     "                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "tool-running": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1255,7 +1255,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                ",
     "> ",
     "                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "tool-streaming": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1281,7 +1281,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                ",
     "> ",
     "                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "unknown": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1307,7 +1307,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Activity (future): Future Pi event",
     "> ",
     "                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "user": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1333,7 +1333,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                ",
     "> ",
     "                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
 }
 `;
@@ -1372,7 +1372,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " ⠋ Running bash · 0s · pytest (Esc to interrupt)",
     "> ",
     "                                                                                                                no-model",
-    " Esc interrupt · ← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc interrupt · ← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "assistant": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1406,7 +1406,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " - item                                                                                                                 ",
     "> ",
     "                                                                                                                no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "compaction": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1440,7 +1440,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Compacting context",
     "> ",
     "                                                                                                                no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "error": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1474,7 +1474,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Error: PROVIDER_ERROR: provider error",
     "> ",
     "                                                                                                                no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "model-thinking": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1508,7 +1508,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                                                        ",
     "> ",
     "                                                                                                 (anthropic) opus • high",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "observer": [
     " pi-dashboard · s · READY/LIVE · OBSERVER",
@@ -1576,7 +1576,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "↓ new activity",
     "> ",
     "                                                                                                                no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "pending-ui": [
     " pi-dashboard · s · WAITING/LIVE · COMPOSER",
@@ -1610,7 +1610,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
     "> ",
     "                                                                                                                no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "placeholders": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1644,7 +1644,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " File: safe.txt 12 bytes",
     "> ",
     "                                                                                                                no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "reconnect": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1678,7 +1678,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Connection lost; reconnecting",
     "> ",
     "                                                                                                                no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "retry": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1712,7 +1712,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Retrying in 4s",
     "> ",
     "                                                                                                                no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "streaming": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1746,7 +1746,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Streaming **markdown                                                                                                   ",
     "> ",
     "                                                                                                                no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "thinking-hidden": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1780,7 +1780,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Answer                                                                                                                 ",
     "> ",
     " Thinking blocks: hidden                                                                                 no-model • high",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "thinking-visible": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1814,7 +1814,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Answer                                                                                                                 ",
     "> ",
     "                                                                                                         no-model • high",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "tool-completed": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1848,7 +1848,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                                                        ",
     "> ",
     "                                                                                                                no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "tool-failed": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1882,7 +1882,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                                                        ",
     "> ",
     "                                                                                                                no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "tool-pending": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1916,7 +1916,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                                                        ",
     "> ",
     "                                                                                                                no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "tool-running": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1950,7 +1950,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                                                        ",
     "> ",
     "                                                                                                                no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "tool-streaming": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -1984,7 +1984,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                                                        ",
     "> ",
     "                                                                                                                no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "unknown": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -2018,7 +2018,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Activity (future): Future Pi event",
     "> ",
     "                                                                                                                no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "user": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -2052,7 +2052,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                                                        ",
     "> ",
     "                                                                                                                no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
 }
 `;
@@ -2099,7 +2099,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " ⠋ Running bash · 0s · pytest (Esc to interrupt)",
     "> ",
     "                                                                                                                                                        no-model",
-    " Esc interrupt · ← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc interrupt · ← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "assistant": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -2141,7 +2141,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " - item                                                                                                                                                         ",
     "> ",
     "                                                                                                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "compaction": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -2183,7 +2183,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Compacting context",
     "> ",
     "                                                                                                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "error": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -2225,7 +2225,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Error: PROVIDER_ERROR: provider error",
     "> ",
     "                                                                                                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "model-thinking": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -2267,7 +2267,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                                                                                                ",
     "> ",
     "                                                                                                                                         (anthropic) opus • high",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "observer": [
     " pi-dashboard · s · READY/LIVE · OBSERVER",
@@ -2351,7 +2351,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "↓ new activity",
     "> ",
     "                                                                                                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "pending-ui": [
     " pi-dashboard · s · WAITING/LIVE · COMPOSER",
@@ -2393,7 +2393,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
     "> ",
     "                                                                                                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "placeholders": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -2435,7 +2435,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " File: safe.txt 12 bytes",
     "> ",
     "                                                                                                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "reconnect": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -2477,7 +2477,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Connection lost; reconnecting",
     "> ",
     "                                                                                                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "retry": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -2519,7 +2519,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Retrying in 4s",
     "> ",
     "                                                                                                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "streaming": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -2561,7 +2561,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Streaming **markdown                                                                                                                                           ",
     "> ",
     "                                                                                                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "thinking-hidden": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -2603,7 +2603,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Answer                                                                                                                                                         ",
     "> ",
     " Thinking blocks: hidden                                                                                                                         no-model • high",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "thinking-visible": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -2645,7 +2645,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Answer                                                                                                                                                         ",
     "> ",
     "                                                                                                                                                 no-model • high",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "tool-completed": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -2687,7 +2687,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                                                                                                ",
     "> ",
     "                                                                                                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "tool-failed": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -2729,7 +2729,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                                                                                                ",
     "> ",
     "                                                                                                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "tool-pending": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -2771,7 +2771,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                                                                                                ",
     "> ",
     "                                                                                                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "tool-running": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -2813,7 +2813,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                                                                                                ",
     "> ",
     "                                                                                                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "tool-streaming": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -2855,7 +2855,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                                                                                                ",
     "> ",
     "                                                                                                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "unknown": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -2897,7 +2897,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Activity (future): Future Pi event",
     "> ",
     "                                                                                                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
   "user": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
@@ -2939,7 +2939,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                                                                                                                                ",
     "> ",
     "                                                                                                                                                        no-model",
-    " Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
+    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands",
   ],
 }
 `;

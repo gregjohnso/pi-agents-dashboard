@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { ProcessTerminal, TuiAltScreen } from "@earendil-works/pi-tui";
 
 import { createDaemonClient } from "../daemon-client.mjs";
+import { createWheelInputTap } from "../mouse-input.mjs";
 import { createPiEditor } from "../viewer/pi-component-adapters.mjs";
 import { ViewerController } from "../viewer/viewer-controller.mjs";
 import { DashboardController, createDaemonDashboardBackend } from "./dashboard.mjs";
@@ -147,17 +148,24 @@ export function startStandaloneTui(tui) {
   }
 }
 
-/** Mount and focus the single input router used by the standalone list/viewer host. @param {any} options */
-export function mountStandaloneHost({ tui, getActive, getHeight }) {
+/**
+ * Mount and focus the single input router used by the standalone list/viewer host.
+ *
+ * `terminal` must be the tap from createWheelInputTap; pi-tui consumes wheel bytes itself, so
+ * without it the host never sees a wheel event. @param {any} options
+ */
+export function mountStandaloneHost({ tui, getActive, getHeight, terminal }) {
   const resolveHeight = getHeight ?? (() => tui.terminal.rows ?? 24);
   const component = {
     focused: false,
     render(width) { return getActive().render(width, resolveHeight()); },
     handleInput(data) { getActive().handleInput(data); tui.requestRender(); },
+    handleMouse(event) { getActive().handleMouse?.(event); tui.requestRender(); },
     invalidate() {},
   };
   tui.addChild(component);
   tui.setFocus(component);
+  terminal?.onWheel?.((/** @type {any} */ event) => component.handleMouse(event));
   return {
     component,
     focus() { tui.setFocus(component); },
@@ -182,7 +190,7 @@ export async function createStandaloneList({ cwd, frontend }) {
       return { canonicalCwd, isolationMode: draft.isolationMode, ownerSessionIds };
     },
   });
-  const terminal = new ProcessTerminal();
+  const terminal = createWheelInputTap(new ProcessTerminal());
   const tui = new TuiAltScreen(terminal);
   const viewerClient = createDaemonViewerClient({ client, clientId: frontend.clientId });
   const viewerState = new Map();
@@ -233,7 +241,7 @@ export async function createStandaloneList({ cwd, frontend }) {
     onClose: () => { if (!switching && activeViewer === undefined) { tui.stop(); resolveClosed(); } },
   });
   active = controller;
-  standaloneHost = mountStandaloneHost({ tui, getActive: () => active });
+  standaloneHost = mountStandaloneHost({ tui, getActive: () => active, terminal });
   await controller.open();
   startStandaloneTui(tui);
   let closing;

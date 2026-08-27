@@ -89,6 +89,16 @@ function safeArguments(value) {
   return { summary: "Tool arguments exceeded the viewer limit", bytes: Buffer.byteLength(text) };
 }
 
+/** Join the readable blocks of normalized content into one system-card body. @param {any[]} content */
+function plainText(content) {
+  return content.filter((block) => ["text", "thinking"].includes(block.type)).map((block) => block.text).join("\n");
+}
+
+/** @param {any[]} content */
+function toolFailureText(content) {
+  return bound(content.filter((block) => block.type === "text").map((block) => block.text).join("\n") || "Tool failed", MAX_SUMMARY_BYTES);
+}
+
 /** @param {unknown} value @param {string} fallback */
 function requiredString(value, fallback) {
   return typeof value === "string" && value.length > 0 ? bound(value, 256) : fallback;
@@ -108,6 +118,13 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     tools.set(tool.id, tool);
     const itemId = `tool:${tool.id}`;
     if (!items.has(itemId)) items.set(itemId, { kind: "tool", itemId, toolId: tool.id });
+  }
+
+  /** Record one info-level system card and return its payload. @param {string} itemId @param {string} text */
+  function noteSystemMessage(itemId, text) {
+    const payload = { kind: "system_message", itemId, text: bound(text, 16_384), level: "info" };
+    items.set(itemId, payload);
+    return payload;
   }
   const pendingUi = new Map();
   /** @type {any[]} */
@@ -250,14 +267,11 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       const prior = tools.get(message.toolCallId);
       /** @type {any} */
       const tool = { id: message.toolCallId, name: bound(message.toolName, 256), state: message.isError === true ? "failed" : "completed", arguments: prior?.arguments ?? {}, startedAt: prior?.startedAt ?? at, result: normalized.content, finishedAt: at };
-      if (message.isError === true) tool.error = bound(normalized.content.filter((/** @type {any} */ block) => block.type === "text").map((/** @type {any} */ block) => block.text).join("\n") || "Tool failed", MAX_SUMMARY_BYTES);
+      if (message.isError === true) tool.error = toolFailureText(normalized.content);
       noteTool(tool);
       output.push(...publish({ kind: "tool_finished", tool }, eventId, at));
     } else {
-      const text = normalized.content.filter((block) => ["text", "thinking"].includes(block.type)).map((block) => block.text).join("\n");
-      const payload = { kind: "system_message", itemId, text: bound(text, 16_384), level: "info" };
-      items.set(itemId, payload);
-      output.push(...publish(payload, eventId, at));
+      output.push(...publish(noteSystemMessage(itemId, plainText(normalized.content)), eventId, at));
     }
     for (const [index, placeholder] of normalized.placeholders.entries()) {
       items.set(placeholder.attachment.id, placeholder);
@@ -294,10 +308,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     if (entry.type === "custom_message") {
       if (entry.display !== true) return [];
       const normalized = normalizeContent(entry.content, sourceId);
-      const text = normalized.content.filter((block) => ["text", "thinking"].includes(block.type)).map((block) => block.text).join("\n");
-      const payload = { kind: "system_message", itemId: sourceId, text: bound(text, 16_384), level: "info" };
-      items.set(sourceId, payload);
-      const output = [...publish(payload, sourceId, at)];
+      const output = [...publish(noteSystemMessage(sourceId, plainText(normalized.content)), sourceId, at)];
       for (const [index, placeholder] of normalized.placeholders.entries()) {
         items.set(placeholder.attachment.id, placeholder);
         output.push(...publish(placeholder, `${sourceId}:attachment:${index}`, at));
@@ -305,10 +316,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       return output;
     }
     if (["compaction", "branch_summary"].includes(entry.type)) {
-      const text = typeof entry.summary === "string" ? entry.summary : `${entry.type} completed`;
-      const payload = { kind: "system_message", itemId: sourceId, text: bound(text, 16_384), level: "info" };
-      items.set(sourceId, payload);
-      return publish(payload, sourceId, at);
+      return publish(noteSystemMessage(sourceId, typeof entry.summary === "string" ? entry.summary : `${entry.type} completed`), sourceId, at);
     }
     const payload = { kind: "unknown_pi_event", piType: bound(entry.type, 4_096), summary: `Unsupported canonical Pi entry (${entry.type})` };
     items.set(sourceId, payload);
@@ -399,7 +407,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       /** @type {any} */
       const tool = { id: frame.toolCallId, name: bound(frame.toolName, 256), state: frame.type === "tool_execution_update" ? "streaming" : frame.isError === true ? "failed" : "completed", arguments: prior?.arguments ?? safeArguments(frame.args), startedAt: prior?.startedAt ?? at, result: normalized.content };
       if (frame.type === "tool_execution_end") tool.finishedAt = at;
-      if (frame.isError === true) tool.error = bound(normalized.content.filter((/** @type {any} */ block) => block.type === "text").map((/** @type {any} */ block) => block.text).join("\n") || "Tool failed", MAX_SUMMARY_BYTES);
+      if (frame.isError === true) tool.error = toolFailureText(normalized.content);
       noteTool(tool);
       const kind = frame.type === "tool_execution_update" ? "tool_updated" : "tool_finished";
       const phase = frame.type === "tool_execution_update" ? "tool_streaming" : frame.isError === true ? "error" : "thinking";

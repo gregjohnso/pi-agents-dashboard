@@ -713,21 +713,21 @@ describe("transcript scrolling keys and wheel", () => {
     expect(f.instance.render(80, 20).join("\n")).toContain("\x1b[38;2;252;211;77m");
   });
 
-  it("colors the prompt box and leaves the typed text white", async () => {
+  it("rules the prompt above and below in the session color and leaves the typed text white", async () => {
     const f = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: "amber" }) });
     await f.instance.open();
     f.instance.editor.setText("hello");
     const rendered = f.instance.render(80, 20);
     const plain = rendered.map(stripVTControlCharacters);
-    const top = plain.findIndex((line) => /^\u256d\u2500+\u256e$/u.test(line.trim()));
-    expect(top).toBeGreaterThan(0);
-    expect(plain[top + 1]).toMatch(/^\u2502.*hello.*\u2502$/u);
-    expect(plain.some((line) => /^\u2570\u2500+\u256f$/u.test(line.trim()))).toBe(true);
-    // The frame carries the colour; the prompt text does not.
-    expect(rendered[top]).toContain("\x1b[38;2;252;211;77m");
-    const promptRow = rendered[top + 1];
-    expect(promptRow).toContain("\x1b[38;2;252;211;77m");
-    expect(promptRow.slice(promptRow.indexOf("hello") - 12, promptRow.indexOf("hello"))).not.toContain("\x1b[38;2;252;211;77m");
+    const promptRow = plain.findLastIndex((line) => line.startsWith("> "));
+    const rules = plain.map((line, index) => ({ line, index })).filter(({ line }) => /^\u2500+$/u.test(line.trim()) && line.trim() !== "");
+    expect(promptRow).toBeGreaterThan(0);
+    // One rule above the prompt, one below, and no side borders anywhere.
+    expect(rules.filter(({ index }) => index < promptRow)).not.toHaveLength(0);
+    expect(rules.filter(({ index }) => index > promptRow)).not.toHaveLength(0);
+    expect(plain.every((line) => !line.includes("\u2502"))).toBe(true);
+    expect(rendered[rules.find(({ index }) => index < promptRow).index]).toContain("\x1b[38;2;252;211;77m");
+    expect(rendered[promptRow]).not.toContain("\x1b[38;2;252;211;77m");
     for (const width of [40, 55, 80, 120, 160]) {
       for (const line of f.instance.render(width, 20)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
     }

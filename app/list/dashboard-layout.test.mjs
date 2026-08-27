@@ -183,6 +183,19 @@ describe("responsive dashboard layout", () => {
     });
 });
 
+it("bolds the selected row without altering its colors", () => {
+    const layout = createDashboardLayout(120, 20);
+    const plain = renderSessionRow(fixtures[0], layout, { now });
+    const selected = renderSessionRow(fixtures[0], layout, { now, selected: true });
+    expect(selected).toContain(JOBWATCH_ANSI.bold);
+    expect(plain).not.toContain(JOBWATCH_ANSI.bold);
+    // Selection changes weight only: the same foregrounds and the same selection background as before.
+    expect(selected).toContain(JOBWATCH_ANSI.selectionBackground);
+    const codes = (line) => line.match(/\u001b\[38;2;[0-9;]+m/gu) ?? [];
+    expect(codes(selected)).toEqual(codes(plain));
+    expect(stripVTControlCharacters(selected)).toBe(stripVTControlCharacters(plain));
+});
+
 it("spins an unlabelled column left of STATE so the state text never shifts", () => {
     const layout = createDashboardLayout(100, 24);
     const spinner = /[\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f]/u;

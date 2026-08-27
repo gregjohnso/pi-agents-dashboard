@@ -22,7 +22,8 @@ function backgroundFor(color) {
 }
 function paint(text, foreground, selected, background = JOBWATCH_ANSI.blackBackground) {
     const rowBackground = selected ? JOBWATCH_ANSI.selectionBackground : background;
-    return `${rowBackground}${foreground}${text}${JOBWATCH_ANSI.reset}`;
+    // Selection adds weight only, so the row keeps the colors that carry its meaning.
+    return `${rowBackground}${foreground}${selected ? JOBWATCH_ANSI.bold : ""}${text}${JOBWATCH_ANSI.reset}`;
 }
 function stateColor(session) {
     switch (displaySessionState(session)) {

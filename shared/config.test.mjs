@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -52,7 +52,7 @@ it("validates and atomically serializes a mode-0600 complete configuration", asy
     await writeFile(configPath, '{"old":true}\n', { mode: 0o600 });
     await writeDashboardConfig(configPath, { workers: { maxLive: 3 } });
     expect(JSON.parse(await readFile(configPath, "utf8"))).toEqual({ ...REVIEWED_DEFAULT_CONFIG, workers: { ...REVIEWED_DEFAULT_CONFIG.workers, maxLive: 3 } });
-    expect((await import("node:fs/promises")).stat(configPath).then((value) => value.mode & 0o777)).resolves.toBe(0o600);
+    expect((await stat(configPath)).mode & 0o777).toBe(0o600);
     expect(await readdir(directory)).toEqual(["dashboard.json"]);
   } finally {
     await rm(directory, { recursive: true, force: true });

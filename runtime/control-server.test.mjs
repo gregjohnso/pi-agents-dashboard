@@ -69,12 +69,12 @@ const auth = `${JSON.stringify({ version: 1, token: "secret" })}\n`;
 const request = `${JSON.stringify({ version: 1, clientId: "client-1", requestId: "request-1", op: "get_state", payload: {} })}\n`;
 
 describe("authenticated control server", () => {
-  it("authenticates before accepting exact Task 4 requests", async () => {
+  it("authenticates before accepting exact Task 4 requests, and never dispatches the authentication frame", async () => {
     const { socketPath, received } = await fixture();
     const responses = await exchange(socketPath, [auth, request]);
     expect(responses[0]).toEqual({ version: 1, kind: "authenticated" });
     expect(responses[1]).toMatchObject({ requestId: "request-1", ok: true });
-    expect(received).toHaveLength(1);
+    expect(received).toEqual([JSON.parse(request)]);
   });
 
   it("compares fixed-length authentication values even when token lengths differ", async () => {
@@ -116,11 +116,5 @@ describe("authenticated control server", () => {
     const responses = await exchange(socketPath, [auth, ...viewerRequests.map((value) => `${JSON.stringify(value)}\n`)]);
     expect(responses.slice(1)).toHaveLength(3);
     expect(received).toEqual(viewerRequests);
-  });
-
-  it("does not dispatch worker action when a frontend disconnects", async () => {
-    const { socketPath, received } = await fixture();
-    await exchange(socketPath, [auth]);
-    expect(received).toHaveLength(0);
   });
 });

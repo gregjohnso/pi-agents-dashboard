@@ -176,9 +176,9 @@ export class ViewerController {
     let hints = renderKeyHints(this.state, width);
     const dockRows = () => 2 + (hints === "" ? 0 : 1) + status.length + editorLines.length + inputLabel.length + toolLine.length + errorLines.length + queuedLines.length;
     if (height - dockRows() < MIN_TRANSCRIPT_ROWS) {
-      // Pi's dock shrinks its own spacers, then its hints, before the transcript loses rows.
+      // Pi's dock gives up its own rows before the transcript loses any: spacers first, then the
+      // prompt frame, then the hints. Only decoration goes; every dock line with content stays.
       status = status.slice(1); errorLines = errorLines.slice(1); queuedLines = queuedLines.slice(1);
-      // The prompt frame is decoration, so it goes before the hints and before transcript rows.
       if (height - dockRows() < MIN_TRANSCRIPT_ROWS) editorLines = this.editor.render(width);
       if (height - dockRows() < MIN_TRANSCRIPT_ROWS) hints = "";
     }

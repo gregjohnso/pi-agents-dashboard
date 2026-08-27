@@ -130,9 +130,16 @@ function event(sequence, payload) {
   return { version: 1, sessionId: "viewer-session", eventId: `event-${sequence}`, cursor: { daemonEpoch: "epoch", sessionId: "viewer-session", sequence: String(sequence) }, timestamp, payload };
 }
 
+// The five-width matrix lives here for both surfaces; component tests assert semantics, not widths.
+// The first row carries wide characters and a deep path because it is the one row every height shows.
 it.each(dimensions)("pins the complete list and viewer surfaces at %ix%i", async (width, height) => {
   const list = dashboardFixture([
-    session("working", { taskState: "WORKING", activity: { kind: "tool", summary: "bash: pytest", updatedAt: timestamp } }),
+    session("working", {
+      name: "検証 🚀 résumé",
+      cwd: "/worktrees/研究/非常に長いプロジェクト名/dashboard",
+      taskState: "WORKING",
+      activity: { kind: "tool", summary: "bash: pytest 検証中 🚀 naïve café", updatedAt: timestamp },
+    }),
     session("waiting", { taskState: "WAITING", activity: { kind: "ui", summary: "Approval needed", updatedAt: timestamp } }),
     session("failed", { taskState: "FAILED", processState: "STALE", activity: { kind: "error", summary: "provider error", updatedAt: timestamp } }),
   ]);
@@ -144,12 +151,6 @@ it.each(dimensions)("pins the complete list and viewer surfaces at %ix%i", async
   expect(listLines).toHaveLength(height);
   expect(viewerLines).toHaveLength(height);
   expect([...listLines, ...viewerLines].every((line) => visibleWidth(line) <= width)).toBe(true);
-  if (width >= 72) {
-    const header = listLines.map(stripVTControlCharacters).find((line) => line.includes("NAME") && line.includes("STATE"));
-    expect(header).toMatch(/NAME\s+STATE\s+ACTIVITY/u);
-    expect(header).not.toContain("MODEL");
-    expect(header).not.toContain("PROJECT");
-  }
   expect({ list: listLines.map(stripVTControlCharacters), viewer: viewerLines.map(stripVTControlCharacters) }).toMatchSnapshot();
   await Promise.all([list.dashboard.close(), viewer.controller.close()]);
 });

@@ -57,22 +57,18 @@ const fixtures = [
     }),
 ];
 describe("responsive dashboard layout", () => {
-    it.each([[160, 40], [120, 32], [80, 24], [55, 16], [40, 10]])("renders a width-safe %ix%i snapshot", (width, height) => {
-        const layout = createDashboardLayout(width, height);
+    // test/terminal.acceptance.test.mjs owns the five-width matrix; this pins truncation of the
+    // hostile fixtures (CJK, emoji, overlong paths and model names) where columns are tightest.
+    it("truncates every fixture inside the narrowest layout", () => {
+        const layout = createDashboardLayout(40, 10);
         const lines = [
             renderColumnHeader(layout),
             ...fixtures.map((record, index) => renderSessionRow(record, layout, { now, selected: index === 1 })),
         ];
         for (const line of lines)
-            expect(visibleWidth(line)).toBeLessThanOrEqual(width);
-        expect({
-            width,
-            density: layout.density,
-            listTop: layout.listTop,
-            listHeight: layout.listHeight,
-            columns: layout.columns,
-            lines: lines.map(stripVTControlCharacters),
-        }).toMatchSnapshot();
+            expect(visibleWidth(line)).toBeLessThanOrEqual(40);
+        // Overlong cells are elided, not silently dropped.
+        expect(stripVTControlCharacters(lines[1])).toContain("…");
     });
     it("prefers a generated summary over raw activity in the Activity column", () => {
         const layout = createDashboardLayout(160, 40);
@@ -84,15 +80,7 @@ describe("responsive dashboard layout", () => {
         expect(row).toContain("Fixes the coverage loader and reruns tests");
         expect(row).not.toContain("Pi assistant streaming");
     });
-    it("colors each displayed state with its Jobwatch semantic color", () => {
-        const layout = createDashboardLayout(160, 40);
-        const colorOf = (overrides) => renderSessionRow(session("colored", overrides), layout, { now });
-        expect(colorOf({ taskState: "WORKING", processState: "LIVE" })).toContain(JOBWATCH_ANSI.green);
-        expect(colorOf({ taskState: "WAITING", processState: "LIVE" })).toContain(JOBWATCH_ANSI.amber);
-        expect(colorOf({ taskState: "READY", processState: "LIVE" })).toContain(JOBWATCH_ANSI.sky);
-        expect(colorOf({ taskState: "FAILED", processState: "EXITED" })).toContain(JOBWATCH_ANSI.rose);
-        expect(colorOf({ taskState: "READY", processState: "EXITED" })).toContain(JOBWATCH_ANSI.gray);
-    });
+
     it("keeps the fixed list column order and never renders Model or Project", () => {
         expect(createDashboardLayout(160, 40).columns.map(({ key }) => key)).toEqual(["name", "spinner", "state", "activity", "age"]);
         const header = stripVTControlCharacters(renderColumnHeader(createDashboardLayout(160, 40)));
@@ -137,6 +125,7 @@ describe("responsive dashboard layout", () => {
     it("highlights the name cell of a colored session behind black text", () => {
         const layout = createDashboardLayout(120, 20);
         const plain = renderSessionRow(fixtures[0], layout, { now });
+        expect(renderSessionRow({ ...fixtures[0], color: undefined }, layout, { now })).toBe(plain);
         const colored = renderSessionRow({ ...fixtures[0], color: "amber" }, layout, { now });
         expect(colored).not.toBe(plain);
         // The colour fills the cell and the name inverts to black, so it reads as a label.
@@ -147,12 +136,7 @@ describe("responsive dashboard layout", () => {
         expect(stripVTControlCharacters(colored)).toBe(stripVTControlCharacters(plain));
     });
 
-    it("renders an uncolored session byte-identically to today", () => {
-        const layout = createDashboardLayout(120, 20);
-        expect(renderSessionRow({ ...fixtures[0], color: undefined }, layout, { now })).toBe(renderSessionRow(fixtures[0], layout, { now }));
-    });
-
-    it("uses Jobwatch's exact surface, selection, accent, and semantic colors", () => {
+    it("uses Jobwatch's exact palette for every displayed state, the header, and selection", () => {
         expect(JOBWATCH_ANSI).toMatchObject({
             blackBackground: "\x1b[48;2;0;0;0m",
             surfaceBackground: "\x1b[48;2;17;17;17m",
@@ -167,19 +151,15 @@ describe("responsive dashboard layout", () => {
             gray: "\x1b[38;2;136;136;136m",
         });
         const layout = createDashboardLayout(120, 20);
-        const working = renderSessionRow(fixtures[0], layout, { now });
-        const waitingSelected = renderSessionRow(fixtures[1], layout, { now, selected: true });
-        const failed = renderSessionRow(fixtures[3], layout, { now });
-        const completed = renderSessionRow(fixtures[6], layout, { now });
+        const colorOf = (overrides, options = {}) => renderSessionRow(session("colored", overrides), layout, { now, ...options });
+        expect(colorOf({ taskState: "WORKING", processState: "LIVE" })).toContain(JOBWATCH_ANSI.green);
+        expect(colorOf({ taskState: "WAITING", processState: "LIVE" })).toContain(JOBWATCH_ANSI.amber);
+        expect(colorOf({ taskState: "READY", processState: "LIVE" })).toContain(JOBWATCH_ANSI.sky);
+        expect(colorOf({ taskState: "FAILED", processState: "EXITED" })).toContain(JOBWATCH_ANSI.rose);
+        expect(colorOf({ taskState: "READY", processState: "EXITED" })).toContain(JOBWATCH_ANSI.gray);
         expect(renderColumnHeader(layout)).toContain(JOBWATCH_ANSI.gray);
-        expect(working).toContain(JOBWATCH_ANSI.green);
-        expect(waitingSelected).toContain(JOBWATCH_ANSI.amber);
-        expect(waitingSelected).toContain(JOBWATCH_ANSI.selectionBackground);
-        expect(failed).toContain(JOBWATCH_ANSI.rose);
-        expect(completed).toContain(JOBWATCH_ANSI.gray);
-        for (const line of [working, failed, completed]) {
-            expect(line).toContain(JOBWATCH_ANSI.blackBackground);
-        }
+        expect(colorOf({ taskState: "WAITING", processState: "LIVE" }, { selected: true })).toContain(JOBWATCH_ANSI.selectionBackground);
+        expect(colorOf({ taskState: "WORKING", processState: "LIVE" })).toContain(JOBWATCH_ANSI.blackBackground);
     });
 });
 

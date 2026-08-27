@@ -495,7 +495,7 @@ describe("dashboard controller", () => {
         const dashboard = controller(backend, { onSessionIntent, requestId: () => "destructive-request" });
         await dashboard.open();
         dashboard.handleInput("\x18");
-        expect(dashboard.overlay).toMatchObject({ kind: "session_confirmation", action: "stop", sessionId: "a", revision: 1, processState: "LIVE", submitting: false });
+        expect(dashboard.overlay).toMatchObject({ kind: "session_confirmation", action: "stop", sessionId: "a", revision: 1, processState: "LIVE" });
         expect(backend.stop).not.toHaveBeenCalled();
         dashboard.handleInput("n");
         expect(dashboard.overlay).toBeUndefined();
@@ -543,7 +543,7 @@ describe("dashboard controller", () => {
         dashboard.handleInput("\x18");
         expect(dashboard.overlay).toMatchObject({ action: "delete", sessionId: "a", revision: 2 });
     });
-    it("ignores repeated Ctrl+X while a confirmation is submitting", async () => {
+    it("ignores repeated Ctrl+X while a stop is in flight", async () => {
         let release;
         const backend = new FakeBackend([session("a")]);
         backend.stop = vi.fn(() => new Promise((resolve) => { release = resolve; }));
@@ -570,7 +570,7 @@ describe("dashboard controller", () => {
         expect(backend.stop).toHaveBeenCalledTimes(1);
         release?.();
     });
-    it("closes the dashboard with Ctrl+C while a confirmation is submitting", async () => {
+    it("closes the dashboard with Ctrl+C while a stop is in flight", async () => {
         let release;
         const backend = new FakeBackend([session("a")]);
         backend.stop = vi.fn(() => new Promise((resolve) => { release = resolve; }));

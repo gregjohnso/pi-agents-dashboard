@@ -1,4 +1,3 @@
-import { basename } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { jobwatchTheme } from "./dashboard-theme.mjs";
@@ -90,9 +89,8 @@ function joinCells(layout, values, paintCell, paintSeparator) {
     return truncateToWidth(cells.join(paintSeparator(" ")), layout.width, "");
 }
 /** Render one responsive, width-safe table header. */
-export function renderColumnHeader(layout, theme = jobwatchTheme) {
-    const values = COLUMN_LABELS;
-    return joinCells(layout, values, (_key, text) => theme.header(text), (text) => theme.header(text));
+export function renderColumnHeader(layout) {
+    return joinCells(layout, COLUMN_LABELS, (_key, text) => jobwatchTheme.header(text), (text) => jobwatchTheme.header(text));
 }
 function age(updatedAt, now) {
     const updated = Date.parse(updatedAt);
@@ -136,19 +134,18 @@ function sessionValues(session, now) {
 /** Render one dense session row without allocating a component per session. */
 export function renderSessionRow(session, layout, options) {
     const selected = options.selected ?? false;
-    const theme = options.theme ?? jobwatchTheme;
     const values = sessionValues(session, options.now);
     return joinCells(layout, values, (key, text) => {
         if (key === "state")
-            return theme.state(session, text, selected);
+            return jobwatchTheme.state(session, text, selected);
         if (key === "age")
-            return theme.muted(text, selected);
-        if (key === "name" && typeof theme.name === "function")
-            return theme.name(text, selected, session.color);
-        return theme.text(text, selected);
-    }, (text) => theme.separator(text, selected));
+            return jobwatchTheme.muted(text, selected);
+        if (key === "name")
+            return jobwatchTheme.name(text, selected, session.color);
+        return jobwatchTheme.text(text, selected);
+    }, (text) => jobwatchTheme.separator(text, selected));
 }
 /** Render an unselectable group row that occupies one virtual list position. */
-export function renderGroupHeader(label, count, layout, theme = jobwatchTheme) {
-    return theme.group(fit(`── ${plainText(label)} (${count}) `, layout.width));
+export function renderGroupHeader(label, count, layout) {
+    return jobwatchTheme.group(fit(`── ${plainText(label)} (${count}) `, layout.width));
 }

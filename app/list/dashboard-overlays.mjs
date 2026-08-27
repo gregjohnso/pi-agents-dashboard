@@ -56,12 +56,6 @@ export function createSessionIntent(session) {
         revision: session.revision,
     };
 }
-function ownershipFingerprint(session) {
-    const ownership = session.ownership;
-    return ownership === undefined
-        ? "unowned"
-        : JSON.stringify([ownership.runId, ownership.process.pid, ownership.process.startIdentity, ownership.process.processGroupId, ownership.acquiredAt, ownership.heartbeatAt]);
-}
 /** Bind confirmation to one canonical session revision and requested action. */
 export function createSessionConfirmation(session) {
     return {
@@ -70,18 +64,7 @@ export function createSessionConfirmation(session) {
         sessionId: session.sessionId,
         revision: session.revision,
         processState: session.processState,
-        ownershipFingerprint: ownershipFingerprint(session),
-        submitting: false,
     };
-}
-/** Check that a confirmation still names the selected record and same action. */
-export function confirmationMatchesSession(confirmation, session) {
-    return session !== undefined &&
-        confirmation.sessionId === session.sessionId &&
-        confirmation.revision === session.revision &&
-        confirmation.processState === session.processState &&
-        confirmation.ownershipFingerprint === ownershipFingerprint(session) &&
-        confirmation.action === destructiveAction(session);
 }
 /**
  * Describe one overlay as a title and plain content rows for the floating panel.
@@ -111,7 +94,7 @@ export function describeOverlay(overlay, options = {}) {
             title: overlay.clearingStopped === true ? "Clear stopped session" : `Confirm ${overlay.action.toUpperCase()}`,
             rows: [
                 { text: overlay.sessionId },
-                { text: overlay.submitting ? "Submitting…" : "Press y/Enter to confirm; n/Escape to cancel.", emphasis: true },
+                { text: "Press y/Enter to confirm; n/Escape to cancel.", emphasis: true },
             ],
         };
     }

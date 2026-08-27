@@ -9,7 +9,7 @@ import { createDashboardLayout, renderColumnHeader, } from "./dashboard-layout.m
 import { jobwatchTheme } from "./dashboard-theme.mjs";
 import { displaySessionState } from "./session-state.mjs";
 import { StopClearGesture } from "./stop-clear-gesture.mjs";
-import { destructiveAction, confirmationMatchesSession, createDeliveryUnknownOverlay, createHelpOverlay, createMetadataOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, describeOverlay, } from "./dashboard-overlays.mjs";
+import { destructiveAction, createDeliveryUnknownOverlay, createHelpOverlay, createMetadataOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, describeOverlay, } from "./dashboard-overlays.mjs";
 import { createLaunchDraft, prepareLaunchRequest, } from "./launch-composer.mjs";
 import { VirtualSessionList } from "./virtual-session-list.mjs";
 function cursorAfter(left, right) {
@@ -189,6 +189,22 @@ function cycleValue(values, current) {
     const index = values.indexOf(current);
     return index < 0 || index === values.length - 1 ? undefined : values[index + 1];
 }
+/**
+ * The filter, sort, and group controls: one row each for the chord that runs it, the segment the
+ * mouse hit-test measures, and what it does. Array order is the left-to-right order of the segments.
+ * Ctrl+J is the same byte as Enter, which handleInput answers first, so only its click reaches here.
+ */
+const CONTROLS = [
+    { key: Key.ctrl("f"), segment: (dashboard) => `/search:${dashboard.query.search ?? ""}`, activate: (dashboard) => { dashboard.focus = "search"; } },
+    { key: Key.ctrl("v"), segment: (dashboard) => `v:${dashboard.query.view}`, activate: (dashboard) => dashboard.cycleView() },
+    { key: Key.ctrl("t"), segment: (dashboard) => `t:${dashboard.query.taskStates?.join(",") ?? "all"}`, activate: (dashboard) => dashboard.setTaskStates(dashboard.singletonCycle(TASK_STATES, dashboard.query.taskStates)) },
+    { key: Key.ctrl("p"), segment: (dashboard) => `p:${dashboard.query.processStates?.join(",") ?? "all"}`, activate: (dashboard) => dashboard.setProcessStates(dashboard.singletonCycle(PROCESS_STATES, dashboard.query.processStates)) },
+    { key: Key.ctrl("o"), segment: (dashboard) => `o:${dashboard.query.outcomes?.join(",") ?? "all"}`, activate: (dashboard) => dashboard.setOutcomes(dashboard.singletonCycle(OUTCOMES, dashboard.query.outcomes)) },
+    { key: Key.ctrl("a"), segment: (dashboard) => `a:${dashboard.query.activityKinds?.join(",") ?? "all"}`, activate: (dashboard) => dashboard.cycleActivityFilter() },
+    { key: Key.ctrl("j"), segment: (dashboard) => `j:${dashboard.query.projectPaths?.join(",") ?? "all"}`, activate: (dashboard) => dashboard.setProjectPaths(dashboard.singletonCycle([...new Set(dashboard.sessions.map((session) => session.cwd))], dashboard.query.projectPaths)) },
+    { key: Key.ctrl("s"), segment: (dashboard) => `s:${dashboard.query.sort === undefined ? "none" : `${dashboard.query.sort.key}/${dashboard.query.sort.direction}`}`, activate: (dashboard) => dashboard.cycleSort() },
+    { key: Key.ctrl("b"), segment: (dashboard) => `g:${dashboard.query.groupBy ?? "none"}`, activate: (dashboard) => dashboard.setGrouping(cycleValue(GROUPS, dashboard.query.groupBy)) },
+];
 function fitLine(line, width) {
     const clipped = truncateToWidth(line.replace(/[\r\n\u2028\u2029]/gu, " "), Math.max(0, width), "");
     return clipped + " ".repeat(Math.max(0, width - visibleWidth(clipped)));
@@ -463,8 +479,6 @@ export class DashboardController {
         this.overlay = undefined;
     }
     async confirmSession(confirmation) {
-        if (confirmation.submitting)
-            return;
         const selected = this.sessions.find((session) => session.sessionId === confirmation.sessionId);
         if (selected === undefined) {
             this.overlay = undefined;
@@ -518,13 +532,10 @@ export class DashboardController {
             return;
         }
         if (this.overlay?.kind === "session_confirmation") {
-            // Escape always dismisses so a stuck destructive request never wedges the dashboard.
-            if (matchesKey(data, Key.escape) || (!this.overlay.submitting && data.toLowerCase() === "n")) {
+            if (matchesKey(data, Key.escape) || data.toLowerCase() === "n") {
                 this.overlay = undefined;
                 return;
             }
-            if (this.overlay.submitting)
-                return;
             if (matchesKey(data, Key.enter) || data.toLowerCase() === "y") {
                 void this.confirmSession(this.overlay);
             }
@@ -602,6 +613,11 @@ export class DashboardController {
             void this.activateSelection();
             return;
         }
+        const control = CONTROLS.find(({ key }) => matchesKey(data, key));
+        if (control !== undefined) {
+            control.activate(this);
+            return;
+        }
         if (matchesKey(data, Key.down))
             this.moveSelection(1);
         else if (matchesKey(data, Key.up))
@@ -614,34 +630,14 @@ export class DashboardController {
             this.selectBoundary(false);
         else if (matchesKey(data, Key.end))
             this.selectBoundary(true);
-        else if (matchesKey(data, Key.ctrl("f")))
-            this.focus = "search";
-        else if (matchesKey(data, Key.tab))
-            this.focusComposer();
         else if (matchesKey(data, Key.ctrl("e")))
             this.toggleMetadata();
         else if (matchesKey(data, Key.ctrl("g")))
             this.toggleHelp();
-        else if (matchesKey(data, Key.ctrl("v")))
-            this.cycleView();
         else if (matchesKey(data, Key.ctrl("r")))
             this.refreshSummaries();
         else if (matchesKey(data, Key.ctrl("l")))
             this.clearFilters();
-        else if (matchesKey(data, Key.ctrl("t")))
-            this.setTaskStates(this.singletonCycle(TASK_STATES, this.query.taskStates));
-        else if (matchesKey(data, Key.ctrl("p")))
-            this.setProcessStates(this.singletonCycle(PROCESS_STATES, this.query.processStates));
-        else if (matchesKey(data, Key.ctrl("o")))
-            this.setOutcomes(this.singletonCycle(OUTCOMES, this.query.outcomes));
-        else if (matchesKey(data, Key.ctrl("a")))
-            this.cycleActivityFilter();
-        else if (matchesKey(data, Key.ctrl("j")))
-            this.setProjectPaths(this.singletonCycle([...new Set(this.sessions.map((session) => session.cwd))], this.query.projectPaths));
-        else if (matchesKey(data, Key.ctrl("s")))
-            this.cycleSort();
-        else if (matchesKey(data, Key.ctrl("b")))
-            this.setGrouping(cycleValue(GROUPS, this.query.groupBy));
         else {
             // Typed and pasted text always composes a prompt, wherever the cursor sits in the list.
             const printable = this.printable(data);
@@ -668,14 +664,14 @@ export class DashboardController {
         const layout = createDashboardLayout(this.width, this.height);
         if (Math.floor(event.row) === 2) {
             const column = Math.max(0, Math.floor(event.column));
-            const segments = this.controlSegments();
             let offset = 1;
-            const index = segments.findIndex((segment) => {
-                const inside = column >= offset && column < offset + segment.length;
-                offset += segment.length + 1;
+            const clicked = CONTROLS.find(({ segment }) => {
+                const width = segment(this).length;
+                const inside = column >= offset && column < offset + width;
+                offset += width + 1;
                 return inside;
             });
-            this.activateControl(index < 0 ? 0 : index);
+            (clicked ?? CONTROLS[0]).activate(this);
             return;
         }
         if (Math.floor(event.row) === this.height - 3) {
@@ -699,6 +695,8 @@ export class DashboardController {
             this.list.setNow(this.now());
             const layout = createDashboardLayout(this.width, this.height);
             const counts = countDashboardSessions(selectDashboardSessions(this.sessions, this.query));
+            // The dock takes the focus border only while it waits for the typed shared-directory path.
+            const confirmingSharedLaunch = this.focus === "confirmation";
             const lines = Array.from({ length: this.height }, () => "");
             if (lines.length > 0)
                 lines[0] = paintPlainLine(" pi-dashboard", this.width, jobwatchTheme.title);
@@ -707,7 +705,7 @@ export class DashboardController {
             if (lines.length > 2)
                 lines[2] = paintPlainLine(this.activeFilterSummary(), this.width, jobwatchTheme.keyHints);
             if (lines.length > 3)
-                lines[3] = sectionBorder("Sessions", this.width, this.focus === "list" || this.focus === "search");
+                lines[3] = sectionBorder("Sessions", this.width, !confirmingSharedLaunch);
             if (lines.length > 4)
                 lines[4] = renderColumnHeader(layout);
             const rendered = this.list.renderViewport({ offset: this.viewportOffset, height: layout.listHeight, width: this.width });
@@ -718,14 +716,13 @@ export class DashboardController {
             }
             if (lines.length >= 4) {
                 const dockTop = lines.length - layout.dockRows;
-                const composerFocused = this.focus === "confirmation";
                 const draftPrompt = this.composerDraft.prompt;
-                lines[dockTop] = sectionBorder(this.composerField === "prompt" ? "" : COMPOSER_FIELD_LABELS[this.composerField], this.width, composerFocused);
+                lines[dockTop] = sectionBorder(this.composerField === "prompt" ? "" : COMPOSER_FIELD_LABELS[this.composerField], this.width, confirmingSharedLaunch);
                 lines[dockTop + 1] = paintPlainLine(` ❯ ${draftPrompt || "describe a task for a new session"}`, this.width, draftPrompt ? (text) => jobwatchTheme.text(text, false) : (text) => jobwatchTheme.muted(text, false));
                 const form = ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
                 lines[dockTop + 2] = paintPlainLine(this.status.kind === "error" ? ` ${this.status.code}: ${this.status.message}  ${form}` : form, this.width, this.status.kind === "error" ? jobwatchTheme.error : jobwatchTheme.surface);
-                if (layout.dockRows >= 5) lines[dockTop + 3] = sectionFooter(this.width, composerFocused);
-                if (layout.dockRows >= 6) lines[dockTop + 4] = paintPlainLine(this.contextSummary(), this.width, jobwatchTheme.keyHints);
+                if (layout.dockRows >= 5) lines[dockTop + 3] = sectionFooter(this.width, confirmingSharedLaunch);
+                if (layout.dockRows >= 6) lines[dockTop + 4] = paintPlainLine(this.selectedCwdLine(), this.width, jobwatchTheme.keyHints);
                 lines[lines.length - 1] = paintPlainLine(" Ctrl+C quit  ↑↓ navigate  Enter/→ open  ←/Esc back  type to compose  Tab fields  ^X action  ^G help", this.width, jobwatchTheme.keyHints);
             }
             this.renderOverlay(lines);
@@ -810,8 +807,7 @@ export class DashboardController {
         const next = this.query.view === "live" ? "done" : this.query.view === "done" ? "all" : "live";
         this.setView(next);
     }
-    /** Show what the cursor is on, then any active filters. The keys themselves live in the footer and in Help. */
-    contextSummary() {
+    selectedCwdLine() {
         const selected = this.selectedSession();
         return selected === undefined ? "" : ` ${selected.cwd}`;
     }
@@ -829,50 +825,6 @@ export class DashboardController {
             this.query.groupBy === undefined ? undefined : `group:${this.query.groupBy}`,
         ].filter((segment) => segment !== undefined);
         return active.length === 0 ? "" : ` ${active.join("  ")}`;
-    }
-    controlSegments() {
-        return [
-            `/search:${this.query.search ?? ""}`,
-            `v:${this.query.view}`,
-            `t:${this.query.taskStates?.join(",") ?? "all"}`,
-            `p:${this.query.processStates?.join(",") ?? "all"}`,
-            `o:${this.query.outcomes?.join(",") ?? "all"}`,
-            `a:${this.query.activityKinds?.join(",") ?? "all"}`,
-            `j:${this.query.projectPaths?.join(",") ?? "all"}`,
-            `s:${this.query.sort === undefined ? "none" : `${this.query.sort.key}/${this.query.sort.direction}`}`,
-            `g:${this.query.groupBy ?? "none"}`,
-        ];
-    }
-    activateControl(index) {
-        switch (index) {
-            case 0:
-                this.focus = "search";
-                break;
-            case 1:
-                this.cycleView();
-                break;
-            case 2:
-                this.setTaskStates(this.singletonCycle(TASK_STATES, this.query.taskStates));
-                break;
-            case 3:
-                this.setProcessStates(this.singletonCycle(PROCESS_STATES, this.query.processStates));
-                break;
-            case 4:
-                this.setOutcomes(this.singletonCycle(OUTCOMES, this.query.outcomes));
-                break;
-            case 5:
-                this.cycleActivityFilter();
-                break;
-            case 6:
-                this.setProjectPaths(this.singletonCycle([...new Set(this.sessions.map((session) => session.cwd))], this.query.projectPaths));
-                break;
-            case 7:
-                this.cycleSort();
-                break;
-            case 8:
-                this.setGrouping(cycleValue(GROUPS, this.query.groupBy));
-                break;
-        }
     }
     singletonCycle(values, current) {
         const next = cycleValue(values, current?.length === 1 ? current[0] : undefined);

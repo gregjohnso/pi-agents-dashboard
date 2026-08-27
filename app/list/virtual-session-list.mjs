@@ -5,13 +5,10 @@ import { createDashboardLayout, renderGroupHeader, renderSessionRow, } from "./d
 function sessionSignature(session) {
     return JSON.stringify(session);
 }
-function groupDisplayValue(session, groupBy) {
-    return groupBy === "taskState" ? session.taskState : session.cwd;
-}
-function groupLabel(value, groupBy) {
+function groupLabel(session, groupBy) {
     if (groupBy === "taskState")
-        return value;
-    return basename(value) || value || "—";
+        return session.taskState;
+    return basename(session.cwd) || session.cwd || "—";
 }
 function buildRows(sessions, groupBy) {
     if (groupBy === undefined) {
@@ -27,7 +24,6 @@ function buildRows(sessions, groupBy) {
     while (index < sessions.length) {
         const session = sessions[index];
         const identity = dashboardGroupIdentity(session, groupBy);
-        const displayValue = groupDisplayValue(session, groupBy);
         let end = index + 1;
         while (end < sessions.length
             && dashboardGroupIdentity(sessions[end], groupBy) === identity) {
@@ -36,7 +32,7 @@ function buildRows(sessions, groupBy) {
         rows.push({
             kind: "group",
             key: `group:${groupBy}:${identity}:${index}`,
-            label: groupLabel(displayValue, groupBy),
+            label: groupLabel(session, groupBy),
             count: end - index,
             selectable: false,
         });
@@ -86,9 +82,6 @@ export class VirtualSessionList {
         if (this.selectedId === undefined)
             return -1;
         return this.virtualRows.findIndex((row) => (row.kind === "session" && row.session.sessionId === this.selectedId));
-    }
-    get cacheSize() {
-        return this.rowCache.size;
     }
     selectSession(sessionId) {
         const exists = this.sessions.some((session) => session.sessionId === sessionId);
@@ -152,11 +145,6 @@ export class VirtualSessionList {
         if (this.now === now)
             return 0;
         this.now = now;
-        return this.invalidate();
-    }
-    invalidate(sessionId) {
-        if (sessionId !== undefined)
-            return this.rowCache.delete(sessionId) ? 1 : 0;
         const invalidated = this.rowCache.size;
         this.rowCache.clear();
         return invalidated;

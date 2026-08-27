@@ -40,6 +40,19 @@ function validateResponse(response, expectedId, command) {
   return response.data;
 }
 
+/**
+ * Build the one argument list a worker launches Pi with. `installed-pi-worker.mjs` spawns it for
+ * real and `PiRpcAdapter.start` reuses it, so the flag set cannot drift between the two.
+ * @param {{ sessionFile: string, model?: { provider: string, id: string }, thinkingLevel?: string, name?: string }} options
+ */
+export function piRpcArgv({ sessionFile, model, thinkingLevel, name }) {
+  const argv = ["--mode", "rpc", "--session", sessionFile];
+  if (model !== undefined) argv.push("--provider", model.provider, "--model", model.id);
+  if (thinkingLevel !== undefined) argv.push("--thinking", thinkingLevel);
+  if (name !== undefined) argv.push("--name", name);
+  return argv;
+}
+
 /** @param {NodeJS.WritableStream} stream @param {Uint8Array} bytes */
 async function writeAll(stream, bytes) {
   await new Promise((resolve, reject) => {
@@ -118,11 +131,7 @@ export class PiRpcAdapter {
    */
   static async start({ executable, cwd, sessionFile, model, thinkingLevel, name, env = process.env, spawnImpl = spawn }) {
     if (typeof executable !== "string" || typeof cwd !== "string" || typeof sessionFile !== "string") throw new TypeError("executable, cwd, and sessionFile are required");
-    const argv = ["--mode", "rpc", "--session", sessionFile];
-    if (model !== undefined) argv.push("--provider", model.provider, "--model", model.id);
-    if (thinkingLevel !== undefined) argv.push("--thinking", thinkingLevel);
-    if (name !== undefined) argv.push("--name", name);
-    const child = spawnImpl(executable, argv, {
+    const child = spawnImpl(executable, piRpcArgv({ sessionFile, model, thinkingLevel, name }), {
       cwd,
       env,
       shell: false,
@@ -132,8 +141,10 @@ export class PiRpcAdapter {
     return new PiRpcAdapter({ input: child.stdin, output: child.stdout, process: child, ownedProcess: true });
   }
 
-  /** Connect the adapter to one installed Pi child's owned pipes. */
-  /** @param {{ input: NodeJS.WritableStream, output: NodeJS.ReadableStream, diagnostics?: { append(record: Uint8Array): Promise<unknown> | unknown }, maxRecordBytes?: number, process?: import("node:child_process").ChildProcess }} options */
+  /**
+   * Connect the adapter to one installed Pi child's owned pipes.
+   * @param {{ input: NodeJS.WritableStream, output: NodeJS.ReadableStream, diagnostics?: { append(record: Uint8Array): Promise<unknown> | unknown }, maxRecordBytes?: number, process?: import("node:child_process").ChildProcess }} options
+   */
   static connect({ input, output, diagnostics, maxRecordBytes, process: child }) {
     return new PiRpcAdapter({ input, output, diagnostics, maxRecordBytes, process: child });
   }

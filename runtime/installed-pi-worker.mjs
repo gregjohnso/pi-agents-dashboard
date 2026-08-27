@@ -3,10 +3,11 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
 import { openPiExecutableBinding } from "./pi-executable.mjs";
-import { PiRpcAdapter } from "./pi-rpc-adapter.mjs";
+import { PiRpcAdapter, piRpcArgv } from "./pi-rpc-adapter.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { openRotatingDiagnostics } from "./rotating-diagnostics.mjs";
 import { sessionEventForPiEvent } from "./session-event-mapping.mjs";
+import { createWorkerCommandDispatcher, createWorkerReplayStore, maintainDaemonConnection, replayDeliveryIsAmbiguous } from "./worker.mjs";
 
 const MAX_PENDING_PARENT_MESSAGES = 256;
 
@@ -51,8 +52,8 @@ function parseArgs(argv) {
 }
 
 
-/** @param {NodeJS.Process} runtimeProcess @param {{ createWorkerReplayStore: Function, createWorkerCommandDispatcher: Function, replayDeliveryIsAmbiguous: Function, maintainDaemonConnection: Function }} dependencies */
-export async function runInstalledPiWorker(runtimeProcess, dependencies) {
+/** @param {NodeJS.Process} runtimeProcess */
+export async function runInstalledPiWorker(runtimeProcess) {
   const options = parseArgs(runtimeProcess.argv.slice(2));
   const token = runtimeProcess.env.PI_DASHBOARD_WORKER_TOKEN;
   if (typeof token !== "string" || token.length === 0 || typeof runtimeProcess.send !== "function") throw new Error("Worker requires an authenticated IPC launch channel");
@@ -100,10 +101,7 @@ export async function runInstalledPiWorker(runtimeProcess, dependencies) {
 
   const executableBinding = await openPiExecutableBinding(options.executable);
   const diagnostics = await openRotatingDiagnostics({ directory: options.diagnosticsDirectory });
-  const argv = ["--mode", "rpc", "--session", options.canonicalSessionFile];
-  if (options.model !== undefined) argv.push("--provider", options.model.provider, "--model", options.model.id);
-  if (options.thinkingLevel !== undefined) argv.push("--thinking", options.thinkingLevel);
-  if (options.name !== undefined) argv.push("--name", options.name);
+  const argv = piRpcArgv({ sessionFile: options.canonicalSessionFile, model: options.model, thinkingLevel: options.thinkingLevel, name: options.name });
   let piChild;
   try {
     piChild = spawn(executableBinding.executionPath, argv, { cwd: options.cwd, env: runtimeProcess.env, detached: false, shell: false, stdio: ["pipe", "pipe", "pipe", executableBinding.handle.fd] });
@@ -136,8 +134,8 @@ export async function runInstalledPiWorker(runtimeProcess, dependencies) {
   if (initialState?.sessionFile !== options.canonicalSessionFile) {
     throw Object.assign(new Error("Installed Pi get_state did not retain the canonical session file"), { code: "CANONICAL_SESSION_MISMATCH" });
   }
-  const replay = await dependencies.createWorkerReplayStore({ path: options.replayPath });
-  const dispatcher = dependencies.createWorkerCommandDispatcher({ replay, adapter });
+  const replay = await createWorkerReplayStore({ path: options.replayPath });
+  const dispatcher = createWorkerCommandDispatcher({ replay, adapter });
   const reconnectController = new AbortController();
   let shuttingDown = false;
   const shutdown = async () => {
@@ -157,7 +155,7 @@ export async function runInstalledPiWorker(runtimeProcess, dependencies) {
     if (message.type !== "command") return;
     dispatcher.deliver(message.command).then(
       (/** @type {any} */ record) => send({ version: 1, type: "command_result", token, id: message.id, ok: true, record }),
-      (/** @type {any} */ error) => send({ version: 1, type: "command_result", token, id: message.id, ok: false, error: { code: error?.code ?? "RPC_FAILED", message: error instanceof Error ? error.message : "RPC failed", deliveryUnknown: error?.deliveryUnknown === true || dependencies.replayDeliveryIsAmbiguous(replay, message.command) } }),
+      (/** @type {any} */ error) => send({ version: 1, type: "command_result", token, id: message.id, ok: false, error: { code: error?.code ?? "RPC_FAILED", message: error instanceof Error ? error.message : "RPC failed", deliveryUnknown: error?.deliveryUnknown === true || replayDeliveryIsAmbiguous(replay, message.command) } }),
     ).catch(() => {});
   };
   transportMessageHandler = onTransportMessage;
@@ -168,7 +166,7 @@ export async function runInstalledPiWorker(runtimeProcess, dependencies) {
 
   if (options.daemonConnector !== undefined) {
     runtimeProcess.once("disconnect", () => {
-      void dependencies.maintainDaemonConnection({
+      void maintainDaemonConnection({
         signal: reconnectController.signal, delaysMs: options.reconnectDelaysMs, sleep: (/** @type {number} */ ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms)),
         connect: async () => {
           const target = options.daemonConnector.startsWith("file:") ? options.daemonConnector : pathToFileURL(options.daemonConnector).href;

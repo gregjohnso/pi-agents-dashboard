@@ -18,6 +18,8 @@ const MAX_QUEUED_FRAME_BYTES = 1024 * 1024;
 const MAX_QUEUED_FRAMES = 256;
 const MAX_BUFFERED_STARTUP_EVENTS = 256;
 const DEFAULT_LAUNCH_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateMs: 5_000 });
+/** Stop dispositions that prove the worker process group is gone, so its lease can be released. */
+const PROVEN_TERMINAL_DISPOSITIONS = ["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "KILLED", "STALE_IDENTITY"];
 
 /** @typedef {(command: string, argv: string[], options: any) => any} SpawnLike */
 
@@ -284,7 +286,7 @@ export class WorkerSupervisor {
       signalProcessGroup: this.#signalProcessGroup,
       sleep: this.#sleep,
     }, this.#launchStopPolicy).catch(() => ({ disposition: "AMBIGUOUS_IDENTITY" }));
-    if (["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "KILLED", "STALE_IDENTITY"].includes(result.disposition)) {
+    if (PROVEN_TERMINAL_DISPOSITIONS.includes(result.disposition)) {
       await this.#reconcileTerminalLocked(supervision, true);
     }
   }
@@ -318,13 +320,12 @@ export class WorkerSupervisor {
 
     let executable;
     let capabilities;
-    const selectedPath = piPath;
     try {
       if (this.#injectedSpawn) {
-        executable = { realpath: selectedPath ?? process.execPath, device: "injected", inode: "injected", size: 0, modifiedTimeNs: "0" };
+        executable = { realpath: piPath ?? process.execPath, device: "injected", inode: "injected", size: 0, modifiedTimeNs: "0" };
         capabilities = /** @type {import("../shared/contracts.mjs").PiCapabilityReport} */ ({ executable, reportedVersion: "injected", rpcMode: true, jsonl: true, commands: ["get_state", "prompt", "follow_up", "steer", "abort", "extension_ui_response"], events: [], missingRequired: [] });
       } else {
-        executable = await this.#resolveExecutable({ cliPath: selectedPath, configuredPath: this.#configuredPiPath, pathEnv: this.#env.PATH ?? "" });
+        executable = await this.#resolveExecutable({ cliPath: piPath, configuredPath: this.#configuredPiPath, pathEnv: this.#env.PATH ?? "" });
         capabilities = await this.#probeCapabilities({ executable, cache: this.#capabilityCache, timeoutMs: this.#startTimeoutMs, env: this.#env });
         if (capabilities.missingRequired.length > 0) {
           throw Object.assign(new WorkerSupervisorError("UNSUPPORTED_PI_CAPABILITY", `Installed Pi is missing required capabilities: ${capabilities.missingRequired.join(", ")}`), { missingCapabilities: capabilities.missingRequired });
@@ -655,7 +656,7 @@ export class WorkerSupervisor {
   }
 
   /**
-   * Stop one owned worker only through Task 6's verified identity boundary.
+   * Stop one owned worker only through the verified process-identity boundary.
    * @param {any} handle
    * @param {Parameters<typeof stopVerifiedProcessGroup>[1]} deps
    * @param {Parameters<typeof stopVerifiedProcessGroup>[2]} policy
@@ -672,7 +673,7 @@ export class WorkerSupervisor {
         throw new WorkerSupervisorError("UNKNOWN_WORKER", "Worker has already exited");
       }
       const result = await stopVerifiedProcessGroup(handle.identity, deps, policy);
-      if (["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "KILLED", "STALE_IDENTITY"].includes(result.disposition)) {
+      if (PROVEN_TERMINAL_DISPOSITIONS.includes(result.disposition)) {
         await this.#reconcileTerminalLocked(supervision, true);
       }
       return result;

@@ -151,6 +151,60 @@ describe("viewer commands and role restrictions", () => {
     expect(f.commands).toHaveLength(1);
   });
 
+  it("offers mode and toggle pickers for bare queue and automation commands", async () => {
+    const f = fixture();
+    await f.instance.open();
+
+    f.instance.editor.setText("/steering");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
+    expect(f.instance.render(80, 24).join("\n")).toContain("one-at-a-time");
+    f.instance.handleInput("\x1b[B");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "session_command", payload: { sessionId: "s", command: "set_steering_mode", mode: "one-at-a-time" } }]));
+
+    f.instance.editor.setText("/auto-compact");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.commands).toHaveLength(2));
+    expect(f.commands.at(-1)).toEqual({ operation: "session_command", payload: { sessionId: "s", command: "set_auto_compaction", enabled: true } });
+
+    f.instance.editor.setText("/follow-up");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
+    f.instance.handleInput("\x1b");
+    expect(f.instance.selection).toBeUndefined();
+    expect(f.commands).toHaveLength(2);
+  });
+
+  it.each([40, 55, 80, 120, 160])("fits the mode picker and help panel in %i columns", async (width) => {
+    const f = fixture();
+    await f.instance.open();
+
+    f.instance.editor.setText("/steering");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
+    expect(f.instance.render(width, 24).every((line) => visibleWidth(line) <= width)).toBe(true);
+    f.instance.handleInput("\x1b");
+
+    f.instance.editor.setText("/help");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.instance.render(width, 24).join("\n")).toContain("auto-compact"));
+    expect(f.instance.render(width, 24).every((line) => visibleWidth(line) <= width)).toBe(true);
+  });
+
+  it("corrects a mistyped mode instead of opening a picker", async () => {
+    const f = fixture();
+    await f.instance.open();
+
+    f.instance.editor.setText("/auto-compact maybe");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.instance.render(80, 24).join("\n")).toContain("TOGGLE_REQUIRED"));
+    expect(f.instance.selection).toBeUndefined();
+    expect(f.commands).toHaveLength(0);
+  });
+
   it("renders a read-only query in an overlay without prompting the session", async () => {
     const f = fixture({ query: async (_sessionId, payload) => ({ rows: [`query:${payload.query}`, "messageCount: 12"] }) });
     await f.instance.open();

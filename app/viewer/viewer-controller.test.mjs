@@ -193,7 +193,7 @@ describe("viewer commands and role restrictions", () => {
     expect(f.instance.hideThinking).toBe(false);
     f.instance.handleInput("\x14");
     expect(f.instance.hideThinking).toBe(true);
-    expect(f.instance.render(80, 24).join("\n")).toContain("thinking:high/hidden");
+    expect(f.instance.render(80, 24).join("\n")).toContain("Thinking blocks: hidden");
 
     f.instance.editor.setText("composer draft");
     f.instance.handleInput("\x13");
@@ -370,5 +370,88 @@ describe("viewer rendering and navigation", () => {
     expect(f.order).toContain("unsubscribe");
     expect(f.order.some((entry) => entry.startsWith("ack:"))).toBe(false);
     expect(f.commands).toEqual([]);
+  });
+});
+
+describe("Pi interactive-mode parity", () => {
+  const working = { snapshot: { taskState: "WORKING", model: { provider: "anthropic", id: "opus" }, thinkingLevel: "high", activity: { kind: "activity", phase: "assistant_streaming", label: "Working...", sourceEventId: "source", startedAt: timestamp } } };
+
+  it("shows Pi's spinner, interrupt hint, model footer, and key hints while a turn works", async () => {
+    const f = fixture(working);
+    await f.instance.open();
+    const lines = f.instance.render(80, 24).map(stripVTControlCharacters);
+    expect(lines.some((line) => /^ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working\.\.\./u.test(line))).toBe(true);
+    expect(lines.join("\n")).toContain("(Esc to interrupt)");
+    expect(lines.at(-2)).toMatch(/\(anthropic\) opus • high$/u);
+    expect(lines.at(-1)).toBe(" Esc interrupt · ← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools");
+    expect(f.instance.render(120, 24).at(-1)).toBe(" Esc interrupt · ← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands");
+  });
+
+  it("drops the interrupt hint and offers the list keys once the turn settles", async () => {
+    const f = fixture({ snapshot: { model: { provider: "anthropic", id: "opus" }, thinkingLevel: "off" } });
+    await f.instance.open();
+    const lines = f.instance.render(80, 24).map(stripVTControlCharacters);
+    expect(lines.join("\n")).not.toContain("to interrupt");
+    expect(lines.at(-2)).toMatch(/\(anthropic\) opus • thinking off$/u);
+    expect(lines.at(-1)).toBe(" Esc/← list · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands");
+  });
+
+  it("keeps the hints and model footer inside every supported width", async () => {
+    const f = fixture(working);
+    await f.instance.open();
+    for (const width of [40, 55, 80, 120, 160]) {
+      const lines = f.instance.render(width, 24);
+      expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
+      expect(visibleWidth(lines.at(-1))).toBeGreaterThan(0);
+      expect(stripVTControlCharacters(lines.at(-2))).toContain("opus");
+    }
+  });
+
+  it("lists queued steer and follow-up messages under the editor until the session consumes them", async () => {
+    const f = fixture({ snapshot: { taskState: "WORKING" } });
+    await f.instance.open();
+    f.instance.editor.setText("next");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.commands.at(-1)?.operation).toBe("follow_up"));
+    await f.instance.submitSteer("urgent");
+    const queued = f.instance.render(80, 24).map(stripVTControlCharacters).join("\n");
+    expect(queued).toContain(" Steering: urgent");
+    expect(queued).toContain(" Follow-up: next");
+
+    await f.emit({ version: 1, sessionId: "s", eventId: "consumed", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "user_message", itemId: "queued-next", content: [{ type: "text", text: "next" }] } });
+    const consumed = f.instance.render(80, 24).map(stripVTControlCharacters).join("\n");
+    expect(consumed).not.toContain("Follow-up: next");
+    expect(consumed).toContain(" Steering: urgent");
+
+    await f.emit({ version: 1, sessionId: "s", eventId: "settled", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "2" }, timestamp, payload: { kind: "turn_state", working: false } });
+    expect(f.instance.render(80, 24).map(stripVTControlCharacters).join("\n")).not.toContain("Steering: urgent");
+  });
+
+  it("shrinks the dock spacers before the transcript at the smallest supported size", async () => {
+    const f = fixture({ snapshot: { taskState: "WORKING", errors: [{ code: "PROVIDER_ERROR", message: "boom", retryable: false }], pendingUi: [{ id: "ui", method: "confirm", title: "Continue?" }] } });
+    await f.instance.open();
+    const lines = f.instance.render(40, 10).map(stripVTControlCharacters);
+    expect(lines).toHaveLength(10);
+    expect(lines.join("\n")).toContain("y/Enter confirm");
+    expect(lines.at(-1)).toContain("Esc interrupt");
+  });
+
+  it("spaces user turns and words error cards the way Pi does", async () => {
+    const f = fixture({ snapshot: {
+      items: [
+        { kind: "assistant_message", itemId: "a", content: [{ type: "text", text: "answer" }] },
+        { kind: "user_message", itemId: "u", content: [{ type: "text", text: "follow up" }] },
+        { kind: "system_message", itemId: "sys", text: "provider degraded", level: "warning" },
+      ],
+      errors: [{ code: "PROVIDER_ERROR", message: "provider error", retryable: true }],
+    } });
+    await f.instance.open();
+    const lines = f.instance.render(80, 24).map(stripVTControlCharacters);
+    const userIndex = lines.findIndex((line) => line.includes("follow up"));
+    expect(userIndex).toBeGreaterThan(1);
+    // Pi separates a user turn from the previous one with its own spacer above the message box padding.
+    expect([lines[userIndex - 2].trim(), lines[userIndex - 1].trim()]).toEqual(["", ""]);
+    expect(lines.join("\n")).toContain(" Warning: provider degraded");
+    expect(lines.join("\n")).toContain(" Error: PROVIDER_ERROR: provider error");
   });
 });

@@ -93,7 +93,7 @@ export class TranscriptModel {
     this.searchMatches = [];
     this.selectedSearchItemId = undefined;
     this.selectedToolId = undefined;
-    this.expandedTools = new Set([...state.tools.values()].filter((tool) => ["running", "streaming", "failed"].includes(tool.state)).map((tool) => tool.id));
+    this.expandedTools = new Set();
   }
   setViewport(width, height) { this.width = Math.max(0, Math.floor(width)); this.height = Math.max(0, Math.floor(height)); }
   update(state) {
@@ -167,7 +167,10 @@ export class TranscriptModel {
       const component = this.adapters.component(renderedItem, { streaming: renderedItem.streaming, thinkingLevel: this.state.thinkingLevel, hideThinking: this.hideThinking, provider: this.state.model?.provider, model: this.state.model?.id });
       if (renderedItem.kind === "tool") component.setExpanded?.(this.expandedTools.has(renderedItem.toolId));
       const markers = [];
-      const itemId = itemIdentity(renderedItem, this.state.items.indexOf(item));
+      const itemIndex = this.state.items.indexOf(item);
+      // Pi opens every user turn but the first with a spacer above the message box.
+      if (renderedItem.kind === "user_message" && itemIndex > 0) markers.push("");
+      const itemId = itemIdentity(renderedItem, itemIndex);
       if (this.selectedSearchItemId !== undefined && itemId === this.selectedSearchItemId) markers.push(fit("› search match", width));
       if (renderedItem.kind === "tool" && renderedItem.toolId === this.selectedToolId) markers.push(fit("› selected tool", width));
       lines = [...markers, ...component.render(width).map((line) => fit(line, width)), ...lines];

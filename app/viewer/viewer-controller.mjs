@@ -3,7 +3,7 @@ import { CombinedAutocompleteProvider, Key, matchesKey, truncateToWidth, visible
 import { parseViewerEvent, parseViewerSnapshot } from "../../shared/viewer-contracts.mjs";
 import { createPiComponentAdapters } from "./pi-component-adapters.mjs";
 import { EMPTY_SESSION_MENU, parseSlashSubmission, sessionSlashCommands } from "./slash-commands.mjs";
-import { CommandSelectionOverlay, PendingUiOverlay, renderActivityLine, renderSystemCard } from "./overlays.mjs";
+import { CommandSelectionOverlay, PendingUiOverlay, renderStatusIndicator, renderSystemCard } from "./overlays.mjs";
 import { ReturnGesture } from "./return-gesture.mjs";
 import { TranscriptModel, applyViewerEvent, createTranscriptState } from "./transcript.mjs";
 
@@ -14,6 +14,37 @@ function fit(line, width) {
 
 function isPageUp(data) { return matchesKey(data, Key.pageUp); }
 function isPageDown(data) { return matchesKey(data, Key.pageDown); }
+
+const QUEUED_MESSAGE_ROWS = 3;
+const MIN_TRANSCRIPT_ROWS = 3;
+
+/** Lay out Pi's footer: sourced viewer status on the left, the model and its thinking level right-aligned. */
+function renderModelFooter({ model, thinkingLevel }, hideThinking, width) {
+  if (width <= 0) return "";
+  const left = hideThinking ? " Thinking blocks: hidden" : "";
+  const leftWidth = visibleWidth(left);
+  if (leftWidth >= width) return truncateToWidth(left, width, "");
+  const thinking = thinkingLevel === null || thinkingLevel === undefined ? "" : thinkingLevel === "off" ? " • thinking off" : ` • ${thinkingLevel}`;
+  const bare = `${model === null ? "no-model" : model.id}${thinking}`;
+  const withProvider = model === null ? bare : `(${model.provider}) ${bare}`;
+  const right = leftWidth + 2 + visibleWidth(withProvider) <= width ? withProvider : bare;
+  const fitted = leftWidth + 2 + visibleWidth(right) <= width ? right : truncateToWidth(right, width - leftWidth - 2, "");
+  return left + " ".repeat(Math.max(0, width - leftWidth - visibleWidth(fitted))) + fitted;
+}
+
+/** Render the widest prefix of Pi's key hints plus the dashboard's own return keys that fits. */
+function renderKeyHints({ role, working }, width) {
+  const segments = role !== "composer"
+    ? ["Esc/← list", "↑↓ scroll", "Ctrl+T thinking", "Ctrl+O tools"]
+    : working
+      ? ["Esc interrupt", "← list", "Ctrl+S steer", "Ctrl+T thinking", "Ctrl+O tools", "/ commands"]
+      : ["Esc/← list", "Ctrl+S steer", "Ctrl+T thinking", "Ctrl+O tools", "/ commands"];
+  for (let count = segments.length; count > 0; count -= 1) {
+    const line = ` ${segments.slice(0, count).join(" · ")}`;
+    if (visibleWidth(line) <= width) return line;
+  }
+  return "";
+}
 
 /** Own one standalone normalized Pi chat subscription and its composer role. */
 export class ViewerController {
@@ -30,6 +61,7 @@ export class ViewerController {
     this.cwd = cwd;
     this.menu = EMPTY_SESSION_MENU;
     this.history = [];
+    this.queued = [];
     this.respondedUi = new Set();
     this.inputMode = "prompt";
     this.hideThinking = false;
@@ -83,20 +115,25 @@ export class ViewerController {
     if (this.state === undefined) return Array.from({ length: height }, () => fit("Loading viewer…", width));
     const role = this.state.role.toUpperCase();
     const header = width >= 70
-      ? ` pi-dashboard · ${this.sessionId} · ${this.state.taskState}/${this.state.processState} · ${role} · ${this.state.working ? "Esc stop · ← list" : "←/Esc list"}`
+      ? ` pi-dashboard · ${this.sessionId} · ${this.state.taskState}/${this.state.processState} · ${role}`
       : width >= 50
-        ? ` ${this.sessionId} · ${this.state.taskState}/${this.state.processState} · ${role} · ← list`
-        : ` ${this.state.taskState}/${this.state.processState} · ${role} · ← list`;
-    const footerParts = [this.state.model === null ? "model:default" : `model:${this.state.model.provider}/${this.state.model.id}`, `thinking:${this.state.thinkingLevel ?? "default"}`, `connection:${this.state.processState}`];
-    const footer = footerParts.join(" · ");
-    const activity = renderActivityLine(this.state.activity, width, this.now());
+        ? ` ${this.sessionId} · ${this.state.taskState}/${this.state.processState} · ${role}`
+        : ` ${this.state.taskState}/${this.state.processState} · ${role}`;
+    let status = renderStatusIndicator(this.state.activity, width, this.now(), { working: this.state.working });
     const editorLines = this.state.role === "composer" ? this.editor.render(width) : [" Read-only session · scroll and tool inspection only"];
     const inputLabel = this.inputMode === "steer" ? [" Steer at next supported boundary"] : this.steerStatus === undefined ? [] : [` Steer ${this.steerStatus}`];
     const selectedTool = this.transcript.selectedToolId === undefined ? undefined : this.state.tools.get(this.transcript.selectedToolId);
     const toolLine = selectedTool === undefined ? [] : [` tool:${selectedTool.name} ${selectedTool.state} ${this.transcript.expandedTools.has(selectedTool.id) ? "expanded" : "collapsed"}`];
-    const errorLines = this.state.errors.slice(-1).flatMap((error) => renderSystemCard({ text: `${error.code}: ${error.message}`, level: "error" }, width));
-    const fixed = 2 + activity.length + editorLines.length + inputLabel.length + toolLine.length + errorLines.length;
-    const transcriptHeight = Math.max(0, height - fixed);
+    let errorLines = this.state.errors.slice(-1).flatMap((error) => renderSystemCard({ text: `${error.code}: ${error.message}`, level: "error" }, width));
+    let queuedLines = this.renderQueued();
+    let hints = renderKeyHints(this.state, width);
+    const dockRows = () => 2 + (hints === "" ? 0 : 1) + status.length + editorLines.length + inputLabel.length + toolLine.length + errorLines.length + queuedLines.length;
+    if (height - dockRows() < MIN_TRANSCRIPT_ROWS) {
+      // Pi's dock shrinks its own spacers, then its hints, before the transcript loses rows.
+      status = status.slice(1); errorLines = errorLines.slice(1); queuedLines = queuedLines.slice(1);
+      if (height - dockRows() < MIN_TRANSCRIPT_ROWS) hints = "";
+    }
+    const transcriptHeight = Math.max(0, height - dockRows());
     let body = this.transcript.render(width, transcriptHeight);
     const activeOverlay = this.overlay ?? this.selection;
     if (activeOverlay !== undefined) {
@@ -104,9 +141,8 @@ export class ViewerController {
       const start = Math.max(0, body.length - overlayLines.length);
       body = [...body.slice(0, start), ...overlayLines];
     }
-    const thinking = `${this.state.thinkingLevel ?? "default"}/${this.hideThinking ? "hidden" : "visible"}`;
-    const statusFooter = footer.replace(`thinking:${this.state.thinkingLevel ?? "default"}`, `thinking:${thinking}`);
-    const lines = [header, ...body, ...errorLines, ...activity, ...toolLine, ...inputLabel, ...editorLines, statusFooter].map((line) => fit(line, width));
+    const footer = renderModelFooter(this.state, this.hideThinking, width);
+    const lines = [header, ...body, ...errorLines, ...queuedLines, ...status, ...toolLine, ...inputLabel, ...editorLines, footer, ...(hints === "" ? [] : [hints])].map((line) => fit(line, width));
     while (lines.length < height) lines.splice(1, 0, "");
     return lines.slice(0, height);
   }
@@ -270,6 +306,7 @@ export class ViewerController {
     } else {
       const operation = this.state.working ? "follow_up" : "prompt";
       if (!await this.sendCommand(operation, { text: submission.text })) return;
+      if (operation === "follow_up") this.queued.push({ mode: "follow_up", text: submission.text });
     }
     this.history.push(prompt);
     this.editor.addToHistory?.(prompt);
@@ -277,9 +314,29 @@ export class ViewerController {
     this.edited = false; this.historyUsed = false;
   }
 
-  submitSteer(text) {
-    if (this.state?.role !== "composer" || text.trim().length === 0) return Promise.resolve(false);
-    return this.sendCommand("steer", { text: text.trim() });
+  async submitSteer(text) {
+    const steer = text.trim();
+    if (this.state?.role !== "composer" || steer.length === 0) return false;
+    const sent = await this.sendCommand("steer", { text: steer });
+    if (sent) this.queued.push({ mode: "steer", text: steer });
+    return sent;
+  }
+
+  /** Drop queued messages once the session has turned them into user turns or ended the turn that held them. */
+  syncQueued() {
+    if (this.queued.length === 0) return;
+    if (this.state?.working !== true) { this.queued = []; return; }
+    const submitted = new Set(this.state.items.filter((item) => item.kind === "user_message").map((item) => item.content.filter((part) => part.type === "text").map((part) => part.text).join("\n")));
+    this.queued = this.queued.filter((entry) => !submitted.has(entry.text));
+  }
+
+  /** Render Pi's queued block, steering before follow-ups, directly above the status indicator. */
+  renderQueued() {
+    if (this.queued.length === 0) return [];
+    const ordered = [...this.queued.filter((entry) => entry.mode === "steer"), ...this.queued.filter((entry) => entry.mode === "follow_up")];
+    const shown = ordered.slice(0, QUEUED_MESSAGE_ROWS).map((entry) => ` ${entry.mode === "steer" ? "Steering" : "Follow-up"}: ${entry.text}`);
+    const remaining = ordered.length - shown.length;
+    return ["", ...shown, ...(remaining > 0 ? [` … ${remaining} more queued`] : [])];
   }
 
   async sendCommand(operation, payload) {
@@ -334,6 +391,7 @@ export class ViewerController {
         for (const tool of authoritative.tools) if (!this.state.tools.has(tool.id)) this.state.tools.set(tool.id, structuredClone(tool));
         this.state = { ...this.state, role: authoritative.role, taskState: authoritative.taskState, processState: authoritative.processState, outcome: authoritative.outcome, model: authoritative.model, thinkingLevel: authoritative.thinkingLevel, activity: authoritative.activity, pendingUi: structuredClone(authoritative.pendingUi), errors: structuredClone(authoritative.errors) };
       }
+      this.syncQueued();
       this.transcript.update(this.state);
       this.editor.disableSubmit = this.state.role !== "composer";
       this.installOverlay();

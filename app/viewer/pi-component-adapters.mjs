@@ -15,6 +15,8 @@ const APP_KEYBINDINGS = {
   "app.editor.external": { defaultKeys: "ctrl+g", description: "Open external editor" },
 };
 
+const PI_HIDDEN_THINKING_LABEL = "Thinking...";
+
 const EMPTY_USAGE = {
   input: 0,
   output: 0,
@@ -88,7 +90,7 @@ export function createPiComponentAdapters({ tui, cwd = process.cwd(), hideThinki
       return new UserMessageComponent(textContent(item.content), markdownTheme, 1);
     },
     assistant(item, options = {}) {
-      const component = new AssistantMessageComponent(undefined, options.hideThinking ?? hideThinking, markdownTheme, `Thinking (${options.thinkingLevel ?? "active"})…`, 1);
+      const component = new AssistantMessageComponent(undefined, options.hideThinking ?? hideThinking, markdownTheme, PI_HIDDEN_THINKING_LABEL, 1);
       component.updateContent(/** @type {any} */ (adaptAssistantMessage(item, options)), options.streaming ?? false);
       return component;
     },
@@ -98,7 +100,7 @@ export function createPiComponentAdapters({ tui, cwd = process.cwd(), hideThinki
       if (tool.state !== "pending") component.markExecutionStarted();
       if (tool.state === "streaming") component.updateResult(toolResult(tool), true);
       if (tool.state === "completed" || tool.state === "failed") component.updateResult(toolResult(tool), false);
-      component.setExpanded(["running", "streaming", "failed"].includes(tool.state));
+      component.setExpanded(false);
       return component;
     },
     component(item, options = {}) {
@@ -108,10 +110,10 @@ export function createPiComponentAdapters({ tui, cwd = process.cwd(), hideThinki
       return {
         invalidate() {},
         render(width) {
-          const label = item.kind === "system_message" ? `${item.level.toUpperCase()}: ${item.text}`
+          const label = item.kind === "system_message" ? `${item.level === "error" ? "Error: " : item.level === "warning" ? "Warning: " : ""}${item.text}`
             : item.kind === "unknown_pi_event" ? `Activity (${item.piType}): ${item.summary}`
               : `${item.kind === "image_placeholder" ? "Image" : "File"}: ${item.attachment.path ?? item.attachment.id}${item.attachment.mediaType ? ` (${item.attachment.mediaType})` : ""}${item.attachment.size !== undefined ? ` ${item.attachment.size} bytes` : ""}`;
-          return boundedLines([label], width);
+          return ["", ...boundedLines([` ${label}`], width)];
         },
       };
     },

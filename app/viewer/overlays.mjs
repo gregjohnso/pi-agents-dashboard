@@ -5,6 +5,11 @@ import { createPiKeybindings } from "./pi-component-adapters.mjs";
 
 initTheme(undefined, false);
 
+// Pi's Loader frames and 80 ms cadence, sampled from the render clock because the viewer renders on demand.
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_INTERVAL_MS = 80;
+const PI_WORKING_MESSAGE = "Working...";
+
 function fit(line, width) {
   const safe = line.replace(/[\r\n\u2028\u2029]/gu, " ");
   return visibleWidth(safe) <= width ? safe : truncateToWidth(safe, Math.max(0, width), "");
@@ -113,15 +118,20 @@ export class CommandSelectionOverlay {
   }
 }
 
-/** Render the currently active normalized phase with elapsed time. */
-export function renderActivityLine(activity, width, now = Date.now()) {
-  if (activity === undefined || activity.phase === "idle") return [];
-  const started = Date.parse(activity.startedAt);
+/** Render Pi's status indicator: a blank separator, the spinner frame, the active phase, and the interrupt key. */
+export function renderStatusIndicator(activity, width, now = Date.now(), { working = false } = {}) {
+  const idle = activity === undefined || activity.phase === "idle";
+  if (idle && !working) return [];
+  const label = idle ? PI_WORKING_MESSAGE : activity.label;
+  const started = idle ? Number.NaN : Date.parse(activity.startedAt);
   const elapsed = Number.isFinite(started) ? ` · ${Math.max(0, Math.floor((now - started) / 1_000))}s` : "";
-  return [fit(`● ${activity.label}${elapsed}${activity.detail ? ` · ${activity.detail}` : ""}`, width)];
+  const detail = idle || activity.detail === undefined ? "" : ` · ${activity.detail}`;
+  const frame = SPINNER_FRAMES[Math.floor(Math.max(0, now) / SPINNER_INTERVAL_MS) % SPINNER_FRAMES.length];
+  return ["", fit(` ${frame} ${label}${elapsed}${detail}${working ? " (Esc to interrupt)" : ""}`, width)];
 }
 
-/** Render one bounded lifecycle/system card without mixing it into assistant prose. */
+/** Render one bounded lifecycle/system card with Pi's own error and warning wording. */
 export function renderSystemCard(message, width) {
-  return [fit(`${message.level === "error" ? "ERROR" : message.level === "warning" ? "NOTICE" : "INFO"}: ${message.text}`, width)];
+  const prefix = message.level === "error" ? "Error: " : message.level === "warning" ? "Warning: " : "";
+  return ["", fit(` ${prefix}${message.text}`, width)];
 }

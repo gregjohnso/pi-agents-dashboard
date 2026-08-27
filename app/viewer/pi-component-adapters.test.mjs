@@ -1,3 +1,4 @@
+import { stripVTControlCharacters } from "node:util";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 
@@ -30,6 +31,25 @@ describe("public Pi component adapters", () => {
       timestamp: 0,
     });
     expect(adaptAssistantMessage({ kind: "assistant_message", itemId: "stream", content: [{ type: "text", text: "partial" }] }, { streaming: true }).stopReason).toBe("pending");
+  });
+
+  it("uses Pi's hidden thinking label and its collapsed tool cards", () => {
+    const adapters = createPiComponentAdapters({ tui, cwd: "/repo" });
+    const hidden = adapters.assistant({ kind: "assistant_message", itemId: "a", content: [{ type: "thinking", text: "Inspecting" }, { type: "text", text: "Done" }] }, { hideThinking: true, thinkingLevel: "high" });
+    const text = hidden.render(40).map(stripVTControlCharacters).join("\n");
+    expect(text).toContain("Thinking...");
+    expect(text).not.toContain("Inspecting");
+    for (const state of ["running", "streaming", "failed"]) {
+      expect(adapters.tool({ id: state, name: "future_tool", state, arguments: {}, startedAt: "2026-08-25T00:00:00Z", ...(state === "failed" ? { error: "boom", finishedAt: "2026-08-25T00:00:01Z" } : {}) }).expanded).toBe(false);
+    }
+  });
+
+  it("words normalized system, unknown, and attachment cards the way Pi does", () => {
+    const adapters = createPiComponentAdapters({ tui, cwd: "/repo" });
+    expect(adapters.component({ kind: "system_message", itemId: "s", text: "boom", level: "error" }).render(40)).toEqual(["", " Error: boom"]);
+    expect(adapters.component({ kind: "system_message", itemId: "s", text: "careful", level: "warning" }).render(40)).toEqual(["", " Warning: careful"]);
+    expect(adapters.component({ kind: "system_message", itemId: "s", text: "note", level: "info" }).render(40)).toEqual(["", " note"]);
+    expect(adapters.component({ kind: "unknown_pi_event", piType: "future", summary: "Future Pi event" }).render(40)).toEqual(["", " Activity (future): Future Pi event"]);
   });
 
   it("uses the public CustomEditor with Pi keybindings and IME focus", () => {

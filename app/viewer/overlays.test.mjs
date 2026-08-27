@@ -1,7 +1,7 @@
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 
-import { CommandSelectionOverlay, PendingUiOverlay, renderActivityLine, renderSystemCard } from "./overlays.mjs";
+import { CommandSelectionOverlay, PendingUiOverlay, renderStatusIndicator, renderSystemCard } from "./overlays.mjs";
 
 const tui = { requestRender: vi.fn(), setFocus: vi.fn(), mode: "fullscreen" };
 
@@ -77,7 +77,31 @@ describe("pending Pi UI overlays", () => {
 });
 
 it("renders bounded lifecycle, activity, reconnect, retry, and error cards", () => {
-  for (const lines of [renderActivityLine({ phase: "retrying", label: "Retrying in 4s", detail: "provider busy", startedAt: "2026-08-25T00:00:00Z" }, 40, Date.parse("2026-08-25T00:00:04Z")), renderSystemCard({ text: "Connection lost; reconnecting", level: "error" }, 40)]) {
+  for (const lines of [renderStatusIndicator({ phase: "retrying", label: "Retrying in 4s", detail: "provider busy", startedAt: "2026-08-25T00:00:00Z" }, 40, Date.parse("2026-08-25T00:00:04Z")), renderSystemCard({ text: "Connection lost; reconnecting", level: "error" }, 40)]) {
     expect(lines.every((line) => visibleWidth(line) <= 40)).toBe(true);
   }
+});
+
+describe("Pi status indicator and system cards", () => {
+  const started = "2026-08-25T00:00:00Z";
+  const now = Date.parse("2026-08-25T00:00:04Z");
+
+  it("spins Pi's working indicator above the dock and offers the interrupt key", () => {
+    const lines = renderStatusIndicator({ phase: "tool_running", label: "Running bash", detail: "pytest", startedAt: started }, 80, now, { working: true });
+    expect(lines[0]).toBe("");
+    expect(lines[1]).toMatch(/^ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Running bash · 4s · pytest \(Esc to interrupt\)$/u);
+    expect(renderStatusIndicator({ phase: "tool_running", label: "Running bash", detail: "pytest", startedAt: started }, 40, now, { working: true }).every((line) => visibleWidth(line) <= 40)).toBe(true);
+  });
+
+  it("falls back to Pi's Working message and hides the interrupt key when the turn is settled", () => {
+    expect(renderStatusIndicator({ phase: "idle", label: "Idle", startedAt: started }, 40, now, { working: true })[1]).toContain("Working...");
+    expect(renderStatusIndicator({ phase: "idle", label: "Idle", startedAt: started }, 40, now)).toEqual([]);
+    expect(renderStatusIndicator({ phase: "waiting", label: "Waiting", startedAt: started }, 40, now)[1]).not.toContain("interrupt");
+  });
+
+  it("words system cards the way Pi does", () => {
+    expect(renderSystemCard({ text: "boom", level: "error" }, 40)).toEqual(["", " Error: boom"]);
+    expect(renderSystemCard({ text: "careful", level: "warning" }, 40)).toEqual(["", " Warning: careful"]);
+    expect(renderSystemCard({ text: "note", level: "info" }, 40)).toEqual(["", " note"]);
+  });
 });

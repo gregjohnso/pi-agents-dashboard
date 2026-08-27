@@ -49,6 +49,21 @@ describe("virtual transcript", () => {
     expect(transcript.render(40, 5).join("\n")).toContain("search match");
   });
 
+  it("starts every tool card collapsed the way Pi does", () => {
+    const adapters = { component: vi.fn((item) => ({ render: () => [item.itemId ?? item.kind], setExpanded() {} })) };
+    const state = createTranscriptState({ ...snapshot, tools: [{ id: "t", name: "bash", state: "failed", arguments: {}, error: "boom", startedAt: "2026-08-25T00:00:00Z", finishedAt: "2026-08-25T00:00:01Z" }] });
+    expect([...new TranscriptModel({ state, adapters }).expandedTools]).toEqual([]);
+  });
+
+  it("opens every user turn after the first with Pi's turn spacer", () => {
+    const adapters = { component: vi.fn((item) => ({ render: () => [item.itemId ?? item.kind] })) };
+    let state = createTranscriptState(snapshot);
+    state = applyViewerEvent(state, event({ kind: "assistant_message", itemId: "a", content: [{ type: "text", text: "answer" }] }, "2"));
+    state = applyViewerEvent(state, event({ kind: "user_message", itemId: "u2", content: [{ type: "text", text: "again" }] }, "3"));
+    const transcript = new TranscriptModel({ state, adapters });
+    expect(transcript.render(40, 5)).toEqual(["", "u", "a", "", "u2"]);
+  });
+
   it("renders only visible blocks, pauses follow mode, and marks new activity", () => {
     const adapters = { component: vi.fn((item) => ({ render: vi.fn(() => [item.itemId ?? item.kind]) })) };
     const state = createTranscriptState({ ...snapshot, items: Array.from({ length: 100 }, (_, index) => ({ kind: "system_message", itemId: `i-${index}`, text: `line ${index}`, level: "info" })) });

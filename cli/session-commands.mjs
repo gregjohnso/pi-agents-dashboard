@@ -10,6 +10,7 @@ import { cleanupManagedWorktree as defaultCleanupManagedWorktree } from "../isol
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
 import { acquireLifecycleLock } from "../runtime/lifecycle-lock.mjs";
 import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
+import { loadDashboardConfig } from "../shared/config.mjs";
 import { parseDaemonResponse } from "../shared/contracts.mjs";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
@@ -22,7 +23,30 @@ const ATOMIC_PUBLICATION_UNSUPPORTED_CODES = new Set(["EPERM", "EOPNOTSUPP", "EN
 const PRIVATE_FILE_MODE = 0o600;
 const AUTHENTICATION_STATES = new Set(["STARTING", "RECONCILING", "READY", "FAILED"]);
 const DESTRUCTIVE_COMMANDS = new Set(["stop", "delete", "cleanup"]);
+const DESTRUCTIVE_TIMEOUT_MARGIN_MS = 1_000;
+const DEFAULT_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateMs: 5_000 });
+/** Worst-case wait for the daemon's SIGTERM-then-SIGKILL escalation under the default policy. */
+export const DEFAULT_STOP_ESCALATION_MS = DEFAULT_STOP_POLICY.gracefulMs + DEFAULT_STOP_POLICY.terminateMs + DESTRUCTIVE_TIMEOUT_MARGIN_MS;
 const RESOLUTIONS = new Set(["retry_at_risk", "abandon"]);
+
+/**
+ * Resolve how long a destructive request may wait, from the stop policy the daemon actually escalates on.
+ * SIGTERM then SIGKILL spans gracefulMs + terminateMs, so a shorter CLI deadline reports a false timeout.
+ * @param {string} root @param {{gracefulMs:number,terminateMs:number}} [override] @param {number} [requested]
+ */
+export async function destructiveRequestTimeoutMs(root, override, requested) {
+  let policy = override;
+  if (policy === undefined) {
+    try {
+      const config = loadDashboardConfig(JSON.parse(await fs.readFile(join(root, "dashboard.json"), "utf8")));
+      policy = config.stop;
+    } catch {
+      policy = DEFAULT_STOP_POLICY;
+    }
+  }
+  const escalation = policy.gracefulMs + policy.terminateMs + DESTRUCTIVE_TIMEOUT_MARGIN_MS;
+  return Math.max(escalation, requested ?? 0);
+}
 
 /** @param {unknown} value */
 function exactId(value) {
@@ -594,8 +618,9 @@ export async function runSessionCommand(argv, options = {}) {
       ? await putPending(root, { action: parsed.command, sessionId: parsed.sessionId, revision: parsed.revision, clientId, requestId: randomUUID() }, options.pendingFailpoint)
       : existing;
     if (pending.entry.clientId !== clientId) throw Object.assign(new Error("Persistent CLI identity changed while a destructive request remains pending"), { code: "CLI_CLIENT_IDENTITY_CHANGED", pendingClientId: pending.entry.clientId, currentClientId: clientId, requestId: pending.entry.requestId });
+    const destructiveTimeoutMs = await destructiveRequestTimeoutMs(root, options.stopPolicy, options.timeoutMs);
     const persistent = options.request === undefined && options.composerRequest === undefined
-      ? await createPersistentDaemonRequester({ root, clientId: pending.entry.clientId, timeoutMs: options.timeoutMs })
+      ? await createPersistentDaemonRequester({ root, clientId: pending.entry.clientId, timeoutMs: destructiveTimeoutMs })
       : undefined;
     const request = options.composerRequest ?? persistent?.request ?? options.request;
     const claimsComposer = options.composerRequest !== undefined || persistent !== undefined;

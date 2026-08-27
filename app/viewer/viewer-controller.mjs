@@ -297,7 +297,8 @@ export class ViewerController {
     if (this.state?.role !== "composer" || prompt.length === 0) return;
     const submission = parseSlashSubmission(prompt, this.menu);
     if (submission.kind === "rejected") {
-      if (!this.openSelection(submission.code)) await this.recordError({ code: submission.code, message: submission.message, retryable: false });
+      const bare = /^\/\S+$/u.test(prompt) ? prompt : undefined;
+      if (!this.openSelection(submission.code, bare)) await this.recordError({ code: submission.code, message: submission.message, retryable: false });
       return;
     }
     if (submission.kind === "help") {
@@ -481,8 +482,8 @@ export class ViewerController {
     }
   }
 
-  /** Offer one Pi selection list for a built-in command submitted without its argument. @param {string} code */
-  openSelection(code) {
+  /** Offer one Pi selection list for a built-in command submitted without its argument. @param {string} code @param {string} [submitted] */
+  openSelection(code, submitted) {
     const models = this.menu.models.map((model) => ({ value: `${model.provider}/${model.id}`, label: `${model.provider}/${model.id}` }));
     const picker = code === "MODEL_REQUIRED"
       ? { title: "Select a model", items: models }
@@ -490,9 +491,14 @@ export class ViewerController {
         ? { title: "Select a thinking level", items: this.menu.thinkingLevels.map((level) => ({ value: level, label: level })) }
         : code === "SUMMARY_MODEL_REQUIRED"
           ? { title: "Select a dashboard summary model", items: [{ value: "off", label: "off · disable summaries" }, ...models] }
-          : undefined;
+          : code === "QUEUE_MODE_REQUIRED"
+            ? { title: `Select a ${submitted === "/steering" ? "steering" : "follow-up"} delivery mode`, items: [{ value: "all", label: "all · deliver every queued message" }, { value: "one-at-a-time", label: "one-at-a-time · deliver one per turn" }] }
+            : code === "TOGGLE_REQUIRED"
+              ? { title: `Turn ${submitted === "/auto-retry" ? "automatic retry" : "automatic compaction"} on or off`, items: [{ value: "on", label: "on" }, { value: "off", label: "off" }] }
+              : undefined;
     if (picker === undefined || picker.items.length === 0) return false;
-    const command = code === "MODEL_REQUIRED" ? "/model" : code === "THINKING_LEVEL_REQUIRED" ? "/thinking" : "/model-summary";
+    const command = code === "MODEL_REQUIRED" ? "/model" : code === "THINKING_LEVEL_REQUIRED" ? "/thinking" : code === "QUEUE_MODE_REQUIRED" || code === "TOGGLE_REQUIRED" ? submitted : "/model-summary";
+    if (command === undefined) return false;
     this.selection?.dispose();
     this.selection = new CommandSelectionOverlay({
       title: picker.title, items: picker.items,

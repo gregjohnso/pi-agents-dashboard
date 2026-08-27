@@ -134,12 +134,14 @@ describe("responsive dashboard layout", () => {
         expect(lines[0]).toContain(JOBWATCH_ANSI.cyan);
         expect(lines[1]).toContain(JOBWATCH_ANSI.sky);
     });
-    it("tints only the name cell for a colored session", () => {
+    it("highlights the name cell of a colored session behind black text", () => {
         const layout = createDashboardLayout(120, 20);
         const plain = renderSessionRow(fixtures[0], layout, { now });
         const colored = renderSessionRow({ ...fixtures[0], color: "amber" }, layout, { now });
         expect(colored).not.toBe(plain);
-        expect(colored).toContain(JOBWATCH_ANSI.amber);
+        // The colour fills the cell and the name inverts to black, so it reads as a label.
+        expect(colored).toContain("\x1b[48;2;252;211;77m");
+        expect(colored).toContain("\x1b[38;2;0;0;0m");
         // The state cell keeps its derived color; only the name cell carries the operator's choice.
         expect(colored).toContain(JOBWATCH_ANSI.green);
         expect(stripVTControlCharacters(colored)).toBe(stripVTControlCharacters(plain));

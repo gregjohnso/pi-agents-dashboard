@@ -14,7 +14,12 @@ export const JOBWATCH_ANSI = {
     amber: "\x1b[38;2;252;211;77m",
     rose: "\x1b[38;2;253;164;175m",
     gray: "\x1b[38;2;136;136;136m",
+    black: "\x1b[38;2;0;0;0m",
 };
+/** Turn a palette foreground into the matching background fill. */
+function backgroundFor(color) {
+    return JOBWATCH_ANSI[color].replace("[38;2;", "[48;2;");
+}
 function paint(text, foreground, selected, background = JOBWATCH_ANSI.blackBackground) {
     const rowBackground = selected ? JOBWATCH_ANSI.selectionBackground : background;
     return `${rowBackground}${foreground}${text}${JOBWATCH_ANSI.reset}`;
@@ -89,7 +94,11 @@ export const jobwatchTheme = {
         return paint(text, JOBWATCH_ANSI.text, selected);
     },
     name(text, selected, color) {
-        return paint(text, color === undefined ? JOBWATCH_ANSI.text : JOBWATCH_ANSI[color], selected);
+        if (color === undefined)
+            return paint(text, JOBWATCH_ANSI.text, selected);
+        // A colour is a label, so it fills the cell and the name inverts to black. Selection still
+        // wins, because the cursor row must stay findable whatever colour it carries.
+        return paint(text, selected ? JOBWATCH_ANSI[color] : JOBWATCH_ANSI.black, selected, backgroundFor(color));
     },
     muted(text, selected) {
         return paint(text, JOBWATCH_ANSI.gray, selected);

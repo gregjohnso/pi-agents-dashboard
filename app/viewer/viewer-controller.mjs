@@ -17,11 +17,24 @@ function fit(line, width) {
 
 const COLOR_CODES = { sky: "\x1b[38;2;125;211;252m", cyan: "\x1b[38;2;125;211;252m", green: "\x1b[38;2;110;231;183m", amber: "\x1b[38;2;252;211;77m", rose: "\x1b[38;2;253;164;175m", gray: "\x1b[38;2;136;136;136m" };
 
-/** Tint the composer's prompt bar with the operator's session color. Untinted lines are returned unchanged. */
-function tintPromptBar(lines, color) {
-  const code = color === undefined ? undefined : COLOR_CODES[color];
-  if (code === undefined) return lines;
-  return lines.map((line) => `${code}${line}\x1b[0m`);
+const BORDER_DEFAULT = "\x1b[38;2;136;136;136m";
+
+/**
+ * Frame the prompt so the operator's session color is visible without recoloring what they type.
+ * The border carries the color; the editor's own lines are passed through untouched.
+ * @param {string[]} lines @param {string | undefined} color @param {number} width
+ */
+function framePromptBox(lines, color, width) {
+  const inner = Math.max(0, width - 2);
+  const code = (color === undefined ? undefined : COLOR_CODES[color]) ?? BORDER_DEFAULT;
+  const edge = (glyph) => `${code}${glyph}\x1b[0m`;
+  const rule = (left, right) => `${code}${left}${"─".repeat(inner)}${right}\x1b[0m`;
+  if (inner === 0) return lines;
+  const padded = lines.map((line) => {
+    const clipped = truncateToWidth(line, inner, "");
+    return `${edge("│")}${clipped}${" ".repeat(Math.max(0, inner - visibleWidth(clipped)))}${edge("│")}`;
+  });
+  return [rule("╭", "╮"), ...padded, rule("╰", "╯")];
 }
 
 function isPageUp(data) { return matchesKey(data, Key.pageUp); }
@@ -140,7 +153,8 @@ export class ViewerController {
         ? ` ${this.sessionId} · ${this.state.taskState}/${this.state.processState} · ${role}`
         : ` ${this.state.taskState}/${this.state.processState} · ${role}`;
     let status = renderStatusIndicator(this.state.activity, width, this.now(), { working: this.state.working });
-    const editorLines = tintPromptBar(this.state.role === "composer" ? this.editor.render(width) : [" Read-only session · scroll and tool inspection only"], this.sessionColor);
+    const promptLines = this.state.role === "composer" ? this.editor.render(Math.max(1, width - 2)) : [" Read-only session · scroll and tool inspection only"];
+    let editorLines = framePromptBox(promptLines, this.sessionColor, width);
     const inputLabel = this.inputMode === "steer" ? [" Steer at next supported boundary"] : this.steerStatus === undefined ? [] : [` Steer ${this.steerStatus}`];
     const selectedTool = this.transcript.selectedToolId === undefined ? undefined : this.state.tools.get(this.transcript.selectedToolId);
     const toolLine = selectedTool === undefined ? [] : [` tool:${selectedTool.name} ${selectedTool.state} ${this.transcript.expandedTools.has(selectedTool.id) ? "expanded" : "collapsed"}`];
@@ -151,6 +165,8 @@ export class ViewerController {
     if (height - dockRows() < MIN_TRANSCRIPT_ROWS) {
       // Pi's dock shrinks its own spacers, then its hints, before the transcript loses rows.
       status = status.slice(1); errorLines = errorLines.slice(1); queuedLines = queuedLines.slice(1);
+      // The prompt frame is decoration, so it goes before the hints and before transcript rows.
+      if (height - dockRows() < MIN_TRANSCRIPT_ROWS) editorLines = this.editor.render(width);
       if (height - dockRows() < MIN_TRANSCRIPT_ROWS) hints = "";
     }
     const transcriptHeight = Math.max(0, height - dockRows());

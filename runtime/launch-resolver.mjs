@@ -24,6 +24,16 @@ function activeSharedOwnerIds(records, canonicalCwd) {
     .sort();
 }
 
+/** Derive a short, human session name from the first line of the launch prompt. @param {string} prompt */
+export function sessionNameFromPrompt(prompt) {
+  const firstLine = prompt.split(/\r?\n/u).map((line) => line.replace(/\s+/gu, " ").trim()).find((line) => line.length > 0);
+  if (firstLine === undefined) return undefined;
+  if (firstLine.length <= 48) return firstLine;
+  const clipped = firstLine.slice(0, 48);
+  const lastSpace = clipped.lastIndexOf(" ");
+  return (lastSpace >= 24 ? clipped.slice(0, lastSpace) : clipped).trim();
+}
+
 /** @param {string} prompt */
 function activitySummary(prompt) {
   const plain = stripVTControlCharacters(prompt).replace(/[\r\n\u2028\u2029]/gu, " ").trim();
@@ -144,7 +154,8 @@ export function createLaunchResolver({
         createdAt: timestamp,
         updatedAt: timestamp,
       };
-      if (payload.name !== undefined) sessionRecord.name = payload.name;
+      const name = payload.name ?? sessionNameFromPrompt(payload.prompt);
+      if (name !== undefined) sessionRecord.name = name;
       if (payload.model !== undefined) sessionRecord.model = { ...payload.model };
       if (payload.thinkingLevel !== undefined) sessionRecord.thinkingLevel = payload.thinkingLevel;
       return {
@@ -156,7 +167,7 @@ export function createLaunchResolver({
         sessionRecord,
         ...(payload.model === undefined ? {} : { model: { ...payload.model } }),
         ...(payload.thinkingLevel === undefined ? {} : { thinkingLevel: payload.thinkingLevel }),
-        ...(payload.name === undefined ? {} : { name: payload.name }),
+        ...(name === undefined ? {} : { name }),
         ...(piSession.identity === undefined ? {} : { preparedSessionIdentity: piSession.identity }),
       };
     } catch (error) {

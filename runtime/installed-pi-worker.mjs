@@ -3,7 +3,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
 import { openPiExecutableBinding } from "./pi-executable.mjs";
-import { PiRpcAdapter } from "./pi-rpc-adapter.mjs";
+import { PiRpcAdapter, piRpcArgv } from "./pi-rpc-adapter.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { openRotatingDiagnostics } from "./rotating-diagnostics.mjs";
 import { sessionEventForPiEvent } from "./session-event-mapping.mjs";
@@ -101,10 +101,7 @@ export async function runInstalledPiWorker(runtimeProcess) {
 
   const executableBinding = await openPiExecutableBinding(options.executable);
   const diagnostics = await openRotatingDiagnostics({ directory: options.diagnosticsDirectory });
-  const argv = ["--mode", "rpc", "--session", options.canonicalSessionFile];
-  if (options.model !== undefined) argv.push("--provider", options.model.provider, "--model", options.model.id);
-  if (options.thinkingLevel !== undefined) argv.push("--thinking", options.thinkingLevel);
-  if (options.name !== undefined) argv.push("--name", options.name);
+  const argv = piRpcArgv({ sessionFile: options.canonicalSessionFile, model: options.model, thinkingLevel: options.thinkingLevel, name: options.name });
   let piChild;
   try {
     piChild = spawn(executableBinding.executionPath, argv, { cwd: options.cwd, env: runtimeProcess.env, detached: false, shell: false, stdio: ["pipe", "pipe", "pipe", executableBinding.handle.fd] });

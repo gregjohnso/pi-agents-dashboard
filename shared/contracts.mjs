@@ -31,6 +31,7 @@ export const SESSION_COLORS = ["sky", "green", "amber", "rose", "cyan", "gray"];
 /** @typedef {"sky"|"green"|"amber"|"rose"|"cyan"|"gray"} SessionColor */
 
 const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "session_query", "get_settings", "set_settings", "refresh_summaries", "set_session_color"];
+const COMMAND_STAGES = ["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED", "DELIVERY_UNKNOWN", "FAILED"];
 const SESSION_COMMANDS = ["set_model", "set_thinking_level", "compact", "set_session_name", "set_auto_compaction", "set_auto_retry", "abort_retry", "set_steering_mode", "set_follow_up_mode"];
 // Pi's own vocabulary for both queue modes; anything else is refused before it reaches a worker.
 const QUEUE_MODES = ["all", "one-at-a-time"];
@@ -53,6 +54,12 @@ function rejectUnknownKeys(record, allowed, path) {
   if (unknown !== undefined) throw new TypeError(`Unknown ${path} field: ${unknown}`);
 }
 
+/** @param {Record<string, any>} record @param {readonly string[]} required @param {readonly string[]} optional @param {string} path */
+function requireKeys(record, required, optional, path) {
+  for (const key of required) if (!Object.hasOwn(record, key)) throw new TypeError(`${path}.${key} is required`);
+  rejectUnknownKeys(record, [...required, ...optional], path);
+}
+
 /** @param {Record<string, any>} record @param {string} key @param {string} [path] */
 function readIdentifier(record, key, path = key) {
   const value = record[key];
@@ -72,6 +79,29 @@ function readEnum(record, key, values, path = key) {
   const value = record[key];
   if (typeof value !== "string" || !values.includes(value)) throw new TypeError(`${path} must be one of: ${values.join(", ")}`);
   return value;
+}
+
+/** @param {unknown} value @param {string} path @returns {{provider:string,id:string}} */
+function readModel(value, path) {
+  const model = readRecord(value, path);
+  requireKeys(model, ["provider", "id"], [], path);
+  return { provider: readIdentifier(model, "provider", `${path}.provider`), id: readIdentifier(model, "id", `${path}.id`) };
+}
+
+/** @param {unknown} value @param {string} path */
+function validateProcessIdentity(value, path) {
+  const identity = readRecord(value, path);
+  requireKeys(identity, ["pid", "startIdentity", "processGroupId"], [], path);
+  if (!Number.isSafeInteger(identity.pid) || !Number.isSafeInteger(identity.processGroupId)) throw new TypeError(`${path} process IDs are invalid`);
+  readIdentifier(identity, "startIdentity", `${path}.startIdentity`);
+}
+
+/** @param {unknown} value @param {string} path */
+function validateExecutableIdentity(value, path) {
+  const executable = readRecord(value, path);
+  requireKeys(executable, ["realpath", "device", "inode", "size", "modifiedTimeNs"], [], path);
+  for (const key of ["realpath", "device", "inode", "modifiedTimeNs"]) readIdentifier(executable, key, `${path}.${key}`);
+  if (!Number.isSafeInteger(executable.size) || executable.size < 0) throw new TypeError(`${path}.size is invalid`);
 }
 
 /** @param {unknown} value @param {string} path @returns {EventCursor} */
@@ -121,11 +151,7 @@ function readLaunchRequest(value) {
     prompt: readText(launch, "prompt", "launch payload.prompt"), cwd: readIdentifier(launch, "cwd", "launch payload.cwd"),
     sourceSessionId: readIdentifier(launch, "sourceSessionId", "launch payload.sourceSessionId"), isolation: parsedIsolation,
   };
-  if (Object.hasOwn(launch, "model")) {
-    const model = readRecord(launch.model, "launch payload.model");
-    rejectUnknownKeys(model, ["provider", "id"], "launch payload.model");
-    Object.assign(parsed, { model: { provider: readIdentifier(model, "provider", "launch payload.model.provider"), id: readIdentifier(model, "id", "launch payload.model.id") } });
-  }
+  if (Object.hasOwn(launch, "model")) Object.assign(parsed, { model: readModel(launch.model, "launch payload.model") });
   if (Object.hasOwn(launch, "thinkingLevel")) Object.assign(parsed, { thinkingLevel: readIdentifier(launch, "thinkingLevel", "launch payload.thinkingLevel") });
   if (Object.hasOwn(launch, "name")) Object.assign(parsed, { name: readText(launch, "name", "launch payload.name") });
   return parsed;
@@ -164,9 +190,7 @@ export function parseClientRequest(value) {
     rejectUnknownKeys(payload, ["summaryModel"], "set_settings payload");
     if (!Object.hasOwn(payload, "summaryModel")) throw new TypeError("set_settings payload.summaryModel is required");
     if (payload.summaryModel === null) return { ...base, payload: { summaryModel: null } };
-    const model = readRecord(payload.summaryModel, "set_settings payload.summaryModel");
-    rejectUnknownKeys(model, ["provider", "id"], "set_settings payload.summaryModel");
-    return { ...base, payload: { summaryModel: { provider: readIdentifier(model, "provider", "set_settings payload.summaryModel.provider"), id: readIdentifier(model, "id", "set_settings payload.summaryModel.id") } } };
+    return { ...base, payload: { summaryModel: readModel(payload.summaryModel, "set_settings payload.summaryModel") } };
   }
   if (op === "set_session_color") {
     const payload = readRecord(request.payload, "set_session_color payload");
@@ -221,9 +245,7 @@ export function parseClientRequest(value) {
     const sessionId = readIdentifier(payload, "sessionId", "session_command payload.sessionId");
     if (command === "set_model") {
       rejectUnknownKeys(payload, ["sessionId", "command", "model"], "session_command payload");
-      const model = readRecord(payload.model, "session_command payload.model");
-      rejectUnknownKeys(model, ["provider", "id"], "session_command payload.model");
-      return { ...base, payload: { sessionId, command, model: { provider: readIdentifier(model, "provider", "session_command payload.model.provider"), id: readIdentifier(model, "id", "session_command payload.model.id") } } };
+      return { ...base, payload: { sessionId, command, model: readModel(payload.model, "session_command payload.model") } };
     }
     if (command === "set_thinking_level") {
       rejectUnknownKeys(payload, ["sessionId", "command", "level"], "session_command payload");
@@ -267,10 +289,14 @@ export function parseClientRequest(value) {
   return { ...base, payload: { targetClientId: readIdentifier(payload, "targetClientId", "resolve_delivery payload.targetClientId"), targetRequestId: readIdentifier(payload, "targetRequestId", "resolve_delivery payload.targetRequestId"), resolution: readEnum(payload, "resolution", ["retry_at_risk", "abandon"], "resolve_delivery payload.resolution") } };
 }
 
-/** @param {Record<string, any>} record @param {readonly string[]} required @param {readonly string[]} optional @param {string} path */
-function requireKeys(record, required, optional, path) {
-  for (const key of required) if (!Object.hasOwn(record, key)) throw new TypeError(`${path}.${key} is required`);
-  rejectUnknownKeys(record, [...required, ...optional], path);
+/** @param {unknown} value @param {string} path */
+function validateCommandStatus(value, path) {
+  const status = readRecord(value, path);
+  requireKeys(status, ["clientId", "requestId", "operation", "stage", "acceptedAt", "updatedAt"], ["error"], path);
+  for (const key of ["clientId", "requestId", "acceptedAt", "updatedAt"]) readIdentifier(status, key, `${path}.${key}`);
+  readEnum(status, "operation", OPERATIONS, `${path}.operation`);
+  readEnum(status, "stage", COMMAND_STAGES, `${path}.stage`);
+  if (Object.hasOwn(status, "error")) validateError(status.error, `${path}.error`);
 }
 
 /** @param {unknown} value @param {string} path */
@@ -291,10 +317,7 @@ function validateSession(value, path) {
     if (typeof summary.text !== "string" || summary.text.length === 0 || summary.text.length > 512) throw new TypeError(`${path}.summary.text must be a bounded non-empty string`);
     readIdentifier(summary, "generatedAt", `${path}.summary.generatedAt`);
     readIdentifier(summary, "sourceCursor", `${path}.summary.sourceCursor`);
-    const model = readRecord(summary.model, `${path}.summary.model`);
-    requireKeys(model, ["provider", "id"], [], `${path}.summary.model`);
-    readIdentifier(model, "provider", `${path}.summary.model.provider`);
-    readIdentifier(model, "id", `${path}.summary.model.id`);
+    readModel(summary.model, `${path}.summary.model`);
   }
   if (session.schemaVersion !== 1 || !Number.isSafeInteger(session.revision) || session.revision < 0) throw new TypeError(`${path} schema version or revision is invalid`);
   for (const key of ["sessionId", "sessionFile", "canonicalSessionFile", "cwd", "createdAt", "updatedAt"]) readIdentifier(session, key, `${path}.${key}`);
@@ -303,8 +326,8 @@ function validateSession(value, path) {
   readEnum(session, "outcome", ["NONE", "COMPLETED", "READY_FOR_REVIEW"], `${path}.outcome`);
   const activity = readRecord(session.activity, `${path}.activity`); requireKeys(activity, ["kind", "summary", "updatedAt"], [], `${path}.activity`); readIdentifier(activity, "kind", `${path}.activity.kind`); if (typeof activity.summary !== "string") throw new TypeError(`${path}.activity.summary must be a string`); readIdentifier(activity, "updatedAt", `${path}.activity.updatedAt`);
   for (const key of ["name", "thinkingLevel", "latestRunId"]) if (Object.hasOwn(session, key)) readIdentifier(session, key, `${path}.${key}`);
-  if (Object.hasOwn(session, "model")) { const model = readRecord(session.model, `${path}.model`); requireKeys(model, ["provider", "id"], [], `${path}.model`); readIdentifier(model, "provider", `${path}.model.provider`); readIdentifier(model, "id", `${path}.model.id`); }
-  if (Object.hasOwn(session, "ownership")) { const ownership = readRecord(session.ownership, `${path}.ownership`); requireKeys(ownership, ["kind", "runId", "process", "acquiredAt", "heartbeatAt"], [], `${path}.ownership`); if (ownership.kind !== "managed") throw new TypeError(`${path}.ownership.kind is invalid`); for (const key of ["runId", "acquiredAt", "heartbeatAt"]) readIdentifier(ownership, key, `${path}.ownership.${key}`); const process = readRecord(ownership.process, `${path}.ownership.process`); requireKeys(process, ["pid", "startIdentity", "processGroupId"], [], `${path}.ownership.process`); if (!Number.isSafeInteger(process.pid) || !Number.isSafeInteger(process.processGroupId)) throw new TypeError(`${path}.ownership.process is invalid`); readIdentifier(process, "startIdentity", `${path}.ownership.process.startIdentity`); }
+  if (Object.hasOwn(session, "model")) readModel(session.model, `${path}.model`);
+  if (Object.hasOwn(session, "ownership")) { const ownership = readRecord(session.ownership, `${path}.ownership`); requireKeys(ownership, ["kind", "runId", "process", "acquiredAt", "heartbeatAt"], [], `${path}.ownership`); if (ownership.kind !== "managed") throw new TypeError(`${path}.ownership.kind is invalid`); for (const key of ["runId", "acquiredAt", "heartbeatAt"]) readIdentifier(ownership, key, `${path}.ownership.${key}`); validateProcessIdentity(ownership.process, `${path}.ownership.process`); }
   if (Object.hasOwn(session, "isolation")) { const isolation = readRecord(session.isolation, `${path}.isolation`); const mode = readEnum(isolation, "mode", ["worktree", "shared_directory"], `${path}.isolation.mode`); if (mode === "worktree") { requireKeys(isolation, ["mode", "worktreePath", "branch"], [], `${path}.isolation`); readIdentifier(isolation, "worktreePath", `${path}.isolation.worktreePath`); readIdentifier(isolation, "branch", `${path}.isolation.branch`); } else { requireKeys(isolation, ["mode", "canonicalCwd"], [], `${path}.isolation`); readIdentifier(isolation, "canonicalCwd", `${path}.isolation.canonicalCwd`); } }
   if (Object.hasOwn(session, "runtime")) validateRuntimeIdentity(session.runtime, `${path}.runtime`);
 }
@@ -312,11 +335,9 @@ function validateSession(value, path) {
 /** @param {unknown} value @param {string} path */
 function validateRuntimeIdentity(value, path) {
   const runtime = readRecord(value, path); requireKeys(runtime, ["executable", "piVersion", "capabilities", "rpcAdapterVersion", "viewerProtocolVersion", "supervisor", "piChild"], [], path);
-  const validateExecutable = (/** @type {unknown} */ candidate, /** @type {string} */ candidatePath) => { const executable = readRecord(candidate, candidatePath); requireKeys(executable, ["realpath", "device", "inode", "size", "modifiedTimeNs"], [], candidatePath); for (const key of ["realpath", "device", "inode", "modifiedTimeNs"]) readIdentifier(executable, key, `${candidatePath}.${key}`); if (!Number.isSafeInteger(executable.size) || executable.size < 0) throw new TypeError(`${candidatePath}.size is invalid`); };
-  const validateProcess = (/** @type {unknown} */ candidate, /** @type {string} */ candidatePath) => { const process = readRecord(candidate, candidatePath); requireKeys(process, ["pid", "startIdentity", "processGroupId"], [], candidatePath); if (!Number.isSafeInteger(process.pid) || !Number.isSafeInteger(process.processGroupId)) throw new TypeError(`${candidatePath} process IDs are invalid`); readIdentifier(process, "startIdentity", `${candidatePath}.startIdentity`); };
-  validateExecutable(runtime.executable, `${path}.executable`); if (runtime.piVersion !== null) readIdentifier(runtime, "piVersion", `${path}.piVersion`); if (runtime.rpcAdapterVersion !== 1 || runtime.viewerProtocolVersion !== 1) throw new TypeError(`${path} protocol versions must be 1`);
-  const capabilities = readRecord(runtime.capabilities, `${path}.capabilities`); requireKeys(capabilities, ["executable", "reportedVersion", "rpcMode", "jsonl", "commands", "events", "missingRequired"], [], `${path}.capabilities`); validateExecutable(capabilities.executable, `${path}.capabilities.executable`); if (capabilities.reportedVersion !== null) readIdentifier(capabilities, "reportedVersion", `${path}.capabilities.reportedVersion`); if (typeof capabilities.rpcMode !== "boolean" || typeof capabilities.jsonl !== "boolean" || !Array.isArray(capabilities.commands) || !Array.isArray(capabilities.events) || !Array.isArray(capabilities.missingRequired) || capabilities.commands.some((/** @type {unknown} */ command) => typeof command !== "string" || !["get_state", "prompt", "follow_up", "steer", "abort", "extension_ui_response"].includes(command)) || [...capabilities.events, ...capabilities.missingRequired].some((/** @type {unknown} */ entry) => typeof entry !== "string")) throw new TypeError(`${path}.capabilities is invalid`);
-  validateProcess(runtime.supervisor, `${path}.supervisor`); validateProcess(runtime.piChild, `${path}.piChild`);
+  validateExecutableIdentity(runtime.executable, `${path}.executable`); if (runtime.piVersion !== null) readIdentifier(runtime, "piVersion", `${path}.piVersion`); if (runtime.rpcAdapterVersion !== 1 || runtime.viewerProtocolVersion !== 1) throw new TypeError(`${path} protocol versions must be 1`);
+  const capabilities = readRecord(runtime.capabilities, `${path}.capabilities`); requireKeys(capabilities, ["executable", "reportedVersion", "rpcMode", "jsonl", "commands", "events", "missingRequired"], [], `${path}.capabilities`); validateExecutableIdentity(capabilities.executable, `${path}.capabilities.executable`); if (capabilities.reportedVersion !== null) readIdentifier(capabilities, "reportedVersion", `${path}.capabilities.reportedVersion`); if (typeof capabilities.rpcMode !== "boolean" || typeof capabilities.jsonl !== "boolean" || !Array.isArray(capabilities.commands) || !Array.isArray(capabilities.events) || !Array.isArray(capabilities.missingRequired) || capabilities.commands.some((/** @type {unknown} */ command) => typeof command !== "string" || !["get_state", "prompt", "follow_up", "steer", "abort", "extension_ui_response"].includes(command)) || [...capabilities.events, ...capabilities.missingRequired].some((/** @type {unknown} */ entry) => typeof entry !== "string")) throw new TypeError(`${path}.capabilities is invalid`);
+  validateProcessIdentity(runtime.supervisor, `${path}.supervisor`); validateProcessIdentity(runtime.piChild, `${path}.piChild`);
 }
 
 /** @param {Record<string, any>} result */
@@ -334,27 +355,12 @@ function validateSessionCommands(result) {
     readEnum(command, "source", ["extension", "prompt", "skill", "builtin"], `${path}.commands[${index}].source`);
     for (const key of ["description", "argumentHint"]) if (Object.hasOwn(command, key) && typeof command[key] !== "string") throw new TypeError(`${path}.commands[${index}].${key} must be a string`);
   });
-  result.models.forEach((/** @type {unknown} */ entry, /** @type {number} */ index) => {
-    const model = readRecord(entry, `${path}.models[${index}]`);
-    requireKeys(model, ["provider", "id"], [], `${path}.models[${index}]`);
-    readIdentifier(model, "provider", `${path}.models[${index}].provider`);
-    readIdentifier(model, "id", `${path}.models[${index}].id`);
-  });
+  result.models.forEach((/** @type {unknown} */ entry, /** @type {number} */ index) => readModel(entry, `${path}.models[${index}]`));
   result.thinkingLevels.forEach((/** @type {unknown} */ level, /** @type {number} */ index) => {
     if (typeof level !== "string" || level.length === 0) throw new TypeError(`${path}.thinkingLevels[${index}] must be a non-empty string`);
   });
-  if (result.model !== null) {
-    const model = readRecord(result.model, `${path}.model`);
-    requireKeys(model, ["provider", "id"], [], `${path}.model`);
-    readIdentifier(model, "provider", `${path}.model.provider`);
-    readIdentifier(model, "id", `${path}.model.id`);
-  }
+  if (result.model !== null) readModel(result.model, `${path}.model`);
   if (result.thinkingLevel !== null && (typeof result.thinkingLevel !== "string" || result.thinkingLevel.length === 0)) throw new TypeError(`${path}.thinkingLevel must be a non-empty string or null`);
-}
-
-/** Validate one strict version-1 session record. @param {unknown} value @param {string} [path] */
-export function validateSessionRecord(value, path = "session") {
-  validateSession(value, path);
 }
 
 /** Parse one strict version-1 daemon response. @param {unknown} value @returns {DaemonResponse} */
@@ -368,7 +374,7 @@ export function parseDaemonResponse(value) {
   if (kind === "state") { requireKeys(result, ["kind", "sessions"], [], "daemon response.result"); if (!Array.isArray(result.sessions)) throw new TypeError("sessions must be an array"); result.sessions.forEach((session, index) => validateSession(session, `daemon response.result.sessions[${index}]`)); }
   else if (["launched", "detached"].includes(kind)) { requireKeys(result, ["kind", "sessionId"], [], "daemon response.result"); readIdentifier(result, "sessionId"); }
   else if (kind === "attached") { requireKeys(result, ["kind", "sessionId", "role"], [], "daemon response.result"); readIdentifier(result, "sessionId"); readEnum(result, "role", ["composer", "observer"]); }
-  else if (kind === "command") { requireKeys(result, ["kind", "status"], [], "daemon response.result"); const status = readRecord(result.status, "status"); requireKeys(status, ["clientId", "requestId", "operation", "stage", "acceptedAt", "updatedAt"], ["error"], "status"); for (const key of ["clientId", "requestId", "acceptedAt", "updatedAt"]) readIdentifier(status, key, `status.${key}`); readEnum(status, "operation", OPERATIONS, "status.operation"); readEnum(status, "stage", ["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED", "DELIVERY_UNKNOWN", "FAILED"], "status.stage"); if (Object.hasOwn(status, "error")) validateError(status.error, "status.error"); }
+  else if (kind === "command") { requireKeys(result, ["kind", "status"], [], "daemon response.result"); validateCommandStatus(result.status, "status"); }
   else if (kind === "session_commands") validateSessionCommands(result);
   else if (kind === "session_query") {
     requireKeys(result, ["kind", "sessionId", "query", "rows"], [], "daemon response.result");
@@ -381,12 +387,7 @@ export function parseDaemonResponse(value) {
   }
   else if (kind === "settings") {
     requireKeys(result, ["kind", "summaryModel"], [], "daemon response.result");
-    if (result.summaryModel !== null) {
-      const model = readRecord(result.summaryModel, "daemon response.result.summaryModel");
-      requireKeys(model, ["provider", "id"], [], "daemon response.result.summaryModel");
-      readIdentifier(model, "provider", "daemon response.result.summaryModel.provider");
-      readIdentifier(model, "id", "daemon response.result.summaryModel.id");
-    }
+    if (result.summaryModel !== null) readModel(result.summaryModel, "daemon response.result.summaryModel");
   }
   else if (kind === "session_colored") {
     requireKeys(result, ["kind", "sessionId", "revision", "color"], [], "daemon response.result");
@@ -399,4 +400,25 @@ export function parseDaemonResponse(value) {
   else if (["viewer_subscribed", "viewer_acknowledged"].includes(kind)) { requireKeys(result, ["kind", "cursor"], [], "daemon response.result"); readViewerCursor(result.cursor, "daemon response.result.cursor"); }
   else { requireKeys(result, ["kind", "cursor"], [], "daemon response.result"); readCursor(result.cursor, "daemon response.result.cursor"); }
   return response;
+}
+
+/** Parse one strict version-1 persisted event broadcast to subscribers. @param {unknown} value @returns {PersistedEvent} */
+export function parsePersistedEvent(value) {
+  const event = readRecord(value, "Persisted event");
+  requireKeys(event, ["version", "cursor", "occurredAt", "kind", "payload"], [], "persisted event");
+  if (event.version !== 1) throw new TypeError("Persisted event version must be 1");
+  readCursor(event.cursor, "persisted event.cursor");
+  readIdentifier(event, "occurredAt", "persisted event.occurredAt");
+  const kind = readEnum(event, "kind", ["session_changed", "command_changed", "attachment_changed"], "persisted event.kind");
+  const payload = readRecord(event.payload, "persisted event.payload");
+  if (kind === "session_changed") { requireKeys(payload, ["session"], [], "persisted event.payload"); validateSession(payload.session, "persisted event.payload.session"); }
+  else if (kind === "command_changed") { requireKeys(payload, ["status"], [], "persisted event.payload"); validateCommandStatus(payload.status, "persisted event.payload.status"); }
+  else {
+    requireKeys(payload, ["sessionId", "clientId", "role", "attached"], [], "persisted event.payload");
+    readIdentifier(payload, "sessionId", "persisted event.payload.sessionId");
+    readIdentifier(payload, "clientId", "persisted event.payload.clientId");
+    readEnum(payload, "role", ["composer", "observer"], "persisted event.payload.role");
+    if (typeof payload.attached !== "boolean") throw new TypeError("persisted event.payload.attached must be a boolean");
+  }
+  return /** @type {PersistedEvent} */ (value);
 }

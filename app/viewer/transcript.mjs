@@ -130,7 +130,7 @@ export class TranscriptModel {
       const item = visible[index];
       const renderedItem = item.kind === "tool" ? { ...item, tool: this.state.tools.get(item.toolId) } : item;
       if (renderedItem.kind === "tool" && renderedItem.tool === undefined) continue;
-      const component = this.adapters.component(renderedItem, { streaming: renderedItem.streaming, thinkingLevel: this.state.thinkingLevel, hideThinking: this.hideThinking, provider: this.state.model?.provider, model: this.state.model?.id });
+      const component = this.adapters.component(renderedItem, { streaming: renderedItem.streaming, hideThinking: this.hideThinking, provider: this.state.model?.provider, model: this.state.model?.id });
       if (renderedItem.kind === "tool") component.setExpanded?.(this.expandedTools.has(renderedItem.toolId));
       const markers = [];
       const itemIndex = this.state.items.indexOf(item);

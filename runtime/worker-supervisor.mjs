@@ -20,6 +20,8 @@ const MAX_BUFFERED_STARTUP_EVENTS = 256;
 const DEFAULT_LAUNCH_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateMs: 5_000 });
 /** Stop dispositions that prove the worker process group is gone, so its lease can be released. */
 const PROVEN_TERMINAL_DISPOSITIONS = ["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "KILLED", "STALE_IDENTITY"];
+/** Child-anchored stop dispositions that prove the recorded Pi child is gone. A changed identity is ambiguous here, not proof. */
+const PROVEN_PI_CHILD_DISPOSITIONS = ["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "KILLED"];
 
 /** @typedef {(command: string, argv: string[], options: any) => any} SpawnLike */
 
@@ -73,6 +75,11 @@ function queueFrame(supervision, frame) {
   }
   supervision.queuedFrames.push({ frame, bytes });
   supervision.queuedFrameBytes += bytes;
+}
+
+/** @param {unknown} error */
+function exited(error) {
+  return error instanceof Error && ["ENOENT", "ESRCH"].includes(/** @type {NodeJS.ErrnoException} */ (error).code ?? "");
 }
 
 /** @param {unknown} supplied @param {string} expected */
@@ -238,6 +245,56 @@ export class WorkerSupervisor {
     void this.#admission.sessions.run(supervision.sessionId, () => this.#reconcileTerminalLocked(supervision)).catch(() => {});
   }
 
+  /**
+   * Record a surviving or unverifiable Pi child on the session it still owns, without releasing the lease.
+   * @param {any} supervision @param {string} summary
+   */
+  async #markStaleLocked(supervision, summary) {
+    const current = await this.#registry.get(supervision.sessionId);
+    if (current === undefined || current.processState === "STALE") return;
+    const ownsRecord = current.ownership?.runId === supervision.lease.runId &&
+      current.ownership?.acquiredAt === supervision.lease.acquiredAt &&
+      sameIdentity(current.ownership?.process, supervision.identity);
+    if (!ownsRecord) return;
+    const next = reduceSessionState(current, { type: "WORKER_CRASHED", at: new Date().toISOString(), summary });
+    await this.#registry.update(supervision.sessionId, current.revision, {
+      processState: next.processState,
+      activity: next.activity,
+      updatedAt: next.updatedAt,
+    });
+  }
+
+  /**
+   * The Pi child, not the supervisor, holds the canonical session file open, so a lease may only be
+   * released once the exact recorded child is provably gone. Anything unproven keeps the lease.
+   * @param {any} supervision
+   */
+  async #piChildTerminalLocked(supervision) {
+    const expected = supervision.piChildIdentity;
+    // A launch that failed before the Pi child handshake has no recorded child that can outlive it.
+    if (expected === undefined) return true;
+    let state;
+    try {
+      state = sameIdentity(await this.#inspect(expected.pid), expected) ? "LIVE" : "REPLACED";
+    } catch (error) {
+      state = exited(error) ? "GONE" : "AMBIGUOUS";
+    }
+    if (state === "GONE") return true;
+    await this.#markStaleLocked(supervision, state === "LIVE"
+      ? "Supervisor exited while its Pi child still owns the session file"
+      : "Supervisor exited and its Pi child identity is unverifiable");
+    // Only a worker that reached readiness has no other stop owner; a failed launch is torn down by #stopFailedLaunchLocked.
+    if (state !== "LIVE" || supervision.activated !== true || supervision.piChildStopped === true) return false;
+    supervision.piChildStopped = true;
+    const result = await stopVerifiedProcessGroup(expected, {
+      inspect: (/** @type {number} */ pid) => this.#inspect(pid),
+      requestGraceful: async () => {},
+      signalProcessGroup: this.#signalProcessGroup,
+      sleep: this.#sleep,
+    }, this.#launchStopPolicy).catch(() => ({ disposition: "AMBIGUOUS_IDENTITY" }));
+    return PROVEN_PI_CHILD_DISPOSITIONS.includes(result.disposition);
+  }
+
   /** @param {any} supervision @param {boolean} [verifiedTerminal] */
   async #reconcileTerminalLocked(supervision, verifiedTerminal = false) {
     if (supervision.lifecycle === "reconciled") return;
@@ -249,6 +306,7 @@ export class WorkerSupervisor {
     supervision.child.off("message", supervision.messageReceiver);
     supervision.handle = undefined;
     if (handle !== undefined) this.#handles.delete(handle);
+    if (!(await this.#piChildTerminalLocked(supervision))) return;
     await this.#ownership.release(supervision.sessionId, supervision.lease.leaseId, supervision.lease.generation);
     supervision.lifecycle = "reconciled";
     this.#supervisions.delete(supervision);
@@ -389,7 +447,7 @@ export class WorkerSupervisor {
         shell: false,
         stdio: ["ignore", stdoutHandle.fd, stderrHandle.fd, "ipc"],
       });
-      supervision = { child, token, sessionId, lease, exit: undefined, identity: undefined, handle: undefined, lifecycle: "launching", queuedFrames: [], queuedFrameBytes: 0, droppedFrameCount: 0, droppedFrameBytes: 0, startupEvents: [], frameListeners: new Set(), commandResultHandler: undefined };
+      supervision = { child, token, sessionId, lease, exit: undefined, identity: undefined, handle: undefined, lifecycle: "launching", activated: false, piChildStopped: false, queuedFrames: [], queuedFrameBytes: 0, droppedFrameCount: 0, droppedFrameBytes: 0, startupEvents: [], frameListeners: new Set(), commandResultHandler: undefined };
       supervision.messageReceiver = (/** @type {any} */ message) => {
         if (!authenticated(message?.token, token)) return;
         if (message.type === "pi_frame" && message.sessionId === sessionId && typeof message.frame === "object" && message.frame !== null) {
@@ -475,6 +533,7 @@ export class WorkerSupervisor {
         throw new WorkerSupervisorError("WORKER_PROCESS_EXITED", "Worker exited after readiness");
       }
       supervision.lifecycle = "active";
+      supervision.activated = true;
       const handle = this.#createHandle(supervision);
       supervision.handle = handle;
       this.#handles.add(handle);

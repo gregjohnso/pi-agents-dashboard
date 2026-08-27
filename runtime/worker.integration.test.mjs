@@ -298,6 +298,8 @@ export async function connectDaemon({ config }) {
     runsDirectory: runs,
     env: process.env,
     startTimeoutMs: 2_000,
+    // The worker exits before its Pi child does, so the lease is released only after the child-anchored stop proves the child gone.
+    launchStopPolicy: { gracefulMs: 100, terminateMs: 100 },
   });
   const launched = await supervisor.launch({
     sessionId: "one",

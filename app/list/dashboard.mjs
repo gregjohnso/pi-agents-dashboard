@@ -694,20 +694,17 @@ export class DashboardController {
             // Rows cache their rendered line; without a fresh reading the spinner frame and age never move.
             this.list.setNow(this.now());
             const layout = createDashboardLayout(this.width, this.height);
-            const counts = countDashboardSessions(selectDashboardSessions(this.sessions, this.query));
             // The dock takes the focus border only while it waits for the typed shared-directory path.
             const confirmingSharedLaunch = this.focus === "confirmation";
             const lines = Array.from({ length: this.height }, () => "");
             if (lines.length > 0)
                 lines[0] = paintPlainLine(" pi-dashboard", this.width, jobwatchTheme.title);
             if (lines.length > 1)
-                lines[1] = paintPlainLine(` Working ${counts.working}  Ready ${counts.ready}  Done ${counts.exited}  Failed ${counts.failed}  Sessions ${counts.sessions}  Processes ${counts.processes}`, this.width, jobwatchTheme.surface);
+                lines[1] = paintPlainLine(this.activeFilterSummary(), this.width, jobwatchTheme.keyHints);
             if (lines.length > 2)
-                lines[2] = paintPlainLine(this.activeFilterSummary(), this.width, jobwatchTheme.keyHints);
+                lines[2] = sectionBorder("Sessions", this.width, !confirmingSharedLaunch);
             if (lines.length > 3)
-                lines[3] = sectionBorder("Sessions", this.width, !confirmingSharedLaunch);
-            if (lines.length > 4)
-                lines[4] = renderColumnHeader(layout);
+                lines[3] = renderColumnHeader(layout);
             const rendered = this.list.renderViewport({ offset: this.viewportOffset, height: layout.listHeight, width: this.width });
             for (let index = 0; index < rendered.length; index += 1) {
                 const target = layout.listTop + index;

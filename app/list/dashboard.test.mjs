@@ -110,8 +110,8 @@ describe("dashboard controller", () => {
         const listFocused = dashboard.render(100, 16);
         expect(listFocused[0]).toContain(JOBWATCH_ANSI.headerBackground);
         expect(listFocused[1]).toContain(JOBWATCH_ANSI.surfaceBackground);
-        expect(listFocused[3]).toContain(JOBWATCH_ANSI.sky);
-        expect(stripVTControlCharacters(listFocused[3])).toContain("Sessions");
+        expect(listFocused[2]).toContain(JOBWATCH_ANSI.sky);
+        expect(stripVTControlCharacters(listFocused[2])).toContain("Sessions");
         expect(listFocused.at(-6)).toContain(JOBWATCH_ANSI.gray);
         expect(stripVTControlCharacters(listFocused.at(-6)).trim()).toMatch(/^\u256d\u2500+$/u);
         expect(listFocused.at(-1)).toContain(JOBWATCH_ANSI.surfaceBackground);
@@ -119,7 +119,7 @@ describe("dashboard controller", () => {
 
         // The list keeps focus: the composer is a destination for text, never a focus stop.
         dashboard.handleInput("\x1b[B");
-        expect(dashboard.render(100, 16)[3]).toContain(JOBWATCH_ANSI.sky);
+        expect(dashboard.render(100, 16)[2]).toContain(JOBWATCH_ANSI.sky);
         dashboard.handleInput("\t");
         expect(stripVTControlCharacters(dashboard.render(100, 16).at(-6))).toContain("cwd");
     });
@@ -178,13 +178,13 @@ describe("dashboard controller", () => {
         const dashboard = controller(new FakeBackend([session("a")]));
         await dashboard.open();
         const plain = dashboard.render(100, 16).map(stripVTControlCharacters);
-        expect(plain[2]).not.toContain("/search");
-        expect(plain[2]).not.toContain("v:live");
+        expect(plain[1]).not.toContain("/search");
+        expect(plain[1]).not.toContain("v:live");
         expect(plain.at(-3).trim()).toMatch(/^─+$/u);
 
         dashboard.setSearch("needle");
         const filtered = dashboard.render(100, 16).map(stripVTControlCharacters);
-        expect(filtered[2]).toContain("needle");
+        expect(filtered[1]).toContain("needle");
     });
     it("shows the selected session's working directory", async () => {
         const dashboard = controller(new FakeBackend([
@@ -200,7 +200,7 @@ describe("dashboard controller", () => {
         dashboard.setSearch("beta");
         const rendered = dashboard.render(100, 16);
         expect(stripVTControlCharacters(rendered.at(-2))).toContain("/repo/beta");
-        expect(stripVTControlCharacters(rendered[2])).toContain("search:beta");
+        expect(stripVTControlCharacters(rendered[1])).toContain("search:beta");
     });
     it("confirms a destructive action against the revision current at confirm time", async () => {
         const backend = new FakeBackend([session("a", { revision: 4 })]);
@@ -348,16 +348,17 @@ describe("dashboard controller", () => {
             vi.useRealTimers();
         }
     });
-    it("counts only the sessions the current view shows", async () => {
+    it("shows only the sessions the current view selects", async () => {
         const dashboard = controller(new FakeBackend([
             session("live", { processState: "LIVE" }),
             session("done", { processState: "EXITED", outcome: "COMPLETED" }),
             session("stopped", { processState: "EXITED", taskState: "STOPPED" }),
         ]));
         await dashboard.open();
-        expect(dashboard.render(80, 24)[1]).toContain("Sessions 1");
+        const rows = () => dashboard.render(80, 24).map(stripVTControlCharacters).filter((line) => /^[\u25b6\u25cc\u00d7 ] \S/u.test(line));
+        expect(rows()).toHaveLength(1);
         dashboard.setQuery({ view: "all" });
-        expect(dashboard.render(80, 24)[1]).toContain("Sessions 3");
+        expect(rows()).toHaveLength(3);
     });
     it("closes the list only on Ctrl+C; Left and Escape are inert", async () => {
         const backend = new FakeBackend([session("a", { processState: "LIVE" })]);

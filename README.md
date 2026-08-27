@@ -32,7 +32,7 @@ The list shows session **ID, State, Project, Activity, and Age**. Model remains 
 
 The persistent list composer starts a new session. Press `n` or Tab to focus it. A Git launch uses a managed worktree by default. Shared-directory mode requires the exact canonical directory and confirmation because another process may write there.
 
-One frontend can hold the composer role for a session. That frontend can send prompts and follow-ups, steer, interrupt, and answer pending confirm/select/input/editor requests. Other frontends are observers: they can follow output, scroll, search, and inspect tools, but cannot mutate the session, Stop, or Delete it. Drafts and history remain scoped to the exact session.
+One frontend can hold the composer role for a session. That frontend can send prompts and follow-ups, steer, interrupt, and answer pending confirm/select/input/editor requests. Other frontends are observers: they can follow output, scroll, and inspect tools, but cannot mutate the session, Stop, or Delete it. Drafts and history remain scoped to the exact session.
 
 Ctrl+C closes the list without signaling any run. In a viewer, Ctrl+C sends an interrupt and leaves the viewer open. Closing the app or frontend disconnects only that frontend; the daemon, supervisors, and Pi children continue.
 

@@ -4,11 +4,11 @@ exports[`pins the complete list and viewer surfaces at 40x10 1`] = `
 {
   "list": [
     " pi-dashboard                           ",
-    " Working 1  Ready 0  Done 0  Failed 0  S",
     "                                        ",
     "╭─ Sessions ────────────────────────────",
     "NAME         STATE    ACTIVITY          ",
     "▶ working  ⠋ WORKING  bash: pytest      ",
+    "▶ waiting    WAITING  Approval needed   ",
     "╭───────────────────────────────────────",
     " ❯ describe a task for a new session    ",
     " cwd:/repo isolation:worktree model:/ th",
@@ -33,12 +33,12 @@ exports[`pins the complete list and viewer surfaces at 55x16 1`] = `
 {
   "list": [
     " pi-dashboard                                          ",
-    " Working 1  Ready 0  Done 0  Failed 0  Sessions 2  Proc",
     "                                                       ",
     "╭─ Sessions ───────────────────────────────────────────",
     "NAME                 STATE    ACTIVITY           AGE   ",
     "▶ working          ⠋ WORKING  bash: pytest       12h   ",
     "▶ waiting            WAITING  Approval needed    12h   ",
+    "                                                       ",
     "                                                       ",
     "                                                       ",
     "                                                       ",
@@ -74,12 +74,12 @@ exports[`pins the complete list and viewer surfaces at 80x24 1`] = `
 {
   "list": [
     " pi-dashboard                                                                   ",
-    " Working 1  Ready 0  Done 0  Failed 0  Sessions 2  Processes 2                  ",
     "                                                                                ",
     "╭─ Sessions ────────────────────────────────────────────────────────────────────",
     "NAME                         STATE     ACTIVITY                         AGE     ",
     "▶ working                  ⠋ WORKING   bash: pytest                     12h     ",
     "▶ waiting                    WAITING   Approval needed                  12h     ",
+    "                                                                                ",
     "                                                                                ",
     "                                                                                ",
     "                                                                                ",
@@ -131,12 +131,12 @@ exports[`pins the complete list and viewer surfaces at 120x32 1`] = `
 {
   "list": [
     " pi-dashboard                                                                                                           ",
-    " Working 1  Ready 0  Done 0  Failed 0  Sessions 2  Processes 2                                                          ",
     "                                                                                                                        ",
     "╭─ Sessions ────────────────────────────────────────────────────────────────────────────────────────────────────────────",
     "NAME                               STATE     ACTIVITY                                                           AGE     ",
     "▶ working                        ⠋ WORKING   bash: pytest                                                       12h     ",
     "▶ waiting                          WAITING   Approval needed                                                    12h     ",
+    "                                                                                                                        ",
     "                                                                                                                        ",
     "                                                                                                                        ",
     "                                                                                                                        ",
@@ -204,12 +204,12 @@ exports[`pins the complete list and viewer surfaces at 160x40 1`] = `
 {
   "list": [
     " pi-dashboard                                                                                                                                                   ",
-    " Working 1  Ready 0  Done 0  Failed 0  Sessions 2  Processes 2                                                                                                  ",
     "                                                                                                                                                                ",
     "╭─ Sessions ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
     "NAME                               STATE     ACTIVITY                                                                                                   AGE     ",
     "▶ working                        ⠋ WORKING   bash: pytest                                                                                               12h     ",
     "▶ waiting                          WAITING   Approval needed                                                                                            12h     ",
+    "                                                                                                                                                                ",
     "                                                                                                                                                                ",
     "                                                                                                                                                                ",
     "                                                                                                                                                                ",

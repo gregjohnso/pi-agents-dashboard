@@ -70,7 +70,7 @@ function columnsForWidth(width) {
 export function createDashboardLayout(width, height) {
     const normalizedWidth = normalizedDimension(width);
     const normalizedHeight = normalizedDimension(height);
-    const listTop = Math.min(5, normalizedHeight);
+    const listTop = Math.min(4, normalizedHeight);
     // The composer sheds decoration as the terminal shrinks: first the selected session's path,
     // then the closing rule, so the list keeps its rows.
     const dockRows = normalizedHeight >= 16 ? 6 : normalizedHeight >= 14 ? 5 : 4;

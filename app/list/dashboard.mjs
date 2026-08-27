@@ -9,7 +9,7 @@ import { createDashboardLayout, renderColumnHeader, } from "./dashboard-layout.m
 import { jobwatchTheme } from "./dashboard-theme.mjs";
 import { displaySessionState } from "./session-state.mjs";
 import { StopClearGesture } from "./stop-clear-gesture.mjs";
-import { destructiveAction, confirmationMatchesSession, createDeliveryUnknownOverlay, createHelpOverlay, createMetadataOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, describeOverlay, } from "./dashboard-overlays.mjs";
+import { destructiveAction, createDeliveryUnknownOverlay, createHelpOverlay, createMetadataOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, describeOverlay, } from "./dashboard-overlays.mjs";
 import { createLaunchDraft, prepareLaunchRequest, } from "./launch-composer.mjs";
 import { VirtualSessionList } from "./virtual-session-list.mjs";
 function cursorAfter(left, right) {
@@ -616,8 +616,6 @@ export class DashboardController {
             this.selectBoundary(true);
         else if (matchesKey(data, Key.ctrl("f")))
             this.focus = "search";
-        else if (matchesKey(data, Key.tab))
-            this.focusComposer();
         else if (matchesKey(data, Key.ctrl("e")))
             this.toggleMetadata();
         else if (matchesKey(data, Key.ctrl("g")))

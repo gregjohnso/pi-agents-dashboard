@@ -299,6 +299,33 @@ describe("dashboard controller", () => {
         dashboard.selectSession("b");
         expect(dashboard.stopClearArmed).toBe(false);
     });
+    it("dismisses the confirmation as soon as a destructive request is sent", async () => {
+        let release = () => {};
+        const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
+        backend.stop = vi.fn(() => new Promise((resolve) => { release = () => resolve({ accepted: true }); }));
+        const dashboard = controller(backend);
+        await dashboard.open();
+        dashboard.selectSession("a");
+        dashboard.handleInput("\x18");
+        dashboard.handleInput("y");
+        // The stop travels in the background: the operator gets the list back without waiting for the daemon.
+        expect(dashboard.overlay).toBeUndefined();
+        expect(backend.stop).toHaveBeenCalledWith("a", 1, expect.any(String));
+        expect(dashboard.status).toMatchObject({ kind: "pending" });
+        release();
+        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
+    });
+    it("reports a background destructive failure without blocking the list", async () => {
+        const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
+        backend.stop = vi.fn(async () => { throw Object.assign(new Error("worker is gone"), { code: "WORKER_UNAVAILABLE" }); });
+        const dashboard = controller(backend);
+        await dashboard.open();
+        dashboard.selectSession("a");
+        dashboard.handleInput("\x18");
+        dashboard.handleInput("y");
+        expect(dashboard.overlay).toBeUndefined();
+        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "WORKER_UNAVAILABLE" }));
+    });
     it("counts only the sessions the current view shows", async () => {
         const dashboard = controller(new FakeBackend([
             session("live", { processState: "LIVE" }),
@@ -459,10 +486,12 @@ describe("dashboard controller", () => {
         dashboard.handleInput("\x18");
         dashboard.handleInput("y");
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "OWNERSHIP_CONFLICT", message: "ownership changed" }));
-        expect(dashboard.overlay).toMatchObject({ kind: "session_confirmation", action: "stop", submitting: false });
+        // A refusal reports itself and leaves the list usable; Ctrl+X retries.
+        expect(dashboard.overlay).toBeUndefined();
+        dashboard.handleInput("\x18");
         dashboard.handleInput("y");
         await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledTimes(2));
-        expect(dashboard.status).toMatchObject({ kind: "ready" });
+        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
     });
     it("keeps a successfully stopped row selected and requires a later Delete confirmation", async () => {
         const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
@@ -488,7 +517,7 @@ describe("dashboard controller", () => {
         expect(backend.stop).toHaveBeenCalledTimes(1);
         release?.();
     });
-    it("dismisses a submitting confirmation with Escape instead of wedging input", async () => {
+    it("never leaves input wedged behind an in-flight destructive request", async () => {
         let release;
         const backend = new FakeBackend([session("a")]);
         backend.stop = vi.fn(() => new Promise((resolve) => { release = resolve; }));
@@ -496,8 +525,7 @@ describe("dashboard controller", () => {
         await dashboard.open();
         dashboard.handleInput("\x18");
         dashboard.handleInput("y");
-        expect(dashboard.overlay).toMatchObject({ kind: "session_confirmation", submitting: true });
-        dashboard.handleInput("\x1b");
+        // Nothing waits on the daemon, so navigation works while the stop is still travelling.
         expect(dashboard.overlay).toBeUndefined();
         dashboard.handleInput("\x1b[B");
         expect(dashboard.focus).toBe("composer");

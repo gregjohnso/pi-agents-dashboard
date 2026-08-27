@@ -472,30 +472,33 @@ export class DashboardController {
             return;
         }
         const requestId = this.requestId();
-        this.overlay = { ...confirmation, revision: selected.revision, submitting: true };
+        const { action, sessionId } = confirmation;
+        const { revision } = selected;
+        // The daemon's stop policy escalates SIGTERM to SIGKILL over seconds. Hand the request off and
+        // give the list straight back; the outcome arrives as a status line and a session event.
+        this.overlay = undefined;
+        this.status = { kind: "pending", code: `${action.toUpperCase()}_SENT`, message: `${action} sent for ${sessionId}` };
+        if (action === "stop") {
+            this.setView("all");
+            this.selectSession(sessionId);
+        }
+        this.requestRender();
         try {
-            await this.backend[confirmation.action](confirmation.sessionId, selected.revision, requestId);
-            if (confirmation.action === "stop") {
-                this.setView("all");
-                this.selectSession(confirmation.sessionId);
-                // Arm only after the stop landed, so a single press can never remove a running session.
-                this.stopClearGesture.armAfterStop(confirmation.sessionId);
-            }
-            if (this.overlay?.kind === "session_confirmation" && this.overlay.sessionId === confirmation.sessionId) {
-                this.overlay = undefined;
-            }
-            this.status = { kind: "ready" };
+            await this.backend[action](sessionId, revision, requestId);
+            // Arm only after the stop landed, so a single press can never remove a running session.
+            if (action === "stop")
+                this.stopClearGesture.armAfterStop(sessionId);
+            if (this.status.kind === "pending" && this.status.code === `${action.toUpperCase()}_SENT`)
+                this.status = { kind: "ready" };
         }
         catch (error) {
             const typed = error;
-            if (typed.code === "DELIVERY_UNKNOWN") {
+            if (typed.code === "DELIVERY_UNKNOWN")
                 this.overlay = createDeliveryUnknownOverlay(typed.clientId ?? this.clientId, typed.requestId ?? requestId);
-            }
-            else {
-                this.overlay = { ...confirmation, submitting: false };
-                this.setError(error, `${confirmation.action.toUpperCase()}_FAILED`);
-            }
+            else
+                this.setError(error, `${action.toUpperCase()}_FAILED`);
         }
+        this.requestRender();
     }
     async activateSelection() {
         const selected = this.selectedSession();

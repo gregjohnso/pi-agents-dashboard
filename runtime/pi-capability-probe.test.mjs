@@ -49,7 +49,7 @@ it("probes recognized validation errors without a valid prompt or canonical sess
   expect(entries.filter((entry) => entry.kind === "start")).toHaveLength(2);
 });
 
-it("recognizes RPC mode from the successful handshake instead of help formatting", async () => {
+it("recognizes RPC mode from the handshake, not help formatting, and accepts stock Pi's one-way extension UI response", async () => {
   const { log, executable } = await setup();
   const report = await probePiCapabilities({
     executable,
@@ -60,37 +60,26 @@ it("recognizes RPC mode from the successful handshake instead of help formatting
 
   expect(report.rpcMode).toBe(true);
   expect(report.missingRequired).toEqual([]);
-});
-
-it("accepts stock Pi's one-way extension UI response protocol", async () => {
-  const { log, executable } = await setup();
-  const report = await probePiCapabilities({
-    executable,
-    cache: new Map(),
-    timeoutMs: 5_000,
-    env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_ONE_WAY_EXTENSION_UI_RESPONSE: "1" },
-  });
-
-  expect(report.missingRequired).toEqual([]);
   expect(report.commands).toContain("extension_ui_response");
 });
 
-it("rejects a delayed unknown-command response for extension UI responses", async () => {
+it.each([
+  ["a missing command", { FAKE_PI_MISSING: "steer" }, "steer", ["steer"]],
+  ["an uncorrelated response ID", { FAKE_PI_WRONG_RESPONSE_ID: "steer" }, "response_correlation", ["steer"]],
+  ["an accepted unknown command", { FAKE_PI_UNKNOWN_SUCCESS: "1" }, "unknown_command_validation", []],
+  ["a delayed unknown-command response", { FAKE_PI_DELAYED_UNKNOWN_EXTENSION_UI_RESPONSE_MS: "5" }, "extension_ui_response", ["extension_ui_response"]],
+])("reports %s as a missing required capability", async (_label, behavior, missing, absentCommands) => {
   const { log, executable } = await setup();
-  const report = await probePiCapabilities({
-    executable,
-    cache: new Map(),
-    timeoutMs: 5_000,
-    env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_DELAYED_UNKNOWN_EXTENSION_UI_RESPONSE_MS: "5" },
-  });
+  const report = await probePiCapabilities({ executable, cache: new Map(), timeoutMs: 5_000, env: { ...process.env, FAKE_PI_LOG: log, ...behavior } });
 
-  expect(report.commands).not.toContain("extension_ui_response");
-  expect(report.missingRequired).toContain("extension_ui_response");
+  expect(report.missingRequired).toContain(missing);
+  for (const command of absentCommands) expect(report.commands).not.toContain(command);
 });
 
 it.each([
   ["invalid UTF-8", { FAKE_PI_INVALID_UTF8: "1" }],
   ["an oversized frame", { FAKE_PI_OVERSIZED_FRAME: "1" }],
+  ["a malformed frame", { FAKE_PI_MALFORMED: "1" }],
 ])("rejects %s through fatal bounded JSONL without inference", async (_label, behavior) => {
   const { log, executable } = await setup();
   const report = await probePiCapabilities({ executable, cache: new Map(), timeoutMs: 5_000, env: { ...process.env, FAKE_PI_LOG: log, ...behavior } });
@@ -98,17 +87,6 @@ it.each([
   expect(report.missingRequired).toContain("jsonl");
   const entries = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
   expect(entries.some((entry) => entry.providerInvocation === true)).toBe(false);
-});
-
-it("requires correlated response IDs and an explicit unknown-command control response", async () => {
-  const wrongId = await setup();
-  const wrongIdReport = await probePiCapabilities({ executable: wrongId.executable, cache: new Map(), timeoutMs: 5_000, env: { ...process.env, FAKE_PI_LOG: wrongId.log, FAKE_PI_WRONG_RESPONSE_ID: "steer" } });
-  expect(wrongIdReport.missingRequired).toContain("response_correlation");
-  expect(wrongIdReport.commands).not.toContain("steer");
-
-  const unknownAccepted = await setup();
-  const unknownReport = await probePiCapabilities({ executable: unknownAccepted.executable, cache: new Map(), timeoutMs: 5_000, env: { ...process.env, FAKE_PI_LOG: unknownAccepted.log, FAKE_PI_UNKNOWN_SUCCESS: "1" } });
-  expect(unknownReport.missingRequired).toContain("unknown_command_validation");
 });
 
 it("requires get_state to report the exact temporary non-canonical session", async () => {
@@ -143,25 +121,4 @@ it("refuses when the selected adapter cannot normalize documented required live 
   expect(report.events).not.toContain("required_live_events");
   const entries = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
   expect(entries.some((entry) => entry.providerInvocation === true || entry.valid === true)).toBe(false);
-});
-
-it("reports missing required commands and malformed JSONL without inference", async () => {
-  const missing = await setup();
-  const report = await probePiCapabilities({
-    executable: missing.executable,
-    cache: new Map(),
-    timeoutMs: 5_000,
-    env: { ...process.env, FAKE_PI_LOG: missing.log, FAKE_PI_MISSING: "steer" },
-  });
-  expect(report.missingRequired).toContain("steer");
-
-  const malformed = await setup();
-  const malformedReport = await probePiCapabilities({
-    executable: malformed.executable,
-    cache: new Map(),
-    timeoutMs: 5_000,
-    env: { ...process.env, FAKE_PI_LOG: malformed.log, FAKE_PI_MALFORMED: "1" },
-  });
-  expect(malformedReport).toMatchObject({ jsonl: false });
-  expect(malformedReport.missingRequired).toContain("jsonl");
 });

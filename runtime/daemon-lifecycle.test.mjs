@@ -32,19 +32,16 @@ it("serializes concurrent starts and publishes one exact daemon identity", async
   await releaseDaemonLifecycle(first);
 });
 
-it("removes a stale socket only after exact PID/start identity mismatch", async () => {
+it.each([
+  ["a reused PID, so cleanup is authorized", { pid: 51, startIdentity: "reused", processGroupId: 51 }, { status: "STALE", canCleanup: true }],
+  ["the exact recorded identity, so nothing may be unlinked", { pid: 51, startIdentity: "old", processGroupId: 51 }, { status: "UNHEALTHY", canCleanup: false }],
+])("reports an unreachable published daemon running under %s", async (_label, observed, expected) => {
   const root = await fixture();
   const identity = { pid: 51, startIdentity: "old", processGroupId: 51 };
   const claim = await claimDaemonLifecycle({ root, identity, daemonEpoch: "epoch", tokenPath: join(root, "daemon", "control.token"), inspect: async () => identity });
   await releaseDaemonLifecycle(claim, { preservePublication: true });
 
-  const stale = await inspectDaemonEndpoint({
-    root,
-    inspect: async () => ({ pid: 51, startIdentity: "reused", processGroupId: 51 }),
-    probe: async () => false,
-  });
-  expect(stale.status).toBe("STALE");
-  expect(stale.canCleanup).toBe(true);
+  await expect(inspectDaemonEndpoint({ root, inspect: async () => observed, probe: async () => false })).resolves.toMatchObject(expected);
 });
 
 it("recovers an exact crashed transaction without letting the old owner unlink the replacement", async () => {
@@ -143,13 +140,4 @@ it("refuses an unowned socket instead of unlinking a possibly live daemon", asyn
   const identity = { pid: 81, startIdentity: "800", processGroupId: 81 };
   await expect(claimDaemonLifecycle({ root, identity, daemonEpoch: "epoch", tokenPath: join(root, "daemon", "control.token"), inspect: async () => identity })).rejects.toMatchObject({ code: "DAEMON_IDENTITY_CONFLICT" });
   await expect(access(socketPath)).resolves.toBeUndefined();
-});
-
-it("reports a live but unreachable daemon unhealthy without authorizing unlink", async () => {
-  const root = await fixture();
-  const identity = { pid: 61, startIdentity: "same", processGroupId: 61 };
-  const claim = await claimDaemonLifecycle({ root, identity, daemonEpoch: "epoch", tokenPath: join(root, "daemon", "control.token"), inspect: async () => identity });
-  await releaseDaemonLifecycle(claim, { preservePublication: true });
-
-  await expect(inspectDaemonEndpoint({ root, inspect: async () => identity, probe: async () => false })).resolves.toMatchObject({ status: "UNHEALTHY", canCleanup: false });
 });

@@ -6,7 +6,7 @@ describe("daemon idle exit", () => {
   /** @param {Record<string, any>} overrides @returns {any} */
   const options = (overrides) => ({ idleMs: 1_000, now: () => 0, onIdle: () => {}, frontends: () => 0, workers: () => 0, ...overrides });
 
-  it("exits once nothing has needed the daemon for the idle window", () => {
+  it("exits exactly once, and only after the full idle window", () => {
     let clock = 0;
     const exit = vi.fn();
     const idle = createIdleExit(options({ now: () => clock, onIdle: exit, frontends: () => 0, workers: () => 0 }));
@@ -15,6 +15,7 @@ describe("daemon idle exit", () => {
     idle.check();
     expect(exit).not.toHaveBeenCalled();
     clock = 1_000;
+    idle.check();
     idle.check();
     expect(exit).toHaveBeenCalledTimes(1);
   });
@@ -41,16 +42,6 @@ describe("daemon idle exit", () => {
     idle.check();
     expect(exit).not.toHaveBeenCalled();
     clock = 11_000;
-    idle.check();
-    expect(exit).toHaveBeenCalledTimes(1);
-  });
-
-  it("exits at most once", () => {
-    let clock = 0;
-    const exit = vi.fn();
-    const idle = createIdleExit(options({ now: () => clock, onIdle: exit, frontends: () => 0, workers: () => 0 }));
-    clock = 5_000;
-    idle.check();
     idle.check();
     expect(exit).toHaveBeenCalledTimes(1);
   });

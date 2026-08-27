@@ -75,23 +75,25 @@ it.each(["staging_start", "after_staged_file_fsync", "before_manifest_rename", "
   })).resolves.toMatchObject({ status: "MIGRATED" });
 });
 
-it("refuses live legacy ownership before staging", async () => {
+it.each([
+  ["an active daemon", { activeDaemon: { pid: 12, startIdentity: "live" }, activeSupervisors: [] }],
+  ["a live supervisor", { activeDaemon: false, activeSupervisors: [{ pid: 42, startIdentity: "legacy-42", processGroupId: 42 }] }],
+])("refuses %s before staging and reports its identity", async (_label, activity) => {
   const paths = await fixture();
+  const reconcileDestination = vi.fn();
+
   await expect(migrateLegacyState({
     ...paths,
     expectedUserId: process.getuid?.() ?? 0,
-    inspectLegacyRuntime: async () => ({ activeDaemon: { pid: 12, startIdentity: "live" }, activeSupervisors: [] }),
-    reconcileDestination: vi.fn(),
-  })).rejects.toMatchObject({ code: "LEGACY_RUNTIME_ACTIVE" });
-});
-
-it("refuses a structurally invalid legacy registry record before staging", async () => {
-  const paths = await fixture();
-  await writeFile(join(paths.legacyRoot, "sessions", "one.json"), JSON.stringify({ schemaVersion: 1, sessionId: "one" }), { mode: 0o600 });
-  await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: vi.fn() })).rejects.toMatchObject({ code: "MALFORMED_LEGACY_STATE" });
+    inspectLegacyRuntime: async () => activity,
+    reconcileDestination,
+  })).rejects.toMatchObject({ code: "LEGACY_RUNTIME_ACTIVE", identities: activity });
+  expect(reconcileDestination).not.toHaveBeenCalled();
+  await expect(readFile(join(paths.legacyRoot, "dashboard.json"), "utf8")).resolves.toContain('"schemaVersion":1');
 });
 
 it.each([
+  ["sessions/one.json", JSON.stringify({ schemaVersion: 1, sessionId: "one" })],
   ["daemon/control.token", ""],
   ["frontend-state.json", JSON.stringify({ schemaVersion: 1, clientId: "client", cursor: { daemonEpoch: "epoch", sequence: "01" } })],
   ["queue/commands.jsonl", "{\"command\":{}}\n"],
@@ -113,26 +115,17 @@ it.each([
   await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: vi.fn() })).rejects.toMatchObject({ code: "MALFORMED_LEGACY_STATE" });
 });
 
-it("rejects changed PUBLISHED output before reconciliation starts", async () => {
-  const paths = await fixture();
-  const options = { ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {}, async failpoint(/** @type {string} */ stage) { if (stage === "after_manifest_publication") throw new Error("crash"); } };
-  await expect(migrateLegacyState(options)).rejects.toThrow("crash");
-  const recordPath = join(paths.destinationRoot, "sessions", "one.json");
-  const record = JSON.parse(await readFile(recordPath, "utf8"));
-  await writeFile(recordPath, `${JSON.stringify({ ...record, revision: 1 })}\n`, { mode: 0o600 });
-  await expect(migrateLegacyState({ ...options, failpoint: async () => {} })).rejects.toMatchObject({ code: "MIGRATION_IDENTITY_MISMATCH" });
-});
-
 it.each([
-  ["a public expected file", async (/** @type {{destinationRoot:string}} */ paths) => chmod(join(paths.destinationRoot, "sessions", "one.json"), 0o644)],
-  ["a same-content symlink", async (/** @type {{legacyRoot:string,destinationRoot:string}} */ paths) => { const target = join(paths.destinationRoot, "sessions", "one.json"); await rm(target); await symlink(join(paths.legacyRoot, "sessions", "one.json"), target); }],
-  ["an extra nested artifact", async (/** @type {{destinationRoot:string}} */ paths) => writeFile(join(paths.destinationRoot, "sessions", "extra.json"), "{}", { mode: 0o600 })],
-])("rejects untouched PUBLISHED output containing %s", async (_name, mutate) => {
+  ["a changed record", async (/** @type {{destinationRoot:string}} */ paths) => { const recordPath = join(paths.destinationRoot, "sessions", "one.json"); const record = JSON.parse(await readFile(recordPath, "utf8")); await writeFile(recordPath, `${JSON.stringify({ ...record, revision: 1 })}\n`, { mode: 0o600 }); }, "MIGRATION_IDENTITY_MISMATCH"],
+  ["a public expected file", async (/** @type {{destinationRoot:string}} */ paths) => chmod(join(paths.destinationRoot, "sessions", "one.json"), 0o644), "MIGRATION_IDENTITY_MISMATCH"],
+  ["a same-content symlink", async (/** @type {{legacyRoot:string,destinationRoot:string}} */ paths) => { const target = join(paths.destinationRoot, "sessions", "one.json"); await rm(target); await symlink(join(paths.legacyRoot, "sessions", "one.json"), target); }, "DESTINATION_COLLISION"],
+  ["an extra nested artifact", async (/** @type {{destinationRoot:string}} */ paths) => writeFile(join(paths.destinationRoot, "sessions", "extra.json"), "{}", { mode: 0o600 }), "DESTINATION_COLLISION"],
+])("rejects PUBLISHED output containing %s before reconciliation starts", async (_name, mutate, code) => {
   const paths = await fixture();
   const options = { ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {}, async failpoint(/** @type {string} */ stage) { if (stage === "after_manifest_publication") throw new Error("crash"); } };
   await expect(migrateLegacyState(options)).rejects.toThrow("crash");
   await mutate(paths);
-  await expect(migrateLegacyState({ ...options, failpoint: async () => {} })).rejects.toMatchObject({ code: expect.stringMatching(/^(MIGRATION_IDENTITY_MISMATCH|DESTINATION_COLLISION)$/u) });
+  await expect(migrateLegacyState({ ...options, failpoint: async () => {} })).rejects.toMatchObject({ code });
 });
 
 it("recovers mutable PUBLISHED output only after the reconciliation marker is durable", async () => {
@@ -143,22 +136,18 @@ it("recovers mutable PUBLISHED output only after the reconciliation marker is du
   await expect(migrateLegacyState({ ...base, reconcileDestination: async () => {} })).resolves.toMatchObject({ status: "MIGRATED" });
 });
 
-it("treats a reconciled migration as idempotent after destination writers mutate copied records", async () => {
-  const paths = await fixture();
-  const options = { ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {} };
-  const first = await migrateLegacyState(options);
-  const recordPath = join(paths.destinationRoot, "sessions", "one.json");
-  const record = JSON.parse(await readFile(recordPath, "utf8"));
-  await writeFile(recordPath, `${JSON.stringify({ ...record, revision: 1 })}\n`, { mode: 0o600 });
-  await expect(migrateLegacyState(options)).resolves.toEqual({ ...first, status: "ALREADY_MIGRATED" });
-});
-
 it("recovers idempotently only for the same completed migration identity", async () => {
   const paths = await fixture();
   const options = { ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {} };
   const first = await migrateLegacyState(options);
-  const second = await migrateLegacyState(options);
-  expect(second).toEqual({ ...first, status: "ALREADY_MIGRATED" });
+  expect(await migrateLegacyState(options)).toEqual({ ...first, status: "ALREADY_MIGRATED" });
+
+  // A reconciled destination is the daemon's to write; its own revisions must stay idempotent.
+  const recordPath = join(paths.destinationRoot, "sessions", "one.json");
+  const record = JSON.parse(await readFile(recordPath, "utf8"));
+  await writeFile(recordPath, `${JSON.stringify({ ...record, revision: 1 })}\n`, { mode: 0o600 });
+  await expect(migrateLegacyState(options)).resolves.toEqual({ ...first, status: "ALREADY_MIGRATED" });
+
   await writeFile(join(paths.destinationRoot, "collision"), "x", { mode: 0o600 });
   await expect(migrateLegacyState(options)).rejects.toMatchObject({ code: "DESTINATION_COLLISION" });
 });

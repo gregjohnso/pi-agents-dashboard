@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { access, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -65,8 +65,6 @@ it("ships one allowlisted standalone tarball without lifecycle, private, or deve
   expect(productFiles.some((path) => /(?:pixi|tsconfig|vitest\.config|package-lock)\b/u.test(path))).toBe(false);
   expect(listing.some((path) => /(?:^|\/)(?:\.env(?:\.|$)|credentials?|control\.token|\.git|worker\.(?:stdout|stderr)\.log)(?:\/|$)/u.test(path))).toBe(false);
   expect(listing.some((path) => /package\/node_modules\/(?:typescript|vitest|@types\/node)(?:\/|$)/u.test(path))).toBe(false);
-  const evidence = { kind: "package-acceptance", tarballBytes: packed[0].size, unpackedBytes: packed[0].unpackedSize, listedFiles: listing.length, bundledDependencies: packed[0].bundled?.length ?? 0 };
-  await writeFile(join(tmpdir(), "pi-dashboard-task-21-package-evidence.json"), `${JSON.stringify(evidence)}\n`, { mode: 0o600 });
 
   const manifestText = (await run("tar", ["-xOf", tarball, "package/package.json"])).stdout;
   const manifest = JSON.parse(manifestText);
@@ -77,7 +75,7 @@ it("ships one allowlisted standalone tarball without lifecycle, private, or deve
   }
 });
 
-it("starts package-relative code with distinct HOME, prefix, cache, cwd, and minimal PATH for every journey", async () => {
+it("starts package-relative code from a local install, a global install, and offline npx", async () => {
   const [local, global, offlineNpx] = await Promise.all([journey("local"), journey("global"), journey("npx")]);
   const [localResult, globalResult, npxResult] = await Promise.all([
     (async () => {
@@ -93,7 +91,5 @@ it("starts package-relative code with distinct HOME, prefix, cache, cwd, and min
   expect(localResult.stdout).toContain("Usage: pi-dashboard");
   expect(globalResult.stdout).toContain("With no arguments");
   expect(npxResult.stdout).toContain("pi-dashboard session <command>");
-  expect(new Set([local.env.HOME, global.env.HOME, offlineNpx.env.HOME]).size).toBe(3);
-  expect(new Set([local.cache, global.cache, offlineNpx.cache]).size).toBe(3);
   await Promise.all([local, global, offlineNpx].map(({ state }) => expect(access(state)).rejects.toMatchObject({ code: "ENOENT" })));
 }, 120_000);

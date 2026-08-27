@@ -22,20 +22,26 @@ it("owns the injected viewer boundary and returns to the same list", async () =>
   expect(viewer.close).toHaveBeenCalledOnce();
 });
 
-it("preserves the list's selected session and scroll across Enter/Right replacement", async () => {
+it("reopens the one list instance when the viewer returns through onReturn", async () => {
   let activate;
-  const state = { selectedSessionId: "session-2", viewportOffset: 17 };
-  const list = {
-    open: vi.fn(async () => { expect(state).toEqual({ selectedSessionId: "session-2", viewportOffset: 17 }); }),
-    close: vi.fn(async () => {}),
+  let onReturn;
+  let reportClosed;
+  const list = { open: vi.fn(async () => {}), close: vi.fn(async () => {}) };
+  const createList = vi.fn(({ openViewer }) => { activate = openViewer; return list; });
+  // open() fires onReturn once the controller has bound the viewer; a viewer that never
+  // returns would leave `closed` pending and time this test out.
+  const viewer = {
+    open: vi.fn(async () => { onReturn(); }),
+    close: vi.fn(async () => { reportClosed(); }),
+    closed: new Promise((resolve) => { reportClosed = resolve; }),
   };
-  const viewer = { open: vi.fn(async () => {}), close: vi.fn(async () => {}) };
   const app = createAppController({
-    createList({ openViewer }) { activate = openViewer; return list; },
-    async openViewer(sessionId, { onReturn }) { expect(sessionId).toBe("session-2"); queueMicrotask(onReturn); return viewer; },
+    createList,
+    async openViewer(sessionId, handlers) { expect(sessionId).toBe("session-2"); onReturn = handlers.onReturn; return viewer; },
   });
   await app.open();
   await activate("session-2");
+  expect(createList).toHaveBeenCalledOnce();
   expect(list.open).toHaveBeenCalledTimes(2);
-  expect(state).toEqual({ selectedSessionId: "session-2", viewportOffset: 17 });
+  expect(viewer.close).toHaveBeenCalled();
 });

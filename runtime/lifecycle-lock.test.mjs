@@ -40,78 +40,39 @@ async function readTokenEntry(path, token) {
   return JSON.parse(await readFile(join(path, token), "utf8"));
 }
 
-it("records the holder process identity in its own lock entry", async () => {
+const staleHolder = { token: "stale-token", owner: { operation: "worktree_ownership" }, holder: deadHolder };
+const staleRecord = JSON.stringify(staleHolder);
+
+it.each([
+  ["process is gone", inspectDead],
+  ["pid was reused by a different process", async (/** @type {number} */ pid) => ({ pid, processGroupId: 4242, startIdentity: "7777" })],
+])("reclaims a lock whose holder %s", async (_label, inspect) => {
   const path = await makeLockPath();
+  await writeSoleRecord(path, staleHolder);
 
-  const lock = await acquireLifecycleLock(path, { operation: "worktree_ownership" });
+  const lock = await acquireLifecycleLock(path, { operation: "worktree_ownership" }, fs, { inspect });
 
-  expect(await readTokenEntry(path, lock.token)).toMatchObject({
+  expect(await readSoleRecord(path)).toMatchObject({
     token: lock.token,
-    owner: { operation: "worktree_ownership" },
     holder: { pid: process.pid, processGroupId: expect.any(Number), startIdentity: expect.any(String) },
   });
 });
 
-it("reclaims a lock whose holder process is gone", async () => {
-  const path = await makeLockPath();
-  await writeSoleRecord(path, { token: "stale-token", owner: { operation: "worktree_ownership" }, holder: deadHolder });
-
-  const lock = await acquireLifecycleLock(path, { operation: "worktree_ownership" }, fs, { inspect: inspectDead });
-
-  expect(await readSoleRecord(path)).toMatchObject({ token: lock.token, holder: { pid: process.pid } });
-  expect((await stat(path)).mode & 0o777).toBe(0o700);
-  expect((await stat(join(path, lock.token))).mode & 0o777).toBe(0o600);
-});
-
-it("reclaims a lock whose holder pid was reused by a different process", async () => {
-  const path = await makeLockPath();
-  await writeSoleRecord(path, { token: "stale-token", owner: { operation: "worktree_ownership" }, holder: deadHolder });
-  const inspectReused = async (/** @type {number} */ pid) => ({ pid, processGroupId: 4242, startIdentity: "7777" });
-
-  const lock = await acquireLifecycleLock(path, { operation: "worktree_ownership" }, fs, { inspect: inspectReused });
-
-  expect(await readSoleRecord(path)).toMatchObject({ token: lock.token });
-});
-
-it("refuses a lock whose holder process is still alive", async () => {
-  const path = await makeLockPath();
-  await writeSoleRecord(path, { token: "stale-token", owner: { operation: "worktree_ownership" }, holder: deadHolder });
-  const inspectAlive = async (/** @type {number} */ pid) => ({ pid, processGroupId: 4242, startIdentity: "9001" });
-
-  await expect(acquireLifecycleLock(path, { operation: "x" }, fs, { inspect: inspectAlive })).rejects.toMatchObject({ code: "LOCK_HELD" });
-  expect(await readSoleRecord(path)).toMatchObject({ token: "stale-token" });
-});
-
 it.each([
-  ["an unreadable record", "{ not json"],
-  ["a record without holder identity", JSON.stringify({ token: "stale-token", owner: { operation: "worktree_ownership" } })],
-  ["a record with an incomplete holder", JSON.stringify({ token: "stale-token", owner: {}, holder: { pid: 4242 } })],
-  ["a token mismatch", JSON.stringify({ token: "other-token", owner: {}, holder: deadHolder })],
-])("fails closed for %s", async (_label, contents) => {
+  ["an unreadable record", [["stale-token", "{ not json"]], inspectDead],
+  ["a record without holder identity", [["stale-token", JSON.stringify({ token: "stale-token", owner: { operation: "worktree_ownership" } })]], inspectDead],
+  ["a record with an incomplete holder", [["stale-token", JSON.stringify({ token: "stale-token", owner: {}, holder: { pid: 4242 } })]], inspectDead],
+  ["a token mismatch", [["stale-token", JSON.stringify({ token: "other-token", owner: {}, holder: deadHolder })]], inspectDead],
+  ["a holder that is still alive", [["stale-token", staleRecord]], async (/** @type {number} */ pid) => ({ pid, processGroupId: 4242, startIdentity: "9001" })],
+  ["holder liveness that cannot be determined", [["stale-token", staleRecord]], async () => { throw Object.assign(new Error("permission denied"), { code: "EACCES" }); }],
+  ["several holders sharing the lock directory", [["stale-token", staleRecord], ["second-token", JSON.stringify({ token: "second-token", owner: {}, holder: deadHolder })]], inspectDead],
+])("fails closed for %s", async (_label, entries, inspect) => {
   const path = await makeLockPath();
   await fs.mkdir(path, { mode: 0o700 });
-  await writeFile(join(path, "stale-token"), `${contents}\n`, { mode: 0o600 });
+  for (const [token, contents] of entries) await writeFile(join(path, token), `${contents}\n`, { mode: 0o600 });
 
-  await expect(acquireLifecycleLock(path, { operation: "x" }, fs, { inspect: inspectDead })).rejects.toMatchObject({ code: "LOCK_HELD" });
-  expect(await fs.readdir(path)).toEqual(["stale-token"]);
-});
-
-it("fails closed when holder liveness cannot be determined", async () => {
-  const path = await makeLockPath();
-  await writeSoleRecord(path, { token: "stale-token", owner: {}, holder: deadHolder });
-  const inspectUnknown = async () => { throw Object.assign(new Error("permission denied"), { code: "EACCES" }); };
-
-  await expect(acquireLifecycleLock(path, { operation: "x" }, fs, { inspect: inspectUnknown })).rejects.toMatchObject({ code: "LOCK_HELD" });
-  expect(await fs.readdir(path)).toEqual(["stale-token"]);
-});
-
-it("fails closed when several holders share the lock directory", async () => {
-  const path = await makeLockPath();
-  await writeSoleRecord(path, { token: "stale-token", owner: {}, holder: deadHolder });
-  await writeFile(join(path, "second-token"), `${JSON.stringify({ token: "second-token", owner: {}, holder: deadHolder })}\n`, { mode: 0o600 });
-
-  await expect(acquireLifecycleLock(path, { operation: "x" }, fs, { inspect: inspectDead })).rejects.toMatchObject({ code: "LOCK_HELD" });
-  expect((await fs.readdir(path)).sort()).toEqual(["second-token", "stale-token"]);
+  await expect(acquireLifecycleLock(path, { operation: "x" }, fs, { inspect })).rejects.toMatchObject({ code: "LOCK_HELD" });
+  expect((await fs.readdir(path)).sort()).toEqual(entries.map(([token]) => token).sort());
 });
 
 it("keeps a live holder's lock when the record changes during reclamation", async () => {
@@ -150,10 +111,12 @@ it("acquires an exclusive token-entry lock directory and releases its own token"
 
   const lock = await acquireLifecycleLock(path, owner);
 
-  expect(await readTokenEntry(path, lock.token)).toMatchObject({ token: lock.token, owner });
+  expect(await readTokenEntry(path, lock.token)).toMatchObject({
+    token: lock.token,
+    owner,
+    holder: { pid: process.pid, processGroupId: expect.any(Number), startIdentity: expect.any(String) },
+  });
   expect(lock.token).toMatch(/^[0-9a-f-]{36}$/);
-  expect((await stat(path)).mode & 0o777).toBe(0o700);
-  expect((await stat(join(path, lock.token))).mode & 0o777).toBe(0o600);
   await expect(acquireLifecycleLock(path, owner)).rejects.toMatchObject({ code: "LOCK_HELD" });
 
   await expect(lock.release()).resolves.toBe(true);

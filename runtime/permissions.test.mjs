@@ -48,28 +48,16 @@ it("creates private directories and files with exact modes under a restrictive u
   expect((await lstat(file)).mode & 0o777).toBe(0o600);
 });
 
-it("rejects an existing directory with a public mode", async () => {
+it.each([
+  ["a public mode", { isDirectory: () => true, isSymbolicLink: () => false, uid: 1000, mode: 0o40755 }, /mode 0700/i],
+  ["another user's ownership", { isDirectory: () => true, isSymbolicLink: () => false, uid: 2000, mode: 0o40700 }, /owner/i],
+])("rejects an existing directory with %s", async (_label, stats, message) => {
   const fsOps = {
-    async lstat() {
-      return { isDirectory: () => true, isSymbolicLink: () => false, uid: 1000, mode: 0o40755 };
-    },
-    async mkdir() {
-      throw new Error("must not create over an existing path");
-    },
+    async lstat() { return stats; },
+    async mkdir() { throw new Error("must not create over an existing path"); },
   };
 
-  await expect(ensurePrivateDirectory("/runtime", fsOps, 1000)).rejects.toThrow(/mode 0700/i);
-});
-
-it("rejects an existing directory owned by another user", async () => {
-  const fsOps = {
-    async lstat() {
-      return { isDirectory: () => true, isSymbolicLink: () => false, uid: 2000, mode: 0o40700 };
-    },
-    async mkdir() {},
-  };
-
-  await expect(ensurePrivateDirectory("/runtime", fsOps, 1000)).rejects.toThrow(/owner/i);
+  await expect(ensurePrivateDirectory("/runtime", fsOps, 1000)).rejects.toThrow(message);
 });
 
 it("removes a newly created file when exact-mode establishment fails", async () => {

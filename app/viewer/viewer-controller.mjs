@@ -30,7 +30,9 @@ function isHome(data) { return matchesKey(data, Key.home); }
 function isEnd(data) { return matchesKey(data, Key.end); }
 
 /** Lines moved per wheel notch, matching Jobwatch's three-line step. */
-const WHEEL_SCROLL_LINES = 3;
+// One line per wheel notch leaves acceleration to the terminal and the OS, which already
+// translate a trackpad swipe into a notch count.
+const WHEEL_SCROLL_LINES = 1;
 
 const QUEUED_MESSAGE_ROWS = 3;
 const MIN_TRANSCRIPT_ROWS = 3;

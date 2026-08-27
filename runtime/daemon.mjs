@@ -739,7 +739,8 @@ export async function createDaemonRuntime({
                 const current = await registry.get(record.sessionId);
                 if (current === undefined) return;
                 // A name the operator chose outranks anything the summarizer writes.
-                const namesItself = typeof writtenName === "string" && writtenName.trim().length > 0 && (current.name === undefined || current.nameGenerated === true);
+                // Only a name the operator typed sets nameGenerated false; an absent flag is a legacy name of unknown provenance, which the agent may replace.
+                const namesItself = typeof writtenName === "string" && writtenName.trim().length > 0 && current.nameGenerated !== false;
                 const updated = await registry.update(current.sessionId, current.revision, { summary: { text: text.trim().slice(0, 512), generatedAt: new Date().toISOString(), model: { ...summaryModel }, sourceCursor }, ...(namesItself ? { name: writtenName.trim().slice(0, 128), nameGenerated: true } : {}), updatedAt: new Date().toISOString() });
                 const event = await context.recovery.events.append({ kind: "session_changed", payload: { session: updated } });
                 context.broadcast(event);

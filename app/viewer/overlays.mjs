@@ -2,12 +2,11 @@ import { DynamicBorder, ExtensionEditorComponent, getMarkdownTheme, getSelectLis
 import { Input, Markdown, SelectList, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 import { createPiKeybindings } from "./pi-component-adapters.mjs";
+import { spinnerFrame } from "../spinner.mjs";
 
 initTheme(undefined, false);
 
 // Pi's Loader frames and 80 ms cadence, sampled from the render clock because the viewer renders on demand.
-const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const SPINNER_INTERVAL_MS = 80;
 const PI_WORKING_MESSAGE = "Working...";
 
 function fit(line, width) {
@@ -173,7 +172,7 @@ export function renderStatusIndicator(activity, width, now = Date.now(), { worki
   const started = idle ? Number.NaN : Date.parse(activity.startedAt);
   const elapsed = Number.isFinite(started) ? ` · ${Math.max(0, Math.floor((now - started) / 1_000))}s` : "";
   const detail = idle || activity.detail === undefined ? "" : ` · ${activity.detail}`;
-  const frame = SPINNER_FRAMES[Math.floor(Math.max(0, now) / SPINNER_INTERVAL_MS) % SPINNER_FRAMES.length];
+  const frame = spinnerFrame(now);
   return ["", fit(` ${frame} ${label}${elapsed}${detail}${working ? " (Esc to interrupt)" : ""}`, width)];
 }
 

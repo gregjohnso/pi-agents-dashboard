@@ -70,11 +70,11 @@ it("names a session from its initial prompt and keeps an explicit name", async (
 
   const base = { cwd: "/repo", sourceSessionId: "source", isolation: { mode: "shared_directory", confirmedCwd: "/repo", ownerSessionIds: [] } };
   const derived = await launch({ ...base, prompt: "  Fix   the coverage loader\nand rerun the tests  " });
-  expect(derived.sessionRecord.name).toBe("Fix the coverage loader");
+  expect(derived.sessionRecord).toMatchObject({ name: "Fix the coverage loader", nameGenerated: true });
   expect(derived.name).toBe("Fix the coverage loader");
 
   const explicit = await launch({ ...base, prompt: "Fix the loader", name: "Chosen name" });
-  expect(explicit.sessionRecord.name).toBe("Chosen name");
+  expect(explicit.sessionRecord).toMatchObject({ name: "Chosen name", nameGenerated: false });
 });
 
 it("removes a prepared worktree when later session preparation fails", async () => {
@@ -160,6 +160,7 @@ it("builds an isolated canonical session launch from the daemon request", async 
       canonicalSessionFile: "/pi/agent/sessions/project/session-id.jsonl",
       cwd: "/pi/agent/pi-dashboard/worktrees/session-id/packages/app",
       name: "identity",
+      nameGenerated: false,
       model: { provider: "openai", id: "gpt" },
       thinkingLevel: "high",
       taskState: "READY",

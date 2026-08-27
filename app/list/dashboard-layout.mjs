@@ -2,6 +2,7 @@ import { basename } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { jobwatchTheme } from "./dashboard-theme.mjs";
+import { spinnerFrame } from "../spinner.mjs";
 import { displaySessionState } from "./session-state.mjs";
 const COLUMN_LABELS = {
     name: "NAME",
@@ -67,8 +68,9 @@ export function createDashboardLayout(width, height) {
     const normalizedWidth = normalizedDimension(width);
     const normalizedHeight = normalizedDimension(height);
     const listTop = Math.min(5, normalizedHeight);
-    // The composer's closing border is decoration: a short terminal spends that row on the list instead.
-    const dockRows = normalizedHeight >= 14 ? 5 : 4;
+    // The composer sheds decoration as the terminal shrinks: first the selected session's path,
+    // then the closing rule, so the list keeps its rows.
+    const dockRows = normalizedHeight >= 16 ? 6 : normalizedHeight >= 14 ? 5 : 4;
     return {
         width: normalizedWidth,
         height: normalizedHeight,
@@ -118,10 +120,18 @@ function liveness(session) {
             return " ";
     }
 }
+/**
+ * A working session shows Pi's spinner beside its state, so the list animates while the agent runs.
+ * @param {any} session @param {number} now
+ */
+function stateCell(session, now) {
+    const state = displaySessionState(session);
+    return state === "WORKING" ? `${spinnerFrame(now)} ${state}` : state;
+}
 function sessionValues(session, now) {
     return {
         name: `${liveness(session)} ${(session.name ?? "").trim() || truncateToWidth(plainText(session.sessionId), 8, "")}`,
-        state: displaySessionState(session),
+        state: stateCell(session, now),
         age: age(session.updatedAt, now),
         activity: (session.summary?.text ?? session.activity.summary).trim() || "—",
     };

@@ -154,8 +154,13 @@ export function createLaunchResolver({
         createdAt: timestamp,
         updatedAt: timestamp,
       };
+      // A name derived from the prompt is a placeholder, so the summary pass may replace it;
+      // only a name the operator typed outranks a generated one.
       const name = payload.name ?? sessionNameFromPrompt(payload.prompt);
-      if (name !== undefined) sessionRecord.name = name;
+      if (name !== undefined) {
+        sessionRecord.name = name;
+        sessionRecord.nameGenerated = payload.name === undefined;
+      }
       if (payload.model !== undefined) sessionRecord.model = { ...payload.model };
       if (payload.thinkingLevel !== undefined) sessionRecord.thinkingLevel = payload.thinkingLevel;
       return {

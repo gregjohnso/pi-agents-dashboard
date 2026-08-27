@@ -112,18 +112,18 @@ describe("dashboard controller", () => {
         expect(listFocused[1]).toContain(JOBWATCH_ANSI.surfaceBackground);
         expect(listFocused[3]).toContain(JOBWATCH_ANSI.sky);
         expect(stripVTControlCharacters(listFocused[3])).toContain("Sessions");
-        expect(listFocused.at(-5)).toContain(JOBWATCH_ANSI.gray);
-        expect(stripVTControlCharacters(listFocused.at(-5))).toContain("New Session");
+        expect(listFocused.at(-6)).toContain(JOBWATCH_ANSI.gray);
+        expect(stripVTControlCharacters(listFocused.at(-6)).trim()).toMatch(/^\u256d\u2500+$/u);
         expect(listFocused.at(-1)).toContain(JOBWATCH_ANSI.surfaceBackground);
         expect(stripVTControlCharacters(listFocused.at(-1))).toContain("Ctrl+C quit");
 
         dashboard.handleInput("\x1b[B");
         const composerFocused = dashboard.render(100, 16);
         expect(composerFocused[3]).toContain(JOBWATCH_ANSI.gray);
-        expect(composerFocused.at(-5)).toContain(JOBWATCH_ANSI.sky);
-        expect(composerFocused.at(-4)).toBe(listFocused.at(-4));
+        expect(composerFocused.at(-6)).toContain(JOBWATCH_ANSI.sky);
+        expect(composerFocused.at(-5)).toBe(listFocused.at(-5));
         dashboard.handleInput("\t");
-        expect(stripVTControlCharacters(dashboard.render(100, 16).at(-5))).toContain("New Session · cwd");
+        expect(stripVTControlCharacters(dashboard.render(100, 16).at(-6))).toContain("cwd");
     });
     it("applies search, task/project filters, grouping, and sort independently without changing selected ID", async () => {
         const waiting = session("waiting", { taskState: "WAITING", processState: "LIVE", outcome: "NONE", cwd: "/repo/a", activity: { kind: "ui", summary: "Need approval", updatedAt: timestamp } });
@@ -147,7 +147,7 @@ describe("dashboard controller", () => {
         const dashboard = controller(backend);
         await dashboard.open();
         await vi.waitFor(() => expect(backend.refreshSummaries).toHaveBeenCalledTimes(1));
-        dashboard.handleInput("R");
+        dashboard.handleInput("\x12");
         await vi.waitFor(() => expect(backend.refreshSummaries).toHaveBeenCalledTimes(2));
     });
     it("opens without summaries when the daemon has none configured", async () => {
@@ -161,7 +161,7 @@ describe("dashboard controller", () => {
     it("greys the composer placeholder and leaves the prompt line unchanged when focused", async () => {
         const dashboard = controller(new FakeBackend([]));
         await dashboard.open();
-        const promptLine = (rendered) => rendered[rendered.length - 4];
+        const promptLine = (rendered) => rendered[rendered.length - 5];
         const unfocused = promptLine(dashboard.render(80, 24));
         expect(stripVTControlCharacters(unfocused)).toContain("describe a task for a new session");
         expect(unfocused).toContain(JOBWATCH_ANSI.gray);
@@ -182,7 +182,7 @@ describe("dashboard controller", () => {
         const plain = dashboard.render(100, 16).map(stripVTControlCharacters);
         expect(plain[2]).not.toContain("/search");
         expect(plain[2]).not.toContain("v:live");
-        expect(plain.at(-2).trim()).toMatch(/^─+$/u);
+        expect(plain.at(-3).trim()).toMatch(/^─+$/u);
 
         dashboard.setSearch("needle");
         const filtered = dashboard.render(100, 16).map(stripVTControlCharacters);
@@ -195,14 +195,14 @@ describe("dashboard controller", () => {
         ]));
         await dashboard.open();
         dashboard.selectSession("a");
-        expect(stripVTControlCharacters(dashboard.render(100, 16)[2])).toContain("/repo/alpha");
+        expect(stripVTControlCharacters(dashboard.render(100, 16).at(-2))).toContain("/repo/alpha");
         dashboard.selectSession("b");
-        expect(stripVTControlCharacters(dashboard.render(100, 16)[2])).toContain("/repo/beta");
+        expect(stripVTControlCharacters(dashboard.render(100, 16).at(-2))).toContain("/repo/beta");
 
         dashboard.setSearch("beta");
-        const filtered = stripVTControlCharacters(dashboard.render(100, 16)[2]);
-        expect(filtered).toContain("/repo/beta");
-        expect(filtered).toContain("search:beta");
+        const rendered = dashboard.render(100, 16);
+        expect(stripVTControlCharacters(rendered.at(-2))).toContain("/repo/beta");
+        expect(stripVTControlCharacters(rendered[2])).toContain("search:beta");
     });
     it("confirms a destructive action against the revision current at confirm time", async () => {
         const backend = new FakeBackend([session("a", { revision: 4 })]);
@@ -747,15 +747,15 @@ describe("dashboard controller", () => {
             session("b"),
         ]));
         await dashboard.open();
-        dashboard.handleInput("/");
+        dashboard.handleInput("\x06");
         dashboard.handleInput("w");
         dashboard.handleInput("\r");
-        dashboard.handleInput("t");
-        dashboard.handleInput("p");
-        dashboard.handleInput("o");
-        dashboard.handleInput("a");
-        dashboard.handleInput("s");
-        dashboard.handleInput("g");
+        dashboard.handleInput("\x14");
+        dashboard.handleInput("\x10");
+        dashboard.handleInput("\x0f");
+        dashboard.handleInput("\x01");
+        dashboard.handleInput("\x13");
+        dashboard.handleInput("\x02");
         expect(dashboard.query).toMatchObject({ search: "w", taskStates: ["WORKING"], processStates: ["LIVE"], outcomes: ["NONE"], activityKinds: ["approval"], sort: { key: "age", direction: "asc" }, groupBy: "taskState" });
         expect(dashboard.selectedSessionId).toBe("a");
         expect(dashboard.render(80, 14).join("\n")).toContain("a");
@@ -989,8 +989,9 @@ describe("wheel scrolling", () => {
         dashboard.render(80, 24);
         dashboard.selectSession("a");
         dashboard.handleMouse({ button: "wheel_down", column: 5, row: 7 });
-        expect(dashboard.selectedSessionId).toBe("d");
+        expect(dashboard.selectedSessionId).toBe("b");
+        dashboard.handleMouse({ button: "wheel_down", column: 5, row: 7 });
         dashboard.handleMouse({ button: "wheel_up", column: 5, row: 7 });
-        expect(dashboard.selectedSessionId).toBe("a");
+        expect(dashboard.selectedSessionId).toBe("b");
     });
 });

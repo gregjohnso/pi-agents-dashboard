@@ -166,17 +166,18 @@ it("drives list navigation, search/filter/sort/group, metadata/help, composer, c
   f.dashboard.handleInput("\r");
   f.dashboard.handleInput("\x1b[C");
   await vi.waitFor(() => expect(openViewer).toHaveBeenCalledTimes(2));
-  for (const input of ["/", "l", "i", "v", "e", "\r", "t", "p", "o", "a", "s", "g"]) f.dashboard.handleInput(input);
+  // Ctrl+F opens search, the letters type into it, then the Ctrl chords cycle each facet.
+  for (const input of ["\x06", "l", "i", "v", "e", "\r", "\x14", "\x10", "\x0f", "\x01", "\x13", "\x02"]) f.dashboard.handleInput(input);
   expect(f.dashboard.query).toMatchObject({ search: "live", taskStates: ["WORKING"], processStates: ["LIVE"], outcomes: ["NONE"], sort: { key: "age", direction: "asc" }, groupBy: "taskState" });
   f.dashboard.clearFilters();
-  f.dashboard.handleInput("i");
+  f.dashboard.handleInput("\x05");
   expect(f.dashboard.overlay?.kind).toBe("metadata");
-  f.dashboard.handleInput("?");
+  f.dashboard.handleInput("\x07");
   expect(f.dashboard.overlay?.kind).toBe("help");
   f.dashboard.toggleHelp();
-  f.dashboard.handleInput("n");
-  expect(f.dashboard.focus).toBe("composer");
+  // Typing anywhere in the list composes a prompt, so the first character focuses the composer.
   for (const input of "draft") f.dashboard.handleInput(input);
+  expect(f.dashboard.focus).toBe("composer");
   f.dashboard.handleInput("\x1b");
   expect(f.dashboard.focus).toBe("list");
 
@@ -193,7 +194,7 @@ it("drives list navigation, search/filter/sort/group, metadata/help, composer, c
   f.dashboard.handleInput("y");
   await vi.waitFor(() => expect(f.backend.delete).toHaveBeenCalledWith("live", 5, "terminal-request"));
 
-  f.dashboard.handleInput("n");
+  f.dashboard.handleInput("\t");
   expect(f.dashboard.focus).toBe("composer");
   f.dashboard.handleInput("\x03");
   await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith({ kind: "closed" }));

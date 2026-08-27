@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { stripVTControlCharacters } from "node:util";
 
 import { decodeKittyPrintable, Key, matchesKey, truncateToWidth, visibleWidth, } from "@earendil-works/pi-tui";
+import { pastedText } from "./dashboard-input.mjs";
 import { countDashboardSessions, selectDashboardSessions, } from "./dashboard-state.mjs";
 import { createDashboardLayout, renderColumnHeader, } from "./dashboard-layout.mjs";
 import { jobwatchTheme } from "./dashboard-theme.mjs";
@@ -206,7 +207,7 @@ function sectionFooter(width, focused) {
     return paintPlainLine("─".repeat(Math.max(0, width)), width, focused ? jobwatchTheme.focusBorder : jobwatchTheme.text);
 }
 function sectionBorder(label, width, focused) {
-    const prefix = `╭─ ${label} `;
+    const prefix = label === "" ? "╭─" : `╭─ ${label} `;
     const line = prefix + "─".repeat(Math.max(0, width - visibleWidth(prefix)));
     return paintPlainLine(line, width, focused ? jobwatchTheme.focusBorder : jobwatchTheme.inactiveBorder);
 }
@@ -618,34 +619,43 @@ export class DashboardController {
             this.selectBoundary(false);
         else if (matchesKey(data, Key.end))
             this.selectBoundary(true);
-        else if (data === "/")
+        else if (matchesKey(data, Key.ctrl("f")))
             this.focus = "search";
-        else if (matchesKey(data, Key.tab) || data === "n")
+        else if (matchesKey(data, Key.tab))
             this.focusComposer();
-        else if (data === "i")
+        else if (matchesKey(data, Key.ctrl("e")))
             this.toggleMetadata();
-        else if (data === "?")
+        else if (matchesKey(data, Key.ctrl("g")))
             this.toggleHelp();
-        else if (data === "v")
+        else if (matchesKey(data, Key.ctrl("v")))
             this.cycleView();
-        else if (data === "R")
+        else if (matchesKey(data, Key.ctrl("r")))
             this.refreshSummaries();
-        else if (data === "c")
+        else if (matchesKey(data, Key.ctrl("l")))
             this.clearFilters();
-        else if (data === "t")
+        else if (matchesKey(data, Key.ctrl("t")))
             this.setTaskStates(this.singletonCycle(TASK_STATES, this.query.taskStates));
-        else if (data === "p")
+        else if (matchesKey(data, Key.ctrl("p")))
             this.setProcessStates(this.singletonCycle(PROCESS_STATES, this.query.processStates));
-        else if (data === "o")
+        else if (matchesKey(data, Key.ctrl("o")))
             this.setOutcomes(this.singletonCycle(OUTCOMES, this.query.outcomes));
-        else if (data === "a")
+        else if (matchesKey(data, Key.ctrl("a")))
             this.cycleActivityFilter();
-        else if (data === "j")
+        else if (matchesKey(data, Key.ctrl("j")))
             this.setProjectPaths(this.singletonCycle([...new Set(this.sessions.map((session) => session.cwd))], this.query.projectPaths));
-        else if (data === "s")
+        else if (matchesKey(data, Key.ctrl("s")))
             this.cycleSort();
-        else if (data === "g")
+        else if (matchesKey(data, Key.ctrl("b")))
             this.setGrouping(cycleValue(GROUPS, this.query.groupBy));
+        else {
+            // Typed and pasted text always composes a prompt, wherever the cursor sits in the list.
+            const printable = this.printable(data);
+            if (printable !== undefined) {
+                this.focusComposer();
+                this.composerField = "prompt";
+                this.editComposerField((value) => value + printable);
+            }
+        }
     }
     /**
      * Only wheel events arrive in production: the terminal tap in app/mouse-input.mjs forwards
@@ -654,11 +664,11 @@ export class DashboardController {
      */
     handleMouse(event) {
         if (event.button === "wheel_up") {
-            this.moveSelection(-3);
+            this.moveSelection(-1);
             return;
         }
         if (event.button === "wheel_down") {
-            this.moveSelection(3);
+            this.moveSelection(1);
             return;
         }
         const layout = createDashboardLayout(this.width, this.height);
@@ -700,7 +710,7 @@ export class DashboardController {
             if (lines.length > 1)
                 lines[1] = paintPlainLine(` Working ${counts.working}  Ready ${counts.ready}  Done ${counts.exited}  Failed ${counts.failed}  Sessions ${counts.sessions}  Processes ${counts.processes}`, this.width, jobwatchTheme.surface);
             if (lines.length > 2)
-                lines[2] = paintPlainLine(this.contextSummary(), this.width, jobwatchTheme.keyHints);
+                lines[2] = paintPlainLine(this.activeFilterSummary(), this.width, jobwatchTheme.keyHints);
             if (lines.length > 3)
                 lines[3] = sectionBorder("Sessions", this.width, this.focus === "list" || this.focus === "search");
             if (lines.length > 4)
@@ -715,12 +725,13 @@ export class DashboardController {
                 const dockTop = lines.length - layout.dockRows;
                 const composerFocused = this.focus === "composer" || this.focus === "confirmation";
                 const draftPrompt = this.composerDraft.prompt;
-                lines[dockTop] = sectionBorder(composerFocused ? `New Session · ${COMPOSER_FIELD_LABELS[this.composerField]}` : "New Session", this.width, composerFocused);
+                lines[dockTop] = sectionBorder(composerFocused ? COMPOSER_FIELD_LABELS[this.composerField] : "", this.width, composerFocused);
                 lines[dockTop + 1] = paintPlainLine(` ❯ ${draftPrompt || "describe a task for a new session"}`, this.width, draftPrompt ? (text) => jobwatchTheme.text(text, false) : (text) => jobwatchTheme.muted(text, false));
                 const form = ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
                 lines[dockTop + 2] = paintPlainLine(this.status.kind === "error" ? ` ${this.status.code}: ${this.status.message}  ${form}` : form, this.width, this.status.kind === "error" ? jobwatchTheme.error : jobwatchTheme.surface);
-                if (layout.dockRows === 5) lines[dockTop + 3] = sectionFooter(this.width, composerFocused);
-                lines[lines.length - 1] = paintPlainLine(" Ctrl+C quit  ↑↓ navigate  Enter/→ open  ←/Esc back  / search  n form  Tab fields  ^X action  ? help", this.width, jobwatchTheme.keyHints);
+                if (layout.dockRows >= 5) lines[dockTop + 3] = sectionFooter(this.width, composerFocused);
+                if (layout.dockRows >= 6) lines[dockTop + 4] = paintPlainLine(this.contextSummary(), this.width, jobwatchTheme.keyHints);
+                lines[lines.length - 1] = paintPlainLine(" Ctrl+C quit  ↑↓ navigate  Enter/→ open  ←/Esc back  type to compose  Tab fields  ^X action  ^G help", this.width, jobwatchTheme.keyHints);
             }
             this.renderOverlay(lines);
             const result = lines.map((line) => fitLine(line, this.width));
@@ -806,10 +817,7 @@ export class DashboardController {
     /** Show what the cursor is on, then any active filters. The keys themselves live in the footer and in Help. */
     contextSummary() {
         const selected = this.selectedSession();
-        const filters = this.activeFilterSummary().trim();
-        const cwd = selected === undefined ? "" : selected.cwd;
-        if (cwd === "" && filters === "") return "";
-        return ` ${[cwd, filters].filter((segment) => segment !== "").join("  ·  ")}`;
+        return selected === undefined ? "" : ` ${selected.cwd}`;
     }
     /** Show filter state only once something is filtered; the keys themselves live in the footer and in Help. */
     activeFilterSummary() {
@@ -920,8 +928,7 @@ export class DashboardController {
         this.scheduleUiSave();
     }
     printable(data) {
-        return decodeKittyPrintable(data)
-            ?? (data.length === 1 && data.charCodeAt(0) >= 32 ? data : undefined);
+        return decodeKittyPrintable(data) ?? pastedText(data);
     }
     /** Ask the daemon for opt-in Activity summaries; absence of a summary model is not an error. */
     refreshSummaries() {

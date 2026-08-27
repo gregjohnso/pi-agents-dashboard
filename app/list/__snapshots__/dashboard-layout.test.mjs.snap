@@ -19,7 +19,7 @@ exports[`responsive dashboard layout > renders a width-safe 40x10 snapshot 1`] =
   "density": "minimal",
   "lines": [
     "NAME       STATE    ACTIVITY           ",
-    "▶ working- WORKING  bash: pytest exten…",
+    "▶ working- ⠋ WORKI… bash: pytest exten…",
     "▶ waiting- WAITING  Approve access to …",
     "◌ ready-12 SLEEPING Activity ready-123…",
     "  failed-1 FAILED   provider 429: quot…",
@@ -58,7 +58,7 @@ exports[`responsive dashboard layout > renders a width-safe 55x16 snapshot 1`] =
   "density": "compact",
   "lines": [
     "NAME               STATE    ACTIVITY             AGE   ",
-    "▶ working-         WORKING  bash: pytest extens… 10m   ",
+    "▶ working-         ⠋ WORKI… bash: pytest extens… 10m   ",
     "▶ waiting-         WAITING  Approve access to r… 10m   ",
     "◌ ready-12         SLEEPING Activity ready-1234… 10m   ",
     "  failed-1         FAILED   provider 429: quota… 10m   ",
@@ -68,7 +68,7 @@ exports[`responsive dashboard layout > renders a width-safe 55x16 snapshot 1`] =
     "▶ unicode-         READY    検証中 🚀 résumé na… 10m   ",
     "▶ no-activ         READY    —                    10m   ",
   ],
-  "listHeight": 6,
+  "listHeight": 5,
   "listTop": 5,
   "width": 55,
 }
@@ -97,7 +97,7 @@ exports[`responsive dashboard layout > renders a width-safe 80x24 snapshot 1`] =
   "density": "compact",
   "lines": [
     "NAME                       STATE     ACTIVITY                           AGE    ",
-    "▶ working-                 WORKING   bash: pytest extensions/agents-da… 10m    ",
+    "▶ working-                 ⠋ WORKING bash: pytest extensions/agents-da… 10m    ",
     "▶ waiting-                 WAITING   Approve access to release credent… 10m    ",
     "◌ ready-12                 SLEEPING  Activity ready-12345678            10m    ",
     "  failed-1                 FAILED    provider 429: quota exhausted      10m    ",
@@ -107,7 +107,7 @@ exports[`responsive dashboard layout > renders a width-safe 80x24 snapshot 1`] =
     "▶ unicode-                 READY     検証中 🚀 résumé naïve café        10m    ",
     "▶ no-activ                 READY     —                                  10m    ",
   ],
-  "listHeight": 14,
+  "listHeight": 13,
   "listTop": 5,
   "width": 80,
 }
@@ -136,7 +136,7 @@ exports[`responsive dashboard layout > renders a width-safe 120x32 snapshot 1`] 
   "density": "full",
   "lines": [
     "NAME                             STATE     ACTIVITY                                                             AGE    ",
-    "▶ working-                       WORKING   bash: pytest extensions/agents-dashboard                             10m    ",
+    "▶ working-                       ⠋ WORKING bash: pytest extensions/agents-dashboard                             10m    ",
     "▶ waiting-                       WAITING   Approve access to release credentials?                               10m    ",
     "◌ ready-12                       SLEEPING  Activity ready-12345678                                              10m    ",
     "  failed-1                       FAILED    provider 429: quota exhausted                                        10m    ",
@@ -146,7 +146,7 @@ exports[`responsive dashboard layout > renders a width-safe 120x32 snapshot 1`] 
     "▶ unicode-                       READY     検証中 🚀 résumé naïve café                                          10m    ",
     "▶ no-activ                       READY     —                                                                    10m    ",
   ],
-  "listHeight": 22,
+  "listHeight": 21,
   "listTop": 5,
   "width": 120,
 }
@@ -175,7 +175,7 @@ exports[`responsive dashboard layout > renders a width-safe 160x40 snapshot 1`] 
   "density": "full",
   "lines": [
     "NAME                             STATE     ACTIVITY                                                                                                     AGE    ",
-    "▶ working-                       WORKING   bash: pytest extensions/agents-dashboard                                                                     10m    ",
+    "▶ working-                       ⠋ WORKING bash: pytest extensions/agents-dashboard                                                                     10m    ",
     "▶ waiting-                       WAITING   Approve access to release credentials?                                                                       10m    ",
     "◌ ready-12                       SLEEPING  Activity ready-12345678                                                                                      10m    ",
     "  failed-1                       FAILED    provider 429: quota exhausted                                                                                10m    ",
@@ -185,7 +185,7 @@ exports[`responsive dashboard layout > renders a width-safe 160x40 snapshot 1`] 
     "▶ unicode-                       READY     検証中 🚀 résumé naïve café                                                                                  10m    ",
     "▶ no-activ                       READY     —                                                                                                            10m    ",
   ],
-  "listHeight": 30,
+  "listHeight": 29,
   "listTop": 5,
   "width": 160,
 }

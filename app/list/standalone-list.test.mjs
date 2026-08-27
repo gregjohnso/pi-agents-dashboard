@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createDaemonViewerClient, createFrontendPersistence, runViewerTransition } from "./standalone-list.mjs";
 
@@ -190,4 +190,22 @@ it("refuses malformed or non-private cursor state", async () => {
   const path = await fixture();
   await writeFile(path, JSON.stringify({ schemaVersion: 1, clientId: "client", cursor: { daemonEpoch: "epoch", sequence: "01" } }), { mode: 0o644 });
   await expect(createFrontendPersistence(path, "client").load()).rejects.toMatchObject({ code: "FRONTEND_STATE_UNSAFE" });
+
+});
+
+describe("viewer transition failures", () => {
+  it("reports a refused viewer attach on the list instead of doing nothing", async () => {
+      // A refused attach used to be dropped, so Enter and Right looked like dead keys.
+      const failures = [];
+      const controller = { closed: false, async close() {}, async open() {}, setError(error, fallback) { failures.push({ code: error?.code ?? fallback, message: error?.message }); } };
+      const viewerClient = { async attach() { throw Object.assign(new Error("Session worker is reconnecting"), { code: "WORKER_RECONNECTING" }); }, async detach() {} };
+      const outcome = await runViewerTransition({
+          sessionId: "a", viewerClient, controller,
+          createViewer: () => { throw new Error("viewer must not be created when attach fails"); },
+          activateViewer() {}, activateList() {}, restoreListFocus() {},
+          shouldRestore: () => true,
+      });
+      expect(outcome).toMatchObject({ kind: "failed" });
+      expect(failures).toEqual([{ code: "WORKER_RECONNECTING", message: "Session worker is reconnecting" }]);
+  });
 });

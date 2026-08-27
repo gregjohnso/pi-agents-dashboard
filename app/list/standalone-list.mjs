@@ -142,6 +142,9 @@ export async function runViewerTransition({ sessionId, viewerClient, controller,
       }
     }
   }
+  // A refused attach is the operator's answer to a keypress, so it belongs on the list's status line.
+  // Dropping it made Enter and Right look like dead keys.
+  if (failure !== undefined && shouldRestore()) controller.setError?.(failure, "VIEWER_OPEN_FAILED");
   return failure === undefined ? { kind: "returned" } : { kind: "failed", error: failure };
 }
 

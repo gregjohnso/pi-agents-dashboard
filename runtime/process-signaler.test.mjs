@@ -17,7 +17,7 @@ const policy = loadDashboardConfig({
 /** @param {unknown[]} inspections @param {any} [options] */
 function dependencies(inspections, options = {}) {
   const inspector = createSequenceInspector(inspections);
-  const signaler = options.signaler ?? createFakeSignaler();
+  const signaler = createFakeSignaler();
   const sleeper = options.sleeper ?? createFakeSleep();
   return {
     deps: {
@@ -33,66 +33,37 @@ function dependencies(inspections, options = {}) {
   };
 }
 
-it("refuses escalation before any action when process identity changes", async () => {
-  const { deps, signaler } = dependencies([ownership, reusedIdentity]);
+it.each([
+  ["the recorded identity was replaced before any action", [ownership, reusedIdentity], "STALE_IDENTITY"],
+  ["liveness is ambiguous", [Object.assign(new Error("malformed proc stat"), { code: "AMBIGUOUS_IDENTITY" })], "AMBIGUOUS_IDENTITY"],
+  ["the process already exited", [Object.assign(new Error("gone"), { code: "ENOENT" })], "ALREADY_EXITED"],
+])("signals nothing and reports %s", async (_label, inspections, disposition) => {
+  const { deps, signaler } = dependencies(inspections);
 
-  const result = await stopVerifiedProcessGroup(ownership, deps, policy);
-
-  expect(result.disposition).toBe("STALE_IDENTITY");
+  await expect(stopVerifiedProcessGroup(ownership, deps, policy)).resolves.toEqual({ disposition });
   expect(signaler.calls).toEqual([]);
 });
 
-it("uses approved waits and signals only the exact recorded process group", async () => {
-  const aliveGroups = new Set([ownership.processGroupId, 777]);
-  const signaler = createFakeSignaler(aliveGroups);
-  const exited = Object.assign(new Error("gone"), { code: "ESRCH" });
-  const { deps, sleeper } = dependencies(
-    [ownership, ownership, ownership, ownership, exited],
-    { signaler },
-  );
-
-  await expect(stopVerifiedProcessGroup(ownership, deps, policy)).resolves.toEqual({
-    disposition: "KILLED",
-  });
-
-  expect(signaler.calls).toEqual([
-    { type: "graceful", ownership },
-    { type: "signal", pgid: ownership.processGroupId, signal: "SIGTERM" },
-    { type: "signal", pgid: ownership.processGroupId, signal: "SIGKILL" },
-  ]);
-  expect(sleeper.calls).toEqual([123, 456]);
-  expect(aliveGroups.has(ownership.processGroupId)).toBe(false);
-  expect(aliveGroups.has(777)).toBe(true);
-});
-
-it("uses the release 5,000 ms graceful and terminate waits before exact-group KILL", async () => {
-  const exited = Object.assign(new Error("gone"), { code: "ESRCH" });
-  const { deps, signaler, sleeper } = dependencies([ownership, ownership, ownership, ownership, exited]);
-
-  await expect(stopVerifiedProcessGroup(ownership, deps, loadDashboardConfig({}).stop)).resolves.toEqual({ disposition: "KILLED" });
-  expect(sleeper.calls).toEqual([5_000, 5_000]);
-  expect(signaler.calls).toEqual([
-    { type: "graceful", ownership },
-    { type: "signal", pgid: ownership.processGroupId, signal: "SIGTERM" },
-    { type: "signal", pgid: ownership.processGroupId, signal: "SIGKILL" },
-  ]);
-});
-
-it("pins exact inspect, wait, and signal interleaving through terminal KILL evidence", async () => {
+it.each([
+  ["the reviewed release defaults", loadDashboardConfig({}).stop, 5_000, 5_000],
+  ["a configured stop policy", policy, 123, 456],
+])("escalates graceful, TERM, then KILL on the recorded group using %s", async (_label, timing, gracefulMs, terminateMs) => {
   /** @type {string[]} */
   const order = [];
   let inspections = 0;
   const exited = Object.assign(new Error("gone"), { code: "ESRCH" });
+
   const result = await stopVerifiedProcessGroup(ownership, {
     async inspect(pid) { order.push(`inspect:${pid}:${++inspections}`); if (inspections === 5) throw exited; return ownership; },
     async requestGraceful() { order.push("graceful"); },
     async signalProcessGroup(pgid, signal) { order.push(`signal:${pgid}:${signal}`); },
     async sleep(ms) { order.push(`sleep:${ms}`); },
-  }, { gracefulMs: 5_000, terminateMs: 5_000 });
+  }, timing);
+
   expect(result).toEqual({ disposition: "KILLED" });
   expect(order).toEqual([
-    "inspect:321:1", "inspect:321:2", "graceful", "sleep:5000",
-    "inspect:321:3", "signal:654:SIGTERM", "sleep:5000",
+    "inspect:321:1", "inspect:321:2", "graceful", `sleep:${gracefulMs}`,
+    "inspect:321:3", "signal:654:SIGTERM", `sleep:${terminateMs}`,
     "inspect:321:4", "signal:654:SIGKILL", "inspect:321:5",
   ]);
 });
@@ -147,28 +118,6 @@ it("stops at graceful and TERM cancellation boundaries without later signals", a
     { type: "graceful", ownership },
     { type: "signal", pgid: ownership.processGroupId, signal: "SIGTERM" },
   ]);
-});
-
-it("fails closed on ambiguous inspection without signaling", async () => {
-  const ambiguous = Object.assign(new Error("malformed proc stat"), {
-    code: "AMBIGUOUS_IDENTITY",
-  });
-  const { deps, signaler } = dependencies([ambiguous]);
-
-  await expect(stopVerifiedProcessGroup(ownership, deps, policy)).resolves.toEqual({
-    disposition: "AMBIGUOUS_IDENTITY",
-  });
-  expect(signaler.calls).toEqual([]);
-});
-
-it("reports an already-exited process without signaling", async () => {
-  const exited = Object.assign(new Error("gone"), { code: "ENOENT" });
-  const { deps, signaler } = dependencies([exited]);
-
-  await expect(stopVerifiedProcessGroup(ownership, deps, policy)).resolves.toEqual({
-    disposition: "ALREADY_EXITED",
-  });
-  expect(signaler.calls).toEqual([]);
 });
 
 it("requires timing policy from the reviewed configuration", async () => {

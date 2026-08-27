@@ -7,7 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, expect, it } from "vitest";
 
 import { atomicWriteJson } from "./atomic-file.mjs";
-import { RegistryStore, applySessionColor, runNestedSessionLifecycle, runSessionLifecycle } from "./registry-store.mjs";
+import { RegistryStore, applySessionColor, registryCoordinationScope, runSessionLifecycle } from "./registry-store.mjs";
 
 /** Replace one store's update with a version that lets background churn win the race first. @param {RegistryStore} store @param {string} sessionId @param {number} losses */
 function loseColorRaces(store, sessionId, losses) {
@@ -72,7 +72,7 @@ it("shares one reentrant lifecycle serializer across registry instances", async 
   const firstStarted = new Promise((resolve) => { started = resolve; });
   const first = runSessionLifecycle(store, "exact", async () => {
     order.push("delete:checks");
-    await runNestedSessionLifecycle(other, "exact", async () => { order.push("delete:nested-result"); });
+    await registryCoordinationScope(other).lifecycle.runNested("exact", async () => { order.push("delete:nested-result"); });
     started?.();
     await gate;
     order.push("delete:done");

@@ -264,11 +264,6 @@ export function runSessionLifecycle(registry, sessionId, operation) {
   return registryCoordinationScope(registry).lifecycle.run(sessionId, operation);
 }
 
-/** Run only a known nested lifecycle operation under its caller's exact session lock. @param {RegistryStore} registry @param {string} sessionId @param {() => any | Promise<any>} operation */
-export function runNestedSessionLifecycle(registry, sessionId, operation) {
-  return registryCoordinationScope(registry).lifecycle.runNested(sessionId, operation);
-}
-
 /**
  * Write one session's operator-chosen color, re-reading the record when a concurrent write wins the
  * compare-and-swap. The color depends on nothing about the session, so metadata churn only costs a retry.
@@ -293,25 +288,23 @@ export async function applySessionColor(registry, sessionId, color) {
 /** Atomic, compare-and-swap storage for canonical session records. */
 export class RegistryStore {
   #sessionsDirectory;
-  #fsOps;
   #atomicWrite;
   #coordinator;
 
   /**
    * @param {string} sessionsDirectory
-   * @param {{ fsOps?: any, atomicWrite?: typeof atomicWriteJson, coordinator?: SessionCoordinator }} [options]
+   * @param {{ atomicWrite?: typeof atomicWriteJson }} [options]
    */
   constructor(sessionsDirectory, options = {}) {
     if (typeof sessionsDirectory !== "string" || !isAbsolute(sessionsDirectory)) {
       throw new TypeError("Registry sessions directory must be an absolute path");
     }
     this.#sessionsDirectory = resolve(sessionsDirectory);
-    this.#fsOps = options.fsOps ?? fs;
     this.#atomicWrite = options.atomicWrite ?? atomicWriteJson;
     let scope = registryScopes.get(this.#sessionsDirectory);
     if (scope === undefined) {
       scope = {
-        coordinator: options.coordinator ?? new SessionCoordinator(),
+        coordinator: new SessionCoordinator(),
         lifecycle: new SessionCoordinator(),
       };
       registryScopes.set(this.#sessionsDirectory, scope);
@@ -329,11 +322,11 @@ export class RegistryStore {
   /** @param {string} path @param {string} expectedSessionId @returns {Promise<SessionRecord | undefined>} */
   async #readPath(path, expectedSessionId) {
     try {
-      const metadata = await this.#fsOps.lstat(path);
+      const metadata = await fs.lstat(path);
       if (!metadata.isFile() || metadata.isSymbolicLink()) {
         throw new TypeError("Registry record must be a regular file");
       }
-      const record = validateSessionRecord(JSON.parse(await this.#fsOps.readFile(path, "utf8")));
+      const record = validateSessionRecord(JSON.parse(await fs.readFile(path, "utf8")));
       if (record.sessionId !== expectedSessionId) {
         throw new TypeError("Registry filename and sessionId must match");
       }
@@ -346,7 +339,7 @@ export class RegistryStore {
   }
 
   async list() {
-    const names = await this.#fsOps.readdir(this.#sessionsDirectory);
+    const names = await fs.readdir(this.#sessionsDirectory);
     const records = await Promise.all(
       names
         .filter((/** @type {string} */ name) => name.endsWith(".json"))
@@ -395,8 +388,8 @@ export class RegistryStore {
         if (current.revision !== expectedRevision) {
           throw new RegistryRevisionError(sessionId, expectedRevision, current.revision);
         }
-        await this.#fsOps.unlink(this.#path(sessionId));
-        const directory = await this.#fsOps.open(this.#sessionsDirectory, "r");
+        await fs.unlink(this.#path(sessionId));
+        const directory = await fs.open(this.#sessionsDirectory, "r");
         try {
           await directory.sync();
         } finally {

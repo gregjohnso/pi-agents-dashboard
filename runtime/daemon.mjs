@@ -11,7 +11,7 @@ import { createAttachmentResultStore } from "./attachment-result-store.mjs";
 import { atomicWriteJson } from "./atomic-file.mjs";
 import { claimDaemonLifecycle, releaseDaemonLifecycle, updateDaemonLifecycleState } from "./daemon-lifecycle.mjs";
 import { createJsonlDecoder, createJsonlEncoder, JsonlFramingError } from "./jsonl.mjs";
-import { createLaunchResolver, rollbackPreparedLaunch } from "./launch-resolver.mjs";
+import { createLaunchResolver } from "./launch-resolver.mjs";
 import { sweepStaleWorktreeLocks } from "../isolation/lock-sweep.mjs";
 import { ensurePrivateDirectory, initializeRuntimePermissions } from "./permissions.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
@@ -29,8 +29,8 @@ initializeRuntimePermissions();
 
 const DEFAULT_MAX_BYTES = 1024 * 1024;
 const MAX_ATTACHMENT_REQUESTS = 4096;
-const DURABLE_COMMANDS = new Set(["prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "session_command"]);
 const WORKER_DELIVERED_COMMANDS = ["prompt", "steer", "follow_up", "interrupt", "ui_response", "session_command"];
+const DURABLE_COMMANDS = new Set([...WORKER_DELIVERED_COMMANDS, "stop", "delete"]);
 const CONNECTOR_PATH = fileURLToPath(new URL("./daemon-connector.mjs", import.meta.url));
 const DEFAULT_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateMs: 5_000 });
 
@@ -276,8 +276,7 @@ function sameProcessIdentity(left, right) {
   return left?.pid === right?.pid && left?.startIdentity === right?.startIdentity && left?.processGroupId === right?.processGroupId;
 }
 
-/** Capture a regular, canonical session file identity without following a symlink replacement. */
-/** @param {string} path */
+/** Capture a regular, canonical session file identity without following a symlink replacement. @param {string} path */
 async function inspectSessionFile(path) {
   if (typeof path !== "string" || resolve(path) !== path) throw Object.assign(new Error("Session file path is not canonical"), { code: "SESSION_PATH_UNSAFE" });
   const metadata = await fs.lstat(path);
@@ -406,18 +405,16 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
       });
     });
     socket.on("close", () => {
-      context.markAttachmentClosing?.(socket);
+      context.markAttachmentClosing(socket);
       sockets.delete(socket);
       subscribers.delete(socket);
       broadcastWriters.delete(socket);
       const activeViewerSubscriptions = viewerSubscriptions.get(socket) ?? [];
       viewerSubscriptions.delete(socket);
       for (const subscription of activeViewerSubscriptions) void subscription.return?.();
-      const attachmentRelease = context.releaseAttachments?.(socket, frontendClientId);
-      if (attachmentRelease !== undefined) {
-        chains.add(attachmentRelease);
-        void attachmentRelease.finally(() => chains.delete(attachmentRelease)).catch(() => {});
-      }
+      const attachmentRelease = context.releaseAttachments(socket, frontendClientId);
+      chains.add(attachmentRelease);
+      void attachmentRelease.finally(() => chains.delete(attachmentRelease)).catch(() => {});
       resolveClosed(undefined);
       for (const [id, pending] of context.workerPending) {
         if (pending.connection === workerConnection && context.workerPending.get(id) === pending) {
@@ -463,7 +460,7 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
               const route = await context.router.adopt(frame, workerConnection);
               workerMetadata = route.metadata;
               workerRouteGeneration = route.routeGeneration;
-              void context.reconcileSessionActivity?.(route).catch(() => {});
+              void context.reconcileSessionActivity(route).catch(() => {});
               return;
             }
             await context.handleWorkerFrame(frame, workerConnection, workerMetadata, workerRouteGeneration);
@@ -515,7 +512,7 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
       }
     });
     socket.on("end", () => {
-      context.markAttachmentClosing?.(socket);
+      context.markAttachmentClosing(socket);
       /** @type {{ code?: string, message?: string } | undefined} */
       let framingError;
       try {
@@ -582,7 +579,6 @@ export async function createDaemonRuntime({
   summarizeSession,
   summaryExecutable = "pi",
   summaryEnv = process.env,
-  rollbackLaunch = rollbackPreparedLaunch,
   randomId = randomUUID,
   responseWriter = async (/** @type {any} */ { value, write }) => write(value),
   closeFailpoint = async () => {},
@@ -597,7 +593,7 @@ export async function createDaemonRuntime({
   if (typeof root !== "string" || resolve(root) !== root) throw new TypeError("Daemon runtime root must be an absolute canonical path");
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 128) throw new TypeError("maxBytes must be at least 128");
   if (typeof randomId !== "function") throw new TypeError("randomId must be a function");
-  if (typeof responseWriter !== "function" || typeof closeFailpoint !== "function" || typeof attachmentFailpoint !== "function" || typeof destructiveFailpoint !== "function" || typeof signalProcessGroupImpl !== "function" || typeof sleepImpl !== "function" || typeof rollbackLaunch !== "function") throw new TypeError("Daemon runtime seams must be functions");
+  if (typeof responseWriter !== "function" || typeof closeFailpoint !== "function" || typeof attachmentFailpoint !== "function" || typeof destructiveFailpoint !== "function" || typeof signalProcessGroupImpl !== "function" || typeof sleepImpl !== "function") throw new TypeError("Daemon runtime seams must be functions");
   if (!Number.isSafeInteger(stopPolicy?.gracefulMs) || stopPolicy.gracefulMs <= 0 || !Number.isSafeInteger(stopPolicy?.terminateMs) || stopPolicy.terminateMs <= 0) throw new TypeError("stopPolicy must contain approved positive integer waits");
   if (trashSessionFile !== undefined && typeof trashSessionFile !== "function") throw new TypeError("trashSessionFile must be a function when supplied");
   await ensureLayout(root);
@@ -658,22 +654,36 @@ export async function createDaemonRuntime({
       publicStatus() { return { state: context.state, recovering: ["STARTING", "RECONCILING"].includes(context.state), error: context.stateError, daemonEpoch, pid: identity.pid }; },
       /** @param {net.Socket} socket */
       markAttachmentClosing(socket) { closingAttachmentSockets.add(socket); },
-      /** @param {string} sessionId @param {() => Promise<any>} operation */
-      serializeAttachment(sessionId, operation) {
-        return runSessionLifecycle(registry, sessionId, operation);
+      /** Append and broadcast one session's new record. @param {any} session */
+      async publishSession(session) {
+        context.broadcast(await context.recovery.events.append({ kind: "session_changed", payload: { session } }));
+      },
+      /** Append and broadcast one durable command's new status. @param {any} status */
+      async publishCommand(status) {
+        context.broadcast(await context.recovery.events.append({ kind: "command_changed", payload: { status } }));
+      },
+      /** Mint one worker command ID that no earlier command in this daemon has used. */
+      nextCommandId() {
+        const id = randomId();
+        if (typeof id !== "string" || id.length < 16 || usedCommandIds.has(id)) throw Object.assign(new Error("Command ID generator did not provide a unique restart-safe ID"), { code: "COMMAND_ID_COLLISION" });
+        usedCommandIds.add(id);
+        return id;
+      },
+      /** Send one command over an exact route, carrying the pending identity handleWorkerFrame checks the reply against. @param {any} route @param {string} id @param {any} durableRequest @param {Record<string, unknown>} [fields] */
+      sendWorkerCommand(route, id, durableRequest, fields = {}) {
+        const { metadata, connection, routeGeneration } = route;
+        const { clientId, requestId, op } = durableRequest;
+        return connection.request(
+          { version: 1, type: "command", token: metadata.token, id, command: { clientId, requestId, op, ...fields } },
+          { clientId, requestId, op, durableRequest, metadata, routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation },
+        );
       },
       /** Ask this session's worker one non-durable question over whichever channel owns it. @param {any} request @param {Record<string, unknown>} [fields] */
       async askWorker(request, fields = {}) {
         const sessionId = request.payload.sessionId;
         const route = router.route(sessionId);
         const handle = sessionHandles.get(sessionId);
-        if (route?.connection !== undefined && route.metadata?.token !== undefined) {
-          const { metadata, connection } = route;
-          const id = randomId();
-          if (typeof id !== "string" || id.length < 16 || usedCommandIds.has(id)) throw Object.assign(new Error("Command ID generator did not provide a unique restart-safe ID"), { code: "COMMAND_ID_COLLISION" });
-          usedCommandIds.add(id);
-          return connection.request({ version: 1, type: "command", token: metadata.token, id, command: { clientId: request.clientId, requestId: request.requestId, op: request.op, ...fields } }, { clientId: request.clientId, requestId: request.requestId, op: request.op, durableRequest: request, metadata, routeGeneration: route.routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
-        }
+        if (route?.connection !== undefined && route.metadata?.token !== undefined) return context.sendWorkerCommand(route, context.nextCommandId(), request, fields);
         // The launch channel carries no extra command fields yet, so a parameterised ask waits for the socket route.
         if (typeof handle?.request === "function" && Object.keys(fields).length === 0) return handle.request(request.op);
         if (typeof handle?.request === "function") throw Object.assign(new Error("This session is still starting; retry once it is connected"), { code: "WORKER_RECONNECTING", retryable: true });
@@ -698,16 +708,14 @@ export async function createDaemonRuntime({
        * @param {any} route
        */
       async reconcileSessionActivity(route) {
-        const { metadata, connection, routeGeneration } = route;
+        const { metadata } = route;
         if (metadata?.token === undefined) return;
         const record = await registry.get(metadata.sessionId);
         if (record === undefined || (record.taskState !== "WORKING" && record.taskState !== "READY")) return;
-        const id = randomId();
-        if (typeof id !== "string" || id.length < 16 || usedCommandIds.has(id)) return;
-        usedCommandIds.add(id);
+        const id = context.nextCommandId();
         const clientId = `daemon-reconcile:${daemonEpoch}`;
         const durableRequest = { version: 1, clientId, requestId: id, op: "get_state", payload: { sessionId: metadata.sessionId } };
-        const result = await connection.request({ version: 1, type: "command", token: metadata.token, id, command: { clientId, requestId: id, op: "get_state" } }, { clientId, requestId: id, op: "get_state", durableRequest, metadata, routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
+        const result = await context.sendWorkerCommand(route, id, durableRequest);
         const streaming = result?.result?.isStreaming;
         if (typeof streaming !== "boolean") return;
         const derived = streaming ? "WORKING" : "READY";
@@ -717,15 +725,14 @@ export async function createDaemonRuntime({
           if (current.taskState === derived || (current.taskState !== "WORKING" && current.taskState !== "READY")) return;
           const next = reduceSessionState(current, { type: streaming ? "TURN_STARTED" : "TURN_COMPLETED", at: new Date().toISOString() });
           const updated = await registry.update(current.sessionId, current.revision, { taskState: next.taskState, processState: next.processState, outcome: next.outcome, activity: next.activity, updatedAt: next.updatedAt });
-          const event = await context.recovery.events.append({ kind: "session_changed", payload: { session: updated } });
-          context.broadcast(event);
+          await context.publishSession(updated);
         });
       },
       /** Refresh opt-in Activity summaries for every session whose transcript advanced. */
       async refreshSummaries() {
         const { summaryModel } = settingsStore.current();
         if (summaryModel === null || context.recovery?.viewer === undefined) return [];
-        const summarize = summarizeSession ?? (async (/** @type {any} */ options) => summarizeWithPi({ ...options, executable: options.executable ?? "pi" }));
+        const summarize = summarizeSession ?? summarizeWithPi;
         /** @type {string[]} */
         const refreshed = [];
         for (const record of await registry.list()) {
@@ -733,7 +740,8 @@ export async function createDaemonRuntime({
           const snapshot = await context.recovery.viewer.snapshot(record.sessionId, "observer").catch(() => undefined);
           if (snapshot === undefined) continue;
           const sourceCursor = snapshot.cursor.sequence;
-          if (record.summary?.sourceCursor === sourceCursor && record.summary.model.provider === summaryModel.provider && record.summary.model.id === summaryModel.id) continue;
+          const summary = record.summary;
+          if (summary !== undefined && summary.sourceCursor === sourceCursor && summary.model.provider === summaryModel.provider && summary.model.id === summaryModel.id) continue;
           const transcript = summarizePromptInput(snapshot.items);
           if (transcript.length === 0) continue;
           refreshed.push(record.sessionId);
@@ -751,8 +759,7 @@ export async function createDaemonRuntime({
                 // Only a name the operator typed sets nameGenerated false; an absent flag is a legacy name of unknown provenance, which the agent may replace.
                 const namesItself = typeof writtenName === "string" && writtenName.trim().length > 0 && current.nameGenerated !== false;
                 const updated = await registry.update(current.sessionId, current.revision, { summary: { text: text.trim().slice(0, 512), generatedAt: new Date().toISOString(), model: { ...summaryModel }, sourceCursor }, ...(namesItself ? { name: writtenName.trim().slice(0, 128), nameGenerated: true } : {}), updatedAt: new Date().toISOString() });
-                const event = await context.recovery.events.append({ kind: "session_changed", payload: { session: updated } });
-                context.broadcast(event);
+                await context.publishSession(updated);
               });
             } catch {
             } finally {
@@ -818,7 +825,7 @@ export async function createDaemonRuntime({
           return cached.promise;
         }
         if (attachmentRequests.size >= MAX_ATTACHMENT_REQUESTS) throw Object.assign(new Error("Too many attachment requests are in flight"), { code: "ATTACHMENT_REQUEST_LIMIT", retryable: true });
-        const operation = context.serializeAttachment(sessionId, async () => {
+        const operation = runSessionLifecycle(registry, sessionId, async () => {
           let accepted = await context.recovery.journal.accept(request);
           const phase = context.attachmentResults.phase(request);
           const stored = context.attachmentResults.get(request);
@@ -911,7 +918,7 @@ export async function createDaemonRuntime({
         if (authenticatedClientId === undefined) return;
         const sessionIds = attachmentSessions.get(socket);
         if (sessionIds === undefined) return;
-        await Promise.all([...sessionIds].map((sessionId) => context.serializeAttachment(sessionId, async () => {
+        await Promise.all([...sessionIds].map((sessionId) => runSessionLifecycle(registry, sessionId, async () => {
           const claims = attachmentClaims.get(sessionId);
           if (claims === undefined) return;
           const prior = claims.get(socket);
@@ -959,8 +966,7 @@ export async function createDaemonRuntime({
           if (record?.ownership === undefined || record.ownership.runId !== metadata.runId) throw Object.assign(new Error("Worker event ownership conflict"), { code: "OWNERSHIP_CONFLICT" });
           const next = reduceSessionState(record, frame.event);
           const updated = next === record ? record : await registry.update(record.sessionId, record.revision, { taskState: next.taskState, processState: next.processState, outcome: next.outcome, activity: next.activity, updatedAt: next.updatedAt });
-          const event = await context.recovery.events.append({ kind: "session_changed", payload: { session: updated } });
-          context.broadcast(event);
+          await context.publishSession(updated);
         });
       },
       /** @param {any} request @param {net.Socket | undefined} socket @param {Set<net.Socket>} subscribers @param {string} [authenticatedClientId] */
@@ -972,8 +978,7 @@ export async function createDaemonRuntime({
         if (request.op === "set_session_color") {
           return runSessionLifecycle(registry, request.payload.sessionId, async () => {
             const updated = await applySessionColor(registry, request.payload.sessionId, request.payload.color);
-            const event = await context.recovery.events.append({ kind: "session_changed", payload: { session: updated } });
-            context.broadcast(event);
+            await context.publishSession(updated);
             return { kind: "session_colored", sessionId: updated.sessionId, revision: updated.revision, color: updated.color ?? null };
           });
         }
@@ -1007,8 +1012,7 @@ export async function createDaemonRuntime({
         }
         if (request.op === "resolve_delivery") {
           const status = await context.recovery.journal.resolveDelivery({ clientId: request.payload.targetClientId, requestId: request.payload.targetRequestId }, request.payload.resolution);
-          const event = await context.recovery.events.append({ kind: "command_changed", payload: { status } });
-          context.broadcast(event);
+          await context.publishCommand(status);
           return { kind: "command", status };
         }
         if (request.op === "launch") {
@@ -1032,8 +1036,7 @@ export async function createDaemonRuntime({
             launch = await resolveLaunchRequest(request);
             if (launch.sessionRecord !== undefined && await registry.get(launch.sessionId) === undefined) {
               const prepared = await registry.create(launch.sessionRecord);
-              const event = await context.recovery.events.append({ kind: "session_changed", payload: { session: prepared } });
-              context.broadcast(event);
+              await context.publishSession(prepared);
             }
             return await runSessionLifecycle(registry, launch.sessionId, async () => {
               if (launchingSessions.has(launch.sessionId)) throw Object.assign(new Error("A launch is already in flight for this session"), { code: "LAUNCH_IN_FLIGHT" });
@@ -1074,8 +1077,7 @@ export async function createDaemonRuntime({
                   activity: { kind: "launch_failed", summary: error instanceof Error ? error.message : "Launch failed", updatedAt: new Date().toISOString() },
                   updatedAt: new Date().toISOString(),
                 });
-                const event = await context.recovery.events.append({ kind: "session_changed", payload: { session: updated } });
-                context.broadcast(event);
+                await context.publishSession(updated);
               }
               await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
               await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "FAILED", dashboardError(launchError.code ?? "LAUNCH_FAILED", error instanceof Error ? error.message : "Launch failed"));
@@ -1123,13 +1125,11 @@ export async function createDaemonRuntime({
             if (connection === undefined || metadata?.token === undefined) {
               status = await context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("WORKER_UNAVAILABLE", "No exact recovered worker owns this session"));
             } else {
-              const id = randomId();
-              if (typeof id !== "string" || id.length < 16 || usedCommandIds.has(id)) throw Object.assign(new Error("Command ID generator did not provide a unique restart-safe ID"), { code: "COMMAND_ID_COLLISION" });
-              usedCommandIds.add(id);
+              const id = context.nextCommandId();
               await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
               const retryAtRisk = (await context.recovery.journal.history(request)).some((/** @type {any} */ prior) => prior.stage === "DELIVERY_UNKNOWN");
               try {
-                await connection.request({ version: 1, type: "command", token: metadata.token, id, command: { clientId: request.clientId, requestId: request.requestId, op: request.op, text: request.payload.text, response: request.op === "ui_response" ? { requestId: request.payload.uiRequestId, response: request.payload.response } : undefined, sessionCommand: request.op === "session_command" ? sessionCommandPayload(request.payload) : undefined, retryAtRisk } }, { clientId: request.clientId, requestId: request.requestId, op: request.op, durableRequest: request, metadata, routeGeneration: route.routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
+                await context.sendWorkerCommand(route, id, request, { text: request.payload.text, response: request.op === "ui_response" ? { requestId: request.payload.uiRequestId, response: request.payload.response } : undefined, sessionCommand: request.op === "session_command" ? sessionCommandPayload(request.payload) : undefined, retryAtRisk });
                 await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
                 status = await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
               } catch (error) {
@@ -1192,8 +1192,7 @@ export async function createDaemonRuntime({
                   // Stop is a task-state verdict; a reviewable outcome the session already earned stays intact.
                   const stopped = reduceSessionState(latest, { type: "USER_STOPPED", at: new Date().toISOString() });
                   const updated = await registry.update(latest.sessionId, latest.revision, { ownership: undefined, taskState: stopped.taskState, processState: stopped.processState, outcome: latest.outcome, activity: stopped.activity, updatedAt: stopped.updatedAt });
-                  const event = await context.recovery.events.append({ kind: "session_changed", payload: { session: updated } });
-                  context.broadcast(event);
+                  await context.publishSession(updated);
                 }
                 await forget();
               }
@@ -1254,7 +1253,6 @@ export async function createDaemonRuntime({
                 if (record === undefined) return refuse("SESSION_NOT_FOUND", "The exact session does not exist");
                 if (record.revision !== request.payload.revision) return refuse("REVISION_CONFLICT", "Session revision changed before Delete");
               }
-              if (record === undefined) return refuse("SESSION_NOT_FOUND", "The exact session does not exist");
               if (record.ownership !== undefined || ["LIVE", "SLEEPING"].includes(record.processState)) return refuse("SESSION_LIVE", "Delete refuses a live or owned session");
               // A lease whose worker process is provably gone cannot be authoritative; reclaim it instead of refusing forever.
               if (lockedMetadata !== undefined && lockedRoute === undefined && await processIsGone(lockedMetadata.identity, inspect)) {
@@ -1314,15 +1312,11 @@ export async function createDaemonRuntime({
             const current = await registry.get(request.payload.sessionId);
             if (current === undefined || current.name === request.payload.name) return;
             const updated = await registry.update(current.sessionId, current.revision, { name: request.payload.name, nameGenerated: false, updatedAt: new Date().toISOString() });
-            const event = await context.recovery.events.append({ kind: "session_changed", payload: { session: updated } });
-            context.broadcast(event);
+            await context.publishSession(updated);
           });
         }
         if (changed) {
-          const publish = async () => {
-            const event = await context.recovery.events.append({ kind: "command_changed", payload: { status } });
-            context.broadcast(event);
-          };
+          const publish = () => context.publishCommand(status);
           if (typeof request.payload?.sessionId === "string") await runSessionLifecycle(registry, request.payload.sessionId, publish);
           else await publish();
         }

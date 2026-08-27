@@ -335,13 +335,9 @@ export async function maintainDaemonConnection({ connect, onConnection, delaysMs
   }
 }
 
-export async function runWorker(runtimeProcess = process) {
-  return runInstalledPiWorker(runtimeProcess, { createWorkerReplayStore, createWorkerCommandDispatcher, replayDeliveryIsAmbiguous, maintainDaemonConnection });
-}
-
 const isMain = process.argv[1] !== undefined && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (isMain) {
-  runWorker().catch((error) => {
+  runInstalledPiWorker(process).catch((error) => {
     process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
     process.disconnect?.();
     try {

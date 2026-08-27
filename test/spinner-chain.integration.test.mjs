@@ -130,6 +130,8 @@ it("moves the throbber in the mounted list while Pi is running a turn", async ()
   worker.emitPiEvent({ type: "tool_execution_start", toolName: "bash" });
   worker.emitPiEvent({ type: "turn_end", message: {} });
   worker.emitPiEvent({ type: "turn_start" });
+  // A recorded run fires bursts of these between turn_start and turn_end; none of them ends the run.
+  for (let index = 0; index < 20; index += 1) expect(worker.emitPiEvent({ type: "extension_ui_request", method: "setWidget", widgetKey: "monitor-list" })).toBe(false);
 
   rows.length = 0;
   await new Promise((resolve) => setTimeout(resolve, SPINNER_INTERVAL_MS * 5));

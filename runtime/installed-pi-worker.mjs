@@ -6,6 +6,7 @@ import { openPiExecutableBinding } from "./pi-executable.mjs";
 import { PiRpcAdapter } from "./pi-rpc-adapter.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { openRotatingDiagnostics } from "./rotating-diagnostics.mjs";
+import { sessionEventForPiEvent } from "./session-event-mapping.mjs";
 
 const MAX_PENDING_PARENT_MESSAGES = 256;
 
@@ -49,19 +50,6 @@ function parseArgs(argv) {
   };
 }
 
-/** @param {Record<string, unknown>} event @returns {any | undefined} */
-function sessionEventForRpc(event) {
-  const at = new Date().toISOString();
-  switch (event.type) {
-    case "agent_start": return { type: "TURN_STARTED", at };
-    case "agent_settled": return { type: "TURN_COMPLETED", at };
-    case "extension_ui_request": return { type: "UI_REQUESTED", at, summary: "Waiting for Pi extension input" };
-    case "tool_execution_start": return { type: "ACTIVITY_SNAPSHOT", at, tool: { summary: typeof event.toolName === "string" ? event.toolName : "Pi tool running" } };
-    case "message_update": return { type: "ACTIVITY_SNAPSHOT", at, assistantStream: { summary: "Pi assistant streaming" } };
-    case "message_end": return { type: "ACTIVITY_SNAPSHOT", at, finalAssistant: { summary: "Pi assistant response received" } };
-    default: return undefined;
-  }
-}
 
 /** @param {NodeJS.Process} runtimeProcess @param {{ createWorkerReplayStore: Function, createWorkerCommandDispatcher: Function, replayDeliveryIsAmbiguous: Function, maintainDaemonConnection: Function }} dependencies */
 export async function runInstalledPiWorker(runtimeProcess, dependencies) {
@@ -127,7 +115,7 @@ export async function runInstalledPiWorker(runtimeProcess, dependencies) {
   const adapter = PiRpcAdapter.connect({ input: piChild.stdin, output: piChild.stdout, diagnostics: diagnostics.rpc, process: piChild, maxRecordBytes: 16 * 1024 * 1024 });
   adapter.onFrame((frame) => sendWorkerMessage({ version: 1, type: "pi_frame", token, sessionId: options.sessionId, frame }));
   adapter.onEvent((event) => {
-    const stateEvent = sessionEventForRpc(event);
+    const stateEvent = sessionEventForPiEvent(event);
     if (stateEvent !== undefined) sendWorkerMessage({ version: 1, type: "worker_event", token, sessionId: options.sessionId, event: stateEvent });
   });
   const piChildPid = /** @type {number} */ (piChild.pid);

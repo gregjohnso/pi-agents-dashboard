@@ -9,6 +9,7 @@ import { validateWorkerReplayRecord } from "./worker-replay-contract.mjs";
 import { initializeRuntimePermissions } from "./permissions.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { runInstalledPiWorker } from "./installed-pi-worker.mjs";
+import { sessionEventForPiEvent } from "./session-event-mapping.mjs";
 
 initializeRuntimePermissions();
 
@@ -349,19 +350,6 @@ export async function maintainDaemonConnection({ connect, onConnection, delaysMs
   }
 }
 
-/** @param {Record<string, unknown>} event @returns {any | undefined} */
-function sessionEventForRpc(event) {
-  const at = new Date().toISOString();
-  switch (event.type) {
-    case "agent_start": return { type: "TURN_STARTED", at };
-    case "agent_settled": return { type: "TURN_COMPLETED", at };
-    case "extension_ui_request": return { type: "UI_REQUESTED", at, summary: "Waiting for Pi extension input" };
-    case "tool_execution_start": return { type: "ACTIVITY_SNAPSHOT", at, tool: { summary: typeof event.toolName === "string" ? event.toolName : "Pi tool running" } };
-    case "message_update": return { type: "ACTIVITY_SNAPSHOT", at, assistantStream: { summary: "Pi assistant streaming" } };
-    case "message_end": return { type: "ACTIVITY_SNAPSHOT", at, finalAssistant: { summary: "Pi assistant response received" } };
-    default: return undefined;
-  }
-}
 
 /** @param {string[]} argv */
 function parseArgs(argv) {
@@ -498,7 +486,7 @@ async function runLegacyWorker(runtimeProcess = process) {
   Object.defineProperty(runtimeProcess, "stdout", { configurable: true, enumerable: true, value: rpcOutput });
   const adapter = PiRpcAdapter.connect({ input: rpcInput, output: rpcOutput });
   adapter.onEvent((event) => {
-    const stateEvent = sessionEventForRpc(event);
+    const stateEvent = sessionEventForPiEvent(event);
     if (stateEvent !== undefined) {
       sendWorkerMessage({ version: 1, type: "worker_event", token, sessionId: options.sessionId, event: stateEvent });
     }

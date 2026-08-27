@@ -463,8 +463,6 @@ export class DashboardController {
         this.overlay = undefined;
     }
     async confirmSession(confirmation) {
-        if (confirmation.submitting)
-            return;
         const selected = this.sessions.find((session) => session.sessionId === confirmation.sessionId);
         if (selected === undefined) {
             this.overlay = undefined;
@@ -518,13 +516,10 @@ export class DashboardController {
             return;
         }
         if (this.overlay?.kind === "session_confirmation") {
-            // Escape always dismisses so a stuck destructive request never wedges the dashboard.
-            if (matchesKey(data, Key.escape) || (!this.overlay.submitting && data.toLowerCase() === "n")) {
+            if (matchesKey(data, Key.escape) || data.toLowerCase() === "n") {
                 this.overlay = undefined;
                 return;
             }
-            if (this.overlay.submitting)
-                return;
             if (matchesKey(data, Key.enter) || data.toLowerCase() === "y") {
                 void this.confirmSession(this.overlay);
             }

@@ -276,8 +276,7 @@ function sameProcessIdentity(left, right) {
   return left?.pid === right?.pid && left?.startIdentity === right?.startIdentity && left?.processGroupId === right?.processGroupId;
 }
 
-/** Capture a regular, canonical session file identity without following a symlink replacement. */
-/** @param {string} path */
+/** Capture a regular, canonical session file identity without following a symlink replacement. @param {string} path */
 async function inspectSessionFile(path) {
   if (typeof path !== "string" || resolve(path) !== path) throw Object.assign(new Error("Session file path is not canonical"), { code: "SESSION_PATH_UNSAFE" });
   const metadata = await fs.lstat(path);
@@ -733,7 +732,7 @@ export async function createDaemonRuntime({
       async refreshSummaries() {
         const { summaryModel } = settingsStore.current();
         if (summaryModel === null || context.recovery?.viewer === undefined) return [];
-        const summarize = summarizeSession ?? (async (/** @type {any} */ options) => summarizeWithPi({ ...options, executable: options.executable ?? "pi" }));
+        const summarize = summarizeSession ?? summarizeWithPi;
         /** @type {string[]} */
         const refreshed = [];
         for (const record of await registry.list()) {

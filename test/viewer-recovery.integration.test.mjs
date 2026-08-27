@@ -51,7 +51,7 @@ it("fails daemon reconciliation closed when durable viewer state is corrupt", as
 });
 
 it("keeps a published event authoritative when re-derived history content drifts", async () => {
-  const { root, sessionFile } = await setup();
+  const { root } = await setup();
   const first = await open(root, "client-drift");
   await first.client.getViewerSnapshot("session-1");
   await first.client.close();

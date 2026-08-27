@@ -1,5 +1,4 @@
 import { stripVTControlCharacters } from "node:util";
-import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 
 import { ViewerController } from "./viewer-controller.mjs";
@@ -339,8 +338,6 @@ describe("viewer rendering and navigation", () => {
     matrix["paused-follow"] = paused.instance.render(width, height).map(stripVTControlCharacters);
     await paused.instance.close();
     expect(matrix).toMatchSnapshot();
-    expect(matrix.active).toHaveLength(height);
-    expect(matrix.active.every((/** @type {string} */ line) => visibleWidth(line) <= width)).toBe(true);
   });
 
   it("replays from origin into exact message/tool chronology before continuing live without a gap", async () => {

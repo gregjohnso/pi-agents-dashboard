@@ -4,39 +4,63 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import { afterEach, expect, it } from "vitest";
+import { afterAll, beforeAll, expect, it } from "vitest";
 
 import { launchPreflight } from "./launch-preflight.mjs";
 
 const execFileAsync = promisify(execFile);
-/** @type {string[]} */
-const temporaryPaths = [];
-
-afterEach(async () => {
-  await Promise.all(temporaryPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })));
-});
 
 /** @param {string} cwd @param {string[]} args */
 async function git(cwd, ...args) {
   return execFileAsync("git", ["-C", cwd, ...args], { encoding: "utf8", shell: false });
 }
 
-/** @param {{ commit?: boolean }} [options] */
-async function repository({ commit = true } = {}) {
-  const parent = await mkdtemp(join(tmpdir(), "dashboard-preflight-"));
-  temporaryPaths.push(parent);
+/**
+ * One committed repository, one unborn repository, and one directory outside Git, shared by every
+ * case in this file. Cases that need a different HEAD or a dirty tree take a linked worktree, so
+ * the shared repository stays on a clean `main`.
+ */
+async function sharedFixtures() {
+  const parent = await realpath(await mkdtemp(join(tmpdir(), "dashboard-preflight-")));
   const root = join(parent, "repo");
+  const unborn = join(parent, "unborn");
+  const outsideGit = join(parent, "outside-git");
   const piConfigRoot = join(parent, "pi-config");
-  await Promise.all([mkdir(root), mkdir(piConfigRoot)]);
-  await git(root, "init", "-b", "main");
+  await Promise.all([
+    mkdir(join(root, "src", "nested"), { recursive: true }),
+    mkdir(unborn),
+    mkdir(outsideGit),
+    mkdir(piConfigRoot),
+  ]);
+  await Promise.all([git(root, "init", "-b", "main"), git(unborn, "init", "-b", "main")]);
   await git(root, "config", "user.name", "Dashboard Tests");
   await git(root, "config", "user.email", "dashboard@example.test");
-  if (commit) {
-    await writeFile(join(root, "tracked.txt"), "base\n");
-    await git(root, "add", "tracked.txt");
-    await git(root, "commit", "-m", "base");
-  }
-  return { parent, root: await realpath(root), piConfigRoot: await realpath(piConfigRoot) };
+  await writeFile(join(root, "tracked.txt"), "base\n");
+  await git(root, "add", "tracked.txt");
+  await git(root, "commit", "-m", "base");
+  const alias = join(parent, "repo-alias");
+  await symlink(root, alias);
+  const { stdout: head } = await git(root, "rev-parse", "HEAD");
+  return { parent, root, alias, unborn, outsideGit, piConfigRoot, head: head.trim() };
+}
+
+/** @type {Awaited<ReturnType<typeof sharedFixtures>>} */
+let shared;
+let worktreeSequence = 0;
+
+beforeAll(async () => {
+  shared = await sharedFixtures();
+});
+afterAll(async () => {
+  await rm(shared.parent, { recursive: true, force: true });
+});
+
+/** A linked worktree of the shared repository, for cases that change HEAD or the working tree. */
+async function linkedWorktree() {
+  worktreeSequence += 1;
+  const path = join(shared.parent, `linked-${worktreeSequence}`);
+  await git(shared.root, "worktree", "add", "-b", `linked-${worktreeSequence}`, path);
+  return path;
 }
 
 /**
@@ -53,118 +77,84 @@ function request(cwd, isolation = { mode: "worktree" }) {
   };
 }
 
-it("preflights an attached branch and preserves a subdirectory cwd", async () => {
-  const fixture = await repository();
-  const subdirectory = join(fixture.root, "src", "nested");
-  await mkdir(subdirectory, { recursive: true });
+it.each([
+  ["a subdirectory cwd", () => join(shared.root, "src", "nested"), () => join(shared.root, "src", "nested"), join("src", "nested")],
+  ["a symlinked repository alias", () => shared.alias, () => shared.root, ""],
+])("preflights an attached branch from %s", async (_label, cwd, canonical, sourceSubdirectory) => {
+  const result = await launchPreflight(request(cwd()), { piConfigRoot: shared.piConfigRoot });
 
-  const result = await launchPreflight(request(subdirectory), {
-    piConfigRoot: fixture.piConfigRoot,
-  });
-
-  const { stdout: head } = await git(fixture.root, "rev-parse", "HEAD");
   expect(result).toMatchObject({
     mode: "worktree",
     sourceSessionId: "source-session",
-    canonicalCwd: subdirectory,
-    repositoryRoot: fixture.root,
-    sourceSubdirectory: join("src", "nested"),
-    baseCommit: head.trim(),
+    canonicalCwd: canonical(),
+    repositoryRoot: shared.root,
+    sourceSubdirectory,
+    baseCommit: shared.head,
     sourceBranch: "main",
     sourceDirty: false,
-    piConfigRoot: fixture.piConfigRoot,
-    worktreesRoot: join(fixture.piConfigRoot, "pi-dashboard", "worktrees"),
+    piConfigRoot: shared.piConfigRoot,
+    worktreesRoot: join(shared.piConfigRoot, "pi-dashboard", "worktrees"),
   });
 });
 
 it("uses the exact detached HEAD commit without inventing a branch", async () => {
-  const fixture = await repository();
-  const { stdout } = await git(fixture.root, "rev-parse", "HEAD");
-  await git(fixture.root, "checkout", "--detach", stdout.trim());
+  const detached = await linkedWorktree();
+  await git(detached, "checkout", "--detach", shared.head);
 
-  const result = await launchPreflight(request(fixture.root), {
-    piConfigRoot: fixture.piConfigRoot,
-  });
+  const result = await launchPreflight(request(detached), { piConfigRoot: shared.piConfigRoot });
 
-  expect(result.baseCommit).toBe(stdout.trim());
+  expect(result.baseCommit).toBe(shared.head);
   expect(result.sourceBranch).toBeNull();
 });
 
 it("refuses worktree launch from an unborn HEAD", async () => {
-  const fixture = await repository({ commit: false });
-
   await expect(
-    launchPreflight(request(fixture.root), { piConfigRoot: fixture.piConfigRoot }),
+    launchPreflight(request(shared.unborn), { piConfigRoot: shared.piConfigRoot }),
   ).rejects.toMatchObject({ code: "UNBORN_HEAD" });
 });
 
 it("records a dirty source without copying its uncommitted state", async () => {
-  const fixture = await repository();
-  await writeFile(join(fixture.root, "tracked.txt"), "dirty\n");
+  const dirty = await linkedWorktree();
+  await writeFile(join(dirty, "tracked.txt"), "dirty\n");
 
-  const result = await launchPreflight(request(fixture.root), {
-    piConfigRoot: fixture.piConfigRoot,
-  });
+  const result = await launchPreflight(request(dirty), { piConfigRoot: shared.piConfigRoot });
 
   expect(result.sourceDirty).toBe(true);
 });
 
-it("canonicalizes cwd aliases before deriving repository metadata", async () => {
-  const fixture = await repository();
-  const alias = join(fixture.parent, "repo-alias");
-  await symlink(fixture.root, alias);
-
-  const result = await launchPreflight(request(alias), {
-    piConfigRoot: fixture.piConfigRoot,
-  });
-
-  expect(result.canonicalCwd).toBe(fixture.root);
-  expect(result.repositoryRoot).toBe(fixture.root);
-});
-
 it("requires a server-derived Pi config root and rejects a client override", async () => {
-  const fixture = await repository();
-
-  await expect(launchPreflight(request(fixture.root), {})).rejects.toMatchObject({
+  await expect(launchPreflight(request(shared.root), {})).rejects.toMatchObject({
     code: "PI_CONFIG_ROOT_REQUIRED",
   });
   await expect(
     launchPreflight(
-      { ...request(fixture.root), piConfigRoot: join(fixture.parent, "untrusted") },
-      { piConfigRoot: fixture.piConfigRoot },
+      { ...request(shared.root), piConfigRoot: join(shared.parent, "untrusted") },
+      { piConfigRoot: shared.piConfigRoot },
     ),
   ).rejects.toMatchObject({ code: "UNTRUSTED_PI_CONFIG_ROOT" });
 });
 
 it("supports explicit shared-directory preflight outside Git", async () => {
-  const parent = await mkdtemp(join(tmpdir(), "dashboard-shared-preflight-"));
-  temporaryPaths.push(parent);
-  const cwd = join(parent, "cwd");
-  const piConfigRoot = join(parent, "pi-config");
-  await Promise.all([mkdir(cwd), mkdir(piConfigRoot)]);
-
   const result = await launchPreflight(
-    request(cwd, { mode: "shared_directory", confirmedCwd: cwd, ownerSessionIds: ["session-b", "session-a", "session-a"] }),
-    { piConfigRoot, currentOwnerSessionIds: ["session-b", "session-a", "session-a"] },
+    request(shared.outsideGit, {
+      mode: "shared_directory",
+      confirmedCwd: shared.outsideGit,
+      ownerSessionIds: ["session-b", "session-a", "session-a"],
+    }),
+    { piConfigRoot: shared.piConfigRoot, currentOwnerSessionIds: ["session-b", "session-a", "session-a"] },
   );
 
   expect(result).toMatchObject({
     mode: "shared_directory_confirmation",
-    canonicalCwd: cwd,
-    confirmedCanonicalCwd: cwd,
+    canonicalCwd: shared.outsideGit,
+    confirmedCanonicalCwd: shared.outsideGit,
     ownerSessionIds: ["session-a", "session-b"],
-    piConfigRoot,
+    piConfigRoot: shared.piConfigRoot,
   });
 });
 
 it("does not infer shared mode when worktree preflight is outside Git", async () => {
-  const parent = await mkdtemp(join(tmpdir(), "dashboard-non-repo-"));
-  temporaryPaths.push(parent);
-  const cwd = join(parent, "cwd");
-  const piConfigRoot = join(parent, "pi-config");
-  await Promise.all([mkdir(cwd), mkdir(piConfigRoot)]);
-
   await expect(
-    launchPreflight(request(cwd), { piConfigRoot }),
+    launchPreflight(request(shared.outsideGit), { piConfigRoot: shared.piConfigRoot }),
   ).rejects.toMatchObject({ code: "NOT_GIT_REPOSITORY" });
 });

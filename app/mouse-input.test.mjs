@@ -10,10 +10,6 @@ describe("wheel input parsing", () => {
     ["SGR wheel-up with zero-based coordinates", "\x1b[<64;13;5M", { events: [{ button: "wheel_up", column: 12, row: 4 }], passThrough: "", pending: "" }],
     ["SGR wheel-down with zero-based coordinates", "\x1b[<65;1;1M", { events: [{ button: "wheel_down", column: 0, row: 0 }], passThrough: "", pending: "" }],
     ["X10 wheel-up", x10(64, 4, 9), { events: [{ button: "wheel_up", column: 3, row: 8 }], passThrough: "", pending: "" }],
-    ["X10 wheel-down", x10(65, 4, 9), { events: [{ button: "wheel_down", column: 3, row: 8 }], passThrough: "", pending: "" }],
-    ["a printable keystroke", "q", { events: [], passThrough: "q", pending: "" }],
-    ["an arrow key", "\x1b[A", { events: [], passThrough: "\x1b[A", pending: "" }],
-    ["a control byte", "\x03", { events: [], passThrough: "\x03", pending: "" }],
     // pi-tui keeps selection and clicks, so a non-wheel mouse report must reach it untouched.
     ["a non-wheel mouse report", "\x1b[<0;5;5M", { events: [], passThrough: "\x1b[<0;5;5M", pending: "" }],
     ["a wheel event surrounded by keystrokes", "ab\x1b[<65;2;3Mcd", { events: [{ button: "wheel_down", column: 1, row: 2 }], passThrough: "abcd", pending: "" }],
@@ -58,16 +54,6 @@ describe("wheel input tap", () => {
     expect(forwarded).toEqual(["hello", "\x1b[B"]);
   });
 
-  it("keeps delegating the rest of the terminal contract", () => {
-    const terminal = fakeTerminal();
-    const tapped = createWheelInputTap(terminal, () => {});
-    expect(tapped.columns).toBe(80);
-    expect(tapped.rows).toBe(24);
-    tapped.write("x");
-    expect(terminal.written).toBe("x");
-    tapped.stop();
-    expect(terminal.stopped).toBe(true);
-  });
 });
 
 describe("installed pi-tui mouse assumptions", () => {

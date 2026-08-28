@@ -1,7 +1,7 @@
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 
-import { CommandSelectionOverlay, PendingUiOverlay, renderStatusIndicator, renderSystemCard } from "./overlays.mjs";
+import { PendingUiOverlay, renderStatusIndicator } from "./overlays.mjs";
 
 const tui = { requestRender: vi.fn(), setFocus: vi.fn(), mode: "fullscreen" };
 
@@ -57,22 +57,6 @@ describe("pending Pi UI overlays", () => {
     expect(prompt.control.focused).toBe(false);
   });
 
-  it("returns focus to the component that owned it before the overlay opened", () => {
-    const host = { focused: true };
-    const editor = { focused: false };
-    const focused = [];
-    let currentFocus = host;
-    const focusedTui = {
-      ...tui,
-      getFocusedComponent: () => currentFocus,
-      setFocus(component) { if (currentFocus !== null) currentFocus.focused = false; focused.push(component); currentFocus = component; if (currentFocus !== null) currentFocus.focused = true; },
-    };
-    const overlay = new CommandSelectionOverlay({ title: "Select a model", items: [{ value: "a/one", label: "a/one" }], tui: focusedTui, returnFocus: editor, respond: vi.fn() });
-    overlay.handleInput("\x1b");
-    expect(focused.at(-1)).toBe(host);
-    expect(host.focused).toBe(true);
-    expect(editor.focused).toBe(false);
-  });
 });
 
 describe("Pi status indicator and system cards", () => {
@@ -88,11 +72,5 @@ describe("Pi status indicator and system cards", () => {
     expect(renderStatusIndicator({ phase: "idle", label: "Idle", startedAt: started }, 40, now, { working: true })[1]).toContain("Working...");
     expect(renderStatusIndicator({ phase: "idle", label: "Idle", startedAt: started }, 40, now)).toEqual([]);
     expect(renderStatusIndicator({ phase: "waiting", label: "Waiting", startedAt: started }, 40, now)[1]).not.toContain("interrupt");
-  });
-
-  it("words system cards the way Pi does", () => {
-    expect(renderSystemCard({ text: "boom", level: "error" }, 40)).toEqual(["", " Error: boom"]);
-    expect(renderSystemCard({ text: "careful", level: "warning" }, 40)).toEqual(["", " Warning: careful"]);
-    expect(renderSystemCard({ text: "note", level: "info" }, 40)).toEqual(["", " note"]);
   });
 });

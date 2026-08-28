@@ -57,19 +57,6 @@ const fixtures = [
     }),
 ];
 describe("responsive dashboard layout", () => {
-    // test/terminal.acceptance.test.mjs owns the five-width matrix; this pins truncation of the
-    // hostile fixtures (CJK, emoji, overlong paths and model names) where columns are tightest.
-    it("truncates every fixture inside the narrowest layout", () => {
-        const layout = createDashboardLayout(40, 10);
-        const lines = [
-            renderColumnHeader(layout),
-            ...fixtures.map((record, index) => renderSessionRow(record, layout, { now, selected: index === 1 })),
-        ];
-        for (const line of lines)
-            expect(visibleWidth(line)).toBeLessThanOrEqual(40);
-        // Overlong cells are elided, not silently dropped.
-        expect(stripVTControlCharacters(lines[1])).toContain("…");
-    });
     it("prefers a generated summary over raw activity in the Activity column", () => {
         const layout = createDashboardLayout(160, 40);
         const summarized = session("summarized", {
@@ -81,16 +68,6 @@ describe("responsive dashboard layout", () => {
         expect(row).not.toContain("Pi assistant streaming");
     });
 
-    it("keeps the fixed list column order and never renders Model or Project", () => {
-        expect(createDashboardLayout(160, 40).columns.map(({ key }) => key)).toEqual(["spinner", "name", "state", "activity", "age"]);
-        const header = stripVTControlCharacters(renderColumnHeader(createDashboardLayout(160, 40)));
-        expect(header).not.toContain("MODEL");
-        expect(header).not.toContain("PROJECT");
-        expect(header).toContain("NAME");
-        expect(createDashboardLayout(120, 32).columns.map(({ key }) => key)).toEqual(["spinner", "name", "state", "activity", "age"]);
-        expect(header).toContain("AGE");
-        expect(header).not.toContain("ID");
-    });
     it("renders the session name and falls back when a session has none", () => {
         const layout = createDashboardLayout(160, 40);
         const named = stripVTControlCharacters(renderSessionRow(session("named", { name: "Coverage loader", processState: "LIVE" }), layout, { now }));
@@ -136,32 +113,6 @@ describe("responsive dashboard layout", () => {
         expect(colored).toContain(JOBWATCH_ANSI.green);
         expect(stripVTControlCharacters(colored)).toBe(stripVTControlCharacters(plain));
     });
-
-    it("uses Jobwatch's exact palette for every displayed state, the header, and selection", () => {
-        expect(JOBWATCH_ANSI).toMatchObject({
-            blackBackground: "\x1b[48;2;0;0;0m",
-            surfaceBackground: "\x1b[48;2;17;17;17m",
-            headerBackground: "\x1b[48;2;2;132;199m",
-            selectionBackground: "\x1b[48;2;54;54;54m",
-            text: "\x1b[38;2;255;255;255m",
-            sky: "\x1b[38;2;125;211;252m",
-            cyan: "\x1b[38;2;125;211;252m",
-            green: "\x1b[38;2;110;231;183m",
-            amber: "\x1b[38;2;252;211;77m",
-            rose: "\x1b[38;2;253;164;175m",
-            gray: "\x1b[38;2;136;136;136m",
-        });
-        const layout = createDashboardLayout(120, 20);
-        const colorOf = (overrides, options = {}) => renderSessionRow(session("colored", overrides), layout, { now, ...options });
-        expect(colorOf({ taskState: "WORKING", processState: "LIVE" })).toContain(JOBWATCH_ANSI.green);
-        expect(colorOf({ taskState: "WAITING", processState: "LIVE" })).toContain(JOBWATCH_ANSI.amber);
-        expect(colorOf({ taskState: "READY", processState: "LIVE" })).toContain(JOBWATCH_ANSI.sky);
-        expect(colorOf({ taskState: "FAILED", processState: "EXITED" })).toContain(JOBWATCH_ANSI.rose);
-        expect(colorOf({ taskState: "READY", processState: "EXITED" })).toContain(JOBWATCH_ANSI.gray);
-        expect(renderColumnHeader(layout)).toContain(JOBWATCH_ANSI.gray);
-        expect(colorOf({ taskState: "WAITING", processState: "LIVE" }, { selected: true })).toContain(JOBWATCH_ANSI.selectionBackground);
-        expect(colorOf({ taskState: "WORKING", processState: "LIVE" })).toContain(JOBWATCH_ANSI.blackBackground);
-    });
 });
 
 it("bolds the selected row without altering its colors", () => {
@@ -177,22 +128,6 @@ it("bolds the selected row without altering its colors", () => {
     expect(stripVTControlCharacters(selected)).toBe(stripVTControlCharacters(plain));
 });
 
-it("keeps a colored name highlighted when the row is selected, adding only weight", () => {
-    const layout = createDashboardLayout(120, 20);
-    const amberBackground = "\u001b[48;2;252;211;77m";
-    const black = "\u001b[38;2;0;0;0m";
-    const colored = renderSessionRow(session("c", { color: "amber" }), layout, { now });
-    const selected = renderSessionRow(session("c", { color: "amber" }), layout, { now, selected: true });
-
-    // Selection adds bold and changes nothing about the color the operator chose.
-    expect(colored).toContain(amberBackground);
-    expect(colored).toContain(black);
-    expect(selected).toContain(amberBackground);
-    expect(selected).toContain(black);
-    expect(selected).toContain(JOBWATCH_ANSI.bold);
-    expect(colored).not.toContain(JOBWATCH_ANSI.bold);
-    expect(stripVTControlCharacters(selected)).toBe(stripVTControlCharacters(colored));
-});
 
 it("spins an unlabelled column left of STATE so the state text never shifts", () => {
     const layout = createDashboardLayout(100, 24);

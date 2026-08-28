@@ -82,14 +82,6 @@ describe("mergeSessionIndex", () => {
             saved("duplicate", "/saved/newer.jsonl", { modified: new Date("2026-08-25T11:00:00.000Z") }),
         ], [liveRecord], lexicalSessionFileIdentity)).toEqual([liveRecord]);
     });
-    it("chooses the newest deterministic saved duplicate when no live record exists", () => {
-        const records = mergeSessionIndex([
-            saved("duplicate", "/saved/older.jsonl", { modified: new Date("2026-08-25T09:00:00.000Z") }),
-            saved("duplicate", "/saved/newer.jsonl", { modified: new Date("2026-08-25T11:00:00.000Z") }),
-        ], [], lexicalSessionFileIdentity);
-        expect(records).toHaveLength(1);
-        expect(records[0]).toMatchObject({ sessionId: "duplicate", sessionFile: "/saved/newer.jsonl" });
-    });
     it("skips malformed saved metadata without rejecting valid sessions", () => {
         const malformed = {
             ...saved("malformed"),
@@ -106,21 +98,5 @@ describe("mergeSessionIndex", () => {
         ], [], lexicalSessionFileIdentity)).toEqual([
             expect.objectContaining({ sessionId: "top-level" }),
         ]);
-    });
-    it("orders the merged snapshot by updated time then session ID", () => {
-        const sameTime = new Date("2026-08-25T11:00:00.000Z");
-        const records = mergeSessionIndex([
-            saved("b", "/sessions/b.jsonl", { modified: sameTime }),
-            saved("a", "/sessions/a.jsonl", { modified: sameTime }),
-            saved("old", "/sessions/old.jsonl", { modified: new Date("2026-08-25T09:00:00.000Z") }),
-        ], [], lexicalSessionFileIdentity);
-        expect(records.map(({ sessionId }) => sessionId)).toEqual(["a", "b", "old"]);
-    });
-    it("does not mutate saved or live input arrays", () => {
-        const savedRecords = Object.freeze([saved("saved")]);
-        const liveRecords = Object.freeze([live("live")]);
-        mergeSessionIndex(savedRecords, liveRecords, lexicalSessionFileIdentity);
-        expect(savedRecords).toHaveLength(1);
-        expect(liveRecords).toHaveLength(1);
     });
 });

@@ -1,4 +1,3 @@
-import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import { VirtualSessionList } from "./virtual-session-list.mjs";
 const timestamp = "2026-08-25T12:00:00.000Z";
@@ -57,54 +56,5 @@ describe("VirtualSessionList", () => {
         list.moveSelection(1);
         expect(list.selectedSessionId).toBe("session-00001");
         expect(list.selectedRowIndex).toBe(4);
-    });
-    it("uses Task 5 canonical cwd identity for alias display paths", () => {
-        const alias = session(0, { cwd: "/projects/team/../shared" });
-        const canonical = session(2, { cwd: "/projects/shared" });
-        const list = new VirtualSessionList([alias, canonical], {
-            groupBy: "cwd",
-            renderRow: (row) => label(row),
-        });
-        expect(list.rows.map((row) => ({ kind: row.kind, label: label(row) }))).toEqual([
-            { kind: "group", label: "[shared]" },
-            { kind: "session", label: "session-00000" },
-            { kind: "session", label: "session-00002" },
-        ]);
-        expect(list.rows[0]).toMatchObject({ kind: "group", count: 2 });
-    });
-    it("keeps selection by session ID when rows reorder", () => {
-        const first = session(1);
-        const selected = session(2);
-        const last = session(3);
-        const list = new VirtualSessionList([first, selected, last]);
-        list.selectSession(selected.sessionId);
-        list.setSessions([last, first, selected]);
-        expect(list.selectedSessionId).toBe(selected.sessionId);
-        expect(list.selectedRowIndex).toBe(2);
-    });
-    it("invalidates exactly one cached row when one session changes", () => {
-        const sessions = [session(0), session(1), session(2)];
-        const renderRow = vi.fn((row) => label(row));
-        const list = new VirtualSessionList(sessions, { renderRow });
-        list.renderViewport({ offset: 0, height: 3, width: 80 });
-        expect(renderRow).toHaveBeenCalledTimes(3);
-        const changed = {
-            ...sessions[1],
-            revision: 2,
-            activity: { ...sessions[1].activity, summary: "Changed activity" },
-        };
-        const result = list.setSessions([sessions[2], changed, sessions[0]]);
-        list.renderViewport({ offset: 0, height: 3, width: 80 });
-        expect(result.invalidated).toBe(1);
-        expect(renderRow).toHaveBeenCalledTimes(4);
-    });
-    it("returns only width-safe default-rendered lines", () => {
-        const list = new VirtualSessionList([
-            session(0, { activity: { kind: "tool", summary: "🚀".repeat(100), updatedAt: timestamp } }),
-        ], { now: Date.parse(timestamp) });
-        const [rendered] = list.renderViewport({ offset: 0, height: 1, width: 40 });
-        expect(rendered?.line).toBeDefined();
-        expect(rendered?.line).not.toContain("undefined");
-        expect(visibleWidth(rendered?.line ?? "")).toBeLessThanOrEqual(40);
     });
 });

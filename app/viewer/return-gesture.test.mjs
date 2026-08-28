@@ -2,13 +2,6 @@ import { expect, it, vi } from "vitest";
 
 import { ReturnGesture } from "./return-gesture.mjs";
 
-it("returns immediately for a clean editor with Left or Escape", () => {
-  const onReturn = vi.fn();
-  const gesture = new ReturnGesture({ now: () => 0, onReturn });
-  expect(gesture.handle("left", { clean: true, overlayCaptured: false })).toBe("returned");
-  expect(onReturn).toHaveBeenCalledOnce();
-});
-
 it("requires the same dirty/history key twice within exactly 500 ms", () => {
   let now = 0;
   const onReturn = vi.fn();

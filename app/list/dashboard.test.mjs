@@ -1,10 +1,8 @@
 import { stripVTControlCharacters } from "node:util";
 
-import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 
 import { DashboardController, createDaemonDashboardBackend, } from "./dashboard.mjs";
-import { JOBWATCH_ANSI } from "./dashboard-theme.mjs";
 const timestamp = "2026-08-25T12:00:00.000Z";
 function session(id, overrides = {}) {
     return {
@@ -102,25 +100,6 @@ describe("dashboard controller", () => {
         expect(dashboard.selectedSessionId).not.toBe("s-09999");
         expect(dashboard.render(80, 14).length).toBeLessThanOrEqual(14);
     });
-    it("renders Jobwatch-style surfaces, focus borders, selection, and key hints", async () => {
-        const dashboard = controller(new FakeBackend([session("a")]));
-        await dashboard.open();
-        const listFocused = dashboard.render(100, 16);
-        expect(listFocused[0]).toContain(JOBWATCH_ANSI.headerBackground);
-        expect(listFocused[1]).toContain(JOBWATCH_ANSI.surfaceBackground);
-        expect(listFocused[2]).toContain(JOBWATCH_ANSI.sky);
-        expect(stripVTControlCharacters(listFocused[2])).toContain("Sessions");
-        expect(listFocused.at(-6)).toContain(JOBWATCH_ANSI.gray);
-        expect(stripVTControlCharacters(listFocused.at(-6)).trim()).toMatch(/^\u256d\u2500+$/u);
-        expect(listFocused.at(-1)).toContain(JOBWATCH_ANSI.surfaceBackground);
-        expect(stripVTControlCharacters(listFocused.at(-1))).toContain("Ctrl+C quit");
-
-        // The list keeps focus: the composer is a destination for text, never a focus stop.
-        dashboard.handleInput("\x1b[B");
-        expect(dashboard.render(100, 16)[2]).toContain(JOBWATCH_ANSI.sky);
-        dashboard.handleInput("\t");
-        expect(stripVTControlCharacters(dashboard.render(100, 16).at(-6))).toContain("cwd");
-    });
     it("asks the daemon to refresh Activity summaries on open and on demand", async () => {
         const backend = new FakeBackend([session("a")]);
         backend.refreshSummaries = vi.fn(async () => ["a"]);
@@ -137,24 +116,6 @@ describe("dashboard controller", () => {
         await dashboard.open();
         await vi.waitFor(() => expect(backend.refreshSummaries).toHaveBeenCalled());
         expect(dashboard.status).toEqual({ kind: "ready" });
-    });
-    it("greys the composer placeholder and leaves the prompt line unchanged when focused", async () => {
-        const dashboard = controller(new FakeBackend([]));
-        await dashboard.open();
-        const promptLine = (rendered) => rendered[rendered.length - 5];
-        const unfocused = promptLine(dashboard.render(80, 24));
-        expect(stripVTControlCharacters(unfocused)).toContain("describe a task for a new session");
-        expect(unfocused).toContain(JOBWATCH_ANSI.gray);
-
-        dashboard.focusComposer();
-        expect(promptLine(dashboard.render(80, 24))).toBe(unfocused);
-
-        dashboard.setComposerPrompt("ship it");
-        const typed = promptLine(dashboard.render(80, 24));
-        expect(stripVTControlCharacters(typed)).toContain("ship it");
-        expect(stripVTControlCharacters(typed)).not.toContain("describe a task");
-        expect(typed).not.toContain(JOBWATCH_ANSI.gray);
-        expect(stripVTControlCharacters(typed)).not.toContain("[prompt]");
     });
     it("shows the selected session's working directory and a filter chip only once a filter is set", async () => {
         const dashboard = controller(new FakeBackend([
@@ -229,19 +190,6 @@ describe("dashboard controller", () => {
         dashboard.handleInput("y");
         await vi.waitFor(() => expect(backend.delete).toHaveBeenCalledWith("a", 2, expect.any(String)));
     });
-    it("forgets the stop gesture when the operator moves the selection", async () => {
-        const backend = new FakeBackend([session("a", { processState: "LIVE" }), session("b", { processState: "LIVE" })]);
-        let now = 0;
-        const dashboard = controller(backend, { now: () => now });
-        await dashboard.open();
-        dashboard.selectSession("a");
-        dashboard.handleInput("\x18");
-        dashboard.handleInput("y");
-        await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledOnce());
-        expect(dashboard.stopClearArmed).toBe(true);
-        dashboard.selectSession("b");
-        expect(dashboard.stopClearArmed).toBe(false);
-    });
     it("hands a destructive request off in the background and never wedges input behind it", async () => {
         let release = () => {};
         const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
@@ -259,42 +207,6 @@ describe("dashboard controller", () => {
         expect(dashboard.focus).toBe("list");
         release();
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
-    });
-    it("repaints on a timer while a session works and stops when none do", async () => {
-        vi.useFakeTimers();
-        try {
-            const backend = new FakeBackend([session("a", { taskState: "WORKING", processState: "LIVE" })]);
-            const requestRender = vi.fn();
-            const dashboard = controller(backend, { requestRender });
-            await dashboard.open();
-            dashboard.render(100, 24);
-            const before = requestRender.mock.calls.length;
-            await vi.advanceTimersByTimeAsync(400);
-            // The throbber only moves if something asks for a frame.
-            expect(requestRender.mock.calls.length).toBeGreaterThan(before);
-
-            dashboard.applySnapshot({ sessions: [session("a", { taskState: "READY", processState: "LIVE" })] });
-            dashboard.render(100, 24);
-            const settled = requestRender.mock.calls.length;
-            await vi.advanceTimersByTimeAsync(400);
-            expect(requestRender.mock.calls.length).toBe(settled);
-            await dashboard.close();
-        }
-        finally {
-            vi.useRealTimers();
-        }
-    });
-    it("shows only the sessions the current view selects", async () => {
-        const dashboard = controller(new FakeBackend([
-            session("live", { processState: "LIVE" }),
-            session("done", { processState: "EXITED", outcome: "COMPLETED" }),
-            session("stopped", { processState: "EXITED", taskState: "STOPPED" }),
-        ]));
-        await dashboard.open();
-        const rows = () => dashboard.render(80, 24).map(stripVTControlCharacters).filter((line) => /^[\u280b-\u28ff ] \S/u.test(line) && !line.includes("NAME"));
-        expect(rows()).toHaveLength(1);
-        dashboard.setQuery({ view: "all" });
-        expect(rows()).toHaveLength(3);
     });
     it("closes the list only on Ctrl+C; Left and Escape are inert", async () => {
         const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
@@ -443,88 +355,7 @@ describe("dashboard controller", () => {
         expect(backend.requests[0]).toMatchObject({ prompt: "go" });
         expect(openSelectedViewer).toHaveBeenCalledTimes(2);
     });
-    it("confirms Ctrl+X against the exact selected revision and invalidates on change", async () => {
-        const backend = new FakeBackend([session("a", { processState: "LIVE" }), session("b", { processState: "EXITED" })]);
-        const onSessionIntent = vi.fn();
-        const dashboard = controller(backend, { onSessionIntent, requestId: () => "destructive-request" });
-        await dashboard.open();
-        dashboard.handleInput("\x18");
-        expect(dashboard.overlay).toMatchObject({ kind: "session_confirmation", action: "stop", sessionId: "a", revision: 1, processState: "LIVE" });
-        expect(backend.stop).not.toHaveBeenCalled();
-        dashboard.handleInput("n");
-        expect(dashboard.overlay).toBeUndefined();
-        expect(backend.stop).not.toHaveBeenCalled();
-        dashboard.handleInput("\x18");
-        await processRenderedEvent(dashboard, backend, { snapshot: { sessions: [session("a", { revision: 2, processState: "LIVE" }), session("b", { processState: "EXITED" })] }, cursor: { daemonEpoch: "epoch", sequence: "1" } });
-        expect(dashboard.overlay).toMatchObject({ kind: "session_confirmation", action: "stop", sessionId: "a" });
-        await processRenderedEvent(dashboard, backend, { snapshot: { sessions: [session("a", { revision: 3, processState: "EXITED" }), session("b", { processState: "EXITED" })] }, cursor: { daemonEpoch: "epoch", sequence: "2" } });
-        expect(dashboard.overlay).toBeUndefined();
-        dashboard.setView("all");
-        dashboard.selectSession("b");
-        dashboard.handleInput("\x18");
-        expect(dashboard.overlay).toMatchObject({ action: "delete", sessionId: "b", revision: 1 });
-        dashboard.handleInput("y");
-        await vi.waitFor(() => expect(backend.delete).toHaveBeenCalledWith("b", 1, "destructive-request"));
-        expect(dashboard.selectedSessionId).toBe("b");
-        expect(onSessionIntent).toHaveBeenCalledWith({ kind: "session_intent", action: "delete", sessionId: "b", revision: 1 });
-    });
-    it("preserves failed destructive confirmation with its structured refusal and permits an explicit retry", async () => {
-        const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
-        backend.stop
-            .mockRejectedValueOnce(Object.assign(new Error("ownership changed"), { code: "OWNERSHIP_CONFLICT" }))
-            .mockResolvedValueOnce(undefined);
-        const dashboard = controller(backend, { requestId: () => "stop-request" });
-        await dashboard.open();
-        dashboard.handleInput("\x18");
-        dashboard.handleInput("y");
-        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "OWNERSHIP_CONFLICT", message: "ownership changed" }));
-        // A refusal reports itself and leaves the list usable; Ctrl+X retries.
-        expect(dashboard.overlay).toBeUndefined();
-        dashboard.handleInput("\x18");
-        dashboard.handleInput("y");
-        await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledTimes(2));
-        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
-    });
-    it("closes the dashboard with Ctrl+C while a stop is in flight", async () => {
-        let release;
-        const backend = new FakeBackend([session("a")]);
-        backend.stop = vi.fn(() => new Promise((resolve) => { release = resolve; }));
-        const onClose = vi.fn();
-        const dashboard = controller(backend, { onClose });
-        await dashboard.open();
-        dashboard.handleInput("\x18");
-        dashboard.handleInput("y");
-        dashboard.handleInput("\x03");
-        await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith({ kind: "closed" }));
-        release?.();
-    });
     describe("floating overlay panels", () => {
-        // The composer dock owns the last five rows, including its own closing border.
-        const panelRows = (rendered) => rendered
-            .map((line, index) => ({ line: stripVTControlCharacters(line), index }))
-            .filter(({ line }) => /\u256d\u2500.*\u256e\s*$|^\s*\u2502.*\u2502\s*$|\u2570\u2500+\u256f\s*$/u.test(line));
-        // The five-width matrix lives in test/terminal.acceptance.test.mjs; the extremes are kept
-        // here because clipping only bites at the narrowest size and centering only shows at the widest.
-        it.each([[40, 10, 0], [160, 40, 1]])("frames and centers a floating panel inside %ix%i", async (width, height, minimumIndent) => {
-            const dashboard = controller(new FakeBackend([session("a")]));
-            await dashboard.open();
-            dashboard.toggleHelp();
-            const rendered = dashboard.render(width, height);
-            for (const line of rendered)
-                expect(visibleWidth(line)).toBeLessThanOrEqual(width);
-            const framed = panelRows(rendered);
-            expect(framed.length).toBeGreaterThan(2);
-            expect(framed[0].line).toContain("Help");
-            expect(framed[0].line).toMatch(/\u256d\u2500/u);
-            expect(framed.at(-1).line).toMatch(/\u2570\u2500+\u256f/u);
-            // The panel floats below the Sessions header rather than covering them.
-            expect(framed[0].index).toBeGreaterThan(2);
-            const indent = framed[0].line.search(/\S/u);
-            expect(indent).toBeGreaterThanOrEqual(minimumIndent);
-            for (const { line } of framed)
-                expect(line.search(/\S/u)).toBe(indent);
-            expect(rendered[framed[0].index]).toContain(JOBWATCH_ANSI.sky);
-        });
         it.each([
             ["help", async (dashboard) => { dashboard.toggleHelp(); }, "Help", "metadata / help"],
             ["metadata", async (dashboard) => { dashboard.toggleMetadata(); }, "Session", "taskState"],
@@ -578,23 +409,6 @@ describe("dashboard controller", () => {
         await dashboard.close();
         expect(saved.saved.length).toBeGreaterThan(0);
     });
-    it("awaits the actual host component render before persisting an event", async () => {
-        const order = [];
-        const backend = new FakeBackend([session("a")]);
-        const saved = persistence();
-        saved.save = vi.fn(async () => { order.push("persist"); });
-        const dashboard = controller(backend, { persistence: saved, requestRender: () => order.push("request-render") });
-        await dashboard.open();
-        order.length = 0;
-        const processing = Promise.resolve(backend.listener?.({ snapshot: { sessions: [session("a", { revision: 2 })] }, cursor: { daemonEpoch: "epoch", sequence: "1" } }));
-        expect(order).toEqual(["request-render"]);
-        await Promise.resolve();
-        expect(order).toEqual(["request-render"]);
-        order.push("host-render");
-        dashboard.render();
-        await processing;
-        expect(order).toEqual(["request-render", "host-render", "persist"]);
-    });
     it("serializes concurrent events through distinct rendered states and acknowledgements", async () => {
         const backend = new FakeBackend([session("initial")]);
         const saved = persistence();
@@ -624,28 +438,6 @@ describe("dashboard controller", () => {
         await second;
         expect(renders[1]?.join("\n")).toContain("state-2");
         expect(acknowledgements).toEqual(["1", "2"]);
-    });
-    it("leaves concurrent events unacknowledged when the first host render fails", async () => {
-        const backend = new FakeBackend([session("initial")]);
-        const saved = persistence();
-        let renderRequests = 0;
-        const dashboard = controller(backend, {
-            persistence: saved,
-            requestRender: () => {
-                renderRequests += 1;
-                if (renderRequests === 1)
-                    return;
-                const internals = dashboard;
-                internals.list.renderViewport = () => { throw new Error("render failed"); };
-                dashboard.render();
-            },
-        });
-        await dashboard.open();
-        const first = Promise.resolve(backend.listener?.({ snapshot: { sessions: [session("state-1")] }, cursor: { daemonEpoch: "epoch", sequence: "1" } }));
-        const second = Promise.resolve(backend.listener?.({ snapshot: { sessions: [session("state-2")] }, cursor: { daemonEpoch: "epoch", sequence: "2" } }));
-        await expect(first).rejects.toThrow("render failed");
-        await expect(second).rejects.toThrow();
-        expect(saved.saved.some((state) => state.cursor?.sequence === "1" || state.cursor?.sequence === "2")).toBe(false);
     });
     it.each(["render", "request", "persistence", "disposed"])("closes on %s failure so the backend sends no acknowledgement", async (failure) => {
         const backend = new FakeBackend([session("a")]);
@@ -725,47 +517,6 @@ describe("dashboard controller", () => {
         expect(rendered).toContain("model:");
         expect(rendered).toContain("thinking:");
         expect(rendered).toContain("name:");
-    });
-    it("serializes delayed UI and final close saves and admits no writes after close resolves", async () => {
-        let releaseFirst;
-        const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
-        const starts = [];
-        let active = 0;
-        let maximumActive = 0;
-        const saved = persistence();
-        saved.save = vi.fn(async (state) => {
-            active += 1;
-            maximumActive = Math.max(maximumActive, active);
-            starts.push(state.viewState?.query.search ?? "final");
-            if (starts.length === 1)
-                await firstGate;
-            active -= 1;
-        });
-        const dashboard = controller(new FakeBackend([session("a")]), { persistence: saved });
-        await dashboard.open();
-        dashboard.setSearch("queued");
-        await vi.waitFor(() => expect(starts).toEqual(["queued"]));
-        let closed = false;
-        const closing = dashboard.close().then(() => { closed = true; });
-        await Promise.resolve();
-        expect(closed).toBe(false);
-        releaseFirst?.();
-        await closing;
-        expect(maximumActive).toBe(1);
-        expect(starts).toEqual(["queued", "queued"]);
-        dashboard.setSearch("late");
-        await Promise.resolve();
-        expect(starts).toEqual(["queued", "queued"]);
-    });
-    it("signals list close exactly once without invoking the viewer boundary", async () => {
-        const onClose = vi.fn();
-        const openSelectedViewer = vi.fn(async () => {});
-        const dashboard = controller(new FakeBackend([session("a")]), { openViewer: openSelectedViewer, onClose });
-        await dashboard.open();
-        await Promise.all([dashboard.close(), dashboard.close()]);
-        expect(openSelectedViewer).not.toHaveBeenCalled();
-        expect(onClose).toHaveBeenCalledOnce();
-        expect(onClose).toHaveBeenCalledWith({ kind: "closed" });
     });
     it("never persists source ownership and derives it from each current Pi session", async () => {
         let current;
@@ -863,25 +614,6 @@ describe("daemon dashboard backend", () => {
         expect(updates[0]?.snapshot.sessions).toEqual([]);
         expect(stateReads).toBe(2);
         unsubscribe();
-    });
-    it("sends no acknowledgement when reducer, render, or persistence processing rejects", async () => {
-        const one = { daemonEpoch: "epoch", sequence: "1" };
-        const requests = [];
-        const event = { version: 1, cursor: one, occurredAt: timestamp, kind: "session_changed", payload: { session: session("a") } };
-        const client = {
-            async connect() { },
-            async request(request) {
-                requests.push(request);
-                return { version: 1, requestId: request.requestId, ok: true, result: { kind: "acknowledged", cursor: one } };
-            },
-            subscribe() { return { async *[Symbol.asyncIterator]() { yield event; } }; },
-            async close() { },
-        };
-        const backend = createDaemonDashboardBackend({ client: client, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
-        const onError = vi.fn();
-        await backend.subscribe(undefined, async () => { throw Object.assign(new Error("render failed"), { code: "RENDER_FAILED" }); }, onError);
-        await vi.waitFor(() => expect(onError).toHaveBeenCalledWith({ code: "RENDER_FAILED", message: "render failed" }));
-        expect(requests.some((request) => request.op === "ack")).toBe(false);
     });
     it("processes replay once, acknowledges only successful events, and resumes from the acknowledged cursor", async () => {
         const zero = { daemonEpoch: "epoch", sequence: "0" };

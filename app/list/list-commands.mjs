@@ -11,6 +11,14 @@ export const LIST_COMMAND_MENU = [
     { name: "/help", argumentHint: "", summary: "the dashboard's keys and commands" },
 ];
 export const LIST_COMMANDS = LIST_COMMAND_MENU.map((command) => command.name);
+/**
+ * Pi's own thinking scale, in its off-to-max order, exactly as `pi --thinking <level>` accepts it.
+ * Pi names the levels only in its help text and over a live session's RPC, so the list carries them
+ * rather than parsing prose on the path an operator uses. It is not a validator: a level typed in
+ * full is passed through and Pi refuses it at launch. The canary at the end of list-commands.test.mjs
+ * re-reads `pi --help` and fails when the installed Pi's levels stop matching.
+ */
+export const PI_THINKING_LEVELS = Object.freeze(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 export const EMPTY_DRAFT_CHOICES = Object.freeze({ models: Object.freeze([]), thinkingLevels: Object.freeze([]) });
 
 const ISOLATION_MODES = { worktree: "worktree", shared: "shared_directory", shared_directory: "shared_directory" };
@@ -67,7 +75,9 @@ export function draftChoices(draft, sessions, defaults, catalog = []) {
         const model = modelValue(entry);
         if (model !== undefined) models.add(model);
     }
-    return { models: [...models].sort(), thinkingLevels: [...thinkingLevels].sort() };
+    // Thinking reads as a scale, so Pi's own order beats alphabetical; anything unnamed follows it.
+    const unnamed = [...thinkingLevels].filter((level) => !PI_THINKING_LEVELS.includes(level)).sort();
+    return { models: [...models].sort(), thinkingLevels: [...PI_THINKING_LEVELS, ...unnamed] };
 }
 
 /** @param {string} code @param {string} message @returns {{kind:"rejected",code:string,message:string}} */

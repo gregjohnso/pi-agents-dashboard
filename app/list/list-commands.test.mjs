@@ -1,6 +1,9 @@
+import { spawn } from "node:child_process";
+
 import { describe, expect, it } from "vitest";
 
-import { LIST_COMMANDS, commandName, draftChoices, matchingListCommands, parseListCommand } from "./list-commands.mjs";
+import { resolvePiExecutable } from "../../runtime/pi-executable.mjs";
+import { LIST_COMMANDS, PI_THINKING_LEVELS, commandName, draftChoices, matchingListCommands, parseListCommand } from "./list-commands.mjs";
 
 const choices = { models: ["anthropic/claude", "google/gemini"], thinkingLevels: ["off", "high"] };
 const unknown = { models: [], thinkingLevels: [] };
@@ -34,9 +37,11 @@ describe("list slash commands", () => {
         expect(parseListCommand("/model", { ...unknown, models: ["anthropic/claude"] })).toEqual({ kind: "pick_model" });
         expect(parseListCommand("/thinking", unknown)).toMatchObject({ kind: "rejected", code: "THINKING_CHOICES_UNKNOWN", message: expect.stringContaining("/thinking") });
     });
-    it("sets any typed thinking level", () => {
+    it("sets any typed thinking level, including one the scale does not name", () => {
         expect(parseListCommand("/thinking high", choices)).toEqual({ kind: "set_thinking", level: "high" });
         expect(parseListCommand("/thinking xhigh", choices)).toEqual({ kind: "set_thinking", level: "xhigh" });
+        // The scale is what the picker offers, not a validator: Pi refuses an unknown level at launch.
+        expect(parseListCommand("/thinking ludicrous", choices)).toEqual({ kind: "set_thinking", level: "ludicrous" });
     });
     it("carries a working directory through for the caller to check", () => {
         expect(parseListCommand("/cwd /repo/alpha", choices)).toEqual({ kind: "set_cwd", path: "/repo/alpha" });
@@ -75,9 +80,13 @@ describe("list slash commands", () => {
         const defaults = { model: { provider: "openai", id: "gpt" }, thinkingLevel: "low" };
         expect(draftChoices(draft, sessions, defaults)).toEqual({
             models: ["anthropic/claude", "anthropic/opus", "google/gemini", "openai/gpt"],
-            thinkingLevels: ["high", "low", "max", "off"],
+            thinkingLevels: [...PI_THINKING_LEVELS],
         });
-        expect(draftChoices({ model: { provider: "", id: "" }, thinkingLevel: "" }, [], undefined)).toEqual({ models: [], thinkingLevels: [] });
+        expect(draftChoices({ model: { provider: "", id: "" }, thinkingLevel: "" }, [], undefined)).toEqual({ models: [], thinkingLevels: [...PI_THINKING_LEVELS] });
+    });
+    it("offers Pi's whole thinking scale in its own order, plus any level seen that it does not name", () => {
+        const seen = draftChoices({ model: { provider: "", id: "" }, thinkingLevel: "ludicrous" }, [{ thinkingLevel: "high" }], undefined);
+        expect(seen.thinkingLevels).toEqual([...PI_THINKING_LEVELS, "ludicrous"]);
     });
     it("offers Pi's own catalog alongside what the frontend has seen, without duplicating either", () => {
         const catalog = [{ provider: "openai", id: "gpt-6", thinking: true }, { provider: "anthropic", id: "claude", thinking: true }, { provider: "", id: "", thinking: false }];
@@ -93,5 +102,29 @@ describe("list slash commands", () => {
         expect(rejected.message).toContain("Listing Pi models timed out");
         expect(rejected.message).toContain("/model provider/id");
         expect(parseListCommand("/model openai/gpt-6", unavailable)).toEqual({ kind: "set_model", model: { provider: "openai", id: "gpt-6" } });
+    });
+});
+
+/** Read `pi --help`. It runs no inference, opens no session, and writes nothing. @param {string} executable */
+async function piHelp(executable) {
+    return new Promise((resolve, reject) => {
+        const child = spawn(executable, ["--help"], { stdio: ["ignore", "pipe", "pipe"], shell: false });
+        let stdout = "";
+        child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+        child.once("error", reject);
+        child.once("exit", (code) => { if (code === 0) resolve(stdout); else reject(new Error(`pi --help exited ${code}`)); });
+    });
+}
+
+describe("installed pi thinking scale", () => {
+    const upgradeNotice = "The installed pi no longer names exactly the thinking levels PI_THINKING_LEVELS lists in app/list/list-commands.mjs, verified against pi 0.84.3. Update the constant to Pi's own off-to-max order; do not invent one.";
+
+    it("still names exactly the levels the list offers, in Pi's own order", async () => {
+        // No skip when pi is missing: a canary that quietly stops running stops being a canary.
+        const executable = await resolvePiExecutable({ pathEnv: process.env.PATH ?? "" });
+        const line = (await piHelp(executable.realpath)).split("\n").find((row) => row.trimStart().startsWith("--thinking"));
+        expect(line, upgradeNotice).toBeDefined();
+        const levels = String(line).slice(String(line).indexOf(":") + 1).split(",").map((level) => level.trim()).filter((level) => level !== "");
+        expect(levels, upgradeNotice).toEqual([...PI_THINKING_LEVELS]);
     });
 });

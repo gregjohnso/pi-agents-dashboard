@@ -288,6 +288,38 @@ describe("dashboard controller", () => {
         release();
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
     });
+    it("coalesces cursor saves across a burst of events and flushes on close", async () => {
+        // Each save fsyncs the file and its directory, about 70ms on a network home, so one save per
+        // event stalls the list while an agent streams.
+        const backend = new FakeBackend([session("a")]);
+        const saves = [];
+        const dashboard = controller(backend, { persistence: { async load() { return undefined; }, async save(value) { saves.push(value.cursor?.sequence); } } });
+        await dashboard.open();
+        const before = saves.length;
+        const burst = [1, 2, 3, 4, 5].map((sequence) => Promise.resolve(backend.listener?.({
+            snapshot: { sessions: [session("a", { revision: sequence })] },
+            cursor: { daemonEpoch: "epoch", sequence: String(sequence) },
+        })));
+        // Each queued event waits for a host render, so keep rendering while the burst drains.
+        const ticker = setInterval(() => dashboard.render(), 5);
+        try { await Promise.all(burst); } finally { clearInterval(ticker); }
+        expect(saves.length - before).toBeLessThan(5);
+        await dashboard.close();
+        // Whatever was coalesced is durable once the dashboard has closed.
+        expect(saves.at(-1)).toBe("5");
+    });
+    it("drops the pending row when the launch request throws", async () => {
+        const backend = new FakeBackend([]);
+        backend.launch = vi.fn(async () => { throw Object.assign(new Error("socket closed"), { code: "DAEMON_UNAVAILABLE" }); });
+        const dashboard = controller(backend);
+        await dashboard.open();
+        for (const character of "ship it") dashboard.handleInput(character);
+        dashboard.handleInput("\r");
+        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error" }));
+        // A thrown launch must not leave a STARTING row that never resolves.
+        expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("STARTING"))).toBe(false);
+        expect(dashboard.composerDraft.prompt).toBe("ship it");
+    });
     it("restores the draft and drops the pending row when a launch fails", async () => {
         const backend = new FakeBackend([]);
         backend.launch = vi.fn(async () => ({ kind: "error", error: { code: "LAUNCH_UNAVAILABLE", message: "no worker slots" } }));
@@ -434,10 +466,10 @@ describe("dashboard controller", () => {
         expect(renders).toHaveLength(2);
         expect(renders[0]?.join("\n")).toContain("state-1");
         expect(renders[0]?.join("\n")).not.toContain("state-2");
-        expect(acknowledgements).toEqual(["1"]);
         await second;
         expect(renders[1]?.join("\n")).toContain("state-2");
-        expect(acknowledgements).toEqual(["1", "2"]);
+        // Cursors advance monotonically, so a burst persists once and the newest cursor covers the rest.
+        expect(acknowledgements).toEqual(["2"]);
     });
     it.each(["render", "request", "persistence", "disposed"])("closes on %s failure so the backend sends no acknowledgement", async (failure) => {
         const backend = new FakeBackend([session("a")]);

@@ -938,9 +938,16 @@ export class DashboardController {
         this.pendingLaunches = [...this.pendingLaunches, pending];
         this.rebuildList();
         this.requestRender?.();
-        const outcome = await this.backend.launch(request, this.requestId());
-        this.pendingLaunches = this.pendingLaunches.filter((entry) => entry !== pending);
-        this.rebuildList();
+        let outcome;
+        try {
+            outcome = await this.backend.launch(request, this.requestId());
+        }
+        finally {
+            // Always retire the placeholder: a throw used to leave a STARTING row that never resolved.
+            this.pendingLaunches = this.pendingLaunches.filter((entry) => entry !== pending);
+            this.rebuildList();
+            this.requestRender?.();
+        }
         if (outcome.kind === "launched") {
             this.scheduleUiSave();
             this.requestRender?.();
@@ -986,10 +993,15 @@ export class DashboardController {
             await this.awaitHostRender();
             if (!this.isCurrentOpen(generation))
                 throw Object.assign(new Error("Dashboard is closed"), { code: "DASHBOARD_CLOSED" });
-            await this.enqueueSave(this.persistedState(update.cursor));
-            if (!this.isCurrentOpen(generation))
-                throw Object.assign(new Error("Dashboard is closed"), { code: "DASHBOARD_CLOSED" });
+            // Each save fsyncs the file and its directory, which costs ~70ms on a network home. Events
+            // arrive in bursts while an agent streams, so coalesce: a snapshot is complete state, and a
+            // cursor that lags by one burst only replays events this dashboard has already applied.
             this.cursor = update.cursor;
+            // One save per burst. Cursors advance monotonically, so a later event's save also makes this
+            // one durable; only the last event in the queue pays the fsync, and it still pays it before
+            // its acknowledgement. Saving per event costs ~70ms each on a network home.
+            if (this.eventOperations.size <= 1)
+                await this.flushCursorSave();
         }
         catch (error) {
             const typed = this.typedError(error, "EVENT_PROCESSING_FAILED");
@@ -1062,6 +1074,10 @@ export class DashboardController {
             launchDraft: { ...launchDraft, model: { ...launchDraft.model } },
         };
     }
+    /** Persist the newest applied cursor. Callers await it, so acknowledgement still follows persistence. */
+    flushCursorSave() {
+        return this.enqueueSave(this.persistedState(this.cursor));
+    }
     enqueueSave(state) {
         const operation = this.saveTail.then(() => this.persistence.save(state));
         this.saveTail = operation.then(() => { }, (error) => { this.saveFailure ??= error; });
@@ -1099,6 +1115,7 @@ export class DashboardController {
     }
     async finishClose(initialError) {
         let error = initialError;
+        await this.flushCursorSave().catch(() => { });
         await Promise.allSettled([...this.eventOperations]);
         await this.saveTail;
         if (error === undefined && this.saveFailure !== undefined)

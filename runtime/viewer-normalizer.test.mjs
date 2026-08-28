@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import { parseViewerEvent, parseViewerSnapshot } from "../shared/viewer-contracts.mjs";
-import { ViewerNormalizerError, createViewerNormalizer } from "./viewer-normalizer.mjs";
+import { createJsonlEncoder } from "./jsonl.mjs";
+import { SNAPSHOT_TRUNCATED_ITEM_ID, ViewerNormalizerError, createViewerNormalizer } from "./viewer-normalizer.mjs";
+
+// The daemon and every frontend frame the control socket at this bound (runtime/daemon.mjs).
+const WIRE_FRAME_BYTES = 1024 * 1024;
 
 const AT = "2026-08-25T00:00:00.000Z";
 const position = (/** @type {number} */ line) => ({ line, byteStart: line * 100, byteEnd: line * 100 + 99, sourceId: `source-${line}` });
@@ -253,6 +257,27 @@ describe("viewer normalizer", () => {
       { kind: "unknown_pi_event", piType: "extension_ui_request", summary: "Unsupported Pi UI method (teleport)" },
     ]);
     assertPayloads(events);
+  });
+
+  it("keeps a long session's snapshot inside one wire frame and says what it left out", () => {
+    const subject = normalizer();
+    for (let index = 0; index < 64; index += 1) {
+      subject.applyViewerEvent({ version: 1, sessionId: "session-1", eventId: `event-${index}`, cursor: { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: String(index + 1) }, timestamp: AT, payload: { kind: "assistant_message", itemId: `answer-${index}`, content: [{ type: "text", text: "x".repeat(60_000) }] } });
+    }
+    const snapshot = subject.snapshot({ daemonEpoch: "epoch-1", sequence: "64", registryRevision: 1, runtime: null, role: "composer", taskState: "READY", processState: "LIVE", outcome: "NONE" });
+
+    expect(() => parseViewerSnapshot(snapshot)).not.toThrow();
+    expect(() => createJsonlEncoder({ maxBytes: WIRE_FRAME_BYTES }).encode({ version: 1, requestId: "r", ok: true, result: { kind: "viewer_snapshot", snapshot } })).not.toThrow();
+    expect(snapshot.items.at(-1)).toMatchObject({ itemId: "answer-63" });
+    expect(snapshot.items[0]).toMatchObject({ kind: "system_message", itemId: SNAPSHOT_TRUNCATED_ITEM_ID, level: "info" });
+    expect(snapshot.items.length).toBeLessThan(64);
+
+    // A trimmed snapshot restores as the window it carries, without the marker becoming a transcript card.
+    const restored = normalizer();
+    restored.restore(snapshot);
+    const republished = restored.snapshot({ daemonEpoch: "epoch-1", sequence: "64", registryRevision: 1, runtime: null, role: "composer", taskState: "READY", processState: "LIVE", outcome: "NONE" });
+    expect(republished.items.some((/** @type {any} */ item) => item.itemId === SNAPSHOT_TRUNCATED_ITEM_ID)).toBe(false);
+    expect(republished.items.at(-1)).toMatchObject({ itemId: "answer-63" });
   });
 
   it("bounds unknown optional events and reports malformed required shapes as typed session errors", () => {

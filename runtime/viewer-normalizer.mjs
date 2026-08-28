@@ -4,6 +4,17 @@ import { basename } from "node:path";
 const MAX_CANONICAL_ID_BYTES = 65_536;
 const MAX_SUMMARY_BYTES = 4_096;
 const MAX_TEXT_BYTES = 65_536;
+/**
+ * Half of the 1 MiB control-socket frame bound the daemon and every frontend enforce
+ * (`DEFAULT_MAX_BYTES`, runtime/daemon.mjs). A snapshot is one frame, and a session's transcript
+ * grows without limit, so the newest items are kept within this budget and older ones are left to
+ * the durable event stream and the canonical session file. The remaining half absorbs the response
+ * envelope and the runtime block, so no amount of use can make a session's snapshot unsendable.
+ */
+const MAX_SNAPSHOT_BYTES = 512 * 1024;
+
+/** The synthetic head item that tells a viewer its snapshot starts mid-transcript. */
+export const SNAPSHOT_TRUNCATED_ITEM_ID = "viewer-snapshot-truncated";
 const DIALOG_METHODS = new Set(["confirm", "select", "input", "editor"]);
 /**
  * The `extension_ui_request` methods Pi 0.84.3's RPC mode fires without waiting for a response
@@ -509,7 +520,10 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
   function restore(restored) {
     if (restored?.sessionId !== sessionId) incompatible("VIEWER_SESSION_MISMATCH", "Viewer snapshot does not match the normalizer session");
     items.clear(); tools.clear(); pendingUi.clear(); errors.splice(0);
-    for (const item of restored.items) items.set(item.itemId ?? item.attachment?.id ?? deterministicId("restored-item", item), item);
+    for (const item of restored.items) {
+      if (item.itemId === SNAPSHOT_TRUNCATED_ITEM_ID) continue;
+      items.set(item.itemId ?? item.attachment?.id ?? deterministicId("restored-item", item), item);
+    }
     for (const tool of restored.tools) noteTool(tool);
     for (const request of restored.pendingUi) pendingUi.set(request.id, request);
     errors.push(...restored.errors);
@@ -531,10 +545,39 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     if (!errors.some((current) => canonical(current) === canonical(candidate))) errors.push(candidate);
   }
 
+  /**
+   * Take the newest items that fit `MAX_SNAPSHOT_BYTES`, with each tool item's tool counted against
+   * the same budget, and head the window with one marker when anything was left out.
+   * @param {number} available
+   */
+  function boundedWindow(available) {
+    const ordered = [...items.values()].filter((item) => item.itemId !== SNAPSHOT_TRUNCATED_ITEM_ID);
+    /** @type {any[]} */
+    const window = [];
+    /** @type {any[]} */
+    const windowTools = [];
+    let remaining = available;
+    let index = ordered.length - 1;
+    for (; index >= 0; index -= 1) {
+      const item = ordered[index];
+      const itemTool = item.kind === "tool" ? tools.get(item.toolId) : undefined;
+      const cost = Buffer.byteLength(JSON.stringify(item)) + (itemTool === undefined ? 0 : Buffer.byteLength(JSON.stringify(itemTool))) + 2;
+      if (cost > remaining && window.length > 0) break;
+      remaining -= cost;
+      window.push(item);
+      if (itemTool !== undefined) windowTools.push(itemTool);
+    }
+    window.reverse();
+    windowTools.reverse();
+    const dropped = index + 1;
+    if (dropped > 0) window.unshift({ kind: "system_message", itemId: SNAPSHOT_TRUNCATED_ITEM_ID, text: `${dropped} earlier transcript ${dropped === 1 ? "entry is" : "entries are"} older than this snapshot's window and are not shown.`, level: "info" });
+    return { items: window, tools: windowTools };
+  }
+
   /** @param {any} runtimeState */
   function snapshot(runtimeState) {
     const cursor = { daemonEpoch: runtimeState.daemonEpoch, sessionId, sequence: runtimeState.sequence };
-    return {
+    const state = {
       version: 1,
       sessionId,
       registryRevision: runtimeState.registryRevision,
@@ -547,11 +590,12 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       activity,
       model: model ?? runtimeState.model ?? null,
       thinkingLevel: thinkingLevel ?? runtimeState.thinkingLevel ?? null,
-      items: [...items.values()],
-      tools: [...tools.values()],
+      items: /** @type {any[]} */ ([]),
+      tools: /** @type {any[]} */ ([]),
       pendingUi: [...pendingUi.values()],
       errors: [...errors],
     };
+    return { ...state, ...boundedWindow(MAX_SNAPSHOT_BYTES - Buffer.byteLength(JSON.stringify(state))) };
   }
 
   return { consumeHistory, consumeFrame, applyViewerEvent, restore, checkpoint, restoreCheckpoint, consumeError, snapshot };

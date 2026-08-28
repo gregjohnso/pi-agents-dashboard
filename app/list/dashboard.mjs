@@ -1172,6 +1172,11 @@ export class DashboardController {
         if (overlay === undefined || lines.length === 0)
             return;
         const layout = createDashboardLayout(this.width, this.height);
+        // Commands and their values read like Pi's own completion list: flush above the prompt, no frame.
+        if (overlay.kind === "command_menu" || overlay.kind === "choice") {
+            this.renderInlineMenu(lines, overlay, layout);
+            return;
+        }
         const described = describeOverlay(overlay, { confirmationText: this.confirmationText, choiceRows: Math.max(1, layout.listHeight - 2) });
         const areaTop = Math.min(layout.listTop, Math.max(0, lines.length - 1));
         // A short terminal leaves no list rows; the panel then borrows the space below it rather than covering the header.
@@ -1180,6 +1185,19 @@ export class DashboardController {
         const start = areaTop + Math.max(0, Math.floor((areaHeight - panel.length) / 2));
         panel.forEach((line, index) => { if (start + index < lines.length)
             lines[start + index] = line; });
+    }
+    /** Draw a completion list in the rows directly above the prompt, newest entry nearest the prompt. */
+    renderInlineMenu(lines, overlay, layout) {
+        const described = describeOverlay(overlay, { confirmationText: this.confirmationText, choiceRows: Math.max(1, layout.listHeight) });
+        const dockTop = lines.length - layout.dockRows;
+        const rows = described.rows.slice(0, Math.max(0, Math.min(described.rows.length, dockTop - layout.listTop)));
+        const start = Math.max(layout.listTop, dockTop - rows.length);
+        rows.forEach((row, index) => {
+            const text = typeof row === "string" ? row : String(row.text ?? "");
+            const selected = text.trimStart().startsWith("❯");
+            if (start + index < lines.length)
+                lines[start + index] = paintPlainLine(` ${text}`, this.width, selected ? jobwatchTheme.focusBorder : jobwatchTheme.muted);
+        });
     }
     trackEvent(update, generation) {
         const operation = this.eventOperations.size === 0

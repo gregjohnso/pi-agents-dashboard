@@ -614,7 +614,7 @@ describe("dashboard controller", () => {
             await dashboard.open();
             dashboard.handleInput("/");
             const menu = dashboard.render(80, 24).map(stripVTControlCharacters);
-            expect(menu.some((line) => line.includes("Commands"))).toBe(true);
+            expect(menu.some((line) => line.includes("/model"))).toBe(true);
             for (const command of ["/model", "/thinking", "/cwd", "/isolation", "/name", "/help"]) {
                 expect(menu.some((line) => line.includes(command))).toBe(true);
             }
@@ -627,7 +627,7 @@ describe("dashboard controller", () => {
             expect(dashboard.composerDraft.prompt).toBe("");
         });
         it("closes the menu on Escape and keeps the typed text editable", async () => {
-            const showsMenu = (dashboard) => dashboard.render(80, 24).some((line) => stripVTControlCharacters(line).includes("Commands"));
+            const showsMenu = (dashboard) => dashboard.render(80, 24).some((line) => stripVTControlCharacters(line).includes("/model"));
             const dashboard = controller(new FakeBackend([session("a")]));
             await dashboard.open();
             typed(dashboard, "/mo");
@@ -725,7 +725,7 @@ describe("dashboard controller", () => {
             const dashboard = controller(backend);
             await dashboard.open();
             typed(dashboard, " /help");
-            expect(dashboard.render(80, 24).some((line) => stripVTControlCharacters(line).includes("Commands"))).toBe(true);
+            expect(dashboard.render(80, 24).some((line) => stripVTControlCharacters(line).includes("/help"))).toBe(true);
             dashboard.handleInput("\r");
             expect(dashboard.overlay).toMatchObject({ kind: "help" });
             expect(dashboard.composerDraft.prompt).toBe("");

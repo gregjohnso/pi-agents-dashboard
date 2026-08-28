@@ -16,6 +16,14 @@ const WHEEL_FLAG = 64;
 /** Longest byte string that can still grow into a complete mouse report. */
 const MAX_PENDING = 32;
 
+/**
+ * Longest a held partial sequence waits before it reaches the TUI unchanged. pi-tui's own
+ * StdinBuffer splits the same way (10 ms for a lone Escape, 50 ms for a longer partial), so the tap
+ * never holds a byte longer than the library behind it already would.
+ */
+const ESCAPE_FLUSH_MS = 10;
+const SEQUENCE_FLUSH_MS = 50;
+
 /** @param {number} button @returns {"wheel_up" | "wheel_down" | undefined} */
 function wheelButton(button) {
   if ((button & WHEEL_FLAG) === 0) return undefined;
@@ -85,6 +93,9 @@ export function parseWheelInput(data) {
  */
 export function createWheelInputTap(terminal, onWheel) {
   let pending = "";
+  /** @type {ReturnType<typeof setTimeout> | undefined} */
+  let flushTimer;
+  const cancelFlush = () => { if (flushTimer !== undefined) { clearTimeout(flushTimer); flushTimer = undefined; } };
   /** @type {Array<(event: any) => void>} */
   const listeners = onWheel === undefined ? [] : [onWheel];
   const emit = (/** @type {any} */ event) => { for (const listener of listeners) listener(event); };
@@ -98,11 +109,26 @@ export function createWheelInputTap(terminal, onWheel) {
       }
       if (property === "start") {
         return (onInput, onResize) => target.start((data) => {
+          cancelFlush();
           const result = parseWheelInput(pending + data);
           pending = result.pending;
           for (const event of result.events) emit(event);
           if (result.passThrough !== "") onInput(result.passThrough);
+          if (pending === "") return;
+          // Without this the tap holds a lone Escape until the next keystroke, which then reaches
+          // pi-tui glued to it and is read as a meta chord. Escape is the viewer's way back to the
+          // list, so a held one costs the operator two keys and every millisecond in between.
+          flushTimer = setTimeout(() => {
+            flushTimer = undefined;
+            const held = pending;
+            pending = "";
+            if (held !== "") onInput(held);
+          }, pending === "\x1b" ? ESCAPE_FLUSH_MS : SEQUENCE_FLUSH_MS);
+          flushTimer.unref?.();
         }, onResize);
+      }
+      if (property === "stop") {
+        return (/** @type {unknown[]} */ ...args) => { cancelFlush(); pending = ""; return target.stop(...args); };
       }
       const value = Reflect.get(target, property, receiver);
       return typeof value === "function" ? value.bind(target) : value;

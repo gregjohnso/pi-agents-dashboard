@@ -184,17 +184,15 @@ it("drives list navigation, search/filter/sort/group, metadata/help, composer, c
   f.dashboard.handleInput("\x1b");
   expect(f.dashboard.focus).toBe("list");
 
+  // Ctrl+X stops on the first press; a second press soon after clears the stopped session.
   f.dashboard.selectSession("live");
   f.dashboard.handleInput("\x18");
-  expect(f.dashboard.overlay).toMatchObject({ action: "stop", sessionId: "live", revision: 4, processState: "LIVE" });
-  f.dashboard.handleInput("y");
   await vi.waitFor(() => expect(f.backend.stop).toHaveBeenCalledWith("live", 4, "terminal-request"));
+  await vi.waitFor(() => expect(f.dashboard.stopClearArmed).toBe(true));
   const processing = Promise.resolve(f.backend.listener({ snapshot: { sessions: [session("live", { revision: 5, processState: "EXITED" }), session("saved", { revision: 7, processState: "EXITED" })] }, cursor: { daemonEpoch: "epoch", sequence: "1" } }));
   f.dashboard.render(80, 24);
   await processing;
   f.dashboard.handleInput("\x18");
-  expect(f.dashboard.overlay).toMatchObject({ action: "delete", sessionId: "live", revision: 5, processState: "EXITED" });
-  f.dashboard.handleInput("y");
   await vi.waitFor(() => expect(f.backend.delete).toHaveBeenCalledWith("live", 5, "terminal-request"));
 
   f.dashboard.handleInput("\t");

@@ -31,7 +31,7 @@ function fixture(overrides = {}) {
   };
   const persistence = { async load() { return overrides.persisted; }, async save(value) { await overrides.save?.(value); saved.push(structuredClone(value)); order.push(`persist:${value.cursor?.sequence ?? "draft"}`); } };
   const dashboard = [];
-  const instance = new ViewerController({ sessionId: "s", client, editor: editor(), persistence, requestRender: async () => { order.push("render"); }, onReturn: vi.fn(), now: () => 0, onDashboardAction: (action) => dashboard.push(action) });
+  const instance = new ViewerController({ sessionId: "s", client, editor: overrides.editor ?? editor(), persistence, requestRender: async () => { order.push("render"); }, onReturn: vi.fn(), now: () => 0, onDashboardAction: (action) => dashboard.push(action) });
   return { instance, client, commands, order, saved, dashboard, emit: (event) => listener(event) };
 }
 
@@ -214,6 +214,19 @@ describe("viewer commands and role restrictions", () => {
     const reopened = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: "amber" }) });
     await reopened.instance.open();
     expect(reopened.instance.render(80, 20).join("\n")).toContain("\x1b[38;2;252;211;77m");
+  });
+
+  it("colors the border Pi's editor already draws instead of adding rules", async () => {
+    // Pi's editor renders its own frame; adding ours put four rules on screen instead of two.
+    const framed = { ...editor(), render: () => ["─".repeat(20), "> hello", "─".repeat(20)] };
+    const f = fixture({ editor: framed, menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: "amber" }) });
+    await f.instance.open();
+    const rendered = f.instance.render(80, 20);
+    const plain = rendered.map(stripVTControlCharacters);
+    expect(plain.filter((line) => /^─+$/u.test(line.trim()) && line.trim() !== "")).toHaveLength(2);
+    const promptRow = plain.findLastIndex((line) => line.startsWith("> "));
+    expect(rendered[promptRow - 1]).toContain("\x1b[38;2;252;211;77m");
+    expect(rendered[promptRow]).not.toContain("\x1b[38;2;252;211;77m");
   });
 
   it("observer mode disables every mutation but preserves scroll and tool inspection", async () => {

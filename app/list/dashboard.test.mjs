@@ -138,58 +138,8 @@ describe("dashboard controller", () => {
         expect(stripVTControlCharacters(filtered.at(-2))).toContain("/repo/beta");
         expect(stripVTControlCharacters(filtered[1])).toContain("search:beta");
     });
-    it("confirms a destructive action against the revision current at confirm time", async () => {
-        const backend = new FakeBackend([session("a", { revision: 4 })]);
-        const dashboard = controller(backend);
-        await dashboard.open();
-        dashboard.selectSession("a");
-        dashboard.handleInput("\x18");
-        expect(dashboard.overlay).toMatchObject({ kind: "session_confirmation", revision: 4 });
-
-        dashboard.applySnapshot({ sessions: [session("a", { revision: 9, summary: { text: "summarized", generatedAt: timestamp, model: { provider: "p", id: "m" }, sourceCursor: "3" } })] });
-        dashboard.selectSession("a");
-        dashboard.handleInput("y");
-        await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledWith("a", 9, expect.any(String)));
-    });
-    it("cancels a destructive confirmation when the session comes back to life", async () => {
-        const backend = new FakeBackend([session("a", { revision: 2, processState: "EXITED" })]);
-        const dashboard = controller(backend);
-        await dashboard.open();
-        dashboard.setView("all");
-        dashboard.selectSession("a");
-        dashboard.handleInput("\x18");
-        expect(dashboard.overlay).toMatchObject({ kind: "session_confirmation", action: "delete" });
-        dashboard.applySnapshot({ sessions: [session("a", { revision: 3, processState: "LIVE", ownership: { kind: "managed", runId: "r", process: { pid: 5, startIdentity: "5", processGroupId: 5 }, acquiredAt: timestamp, heartbeatAt: timestamp } })] });
-        dashboard.selectSession("a");
-        dashboard.handleInput("y");
-        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "SESSION_LIVE" }));
-        expect(backend.stop).not.toHaveBeenCalled();
-    });
     // Ctrl+X on a live session is a Stop; only a second press inside the window clears it, and
     // both presses confirm. app/list/stop-clear-gesture.test.mjs owns the window's exact edges.
-    it("stops a live session first, then clears it on a second confirmed Ctrl+X", async () => {
-        const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
-        let now = 0;
-        const dashboard = controller(backend, { now: () => now });
-        await dashboard.open();
-        dashboard.selectSession("a");
-        dashboard.handleInput("\x18");
-        expect(dashboard.overlay).toMatchObject({ kind: "session_confirmation", action: "stop" });
-        dashboard.handleInput("y");
-        await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledWith("a", 1, expect.any(String)));
-        expect(backend.delete).not.toHaveBeenCalled();
-        dashboard.applySnapshot({ sessions: [session("a", { revision: 2, processState: "EXITED", taskState: "STOPPED" })] });
-        // The stopped row stays selected without the operator re-aiming at it.
-        expect(dashboard.selectedSessionId).toBe("a");
-
-        now = 400;
-        expect(dashboard.stopClearArmed).toBe(true);
-        dashboard.handleInput("\x18");
-        expect(dashboard.overlay).toMatchObject({ kind: "session_confirmation", action: "delete", clearingStopped: true });
-        expect(backend.delete).not.toHaveBeenCalled();
-        dashboard.handleInput("y");
-        await vi.waitFor(() => expect(backend.delete).toHaveBeenCalledWith("a", 2, expect.any(String)));
-    });
     it("hands a destructive request off in the background and never wedges input behind it", async () => {
         let release = () => {};
         const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
@@ -287,6 +237,56 @@ describe("dashboard controller", () => {
         expect(backend.launch).toHaveBeenCalledTimes(1);
         release();
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
+    });
+    it("stops on the first Ctrl+X and clears only on a second press inside the window", async () => {
+        let clock = 0;
+        const backend = new FakeBackend([session("a", { processState: "LIVE" })]);
+        const dashboard = controller(backend, { now: () => clock });
+        await dashboard.open();
+        dashboard.selectSession("a");
+
+        // One press stops, with no prompt to confirm.
+        dashboard.handleInput("\x18");
+        await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledWith("a", 1, expect.any(String)));
+        expect(dashboard.overlay).toBeUndefined();
+        expect(backend.delete).not.toHaveBeenCalled();
+
+        // The clear arms only once the stop has landed.
+        await vi.waitFor(() => expect(dashboard.stopClearArmed).toBe(true));
+        dashboard.applySnapshot({ sessions: [session("a", { taskState: "STOPPED", processState: "EXITED", revision: 2 })] });
+        clock = 400;
+        dashboard.handleInput("\x18");
+        await vi.waitFor(() => expect(backend.delete).toHaveBeenCalledWith("a", 2, expect.any(String)));
+    });
+    it("requires two presses to clear a session that was already stopped", async () => {
+        let clock = 0;
+        const backend = new FakeBackend([session("a", { taskState: "STOPPED", processState: "EXITED" })]);
+        const dashboard = controller(backend, { now: () => clock });
+        await dashboard.open();
+        dashboard.setView("all");
+        dashboard.selectSession("a");
+
+        // A dead session cannot be stopped, so the first press only arms the clear.
+        dashboard.handleInput("\x18");
+        expect(backend.delete).not.toHaveBeenCalled();
+        expect(dashboard.status).toMatchObject({ kind: "pending", code: "CLEAR_ARMED" });
+
+        clock = 300;
+        dashboard.handleInput("\x18");
+        await vi.waitFor(() => expect(backend.delete).toHaveBeenCalledWith("a", 1, expect.any(String)));
+    });
+    it("forgets an armed clear once the window passes", async () => {
+        let clock = 0;
+        const backend = new FakeBackend([session("a", { taskState: "STOPPED", processState: "EXITED" })]);
+        const dashboard = controller(backend, { now: () => clock });
+        await dashboard.open();
+        dashboard.setView("all");
+        dashboard.selectSession("a");
+        dashboard.handleInput("\x18");
+        clock = 900;
+        dashboard.handleInput("\x18");
+        expect(backend.delete).not.toHaveBeenCalled();
+        expect(dashboard.status).toMatchObject({ kind: "pending", code: "CLEAR_ARMED" });
     });
     it("coalesces cursor saves across a burst of events and flushes on close", async () => {
         // Each save fsyncs the file and its directory, about 70ms on a network home, so one save per
@@ -391,7 +391,6 @@ describe("dashboard controller", () => {
         it.each([
             ["help", async (dashboard) => { dashboard.toggleHelp(); }, "Help", "metadata / help"],
             ["metadata", async (dashboard) => { dashboard.toggleMetadata(); }, "Session", "taskState"],
-            ["session confirmation", async (dashboard) => { dashboard.handleInput("\x18"); }, "Confirm STOP", "y/Enter"],
             ["delivery unknown", async (dashboard, backend) => {
                 backend.launch = vi.fn(async () => ({ kind: "delivery_unknown", clientId: "stable-client", requestId: "launch-unknown" }));
                 dashboard.setComposerPrompt("Implement it");

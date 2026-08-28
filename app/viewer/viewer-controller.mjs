@@ -1,3 +1,4 @@
+import { stripVTControlCharacters } from "node:util";
 import { CombinedAutocompleteProvider, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 import { SESSION_COLORS } from "../../shared/contracts.mjs";
@@ -20,19 +21,24 @@ const COLOR_CODES = { sky: "\x1b[38;2;125;211;252m", cyan: "\x1b[38;2;125;211;25
 const BORDER_DEFAULT = "\x1b[38;2;136;136;136m";
 
 /**
- * Rule the prompt above and below so the operator's session color is visible without recoloring
- * what they type. Only the rules carry the color; the editor's own lines pass through untouched.
+ * Show the operator's session color on the prompt without recoloring what they type.
+ *
+ * Pi's editor draws its own border, so paint those lines rather than adding more: adding rules put
+ * four horizontal lines on screen instead of two. An editor that draws no border gets one rule above
+ * and one below.
  * @param {string[]} lines @param {string | undefined} color @param {number} width
  */
 function framePromptBox(lines, color, width) {
   if (width <= 0) return lines;
   const code = (color === undefined ? undefined : COLOR_CODES[color]) ?? BORDER_DEFAULT;
+  const isBorder = (line) => /^[\u2500\u250c\u2510\u2514\u2518\u256d\u256e\u256f\u2570\s]+$/u.test(stripVTControlCharacters(line)) && stripVTControlCharacters(line).trim() !== "";
+  if (lines.some(isBorder)) return lines.map((line) => (isBorder(line) ? `${code}${stripVTControlCharacters(line)}\x1b[0m` : line));
   const rule = `${code}${"─".repeat(width)}\x1b[0m`;
   return [rule, ...lines, rule];
 }
 
-// One line per wheel notch leaves acceleration to the terminal and the OS, which already
-// translate a trackpad swipe into a notch count.
+// One line per wheel notch leaves acceleration to the terminal and the OS, which already translate a
+// trackpad swipe into a notch count.
 const WHEEL_SCROLL_LINES = 1;
 
 const QUEUED_MESSAGE_ROWS = 3;

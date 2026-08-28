@@ -400,7 +400,8 @@ export class DashboardController {
         const selected = this.list.selectSession(sessionId);
         this.ensureSelectionVisible();
         if (selected) {
-            this.invalidateSessionConfirmation();
+            // Selecting elsewhere abandons an armed clear, so Ctrl+X can never remove the wrong session.
+            this.stopClearGesture.cancel();
             this.scheduleUiSave();
         }
         return selected;
@@ -505,6 +506,28 @@ export class DashboardController {
         await this.backend.resolveDelivery(clientId, requestId, resolution);
         this.overlay = undefined;
     }
+    /**
+     * Ctrl+X stops a running session. A second press within the gesture window clears it, and a session
+     * that is already stopped needs the same two presses, so one keystroke can never remove anything.
+     */
+    pressStopClear() {
+        const selected = this.selectedSession();
+        if (selected === undefined)
+            return;
+        const action = destructiveAction(selected);
+        if (action === "stop") {
+            void this.confirmSession({ ...createSessionConfirmation(selected), clearingStopped: false });
+            return;
+        }
+        if (this.stopClearGesture.pressWouldClear(selected.sessionId)) {
+            void this.confirmSession({ ...createSessionConfirmation(selected), clearingStopped: true });
+            return;
+        }
+        this.stopClearGesture.armAfterStop(selected.sessionId);
+        this.status = { kind: "pending", code: "CLEAR_ARMED", message: `Press Ctrl+X again to clear ${selected.name ?? selected.sessionId}` };
+        this.onSessionIntent?.(createSessionIntent(selected));
+        this.requestRender?.();
+    }
     async confirmSession(confirmation) {
         const selected = this.sessions.find((session) => session.sessionId === confirmation.sessionId);
         if (selected === undefined) {
@@ -573,16 +596,6 @@ export class DashboardController {
             void this.close();
             return;
         }
-        if (this.overlay?.kind === "session_confirmation") {
-            if (matchesKey(data, Key.escape) || data.toLowerCase() === "n") {
-                this.overlay = undefined;
-                return;
-            }
-            if (matchesKey(data, Key.enter) || data.toLowerCase() === "y") {
-                void this.confirmSession(this.overlay);
-            }
-            return;
-        }
         if (this.focus === "confirmation") {
             if (matchesKey(data, Key.escape)) {
                 this.focus = "list";
@@ -636,12 +649,7 @@ export class DashboardController {
         }
         if (matchesKey(data, Key.escape) || matchesKey(data, Key.left)) return;
         if (matchesKey(data, Key.ctrl("x"))) {
-            const selected = this.selectedSession();
-            if (selected !== undefined) {
-                const clearingStopped = this.stopClearGesture.pressWouldClear(selected.sessionId);
-                this.overlay = { ...createSessionConfirmation(selected), clearingStopped };
-                this.onSessionIntent?.(createSessionIntent(selected));
-            }
+            this.pressStopClear();
             return;
         }
         if (matchesKey(data, Key.enter)) {
@@ -787,20 +795,10 @@ export class DashboardController {
     applySnapshot(snapshot) {
         this.sessions = snapshot.sessions;
         this.rebuildList();
-        this.invalidateSessionConfirmation();
-    }
-    invalidateSessionConfirmation() {
-        if (this.overlay?.kind !== "session_confirmation")
-            return;
-        // Summaries, names and activity churn the revision constantly; only a change in what the session
-        // admits (stop versus delete, or the session disappearing) invalidates an open confirmation.
-        const current = this.sessions.find((session) => session.sessionId === this.overlay.sessionId);
-        if (current === undefined || destructiveAction(current) !== this.overlay.action) {
-            const action = this.overlay.action;
-            this.overlay = undefined;
-            if (current !== undefined)
-                this.setError(Object.assign(new Error(`Session became ${destructiveAction(current) === "stop" ? "live" : "inactive"} before ${action.toUpperCase()}`), { code: destructiveAction(current) === "stop" ? "SESSION_LIVE" : "SESSION_INACTIVE" }), "SESSION_CHANGED");
-        }
+        // An armed clear belongs to the session as it was: if it came back to life, the next press stops it.
+        const armedSession = this.sessions.find((session) => this.stopClearGesture.armedFor(session.sessionId));
+        if (armedSession !== undefined && destructiveAction(armedSession) === "stop")
+            this.stopClearGesture.cancel();
     }
     /** Put a failed launch's text back so the operator does not retype it. */
     restoreDraft(prompt) {

@@ -1,4 +1,5 @@
 import net from "node:net";
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -8,7 +9,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { connectDaemon } from "./daemon-connector.mjs";
 import { createJsonlDecoder, createJsonlEncoder } from "./jsonl.mjs";
 import { createBoundedSocketWriter, createDaemonRuntime } from "./daemon.mjs";
-import { RegistryStore } from "./registry-store.mjs";
+import { RegistryStore, runSessionLifecycle } from "./registry-store.mjs";
 
 /** @type {any[]} */
 const runtimes = [];
@@ -77,12 +78,15 @@ function startPersistentFakeWorker(config, worker) {
   /** @type {any} */
   let previousCommand;
   let alive = true;
+  /** @type {any} */
+  let live;
   const run = (async () => {
     while (!controller.signal.aborted) {
       /** @type {any} */
       let connection;
       try {
         connection = await connectDaemon({ config: { ...config, maxBytes: 1024 }, signal: controller.signal });
+        live = connection;
         connectionCount += 1;
         connection.onMessage((/** @type {any} */ frame) => {
           if (frame?.type !== "command") return;
@@ -128,7 +132,7 @@ function startPersistentFakeWorker(config, worker) {
     }
     alive = false;
   })();
-  const loop = { pid: worker.identity.pid, get alive() { return alive; }, get connectionCount() { return connectionCount; }, get commandCount() { return commandCount; }, get commandIds() { return [...commandIds]; }, get commands() { return [...commands]; }, async stop() { controller.abort(); await run; } };
+  const loop = { pid: worker.identity.pid, get alive() { return alive; }, get connectionCount() { return connectionCount; }, get commandCount() { return commandCount; }, get commandIds() { return [...commandIds]; }, get commands() { return [...commands]; }, async sendFrame(/** @type {any} */ frame) { await live.send({ version: 1, type: "pi_frame", token: worker.token, sessionId: worker.sessionId, frame }); }, async stop() { controller.abort(); await run; } };
   workerLoops.push(loop);
   return loop;
 }
@@ -939,6 +943,51 @@ it("durably admits authenticated Pi frames while worker reconnect reconciliation
   frontend.send({ version: 1, clientId: "viewer", requestId: "early-snapshot", op: "get_viewer_snapshot", payload: { sessionId: "early" } });
   expect(await frontend.next()).toMatchObject({ ok: true, result: { snapshot: { items: [expect.objectContaining({ kind: "user_message", content: [{ type: "text", text: "during recovery" }] })] } } });
   frontend.close();
+});
+
+it("ingests Pi frames and keeps their order while a lifecycle operation holds the session lock", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const identity = { pid: 261, startIdentity: "worker-stream", processGroupId: 261 };
+  const piChild = { pid: 262, startIdentity: "pi-stream", processGroupId: 261 };
+  const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === 261 ? identity : piChild;
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const now = "2026-08-25T12:00:00.000Z";
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "stream", sessionFile: "/sessions/stream.jsonl", canonicalSessionFile: "/sessions/stream.jsonl", cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-stream", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-stream", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "stream", runId: "run-stream", leaseId: "lease-stream", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  const runtime = await createDaemonRuntime({ root: stateRoot, inspect, reconnectTimeoutMs: 1_000 });
+  runtimes.push(runtime);
+  const worker = startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "stream", runId: "run-stream", leaseId: "lease-stream", generation: 1, identity, piChildIdentity: piChild, token: "stream-token" });
+  await runtime.ready;
+  const frontend = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 65536 });
+  await frontend.ready;
+  await vi.waitFor(() => expect(worker.connectionCount).toBeGreaterThan(0));
+
+  /** @type {(value?: unknown) => void} */
+  let releaseLock = () => {};
+  const held = new Promise((resolve) => { releaseLock = resolve; });
+  const lockHeld = runSessionLifecycle(registry, "stream", () => held);
+  await Promise.resolve();
+
+  try {
+    for (let index = 0; index < 6; index += 1) {
+      await worker.sendFrame({ type: "message_end", message: { role: "user", content: `frame ${index}`, timestamp: Date.parse(now) + index } });
+    }
+    // Ingest that still needed the lifecycle lock could not finish until releaseLock ran.
+    await vi.waitFor(async () => {
+      frontend.send({ version: 1, clientId: "viewer", requestId: `snapshot-${randomUUID()}`, op: "get_viewer_snapshot", payload: { sessionId: "stream" } });
+      const response = await frontend.next();
+      expect(response.result.snapshot.items).toHaveLength(6);
+    }, { timeout: 5_000 });
+
+    frontend.send({ version: 1, clientId: "viewer", requestId: "ordered", op: "get_viewer_snapshot", payload: { sessionId: "stream" } });
+    const ordered = await frontend.next();
+    expect(ordered.result.snapshot.items.map((/** @type {any} */ item) => item.content[0].text)).toEqual([0, 1, 2, 3, 4, 5].map((index) => `frame ${index}`));
+  } finally {
+    releaseLock();
+    await lockHeld;
+    frontend.close();
+  }
 });
 
 it("reconnects two surviving fake workers through the concrete connector after daemon restart", async () => {

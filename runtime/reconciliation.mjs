@@ -6,6 +6,7 @@ import { createCommandJournal } from "./command-journal.mjs";
 import { createEventStore } from "./event-store.mjs";
 import { traceSessionLock } from "./lock-trace.mjs";
 import { RegistryStore, registryCoordinationScope } from "./registry-store.mjs";
+import { SessionCoordinator } from "./session-coordinator.mjs";
 import { createSessionHistoryReader, SessionHistoryError } from "./session-history.mjs";
 import { reduceSessionState } from "./state-reducer.mjs";
 import { createViewerNormalizer } from "./viewer-normalizer.mjs";
@@ -68,6 +69,9 @@ export class RecoveredWorkerRouter {
   #routes = new Map();
   #routeGenerations = new Map();
   #lifecycle;
+  // Viewer frames mutate one session's normalized stream, not its registry record, so they order
+  // against each other on their own queue instead of the lifecycle lock an attach or detach needs.
+  #frames = new SessionCoordinator();
   #loaded = false;
 
   /** @param {{ registry: RegistryStore, inspect(pid: number): Promise<any>, metadataPath: string }} options */
@@ -231,11 +235,30 @@ export class RecoveredWorkerRouter {
     }, "router_frame");
   }
 
+  /** Ingest one session's viewer frames in arrival order, off the lifecycle lock. @template T @param {string} sessionId @param {() => Promise<T>} action */
+  runFrame(sessionId, action) {
+    return traceSessionLock("viewer_ingest", sessionId, (traced) => this.#frames.run(sessionId, traced), action);
+  }
+
+  /**
+   * Check this frame's route and both process identities, then ingest it in arrival order. The
+   * identity check re-reads the route after every await, so the only window a concurrent adopt can
+   * win is between the last check and the ingest, where a late frame costs a duplicate viewer event
+   * rather than a registry write.
+   * @param {any} metadata @param {any} connection @param {number} routeGeneration @param {() => Promise<any>} action
+   */
+  runCurrentFrame(metadata, connection, routeGeneration, action) {
+    return this.runFrame(metadata.sessionId, async () => {
+      await this.#assertCurrent(metadata, connection, routeGeneration);
+      return action();
+    });
+  }
+
   async close() {
     const routes = [...this.#routes.values()];
     this.#routes.clear();
     for (const route of routes) route.connection.close?.();
-    await this.#lifecycle.idle();
+    await Promise.all([this.#lifecycle.idle(), this.#frames.idle()]);
   }
 }
 

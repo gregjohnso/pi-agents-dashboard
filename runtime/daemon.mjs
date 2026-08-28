@@ -699,9 +699,9 @@ export async function createDaemonRuntime({
         await router.register(handle);
         await context.recovery.viewer.ensure(handle.sessionId);
         handle.onFrame?.((/** @type {Record<string, unknown>} */ frame) => {
-          void runSessionLifecycle(registry, handle.sessionId, async () => {
+          void router.runFrame(handle.sessionId, async () => {
             await context.recovery.viewer.ingest(handle.sessionId, frame);
-          }, "viewer_ingest_launch").catch(() => {});
+          }).catch(() => {});
         });
       },
       /**
@@ -997,7 +997,7 @@ export async function createDaemonRuntime({
           if (frame.version !== 1 || frame.sessionId !== metadata.sessionId || Object.keys(frame).some((key) => !allowed.includes(key)) || typeof frame.frame !== "object" || frame.frame === null || Array.isArray(frame.frame)) throw Object.assign(new Error("Invalid Pi viewer frame"), { code: "INVALID_WORKER_FRAME" });
           const viewer = context.recovery?.viewer ?? context.viewerRecovery;
           if (viewer === undefined) throw Object.assign(new Error("Viewer recovery is still initializing"), { code: "RECOVERING", retryable: true });
-          await router.runCurrent(metadata, connection, routeGeneration, async () => {
+          await router.runCurrentFrame(metadata, connection, routeGeneration, async () => {
             await viewer.ingest(frame.sessionId, frame.frame);
           });
           return;

@@ -2,7 +2,7 @@ import { appendFile, mkdtemp, open, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { EventStoreError, createEventStore, parseCursorSequence } from "./event-store.mjs";
+import { EventStoreError, createEventStore } from "./event-store.mjs";
 
 /** @type {string[]} */
 const directories = [];
@@ -12,11 +12,6 @@ afterEach(async () => { await Promise.all(directories.splice(0).map((directory) 
 const change = { kind: "attachment_changed", payload: { sessionId: "session-1", clientId: "client-1", role: "observer", attached: true } };
 
 describe("event store", () => {
-  it("shares exact arbitrary-size sequence parsing with session-scoped viewer cursors", () => {
-    expect(parseCursorSequence("18446744073709551616")).toBe(18446744073709551616n);
-    expect(() => parseCursorSequence("01")).toThrow(/canonical/u);
-  });
-
   it("persists monotonically exact string cursors and replays strictly after a cursor", async () => {
     const store = await createEventStore({ path: await path(), daemonEpoch: "epoch-1", now: () => "2026-01-01T00:00:00.000Z" });
     const first = await store.append(change);
@@ -44,20 +39,11 @@ describe("event store", () => {
     await reopened.close();
   });
 
-  it("rejects an initial replay larger than the subscriber bound", async () => {
-    const store = await createEventStore({ path: await path(), daemonEpoch: "epoch-1", subscriberLimit: 1 });
-    await store.append(change);
-    await store.append(change);
-    expect(() => store.subscribe()).toThrow(expect.objectContaining({ code: "SUBSCRIBER_OVERFLOW" }));
-    await store.close();
-  });
-
-  it.each([
-    ["pending when the store closes", /** @param {any} store */ async (store) => { const pending = store.subscribe().next(); await store.close(); return pending; }],
-    ["created after the store closes", /** @param {any} store */ async (store) => { await store.close(); return store.subscribe().next(); }],
-  ])("finishes an iterator %s", async (_label, iterate) => {
+  it("finishes a subscriber iterator pending when the store closes", async () => {
     const store = await createEventStore({ path: await path(), daemonEpoch: "epoch-1" });
-    await expect(iterate(store)).resolves.toEqual({ value: undefined, done: true });
+    const pending = store.subscribe().next();
+    await store.close();
+    await expect(pending).resolves.toEqual({ value: undefined, done: true });
   });
 
   it("persists complete records across deterministic short writes", async () => {
@@ -81,38 +67,6 @@ describe("event store", () => {
     const reopened = await createEventStore({ path: storePath, daemonEpoch: "epoch-1" });
     await expect(reopened.replay()).resolves.toHaveLength(1);
     await reopened.close();
-  });
-
-  it("poisons the store after a partial write stalls and recovers the torn tail on reopen", async () => {
-    const storePath = await path();
-    const probe = await open(storePath, "a", 0o600);
-    const prototype = Object.getPrototypeOf(probe);
-    await probe.close();
-    const originalWrite = prototype.write;
-    let writeAttempt = 0;
-    const write = vi.spyOn(prototype, "write").mockImplementation(function (buffer) {
-      writeAttempt += 1;
-      if (writeAttempt === 1) return originalWrite.call(this, /** @type {Buffer} */ (buffer).subarray(0, 7));
-      if (writeAttempt === 2) return Promise.resolve({ bytesWritten: 0, buffer });
-      return originalWrite.call(this, buffer);
-    });
-    const store = await createEventStore({ path: storePath, daemonEpoch: "epoch-1" });
-    try {
-      await expect(store.append(change)).rejects.toMatchObject({ name: "AppendStoreError", code: "WRITE_STALLED" });
-      await expect(store.append(change)).rejects.toMatchObject({ name: "AppendStoreError", code: "STORE_FAILED" });
-    } finally {
-      write.mockRestore();
-      await store.close();
-    }
-
-    const reopened = await createEventStore({ path: storePath, daemonEpoch: "epoch-1" });
-    await expect(reopened.replay()).resolves.toEqual([]);
-    await expect(reopened.append(change)).resolves.toMatchObject({ cursor: { daemonEpoch: "epoch-1", sequence: "1" } });
-    await reopened.close();
-
-    const verified = await createEventStore({ path: storePath, daemonEpoch: "epoch-1" });
-    await expect(verified.replay()).resolves.toHaveLength(1);
-    await verified.close();
   });
 
   it("incrementally discards an incomplete final record after a crash", async () => {

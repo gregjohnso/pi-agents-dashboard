@@ -18,6 +18,7 @@ async function fixture() {
 it("adapts the installed daemon client to origin replay, mutation, ACK, and detach", async () => {
   const requests = [];
   const events = { async *[Symbol.asyncIterator]() { yield { eventId: "one" }; } };
+  const watchers = [];
   const client = {
     async request(value) {
       requests.push(value);
@@ -29,9 +30,13 @@ it("adapts the installed daemon client to origin replay, mutation, ACK, and deta
     async getViewerSnapshot(sessionId) { return { sessionId }; },
     subscribeViewer(sessionId, cursor) { expect([sessionId, cursor.sequence]).toEqual(["session", "0"]); return events; },
     async ackViewer(cursor) { return cursor; },
+    onConnectionChange(listener) { watchers.push(listener); return () => watchers.pop(); },
   };
   const viewer = createDaemonViewerClient({ client, clientId: "client" });
   expect(viewer.replayFromOrigin).toBe(false);
+  // The viewer learns about a dead daemon through this seam; without it an outage is invisible.
+  viewer.onConnectionChange(() => {});
+  expect(watchers).toHaveLength(1);
   await viewer.attach("session");
   const received = [];
   const unsubscribe = viewer.subscribe("session", { sequence: "0" }, async (event) => { received.push(event); }, () => {});

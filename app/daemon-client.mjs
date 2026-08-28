@@ -72,12 +72,22 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
     const subscribers = new Set();
     const viewerSubscribers = new Set();
     const fatalErrorListeners = new Set();
+    const connectionListeners = new Set();
     const wakeDelays = new Set();
     let socket;
     let reconnectLoop;
     let closed = false;
     let authenticated = false;
     let everConnected = false;
+    let connectionReported = false;
+    /** Report only transitions: a daemon that stays down keeps retrying without repeating itself. */
+    const reportConnection = (connected) => {
+        if (connectionReported === connected)
+            return;
+        connectionReported = connected;
+        for (const listener of connectionListeners)
+            listener({ connected });
+    };
     const hasWork = () => pending.size > 0 || subscribers.size > 0 || viewerSubscribers.size > 0;
     const reportFatalFrame = (error, fallbackCode) => {
         const typed = error;
@@ -208,6 +218,7 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                             for (const item of pending.values())
                                 sendPending(item);
                             sendSubscriptions();
+                            reportConnection(true);
                             if (!settled) {
                                 settled = true;
                                 resolve();
@@ -260,6 +271,7 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                 socket = undefined;
                 authenticated = false;
             }
+            reportConnection(false);
             const closedError = (submitted = false) => Object.assign(new DaemonClientError("CONNECTION_CLOSED", "Daemon connection closed"), { submitted });
             failAttempt(closedError());
             if (!reconnect) {
@@ -415,6 +427,11 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
             fatalErrorListeners.add(listener);
             return () => fatalErrorListeners.delete(listener);
         },
+        /** Watch the control connection itself, so a dead daemon is visible instead of a frozen screen. */
+        onConnectionChange(listener) {
+            connectionListeners.add(listener);
+            return () => connectionListeners.delete(listener);
+        },
         async close() {
             if (closed)
                 return;
@@ -432,6 +449,7 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
             subscribers.clear();
             viewerSubscribers.clear();
             fatalErrorListeners.clear();
+            connectionListeners.clear();
             if (socket !== undefined && !socket.destroyed) {
                 await new Promise((resolve) => {
                     socket.once("close", resolve);

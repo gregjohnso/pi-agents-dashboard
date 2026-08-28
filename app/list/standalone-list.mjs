@@ -121,6 +121,7 @@ export function createDaemonViewerClient({ client, clientId }) {
     },
     command(operation, payload) { return request(operation, payload); },
     ack(_sessionId, cursor) { return client.ackViewer(cursor); },
+    onConnectionChange(listener) { return client.onConnectionChange?.(listener); },
   };
 }
 

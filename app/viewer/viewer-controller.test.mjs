@@ -18,12 +18,16 @@ function editor() {
 }
 function fixture(overrides = {}) {
   let listener;
+  let connectionListener;
   const commands = [];
   const order = [];
   const saved = [];
+  const attached = [];
   const client = {
-    async getSnapshot() { return snapshot(overrides.snapshot); },
+    async getSnapshot() { order.push("snapshot"); return snapshot(overrides.snapshot); },
     subscribe(_sessionId, _cursor, next) { listener = next; return () => order.push("unsubscribe"); },
+    onConnectionChange(next) { connectionListener = next; return () => { connectionListener = undefined; }; },
+    ...(overrides.attach === undefined ? {} : { attach: async (sessionId) => { attached.push(sessionId); return overrides.attach(sessionId); } }),
     async command(operation, payload) { commands.push({ operation, payload }); return overrides.command?.(operation, payload); },
     ...(overrides.query === undefined ? {} : { query: overrides.query }),
     ...(overrides.menu === undefined ? {} : { menu: overrides.menu }),
@@ -32,7 +36,7 @@ function fixture(overrides = {}) {
   const persistence = { async load() { return overrides.persisted; }, async save(value) { await overrides.save?.(value); saved.push(structuredClone(value)); order.push(`persist:${value.cursor?.sequence ?? "draft"}`); } };
   const dashboard = [];
   const instance = new ViewerController({ sessionId: "s", client, editor: overrides.editor ?? editor(), persistence, requestRender: async () => { order.push("render"); }, onReturn: vi.fn(), now: () => 0, onDashboardAction: (action) => dashboard.push(action) });
-  return { instance, client, commands, order, saved, dashboard, emit: (event) => listener(event) };
+  return { instance, client, commands, order, saved, dashboard, attached, emit: (event) => listener(event), connection: (status) => connectionListener(status) };
 }
 
 describe("viewer commands and role restrictions", () => {
@@ -452,6 +456,39 @@ describe("Pi interactive-mode parity", () => {
     expect(f.instance.render(80, 24).map(stripVTControlCharacters).join("\n")).not.toContain("Steering: urgent");
   });
 
+});
+
+describe("daemon outage", () => {
+  it("says the daemon is unreachable and rebuilds the session when it comes back", async () => {
+    const f = fixture({ attach: async () => ({ role: "composer" }) });
+    await f.instance.open();
+    const view = () => stripVTControlCharacters(f.instance.render(80, 24).join("\n"));
+    expect(view()).not.toContain("Daemon unreachable");
+
+    await f.connection({ connected: false });
+    expect(view()).toContain("Daemon unreachable");
+    expect(f.instance.closedState).toBe(false);
+
+    await f.connection({ connected: true });
+    expect(view()).not.toContain("Daemon unreachable");
+    expect(f.attached).toEqual(["s"]);
+    expect(f.order.filter((entry) => entry === "snapshot")).toHaveLength(2);
+    expect(f.order.filter((entry) => entry === "unsubscribe")).toHaveLength(1);
+
+    // The rebuilt subscription feeds the same transcript, from the new daemon's cursor.
+    await f.emit({ version: 1, sessionId: "s", eventId: "after", cursor: { daemonEpoch: "epoch-2", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "system_message", itemId: "back", text: "daemon is back", level: "info" } });
+    expect(view()).toContain("daemon is back");
+  });
+
+  it("keeps the viewer open and says why when the returning daemon refuses the composer claim", async () => {
+    const f = fixture({ attach: async () => { throw Object.assign(new Error("Another frontend owns this session"), { code: "SESSION_IN_USE" }); } });
+    await f.instance.open();
+    await f.connection({ connected: false });
+    await f.connection({ connected: true });
+
+    expect(f.instance.closedState).toBe(false);
+    expect(stripVTControlCharacters(f.instance.render(80, 24).join("\n"))).toContain("SESSION_IN_USE");
+  });
 });
 
 describe("transcript scrolling keys and wheel", () => {

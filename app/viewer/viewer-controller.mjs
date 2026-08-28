@@ -163,6 +163,7 @@ export class ViewerController {
       await this.loadMenu();
       const unsubscribe = await this.client.subscribe(this.sessionId, initial.cursor, (event) => this.processEvent(event), (error) => this.fail(error));
       if (this.closedState) unsubscribe?.(); else this.unsubscribe = unsubscribe;
+      this.watchConnection = this.client.onConnectionChange?.((status) => this.onConnection(status));
       await this.requestRender();
     } catch (error) {
       await this.close({ persist: false });
@@ -188,8 +189,9 @@ export class ViewerController {
     const toolLine = selectedTool === undefined ? [] : [` tool:${selectedTool.name} ${selectedTool.state} ${this.transcript.expandedTools.has(selectedTool.id) ? "expanded" : "collapsed"}`];
     let errorLines = this.state.errors.slice(-1).flatMap((error) => renderSystemCard({ text: `${error.code}: ${error.message}`, level: "error" }, width));
     let queuedLines = this.renderQueued();
+    const connectionLines = this.daemonUnreachable === true ? [" Daemon unreachable · reconnecting…"] : [];
     let hints = renderKeyHints(this.state, width);
-    const dockRows = () => 2 + (hints === "" ? 0 : 1) + status.length + editorLines.length + inputLabel.length + toolLine.length + errorLines.length + queuedLines.length;
+    const dockRows = () => 2 + (hints === "" ? 0 : 1) + status.length + editorLines.length + inputLabel.length + toolLine.length + errorLines.length + queuedLines.length + connectionLines.length;
     if (height - dockRows() < MIN_TRANSCRIPT_ROWS) {
       // Pi's dock gives up its own rows before the transcript loses any: spacers first, then the
       // prompt frame, then the hints. Only decoration goes; every dock line with content stays.
@@ -206,7 +208,7 @@ export class ViewerController {
       body = [...body.slice(0, start), ...overlayLines];
     }
     const footer = renderModelFooter(this.state, this.hideThinking, width);
-    const lines = [header, ...body, ...errorLines, ...queuedLines, ...status, ...toolLine, ...inputLabel, ...editorLines, footer, ...(hints === "" ? [] : [hints])].map((line) => fit(line, width));
+    const lines = [header, ...body, ...connectionLines, ...errorLines, ...queuedLines, ...status, ...toolLine, ...inputLabel, ...editorLines, footer, ...(hints === "" ? [] : [hints])].map((line) => fit(line, width));
     while (lines.length < height) lines.splice(1, 0, "");
     return lines.slice(0, height);
   }
@@ -562,6 +564,45 @@ export class ViewerController {
     await this.requestRender();
   }
 
+  /** @param {{ connected: boolean }} status */
+  async onConnection(status) {
+    if (this.closedState) return;
+    this.daemonUnreachable = !status.connected;
+    if (status.connected) await this.resynchronize();
+    else await this.requestRender();
+  }
+
+  /**
+   * Rebuild against a daemon that just came back. A restarted daemon holds no attachment claims and
+   * issues a new epoch, so this viewer's composer role and cursor both died with the old process:
+   * reclaim the role if it is free, then resubscribe from a fresh snapshot.
+   */
+  async resynchronize() {
+    this.unsubscribe?.();
+    this.unsubscribe = undefined;
+    let attachError;
+    if (typeof this.client.attach === "function") {
+      try { await this.client.attach(this.sessionId); } catch (error) { attachError = error; }
+    }
+    try {
+      const snapshot = parseViewerSnapshot(await this.client.getSnapshot(this.sessionId));
+      this.state = createTranscriptState(snapshot);
+      this.editor.disableSubmit = snapshot.role !== "composer";
+      this.transcript.update(this.state);
+      this.installOverlay();
+      const unsubscribe = await this.client.subscribe(this.sessionId, snapshot.cursor, (event) => this.processEvent(event), (error) => this.fail(error));
+      if (this.closedState) unsubscribe?.(); else this.unsubscribe = unsubscribe;
+    } catch (error) {
+      const typed = /** @type {any} */ (error);
+      await this.recordError({ code: typed?.code ?? "VIEWER_RESYNC_FAILED", message: error instanceof Error ? error.message : "This session could not be reloaded after the daemon restarted", retryable: true });
+    }
+    if (attachError !== undefined) {
+      const typed = /** @type {any} */ (attachError);
+      await this.recordError({ code: typed?.code ?? "SESSION_REATTACH_FAILED", message: attachError instanceof Error ? attachError.message : "This session could not be reclaimed after the daemon restarted", retryable: false });
+    }
+    await this.requestRender();
+  }
+
   async processEvent(value) {
     if (this.closedState) throw Object.assign(new Error("Viewer is closed"), { code: "VIEWER_CLOSED" });
     try {
@@ -641,6 +682,7 @@ export class ViewerController {
     if (this.closedState) return;
     this.closedState = true;
     this.unsubscribe?.(); this.unsubscribe = undefined;
+    this.watchConnection?.(); this.watchConnection = undefined;
     try {
       if (options.persist !== false) await this.persistence.save(this.persisted());
     } finally {

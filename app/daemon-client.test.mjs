@@ -228,6 +228,22 @@ describe("daemon client", () => {
     await iterator.return?.();
   });
 
+  it("reports the daemon going away and coming back", async () => {
+    const socketPath = await socketPathIn("client-connection-");
+    const server = await daemonServer(socketPath, ({ reply }) => reply({ kind: "subscribed", cursor: { daemonEpoch: "epoch-1", sequence: "0" } }));
+    const client = startClient({ socketPath, reconnectDelayMs: 1 });
+    /** @type {boolean[]} */
+    const connection = [];
+    client.onConnectionChange((status) => connection.push(status.connected));
+    const iterator = client.subscribe()[Symbol.asyncIterator]();
+    await waitFor(() => connection.length === 1);
+
+    server.socket?.destroy();
+    await waitFor(() => connection.length === 3);
+    expect(connection).toEqual([true, false, true]);
+    await iterator.return?.();
+  });
+
   it("forgets old completed responses instead of retaining every one for the life of the dashboard", async () => {
     const socketPath = await socketPathIn("client-seen-");
     const server = await daemonServer(socketPath, ({ reply }) => reply(emptyState));

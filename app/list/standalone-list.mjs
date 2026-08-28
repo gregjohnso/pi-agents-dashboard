@@ -75,6 +75,7 @@ export function createDaemonViewerClient({ client, clientId }) {
         ...result,
         summaryModel: settings?.kind === "settings" ? settings.summaryModel : null,
         color: record?.color ?? null,
+        name: record?.name,
         ...(record === undefined ? {} : { registryRevision: record.revision }),
       };
     },

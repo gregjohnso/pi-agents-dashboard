@@ -21,20 +21,35 @@ const COLOR_CODES = { sky: "\x1b[38;2;125;211;252m", cyan: "\x1b[38;2;125;211;25
 const BORDER_DEFAULT = "\x1b[38;2;136;136;136m";
 
 /**
- * Show the operator's session color on the prompt without recoloring what they type.
+ * Show the operator's session color and name on the prompt without recoloring what they type.
  *
  * Pi's editor draws its own border, so paint those lines rather than adding more: adding rules put
- * four horizontal lines on screen instead of two. An editor that draws no border gets one rule above
- * and one below.
- * @param {string[]} lines @param {string | undefined} color @param {number} width
+ * four horizontal lines on screen instead of two. The session name rides the top rule, right-aligned,
+ * so a viewer always says which session the keystrokes go to.
+ * @param {string[]} lines @param {string | undefined} color @param {number} width @param {string} [name]
  */
-function framePromptBox(lines, color, width) {
+function framePromptBox(lines, color, width, name) {
   if (width <= 0) return lines;
   const code = (color === undefined ? undefined : COLOR_CODES[color]) ?? BORDER_DEFAULT;
   const isBorder = (line) => /^[\u2500\u250c\u2510\u2514\u2518\u256d\u256e\u256f\u2570\s]+$/u.test(stripVTControlCharacters(line)) && stripVTControlCharacters(line).trim() !== "";
-  if (lines.some(isBorder)) return lines.map((line) => (isBorder(line) ? `${code}${stripVTControlCharacters(line)}\x1b[0m` : line));
-  const rule = `${code}${"─".repeat(width)}\x1b[0m`;
-  return [rule, ...lines, rule];
+  const labelled = (line) => {
+    const bare = stripVTControlCharacters(line);
+    const label = (name ?? "").trim();
+    if (label === "" || bare.length < label.length + 6) return bare;
+    return `${"─".repeat(bare.length - label.length - 3)} ${truncateToWidth(label, bare.length - 6, "…")} ─`;
+  };
+  const framed = lines.some(isBorder);
+  if (framed) {
+    let top = true;
+    return lines.map((line) => {
+      if (!isBorder(line)) return line;
+      const painted = `${code}${top ? labelled(line) : stripVTControlCharacters(line)}\x1b[0m`;
+      top = false;
+      return painted;
+    });
+  }
+  const bare = "─".repeat(width);
+  return [`${code}${labelled(bare)}\x1b[0m`, ...lines, `${code}${bare}\x1b[0m`];
 }
 
 // One line per wheel notch leaves acceleration to the terminal and the OS, which already translate a
@@ -167,7 +182,7 @@ export class ViewerController {
         : ` ${this.state.taskState}/${this.state.processState} · ${role}`;
     let status = renderStatusIndicator(this.state.activity, width, this.now(), { working: this.state.working });
     const promptLines = this.state.role === "composer" ? this.editor.render(width) : [" Read-only session · scroll and tool inspection only"];
-    let editorLines = framePromptBox(promptLines, this.sessionColor, width);
+    let editorLines = framePromptBox(promptLines, this.sessionColor, width, this.menu?.name);
     const inputLabel = this.inputMode === "steer" ? [" Steer at next supported boundary"] : this.steerStatus === undefined ? [] : [` Steer ${this.steerStatus}`];
     const selectedTool = this.transcript.selectedToolId === undefined ? undefined : this.state.tools.get(this.transcript.selectedToolId);
     const toolLine = selectedTool === undefined ? [] : [` tool:${selectedTool.name} ${selectedTool.state} ${this.transcript.expandedTools.has(selectedTool.id) ? "expanded" : "collapsed"}`];
@@ -311,6 +326,7 @@ export class ViewerController {
         model: menu?.model ?? null,
         thinkingLevel: menu?.thinkingLevel ?? null,
         color: menu?.color ?? null,
+        name: typeof menu?.name === "string" ? menu.name : undefined,
       };
       // The colour is stored on the session record, so adopt it on every open, not only when /color runs.
       this.sessionColor = this.menu.color ?? undefined;

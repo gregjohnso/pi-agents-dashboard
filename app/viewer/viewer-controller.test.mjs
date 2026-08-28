@@ -216,6 +216,26 @@ describe("viewer commands and role restrictions", () => {
     expect(reopened.instance.render(80, 20).join("\n")).toContain("\x1b[38;2;252;211;77m");
   });
 
+  it("names the session on the prompt's top rule", async () => {
+    const framed = { ...editor(), render: () => ["─".repeat(60), "> do 3", "─".repeat(60)] };
+    const f = fixture({ editor: framed, menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: null, name: "recurse agent investigation" }) });
+    await f.instance.open();
+    const plain = f.instance.render(80, 20).map(stripVTControlCharacters);
+    const promptRow = plain.findLastIndex((line) => line.startsWith("> "));
+    // The name rides the rule above the prompt, right-aligned, so the operator sees which session they type into.
+    expect(plain[promptRow - 1]).toMatch(/^─+ recurse agent investigation ─$/u);
+    expect(plain[promptRow]).toBe("> do 3");
+  });
+
+  it("leaves the rule bare when the session has no name", async () => {
+    const framed = { ...editor(), render: () => ["─".repeat(60), "> do 3", "─".repeat(60)] };
+    const f = fixture({ editor: framed, menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: null }) });
+    await f.instance.open();
+    const plain = f.instance.render(80, 20).map(stripVTControlCharacters);
+    const promptRow = plain.findLastIndex((line) => line.startsWith("> "));
+    expect(plain[promptRow - 1]).toMatch(/^─+$/u);
+  });
+
   it("colors the border Pi's editor already draws instead of adding rules", async () => {
     // Pi's editor renders its own frame; adding ours put four rules on screen instead of two.
     const framed = { ...editor(), render: () => ["─".repeat(20), "> hello", "─".repeat(20)] };

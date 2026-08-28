@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { DashboardController, createDaemonDashboardBackend, } from "./dashboard.mjs";
 import { JOBWATCH_ANSI } from "./dashboard-theme.mjs";
+import { createDashboardLayout } from "./dashboard-layout.mjs";
 const timestamp = "2026-08-25T12:00:00.000Z";
 function session(id, overrides = {}) {
     return {
@@ -795,8 +796,10 @@ describe("dashboard controller", () => {
                     expect(lines.every((line) => visibleWidth(line) <= width), `${width}x${height}`).toBe(true);
                 }
             }
-            // 300 rows never reach the screen: the picker draws one windowful of the list area.
-            expect(dashboard.render(80, 24).filter((line) => stripVTControlCharacters(line).includes("-with-a-deliberately-long-identifier")).length).toBeLessThanOrEqual(12);
+            // 300 rows never reach the screen: the picker draws one windowful between header and dock.
+            const windowRows = createDashboardLayout(80, 24);
+            expect(dashboard.render(80, 24).filter((line) => stripVTControlCharacters(line).includes("-with-a-deliberately-long-identifier")).length)
+                .toBeLessThanOrEqual(24 - windowRows.listTop - windowRows.dockRows);
             typed(dashboard, "model-137");
             expect(dashboard.overlay.values).toEqual(["anthropic/model-137-with-a-deliberately-long-identifier"]);
             dashboard.handleInput("\r");

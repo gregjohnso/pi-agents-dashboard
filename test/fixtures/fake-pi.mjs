@@ -82,5 +82,12 @@ process.stdin.on("data", (chunk) => {
   }
 });
 
+// A session that streams without being prompted, so a measurement can hold one session's viewer
+// ingest busy while an operator attaches to or detaches from that same session.
+const streamMs = Number(process.env.FAKE_PI_STREAM_MS);
+if (Number.isSafeInteger(streamMs) && streamMs > 0) {
+  setInterval(() => process.stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: `stream:${sessionFile}` }], timestamp: Date.now() } })}\n`), streamMs).unref?.();
+}
+
 const exitMs = Number(process.env.FAKE_PI_EXIT_MS);
 if (Number.isSafeInteger(exitMs) && exitMs > 0) setTimeout(() => process.exit(0), exitMs);

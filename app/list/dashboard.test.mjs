@@ -643,7 +643,7 @@ describe("dashboard controller", () => {
             await dashboard.open();
             typed(dashboard, "/model");
             dashboard.handleInput("\r");
-            expect(dashboard.overlay).toMatchObject({ kind: "choice", field: "model", values: ["anthropic/claude", "google/gemini"] });
+            await vi.waitFor(() => expect(dashboard.overlay).toMatchObject({ kind: "choice", field: "model", values: ["anthropic/claude", "google/gemini"] }));
             dashboard.handleInput("\x1b[B");
             dashboard.handleInput("\r");
             expect(dashboard.composerDraft.model).toEqual({ provider: "google", id: "gemini" });
@@ -663,13 +663,50 @@ describe("dashboard controller", () => {
             dashboard.handleInput("\x1b[B");
             expect(dashboard.selectedSessionId).toBe("a");
         });
+        it("offers Pi's whole catalog on a cold dashboard, asking for it only when a picker needs it", async () => {
+            const backend = new FakeBackend([]);
+            backend.getModels = vi.fn(async () => [{ provider: "openai", id: "gpt-6", thinking: true }, { provider: "anthropic", id: "claude-opus-4", thinking: true }]);
+            const dashboard = controller(backend, { launchDefaults: { cwd: "/repo" } });
+            await dashboard.open();
+            typed(dashboard, "/model");
+            // Neither startup nor a keystroke spends a catalog read.
+            expect(backend.getModels).not.toHaveBeenCalled();
+            dashboard.handleInput("\r");
+            await vi.waitFor(() => expect(dashboard.overlay).toMatchObject({ kind: "choice", field: "model", values: ["anthropic/claude-opus-4", "openai/gpt-6"] }));
+            dashboard.handleInput("\x1b");
+            typed(dashboard, "/model");
+            dashboard.handleInput("\r");
+            await vi.waitFor(() => expect(dashboard.overlay).toMatchObject({ kind: "choice", field: "model" }));
+            // The catalog is cached for the dashboard's life.
+            expect(backend.getModels).toHaveBeenCalledTimes(1);
+            // A picker for another field never reaches the daemon at all.
+            dashboard.handleInput("\x1b");
+            typed(dashboard, "/isolation");
+            dashboard.handleInput("\r");
+            await vi.waitFor(() => expect(dashboard.overlay).toMatchObject({ kind: "choice", field: "isolation" }));
+            expect(backend.getModels).toHaveBeenCalledTimes(1);
+        });
+        it("names the daemon's own reason when it cannot list models, and asks again next time", async () => {
+            const backend = new FakeBackend([session("a", { model: undefined, thinkingLevel: undefined })]);
+            backend.getModels = vi.fn(async () => { throw Object.assign(new Error("Listing Pi models timed out"), { code: "MODEL_CATALOG_TIMEOUT" }); });
+            const dashboard = controller(backend, { launchDefaults: { cwd: "/repo" } });
+            await dashboard.open();
+            typed(dashboard, "/model");
+            dashboard.handleInput("\r");
+            await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "MODEL_CATALOG_TIMEOUT", message: expect.stringContaining("Listing Pi models timed out") }));
+            expect(dashboard.overlay).toBeUndefined();
+            // A refusal keeps the text editable, and a failed read is never cached.
+            expect(dashboard.composerDraft.prompt).toBe("/model");
+            dashboard.handleInput("\r");
+            await vi.waitFor(() => expect(backend.getModels).toHaveBeenCalledTimes(2));
+        });
         it("says so when it knows no model to offer, and still takes one typed in full", async () => {
             const backend = new FakeBackend([session("a", { model: undefined, thinkingLevel: undefined })]);
             const dashboard = controller(backend, { launchDefaults: { cwd: "/repo" } });
             await dashboard.open();
             typed(dashboard, "/model");
             dashboard.handleInput("\r");
-            expect(dashboard.status).toMatchObject({ kind: "error", code: "MODEL_CHOICES_UNKNOWN" });
+            await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "MODEL_CHOICES_UNKNOWN" }));
             expect(dashboard.overlay).toBeUndefined();
             typed(dashboard, "\x7f".repeat(6));
             typed(dashboard, "/model openai/gpt-6");
@@ -750,7 +787,7 @@ describe("dashboard controller", () => {
             dashboard.handleInput("/");
             expect(dashboard.render(width, 24).every((line) => visibleWidth(line) <= width)).toBe(true);
             dashboard.handleInput("\r");
-            expect(dashboard.overlay).toMatchObject({ kind: "choice", field: "model" });
+            await vi.waitFor(() => expect(dashboard.overlay).toMatchObject({ kind: "choice", field: "model" }));
             expect(dashboard.render(width, 24).every((line) => visibleWidth(line) <= width)).toBe(true);
             expect(dashboard.render(width, 10).every((line) => visibleWidth(line) <= width)).toBe(true);
         });
@@ -851,6 +888,25 @@ describe("daemon dashboard backend", () => {
         expect(updates[0]?.snapshot.sessions).toEqual([]);
         expect(stateReads).toBe(2);
         unsubscribe();
+    });
+    it("reads the model catalog through get_models and names a daemon that cannot list one", async () => {
+        const models = [{ provider: "anthropic", id: "claude-opus-4", thinking: true }];
+        const operations = [];
+        let refusals = 0;
+        const client = {
+            async connect() { },
+            async request(request) {
+                operations.push(request.op);
+                if (refusals++ > 0) return { version: 1, requestId: request.requestId, ok: false, error: { code: "MODEL_CATALOG_TIMEOUT", message: "Listing Pi models timed out", retryable: true } };
+                return { version: 1, requestId: request.requestId, ok: true, result: { kind: "models", models } };
+            },
+            subscribe() { return { async *[Symbol.asyncIterator]() { } }; },
+            async close() { },
+        };
+        const backend = createDaemonDashboardBackend({ client, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
+        await expect(backend.getModels()).resolves.toEqual(models);
+        await expect(backend.getModels()).rejects.toMatchObject({ code: "MODEL_CATALOG_TIMEOUT", message: "Listing Pi models timed out" });
+        expect(operations).toEqual(["get_models", "get_models"]);
     });
     it("processes replay once, acknowledges only successful events, and resumes from the acknowledged cursor", async () => {
         const zero = { daemonEpoch: "epoch", sequence: "0" };

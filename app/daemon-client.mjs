@@ -355,6 +355,10 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                 throw new TypeError("sessionId is required");
             return requestResult("set_session_color", { sessionId, color });
         },
+        /** Every model the installed Pi will accept. Listing them runs no inference. */
+        async getModels() {
+            return (await requestResult("get_models", {})).models;
+        },
         async getViewerSnapshot(sessionId) {
             if (typeof sessionId !== "string" || sessionId.length === 0)
                 throw new TypeError("sessionId is required");

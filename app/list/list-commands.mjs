@@ -1,4 +1,4 @@
-/** @typedef {{models:string[],thinkingLevels:string[]}} DraftChoices */
+/** @typedef {{models:string[],thinkingLevels:string[],modelsUnavailable?:{code:string,message:string}}} DraftChoices */
 /** @typedef {{name:string,argumentHint:string,summary:string}} ListCommand */
 
 /** The dashboard's own commands. Each one configures the next launch; none of them reaches a session. */
@@ -11,6 +11,14 @@ export const LIST_COMMAND_MENU = [
     { name: "/help", argumentHint: "", summary: "the dashboard's keys and commands" },
 ];
 export const LIST_COMMANDS = LIST_COMMAND_MENU.map((command) => command.name);
+/**
+ * Pi's own thinking scale, in its off-to-max order, exactly as `pi --thinking <level>` accepts it.
+ * Pi names the levels only in its help text and over a live session's RPC, so the list carries them
+ * rather than parsing prose on the path an operator uses. It is not a validator: a level typed in
+ * full is passed through and Pi refuses it at launch. The canary at the end of list-commands.test.mjs
+ * re-reads `pi --help` and fails when the installed Pi's levels stop matching.
+ */
+export const PI_THINKING_LEVELS = Object.freeze(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 export const EMPTY_DRAFT_CHOICES = Object.freeze({ models: Object.freeze([]), thinkingLevels: Object.freeze([]) });
 
 const ISOLATION_MODES = { worktree: "worktree", shared: "shared_directory", shared_directory: "shared_directory" };
@@ -49,11 +57,12 @@ function modelValue(model) {
 }
 
 /**
- * The values this frontend can offer without asking the daemon or a worker: the draft's own value,
- * whatever the session records in memory report, and the launch defaults.
- * @param {any} draft @param {any[]} sessions @param {any} [defaults] @returns {DraftChoices}
+ * The values a picker can offer: the draft's own value, whatever the session records in memory
+ * report, the launch defaults, and Pi's own catalog when the caller has read it. A cold dashboard
+ * has none of the first three, so the catalog is what makes its picker complete.
+ * @param {any} draft @param {any[]} sessions @param {any} [defaults] @param {{provider:string,id:string}[]} [catalog] @returns {DraftChoices}
  */
-export function draftChoices(draft, sessions, defaults) {
+export function draftChoices(draft, sessions, defaults, catalog = []) {
     const sources = [draft, ...sessions, defaults ?? {}];
     const models = new Set();
     const thinkingLevels = new Set();
@@ -62,7 +71,13 @@ export function draftChoices(draft, sessions, defaults) {
         if (model !== undefined) models.add(model);
         if (typeof source?.thinkingLevel === "string" && source.thinkingLevel !== "") thinkingLevels.add(source.thinkingLevel);
     }
-    return { models: [...models].sort(), thinkingLevels: [...thinkingLevels].sort() };
+    for (const entry of catalog) {
+        const model = modelValue(entry);
+        if (model !== undefined) models.add(model);
+    }
+    // Thinking reads as a scale, so Pi's own order beats alphabetical; anything unnamed follows it.
+    const unnamed = [...thinkingLevels].filter((level) => !PI_THINKING_LEVELS.includes(level)).sort();
+    return { models: [...models].sort(), thinkingLevels: [...PI_THINKING_LEVELS, ...unnamed] };
 }
 
 /** @param {string} code @param {string} message @returns {{kind:"rejected",code:string,message:string}} */
@@ -81,9 +96,12 @@ export function parseListCommand(text, choices) {
     if (!name.startsWith("/")) return { kind: "not_a_command" };
     if (name === "/model") {
         if (argument === "") {
-            return choices.models.length === 0
+            if (choices.models.length > 0) return { kind: "pick_model" };
+            // A refusal names the daemon's own reason when there is one, so an empty picker is never mute.
+            const unavailable = choices.modelsUnavailable;
+            return unavailable === undefined
                 ? rejected("MODEL_CHOICES_UNKNOWN", "No model is known here yet. Type /model provider/id.")
-                : { kind: "pick_model" };
+                : rejected(unavailable.code, `${unavailable.message}. Type /model provider/id.`);
         }
         const separator = argument.indexOf("/");
         const provider = argument.slice(0, separator);

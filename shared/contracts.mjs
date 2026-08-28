@@ -16,6 +16,7 @@ import { parseViewerSnapshot } from "./viewer-contracts.mjs";
 /** @typedef {{schemaVersion:1,revision:number,sessionId:string,sessionFile:string,canonicalSessionFile:string,cwd:string,name?:string,nameGenerated?:boolean,color?:SessionColor,model?:{provider:string,id:string},thinkingLevel?:string,taskState:TaskState,processState:ProcessState,outcome:Outcome,activity:{kind:string,summary:string,updatedAt:string},ownership?:WorkerOwnership,isolation?:IsolationRecord,latestRunId?:string,runtime?:RunRuntimeIdentity,summary?:SessionSummary,createdAt:string,updatedAt:string}} SessionRecord */
 /** @typedef {{mode:"worktree"}|{mode:"shared_directory",confirmedCwd:string,ownerSessionIds:string[]}} LaunchIsolation */
 /** @typedef {{prompt:string,cwd:string,sourceSessionId:string,isolation:LaunchIsolation,model?:{provider:string,id:string},thinkingLevel?:string,name?:string}} LaunchRequest */
+/** @typedef {{provider:string,id:string,thinking:boolean}} CatalogModel */
 /** @typedef {{daemonEpoch:string,sequence:string}} EventCursor */
 /** @typedef {{daemonEpoch:string,sessionId:string,sequence:string}} ViewerCursor */
 /** @typedef {"ACCEPTED"|"DELIVERY_ATTEMPTED"|"WORKER_ACKNOWLEDGED"|"COMPLETED"|"DELIVERY_UNKNOWN"|"FAILED"} CommandStage */
@@ -39,6 +40,8 @@ const QUEUE_MODES = ["all", "one-at-a-time"];
 const SESSION_QUERIES = ["get_session_stats", "get_tree", "export_html"];
 const MAX_QUERY_ROWS = 500;
 const MAX_MENU_ENTRIES = 1_000;
+// Matches MAX_MODELS in runtime/pi-model-catalog.mjs, which stops reading `pi --list-models` there.
+const MAX_CATALOG_MODELS = 2_000;
 
 /** @param {unknown} value @param {string} path @returns {Record<string, any>} */
 function readRecord(value, path) {
@@ -370,7 +373,7 @@ export function parseDaemonResponse(value) {
   if (!response.ok) { requireKeys(response, ["version", "requestId", "ok", "error"], [], "daemon response"); validateError(response.error, "daemon response.error"); return response; }
   requireKeys(response, ["version", "requestId", "ok", "result"], [], "daemon response");
   const result = readRecord(response.result, "daemon response.result");
-  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "subscribed", "acknowledged", "viewer_snapshot", "viewer_subscribed", "viewer_acknowledged", "session_commands", "session_query", "settings", "summaries_refreshing", "session_colored"], "daemon response.result.kind");
+  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "subscribed", "acknowledged", "viewer_snapshot", "viewer_subscribed", "viewer_acknowledged", "session_commands", "session_query", "settings", "models", "summaries_refreshing", "session_colored"], "daemon response.result.kind");
   if (kind === "state") { requireKeys(result, ["kind", "sessions"], [], "daemon response.result"); if (!Array.isArray(result.sessions)) throw new TypeError("sessions must be an array"); result.sessions.forEach((session, index) => validateSession(session, `daemon response.result.sessions[${index}]`)); }
   else if (["launched", "detached"].includes(kind)) { requireKeys(result, ["kind", "sessionId"], [], "daemon response.result"); readIdentifier(result, "sessionId"); }
   else if (kind === "attached") { requireKeys(result, ["kind", "sessionId", "role"], [], "daemon response.result"); readIdentifier(result, "sessionId"); readEnum(result, "role", ["composer", "observer"]); }
@@ -388,6 +391,18 @@ export function parseDaemonResponse(value) {
   else if (kind === "settings") {
     requireKeys(result, ["kind", "summaryModel"], [], "daemon response.result");
     if (result.summaryModel !== null) readModel(result.summaryModel, "daemon response.result.summaryModel");
+  }
+  else if (kind === "models") {
+    requireKeys(result, ["kind", "models"], [], "daemon response.result");
+    if (!Array.isArray(result.models) || result.models.length > MAX_CATALOG_MODELS) throw new TypeError("daemon response.result.models must be a bounded array");
+    result.models.forEach((/** @type {unknown} */ entry, /** @type {number} */ index) => {
+      const path = `daemon response.result.models[${index}]`;
+      const model = readRecord(entry, path);
+      requireKeys(model, ["provider", "id", "thinking"], [], path);
+      readIdentifier(model, "provider", `${path}.provider`);
+      readIdentifier(model, "id", `${path}.id`);
+      if (typeof model.thinking !== "boolean") throw new TypeError(`${path}.thinking must be a boolean`);
+    });
   }
   else if (kind === "session_colored") {
     requireKeys(result, ["kind", "sessionId", "revision", "color"], [], "daemon response.result");

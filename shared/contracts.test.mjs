@@ -69,6 +69,7 @@ const menu = {
   model: { provider: "anthropic", id: "claude" }, thinkingLevel: "high",
 };
 const queryResult = { kind: "session_query", sessionId: "session", query: "get_session_stats", rows: ["messages: 12", "tokens: 3400"] };
+const modelCatalog = { kind: "models", models: [{ provider: "anthropic", id: "claude-opus-4", thinking: true }, { provider: "google", id: "gemini-3-flash", thinking: false }] };
 
 /** @param {Record<string, any>} result */
 const ok = (result) => ({ version: 1, requestId: "request", ok: true, result });
@@ -80,6 +81,8 @@ const acceptedResponses = [
   ["summaries disabled", ok({ kind: "settings", summaryModel: null })],
   ["session state carrying a bounded summary", ok({ kind: "state", sessions: [sessionRecord] })],
   ["session query rows", ok(queryResult)],
+  ["the installed Pi's model catalog", ok(modelCatalog)],
+  ["an empty model catalog", ok({ kind: "models", models: [] })],
   ["typed failure", { version: 1, requestId: "request", ok: false, error: { code: "DENIED", message: "denied", retryable: false } }],
 ];
 
@@ -90,6 +93,11 @@ const rejectedResponses = [
   ["empty session summary text", ok({ kind: "state", sessions: [{ ...sessionRecord, summary: { ...sessionRecord.summary, text: "" } }] }), /summary\.text/u],
   ["unknown query result field", ok({ ...queryResult, unknown: true }), /unknown/iu],
   ["non-string query rows", ok({ ...queryResult, rows: [{ nested: true }] }), /rows/iu],
+  ["unknown model catalog field", ok({ ...modelCatalog, unknown: true }), /unknown/iu],
+  ["unknown field on a catalog model", ok({ kind: "models", models: [{ provider: "anthropic", id: "claude", thinking: true, unknown: true }] }), /unknown/iu],
+  ["a catalog model without a thinking flag", ok({ kind: "models", models: [{ provider: "anthropic", id: "claude" }] }), /thinking/iu],
+  ["a catalog model with a non-boolean thinking flag", ok({ kind: "models", models: [{ provider: "anthropic", id: "claude", thinking: "yes" }] }), /thinking/iu],
+  ["an unbounded model catalog", ok({ kind: "models", models: Array.from({ length: 2_001 }, (_, index) => ({ provider: "p", id: `m-${index}`, thinking: false })) }), /bounded/iu],
   ["unknown field on a failure", { version: 1, requestId: "request", ok: false, error: { code: "DENIED", message: "denied", retryable: false }, unknown: true }, /unknown/iu],
 ];
 

@@ -31,6 +31,7 @@ describe("list slash commands", () => {
         expect(parseListCommand("/model", choices)).toEqual({ kind: "pick_model" });
         expect(parseListCommand("/thinking", choices)).toEqual({ kind: "pick_thinking" });
         expect(parseListCommand("/model", unknown)).toMatchObject({ kind: "rejected", code: "MODEL_CHOICES_UNKNOWN", message: expect.stringContaining("/model provider/id") });
+        expect(parseListCommand("/model", { ...unknown, models: ["anthropic/claude"] })).toEqual({ kind: "pick_model" });
         expect(parseListCommand("/thinking", unknown)).toMatchObject({ kind: "rejected", code: "THINKING_CHOICES_UNKNOWN", message: expect.stringContaining("/thinking") });
     });
     it("sets any typed thinking level", () => {
@@ -77,5 +78,20 @@ describe("list slash commands", () => {
             thinkingLevels: ["high", "low", "max", "off"],
         });
         expect(draftChoices({ model: { provider: "", id: "" }, thinkingLevel: "" }, [], undefined)).toEqual({ models: [], thinkingLevels: [] });
+    });
+    it("offers Pi's own catalog alongside what the frontend has seen, without duplicating either", () => {
+        const catalog = [{ provider: "openai", id: "gpt-6", thinking: true }, { provider: "anthropic", id: "claude", thinking: true }, { provider: "", id: "", thinking: false }];
+        const cold = draftChoices({ model: { provider: "", id: "" }, thinkingLevel: "" }, [], undefined, catalog);
+        expect(cold.models).toEqual(["anthropic/claude", "openai/gpt-6"]);
+        const seen = draftChoices({ model: { provider: "anthropic", id: "claude" }, thinkingLevel: "" }, [], undefined, catalog);
+        expect(seen.models).toEqual(["anthropic/claude", "openai/gpt-6"]);
+    });
+    it("names why it has no models to offer and still takes a model typed in full", () => {
+        const unavailable = { ...unknown, modelsUnavailable: { code: "MODEL_CATALOG_TIMEOUT", message: "Listing Pi models timed out" } };
+        const rejected = parseListCommand("/model", unavailable);
+        expect(rejected).toMatchObject({ kind: "rejected", code: "MODEL_CATALOG_TIMEOUT" });
+        expect(rejected.message).toContain("Listing Pi models timed out");
+        expect(rejected.message).toContain("/model provider/id");
+        expect(parseListCommand("/model openai/gpt-6", unavailable)).toEqual({ kind: "set_model", model: { provider: "openai", id: "gpt-6" } });
     });
 });

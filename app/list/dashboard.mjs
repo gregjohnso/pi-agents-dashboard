@@ -336,6 +336,9 @@ export class DashboardController {
     /** Which command the slash menu highlights, and whether Escape has closed it for this text. */
     commandMenuIndex = 0;
     commandMenuClosed = false;
+    /** Pi's own model list, read when a picker first needs it and kept for this dashboard's life. */
+    modelCatalog;
+    modelCatalogFailure;
     overlay;
     status = { kind: "loading" };
     constructor(options) {
@@ -506,9 +509,30 @@ export class DashboardController {
         this.commandMenuIndex = Math.max(0, Math.min(menu.index + delta, menu.commands.length - 1));
         this.requestRender?.();
     }
-    /** The model and thinking values this frontend can name without asking the daemon or a worker. */
-    draftChoices() {
-        return draftChoices(this.composerDraft, this.sessions, this.launchDefaults);
+    /**
+     * Every model the installed Pi will accept. Spawning `pi --list-models` costs a process, so the
+     * answer is read once, on the first picker that needs it, and never at startup or per keystroke.
+     */
+    async catalogModels() {
+        if (typeof this.backend.getModels !== "function")
+            return [];
+        try {
+            this.modelCatalog ??= Promise.resolve(this.backend.getModels());
+            const models = await this.modelCatalog;
+            this.modelCatalogFailure = undefined;
+            return models;
+        }
+        catch (error) {
+            // A failed read is not cached: the next picker asks the daemon again.
+            this.modelCatalog = undefined;
+            this.modelCatalogFailure = this.typedError(error, "MODEL_CATALOG_UNAVAILABLE");
+            return [];
+        }
+    }
+    /** The model and thinking values a picker can offer, given Pi's catalog if the caller read it. */
+    draftChoices(catalog = []) {
+        const choices = draftChoices(this.composerDraft, this.sessions, this.launchDefaults, catalog);
+        return this.modelCatalogFailure === undefined ? choices : { ...choices, modelsUnavailable: this.modelCatalogFailure };
     }
     /**
      * Run one slash prompt as a dashboard command. It configures the next launch and never reaches
@@ -520,7 +544,8 @@ export class DashboardController {
         const typed = this.composerDraft.prompt.trim();
         // A bare name the menu has narrowed to one command runs that command, so /mo means /model.
         const text = highlighted !== undefined && !/\s/u.test(typed) ? highlighted.name : typed;
-        const choices = this.draftChoices();
+        // Only a bare /model opens a picker over Pi's whole catalog, so only it pays for the read.
+        const choices = this.draftChoices(text === "/model" ? await this.catalogModels() : []);
         const parsed = parseListCommand(text, choices);
         if (parsed.kind === "rejected") {
             this.status = { kind: "error", code: parsed.code, message: parsed.message };

@@ -1,4 +1,4 @@
-/** @typedef {{models:string[],thinkingLevels:string[]}} DraftChoices */
+/** @typedef {{models:string[],thinkingLevels:string[],modelsUnavailable?:{code:string,message:string}}} DraftChoices */
 /** @typedef {{name:string,argumentHint:string,summary:string}} ListCommand */
 
 /** The dashboard's own commands. Each one configures the next launch; none of them reaches a session. */
@@ -49,11 +49,12 @@ function modelValue(model) {
 }
 
 /**
- * The values this frontend can offer without asking the daemon or a worker: the draft's own value,
- * whatever the session records in memory report, and the launch defaults.
- * @param {any} draft @param {any[]} sessions @param {any} [defaults] @returns {DraftChoices}
+ * The values a picker can offer: the draft's own value, whatever the session records in memory
+ * report, the launch defaults, and Pi's own catalog when the caller has read it. A cold dashboard
+ * has none of the first three, so the catalog is what makes its picker complete.
+ * @param {any} draft @param {any[]} sessions @param {any} [defaults] @param {{provider:string,id:string}[]} [catalog] @returns {DraftChoices}
  */
-export function draftChoices(draft, sessions, defaults) {
+export function draftChoices(draft, sessions, defaults, catalog = []) {
     const sources = [draft, ...sessions, defaults ?? {}];
     const models = new Set();
     const thinkingLevels = new Set();
@@ -61,6 +62,10 @@ export function draftChoices(draft, sessions, defaults) {
         const model = modelValue(source?.model);
         if (model !== undefined) models.add(model);
         if (typeof source?.thinkingLevel === "string" && source.thinkingLevel !== "") thinkingLevels.add(source.thinkingLevel);
+    }
+    for (const entry of catalog) {
+        const model = modelValue(entry);
+        if (model !== undefined) models.add(model);
     }
     return { models: [...models].sort(), thinkingLevels: [...thinkingLevels].sort() };
 }
@@ -81,9 +86,12 @@ export function parseListCommand(text, choices) {
     if (!name.startsWith("/")) return { kind: "not_a_command" };
     if (name === "/model") {
         if (argument === "") {
-            return choices.models.length === 0
+            if (choices.models.length > 0) return { kind: "pick_model" };
+            // A refusal names the daemon's own reason when there is one, so an empty picker is never mute.
+            const unavailable = choices.modelsUnavailable;
+            return unavailable === undefined
                 ? rejected("MODEL_CHOICES_UNKNOWN", "No model is known here yet. Type /model provider/id.")
-                : { kind: "pick_model" };
+                : rejected(unavailable.code, `${unavailable.message}. Type /model provider/id.`);
         }
         const separator = argument.indexOf("/");
         const provider = argument.slice(0, separator);

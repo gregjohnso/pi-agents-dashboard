@@ -18,12 +18,16 @@ function editor() {
 }
 function fixture(overrides = {}) {
   let listener;
+  let connectionListener;
   const commands = [];
   const order = [];
   const saved = [];
+  const attached = [];
   const client = {
-    async getSnapshot() { return snapshot(overrides.snapshot); },
+    async getSnapshot() { order.push("snapshot"); return snapshot(overrides.snapshot); },
     subscribe(_sessionId, _cursor, next) { listener = next; return () => order.push("unsubscribe"); },
+    onConnectionChange(next) { connectionListener = next; return () => { connectionListener = undefined; }; },
+    ...(overrides.attach === undefined ? {} : { attach: async (sessionId) => { attached.push(sessionId); return overrides.attach(sessionId); } }),
     async command(operation, payload) { commands.push({ operation, payload }); return overrides.command?.(operation, payload); },
     ...(overrides.query === undefined ? {} : { query: overrides.query }),
     ...(overrides.menu === undefined ? {} : { menu: overrides.menu }),
@@ -32,7 +36,7 @@ function fixture(overrides = {}) {
   const persistence = { async load() { return overrides.persisted; }, async save(value) { await overrides.save?.(value); saved.push(structuredClone(value)); order.push(`persist:${value.cursor?.sequence ?? "draft"}`); } };
   const dashboard = [];
   const instance = new ViewerController({ sessionId: "s", client, editor: overrides.editor ?? editor(), persistence, requestRender: async () => { order.push("render"); }, onReturn: vi.fn(), now: () => 0, onDashboardAction: (action) => dashboard.push(action) });
-  return { instance, client, commands, order, saved, dashboard, emit: (event) => listener(event) };
+  return { instance, client, commands, order, saved, dashboard, attached, emit: (event) => listener(event), connection: (status) => connectionListener(status) };
 }
 
 describe("viewer commands and role restrictions", () => {
@@ -454,6 +458,39 @@ describe("Pi interactive-mode parity", () => {
 
 });
 
+describe("daemon outage", () => {
+  it("says the daemon is unreachable and rebuilds the session when it comes back", async () => {
+    const f = fixture({ attach: async () => ({ role: "composer" }) });
+    await f.instance.open();
+    const view = () => stripVTControlCharacters(f.instance.render(80, 24).join("\n"));
+    expect(view()).not.toContain("Daemon unreachable");
+
+    await f.connection({ connected: false });
+    expect(view()).toContain("Daemon unreachable");
+    expect(f.instance.closedState).toBe(false);
+
+    await f.connection({ connected: true });
+    expect(view()).not.toContain("Daemon unreachable");
+    expect(f.attached).toEqual(["s"]);
+    expect(f.order.filter((entry) => entry === "snapshot")).toHaveLength(2);
+    expect(f.order.filter((entry) => entry === "unsubscribe")).toHaveLength(1);
+
+    // The rebuilt subscription feeds the same transcript, from the new daemon's cursor.
+    await f.emit({ version: 1, sessionId: "s", eventId: "after", cursor: { daemonEpoch: "epoch-2", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "system_message", itemId: "back", text: "daemon is back", level: "info" } });
+    expect(view()).toContain("daemon is back");
+  });
+
+  it("keeps the viewer open and says why when the returning daemon refuses the composer claim", async () => {
+    const f = fixture({ attach: async () => { throw Object.assign(new Error("Another frontend owns this session"), { code: "SESSION_IN_USE" }); } });
+    await f.instance.open();
+    await f.connection({ connected: false });
+    await f.connection({ connected: true });
+
+    expect(f.instance.closedState).toBe(false);
+    expect(stripVTControlCharacters(f.instance.render(80, 24).join("\n"))).toContain("SESSION_IN_USE");
+  });
+});
+
 describe("transcript scrolling keys and wheel", () => {
   const longSnapshot = { items: Array.from({ length: 60 }, (_, index) => ({ kind: "system_message", itemId: `i-${index}`, text: `line ${index}`, level: "info" })) };
 
@@ -470,33 +507,41 @@ describe("transcript scrolling keys and wheel", () => {
     prepare(f);
     f.instance.handleInput("\x1b[A");
     expect(f.instance.transcript.following).toBe(editorKeeps);
-    expect(f.instance.transcript.distanceFromEnd).toBe(editorKeeps ? 0 : 1);
+    expect(f.instance.transcript.linesFromEnd).toBe(editorKeeps ? 0 : 1);
     f.instance.handleInput("\x1b[B");
     expect(f.instance.transcript.following).toBe(true);
-    expect(f.instance.transcript.distanceFromEnd).toBe(0);
+    expect(f.instance.transcript.linesFromEnd).toBe(0);
   });
 
   it("jumps with Home and End, scrolls on the wheel, and clears the new-activity marker at the end", async () => {
     const f = fixture({ snapshot: longSnapshot });
     await f.instance.open();
-    f.instance.render(80, 24);
+    const body = () => stripVTControlCharacters(f.instance.render(80, 24).join("\n"));
+    body();
 
     f.instance.handleMouse({ button: "wheel_up", column: 10, row: 5 });
     expect(f.instance.transcript.following).toBe(false);
-    expect(f.instance.transcript.distanceFromEnd).toBeGreaterThan(0);
+    expect(f.instance.transcript.linesFromEnd).toBe(1);
     f.instance.handleMouse({ button: "wheel_down", column: 10, row: 5 });
     expect(f.instance.transcript.following).toBe(true);
 
+    // Home shows the oldest lines filling the transcript, not one message stranded on a blank screen.
     f.instance.handleInput("\x1b[H");
     expect(f.instance.transcript.following).toBe(false);
-    expect(f.instance.transcript.distanceFromEnd).toBe(59);
+    const top = body();
+    expect(top).toContain("line 0");
+    expect(top).toContain("line 8");
+    expect(top).not.toContain("line 59");
     await f.emit({ version: 1, sessionId: "s", eventId: "e1", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "system_message", itemId: "fresh", text: "fresh", level: "info" } });
-    expect(stripVTControlCharacters(f.instance.render(80, 24).join("\n"))).toContain("new activity");
+    expect(body()).toContain("new activity");
+    expect(body()).toContain("line 0");
 
     f.instance.handleInput("\x1b[F");
     expect(f.instance.transcript.following).toBe(true);
-    expect(f.instance.transcript.distanceFromEnd).toBe(0);
-    expect(stripVTControlCharacters(f.instance.render(80, 24).join("\n"))).not.toContain("new activity");
+    expect(f.instance.transcript.linesFromEnd).toBe(0);
+    const tail = body();
+    expect(tail).not.toContain("new activity");
+    expect(tail).toContain("fresh");
   });
 
 });

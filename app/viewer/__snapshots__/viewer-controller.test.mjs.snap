@@ -160,8 +160,6 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
   ],
   "paused-follow": [
     " pi-dashboard · s · READY/LIVE · COMPOSER",
-    " history 2",
-    "",
     " history 3",
     "",
     " history 4",
@@ -177,6 +175,8 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " history 9",
     "",
     " history 10",
+    "",
+    " history 11",
     "↓ new activity",
     "────────────────────────────────────────────────────────────────────────────────",
     "> ",

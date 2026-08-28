@@ -228,6 +228,53 @@ describe("daemon client", () => {
     await iterator.return?.();
   });
 
+  it("reports the daemon going away and coming back", async () => {
+    const socketPath = await socketPathIn("client-connection-");
+    const server = await daemonServer(socketPath, ({ reply }) => reply({ kind: "subscribed", cursor: { daemonEpoch: "epoch-1", sequence: "0" } }));
+    const client = startClient({ socketPath, reconnectDelayMs: 1 });
+    /** @type {boolean[]} */
+    const connection = [];
+    client.onConnectionChange((status) => connection.push(status.connected));
+    const iterator = client.subscribe()[Symbol.asyncIterator]();
+    await waitFor(() => connection.length === 1);
+
+    server.socket?.destroy();
+    await waitFor(() => connection.length === 3);
+    expect(connection).toEqual([true, false, true]);
+    await iterator.return?.();
+  });
+
+  it("forgets old completed responses instead of retaining every one for the life of the dashboard", async () => {
+    const socketPath = await socketPathIn("client-seen-");
+    const server = await daemonServer(socketPath, ({ reply }) => reply(emptyState));
+    const client = startClient({ socketPath });
+    const state = (/** @type {string} */ requestId) => ({ version: 1, clientId: "client-1", requestId, op: "get_state", payload: {} });
+    for (let index = 0; index < 300; index += 1) await client.request(state(`request-${index}`));
+    const answered = server.requests;
+
+    await client.request(state("request-299"));
+    expect(server.requests).toBe(answered);
+    await client.request(state("request-0"));
+    expect(server.requests).toBe(answered + 1);
+  });
+
+  it("forgets retained snapshots once they outgrow the client's response budget", async () => {
+    const socketPath = await socketPathIn("client-seen-bytes-");
+    const cursor = { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "0" };
+    const activity = { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "source", startedAt: "2026-08-25T00:00:00.000Z" };
+    const snapshot = { version: 1, sessionId: "session-1", registryRevision: 1, cursor, runtime: null, role: "observer", taskState: "READY", processState: "SLEEPING", outcome: "NONE", activity, model: null, thinkingLevel: null, items: [{ kind: "assistant_message", itemId: "answer", content: Array.from({ length: 10 }, () => ({ type: "text", text: "x".repeat(60_000) })) }], tools: [], pendingUi: [], errors: [] };
+    const server = await daemonServer(socketPath, ({ reply }) => reply({ kind: "viewer_snapshot", snapshot }));
+    const client = startClient({ socketPath, maxBytes: 1024 * 1024 });
+    const read = (/** @type {string} */ requestId) => client.request({ version: 1, clientId: "client-1", requestId, op: "get_viewer_snapshot", payload: { sessionId: "session-1" } });
+    for (let index = 0; index < 8; index += 1) await read(`snapshot-${index}`);
+    const answered = server.requests;
+
+    await read("snapshot-7");
+    expect(server.requests).toBe(answered);
+    await read("snapshot-0");
+    expect(server.requests).toBe(answered + 1);
+  });
+
   it("sets a session color without a revision precondition", async () => {
     const socketPath = await socketPathIn("client-color-");
     /** @type {any[]} */

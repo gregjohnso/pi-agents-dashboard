@@ -3,6 +3,16 @@ import { randomUUID } from "node:crypto";
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
 import { parseDaemonResponse, parsePersistedEvent } from "../shared/contracts.mjs";
 import { parseViewerEvent, parseViewerSnapshot } from "../shared/viewer-contracts.mjs";
+/**
+ * How much answered-request history one client keeps to deduplicate a repeated request ID.
+ * Every caller here mints a fresh `randomUUID` per operation, so a repeat only comes from a retry
+ * of a still-recent request; past these bounds the request goes back to the daemon, whose command
+ * journal deduplicates a mutation by clientId and requestId. The character budget is what keeps a
+ * viewer snapshot, the one large response this client can receive, from being retained forever.
+ */
+const MAX_SEEN_REQUESTS = 256;
+const MAX_SEEN_RESPONSE_CHARACTERS = 4 * 1024 * 1024;
+
 export class DaemonClientError extends Error {
     code;
     constructor(code, message) {
@@ -47,15 +57,37 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
     const encoder = createJsonlEncoder({ maxBytes });
     const pending = new Map();
     const seen = new Map();
+    let seenCharacters = 0;
+    /** Forget the oldest answered requests first; a request still in flight is never forgotten. */
+    const evictSeen = () => {
+        for (const [requestId, entry] of seen) {
+            if (seen.size <= MAX_SEEN_REQUESTS && seenCharacters <= MAX_SEEN_RESPONSE_CHARACTERS)
+                return;
+            if (pending.has(requestId))
+                continue;
+            seen.delete(requestId);
+            seenCharacters -= entry.characters ?? 0;
+        }
+    };
     const subscribers = new Set();
     const viewerSubscribers = new Set();
     const fatalErrorListeners = new Set();
+    const connectionListeners = new Set();
     const wakeDelays = new Set();
     let socket;
     let reconnectLoop;
     let closed = false;
     let authenticated = false;
     let everConnected = false;
+    let connectionReported = false;
+    /** Report only transitions: a daemon that stays down keeps retrying without repeating itself. */
+    const reportConnection = (connected) => {
+        if (connectionReported === connected)
+            return;
+        connectionReported = connected;
+        for (const listener of connectionListeners)
+            listener({ connected });
+    };
     const hasWork = () => pending.size > 0 || subscribers.size > 0 || viewerSubscribers.size > 0;
     const reportFatalFrame = (error, fallbackCode) => {
         const typed = error;
@@ -186,6 +218,7 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                             for (const item of pending.values())
                                 sendPending(item);
                             sendSubscriptions();
+                            reportConnection(true);
                             if (!settled) {
                                 settled = true;
                                 resolve();
@@ -206,8 +239,12 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                             continue;
                         pending.delete(response.requestId);
                         const entry = seen.get(response.requestId);
-                        if (entry !== undefined)
+                        if (entry !== undefined) {
                             entry.response = response;
+                            entry.characters = JSON.stringify(response)?.length ?? 0;
+                            seenCharacters += entry.characters;
+                            evictSeen();
+                        }
                         if (item.request.op === "ack" && response.ok && response.result.kind === "acknowledged")
                             applyAcknowledgement(response.result.cursor);
                         if (item.request.op === "ack_viewer" && response.ok && response.result.kind === "viewer_acknowledged")
@@ -234,6 +271,7 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                 socket = undefined;
                 authenticated = false;
             }
+            reportConnection(false);
             const closedError = (submitted = false) => Object.assign(new DaemonClientError("CONNECTION_CLOSED", "Daemon connection closed"), { submitted });
             failAttempt(closedError());
             if (!reconnect) {
@@ -329,7 +367,8 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                 reject = no;
             });
             pending.set(request.requestId, { request, resolve, reject, promise, sent: false });
-            seen.set(request.requestId, { canonical: serialized });
+            seen.set(request.requestId, { canonical: serialized, characters: 0 });
+            evictSeen();
             if (socket !== undefined && authenticated && !socket.destroyed)
                 sendPending(pending.get(request.requestId));
             else
@@ -388,6 +427,11 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
             fatalErrorListeners.add(listener);
             return () => fatalErrorListeners.delete(listener);
         },
+        /** Watch the control connection itself, so a dead daemon is visible instead of a frozen screen. */
+        onConnectionChange(listener) {
+            connectionListeners.add(listener);
+            return () => connectionListeners.delete(listener);
+        },
         async close() {
             if (closed)
                 return;
@@ -405,6 +449,7 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
             subscribers.clear();
             viewerSubscribers.clear();
             fatalErrorListeners.clear();
+            connectionListeners.clear();
             if (socket !== undefined && !socket.destroyed) {
                 await new Promise((resolve) => {
                     socket.once("close", resolve);

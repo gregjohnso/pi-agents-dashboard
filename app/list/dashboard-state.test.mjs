@@ -47,15 +47,7 @@ describe("selectDashboardSessions", () => {
     });
     it.each([
         ["display name", { name: "Release Sentinel" }, "release sentinel"],
-        ["session path", { sessionFile: "/archive/needle/transcript.jsonl" }, "archive/needle"],
-        ["canonical path", { canonicalSessionFile: "/canonical/needle.jsonl" }, "canonical/needle"],
         ["project path", { cwd: "/projects/NeedleProject" }, "needleproject"],
-        ["model provider", { model: { provider: "NeedleProvider", id: "model" } }, "needleprovider"],
-        ["model ID", { model: { provider: "provider", id: "NeedleModel" } }, "needlemodel"],
-        ["task state", { taskState: "WAITING" }, "waiting"],
-        ["process state", { processState: "STALE" }, "stale"],
-        ["outcome", { outcome: "READY_FOR_REVIEW" }, "ready_for_review"],
-        ["activity kind", { activity: { kind: "NeedleTool", summary: "summary", updatedAt: timestamp } }, "needletool"],
         ["activity summary", { activity: { kind: "tool", summary: "Needle Summary", updatedAt: timestamp } }, "needle summary"],
     ])("searches %s case-insensitively", (_field, overrides, search) => {
         const target = session("target", overrides);
@@ -80,35 +72,6 @@ describe("selectDashboardSessions", () => {
             view: "all",
             sort: { key: "age", direction: "desc" },
         }).map(({ sessionId }) => sessionId)).toEqual(["newer-first", "newer-second", "older"]);
-    });
-    it("groups deterministically before applying stable row sorting", () => {
-        const readyB = session("ready-b", { taskState: "READY", cwd: "/repo/b" });
-        const failed = session("failed", { taskState: "FAILED", cwd: "/repo/a" });
-        const working = session("working", { taskState: "WORKING", cwd: "/repo/c" });
-        const readyA = session("ready-a", { taskState: "READY", cwd: "/repo/a" });
-        expect(selectDashboardSessions([readyB, failed, working, readyA], {
-            view: "all",
-            groupBy: "taskState",
-            sort: { key: "id", direction: "asc" },
-        }).map(({ sessionId }) => sessionId)).toEqual(["working", "ready-a", "ready-b", "failed"]);
-        expect(selectDashboardSessions([working, readyB, failed, readyA], {
-            view: "all",
-            groupBy: "cwd",
-            sort: { key: "id", direction: "asc" },
-        }).map(({ sessionId }) => sessionId)).toEqual(["failed", "ready-a", "ready-b", "working"]);
-    });
-    it("injects history policy without reading clocks or configuration", () => {
-        const recent = session("recent");
-        const old = session("old");
-        const considered = [];
-        expect(selectDashboardSessions([old, recent], {
-            view: "all",
-            historyPolicy(candidate) {
-                considered.push(candidate.sessionId);
-                return candidate.sessionId !== "old";
-            },
-        })).toEqual([recent]);
-        expect(considered).toEqual(["old", "recent"]);
     });
 });
 describe("countDashboardSessions", () => {

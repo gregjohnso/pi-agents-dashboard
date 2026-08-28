@@ -8,6 +8,7 @@ const COLUMN_LABELS = {
     spinner: "",
     state: "STATE",
     activity: "ACTIVITY",
+    model: "MODEL",
     age: "AGE",
 };
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu;
@@ -29,6 +30,8 @@ function densityForWidth(width) {
         return "compact";
     return "minimal";
 }
+/** Wide enough for a model id such as claude-opus-5 or gpt-5.6-sol. */
+const MODEL_WIDTH = 16;
 function columnsForWidth(width) {
     if (width <= 0)
         return [];
@@ -37,7 +40,8 @@ function columnsForWidth(width) {
             { key: "spinner", width: 1 },
             { key: "name", width: width >= 100 ? 32 : 26 },
             { key: "state", width: 9 },
-            { key: "activity", width: width - (width >= 100 ? 54 : 48) },
+            { key: "activity", width: width - (width >= 100 ? 54 : 48) - MODEL_WIDTH - 1 },
+            { key: "model", width: MODEL_WIDTH },
             { key: "age", width: 7 },
         ];
     }
@@ -118,6 +122,7 @@ function sessionValues(session, now) {
         state: displaySessionState(session),
         age: age(session.createdAt, now),
         activity: (session.summary?.text ?? session.activity.summary).trim() || "—",
+        model: session.model?.id ?? "—",
     };
 }
 /** Render one dense session row without allocating a component per session. */

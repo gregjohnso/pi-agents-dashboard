@@ -30,7 +30,7 @@ const ENVELOPE_KEYS = ["version", "clientId", "requestId", "op", "payload"];
 export const SESSION_COLORS = ["sky", "green", "amber", "rose", "cyan", "gray"];
 /** @typedef {"sky"|"green"|"amber"|"rose"|"cyan"|"gray"} SessionColor */
 
-const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "session_query", "get_settings", "set_settings", "refresh_summaries", "set_session_color"];
+const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "session_query", "get_settings", "set_settings", "refresh_summaries", "set_session_color", "get_models"];
 const COMMAND_STAGES = ["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED", "DELIVERY_UNKNOWN", "FAILED"];
 const SESSION_COMMANDS = ["set_model", "set_thinking_level", "compact", "set_session_name", "set_auto_compaction", "set_auto_retry", "abort_retry", "set_steering_mode", "set_follow_up_mode"];
 // Pi's own vocabulary for both queue modes; anything else is refused before it reaches a worker.
@@ -182,7 +182,7 @@ export function parseClientRequest(value) {
   const requestId = readIdentifier(request, "requestId");
   const op = readEnum(request, "op", OPERATIONS, "operation");
   const base = { version: 1, clientId, requestId, op };
-  if (["get_state", "get_settings", "refresh_summaries"].includes(op)) {
+  if (["get_state", "get_settings", "refresh_summaries", "get_models"].includes(op)) {
     const payload = readRecord(request.payload, `${op} payload`); rejectUnknownKeys(payload, [], `${op} payload`); return { ...base, payload: {} };
   }
   if (op === "set_settings") {

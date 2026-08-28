@@ -21,6 +21,8 @@ import { openSettingsStore, summarizePromptInput, summarizeWithPi } from "./summ
 import { RegistryStore, applySessionColor, runSessionLifecycle } from "./registry-store.mjs";
 import { reduceSessionState } from "./state-reducer.mjs";
 import { createIdleExit } from "./idle-exit.mjs";
+import { spawn as spawnProcess } from "node:child_process";
+import { createModelCatalog } from "./pi-model-catalog.mjs";
 import { WorkerSupervisor } from "./worker-supervisor.mjs";
 import { loadDashboardConfig } from "../shared/config.mjs";
 import { parseClientRequest } from "../shared/contracts.mjs";
@@ -579,6 +581,7 @@ export async function createDaemonRuntime({
   summarizeSession,
   summaryExecutable = "pi",
   summaryEnv = process.env,
+  modelCatalog = createModelCatalog({ executable: summaryExecutable, spawn: spawnProcess, env: summaryEnv }),
   randomId = randomUUID,
   responseWriter = async (/** @type {any} */ { value, write }) => write(value),
   closeFailpoint = async () => {},
@@ -989,6 +992,11 @@ export async function createDaemonRuntime({
         if (!context.admissionOpen) throw Object.assign(new Error("Daemon is shutting down"), { code: "SHUTTING_DOWN", retryable: true });
         if (request.op === "get_state") return { kind: "state", sessions: await registry.list() };
         if (request.op === "get_settings") return { kind: "settings", ...settingsStore.current() };
+        if (request.op === "get_models") {
+          // Listing models runs no inference; it asks the installed Pi what it will accept.
+          const models = await modelCatalog.models();
+          return { kind: "models", models: models.map((/** @type {any} */ model) => ({ provider: model.provider, id: model.id, thinking: model.thinking })) };
+        }
         if (request.op === "set_settings") return { kind: "settings", ...(await settingsStore.setSummaryModel(request.payload.summaryModel)) };
         if (request.op === "set_session_color") {
           return runSessionLifecycle(registry, request.payload.sessionId, async () => {

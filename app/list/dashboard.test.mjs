@@ -616,7 +616,7 @@ describe("dashboard controller", () => {
         await opening;
         expect(unsubscribe).toHaveBeenCalledOnce();
     });
-    it("provides keyboard and mouse access to filters, sorting, grouping, search, and every launch field", async () => {
+    it("cycles every filter, sort, and grouping from its own chord", async () => {
         const dashboard = controller(new FakeBackend([
             session("a", { taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "approval", summary: "waiting", updatedAt: timestamp } }),
             session("b"),
@@ -634,17 +634,38 @@ describe("dashboard controller", () => {
         expect(dashboard.query).toMatchObject({ search: "w", taskStates: ["WORKING"], processStates: ["LIVE"], outcomes: ["NONE"], activityKinds: ["approval"], sort: { key: "age", direction: "asc" }, groupBy: "taskState" });
         expect(dashboard.selectedSessionId).toBe("a");
         expect(dashboard.render(80, 14).join("\n")).toContain("a");
-        dashboard.handleMouse({ row: 2, column: 2, button: "left" });
-        expect(dashboard.focus).toBe("search");
-        dashboard.focusComposer();
-        const fields = ["prompt", "cwd", "isolationMode", "modelProvider", "modelId", "thinkingLevel", "name"];
-        expect(dashboard.composerField).toBe(fields[0]);
-        for (const field of fields.slice(1)) {
-            dashboard.handleInput("\t");
-            expect(dashboard.composerField).toBe(field);
-        }
         // Only the working directory has a header row now; the rest are set through the slash menu.
         expect(dashboard.render(100, 16).join("\n")).toContain("cwd:");
+    });
+    it("cycles the project filter from Ctrl+W, because Ctrl+J is the Enter byte", async () => {
+        const openSelectedViewer = vi.fn(async () => {});
+        const dashboard = controller(new FakeBackend([session("a", { cwd: "/repo/alpha" })]), { openViewer: openSelectedViewer });
+        await dashboard.open();
+        // Ctrl+J is a line feed, so a terminal cannot tell it from Enter; it opens the selection.
+        dashboard.handleInput("\n");
+        await vi.waitFor(() => expect(openSelectedViewer).toHaveBeenCalledWith("a"));
+        expect(dashboard.query.projectPaths).toBeUndefined();
+
+        dashboard.handleInput("\x17");
+        expect(dashboard.query.projectPaths).toEqual(["/repo/alpha"]);
+    });
+    it("leaves the launch fields to the slash commands: Tab moves nothing and Backspace only trims the prompt", async () => {
+        const dashboard = controller(new FakeBackend([session("a")]));
+        await dashboard.open();
+        for (const character of "go") dashboard.handleInput(character);
+        // Tab used to move an invisible cursor that typing ignored and Backspace obeyed, so a
+        // Backspace after it silently ate the launch cwd.
+        dashboard.handleInput("\t");
+        dashboard.handleInput("\x7f");
+        expect(dashboard.composerDraft.prompt).toBe("g");
+        expect(dashboard.composerField).toBeUndefined();
+        dashboard.handleInput("\x1b[Z");
+        dashboard.handleInput("x");
+        expect(dashboard.composerDraft.prompt).toBe("gx");
+        expect(dashboard.composerDraft.cwd).toBe("/repo");
+        expect(dashboard.composerDraft.model).toEqual({ provider: "anthropic", id: "claude" });
+        expect(dashboard.composerDraft.name).toBe("new task");
+        expect(dashboard.composerDraft.isolationMode).toBe("worktree");
     });
     it("shows a persisted launch model, so a draft the operator cannot fix cannot poison a launch unseen", async () => {
         // The menu hint reads /model [provider/id]; typing it literally persisted this draft, and
@@ -1084,6 +1105,45 @@ describe("mouse clicks", () => {
         const layout = createDashboardLayout(100, 24);
         dashboard.handleMouse({ button: "left", column: 4, row: layout.listTop + 6 });
         expect(dashboard.selectedSessionId).toBe("a");
+    });
+
+    it("does nothing at all where the layout draws no target", async () => {
+        const backend = new FakeBackend([session("a", { cwd: "/repo/alpha" }), session("b", { cwd: "/repo/beta" })]);
+        const opened = [];
+        const dashboard = controller(backend, { openViewer: async (id) => { opened.push(id); } });
+        await dashboard.open();
+        dashboard.render(100, 24);
+        const layout = createDashboardLayout(100, 24);
+        const dockTop = 24 - layout.dockRows;
+        const before = { ...dashboard.query };
+        // The title, the selected session's path, the cwd row, the section border, the column
+        // header, both prompt rules, and the status line are all read-only.
+        for (const row of [0, 1, 2, layout.listTop - 2, layout.listTop - 1, dockTop, dockTop + 2, dockTop + 3]) {
+            for (const column of [0, 2, 40, 99]) {
+                dashboard.handleMouse({ button: "left", column, row });
+                expect(dashboard.query, `row ${row} column ${column}`).toEqual(before);
+                expect(dashboard.focus, `row ${row} column ${column}`).toBe("list");
+                expect(dashboard.selectedSessionId, `row ${row} column ${column}`).toBe("a");
+            }
+        }
+        expect(opened).toEqual([]);
+        expect(dashboard.composerDraft.cwd).toBe("/repo");
+    });
+
+    it("puts the search box away when the prompt row is clicked, wherever the dock sits", async () => {
+        for (const height of [24, 11]) {
+            const dashboard = controller(new FakeBackend([session("a")]));
+            await dashboard.open();
+            dashboard.render(100, height);
+            const layout = createDashboardLayout(100, height);
+            dashboard.handleInput("\x06");
+            expect(dashboard.focus).toBe("search");
+            // The cwd row is not a click target, so the search box keeps the keystrokes.
+            dashboard.handleMouse({ button: "left", column: 4, row: 2 });
+            expect(dashboard.focus, `height ${height}`).toBe("search");
+            dashboard.handleMouse({ button: "left", column: 4, row: height - layout.dockRows + 1 });
+            expect(dashboard.focus, `height ${height}`).toBe("list");
+        }
     });
 });
 describe("wheel scrolling", () => {

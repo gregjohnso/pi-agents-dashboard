@@ -12,6 +12,8 @@ const MAX_TEXT_BYTES = 65_536;
  * envelope and the runtime block, so no amount of use can make a session's snapshot unsendable.
  */
 const MAX_SNAPSHOT_BYTES = 512 * 1024;
+/** Newest session errors carried in a snapshot; each is bounded, their count was not. */
+const MAX_SNAPSHOT_ERRORS = 20;
 
 /** The synthetic head item that tells a viewer its snapshot starts mid-transcript. */
 export const SNAPSHOT_TRUNCATED_ITEM_ID = "viewer-snapshot-truncated";
@@ -562,7 +564,9 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       const item = ordered[index];
       const itemTool = item.kind === "tool" ? tools.get(item.toolId) : undefined;
       const cost = Buffer.byteLength(JSON.stringify(item)) + (itemTool === undefined ? 0 : Buffer.byteLength(JSON.stringify(itemTool))) + 2;
-      if (cost > remaining && window.length > 0) break;
+      // One entry near the durable record limit is left out rather than sent: an unsendable snapshot
+      // is an unopenable session, and the entry stays in the durable stream either way.
+      if (cost > remaining) break;
       remaining -= cost;
       window.push(item);
       if (itemTool !== undefined) windowTools.push(itemTool);
@@ -593,7 +597,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       items: /** @type {any[]} */ ([]),
       tools: /** @type {any[]} */ ([]),
       pendingUi: [...pendingUi.values()],
-      errors: [...errors],
+      errors: errors.slice(-MAX_SNAPSHOT_ERRORS),
     };
     return { ...state, ...boundedWindow(MAX_SNAPSHOT_BYTES - Buffer.byteLength(JSON.stringify(state))) };
   }

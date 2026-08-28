@@ -280,6 +280,19 @@ describe("viewer normalizer", () => {
     expect(republished.items.at(-1)).toMatchObject({ itemId: "answer-63" });
   });
 
+  it("leaves out even the newest entry when it alone would not fit one wire frame", () => {
+    const subject = normalizer();
+    for (let index = 0; index < 40; index += 1) subject.consumeError({ code: `HISTORY_${index}`, message: "y".repeat(4_000) });
+    subject.applyViewerEvent({ version: 1, sessionId: "session-1", eventId: "huge", cursor: { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "1" }, timestamp: AT, payload: { kind: "assistant_message", itemId: "huge", content: Array.from({ length: 12 }, () => ({ type: "text", text: "x".repeat(60_000) })) } });
+    const snapshot = subject.snapshot({ daemonEpoch: "epoch-1", sequence: "1", registryRevision: 1, runtime: null, role: "composer", taskState: "READY", processState: "LIVE", outcome: "NONE" });
+
+    expect(() => parseViewerSnapshot(snapshot)).not.toThrow();
+    expect(() => createJsonlEncoder({ maxBytes: WIRE_FRAME_BYTES }).encode({ version: 1, requestId: "r", ok: true, result: { kind: "viewer_snapshot", snapshot } })).not.toThrow();
+    expect(snapshot.items).toEqual([expect.objectContaining({ itemId: SNAPSHOT_TRUNCATED_ITEM_ID })]);
+    expect(snapshot.errors.length).toBeLessThan(40);
+    expect(snapshot.errors.at(-1)).toMatchObject({ code: "HISTORY_39" });
+  });
+
   it("bounds unknown optional events and reports malformed required shapes as typed session errors", () => {
     const subject = normalizer();
     const events = subject.consumeFrame({ type: "future_pi_event", secret: "x".repeat(100_000) });

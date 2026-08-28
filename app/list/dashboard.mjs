@@ -734,7 +734,7 @@ export class DashboardController {
             this.setError(Object.assign(new Error("The session changed before the action ran"), { code: selected.processState === "LIVE" || selected.ownership !== undefined ? "SESSION_LIVE" : "SESSION_CHANGED" }), "SESSION_CHANGED");
             return;
         }
-        const requestId = this.requestId();
+        let attemptRequestId = this.requestId();
         const { action, sessionId } = confirmation;
         const { revision } = selected;
         // The daemon's stop policy escalates SIGTERM to SIGKILL over seconds. Hand the request off and
@@ -752,7 +752,7 @@ export class DashboardController {
             let attemptRevision = revision;
             for (let attempt = 1; ; attempt += 1) {
                 try {
-                    await this.backend[action](sessionId, attemptRevision, requestId);
+                    await this.backend[action](sessionId, attemptRevision, attemptRequestId);
                     break;
                 }
                 catch (error) {
@@ -767,6 +767,9 @@ export class DashboardController {
                     if (current === undefined || destructiveAction(current) !== action)
                         throw error;
                     attemptRevision = current.revision;
+                    // The journal keys a command by request ID and refuses the same ID carrying a
+                    // different payload, so a re-aimed revision needs its own ID or it conflicts.
+                    attemptRequestId = this.requestId();
                     await new Promise((resolve) => setTimeout(resolve, 25));
                 }
             }
@@ -782,7 +785,7 @@ export class DashboardController {
         catch (error) {
             const typed = error;
             if (typed.code === "DELIVERY_UNKNOWN")
-                this.overlay = createDeliveryUnknownOverlay(typed.clientId ?? this.clientId, typed.requestId ?? requestId);
+                this.overlay = createDeliveryUnknownOverlay(typed.clientId ?? this.clientId, typed.requestId ?? attemptRequestId);
             else
                 this.setError(error, `${action.toUpperCase()}_FAILED`);
         }

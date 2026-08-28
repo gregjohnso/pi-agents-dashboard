@@ -77,6 +77,26 @@ function controller(backend, overrides = {}) {
         ...overrides,
     });
 }
+/**
+ * A destructive backend call that keys its command the way runtime/command-journal.mjs does:
+ * one request ID owns one exact payload, and the same ID with a changed revision is a conflict.
+ */
+function journalledDestructive(refuse) {
+    const revisionsById = new Map();
+    const requestIds = [];
+    return {
+        requestIds,
+        async call(_sessionId, revision, requestId) {
+            requestIds.push(requestId);
+            const recorded = revisionsById.get(requestId);
+            if (recorded !== undefined && recorded !== revision)
+                throw Object.assign(new Error("Request IDs were already used with a different command"), { code: "IDEMPOTENCY_CONFLICT" });
+            revisionsById.set(requestId, revision);
+            refuse(revision);
+            return { accepted: true };
+        },
+    };
+}
 async function processRenderedEvent(dashboard, backend, update) {
     const processing = Promise.resolve(backend.listener?.(update));
     dashboard.render();
@@ -197,11 +217,11 @@ describe("dashboard controller", () => {
     });
     it("keeps retrying a stop against the newest revision instead of failing on churn", async () => {
         const backend = new FakeBackend([session("a", { processState: "LIVE", revision: 4 })]);
-        backend.stop = vi.fn(async (_sessionId, revision) => {
+        const journal = journalledDestructive((revision) => {
             // A working session's record churns constantly, so the revision moves under the request.
             if (revision === 4) throw Object.assign(new Error("Session revision changed before Stop"), { code: "REVISION_CONFLICT" });
-            return { accepted: true };
         });
+        backend.stop = vi.fn(journal.call);
         const dashboard = controller(backend);
         await dashboard.open();
         dashboard.selectSession("a");
@@ -210,6 +230,9 @@ describe("dashboard controller", () => {
         dashboard.handleInput("\x18");
         await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledWith("a", 9, expect.any(String)));
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
+        // The journal keys a command by request ID and refuses the same ID with a changed payload,
+        // so a retry that reuses it can only fail; each attempt carries its own.
+        expect(new Set(journal.requestIds).size).toBe(journal.requestIds.length);
     });
     it("gives up a stop that keeps conflicting and says so", async () => {
         const backend = new FakeBackend([session("a", { processState: "LIVE", revision: 4 })]);
@@ -330,10 +353,10 @@ describe("dashboard controller", () => {
         // The record churns from background writes, and the frontend's cached copy can be many
         // revisions behind, so retrying against the cache conflicts forever.
         const backend = new FakeBackend([session("a", { taskState: "FAILED", processState: "EXITED", revision: 4 })]);
-        backend.delete = vi.fn(async (_sessionId, revision) => {
+        const journal = journalledDestructive((revision) => {
             if (revision !== 25) throw Object.assign(new Error("Session revision changed before Delete"), { code: "REVISION_CONFLICT" });
-            return { accepted: true };
         });
+        backend.delete = vi.fn(journal.call);
         const dashboard = controller(backend);
         await dashboard.open();
         // The daemon has moved on; the frontend still holds revision 4 because no event carried the change.
@@ -344,6 +367,7 @@ describe("dashboard controller", () => {
         dashboard.handleInput("\x18");
         await vi.waitFor(() => expect(backend.delete).toHaveBeenCalledWith("a", 25, expect.any(String)));
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
+        expect(new Set(journal.requestIds).size).toBe(journal.requestIds.length);
     });
     it("coalesces cursor saves across a burst of events and flushes on close", async () => {
         // Each save fsyncs the file and its directory, about 70ms on a network home, so one save per

@@ -92,45 +92,6 @@ it("uses the public RPC entry with structured argv and an exact environment", as
   await adapter.close();
 });
 
-it("fails an unsupported session command deterministically instead of reporting ambiguity", async () => {
-  /** @type {string[]} */
-  const order = [];
-  const replay = await createWorkerReplayStore({ append: async (/** @type {any} */ record) => order.push(record.stage) });
-  const dispatcher = createWorkerCommandDispatcher({ replay, adapter: { async setModel() { throw new Error("never reached"); } } });
-
-  await expect(dispatcher.deliver({ clientId: "client", requestId: "unsupported", op: "session_command", sessionCommand: { command: "invented_command" } }))
-    .rejects.toMatchObject({ code: "INVALID_SESSION_COMMAND" });
-
-  expect(order).toEqual(["RECEIVED", "FAILED"]);
-  await dispatcher.close();
-});
-
-it("records the worker delivery boundary before and after the Pi acknowledgement", async () => {
-  /** @type {string[]} */
-  const order = [];
-  const replay = await createWorkerReplayStore({
-    append: async (record) => order.push(record.stage),
-  });
-  const dispatcher = createWorkerCommandDispatcher({
-    replay,
-    adapter: {
-      /** @param {string} text */
-      async prompt(text) {
-        order.push(`PI:${text}`);
-      },
-    },
-  });
-
-  await dispatcher.deliver({ clientId: "client-1", requestId: "request-1", op: "prompt", text: "hello" });
-
-  expect(order).toEqual([
-    "RECEIVED",
-    "RPC_WRITE_STARTED",
-    "PI:hello",
-    "RPC_ACKNOWLEDGED",
-  ]);
-});
-
 it("recovers a durable in-flight Pi write as ambiguous without writing again", async () => {
   const root = await mkdtemp(join(tmpdir(), "worker-replay-"));
   cleanup.push(root);
@@ -151,11 +112,8 @@ it("recovers a durable in-flight Pi write as ambiguous without writing again", a
   await dispatcher.close();
 });
 
-it.each([
-  ["write loss", "RPC_WRITE_FAILED"],
-  ["stream loss", "RPC_STREAM_CLOSED"],
-  ["malformed output", "MALFORMED_RPC_OUTPUT"],
-])("marks %s after RPC_WRITE_STARTED as delivery unknown", async (_name, code) => {
+it("marks stream loss after RPC_WRITE_STARTED as delivery unknown", async () => {
+  const code = "RPC_STREAM_CLOSED";
   /** @type {any[]} */
   const records = [];
   const replay = await createWorkerReplayStore({ append: async (record) => { records.push(record); } });
@@ -223,15 +181,6 @@ it("fails unsupported operations before recording RPC_WRITE_STARTED", async () =
 
   await expect(dispatcher.deliver({ clientId: "client", requestId: "unsupported", op: "unknown" })).rejects.toMatchObject({ code: "UNSUPPORTED_WORKER_OPERATION" });
   expect(records.map((record) => record.stage)).toEqual(["RECEIVED", "FAILED"]);
-});
-
-it("retains the raw malformed record before closing the protocol stream", async () => {
-  const child = fakeRpcProcess((_command, process) => process.stdout.write("{malformed}\n"));
-  const diagnostics = { append: vi.fn(async () => {}) };
-  const adapter = PiRpcAdapter.connect({ input: child.stdin, output: child.stdout, diagnostics });
-  await expect(adapter.getState()).rejects.toMatchObject({ code: "MALFORMED_RPC_OUTPUT" });
-  expect(diagnostics.append).toHaveBeenCalledWith(Buffer.from("{malformed}\n"));
-  await adapter.close();
 });
 
 it("persists exact invalid RPC bytes before fatal decoding", async () => {

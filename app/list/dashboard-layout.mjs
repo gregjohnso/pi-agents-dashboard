@@ -92,8 +92,9 @@ function joinCells(layout, values, paintCell, paintSeparator) {
 export function renderColumnHeader(layout) {
     return joinCells(layout, COLUMN_LABELS, (_key, text) => jobwatchTheme.header(text), (text) => jobwatchTheme.header(text));
 }
-function age(updatedAt, now) {
-    const updated = Date.parse(updatedAt);
+/** How long the session has existed. Last-activity age reads as "0m" for a day-old session that just replied. */
+function age(createdAt, now) {
+    const updated = Date.parse(createdAt);
     if (!Number.isFinite(updated))
         return "—";
     const seconds = Math.max(0, Math.floor((now - updated) / 1_000));
@@ -115,7 +116,7 @@ function sessionValues(session, now) {
         name: (session.name ?? "").trim() || truncateToWidth(plainText(session.sessionId), 8, ""),
         spinner: displaySessionState(session) === "WORKING" ? spinnerFrame(now) : "",
         state: displaySessionState(session),
-        age: age(session.updatedAt, now),
+        age: age(session.createdAt, now),
         activity: (session.summary?.text ?? session.activity.summary).trim() || "—",
     };
 }

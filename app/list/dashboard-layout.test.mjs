@@ -129,6 +129,16 @@ it("bolds the selected row without altering its colors", () => {
 });
 
 
+it("ages a session from when it started, not from its last activity", () => {
+    const layout = createDashboardLayout(120, 20);
+    const started = new Date(now - 3 * 60 * 60 * 1000).toISOString();
+    const justSpoke = new Date(now - 30 * 1000).toISOString();
+    const row = stripVTControlCharacters(renderSessionRow(session("old", { createdAt: started, updatedAt: justSpoke }), layout, { now }));
+    // A session running since this morning must not read as one minute old because it just replied.
+    expect(row).toContain("3h");
+    expect(row).not.toContain("30s");
+});
+
 it("spins an unlabelled column left of STATE so the state text never shifts", () => {
     const layout = createDashboardLayout(100, 24);
     const spinner = /[\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f]/u;

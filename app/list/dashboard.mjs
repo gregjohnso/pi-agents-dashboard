@@ -195,6 +195,8 @@ function cycleValue(values, current) {
  * mouse hit-test measures, and what it does. Array order is the left-to-right order of the segments.
  * Ctrl+J is the same byte as Enter, which handleInput answers first, so only its click reaches here.
  */
+/** Matches StopClearGesture's default window; the hint must vanish exactly when the gesture does. */
+const STOP_CLEAR_WINDOW_MS = 500;
 const CONTROLS = [
     { key: Key.ctrl("f"), segment: (dashboard) => `/search:${dashboard.query.search ?? ""}`, activate: (dashboard) => { dashboard.focus = "search"; } },
     { key: Key.ctrl("v"), segment: (dashboard) => `v:${dashboard.query.view}`, activate: (dashboard) => dashboard.cycleView() },
@@ -304,6 +306,7 @@ export class DashboardController {
     /** Launches sent but not yet answered, shown as STARTING rows so a prompt never looks lost. */
     pendingLaunches = [];
     stopRetryLimit;
+    clearHintTimer;
     query = defaultQuery();
     focus = "list";
     composerField = "prompt";
@@ -523,9 +526,15 @@ export class DashboardController {
             void this.confirmSession({ ...createSessionConfirmation(selected), clearingStopped: true });
             return;
         }
-        this.stopClearGesture.armAfterStop(selected.sessionId);
-        this.status = { kind: "pending", code: "CLEAR_ARMED", message: `Press Ctrl+X again to clear ${selected.name ?? selected.sessionId}` };
-        this.onSessionIntent?.(createSessionIntent(selected));
+        this.armClear(selected);
+    }
+    /** Arm the clear and repaint once the window lapses, so the hint disappears on its own. */
+    armClear(session) {
+        this.stopClearGesture.armAfterStop(session.sessionId);
+        this.onSessionIntent?.(createSessionIntent(session));
+        clearTimeout(this.clearHintTimer);
+        this.clearHintTimer = setTimeout(() => this.requestRender?.(), STOP_CLEAR_WINDOW_MS + 1);
+        this.clearHintTimer.unref?.();
         this.requestRender?.();
     }
     async confirmSession(confirmation) {
@@ -571,8 +580,11 @@ export class DashboardController {
                 }
             }
             // Arm only after the stop landed, so a single press can never remove a running session.
-            if (action === "stop")
-                this.stopClearGesture.armAfterStop(sessionId);
+            if (action === "stop") {
+                const stopped = this.sessions.find((candidate) => candidate.sessionId === sessionId);
+                if (stopped !== undefined)
+                    this.armClear(stopped);
+            }
             if (this.status.kind === "pending" && this.status.code === `${action.toUpperCase()}_SENT`)
                 this.status = { kind: "ready" };
         }
@@ -770,7 +782,10 @@ export class DashboardController {
                 // The rule closes the prompt box; launch settings and the selected path are context below it.
                 const formRow = layout.dockRows >= 5 ? dockTop + 3 : dockTop + 2;
                 if (layout.dockRows >= 5) lines[dockTop + 2] = sectionFooter(this.width, confirmingSharedLaunch);
-                lines[formRow] = paintPlainLine(this.status.kind === "error" ? ` ${this.status.code}: ${this.status.message}  ${form}` : form, this.width, this.status.kind === "error" ? jobwatchTheme.error : jobwatchTheme.surface);
+                // An armed clear is the one thing on this row worth interrupting for, and it expires on its own.
+                lines[formRow] = this.stopClearArmed
+                    ? paintPlainLine(" ctrl+x to confirm", this.width, jobwatchTheme.error)
+                    : paintPlainLine(this.status.kind === "error" ? ` ${this.status.code}: ${this.status.message}  ${form}` : form, this.width, this.status.kind === "error" ? jobwatchTheme.error : jobwatchTheme.surface);
                 if (layout.dockRows >= 6) lines[dockTop + 4] = paintPlainLine(this.selectedCwdLine(), this.width, jobwatchTheme.keyHints);
                 lines[lines.length - 1] = paintPlainLine(" Ctrl+C quit  ↑↓ navigate  Enter/→ open  ←/Esc back  type to compose  Tab fields  ^X action  ^G help", this.width, jobwatchTheme.keyHints);
             }

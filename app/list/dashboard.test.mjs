@@ -3,6 +3,7 @@ import { stripVTControlCharacters } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 
 import { DashboardController, createDaemonDashboardBackend, } from "./dashboard.mjs";
+import { JOBWATCH_ANSI } from "./dashboard-theme.mjs";
 const timestamp = "2026-08-25T12:00:00.000Z";
 function session(id, overrides = {}) {
     return {
@@ -258,6 +259,22 @@ describe("dashboard controller", () => {
         dashboard.handleInput("\x18");
         await vi.waitFor(() => expect(backend.delete).toHaveBeenCalledWith("a", 2, expect.any(String)));
     });
+    it("shows a red confirm hint while the clear is armed and drops it when the window passes", async () => {
+        let clock = 0;
+        const backend = new FakeBackend([session("a", { taskState: "STOPPED", processState: "EXITED" })]);
+        const dashboard = controller(backend, { now: () => clock });
+        await dashboard.open();
+        dashboard.setView("all");
+        dashboard.selectSession("a");
+
+        dashboard.handleInput("\x18");
+        const armed = dashboard.render(100, 24);
+        expect(armed.map(stripVTControlCharacters).some((line) => line.includes("ctrl+x to confirm"))).toBe(true);
+        expect(armed.find((line) => stripVTControlCharacters(line).includes("ctrl+x to confirm"))).toContain(JOBWATCH_ANSI.rose);
+
+        clock = 600;
+        expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("ctrl+x to confirm"))).toBe(false);
+    });
     it("requires two presses to clear a session that was already stopped", async () => {
         let clock = 0;
         const backend = new FakeBackend([session("a", { taskState: "STOPPED", processState: "EXITED" })]);
@@ -269,7 +286,7 @@ describe("dashboard controller", () => {
         // A dead session cannot be stopped, so the first press only arms the clear.
         dashboard.handleInput("\x18");
         expect(backend.delete).not.toHaveBeenCalled();
-        expect(dashboard.status).toMatchObject({ kind: "pending", code: "CLEAR_ARMED" });
+        expect(dashboard.stopClearArmed).toBe(true);
 
         clock = 300;
         dashboard.handleInput("\x18");
@@ -286,7 +303,7 @@ describe("dashboard controller", () => {
         clock = 900;
         dashboard.handleInput("\x18");
         expect(backend.delete).not.toHaveBeenCalled();
-        expect(dashboard.status).toMatchObject({ kind: "pending", code: "CLEAR_ARMED" });
+        expect(dashboard.stopClearArmed).toBe(true);
     });
     it("coalesces cursor saves across a burst of events and flushes on close", async () => {
         // Each save fsyncs the file and its directory, about 70ms on a network home, so one save per

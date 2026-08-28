@@ -1142,6 +1142,25 @@ it("relaunches a stopped session whose recorded worker processes are both gone",
   client.close();
 });
 
+it("records the model Pi actually selected so the list can show it", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const identity = { pid: 621, startIdentity: "modelled-worker", processGroupId: 621 };
+  const piChild = { pid: 622, startIdentity: "modelled-pi", processGroupId: 621 };
+  const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === 621 ? identity : piChild;
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const now = "2026-08-25T12:00:00.000Z";
+  // A launch that names no model still runs on Pi's default, and the row must say which.
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "modelled", sessionFile: "/sessions/modelled.jsonl", canonicalSessionFile: "/sessions/modelled.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "assistant_final", summary: "done", updatedAt: now }, ownership: { kind: "managed", runId: "run-modelled", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-modelled", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "modelled", runId: "run-modelled", leaseId: "lease-modelled", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  const runtime = await createDaemonRuntime({ root: stateRoot, inspect });
+  runtimes.push(runtime);
+  startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "modelled", runId: "run-modelled", leaseId: "lease-modelled", generation: 1, identity, piChildIdentity: piChild, token: "modelled-token", results: { get_state: { sessionId: "modelled", isStreaming: false, model: { provider: "openai-codex", id: "gpt-5.6-sol" }, thinkingLevel: "high" } } });
+  await runtime.ready;
+
+  await vi.waitFor(async () => expect(await registry.get("modelled")).toMatchObject({ model: { provider: "openai-codex", id: "gpt-5.6-sol" }, thinkingLevel: "high" }), { timeout: 5_000 });
+});
+
 it("refuses an activating attach while the recorded Pi child of a gone supervisor is alive", async () => {
   const stateRoot = await root();
   for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });

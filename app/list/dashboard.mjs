@@ -928,7 +928,7 @@ export class DashboardController {
             if (lines.length > 1)
                 lines[1] = paintPlainLine(this.contextLine(), this.width, jobwatchTheme.keyHints);
             // One launch setting per row, above the list, so each is readable without truncation.
-            if (layout.listTop >= 9) {
+            if (layout.listTop >= 5) {
                 for (const [offset, [field, label, value]] of this.launchSettingRows().entries()) {
                     const active = this.composerField === field;
                     lines[2 + offset] = paintPlainLine(`${active ? " ❯ " : "   "}${label}: ${value}`, this.width, active ? jobwatchTheme.focusBorder : jobwatchTheme.surface);
@@ -950,7 +950,7 @@ export class DashboardController {
                 const draftPrompt = this.composerDraft.prompt;
                 lines[dockTop] = sectionBorder(this.composerField === "prompt" ? "" : COMPOSER_FIELD_LABELS[this.composerField], this.width, confirmingSharedLaunch);
                 lines[dockTop + 1] = paintPlainLine(` ❯ ${draftPrompt || "describe a task for a new session"}`, this.width, draftPrompt ? (text) => jobwatchTheme.text(text, false) : (text) => jobwatchTheme.muted(text, false));
-                const form = layout.listTop >= 9 ? "" : ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
+                const form = layout.listTop >= 5 ? "" : ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
                 // The rule closes the prompt box; launch settings and the selected path are context below it.
                 const formRow = layout.dockRows >= 4 ? dockTop + 3 : dockTop + 2;
                 if (layout.dockRows >= 4) lines[dockTop + 2] = sectionFooter(this.width, confirmingSharedLaunch);
@@ -1045,13 +1045,9 @@ export class DashboardController {
     /** The next session's settings, one per row: field key, label, and current value. */
     launchSettingRows() {
         const draft = this.composerDraft;
-        return [
-            ["cwd", "cwd", draft.cwd],
-            ["isolationMode", "isolation", draft.isolationMode],
-            ["modelId", "model", `${draft.model.provider}/${draft.model.id}`],
-            ["thinkingLevel", "thinking", draft.thinkingLevel],
-            ["name", "name", draft.name === "" ? "(the agent names it)" : draft.name],
-        ];
+        // Only the working directory earns a row: the MODEL column reports each session's own model,
+        // and the rest are set through the slash menu when they matter.
+        return [["cwd", "cwd", draft.cwd]];
     }
     /** The selected session's working directory, plus any active filters. */
     contextLine() {

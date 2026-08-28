@@ -720,6 +720,8 @@ export async function createDaemonRuntime({
         const durableRequest = { version: 1, clientId, requestId: id, op: "get_state", payload: { sessionId: metadata.sessionId } };
         const result = await context.sendWorkerCommand(route, id, durableRequest);
         const streaming = result?.result?.isStreaming;
+        // Pi is the authority on which model a session runs: a launch that names none still gets one.
+        await context.recordSessionModel(metadata, result?.result);
         if (typeof streaming !== "boolean") return;
         const derived = streaming ? "WORKING" : "READY";
         await runSessionLifecycle(registry, metadata.sessionId, async () => {
@@ -728,6 +730,30 @@ export async function createDaemonRuntime({
           if (current.taskState === derived || (current.taskState !== "WORKING" && current.taskState !== "READY")) return;
           const next = reduceSessionState(current, { type: streaming ? "TURN_STARTED" : "TURN_COMPLETED", at: new Date().toISOString() });
           const updated = await registry.update(current.sessionId, current.revision, { taskState: next.taskState, processState: next.processState, outcome: next.outcome, activity: next.activity, updatedAt: next.updatedAt });
+          await context.publishSession(updated);
+        });
+      },
+      /**
+       * Store the model and thinking level Pi reported, so the list shows what a session actually runs
+       * rather than only what the launch happened to ask for.
+       * @param {any} metadata @param {any} state
+       */
+      async recordSessionModel(metadata, state) {
+        const model = state?.model;
+        const thinkingLevel = state?.thinkingLevel;
+        const named = typeof model?.provider === "string" && typeof model?.id === "string";
+        if (!named && typeof thinkingLevel !== "string") return;
+        await runSessionLifecycle(registry, metadata.sessionId, async () => {
+          const current = await registry.get(metadata.sessionId);
+          if (current === undefined || current.ownership?.runId !== metadata.runId) return;
+          const sameModel = !named || (current.model?.provider === model.provider && current.model?.id === model.id);
+          const sameThinking = typeof thinkingLevel !== "string" || current.thinkingLevel === thinkingLevel;
+          if (sameModel && sameThinking) return;
+          const updated = await registry.update(current.sessionId, current.revision, {
+            ...(named ? { model: { provider: model.provider, id: model.id } } : {}),
+            ...(typeof thinkingLevel === "string" ? { thinkingLevel } : {}),
+            updatedAt: new Date().toISOString(),
+          });
           await context.publishSession(updated);
         });
       },

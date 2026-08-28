@@ -599,11 +599,8 @@ describe("dashboard controller", () => {
             dashboard.handleInput("\t");
             expect(dashboard.composerField).toBe(field);
         }
-        const rendered = dashboard.render(100, 16).join("\n");
-        expect(rendered).toContain("isolation:");
-        expect(rendered).toContain("model:");
-        expect(rendered).toContain("thinking:");
-        expect(rendered).toContain("name:");
+        // Only the working directory has a header row now; the rest are set through the slash menu.
+        expect(dashboard.render(100, 16).join("\n")).toContain("cwd:");
     });
     describe("slash commands", () => {
         function typed(dashboard, text) {

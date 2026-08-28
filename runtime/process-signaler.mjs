@@ -60,7 +60,7 @@ function sameIdentity(actual, expected) {
  * The timing policy is the validated `config.stop` object from shared/config.ts.
  *
  * @param {{ pid: number, processGroupId: number, startIdentity: string }} ownership
- * @param {{ inspect(pid: number): Promise<unknown>, requestGraceful(ownership: { pid: number, processGroupId: number, startIdentity: string }): Promise<void>, signalProcessGroup(processGroupId: number, signal: NodeJS.Signals): void | Promise<void>, sleep(ms: number): Promise<void>, abortSignal?: AbortSignal }} deps
+ * @param {{ inspect(pid: number): Promise<unknown>, requestGraceful(ownership: { pid: number, processGroupId: number, startIdentity: string }): Promise<void>, signalProcessGroup(processGroupId: number, signal: NodeJS.Signals): void | Promise<void>, sleep(ms: number): Promise<void>, now?: () => number, abortSignal?: AbortSignal }} deps
  * @param {{ gracefulMs: number, terminateMs: number }} [policy]
  */
 export async function stopVerifiedProcessGroup(ownership, deps, policy) {
@@ -100,17 +100,18 @@ export async function stopVerifiedProcessGroup(ownership, deps, policy) {
     }
   };
 
+  // The window is a deadline, not a sum of sleeps: polling cost must not push the next signal past it.
+  const clock = typeof deps.now === "function" ? deps.now : Date.now;
   /** @param {number} windowMs */
   const awaitBoundary = async (windowMs) => {
-    let remaining = windowMs;
+    const deadline = clock() + windowMs;
     let observed = "MATCH";
-    while (remaining > 0 && observed === "MATCH") {
-      const interval = Math.min(EXIT_POLL_INTERVAL_MS, remaining);
-      await deps.sleep(interval);
-      remaining -= interval;
+    for (;;) {
+      const remaining = deadline - clock();
+      if (observed !== "MATCH" || remaining <= 0) return observed;
+      await deps.sleep(Math.min(EXIT_POLL_INTERVAL_MS, remaining));
       observed = await inspect();
     }
-    return observed;
   };
 
   const initial = await inspect();

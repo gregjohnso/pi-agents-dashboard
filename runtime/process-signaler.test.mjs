@@ -15,18 +15,23 @@ const policy = loadDashboardConfig({
 }).stop;
 /** One poll per stop window, so a sequence inspector covers each boundary exactly once. */
 const singlePoll = { gracefulMs: EXIT_POLL_INTERVAL_MS, terminateMs: EXIT_POLL_INTERVAL_MS };
+/** Each identity check costs time on the virtual clock, the way a /proc read does. */
+const INSPECT_MS = 3;
 
 /** @param {unknown[]} inspections @param {any} [options] */
 function dependencies(inspections, options = {}) {
   const inspector = createSequenceInspector(inspections);
   const signaler = createFakeSignaler();
   const sleeper = options.sleeper ?? createFakeSleep();
+  let clock = 0;
   return {
     deps: {
       inspect: inspector.inspect,
       requestGraceful: signaler.requestGraceful,
       signalProcessGroup: signaler.signalProcessGroup,
-      sleep: sleeper.sleep,
+      /** @param {number} ms */
+      sleep: async (ms) => { clock += ms; await sleeper.sleep(ms); },
+      now: () => clock,
       abortSignal: options.abortSignal,
     },
     inspector,
@@ -50,31 +55,34 @@ it.each([
   ["the reviewed release defaults", loadDashboardConfig({}).stop],
   ["a configured stop policy", policy],
 ])("escalates graceful, TERM, then KILL on the recorded group using %s", async (_label, timing) => {
-  /** @type {string[]} */
+  /** @type {Array<{ at: number, event: string }>} */
   const order = [];
+  let clock = 0;
   let killed = false;
   const exited = Object.assign(new Error("gone"), { code: "ESRCH" });
-  /** @param {string} from @param {string} to */
-  const sleptBetween = (from, to) => order.slice(order.indexOf(from) + 1, order.indexOf(to))
-    .filter((entry) => entry.startsWith("sleep:"))
-    .reduce((total, entry) => total + Number(entry.slice("sleep:".length)), 0);
+  /** @param {string} event */
+  const at = (event) => order.find((entry) => entry.event === event)?.at ?? Number.NaN;
 
   const result = await stopVerifiedProcessGroup(ownership, {
-    async inspect(pid) { order.push(`inspect:${pid}`); if (killed) throw exited; return ownership; },
-    async requestGraceful() { order.push("graceful"); },
-    async signalProcessGroup(pgid, signal) { order.push(`signal:${pgid}:${signal}`); killed = signal === "SIGKILL"; },
-    async sleep(ms) { order.push(`sleep:${ms}`); },
+    async inspect(pid) { order.push({ at: clock, event: `inspect:${pid}` }); clock += INSPECT_MS; if (killed) throw exited; return ownership; },
+    async requestGraceful() { order.push({ at: clock, event: "graceful" }); },
+    async signalProcessGroup(pgid, signal) { order.push({ at: clock, event: `signal:${pgid}:${signal}` }); killed = signal === "SIGKILL"; },
+    async sleep(ms) { clock += ms; },
+    now: () => clock,
   }, timing);
 
   expect(result).toEqual({ disposition: "KILLED" });
-  expect(order.filter((entry) => entry.startsWith("graceful") || entry.startsWith("signal:"))).toEqual([
-    "graceful", "signal:654:SIGTERM", "signal:654:SIGKILL",
-  ]);
+  const events = order.map((entry) => entry.event);
+  expect(events.filter((event) => !event.startsWith("inspect"))).toEqual(["graceful", "signal:654:SIGTERM", "signal:654:SIGKILL"]);
   for (const action of ["graceful", "signal:654:SIGTERM", "signal:654:SIGKILL"]) {
-    expect(order[order.indexOf(action) - 1]).toBe("inspect:321");
+    expect(events[events.indexOf(action) - 1]).toBe("inspect:321");
   }
-  expect(sleptBetween("graceful", "signal:654:SIGTERM")).toBe(timing.gracefulMs);
-  expect(sleptBetween("signal:654:SIGTERM", "signal:654:SIGKILL")).toBe(timing.terminateMs);
+  /** @type {Array<[string, string, number]>} */
+  const windows = [["graceful", "signal:654:SIGTERM", timing.gracefulMs], ["signal:654:SIGTERM", "signal:654:SIGKILL", timing.terminateMs]];
+  for (const [from, to, windowMs] of windows) {
+    expect(at(to) - at(from)).toBeGreaterThanOrEqual(windowMs);
+    expect(at(to) - at(from)).toBeLessThan(windowMs + EXIT_POLL_INTERVAL_MS + INSPECT_MS);
+  }
 });
 
 it("escalates as soon as a graceful exit is observed instead of waiting out the window", async () => {

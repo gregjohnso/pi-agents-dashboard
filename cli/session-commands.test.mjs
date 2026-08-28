@@ -249,6 +249,14 @@ it.each([
   await closeServer(server);
 });
 
+it("reports a read-only timeout as a timeout, never as an ambiguous delivery", async () => {
+  const root = await stateRoot();
+  const server = await daemonServer(root, () => {}, undefined, { closeOnInputEnd: false });
+  const requester = createDaemonRequester({ root, clientId: "cli-stable", maxBytes: 4096, timeoutMs: 100 });
+  await expect(requester("get_state", {}, "read-only-request")).rejects.toMatchObject({ code: "DAEMON_REQUEST_TIMEOUT" });
+  await closeServer(server);
+});
+
 it("returns one validated response when the peer immediately ends the connection", async () => {
   const root = await stateRoot();
   const response = { version: 1, requestId: "response-boundary", ok: true, result: { kind: "state", sessions: [] } };

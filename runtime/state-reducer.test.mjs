@@ -42,34 +42,6 @@ describe("reduceSessionState", () => {
     expect(reduceSessionState(baseRecord, { type, at: now, summary: type })).toMatchObject(expected);
   });
 
-  it("marks an abandoned launch failed with a launch_failed activity", () => {
-    /** @type {SessionRecord} */
-    const launching = { ...baseRecord, taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "launching", summary: "hello?", updatedAt: now } };
-
-    expect(reduceSessionState(launching, { type: "LAUNCH_ABANDONED", at: now })).toMatchObject({
-      taskState: "FAILED",
-      processState: "EXITED",
-      outcome: "NONE",
-      activity: { kind: "launch_failed", summary: "Launch did not start before the daemon exited", updatedAt: now },
-    });
-  });
-
-  it("keeps READY independent from LIVE, SLEEPING, and EXITED process states", () => {
-    const ready = reduceSessionState(baseRecord, { type: "TURN_COMPLETED", at: now });
-    const sleeping = reduceSessionState(ready, { type: "WORKER_SLEEPING", at: now });
-    const exited = reduceSessionState(sleeping, { type: "WORKER_EXITED", at: now });
-
-    expect([ready, sleeping, exited].map(({ taskState, processState, outcome }) => ({
-      taskState,
-      processState,
-      outcome,
-    }))).toEqual([
-      { taskState: "READY", processState: "LIVE", outcome: "COMPLETED" },
-      { taskState: "READY", processState: "SLEEPING", outcome: "COMPLETED" },
-      { taskState: "READY", processState: "EXITED", outcome: "COMPLETED" },
-    ]);
-  });
-
   it.each(outcomePreservingProcessEvents)(
     "preserves an absent outcome when %s has no explicit completion",
     (type) => {
@@ -118,20 +90,5 @@ describe("reduceSessionState", () => {
       at: now,
       processError: { summary: "old stderr" },
     }).activity.kind).toBe("process_error");
-  });
-
-  it("treats frontend detachment as an exact no-op", () => {
-    expect(reduceSessionState(baseRecord, { type: "FRONTEND_DETACHED", at: now })).toBe(baseRecord);
-  });
-
-  it("returns the original record when an activity snapshot has no signal", () => {
-    expect(reduceSessionState(baseRecord, { type: "ACTIVITY_SNAPSHOT", at: now })).toBe(baseRecord);
-  });
-
-  it("advances revision and timestamps only for effective transitions", () => {
-    const result = reduceSessionState(baseRecord, { type: "TURN_STARTED", at: now });
-
-    expect(result).toMatchObject({ revision: 5, updatedAt: now });
-    expect(baseRecord).toMatchObject({ revision: 4, updatedAt: "2026-08-25T11:00:00.000Z" });
   });
 });

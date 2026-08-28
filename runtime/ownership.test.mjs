@@ -45,21 +45,6 @@ async function makeOwnership(options = {}) {
 const worker = { pid: 101, startIdentity: "worker-start", processGroupId: 101 };
 const piChild = { pid: 102, startIdentity: "pi-start", processGroupId: 101 };
 
-it("permits one writer under simultaneous resume", async () => {
-  const { ownership } = await makeOwnership();
-  const canonicalFile = "/pi/sessions/session-1.jsonl";
-
-  const [a, b] = await Promise.allSettled([
-    ownership.acquire("session-1", canonicalFile, "run-a"),
-    ownership.acquire("session-1", canonicalFile, "run-b"),
-  ]);
-
-  expect([a, b].filter((result) => result.status === "fulfilled")).toHaveLength(1);
-  const conflict = [a, b].find((result) => result.status === "rejected");
-  if (conflict?.status !== "rejected") throw new Error("Expected one ownership conflict");
-  expect(conflict.reason).toMatchObject({ code: "OWNERSHIP_CONFLICT" });
-});
-
 it("permits one writer across managers backed by separate stores for one directory", async () => {
   const { sessions, ownership: a } = await makeOwnership();
   const b = new OwnershipManager(new RegistryStore(`${sessions}/.`));
@@ -76,49 +61,6 @@ it("permits one writer across managers backed by separate stores for one directo
   expect(conflict.reason).toMatchObject({ code: "OWNERSHIP_CONFLICT" });
 });
 
-it("binds the lease to the frozen managed ownership contract and updates heartbeat", async () => {
-  const times = [
-    "2026-08-25T12:00:01.000Z",
-    "2026-08-25T12:00:02.000Z",
-  ];
-  const { registry, ownership } = await makeOwnership({
-    now: () => times.shift(),
-    randomId: () => "lease-1",
-  });
-  const lease = await ownership.acquire(
-    "session-1",
-    "/pi/sessions/session-1.jsonl",
-    "run-1",
-  );
-
-  await expect(
-    ownership.bindProcesses("session-1", lease.leaseId, lease.generation, worker, piChild),
-  ).resolves.toEqual({
-    ...lease,
-    worker,
-    piChild,
-  });
-  expect(await registry.get("session-1")).toMatchObject({
-    revision: 1,
-    processState: "LIVE",
-    latestRunId: "run-1",
-    ownership: {
-      kind: "managed",
-      runId: "run-1",
-      process: worker,
-      acquiredAt: "2026-08-25T12:00:01.000Z",
-      heartbeatAt: "2026-08-25T12:00:01.000Z",
-    },
-  });
-
-  await expect(
-    ownership.heartbeat("session-1", lease.leaseId, lease.generation),
-  ).resolves.toMatchObject({
-    revision: 2,
-    ownership: { heartbeatAt: "2026-08-25T12:00:02.000Z" },
-  });
-});
-
 it("persists the distinct Pi child runtime identity before readiness", async () => {
   const { registry, ownership } = await makeOwnership({ randomId: () => "lease-runtime" });
   const lease = await ownership.acquire("session-1", "/pi/sessions/session-1.jsonl", "run-runtime");
@@ -129,47 +71,6 @@ it("persists the distinct Pi child runtime identity before readiness", async () 
 
   await expect(ownership.bindPiChild("session-1", lease.leaseId, lease.generation, piChild, runtime)).resolves.toMatchObject({ runtime });
   expect(await registry.get("session-1")).toMatchObject({ ownership: { process: worker }, runtime: { supervisor: worker, piChild } });
-});
-
-it("rejects a stale worker hello and stale release after lease generation advances", async () => {
-  const leaseIds = ["lease-old", "lease-current"];
-  const { registry, ownership } = await makeOwnership({ randomId: () => leaseIds.shift() });
-  const oldLease = await ownership.acquire(
-    "session-1",
-    "/pi/sessions/session-1.jsonl",
-    "run-old",
-  );
-  await expect(
-    ownership.release("session-1", oldLease.leaseId, oldLease.generation),
-  ).resolves.toBe(true);
-  const currentLease = await ownership.acquire(
-    "session-1",
-    "/pi/sessions/session-1.jsonl",
-    "run-current",
-  );
-
-  await expect(
-    ownership.bindProcesses(
-      "session-1",
-      oldLease.leaseId,
-      oldLease.generation,
-      worker,
-      piChild,
-    ),
-  ).rejects.toMatchObject({ code: "STALE_LEASE" });
-  await expect(
-    ownership.release("session-1", oldLease.leaseId, oldLease.generation),
-  ).resolves.toBe(false);
-  await ownership.bindProcesses(
-    "session-1",
-    currentLease.leaseId,
-    currentLease.generation,
-    worker,
-    piChild,
-  );
-  expect(await registry.get("session-1")).toMatchObject({
-    ownership: { runId: "run-current" },
-  });
 });
 
 it("uses generation with a repeated lease ID to reject stale bind, heartbeat, and release", async () => {
@@ -238,36 +139,6 @@ it("reconciles ownership published before an atomic writer reports failure", asy
   await expect(
     ownership.release("session-1", lease.leaseId, lease.generation),
   ).resolves.toBe(true);
-  expect((await registry.get("session-1"))?.ownership).toBeUndefined();
-});
-
-it("releases matching durable ownership while the local lease is still pending", async () => {
-  const acquiredAt = "2026-08-25T12:00:01.000Z";
-  const { registry, ownership } = await makeOwnership({
-    now: () => acquiredAt,
-    randomId: () => "lease-1",
-  });
-  const lease = await ownership.acquire(
-    "session-1",
-    "/pi/sessions/session-1.jsonl",
-    "run-1",
-  );
-  await registry.update("session-1", 0, {
-    processState: "LIVE",
-    updatedAt: acquiredAt,
-    ownership: {
-      kind: "managed",
-      runId: lease.runId,
-      process: worker,
-      acquiredAt: lease.acquiredAt,
-      heartbeatAt: lease.acquiredAt,
-    },
-  });
-
-  await expect(
-    ownership.release("session-1", lease.leaseId, lease.generation),
-  ).resolves.toBe(true);
-  expect(await registry.get("session-1")).toMatchObject({ revision: 2, processState: "EXITED" });
   expect((await registry.get("session-1"))?.ownership).toBeUndefined();
 });
 

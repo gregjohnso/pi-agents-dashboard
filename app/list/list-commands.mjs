@@ -65,7 +65,7 @@ export function draftChoices(draft, sessions, defaults) {
     return { models: [...models].sort(), thinkingLevels: [...thinkingLevels].sort() };
 }
 
-/** @param {string} code @param {string} message */
+/** @param {string} code @param {string} message @returns {{kind:"rejected",code:string,message:string}} */
 function rejected(code, message) {
     return { kind: "rejected", code, message };
 }

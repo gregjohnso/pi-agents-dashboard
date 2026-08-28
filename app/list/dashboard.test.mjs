@@ -1,5 +1,9 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 
 import { DashboardController, createDaemonDashboardBackend, } from "./dashboard.mjs";
@@ -581,6 +585,156 @@ describe("dashboard controller", () => {
         expect(rendered).toContain("model:");
         expect(rendered).toContain("thinking:");
         expect(rendered).toContain("name:");
+    });
+    describe("slash commands", () => {
+        function typed(dashboard, text) {
+            for (const character of text) dashboard.handleInput(character);
+        }
+        it("offers the command menu while the prompt is a slash and runs the highlighted command", async () => {
+            const dashboard = controller(new FakeBackend([session("a")]));
+            await dashboard.open();
+            dashboard.handleInput("/");
+            const menu = dashboard.render(80, 24).map(stripVTControlCharacters);
+            expect(menu.some((line) => line.includes("Commands"))).toBe(true);
+            for (const command of ["/model", "/thinking", "/cwd", "/isolation", "/name", "/help"]) {
+                expect(menu.some((line) => line.includes(command))).toBe(true);
+            }
+            // Down drives the menu, not the session list, while a slash prompt is open.
+            dashboard.handleInput("\x1b[B");
+            expect(dashboard.selectedSessionId).toBe("a");
+            expect(dashboard.render(80, 24).some((line) => stripVTControlCharacters(line).includes("❯ /thinking"))).toBe(true);
+            dashboard.handleInput("\r");
+            expect(dashboard.overlay).toMatchObject({ kind: "choice", field: "thinking" });
+            expect(dashboard.composerDraft.prompt).toBe("");
+        });
+        it("closes the menu on Escape and keeps the typed text editable", async () => {
+            const showsMenu = (dashboard) => dashboard.render(80, 24).some((line) => stripVTControlCharacters(line).includes("Commands"));
+            const dashboard = controller(new FakeBackend([session("a")]));
+            await dashboard.open();
+            typed(dashboard, "/mo");
+            expect(showsMenu(dashboard)).toBe(true);
+            dashboard.handleInput("\x1b");
+            expect(dashboard.composerDraft.prompt).toBe("/mo");
+            expect(showsMenu(dashboard)).toBe(false);
+            // Editing the mistyped name brings the menu back.
+            dashboard.handleInput("\x7f");
+            expect(dashboard.composerDraft.prompt).toBe("/m");
+            expect(showsMenu(dashboard)).toBe(true);
+        });
+        it("picks a model from the values the list already knows and applies it to the draft", async () => {
+            const backend = new FakeBackend([session("a", { model: { provider: "google", id: "gemini" } }), session("b")]);
+            const dashboard = controller(backend);
+            await dashboard.open();
+            typed(dashboard, "/model");
+            dashboard.handleInput("\r");
+            expect(dashboard.overlay).toMatchObject({ kind: "choice", field: "model", values: ["anthropic/claude", "google/gemini"] });
+            dashboard.handleInput("\x1b[B");
+            dashboard.handleInput("\r");
+            expect(dashboard.composerDraft.model).toEqual({ provider: "google", id: "gemini" });
+            expect(dashboard.overlay).toBeUndefined();
+            expect(dashboard.focus).toBe("list");
+            expect(backend.requests).toEqual([]);
+        });
+        it("cancels a picker without changing the draft", async () => {
+            const dashboard = controller(new FakeBackend([session("a")]));
+            await dashboard.open();
+            typed(dashboard, "/isolation");
+            dashboard.handleInput("\r");
+            expect(dashboard.overlay).toMatchObject({ kind: "choice", field: "isolation", values: ["worktree", "shared_directory"] });
+            dashboard.handleInput("\x1b");
+            expect(dashboard.overlay).toBeUndefined();
+            expect(dashboard.composerDraft.isolationMode).toBe("worktree");
+            dashboard.handleInput("\x1b[B");
+            expect(dashboard.selectedSessionId).toBe("a");
+        });
+        it("says so when it knows no model to offer, and still takes one typed in full", async () => {
+            const backend = new FakeBackend([session("a", { model: undefined, thinkingLevel: undefined })]);
+            const dashboard = controller(backend, { launchDefaults: { cwd: "/repo" } });
+            await dashboard.open();
+            typed(dashboard, "/model");
+            dashboard.handleInput("\r");
+            expect(dashboard.status).toMatchObject({ kind: "error", code: "MODEL_CHOICES_UNKNOWN" });
+            expect(dashboard.overlay).toBeUndefined();
+            typed(dashboard, "\x7f".repeat(6));
+            typed(dashboard, "/model openai/gpt-6");
+            dashboard.handleInput("\r");
+            expect(dashboard.composerDraft.model).toEqual({ provider: "openai", id: "gpt-6" });
+            // An unknown model is carried to the daemon unchanged, so Pi refuses it at launch.
+            typed(dashboard, "ship it");
+            dashboard.handleInput("\r");
+            await vi.waitFor(() => expect(backend.requests).toHaveLength(1));
+            expect(backend.requests[0]).toMatchObject({ prompt: "ship it", model: { provider: "openai", id: "gpt-6" } });
+        });
+        it("takes an existing directory and refuses anything else by name", async () => {
+            const root = await mkdtemp(join(tmpdir(), "pi-dashboard-cwd-"));
+            const file = join(root, "notes.txt");
+            await writeFile(file, "", { mode: 0o600 });
+            try {
+                const backend = new FakeBackend([session("a")]);
+                const dashboard = controller(backend);
+                await dashboard.open();
+                typed(dashboard, `/cwd ${root}`);
+                dashboard.handleInput("\r");
+                await vi.waitFor(() => expect(dashboard.composerDraft.cwd).toBe(root));
+                expect(dashboard.composerDraft.prompt).toBe("");
+                for (const rejectedPath of [join(root, "missing"), file]) {
+                    typed(dashboard, `/cwd ${rejectedPath}`);
+                    dashboard.handleInput("\r");
+                    await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "CWD_NOT_A_DIRECTORY", message: expect.stringContaining(rejectedPath) }));
+                    expect(dashboard.composerDraft.cwd).toBe(root);
+                    // A refusal keeps the text so the operator can correct it in place.
+                    expect(dashboard.composerDraft.prompt).toBe(`/cwd ${rejectedPath}`);
+                    typed(dashboard, "\x7f".repeat(`/cwd ${rejectedPath}`.length));
+                }
+                expect(backend.requests).toEqual([]);
+            } finally {
+                await rm(root, { recursive: true, force: true });
+            }
+        });
+        it("clears the draft name so the agent names the session itself", async () => {
+            const dashboard = controller(new FakeBackend([]));
+            await dashboard.open();
+            typed(dashboard, "/name Coverage loader");
+            dashboard.handleInput("\r");
+            expect(dashboard.composerDraft.name).toBe("Coverage loader");
+            typed(dashboard, "/name");
+            dashboard.handleInput("\r");
+            expect(dashboard.composerDraft.name).toBe("");
+        });
+        it("opens the help overlay from /help", async () => {
+            const dashboard = controller(new FakeBackend([]));
+            await dashboard.open();
+            typed(dashboard, "/help");
+            dashboard.handleInput("\r");
+            expect(dashboard.overlay).toMatchObject({ kind: "help" });
+            expect(dashboard.composerDraft.prompt).toBe("");
+        });
+        it("refuses an unknown command by name and launches nothing", async () => {
+            const openSelectedViewer = vi.fn(async () => {});
+            const backend = new FakeBackend([session("a")]);
+            const dashboard = controller(backend, { openViewer: openSelectedViewer });
+            await dashboard.open();
+            typed(dashboard, "/logni now");
+            dashboard.handleInput("\r");
+            expect(dashboard.status).toMatchObject({ kind: "error", code: "UNKNOWN_LIST_COMMAND", message: expect.stringContaining("/logni") });
+            expect(dashboard.status.message).toContain("/model");
+            expect(dashboard.composerDraft.prompt).toBe("/logni now");
+            expect(backend.requests).toEqual([]);
+            expect(openSelectedViewer).not.toHaveBeenCalled();
+        });
+        it.each([40, 55, 80, 120, 160])("keeps the menu and the picker inside %i columns", async (width) => {
+            const dashboard = controller(new FakeBackend([
+                session("a", { model: { provider: "a-very-long-provider-name", id: "an-even-longer-model-identifier-2026" } }),
+                session("b", { thinkingLevel: "an-unusually-long-thinking-level" }),
+            ]));
+            await dashboard.open();
+            dashboard.handleInput("/");
+            expect(dashboard.render(width, 24).every((line) => visibleWidth(line) <= width)).toBe(true);
+            dashboard.handleInput("\r");
+            expect(dashboard.overlay).toMatchObject({ kind: "choice", field: "model" });
+            expect(dashboard.render(width, 24).every((line) => visibleWidth(line) <= width)).toBe(true);
+            expect(dashboard.render(width, 10).every((line) => visibleWidth(line) <= width)).toBe(true);
+        });
     });
     it("never persists source ownership and derives it from each current Pi session", async () => {
         let current;

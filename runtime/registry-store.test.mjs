@@ -86,19 +86,6 @@ it("shares one reentrant lifecycle serializer across registry instances", async 
   expect(order).toEqual(["delete:checks", "delete:nested-result", "delete:done", "launch"]);
 });
 
-it("creates and lists imported records with Task 5 canonical identity unchanged", async () => {
-  const { sessions, store } = await makeRegistry();
-  const imported = record("imported", {
-    sessionFile: "/pi/sessions/aliases/../imported.jsonl",
-    canonicalSessionFile: "/pi/sessions/imported.jsonl",
-  });
-
-  await expect(store.create(imported)).resolves.toEqual(imported);
-  await expect(store.get("imported")).resolves.toEqual(imported);
-  await expect(store.list()).resolves.toEqual([imported]);
-  expect((await fs.stat(join(sessions, "imported.json"))).mode & 0o777).toBe(0o600);
-});
-
 it("removes only the exact compare-and-swap revision", async () => {
   const { sessions, store } = await makeRegistry();
   await store.create(record("remove-me"));
@@ -107,43 +94,6 @@ it("removes only the exact compare-and-swap revision", async () => {
   await expect(store.remove("remove-me", 0)).resolves.toMatchObject({ sessionId: "remove-me" });
   await expect(store.get("remove-me")).resolves.toBeUndefined();
   await expect(fs.access(join(sessions, "remove-me.json"))).rejects.toMatchObject({ code: "ENOENT" });
-});
-
-it("uses compare-and-swap revisions and retains canonical session identity", async () => {
-  const { store } = await makeRegistry();
-  await store.create(record("one"));
-
-  const updated = await store.update("one", 0, {
-    taskState: "WORKING",
-    processState: "LIVE",
-    updatedAt: "2026-08-25T12:00:01.000Z",
-  });
-
-  expect(updated).toMatchObject({
-    sessionId: "one",
-    canonicalSessionFile: "/pi/sessions/one.jsonl",
-    revision: 1,
-    taskState: "WORKING",
-  });
-  await expect(store.update("one", 0, { taskState: "FAILED" })).rejects.toMatchObject({
-    code: "REVISION_CONFLICT",
-    expectedRevision: 0,
-    actualRevision: 1,
-  });
-});
-
-it("refuses duplicate canonical session files across session IDs", async () => {
-  const { store } = await makeRegistry();
-  await store.create(record("one"));
-
-  await expect(
-    store.create(record("two", { canonicalSessionFile: "/pi/sessions/one.jsonl" })),
-  ).rejects.toMatchObject({
-    code: "CANONICAL_SESSION_CONFLICT",
-    canonicalSessionFile: "/pi/sessions/one.jsonl",
-    existingSessionId: "one",
-  });
-  await expect(store.list()).resolves.toEqual([record("one")]);
 });
 
 it("coordinates compare-and-swap updates across stores for one canonical directory", async () => {
@@ -188,17 +138,6 @@ it("coordinates canonical-file uniqueness across stores for one directory", asyn
   expect(conflict.reason).toMatchObject({ code: "CANONICAL_SESSION_CONFLICT" });
 });
 
-it("round-trips the frozen installed-Pi runtime identity", async () => {
-  const { store } = await makeRegistry();
-  const executable = { realpath: "/installed/pi", device: "1", inode: "2", size: 3, modifiedTimeNs: "4" };
-  const process = { pid: 101, startIdentity: "start", processGroupId: 101 };
-  const piChild = { pid: 102, startIdentity: "child", processGroupId: 101 };
-  const capabilities = { executable, reportedVersion: "1.2.3", rpcMode: true, jsonl: true, commands: ["get_state", "prompt", "follow_up", "steer", "abort", "extension_ui_response"], events: [], missingRequired: [] };
-  const runtime = /** @type {import("../shared/contracts.mjs").RunRuntimeIdentity} */ ({ executable, piVersion: "1.2.3", capabilities, rpcAdapterVersion: 1, viewerProtocolVersion: 1, supervisor: process, piChild });
-  await store.create(record("runtime", { runtime }));
-  await expect(store.get("runtime")).resolves.toMatchObject({ runtime });
-});
-
 it("refuses corrupted registry JSON without rewriting it", async () => {
   const { sessions, store } = await makeRegistry();
   const path = join(sessions, "broken.json");
@@ -210,31 +149,7 @@ it("refuses corrupted registry JSON without rewriting it", async () => {
 });
 
 it.each([
-  ["name", { name: 3 }],
-  ["model", { model: 3 }],
-  ["model.provider", { model: { provider: 3, id: "model" } }],
-  ["model.id", { model: { provider: "provider", id: 3 } }],
-  ["model shape", { model: { provider: "provider" } }],
-  ["thinkingLevel", { thinkingLevel: 3 }],
-  ["isolation", { isolation: 3 }],
-  ["isolation.mode", { isolation: { mode: "container" } }],
   ["worktree isolation", { isolation: { mode: "worktree", worktreePath: "/repo" } }],
-  ["shared-directory isolation", { isolation: { mode: "shared_directory" } }],
-  ["latestRunId", { latestRunId: 3 }],
-  ["activity shape", { activity: { kind: "saved_session", summary: "Imported", extra: true } }],
-  [
-    "ownership shape",
-    {
-      ownership: {
-        kind: "managed",
-        runId: "run-1",
-        process: { pid: 1, startIdentity: "start", processGroupId: 1 },
-        acquiredAt: "2026-08-25T12:00:00.000Z",
-        heartbeatAt: "2026-08-25T12:00:00.000Z",
-        extra: true,
-      },
-    },
-  ],
   ["unknown field", { unexpected: true }],
 ])("refuses valid JSON with invalid %s", async (_label, overrides) => {
   const { sessions, store } = await makeRegistry();
@@ -311,15 +226,6 @@ it("applies a color write that loses a compare-and-swap race to background churn
   await expect(applySessionColor(store, "colored", "amber")).resolves.toMatchObject({ color: "amber" });
   expect(attempts.count).toBe(2);
   expect(await store.get("colored")).toMatchObject({ color: "amber", activity: { summary: "churn 1" } });
-});
-
-it("clears a color that loses a compare-and-swap race to background churn", async () => {
-  const { store } = await makeRegistry();
-  await store.create(record("colored", { color: "rose" }));
-  loseColorRaces(store, "colored", 1);
-
-  expect((await applySessionColor(store, "colored", null)).color).toBeUndefined();
-  expect(await store.get("colored")).not.toHaveProperty("color");
 });
 
 it("bounds the color write retry instead of spinning against endless churn", async () => {

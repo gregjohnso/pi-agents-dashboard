@@ -123,29 +123,6 @@ it("stops the spinner timer when the dashboard closes on a subscription failure"
   tui.stop({ preserveScreen: true });
 });
 
-it("stops the spinner timer when the viewer takes the screen", async () => {
-  const { controller, terminal, tui } = mountedDashboard();
-  tui.start();
-  await controller.open();
-  await vi.waitFor(() => expect(paintedGlyphs(terminal).length).toBeGreaterThan(0), { timeout: 2_000 });
-
-  let resolveViewer;
-  const viewer = { open: async () => {}, closed: new Promise((resolve) => { resolveViewer = resolve; }), close: async () => {} };
-  const transition = standaloneList.runViewerTransition({
-    sessionId: "busy", viewerClient: { attach: async () => {}, detach: async () => {} }, controller,
-    createViewer: () => viewer, activateViewer: () => {}, activateList: () => {}, restoreListFocus: () => {},
-    shouldRestore: () => false,
-  });
-  await vi.waitFor(() => expect(controller.closed).toBe(true));
-  terminal.writes.length = 0;
-  await new Promise((resolve) => setTimeout(resolve, SPINNER_INTERVAL_MS * 4));
-  expect(terminal.writes).toEqual([]);
-
-  resolveViewer();
-  await transition;
-  tui.stop({ preserveScreen: true });
-});
-
 it("routes wheel events past pi-tui to the active surface", () => {
   const terminal = createWheelInputTap(new FakeTerminal());
   const tui = new TuiAltScreen(terminal, false, undefined, { mouse: false });

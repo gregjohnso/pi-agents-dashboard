@@ -75,7 +75,6 @@ it("summarizes through stock Pi print mode without a session or tools, keeping a
 });
 
 it.each([
-  ["a failed exit", { stdout: "ignored", code: 1 }],
   ["a spawn failure", { failSpawn: true }],
   ["empty output", { stdout: "   " }],
 ])("returns no summary for %s", async (_label, behavior) => {

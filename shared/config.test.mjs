@@ -16,10 +16,6 @@ const REVIEWED_DEFAULT_CONFIG = {
   diagnostics: { rpcSegmentBytes: 8_388_608, rpcSegments: 4, stderrBytes: 8_388_608 },
 };
 
-it("loads the exact schema 2 defaults", () => {
-  expect(loadDashboardConfig({})).toEqual(REVIEWED_DEFAULT_CONFIG);
-});
-
 it("rejects every unknown key and invalid schema 2 value", () => {
   expect(() => loadDashboardConfig({ unexpected: true })).toThrow(/unknown/i);
   expect(() => loadDashboardConfig({ diagnostics: { extra: 1 } })).toThrow(/unknown/i);

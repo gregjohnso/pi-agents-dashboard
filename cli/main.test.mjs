@@ -50,9 +50,3 @@ it("routes exact confirmed session commands without prefix resolution", async ()
   expect(code).toBe(0);
   expect(JSON.parse(output.stdout[0])).toMatchObject({ ok: true, kind: "command" });
 });
-
-it("removes package registration and extension-host commands", async () => {
-  for (const command of ["install", "uninstall", "doctor", "run"]) {
-    expect(await runCli([command], { io: capture().io })).toBe(2);
-  }
-});

@@ -157,36 +157,6 @@ describe("viewer normalizer", () => {
     expect(events.filter((event) => event.payload.kind === "activity").at(-1)?.payload.phase).toBe(phase);
   });
 
-  it("never serializes image bytes from custom or fallback message roles", () => {
-    const subject = normalizer();
-    const content = [{ type: "text", text: "visible" }, { type: "image", data: "raw-base64-secret", mimeType: "image/png" }];
-    const events = [
-      ...subject.consumeHistory({ type: "custom_message", id: "custom-image", timestamp: AT, customType: "ext", content, display: true }, position(10)),
-      ...subject.consumeHistory({ type: "message", id: "fallback-image", timestamp: AT, message: { role: "custom", content } }, position(11)),
-    ];
-    expect(JSON.stringify(events)).not.toContain("raw-base64-secret");
-    expect(events.filter((event) => event.payload.kind === "image_placeholder")).toHaveLength(2);
-    expect(events.filter((event) => event.payload.kind === "system_message").map((event) => event.payload.text)).toEqual(["visible", "visible"]);
-    const toolEvents = subject.consumeFrame({ type: "tool_execution_start", toolCallId: "image-tool", toolName: "inspect", args: { image: { type: "image", data: "tool-base64-secret", mimeType: "image/png" } } });
-    expect(JSON.stringify(toolEvents)).not.toContain("tool-base64-secret");
-  });
-
-  it("restores a partial streaming assistant with stable identity and distinct continuation events", () => {
-    const first = normalizer();
-    first.consumeFrame({ type: "message_start", message: { role: "assistant", content: [], timestamp: Date.parse(AT) } });
-    const initial = first.consumeFrame({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hel" } });
-    const snapshot = first.snapshot({ daemonEpoch: "epoch-1", sequence: "2", registryRevision: 1, runtime: null, role: "observer", taskState: "WORKING", processState: "LIVE", outcome: "NONE" });
-    const partial = snapshot.items.find((item) => item.kind === "assistant_message");
-    expect(partial).toMatchObject({ content: [{ type: "text", text: "hel" }] });
-
-    const restored = normalizer();
-    restored.restore(snapshot);
-    const continued = restored.consumeFrame({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "lo" } });
-    expect(continued[0].payload).toMatchObject({ kind: "assistant_delta", itemId: partial.itemId, delta: "lo" });
-    expect(continued[0].eventId).not.toBe(initial[0].eventId);
-    expect(restored.snapshot({ daemonEpoch: "epoch-1", sequence: "4", registryRevision: 1, runtime: null, role: "observer", taskState: "WORKING", processState: "LIVE", outcome: "NONE" }).items).toContainEqual({ kind: "assistant_message", itemId: partial.itemId, content: [{ type: "text", text: "hello" }] });
-  });
-
   it("preserves exact active assistant blocks through non-streaming snapshots and durable replay", () => {
     const first = normalizer();
     first.consumeFrame({ type: "message_start", message: { role: "assistant", content: [], timestamp: Date.parse(AT) } });

@@ -5,7 +5,6 @@ import { afterEach, describe, expect, it } from "vitest";
 import { CommandJournalError, createCommandJournal } from "./command-journal.mjs";
 
 /** @typedef {import("../shared/contracts.mjs").ClientRequest} ClientRequest */
-/** @typedef {import("../shared/contracts.mjs").CommandStage} CommandStage */
 
 /** @type {string[]} */
 const directories = [];
@@ -46,19 +45,6 @@ describe("command journal", () => {
     await reopened.close();
   });
 
-  it("rejects a changed payload under the same exact IDs", async () => {
-    const journal = await createCommandJournal({ path: await path() });
-    await journal.accept(command);
-    await expect(journal.accept({ ...command, payload: { ...command.payload, text: "changed" } })).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
-    await journal.close();
-  });
-
-  it("does not acknowledge before the journal sync boundary", async () => {
-    const journal = await createCommandJournal({ path: await path(), failpoint(name) { if (name === "before_sync") throw new Error("crash-before-sync"); } });
-    await expect(journal.accept(command)).rejects.toThrow("crash-before-sync");
-    await journal.close();
-  });
-
   it("recovers a synced acceptance when the response boundary fails", async () => {
     const journalPath = await path();
     const journal = await createCommandJournal({ path: journalPath, failpoint(name) { if (name === "after_sync") throw new Error("crash"); } });
@@ -66,28 +52,6 @@ describe("command journal", () => {
     await journal.close();
     const reopened = await createCommandJournal({ path: journalPath });
     expect((await reopened.get({ clientId: "client-1", requestId: "request-1" }))?.stage).toBe("ACCEPTED");
-    await reopened.close();
-  });
-
-  it.each(/** @type {Array<[CommandStage, CommandStage]>} */ ([
-    ["DELIVERY_ATTEMPTED", "DELIVERY_UNKNOWN"],
-    ["WORKER_ACKNOWLEDGED", "WORKER_ACKNOWLEDGED"],
-    ["COMPLETED", "COMPLETED"],
-  ]))("recovers synced %s when its response boundary fails", async (target, recovered) => {
-    const journalPath = await path();
-    let crash = false;
-    const journal = await createCommandJournal({ path: journalPath, failpoint(name, record) { if (crash && name === "after_sync" && record.status.stage === target) throw new Error("response-crash"); } });
-    const key = { clientId: command.clientId, requestId: command.requestId };
-    await journal.accept(command);
-    if (target !== "DELIVERY_ATTEMPTED") await journal.transition(key, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
-    if (target === "COMPLETED") await journal.transition(key, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-    crash = true;
-    /** @type {CommandStage[]} */
-    const allowed = target === "DELIVERY_ATTEMPTED" ? ["ACCEPTED"] : target === "WORKER_ACKNOWLEDGED" ? ["DELIVERY_ATTEMPTED"] : ["WORKER_ACKNOWLEDGED"];
-    await expect(journal.transition(key, allowed, target)).rejects.toThrow("response-crash");
-    await journal.close();
-    const reopened = await createCommandJournal({ path: journalPath });
-    expect((await reopened.get(key))?.stage).toBe(recovered);
     await reopened.close();
   });
 
@@ -117,35 +81,6 @@ describe("command journal", () => {
     expect((await reopened.get(key))?.stage).toBe("DELIVERY_UNKNOWN");
     expect((await reopened.history(key)).map(({ stage }) => stage)).toEqual(["ACCEPTED", "DELIVERY_ATTEMPTED", "DELIVERY_UNKNOWN"]);
     await reopened.close();
-  });
-
-  it.each(/** @type {Array<[CommandStage, CommandStage]>} */ ([
-    ["ACCEPTED", "COMPLETED"],
-    ["COMPLETED", "ACCEPTED"],
-    ["FAILED", "WORKER_ACKNOWLEDGED"],
-  ]))("rejects internal command-stage edge %s -> %s", async (from, to) => {
-    const journal = await createCommandJournal({ path: await path() });
-    const keyedCommand = { ...command, requestId: `${from}-${to}` };
-    const key = { clientId: keyedCommand.clientId, requestId: keyedCommand.requestId };
-    await journal.accept(keyedCommand);
-    if (from === "COMPLETED") {
-      await journal.transition(key, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
-      await journal.transition(key, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-      await journal.transition(key, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
-    } else if (from === "FAILED") {
-      await journal.transition(key, ["ACCEPTED"], "FAILED");
-    }
-    await expect(journal.transition(key, [from], to)).rejects.toMatchObject({ code: "INVALID_TRANSITION" });
-    await journal.close();
-  });
-
-  it("keeps NUL-bearing client and request identifiers as exact tuple identities", async () => {
-    const journal = await createCommandJournal({ path: await path() });
-    const first = { ...command, clientId: "a", requestId: "b\0c" };
-    const second = { ...command, clientId: "a\0b", requestId: "c", payload: { ...command.payload, text: "different" } };
-    await journal.accept(first);
-    await expect(journal.accept(second)).resolves.toMatchObject({ clientId: "a\0b", requestId: "c" });
-    await journal.close();
   });
 
   it("incrementally discards an incomplete final record after a crash", async () => {

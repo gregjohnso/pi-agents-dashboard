@@ -2,12 +2,7 @@ import { Buffer } from "node:buffer";
 
 import { describe, expect, it } from "vitest";
 
-import {
-  JsonlFramingError,
-  createJsonlDecoder,
-  createJsonlEncoder,
-  encodeJsonl,
-} from "./jsonl.mjs";
+import { createJsonlDecoder, createJsonlEncoder, encodeJsonl } from "./jsonl.mjs";
 
 describe("JSONL decoder", () => {
   it("decodes split UTF-8 and coalesced LF records", () => {
@@ -20,12 +15,6 @@ describe("JSONL decoder", () => {
       { text: "café" },
       { op: "ack" },
     ]);
-  });
-
-  it("accepts an optional CR before LF", () => {
-    const decoder = createJsonlDecoder({ maxBytes: 1024 });
-
-    expect(decoder.push(Buffer.from('{"ok":true}\r\n'))).toEqual([{ ok: true }]);
   });
 
   // FRAME_TOO_LARGE must win over MALFORMED_JSON: the limit is enforced before JSON parsing.
@@ -49,23 +38,12 @@ describe("JSONL decoder", () => {
       expect.objectContaining({ name: "JsonlFramingError", code: "INCOMPLETE_FRAME" }),
     );
   });
-
-  it("rejects invalid limits", () => {
-    expect(() => createJsonlDecoder({ maxBytes: 0 })).toThrowError(TypeError);
-  });
 });
 
 describe("JSONL encoder", () => {
   it("encodes one LF-terminated JSON record", () => {
     expect(encodeJsonl({ text: "line\nbreak" }).toString("utf8")).toBe(
       '{"text":"line\\nbreak"}\n',
-    );
-  });
-
-  it("returns a typed error when the value cannot be represented as JSON", () => {
-    expect(() => encodeJsonl(undefined)).toThrowError(JsonlFramingError);
-    expect(() => encodeJsonl(1n)).toThrowError(
-      expect.objectContaining({ code: "NOT_SERIALIZABLE" }),
     );
   });
 

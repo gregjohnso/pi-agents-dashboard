@@ -126,6 +126,7 @@ export class ViewerController {
     this.respondedUi = new Set();
     this.inputMode = "prompt";
     this.hideThinking = false;
+    this.daemonUnreachable = false;
     this.edited = false;
     this.historyUsed = false;
     this.closedState = true;
@@ -189,7 +190,7 @@ export class ViewerController {
     const toolLine = selectedTool === undefined ? [] : [` tool:${selectedTool.name} ${selectedTool.state} ${this.transcript.expandedTools.has(selectedTool.id) ? "expanded" : "collapsed"}`];
     let errorLines = this.state.errors.slice(-1).flatMap((error) => renderSystemCard({ text: `${error.code}: ${error.message}`, level: "error" }, width));
     let queuedLines = this.renderQueued();
-    const connectionLines = this.daemonUnreachable === true ? [" Daemon unreachable · reconnecting…"] : [];
+    const connectionLines = this.daemonUnreachable ? [" Daemon unreachable · reconnecting…"] : [];
     let hints = renderKeyHints(this.state, width);
     const dockRows = () => 2 + (hints === "" ? 0 : 1) + status.length + editorLines.length + inputLabel.length + toolLine.length + errorLines.length + queuedLines.length + connectionLines.length;
     if (height - dockRows() < MIN_TRANSCRIPT_ROWS) {

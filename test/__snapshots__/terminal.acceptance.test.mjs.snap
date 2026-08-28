@@ -4,15 +4,15 @@ exports[`pins the complete list and viewer surfaces at 40x10 1`] = `
 {
   "list": [
     " pi-dashboard                           ",
-    "                                        ",
+    " /worktrees/研究/非常に長いプロジェクト ",
     "╭─ Sessions ────────────────────────────",
     "  NAME       STATE    ACTIVITY          ",
     "⠋ 検証 🚀 r… WORKING  bash: pytest 検…  ",
     "  waiting    WAITING  Approval needed   ",
+    "                                        ",
     "╭───────────────────────────────────────",
     " ❯ describe a task for a new session    ",
     " cwd:/repo isolation:worktree model:/ th",
-    " Ctrl+C quit  ↑↓ navigate  Enter/→ open ",
   ],
   "viewer": [
     " WAITING/LIVE · COMPOSER",
@@ -33,7 +33,7 @@ exports[`pins the complete list and viewer surfaces at 55x16 1`] = `
 {
   "list": [
     " pi-dashboard                                          ",
-    "                                                       ",
+    " /worktrees/研究/非常に長いプロジェクト名/dashboard    ",
     "╭─ Sessions ───────────────────────────────────────────",
     "  NAME               STATE    ACTIVITY           AGE   ",
     "⠋ 検証 🚀 résumé     WORKING  bash: pytest 検証… 12h   ",
@@ -42,12 +42,12 @@ exports[`pins the complete list and viewer surfaces at 55x16 1`] = `
     "                                                       ",
     "                                                       ",
     "                                                       ",
+    "                                                       ",
+    "                                                       ",
     "╭──────────────────────────────────────────────────────",
     " ❯ describe a task for a new session                   ",
     "───────────────────────────────────────────────────────",
     " cwd:/repo isolation:worktree model:/ thinking: name:  ",
-    " /worktrees/研究/非常に長いプロジェクト名/dashboard    ",
-    " Ctrl+C quit  ↑↓ navigate  Enter/→ open  ←/Esc back  ty",
   ],
   "viewer": [
     " viewer-session · WAITING/LIVE · COMPOSER",
@@ -74,7 +74,7 @@ exports[`pins the complete list and viewer surfaces at 80x24 1`] = `
 {
   "list": [
     " pi-dashboard                                                                   ",
-    "                                                                                ",
+    " /worktrees/研究/非常に長いプロジェクト名/dashboard                             ",
     "╭─ Sessions ────────────────────────────────────────────────────────────────────",
     "  NAME                       STATE     ACTIVITY                         AGE     ",
     "⠋ 検証 🚀 résumé             WORKING   bash: pytest 検証中 🚀 naïve ca… 12h     ",
@@ -91,12 +91,12 @@ exports[`pins the complete list and viewer surfaces at 80x24 1`] = `
     "                                                                                ",
     "                                                                                ",
     "                                                                                ",
+    "                                                                                ",
+    "                                                                                ",
     "╭───────────────────────────────────────────────────────────────────────────────",
     " ❯ describe a task for a new session                                            ",
     "────────────────────────────────────────────────────────────────────────────────",
     " cwd:/repo isolation:worktree model:/ thinking: name:                           ",
-    " /worktrees/研究/非常に長いプロジェクト名/dashboard                             ",
-    " Ctrl+C quit  ↑↓ navigate  Enter/→ open  ←/Esc back  type to compose  Tab fields",
   ],
   "viewer": [
     " pi-dashboard · viewer-session · WAITING/LIVE · COMPOSER",
@@ -131,7 +131,7 @@ exports[`pins the complete list and viewer surfaces at 120x32 1`] = `
 {
   "list": [
     " pi-dashboard                                                                                                           ",
-    "                                                                                                                        ",
+    " /worktrees/研究/非常に長いプロジェクト名/dashboard                                                                     ",
     "╭─ Sessions ────────────────────────────────────────────────────────────────────────────────────────────────────────────",
     "  NAME                             STATE     ACTIVITY                                                           AGE     ",
     "⠋ 検証 🚀 résumé                   WORKING   bash: pytest 検証中 🚀 naïve café                                  12h     ",
@@ -156,12 +156,12 @@ exports[`pins the complete list and viewer surfaces at 120x32 1`] = `
     "                                                                                                                        ",
     "                                                                                                                        ",
     "                                                                                                                        ",
+    "                                                                                                                        ",
+    "                                                                                                                        ",
     "╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
     " ❯ describe a task for a new session                                                                                    ",
     "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
     " cwd:/repo isolation:worktree model:/ thinking: name:                                                                   ",
-    " /worktrees/研究/非常に長いプロジェクト名/dashboard                                                                     ",
-    " Ctrl+C quit  ↑↓ navigate  Enter/→ open  ←/Esc back  type to compose  Tab fields  ^X action  ^G help                    ",
   ],
   "viewer": [
     " pi-dashboard · viewer-session · WAITING/LIVE · COMPOSER",
@@ -204,7 +204,7 @@ exports[`pins the complete list and viewer surfaces at 160x40 1`] = `
 {
   "list": [
     " pi-dashboard                                                                                                                                                   ",
-    "                                                                                                                                                                ",
+    " /worktrees/研究/非常に長いプロジェクト名/dashboard                                                                                                             ",
     "╭─ Sessions ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
     "  NAME                             STATE     ACTIVITY                                                                                                   AGE     ",
     "⠋ 検証 🚀 résumé                   WORKING   bash: pytest 検証中 🚀 naïve café                                                                          12h     ",
@@ -237,12 +237,12 @@ exports[`pins the complete list and viewer surfaces at 160x40 1`] = `
     "                                                                                                                                                                ",
     "                                                                                                                                                                ",
     "                                                                                                                                                                ",
+    "                                                                                                                                                                ",
+    "                                                                                                                                                                ",
     "╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
     " ❯ describe a task for a new session                                                                                                                            ",
     "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
     " cwd:/repo isolation:worktree model:/ thinking: name:                                                                                                           ",
-    " /worktrees/研究/非常に長いプロジェクト名/dashboard                                                                                                             ",
-    " Ctrl+C quit  ↑↓ navigate  Enter/→ open  ←/Esc back  type to compose  Tab fields  ^X action  ^G help                                                            ",
   ],
   "viewer": [
     " pi-dashboard · viewer-session · WAITING/LIVE · COMPOSER",

@@ -19,15 +19,18 @@ export function createHelpOverlay() {
     return {
         kind: "help",
         bindings: [
-            { keys: "↑/↓ PgUp/PgDn Home/End", action: "navigate" },
-            { keys: "Enter/→", action: "open native Pi session" },
-            { keys: "n, then Tab/Shift+Tab", action: "edit prompt, cwd, isolation, provider/model, thinking, and name" },
-            { keys: "/ t p o a j", action: "edit search; cycle task, process, outcome, activity, and project filters" },
-            { keys: "v s g c", action: "cycle view, sort, group; clear filters" },
-            { keys: "mouse controls/form", action: "focus or cycle the clicked search, filter, sort, group, or launch field" },
-            { keys: "i / ?", action: "metadata / help" },
-            { keys: "Ctrl+C / Escape", action: "close dashboard" },
+            { keys: "type anything", action: "compose a prompt; Enter launches it" },
+            { keys: "Enter / →", action: "open the selected session" },
+            { keys: "↑ ↓ PgUp PgDn Home End", action: "move the selection" },
+            { keys: "Tab / Shift+Tab", action: "edit cwd, isolation, model, thinking, name" },
             { keys: "Ctrl+X", action: "stop the session; press again within 500 ms to clear it" },
+            { keys: "Ctrl+F", action: "search" },
+            { keys: "Ctrl+V / Ctrl+T / Ctrl+P", action: "cycle view, task state, process state" },
+            { keys: "Ctrl+O / Ctrl+A / Ctrl+J", action: "cycle outcome, activity, project filters" },
+            { keys: "Ctrl+S / Ctrl+B / Ctrl+L", action: "cycle sort, grouping; clear filters" },
+            { keys: "Ctrl+R / Ctrl+E", action: "refresh activity summaries; show session metadata" },
+            { keys: "? / Ctrl+G", action: "this help" },
+            { keys: "Ctrl+C", action: "quit" },
         ],
     };
 }

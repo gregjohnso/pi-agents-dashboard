@@ -608,6 +608,12 @@ export class DashboardController {
             void this.close();
             return;
         }
+        // Any key other than a second Ctrl+X abandons an armed clear, so the red warning cannot linger
+        // and a later keystroke cannot inherit it.
+        if (this.stopClearArmed && !matchesKey(data, Key.ctrl("x"))) {
+            this.stopClearGesture.cancel();
+            this.requestRender?.();
+        }
         if (this.focus === "confirmation") {
             if (matchesKey(data, Key.escape)) {
                 this.focus = "list";
@@ -696,6 +702,8 @@ export class DashboardController {
             this.toggleMetadata();
         else if (matchesKey(data, Key.ctrl("g")))
             this.toggleHelp();
+        else if (data === "?" && this.composerDraft.prompt === "")
+            this.toggleHelp();
         else if (matchesKey(data, Key.ctrl("r")))
             this.refreshSummaries();
         else if (matchesKey(data, Key.ctrl("l")))
@@ -762,7 +770,7 @@ export class DashboardController {
             if (lines.length > 0)
                 lines[0] = paintPlainLine(" pi-dashboard", this.width, jobwatchTheme.title);
             if (lines.length > 1)
-                lines[1] = paintPlainLine(this.activeFilterSummary(), this.width, jobwatchTheme.keyHints);
+                lines[1] = paintPlainLine(this.contextLine(), this.width, jobwatchTheme.keyHints);
             if (lines.length > 2)
                 lines[2] = sectionBorder("Sessions", this.width, !confirmingSharedLaunch);
             if (lines.length > 3)
@@ -780,14 +788,13 @@ export class DashboardController {
                 lines[dockTop + 1] = paintPlainLine(` ❯ ${draftPrompt || "describe a task for a new session"}`, this.width, draftPrompt ? (text) => jobwatchTheme.text(text, false) : (text) => jobwatchTheme.muted(text, false));
                 const form = ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
                 // The rule closes the prompt box; launch settings and the selected path are context below it.
-                const formRow = layout.dockRows >= 5 ? dockTop + 3 : dockTop + 2;
-                if (layout.dockRows >= 5) lines[dockTop + 2] = sectionFooter(this.width, confirmingSharedLaunch);
+                const formRow = layout.dockRows >= 4 ? dockTop + 3 : dockTop + 2;
+                if (layout.dockRows >= 4) lines[dockTop + 2] = sectionFooter(this.width, confirmingSharedLaunch);
                 // An armed clear is the one thing on this row worth interrupting for, and it expires on its own.
                 lines[formRow] = this.stopClearArmed
                     ? paintPlainLine(" ctrl+x to confirm", this.width, jobwatchTheme.error)
                     : paintPlainLine(this.status.kind === "error" ? ` ${this.status.code}: ${this.status.message}  ${form}` : form, this.width, this.status.kind === "error" ? jobwatchTheme.error : jobwatchTheme.surface);
-                if (layout.dockRows >= 6) lines[dockTop + 4] = paintPlainLine(this.selectedCwdLine(), this.width, jobwatchTheme.keyHints);
-                lines[lines.length - 1] = paintPlainLine(" Ctrl+C quit  ↑↓ navigate  Enter/→ open  ←/Esc back  type to compose  Tab fields  ^X action  ^G help", this.width, jobwatchTheme.keyHints);
+
             }
             this.renderOverlay(lines);
             this.syncAnimation();
@@ -866,9 +873,14 @@ export class DashboardController {
         const next = this.query.view === "live" ? "done" : this.query.view === "done" ? "all" : "live";
         this.setView(next);
     }
-    selectedCwdLine() {
+    /** The selected session's working directory, plus any active filters. */
+    contextLine() {
         const selected = this.selectedSession();
-        return selected === undefined ? "" : ` ${selected.cwd}`;
+        const filters = this.activeFilterSummary().trim();
+        const cwd = selected === undefined ? "" : selected.cwd;
+        if (cwd === "" && filters === "")
+            return "";
+        return ` ${[cwd, filters].filter((segment) => segment !== "").join("  ·  ")}`;
     }
     /** Show filter state only once something is filtered; the keys themselves live in the footer and in Help. */
     activeFilterSummary() {

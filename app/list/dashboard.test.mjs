@@ -127,16 +127,18 @@ describe("dashboard controller", () => {
         const unfiltered = dashboard.render(100, 16).map(stripVTControlCharacters);
         expect(unfiltered[1]).not.toContain("search:");
         expect(unfiltered[1]).not.toContain("v:live");
-        expect(unfiltered.at(-4).trim()).toMatch(/^─+$/u);
+        expect(unfiltered.at(-2).trim()).toMatch(/^─+$/u);
 
+        // The selected session's path sits at the top, above the list.
         dashboard.selectSession("a");
-        expect(stripVTControlCharacters(dashboard.render(100, 16).at(-2))).toContain("/repo/alpha");
+        expect(stripVTControlCharacters(dashboard.render(100, 16)[1])).toContain("/repo/alpha");
         dashboard.selectSession("b");
-        expect(stripVTControlCharacters(dashboard.render(100, 16).at(-2))).toContain("/repo/beta");
+        expect(stripVTControlCharacters(dashboard.render(100, 16)[1])).toContain("/repo/beta");
 
         dashboard.setSearch("beta");
         const filtered = dashboard.render(100, 16);
-        expect(stripVTControlCharacters(filtered.at(-2))).toContain("/repo/beta");
+        // Path and active filters share the one context line.
+        expect(stripVTControlCharacters(filtered[1])).toContain("/repo/beta");
         expect(stripVTControlCharacters(filtered[1])).toContain("search:beta");
     });
     // Ctrl+X on a live session is a Stop; only a second press inside the window clears it, and
@@ -275,6 +277,20 @@ describe("dashboard controller", () => {
         clock = 600;
         expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("ctrl+x to confirm"))).toBe(false);
     });
+    it("abandons an armed clear on any other key", async () => {
+        const backend = new FakeBackend([session("a", { taskState: "STOPPED", processState: "EXITED" })]);
+        const dashboard = controller(backend);
+        await dashboard.open();
+        dashboard.setView("all");
+        dashboard.selectSession("a");
+        for (const key of ["\x1b", "\x7f", "x"]) {
+            dashboard.handleInput("\x18");
+            expect(dashboard.stopClearArmed).toBe(true);
+            dashboard.handleInput(key);
+            expect(dashboard.stopClearArmed).toBe(false);
+        }
+        expect(backend.delete).not.toHaveBeenCalled();
+    });
     it("requires two presses to clear a session that was already stopped", async () => {
         let clock = 0;
         const backend = new FakeBackend([session("a", { taskState: "STOPPED", processState: "EXITED" })]);
@@ -406,7 +422,7 @@ describe("dashboard controller", () => {
     });
     describe("floating overlay panels", () => {
         it.each([
-            ["help", async (dashboard) => { dashboard.toggleHelp(); }, "Help", "metadata / help"],
+            ["help", async (dashboard) => { dashboard.toggleHelp(); }, "Help", "this help"],
             ["metadata", async (dashboard) => { dashboard.toggleMetadata(); }, "Session", "taskState"],
             ["delivery unknown", async (dashboard, backend) => {
                 backend.launch = vi.fn(async () => ({ kind: "delivery_unknown", clientId: "stable-client", requestId: "launch-unknown" }));
@@ -429,7 +445,7 @@ describe("dashboard controller", () => {
             expect(rendered.some((line) => line.includes(title))).toBe(true);
             expect(rendered.some((line) => line.includes(content))).toBe(true);
             // A floating panel never swallows the composer dock at an ordinary size.
-            expect(rendered.at(-1)).toContain("Ctrl+C quit");
+            expect(rendered.at(-1)).toContain("cwd:");
         });
     });
     it("closes and surfaces a typed malformed-frame state without signaling workers", async () => {

@@ -17,6 +17,7 @@ describe("list slash commands", () => {
         expect(matchingListCommands("/m").map((command) => command.name)).toEqual(["/model"]);
         expect(matchingListCommands("/h")[0]).toMatchObject({ name: "/help", summary: expect.any(String) });
         expect(matchingListCommands("/zz")).toEqual([]);
+        expect(matchingListCommands("  /mo").map((command) => command.name)).toEqual(["/model"]);
         // An argument means the operator has chosen; the menu stops offering alternatives.
         expect(matchingListCommands("/model anthropic/claude").map((command) => command.name)).toEqual(["/model"]);
     });

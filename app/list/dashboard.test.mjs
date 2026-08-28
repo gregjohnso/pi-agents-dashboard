@@ -701,13 +701,16 @@ describe("dashboard controller", () => {
             dashboard.handleInput("\r");
             expect(dashboard.composerDraft.name).toBe("");
         });
-        it("opens the help overlay from /help", async () => {
-            const dashboard = controller(new FakeBackend([]));
+        it("opens the help overlay from /help, leading space and all", async () => {
+            const backend = new FakeBackend([]);
+            const dashboard = controller(backend);
             await dashboard.open();
-            typed(dashboard, "/help");
+            typed(dashboard, " /help");
+            expect(dashboard.render(80, 24).some((line) => stripVTControlCharacters(line).includes("Commands"))).toBe(true);
             dashboard.handleInput("\r");
             expect(dashboard.overlay).toMatchObject({ kind: "help" });
             expect(dashboard.composerDraft.prompt).toBe("");
+            expect(backend.requests).toEqual([]);
         });
         it("refuses an unknown command by name and launches nothing", async () => {
             const openSelectedViewer = vi.fn(async () => {});

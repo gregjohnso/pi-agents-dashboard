@@ -39,7 +39,7 @@ export function commandName(text) {
 export function matchingListCommands(text) {
     const { name, argument } = split(text);
     if (!name.startsWith("/")) return [];
-    if (argument !== "" || text.trim() !== text || text.endsWith(" ")) return LIST_COMMAND_MENU.filter((command) => command.name === name);
+    if (argument !== "") return LIST_COMMAND_MENU.filter((command) => command.name === name);
     return LIST_COMMAND_MENU.filter((command) => command.name.startsWith(name));
 }
 

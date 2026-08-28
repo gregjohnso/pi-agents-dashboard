@@ -475,7 +475,7 @@ export class DashboardController {
         this.composerDraft = { ...this.composerDraft, prompt };
         // Every edit reopens the slash menu: a closed menu belongs to the text the operator escaped from.
         this.commandMenuClosed = false;
-        if (!prompt.startsWith("/"))
+        if (!prompt.trim().startsWith("/"))
             this.commandMenuIndex = 0;
         this.scheduleUiSave();
     }
@@ -485,9 +485,10 @@ export class DashboardController {
     }
     /** The commands a slash prompt still admits, or undefined when the operator is not typing one. */
     commandMenuOverlay() {
-        if (this.focus !== "list" || this.commandMenuClosed || !this.composerDraft.prompt.startsWith("/"))
+        const prompt = this.composerDraft.prompt.trim();
+        if (this.focus !== "list" || this.commandMenuClosed || !prompt.startsWith("/"))
             return undefined;
-        return createCommandMenuOverlay(this.composerDraft.prompt, this.commandMenuIndex);
+        return createCommandMenuOverlay(prompt, this.commandMenuIndex);
     }
     moveCommandMenu(delta) {
         const menu = this.commandMenuOverlay();

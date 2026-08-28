@@ -205,9 +205,9 @@ describe("dashboard controller", () => {
         const dashboard = controller(backend);
         await dashboard.open();
         dashboard.selectSession("a");
+        // The retry re-reads from the daemon, so the newest revision comes from there.
+        backend.getSnapshot = vi.fn(async () => ({ sessions: [session("a", { processState: "LIVE", revision: 9 })] }));
         dashboard.handleInput("\x18");
-        dashboard.handleInput("y");
-        dashboard.applySnapshot({ sessions: [session("a", { processState: "LIVE", revision: 9 })] });
         await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledWith("a", 9, expect.any(String)));
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
     });
@@ -325,6 +325,25 @@ describe("dashboard controller", () => {
         dashboard.handleInput("\x18");
         expect(backend.delete).not.toHaveBeenCalled();
         expect(dashboard.stopClearArmed).toBe(true);
+    });
+    it("re-reads the authoritative revision when a destructive request conflicts", async () => {
+        // The record churns from background writes, and the frontend's cached copy can be many
+        // revisions behind, so retrying against the cache conflicts forever.
+        const backend = new FakeBackend([session("a", { taskState: "FAILED", processState: "EXITED", revision: 4 })]);
+        backend.delete = vi.fn(async (_sessionId, revision) => {
+            if (revision !== 25) throw Object.assign(new Error("Session revision changed before Delete"), { code: "REVISION_CONFLICT" });
+            return { accepted: true };
+        });
+        const dashboard = controller(backend);
+        await dashboard.open();
+        // The daemon has moved on; the frontend still holds revision 4 because no event carried the change.
+        backend.getSnapshot = vi.fn(async () => ({ sessions: [session("a", { taskState: "FAILED", processState: "EXITED", revision: 25 })] }));
+        dashboard.setView("all");
+        dashboard.selectSession("a");
+        dashboard.handleInput("\x18");
+        dashboard.handleInput("\x18");
+        await vi.waitFor(() => expect(backend.delete).toHaveBeenCalledWith("a", 25, expect.any(String)));
+        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
     });
     it("coalesces cursor saves across a burst of events and flushes on close", async () => {
         // Each save fsyncs the file and its directory, about 70ms on a network home, so one save per
@@ -996,6 +1015,34 @@ describe("daemon dashboard backend", () => {
     });
 });
 
+describe("mouse clicks", () => {
+    it("selects the clicked session and opens it when it is already selected", async () => {
+        const backend = new FakeBackend([session("a"), session("b"), session("c")]);
+        const opened = [];
+        const dashboard = controller(backend, { openViewer: async (id) => { opened.push(id); } });
+        await dashboard.open();
+        dashboard.render(100, 24);
+        const layout = createDashboardLayout(100, 24);
+
+        dashboard.handleMouse({ button: "left", column: 4, row: layout.listTop + 1 });
+        expect(dashboard.selectedSessionId).toBe("b");
+        expect(opened).toEqual([]);
+
+        // Clicking the row you are already on opens it, so a session is one or two clicks away.
+        dashboard.handleMouse({ button: "left", column: 4, row: layout.listTop + 1 });
+        await vi.waitFor(() => expect(opened).toEqual(["b"]));
+    });
+
+    it("ignores a click below the last session", async () => {
+        const backend = new FakeBackend([session("a")]);
+        const dashboard = controller(backend);
+        await dashboard.open();
+        dashboard.render(100, 24);
+        const layout = createDashboardLayout(100, 24);
+        dashboard.handleMouse({ button: "left", column: 4, row: layout.listTop + 6 });
+        expect(dashboard.selectedSessionId).toBe("a");
+    });
+});
 describe("wheel scrolling", () => {
     it("moves the selection up and down from wheel events", async () => {
         const dashboard = controller(new FakeBackend([session("a"), session("b"), session("c"), session("d"), session("e")]));

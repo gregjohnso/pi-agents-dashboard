@@ -107,6 +107,10 @@ export function parseListCommand(text, choices) {
         const provider = argument.slice(0, separator);
         const id = argument.slice(separator + 1);
         if (separator === -1 || provider === "" || id === "") return rejected("MODEL_FORMAT_REQUIRED", `Name the provider too: /model provider/id, not ${argument}`);
+        // Checked only when the catalog loaded: an unknown model launches a session Pi kills on startup,
+        // and the hint text itself, provider/id, is the value operators type first.
+        if (choices.models.length > 0 && !choices.models.includes(argument))
+            return rejected("MODEL_UNKNOWN", `Pi does not offer ${argument}. Press Enter on /model to pick one.`);
         return { kind: "set_model", model: { provider, id } };
     }
     if (name === "/thinking") {

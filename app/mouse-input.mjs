@@ -24,13 +24,22 @@ const MAX_PENDING = 32;
 const ESCAPE_FLUSH_MS = 10;
 const SEQUENCE_FLUSH_MS = 50;
 
-/** @param {number} button @returns {"wheel_up" | "wheel_down" | undefined} */
-function wheelButton(button) {
-  if ((button & WHEEL_FLAG) === 0) return undefined;
-  const direction = button & 3;
-  if (direction === 0) return "wheel_up";
-  if (direction === 1) return "wheel_down";
-  return undefined;
+const DRAG_FLAG = 32;
+
+/**
+ * Name the event a mouse report carries, or undefined to leave the bytes to pi-tui.
+ * Wheel notches scroll, and a plain left-button press selects; drags, other buttons and modified
+ * clicks stay with pi-tui, which owns text selection.
+ * @param {number} button @returns {"wheel_up" | "wheel_down" | "left" | undefined}
+ */
+function mouseButton(button) {
+  if ((button & WHEEL_FLAG) !== 0) {
+    const direction = button & 3;
+    if (direction === 0) return "wheel_up";
+    if (direction === 1) return "wheel_down";
+    return undefined;
+  }
+  return button === 0 ? "left" : undefined;
 }
 
 /** True when `data` is a strict prefix of some complete mouse report. */
@@ -51,7 +60,7 @@ function couldCompleteMouseReport(data) {
  * turns out not to be a wheel report is passed through unchanged.
  *
  * @param {string} data
- * @returns {{ events: Array<{ button: "wheel_up" | "wheel_down", column: number, row: number }>, passThrough: string, pending: string }}
+ * @returns {{ events: Array<{ button: "wheel_up" | "wheel_down" | "left", column: number, row: number }>, passThrough: string, pending: string }}
  */
 export function parseWheelInput(data) {
   const events = [];
@@ -61,16 +70,19 @@ export function parseWheelInput(data) {
     if (couldCompleteMouseReport(rest)) return { events, passThrough, pending: rest };
     const sgr = SGR_MOUSE.exec(rest);
     if (sgr !== null) {
-      const button = wheelButton(Number.parseInt(sgr[1], 10));
-      // A press/drag/release report belongs to pi-tui's selection and scrollbar handling.
-      if (button === undefined || sgr[4] === "m") passThrough += sgr[0];
+      const raw = Number.parseInt(sgr[1], 10);
+      const button = (raw & DRAG_FLAG) === 0 ? mouseButton(raw) : undefined;
+      const release = sgr[4] === "m";
+      // Swallow the release that matches a click we reported, so pi-tui never sees half a click.
+      if (button === "left" && release) { rest = rest.slice(sgr[0].length); continue; }
+      if (button === undefined || (release && button !== "left")) passThrough += sgr[0];
       else events.push({ button, column: Number.parseInt(sgr[2], 10) - 1, row: Number.parseInt(sgr[3], 10) - 1 });
       rest = rest.slice(sgr[0].length);
       continue;
     }
     if (rest.startsWith(X10_MOUSE_PREFIX) && rest.length >= X10_MOUSE_LENGTH) {
       const report = rest.slice(0, X10_MOUSE_LENGTH);
-      const button = wheelButton(report.charCodeAt(3) - 32);
+      const button = mouseButton(report.charCodeAt(3) - 32);
       if (button === undefined) passThrough += report;
       else events.push({ button, column: report.charCodeAt(4) - 32 - 1, row: report.charCodeAt(5) - 32 - 1 });
       rest = rest.slice(X10_MOUSE_LENGTH);
@@ -83,13 +95,14 @@ export function parseWheelInput(data) {
 }
 
 /**
- * Wrap a pi-tui `Terminal` so wheel events reach `onWheel` and every other byte reaches the TUI.
+ * Wrap a pi-tui `Terminal` so wheel notches and plain left clicks reach `onWheel`, and every other
+ * byte reaches the TUI unchanged.
  *
  * The returned terminal also exposes `onWheel(listener)` so a host mounted after construction can
  * subscribe; the constructor argument is optional for that reason.
  *
  * @param {any} terminal
- * @param {(event: { button: "wheel_up" | "wheel_down", column: number, row: number }) => void} [onWheel]
+ * @param {(event: { button: "wheel_up" | "wheel_down" | "left", column: number, row: number }) => void} [onWheel]
  */
 export function createWheelInputTap(terminal, onWheel) {
   let pending = "";

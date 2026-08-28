@@ -27,8 +27,8 @@ describe("list slash commands", () => {
     it("sets an exact model and requires the provider/id form", () => {
         expect(parseListCommand("/model google/gemini", choices)).toEqual({ kind: "set_model", model: { provider: "google", id: "gemini" } });
         expect(parseListCommand("/model google", choices)).toMatchObject({ kind: "rejected", code: "MODEL_FORMAT_REQUIRED" });
-        // The choices are only what this frontend has seen, so an unseen model is typed text, not an error.
-        expect(parseListCommand("/model openai/gpt", choices)).toEqual({ kind: "set_model", model: { provider: "openai", id: "gpt" } });
+        // With a catalog loaded, a model Pi does not offer is refused here rather than at launch.
+        expect(parseListCommand("/model openai/gpt", choices)).toMatchObject({ kind: "rejected", code: "MODEL_UNKNOWN" });
     });
     it("opens a picker for a bare choice command and says so when it knows no values", () => {
         expect(parseListCommand("/model", choices)).toEqual({ kind: "pick_model" });
@@ -127,4 +127,21 @@ describe("installed pi thinking scale", () => {
         const levels = String(line).slice(String(line).indexOf(":") + 1).split(",").map((level) => level.trim()).filter((level) => level !== "");
         expect(levels, upgradeNotice).toEqual([...PI_THINKING_LEVELS]);
     });
+
+describe("model values checked against Pi's catalog", () => {
+    const catalog = { models: ["anthropic/claude-opus-5", "openai-codex/gpt-5.6-sol"], thinkingLevels: ["high"] };
+
+    it("refuses a model the catalog does not list, naming it", () => {
+        // The menu hint reads /model [provider/id]; typing it literally launched a session Pi killed.
+        expect(parseListCommand("/model provider/id", catalog)).toMatchObject({ kind: "rejected", code: "MODEL_UNKNOWN", message: expect.stringContaining("provider/id") });
+    });
+
+    it("accepts a model the catalog lists", () => {
+        expect(parseListCommand("/model anthropic/claude-opus-5", catalog)).toMatchObject({ kind: "set_model", model: { provider: "anthropic", id: "claude-opus-5" } });
+    });
+
+    it("accepts anything when the catalog is unavailable, so an offline daemon cannot block a launch", () => {
+        expect(parseListCommand("/model local/whatever", { models: [], thinkingLevels: [] })).toMatchObject({ kind: "set_model", model: { provider: "local", id: "whatever" } });
+    });
+});
 });

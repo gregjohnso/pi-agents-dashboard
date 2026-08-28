@@ -10,8 +10,9 @@ describe("wheel input parsing", () => {
     ["SGR wheel-up with zero-based coordinates", "\x1b[<64;13;5M", { events: [{ button: "wheel_up", column: 12, row: 4 }], passThrough: "", pending: "" }],
     ["SGR wheel-down with zero-based coordinates", "\x1b[<65;1;1M", { events: [{ button: "wheel_down", column: 0, row: 0 }], passThrough: "", pending: "" }],
     ["X10 wheel-up", x10(64, 4, 9), { events: [{ button: "wheel_up", column: 3, row: 8 }], passThrough: "", pending: "" }],
-    // pi-tui keeps selection and clicks, so a non-wheel mouse report must reach it untouched.
-    ["a non-wheel mouse report", "\x1b[<0;5;5M", { events: [], passThrough: "\x1b[<0;5;5M", pending: "" }],
+    // A plain left click is ours; pi-tui keeps drags and every other button for its own selection.
+    ["a left-button press", "\x1b[<0;5;5M", { events: [{ button: "left", column: 4, row: 4 }], passThrough: "", pending: "" }],
+    ["a middle-button press", "\x1b[<1;5;5M", { events: [], passThrough: "\x1b[<1;5;5M", pending: "" }],
     ["a wheel event surrounded by keystrokes", "ab\x1b[<65;2;3Mcd", { events: [{ button: "wheel_down", column: 1, row: 2 }], passThrough: "abcd", pending: "" }],
   ])("reads %s", (_label, input, expected) => {
     expect(parseWheelInput(input)).toEqual(expected);
@@ -143,4 +144,22 @@ describe("installed pi-tui mouse assumptions", () => {
       tui.stop({ preserveScreen: true });
     }
   });
+
+describe("clicks", () => {
+  it("reports a left-button press with its cell, and swallows the matching release", () => {
+    const pressed = parseWheelInput("\u001b[<0;12;7M");
+    expect(pressed.events).toEqual([{ button: "left", column: 11, row: 6 }]);
+    expect(pressed.passThrough).toBe("");
+    // A release would otherwise reach pi-tui as a stray sequence.
+    expect(parseWheelInput("\u001b[<0;12;7m").events).toEqual([]);
+  });
+
+  it("leaves drags and other buttons to pi-tui", () => {
+    for (const report of ["\u001b[<32;12;7M", "\u001b[<2;12;7M"]) {
+      const parsed = parseWheelInput(report);
+      expect(parsed.events).toEqual([]);
+      expect(parsed.passThrough).toBe(report);
+    }
+  });
+});
 });

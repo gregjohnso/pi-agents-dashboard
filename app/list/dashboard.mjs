@@ -244,6 +244,12 @@ const COMPOSER_FIELD_LABELS = {
     thinkingLevel: "thinking",
     name: "name",
 };
+/** The prompt's own rule, carrying the active launch field's name when the operator is editing one. */
+function composerRule(label, width, focused) {
+    const bare = "─".repeat(Math.max(0, width));
+    const named = label === "" || width < label.length + 6 ? bare : `${"─".repeat(width - label.length - 3)} ${label} ─`;
+    return paintPlainLine(named, width, focused ? jobwatchTheme.focusBorder : jobwatchTheme.text);
+}
 function sectionFooter(width, focused) {
     return paintPlainLine("─".repeat(Math.max(0, width)), width, focused ? jobwatchTheme.focusBorder : jobwatchTheme.text);
 }
@@ -750,8 +756,15 @@ export class DashboardController {
                     break;
                 }
                 catch (error) {
+                    if (error?.code !== "REVISION_CONFLICT" || attempt >= this.stopRetryLimit)
+                        throw error;
+                    // The cached list can be many revisions behind, so ask the daemon rather than
+                    // retrying against a copy that will conflict forever.
+                    const snapshot = await this.backend.getSnapshot().catch(() => undefined);
+                    if (snapshot !== undefined)
+                        this.applySnapshot(snapshot);
                     const current = this.sessions.find((candidate) => candidate.sessionId === sessionId);
-                    if (error?.code !== "REVISION_CONFLICT" || attempt >= this.stopRetryLimit || current === undefined || destructiveAction(current) !== action)
+                    if (current === undefined || destructiveAction(current) !== action)
                         throw error;
                     attemptRevision = current.revision;
                     await new Promise((resolve) => setTimeout(resolve, 25));
@@ -966,7 +979,12 @@ export class DashboardController {
         }
         const index = this.viewportOffset + Math.floor(event.row) - layout.listTop;
         const row = this.list.rows[index];
-        if (row?.kind === "session")
+        if (row?.kind !== "session")
+            return;
+        // First click selects, a second on the same row opens it, so the mouse alone can reach a session.
+        if (this.list.selectedSessionId === row.session.sessionId)
+            void this.activateSelection();
+        else
             this.selectSession(row.session.sessionId);
     }
     render(width = this.width, height = this.height) {
@@ -1004,7 +1022,8 @@ export class DashboardController {
             if (lines.length >= 4) {
                 const dockTop = lines.length - layout.dockRows;
                 const draftPrompt = this.composerDraft.prompt;
-                lines[dockTop] = sectionBorder(this.composerField === "prompt" ? "" : COMPOSER_FIELD_LABELS[this.composerField], this.width, confirmingSharedLaunch);
+                // Flat rules above and below the prompt: a rounded top with a flat bottom read as a broken box.
+                lines[dockTop] = composerRule(this.composerField === "prompt" ? "" : COMPOSER_FIELD_LABELS[this.composerField], this.width, confirmingSharedLaunch);
                 lines[dockTop + 1] = paintPlainLine(` ❯ ${draftPrompt || "describe a task for a new session"}`, this.width, draftPrompt ? (text) => jobwatchTheme.text(text, false) : (text) => jobwatchTheme.muted(text, false));
                 const form = layout.listTop >= 5 ? "" : ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
                 // The rule closes the prompt box; launch settings and the selected path are context below it.

@@ -134,8 +134,11 @@ export function renderSessionRow(session, layout, options) {
             return jobwatchTheme.state(session, text, selected);
         if (key === "age")
             return jobwatchTheme.muted(text, selected);
-        if (key === "name")
-            return jobwatchTheme.name(text, selected, session.color);
+        if (key === "name") {
+            // A colour marks the name, not the column: fill behind the text and leave the padding alone.
+            const label = text.trimEnd();
+            return jobwatchTheme.name(label, selected, session.color) + jobwatchTheme.text(text.slice(label.length), selected);
+        }
         return jobwatchTheme.text(text, selected);
     }, (text) => jobwatchTheme.separator(text, selected));
 }

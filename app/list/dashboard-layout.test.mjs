@@ -139,6 +139,17 @@ it("ages a session from when it started, not from its last activity", () => {
     expect(row).not.toContain("30s");
 });
 
+it("tints only the name itself, not the padding that follows it", () => {
+    const layout = createDashboardLayout(120, 20);
+    const amberBackground = "\u001b[48;2;252;211;77m";
+    const row = renderSessionRow(session("c", { name: "Inspect Mantis Installer", color: "amber" }), layout, { now });
+    const tinted = row.slice(row.indexOf(amberBackground));
+    const label = stripVTControlCharacters(tinted.slice(0, tinted.indexOf("\u001b[0m")));
+    // The highlight hugs the name; the rest of the column keeps the row's own background.
+    expect(label).toBe("Inspect Mantis Installer");
+    expect(stripVTControlCharacters(row)).toContain("Inspect Mantis Installer  ");
+});
+
 it("spins an unlabelled column left of STATE so the state text never shifts", () => {
     const layout = createDashboardLayout(100, 24);
     const spinner = /[\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f]/u;

@@ -6,10 +6,11 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, expect, it, vi } from "vitest";
 
+import { atomicWriteJson } from "./atomic-file.mjs";
 import { connectDaemon } from "./daemon-connector.mjs";
 import { createJsonlDecoder, createJsonlEncoder } from "./jsonl.mjs";
 import { createBoundedSocketWriter, createDaemonRuntime } from "./daemon.mjs";
-import { RegistryStore, runSessionLifecycle } from "./registry-store.mjs";
+import { RegistryStore, registryCoordinationScope, runSessionLifecycle } from "./registry-store.mjs";
 
 /** @type {any[]} */
 const runtimes = [];
@@ -132,7 +133,7 @@ function startPersistentFakeWorker(config, worker) {
     }
     alive = false;
   })();
-  const loop = { pid: worker.identity.pid, get alive() { return alive; }, get connectionCount() { return connectionCount; }, get commandCount() { return commandCount; }, get commandIds() { return [...commandIds]; }, get commands() { return [...commands]; }, async sendFrame(/** @type {any} */ frame) { await live.send({ version: 1, type: "pi_frame", token: worker.token, sessionId: worker.sessionId, frame }); }, async stop() { controller.abort(); await run; } };
+  const loop = { pid: worker.identity.pid, get alive() { return alive; }, get connectionCount() { return connectionCount; }, get commandCount() { return commandCount; }, get commandIds() { return [...commandIds]; }, get commands() { return [...commands]; }, async sendFrame(/** @type {any} */ frame) { await live.send({ version: 1, type: "pi_frame", token: worker.token, sessionId: worker.sessionId, frame }); }, async sendEvent(/** @type {any} */ event) { await live.send({ version: 1, type: "worker_event", token: worker.token, sessionId: worker.sessionId, event }); }, async stop() { controller.abort(); await run; } };
   workerLoops.push(loop);
   return loop;
 }
@@ -412,6 +413,46 @@ it("summarizes sessions only after the opt-in model is chosen and reuses cached 
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "summaries_refreshing", sessionIds: [] } });
   expect(summarized).toHaveLength(1);
   client.close();
+});
+
+it("keeps the worker connection when a concurrent record write loses the worker event a compare-and-swap", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const identity = { pid: 271, startIdentity: "worker-cas", processGroupId: 271 };
+  const piChild = { pid: 272, startIdentity: "pi-cas", processGroupId: 271 };
+  const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === 271 ? identity : piChild;
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const now = "2026-08-25T12:00:00.000Z";
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "cas", sessionFile: "/sessions/cas.jsonl", canonicalSessionFile: "/sessions/cas.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "idle", summary: "Idle", updatedAt: now }, ownership: { kind: "managed", runId: "run-cas", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-cas", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "cas", runId: "run-cas", leaseId: "lease-cas", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  const runtime = await createDaemonRuntime({ root: stateRoot, inspect, reconnectTimeoutMs: 1_000 });
+  runtimes.push(runtime);
+  const worker = startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "cas", runId: "run-cas", leaseId: "lease-cas", generation: 1, identity, piChildIdentity: piChild, token: "cas-token" });
+  await runtime.ready;
+  await vi.waitFor(() => expect(worker.connectionCount).toBe(1));
+
+  // Hold the coordination key RegistryStore.update takes, so the handler's own update queues behind a
+  // record write it cannot see. RegistryStore.get is uncoordinated, so its read is already stale.
+  const coordinated = registryCoordinationScope(registry).coordinator;
+  /** @type {(value?: unknown) => void} */
+  let releaseWrite = () => {};
+  const blocked = new Promise((resolve) => { releaseWrite = resolve; });
+  const holding = coordinated.run("cas", async () => {
+    await worker.sendEvent({ type: "TURN_STARTED", at: "2026-08-25T12:00:01.000Z" });
+    // Let the handler read the record before another writer bumps its revision.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const current = await registry.get("cas");
+    if (current === undefined) throw new Error("cas record missing");
+    await atomicWriteJson(join(stateRoot, "sessions", "cas.json"), { ...current, revision: current.revision + 1, color: "amber" });
+    await blocked;
+  });
+  releaseWrite();
+  await holding;
+
+  await vi.waitFor(async () => expect(await registry.get("cas")).toMatchObject({ taskState: "WORKING", color: "amber" }), { timeout: 5_000 });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  expect(worker.connectionCount).toBe(1);
+  expect(worker.alive).toBe(true);
 });
 
 it("selects sessions to summarize without republishing a durable viewer snapshot", async () => {

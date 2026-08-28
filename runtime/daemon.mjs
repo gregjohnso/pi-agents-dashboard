@@ -18,7 +18,7 @@ import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "./process-signaler.mjs";
 import { RecoveredWorkerRouter, reconcileRuntime } from "./reconciliation.mjs";
 import { openSettingsStore, summarizePromptInput, summarizeWithPi } from "./summaries.mjs";
-import { RegistryStore, applySessionColor, runSessionLifecycle } from "./registry-store.mjs";
+import { RegistryStore, applySessionColor, applySessionUpdate, runSessionLifecycle } from "./registry-store.mjs";
 import { reduceSessionState } from "./state-reducer.mjs";
 import { createIdleExit } from "./idle-exit.mjs";
 import { spawn as spawnProcess } from "node:child_process";
@@ -1014,10 +1014,14 @@ export async function createDaemonRuntime({
         const eventKeys = ["version", "type", "token", "sessionId", "event"];
         if (frame.type !== "worker_event" || frame.version !== 1 || frame.sessionId !== metadata.sessionId || Object.keys(frame).some((key) => !eventKeys.includes(key)) || typeof frame.event !== "object" || frame.event === null || Array.isArray(frame.event)) throw Object.assign(new Error("Invalid worker frame"), { code: "INVALID_WORKER_FRAME" });
         await router.runCurrent(metadata, connection, routeGeneration, async () => {
-          const record = await registry.get(frame.sessionId);
-          if (record?.ownership === undefined || record.ownership.runId !== metadata.runId) throw Object.assign(new Error("Worker event ownership conflict"), { code: "OWNERSHIP_CONFLICT" });
-          const next = reduceSessionState(record, frame.event);
-          const updated = next === record ? record : await registry.update(record.sessionId, record.revision, { taskState: next.taskState, processState: next.processState, outcome: next.outcome, activity: next.activity, updatedAt: next.updatedAt });
+          // Re-read and re-reduce when another writer wins the compare-and-swap. Throwing here reaches
+          // the worker socket's error path, which destroys the connection: losing a race with a color,
+          // rename or summary write must not cost the supervisor its route.
+          const updated = await applySessionUpdate(registry, frame.sessionId, (current) => {
+            if (current.ownership === undefined || current.ownership.runId !== metadata.runId) throw Object.assign(new Error("Worker event ownership conflict"), { code: "OWNERSHIP_CONFLICT" });
+            const next = reduceSessionState(current, frame.event);
+            return next === current ? undefined : { taskState: next.taskState, processState: next.processState, outcome: next.outcome, activity: next.activity, updatedAt: next.updatedAt };
+          });
           await context.publishSession(updated);
         });
       },

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { atomicWriteJson } from "./atomic-file.mjs";
 import { createCommandJournal } from "./command-journal.mjs";
 import { createEventStore } from "./event-store.mjs";
+import { traceSessionLock } from "./lock-trace.mjs";
 import { RegistryStore, registryCoordinationScope } from "./registry-store.mjs";
 import { createSessionHistoryReader, SessionHistoryError } from "./session-history.mjs";
 import { reduceSessionState } from "./state-reducer.mjs";
@@ -132,9 +133,9 @@ export class RecoveredWorkerRouter {
     return [...this.#routes.keys()];
   }
 
-  /** @template T @param {string} sessionId @param {() => Promise<T>} action */
-  #serializeRoute(sessionId, action) {
-    return this.#lifecycle.run(sessionId, action);
+  /** @template T @param {string} sessionId @param {() => Promise<T>} action @param {string} label */
+  #serializeRoute(sessionId, action, label) {
+    return traceSessionLock(label, sessionId, (traced) => this.#lifecycle.run(sessionId, traced), action);
   }
 
   /** @param {any} frame @param {any} connection */
@@ -169,7 +170,7 @@ export class RecoveredWorkerRouter {
         if (this.#routes.get(frame.sessionId) === route) this.#routes.delete(frame.sessionId);
       }).catch(() => {});
       return route;
-    });
+    }, "router_adopt");
   }
 
   /** @param {string} sessionId */
@@ -198,7 +199,7 @@ export class RecoveredWorkerRouter {
           route?.connection.close?.();
         },
       });
-    });
+    }, "router_session");
   }
 
   /** @param {any} metadata @param {any} connection @param {number} routeGeneration */
@@ -227,7 +228,7 @@ export class RecoveredWorkerRouter {
     return this.#serializeRoute(metadata.sessionId, async () => {
       await this.#assertCurrent(metadata, connection, routeGeneration);
       return action();
-    });
+    }, "router_frame");
   }
 
   async close() {

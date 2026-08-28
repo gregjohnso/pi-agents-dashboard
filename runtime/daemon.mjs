@@ -701,7 +701,7 @@ export async function createDaemonRuntime({
         handle.onFrame?.((/** @type {Record<string, unknown>} */ frame) => {
           void runSessionLifecycle(registry, handle.sessionId, async () => {
             await context.recovery.viewer.ingest(handle.sessionId, frame);
-          }).catch(() => {});
+          }, "viewer_ingest_launch").catch(() => {});
         });
       },
       /**
@@ -731,7 +731,7 @@ export async function createDaemonRuntime({
           const next = reduceSessionState(current, { type: streaming ? "TURN_STARTED" : "TURN_COMPLETED", at: new Date().toISOString() });
           const updated = await registry.update(current.sessionId, current.revision, { taskState: next.taskState, processState: next.processState, outcome: next.outcome, activity: next.activity, updatedAt: next.updatedAt });
           await context.publishSession(updated);
-        });
+        }, "reconcile_activity");
       },
       /**
        * Store the model and thinking level Pi reported, so the list shows what a session actually runs
@@ -755,7 +755,7 @@ export async function createDaemonRuntime({
             updatedAt: new Date().toISOString(),
           });
           await context.publishSession(updated);
-        });
+        }, "record_model");
       },
       /** Refresh opt-in Activity summaries for every session whose transcript advanced. */
       async refreshSummaries() {
@@ -789,7 +789,7 @@ export async function createDaemonRuntime({
                 const namesItself = typeof writtenName === "string" && writtenName.trim().length > 0 && current.nameGenerated !== false;
                 const updated = await registry.update(current.sessionId, current.revision, { summary: { text: text.trim().slice(0, 512), generatedAt: new Date().toISOString(), model: { ...summaryModel }, sourceCursor }, ...(namesItself ? { name: writtenName.trim().slice(0, 128), nameGenerated: true } : {}), updatedAt: new Date().toISOString() });
                 await context.publishSession(updated);
-              });
+              }, "summary_write");
             } catch {
             } finally {
               summarizing.delete(record.sessionId);
@@ -949,7 +949,7 @@ export async function createDaemonRuntime({
           await checkpoint("after_result_completion");
           if (durable.ok) return durable.result;
           throw Object.assign(new Error(durable.error.message), durable.error);
-        });
+        }, request.op);
         const reservation = { serialized, promise: operation };
         attachmentRequests.set(cacheKey, reservation);
         void operation.finally(() => {
@@ -971,7 +971,7 @@ export async function createDaemonRuntime({
           claims.delete(socket);
           if (claims.size === 0) attachmentClaims.delete(sessionId);
           context.broadcast(event);
-        })));
+        }, "release_attachments")));
         attachmentSessions.delete(socket);
       },
       /** @param {any} frame @param {any} connection @param {any} metadata @param {number} routeGeneration */
@@ -1029,7 +1029,7 @@ export async function createDaemonRuntime({
             const updated = await applySessionColor(registry, request.payload.sessionId, request.payload.color);
             await context.publishSession(updated);
             return { kind: "session_colored", sessionId: updated.sessionId, revision: updated.revision, color: updated.color ?? null };
-          });
+          }, "set_session_color");
         }
         if (context.state !== "READY" && !duringRecovery) throw Object.assign(new Error(context.state === "FAILED" ? context.stateError?.message ?? "Daemon recovery failed" : "Daemon recovery is still in progress"), { code: context.state === "FAILED" ? context.stateError?.code ?? "RECOVERY_FAILED" : "RECOVERING", retryable: context.state !== "FAILED" });
         if (request.op === "get_viewer_snapshot") {
@@ -1113,7 +1113,7 @@ export async function createDaemonRuntime({
               await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
               await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
               return { kind: "launched", sessionId: persisted.sessionId };
-            });
+            }, "launch");
           } catch (error) {
             const launchError = /** @type {any} */ (error);
             const current = await context.recovery.journal.get(request);
@@ -1365,11 +1365,11 @@ export async function createDaemonRuntime({
             if (current === undefined || current.name === request.payload.name) return;
             const updated = await registry.update(current.sessionId, current.revision, { name: request.payload.name, nameGenerated: false, updatedAt: new Date().toISOString() });
             await context.publishSession(updated);
-          });
+          }, "set_session_name");
         }
         if (changed) {
           const publish = () => context.publishCommand(status);
-          if (typeof request.payload?.sessionId === "string") await runSessionLifecycle(registry, request.payload.sessionId, publish);
+          if (typeof request.payload?.sessionId === "string") await runSessionLifecycle(registry, request.payload.sessionId, publish, "publish_command");
           else await publish();
         }
         return { kind: "command", status };

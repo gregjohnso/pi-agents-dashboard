@@ -3,6 +3,7 @@ import { isAbsolute, join, resolve } from "node:path";
 
 import { SESSION_COLORS } from "../shared/contracts.mjs";
 import { atomicWriteJson } from "./atomic-file.mjs";
+import { traceSessionLock } from "./lock-trace.mjs";
 import { SessionCoordinator } from "./session-coordinator.mjs";
 
 const CREATE_COORDINATION_KEY = "\0registry-create";
@@ -259,9 +260,10 @@ export function registryCoordinationScope(registry) {
   return scope;
 }
 
-/** Serialize a complete ownership/revision lifecycle for one exact session. @param {RegistryStore} registry @param {string} sessionId @param {() => any | Promise<any>} operation */
-export function runSessionLifecycle(registry, sessionId, operation) {
-  return registryCoordinationScope(registry).lifecycle.run(sessionId, operation);
+/** Serialize a complete ownership/revision lifecycle for one exact session. @param {RegistryStore} registry @param {string} sessionId @param {() => any | Promise<any>} operation @param {string} [label] */
+export function runSessionLifecycle(registry, sessionId, operation, label = "lifecycle") {
+  const { lifecycle } = registryCoordinationScope(registry);
+  return traceSessionLock(label, sessionId, (traced) => lifecycle.run(sessionId, traced), operation);
 }
 
 /**

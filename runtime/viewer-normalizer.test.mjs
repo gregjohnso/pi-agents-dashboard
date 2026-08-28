@@ -204,6 +204,57 @@ describe("viewer normalizer", () => {
     expect(() => normalizer().consumeFrame({ type: "response", command: "cycle_model", success: true, data: null })).not.toThrow();
   });
 
+  it("keeps a burst of one-way Pi UI updates out of the transcript", () => {
+    // One recorded run emitted 153 consecutive setWidget requests inside a single turn
+    // (~/.local/state/pi-dashboard/runs/*/diagnostics/rpc.*.jsonl).
+    const subject = normalizer();
+    const events = [];
+    for (let index = 0; index < 153; index += 1) {
+      events.push(...subject.consumeFrame({ type: "extension_ui_request", id: `widget-${index}`, method: "setWidget", widgetKey: "monitor-list", widgetLines: ["job 1"] }));
+    }
+    for (const frame of [{ method: "setStatus", statusKey: "monitor", statusText: "3 jobs" }, { method: "setTitle", title: "pi" }, { method: "set_editor_text", text: "draft" }]) {
+      events.push(...subject.consumeFrame({ type: "extension_ui_request", id: `${frame.method}-1`, ...frame }));
+    }
+    expect(events).toEqual([]);
+    const snapshot = subject.snapshot({ daemonEpoch: "epoch-1", sequence: "0", registryRevision: 1, runtime: null, role: "composer", taskState: "WORKING", processState: "LIVE", outcome: "NONE" });
+    expect(snapshot.items).toEqual([]);
+    expect(snapshot.activity.phase).toBe("idle");
+    expect(() => parseViewerSnapshot(snapshot)).not.toThrow();
+  });
+
+  it("shows a Pi notify as one bounded activity line instead of a transcript card", () => {
+    const subject = normalizer();
+    const events = [
+      ...subject.consumeFrame({ type: "extension_ui_request", id: "notify-1", method: "notify", message: "  [monitor mon_1]\n  exit: status=timed-out  ", notifyType: "info" }),
+      ...subject.consumeFrame({ type: "extension_ui_request", id: "notify-2", method: "notify", message: "pull failed", notifyType: "error" }),
+      ...subject.consumeFrame({ type: "extension_ui_request", id: "notify-3", method: "notify", message: "x".repeat(100_000) }),
+      ...subject.consumeFrame({ type: "extension_ui_request", id: "notify-4", method: "notify" }),
+    ];
+    expect(events.map((event) => event.payload.kind)).toEqual(["activity", "activity", "activity", "activity"]);
+    expect(events[0].payload).toMatchObject({ phase: "thinking", label: "Pi notice", detail: "[monitor mon_1] exit: status=timed-out" });
+    expect(events[1].payload).toMatchObject({ phase: "error", label: "Pi error", detail: "pull failed" });
+    expect(String(events[2].payload.detail).length).toBeLessThanOrEqual(4_096);
+    expect(events[3].payload).not.toHaveProperty("detail");
+    const snapshot = subject.snapshot({ daemonEpoch: "epoch-1", sequence: "4", registryRevision: 1, runtime: null, role: "composer", taskState: "WORKING", processState: "LIVE", outcome: "NONE" });
+    expect(snapshot.items).toEqual([]);
+    expect(() => parseViewerSnapshot(snapshot)).not.toThrow();
+    assertPayloads(events);
+  });
+
+  it("reports a UI method Pi does not define once per method, not once per frame", () => {
+    const subject = normalizer();
+    const events = [
+      ...subject.consumeFrame({ type: "extension_ui_request", id: "new-1", method: "hologram", frames: 1 }),
+      ...subject.consumeFrame({ type: "extension_ui_request", id: "new-2", method: "hologram", frames: 2 }),
+      ...subject.consumeFrame({ type: "extension_ui_request", id: "new-3", method: "teleport" }),
+    ];
+    expect(events.map((event) => event.payload)).toEqual([
+      { kind: "unknown_pi_event", piType: "extension_ui_request", summary: "Unsupported Pi UI method (hologram)" },
+      { kind: "unknown_pi_event", piType: "extension_ui_request", summary: "Unsupported Pi UI method (teleport)" },
+    ]);
+    assertPayloads(events);
+  });
+
   it("bounds unknown optional events and reports malformed required shapes as typed session errors", () => {
     const subject = normalizer();
     const events = subject.consumeFrame({ type: "future_pi_event", secret: "x".repeat(100_000) });

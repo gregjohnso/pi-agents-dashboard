@@ -71,19 +71,23 @@ export class TranscriptModel {
     this.adapters = adapters;
     this.width = 80;
     this.height = 20;
-    this.distanceFromEnd = 0;
+    /** Rendered lines hidden below the bottom of the viewport; 0 is the tail. */
+    this.linesFromEnd = 0;
     this.following = true;
     this.newActivity = false;
     this.hideThinking = false;
     this.selectedToolId = undefined;
     this.expandedTools = new Set();
+    // Keyed by item identity, so a replaced item (a streaming answer) drops its entry on its own.
+    this.renderedBlocks = new WeakMap();
+    this.anchor = undefined;
   }
   setViewport(width, height) { this.width = Math.max(0, Math.floor(width)); this.height = Math.max(0, Math.floor(height)); }
   update(state) {
     const grew = state.items.length > this.state.items.length;
     this.state = state;
     if (grew && !this.following) this.newActivity = true;
-    if (this.following) this.distanceFromEnd = 0;
+    if (this.following) this.linesFromEnd = 0;
   }
   setThinkingHidden(hidden) { this.hideThinking = hidden; }
   selectNextTool(direction = 1) {
@@ -94,54 +98,108 @@ export class TranscriptModel {
     this.selectedToolId = toolIds[index];
     const itemIndex = this.state.items.findIndex((item) => item.kind === "tool" && item.toolId === this.selectedToolId);
     this.following = false;
-    this.distanceFromEnd = Math.max(0, this.state.items.length - itemIndex - 1);
+    this.anchor = undefined;
+    this.linesFromEnd = this.linesBelow(itemIndex);
     return this.selectedToolId;
   }
   toggleSelectedTool() { if (this.selectedToolId !== undefined) this.toggleTool(this.selectedToolId); }
   clearToolSelection() { this.selectedToolId = undefined; }
   scrollBy(lines) {
-    if (lines < 0) {
+    const step = Math.trunc(lines);
+    this.anchor = undefined;
+    if (step < 0) {
       this.following = false;
-      this.distanceFromEnd = Math.min(this.state.items.length, this.distanceFromEnd + Math.abs(Math.trunc(lines)));
+      this.linesFromEnd = this.clampToOldestLine(this.linesFromEnd - step);
     } else {
-      this.distanceFromEnd = Math.max(0, this.distanceFromEnd - Math.trunc(lines));
-      if (this.distanceFromEnd === 0) { this.following = true; this.newActivity = false; }
+      this.linesFromEnd = Math.max(0, this.linesFromEnd - step);
+      if (this.linesFromEnd === 0) { this.following = true; this.newActivity = false; }
     }
   }
-  scrollToEnd() { this.distanceFromEnd = 0; this.following = true; this.newActivity = false; }
+  scrollToEnd() { this.linesFromEnd = 0; this.following = true; this.newActivity = false; this.anchor = undefined; }
   scrollToStart() {
-    // `distanceFromEnd` counts items hidden below the window, so the oldest item stays visible
-    // only when at least one screenful remains above it.
-    this.distanceFromEnd = Math.max(0, this.state.items.length - 1);
+    this.anchor = undefined;
+    this.linesFromEnd = this.clampToOldestLine(Number.MAX_SAFE_INTEGER);
     this.following = false;
   }
   toggleTool(toolId) {
     if (this.expandedTools.has(toolId)) this.expandedTools.delete(toolId); else this.expandedTools.add(toolId);
   }
+  /** Rendered lines of one item, reused until the item, its tool, or the render options change. */
+  blockLines(item, index) {
+    const tool = item.kind === "tool" ? this.state.tools.get(item.toolId) : undefined;
+    if (item.kind === "tool" && tool === undefined) return [];
+    const signature = `${this.width}|${this.hideThinking ? 1 : 0}|${this.expandedTools.has(item.toolId) ? 1 : 0}|${this.state.model?.provider ?? ""}/${this.state.model?.id ?? ""}`;
+    const cached = this.renderedBlocks.get(item);
+    let lines = cached?.signature === signature && cached.tool === tool ? cached.lines : undefined;
+    if (lines === undefined) {
+      const renderedItem = item.kind === "tool" ? { ...item, tool } : item;
+      const component = this.adapters.component(renderedItem, { streaming: renderedItem.streaming, hideThinking: this.hideThinking, provider: this.state.model?.provider, model: this.state.model?.id });
+      if (item.kind === "tool") component.setExpanded?.(this.expandedTools.has(item.toolId));
+      lines = component.render(this.width).map((line) => fit(line, this.width));
+      this.renderedBlocks.set(item, { signature, tool, lines });
+    }
+    const markers = [];
+    // Pi opens every user turn but the first with a spacer above the message box.
+    if (item.kind === "user_message" && index > 0) markers.push("");
+    if (item.kind === "tool" && item.toolId === this.selectedToolId) markers.push(fit("› selected tool", this.width));
+    return markers.length === 0 ? lines : [...markers, ...lines];
+  }
+  /** The newest rendered lines, stopping once `count` of them exist or the transcript runs out. */
+  tailLines(count) {
+    const blocks = [];
+    let lines = 0;
+    let index = this.state.items.length - 1;
+    for (; index >= 0 && lines < count; index -= 1) {
+      const block = this.blockLines(this.state.items[index], index);
+      blocks.push(block);
+      lines += block.length;
+    }
+    return { lines: blocks.reverse().flat(), exhausted: index < 0 };
+  }
+  /** Rendered lines below one item, which is where that item sits at the bottom of the viewport. */
+  linesBelow(index) {
+    let lines = 0;
+    for (let below = index + 1; below < this.state.items.length; below += 1) lines += this.blockLines(this.state.items[below], below).length;
+    return lines;
+  }
+  /**
+   * Bind a paused viewport to the item its bottom edge sits in, counted from that item's top, so
+   * output appended below it (a streaming answer growing) does not drag the reader down the page.
+   */
+  captureAnchor() {
+    let below = 0;
+    for (let index = this.state.items.length - 1; index >= 0; index -= 1) {
+      const length = this.blockLines(this.state.items[index], index).length;
+      if (below + length > this.linesFromEnd || index === 0) return { index, item: this.state.items[index], above: below + length - this.linesFromEnd };
+      below += length;
+    }
+    return undefined;
+  }
+  /** @param {{ index: number, item: any, above: number }} anchor */
+  offsetFromAnchor(anchor) {
+    const index = this.state.items[anchor.index] === anchor.item ? anchor.index : this.state.items.indexOf(anchor.item);
+    if (index < 0) return this.linesFromEnd;
+    return Math.max(0, this.linesBelow(index) + this.blockLines(this.state.items[index], index).length - anchor.above);
+  }
+  /** Never scroll past the oldest line: the top stop keeps a full viewport, never an empty one. */
+  clampToOldestLine(candidate) {
+    const rows = Math.max(0, this.height - (this.newActivity ? 1 : 0));
+    const { lines, exhausted } = this.tailLines(candidate + rows);
+    return exhausted ? Math.min(candidate, Math.max(0, lines.length - rows)) : candidate;
+  }
   render(width = this.width, height = this.height) {
     this.setViewport(width, height);
     if (height === 0 || width === 0) return [];
     const markerRows = this.newActivity ? 1 : 0;
-    const blockCount = Math.max(0, height - markerRows);
-    const end = Math.max(0, this.state.items.length - this.distanceFromEnd);
-    const visible = this.state.items.slice(Math.max(0, end - blockCount), end);
-    let lines = [];
-    for (let index = visible.length - 1; index >= 0 && lines.length < height - markerRows; index -= 1) {
-      const item = visible[index];
-      const renderedItem = item.kind === "tool" ? { ...item, tool: this.state.tools.get(item.toolId) } : item;
-      if (renderedItem.kind === "tool" && renderedItem.tool === undefined) continue;
-      const component = this.adapters.component(renderedItem, { streaming: renderedItem.streaming, hideThinking: this.hideThinking, provider: this.state.model?.provider, model: this.state.model?.id });
-      if (renderedItem.kind === "tool") component.setExpanded?.(this.expandedTools.has(renderedItem.toolId));
-      const markers = [];
-      const itemIndex = this.state.items.indexOf(item);
-      // Pi opens every user turn but the first with a spacer above the message box.
-      if (renderedItem.kind === "user_message" && itemIndex > 0) markers.push("");
-      if (renderedItem.kind === "tool" && renderedItem.toolId === this.selectedToolId) markers.push(fit("› selected tool", width));
-      lines = [...markers, ...component.render(width).map((line) => fit(line, width)), ...lines];
-    }
-    lines = lines.slice(-(height - markerRows));
-    while (lines.length < height - markerRows) lines.unshift("");
-    if (this.newActivity) lines.push(fit("↓ new activity", width));
-    return lines.slice(-height);
+    const rows = Math.max(0, height - markerRows);
+    if (!this.following && this.anchor !== undefined) this.linesFromEnd = this.offsetFromAnchor(this.anchor);
+    const { lines, exhausted } = this.tailLines(this.linesFromEnd + rows);
+    if (exhausted) this.linesFromEnd = Math.min(this.linesFromEnd, Math.max(0, lines.length - rows));
+    const end = lines.length - this.linesFromEnd;
+    const visible = lines.slice(Math.max(0, end - rows), end);
+    this.anchor = this.following ? undefined : this.captureAnchor();
+    while (visible.length < rows) visible.unshift("");
+    if (this.newActivity) visible.push(fit("↓ new activity", width));
+    return visible.slice(-height);
   }
 }

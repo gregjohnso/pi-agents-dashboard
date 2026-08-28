@@ -470,33 +470,41 @@ describe("transcript scrolling keys and wheel", () => {
     prepare(f);
     f.instance.handleInput("\x1b[A");
     expect(f.instance.transcript.following).toBe(editorKeeps);
-    expect(f.instance.transcript.distanceFromEnd).toBe(editorKeeps ? 0 : 1);
+    expect(f.instance.transcript.linesFromEnd).toBe(editorKeeps ? 0 : 1);
     f.instance.handleInput("\x1b[B");
     expect(f.instance.transcript.following).toBe(true);
-    expect(f.instance.transcript.distanceFromEnd).toBe(0);
+    expect(f.instance.transcript.linesFromEnd).toBe(0);
   });
 
   it("jumps with Home and End, scrolls on the wheel, and clears the new-activity marker at the end", async () => {
     const f = fixture({ snapshot: longSnapshot });
     await f.instance.open();
-    f.instance.render(80, 24);
+    const body = () => stripVTControlCharacters(f.instance.render(80, 24).join("\n"));
+    body();
 
     f.instance.handleMouse({ button: "wheel_up", column: 10, row: 5 });
     expect(f.instance.transcript.following).toBe(false);
-    expect(f.instance.transcript.distanceFromEnd).toBeGreaterThan(0);
+    expect(f.instance.transcript.linesFromEnd).toBe(1);
     f.instance.handleMouse({ button: "wheel_down", column: 10, row: 5 });
     expect(f.instance.transcript.following).toBe(true);
 
+    // Home shows the oldest lines filling the transcript, not one message stranded on a blank screen.
     f.instance.handleInput("\x1b[H");
     expect(f.instance.transcript.following).toBe(false);
-    expect(f.instance.transcript.distanceFromEnd).toBe(59);
+    const top = body();
+    expect(top).toContain("line 0");
+    expect(top).toContain("line 8");
+    expect(top).not.toContain("line 59");
     await f.emit({ version: 1, sessionId: "s", eventId: "e1", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "system_message", itemId: "fresh", text: "fresh", level: "info" } });
-    expect(stripVTControlCharacters(f.instance.render(80, 24).join("\n"))).toContain("new activity");
+    expect(body()).toContain("new activity");
+    expect(body()).toContain("line 0");
 
     f.instance.handleInput("\x1b[F");
     expect(f.instance.transcript.following).toBe(true);
-    expect(f.instance.transcript.distanceFromEnd).toBe(0);
-    expect(stripVTControlCharacters(f.instance.render(80, 24).join("\n"))).not.toContain("new activity");
+    expect(f.instance.transcript.linesFromEnd).toBe(0);
+    const tail = body();
+    expect(tail).not.toContain("new activity");
+    expect(tail).toContain("fresh");
   });
 
 });

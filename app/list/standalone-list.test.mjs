@@ -103,6 +103,49 @@ it("reopens the list before exposing and focusing it after the viewer returns", 
   expect(restoreListFocus).toHaveBeenCalledOnce();
 });
 
+it("restores the list without waiting for the detach round trip", async () => {
+  let resolveDetach;
+  const viewerClient = { attach: vi.fn(async () => {}), detach: vi.fn(() => new Promise((resolve) => { resolveDetach = resolve; })) };
+  const controller = { closed: false, close: vi.fn(async () => { controller.closed = true; }), open: vi.fn(async () => { controller.closed = false; }) };
+  const viewer = { open: vi.fn(async () => {}), closed: Promise.resolve(), close: vi.fn(async () => {}) };
+  const activateList = vi.fn();
+  const transition = await runViewerTransition({
+    sessionId: "session", viewerClient, controller, createViewer: () => viewer,
+    activateViewer() {}, activateList, restoreListFocus() {}, shouldRestore: () => true,
+  });
+  expect(transition).toEqual({ kind: "returned" });
+  expect(viewerClient.detach).toHaveBeenCalledWith("session");
+  expect(activateList).toHaveBeenCalledOnce();
+  resolveDetach();
+});
+
+it("holds a reattach behind the same session's in-flight detach", async () => {
+  const order = [];
+  let resolveDetach;
+  const client = {
+    async request(value) {
+      if (value.op === "detach") {
+        order.push("detach:start");
+        await new Promise((resolve) => { resolveDetach = resolve; });
+        order.push("detach:done");
+        return { ok: true, result: { kind: "detached" } };
+      }
+      order.push(`${value.op}:run`);
+      return { ok: true, result: { kind: "attached", sessionId: value.payload.sessionId, role: "composer" } };
+    },
+  };
+  const viewer = createDaemonViewerClient({ client, clientId: "client" });
+  void viewer.detach("session").catch(() => {});
+  await vi.waitFor(() => expect(order).toEqual(["detach:start"]));
+  const reattach = viewer.attach("session");
+  // A different session must not queue behind it.
+  await viewer.attach("other");
+  expect(order).toEqual(["detach:start", "attach:run"]);
+  resolveDetach();
+  await expect(reattach).resolves.toMatchObject({ role: "composer" });
+  expect(order).toEqual(["detach:start", "attach:run", "detach:done", "attach:run"]);
+});
+
 it("does not replace the prior cursor when publication fails before rename", async () => {
   const path = await fixture();
   const original = { schemaVersion: 1, clientId: "client", cursor: { daemonEpoch: "epoch", sequence: "1" }, viewState: { query: { view: "live" } }, launchDraft: {} };

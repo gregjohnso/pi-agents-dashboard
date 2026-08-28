@@ -56,14 +56,24 @@ export function createDaemonViewerClient({ client, clientId }) {
     if (response.result?.kind === "command" && response.result.status.stage === "FAILED") throw Object.assign(new Error(response.result.status.error?.message ?? "Viewer command failed"), response.result.status.error);
     return response.result;
   };
+  /** @type {Map<string, Promise<unknown>>} */
+  const detaching = new Map();
   return {
     replayFromOrigin: false,
     async attach(sessionId) {
+      // Leaving no longer waits for the daemon to release this session's composer claim, so a fast
+      // reopen can outrun its own detach. Ordering per session is what the one-composer rule needs;
+      // a different session never queues behind it.
+      await detaching.get(sessionId)?.catch(() => {});
       const attached = await request("attach", { sessionId, role: "composer", activate: true });
       if (attached?.kind !== "attached" || attached.role !== "composer") throw Object.assign(new Error("Another frontend owns this session"), { code: "SESSION_IN_USE", retryable: false });
       return attached;
     },
-    async detach(sessionId) { return request("detach", { sessionId }); },
+    detach(sessionId) {
+      const tracked = request("detach", { sessionId }).finally(() => { if (detaching.get(sessionId) === tracked) detaching.delete(sessionId); });
+      detaching.set(sessionId, tracked);
+      return tracked;
+    },
     getSnapshot: (sessionId) => client.getViewerSnapshot(sessionId),
     async menu(sessionId) {
       const result = await request("get_session_commands", { sessionId });
@@ -132,7 +142,10 @@ export async function runViewerTransition({ sessionId, viewerClient, controller,
     failure = error;
   } finally {
     await viewer?.close().catch(() => {});
-    if (attached) await viewerClient.detach(sessionId).catch(() => {});
+    // Releasing the composer claim is cleanup, not a precondition for drawing the list, and on a
+    // network home one detach measured 4.3 to 6.4 s of durable daemon writes. The client keeps the
+    // promise so a later attach for this session still waits behind it; the operator does not.
+    if (attached) void viewerClient.detach(sessionId).catch(() => {});
     if (restoreList && shouldRestore()) await controller.open();
     if (shouldRestore()) {
       if (controller.closed) onRestoreClosed?.();

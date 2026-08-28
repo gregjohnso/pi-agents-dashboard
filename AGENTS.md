@@ -61,7 +61,8 @@ State root: `$PI_DASHBOARD_STATE_DIR`, else `${XDG_STATE_HOME:-$HOME/.local/stat
   dashboard.json                 validated config, schema version 2 (shared/config.mjs)
   frontend-state.json            one frontend's cursors and drafts
   daemon/                        pid.json, control.sock, control.token, epoch, lifecycle.lock,
-                                 workers.json, settings.json, reconciliation.json
+                                 workers.json, settings.json, reconciliation.json,
+                                 startup.log (the detached daemon's stderr, reported by `daemon start`)
   sessions/<sessionId>.json      one SessionRecord per session, the registry
   queue/commands.jsonl           durable command journal
   index/events.jsonl             frontend event stream

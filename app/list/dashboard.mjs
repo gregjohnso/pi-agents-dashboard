@@ -829,6 +829,11 @@ export class DashboardController {
     }
     rebuildList() {
         const selected = this.preferredSelectionId ?? this.list.selectedSessionId;
+        // The daemon publishes a launching session before it answers the launch call, so retire any
+        // placeholder the real record has already replaced. Otherwise a row sits at STARTING forever
+        // beside the session it stands for.
+        // Match on creation time, not name: the summary pass renames a session minutes later.
+        this.pendingLaunches = this.pendingLaunches.filter((entry) => !this.sessions.some((session) => session.createdAt >= entry.createdAt));
         const visible = [...selectDashboardSessions(this.sessions, this.query), ...this.pendingLaunches.map((entry) => pendingSessionRecord(entry))];
         this.list.setSessions(visible, { groupBy: this.query.groupBy });
         if (selected !== undefined && visible.some((session) => session.sessionId === selected)) {

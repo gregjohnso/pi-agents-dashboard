@@ -341,6 +341,25 @@ describe("dashboard controller", () => {
         // Whatever was coalesced is durable once the dashboard has closed.
         expect(saves.at(-1)).toBe("5");
     });
+    it("retires the pending row as soon as the real session appears", async () => {
+        let release = () => {};
+        const backend = new FakeBackend([]);
+        backend.launch = vi.fn(() => new Promise((resolve) => { release = () => resolve({ kind: "launched", sessionId: "real" }); }));
+        const dashboard = controller(backend);
+        await dashboard.open();
+        for (const character of "ship it") dashboard.handleInput(character);
+        dashboard.handleInput("\r");
+        await vi.waitFor(() => expect(backend.launch).toHaveBeenCalled());
+        expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("STARTING"))).toBe(true);
+
+        // The daemon publishes the session before it answers the launch, so the placeholder must yield
+        // to the real record instead of sitting at STARTING beside it.
+        dashboard.applySnapshot({ sessions: [session("real", { name: "Ship It", processState: "LIVE", taskState: "READY", createdAt: new Date().toISOString() })] });
+        const rows = dashboard.render(100, 24).map(stripVTControlCharacters);
+        expect(rows.filter((line) => line.includes("Ship It"))).toHaveLength(1);
+        expect(rows.some((line) => line.includes("STARTING"))).toBe(false);
+        release();
+    });
     it("drops the pending row when the launch request throws", async () => {
         const backend = new FakeBackend([]);
         backend.launch = vi.fn(async () => { throw Object.assign(new Error("socket closed"), { code: "DAEMON_UNAVAILABLE" }); });

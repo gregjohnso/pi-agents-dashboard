@@ -1117,8 +1117,11 @@ export async function createDaemonRuntime({
           } catch (error) {
             const launchError = /** @type {any} */ (error);
             const current = await context.recovery.journal.get(request);
-            if (current?.stage === "DELIVERY_ATTEMPTED" && launchError?.preChild === true && launch !== undefined) {
-              const prepared = await registry.get(launch.sessionId);
+            // A worker that died before it was ready leaves no lease behind, so nothing owns this session
+            // and the row must say the launch failed. Leaving it at STARTING makes the list lie for hours.
+            const prepared = launch === undefined ? undefined : await registry.get(launch.sessionId);
+            const unowned = prepared !== undefined && prepared.ownership === undefined;
+            if (current?.stage === "DELIVERY_ATTEMPTED" && (launchError?.preChild === true || unowned) && launch !== undefined) {
               if (prepared !== undefined) {
                 const updated = await registry.update(prepared.sessionId, prepared.revision, {
                   taskState: "FAILED",

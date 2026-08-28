@@ -1161,6 +1161,31 @@ it("records the model Pi actually selected so the list can show it", async () =>
   await vi.waitFor(async () => expect(await registry.get("modelled")).toMatchObject({ model: { provider: "openai-codex", id: "gpt-5.6-sol" }, thinkingLevel: "high" }), { timeout: 5_000 });
 });
 
+it("marks a launch failed when the worker dies before it is ready", async () => {
+  const stateRoot = await root();
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  // The supervisor spawned a worker, it died before worker_ready, and it released its lease on the way out.
+  const launch = async () => { throw Object.assign(new Error("Worker exited before worker_ready (SIGTERM)"), { code: "WORKER_PROCESS_EXITED" }); };
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    hostProbe: async () => ({ blockers: [] }),
+    workerSupervisor: { launch, async close() {} },
+    resolveLaunchRequest: async () => ({
+      sessionId: "doomed", canonicalSessionFile: "/sessions/doomed.jsonl", cwd: "/repo", runId: "run-doomed", initialPrompt: "hello",
+      sessionRecord: { schemaVersion: 1, revision: 0, sessionId: "doomed", sessionFile: "/sessions/doomed.jsonl", canonicalSessionFile: "/sessions/doomed.jsonl", cwd: "/repo", name: "hello", taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "launching", summary: "hello", updatedAt: "2026-08-28T12:00:00.000Z" }, createdAt: "2026-08-28T12:00:00.000Z", updatedAt: "2026-08-28T12:00:00.000Z" },
+    }),
+  });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await client.ready;
+  client.send({ version: 1, clientId: "launcher", requestId: "launch-doomed", op: "launch", payload: { prompt: "hello", cwd: "/repo", sourceSessionId: "dash", isolation: { mode: "worktree" } } });
+  await client.next();
+
+  // The row must say what happened rather than sitting at STARTING forever.
+  await vi.waitFor(async () => expect(await registry.get("doomed")).toMatchObject({ taskState: "FAILED", processState: "EXITED", activity: { kind: "launch_failed" } }));
+});
+
 it("refuses an activating attach while the recorded Pi child of a gone supervisor is alive", async () => {
   const stateRoot = await root();
   for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });

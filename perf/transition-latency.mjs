@@ -23,7 +23,7 @@ const LABEL = option("label", "run");
 const PHASE_LOG = option("phase-log", "");
 
 const VIEWER_MARK = Buffer.from("COMPOSER");
-const LIST_MARK = Buffer.from("describe a task for a new session");
+const LIST_MARK = Buffer.from("pi-dashboard");
 const QUIET_MS = 400;
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }

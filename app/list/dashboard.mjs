@@ -1024,7 +1024,7 @@ export class DashboardController {
                 const draftPrompt = this.composerDraft.prompt;
                 // Flat rules above and below the prompt: a rounded top with a flat bottom read as a broken box.
                 lines[dockTop] = composerRule(this.composerField === "prompt" ? "" : COMPOSER_FIELD_LABELS[this.composerField], this.width, confirmingSharedLaunch);
-                lines[dockTop + 1] = paintPlainLine(` ❯ ${draftPrompt || "describe a task for a new session"}`, this.width, draftPrompt ? (text) => jobwatchTheme.text(text, false) : (text) => jobwatchTheme.muted(text, false));
+                lines[dockTop + 1] = paintPlainLine(` ❯ ${draftPrompt}`, this.width, (text) => jobwatchTheme.text(text, false));
                 const form = layout.listTop >= 5 ? "" : ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
                 // The rule closes the prompt box; launch settings and the selected path are context below it.
                 const formRow = layout.dockRows >= 4 ? dockTop + 3 : dockTop + 2;

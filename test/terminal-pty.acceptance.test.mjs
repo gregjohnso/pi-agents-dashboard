@@ -32,7 +32,7 @@ it("navigates to New Session, quits with Ctrl+C, and restores the real terminal"
   let stage = "startup";
   const onOutput = (chunk) => {
     output = Buffer.concat([output, Buffer.from(chunk)]);
-    if (stage === "startup" && output.includes(Buffer.from("describe a task for a new session"))) {
+    if (stage === "startup" && output.includes(Buffer.from("pi-dashboard"))) {
       // Typing needs no navigation: the composer is not a focus stop.
       stage = "typing";
       child.stdin.write("x");

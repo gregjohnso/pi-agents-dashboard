@@ -41,6 +41,59 @@ describe("wheel input tap", () => {
     return terminal;
   };
 
+  it("releases a lone Escape without waiting for another keystroke", () => {
+    vi.useFakeTimers();
+    try {
+      const terminal = fakeTerminal();
+      const tapped = createWheelInputTap(terminal, () => {});
+      const forwarded = [];
+      tapped.start((data) => forwarded.push(data), () => {});
+      terminal.started.onInput("\x1b");
+      vi.advanceTimersByTime(50);
+      expect(forwarded).toEqual(["\x1b"]);
+      // A held Escape would arrive glued to the next key, which pi-tui then reads as a meta chord.
+      terminal.started.onInput("\r");
+      expect(forwarded).toEqual(["\x1b", "\r"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still reassembles a wheel report split across chunks inside the flush window", () => {
+    vi.useFakeTimers();
+    try {
+      const terminal = fakeTerminal();
+      const onWheel = vi.fn();
+      const tapped = createWheelInputTap(terminal, onWheel);
+      const forwarded = [];
+      tapped.start((data) => forwarded.push(data), () => {});
+      terminal.started.onInput("\x1b[<65;2");
+      vi.advanceTimersByTime(40);
+      terminal.started.onInput(";3M");
+      expect(onWheel).toHaveBeenCalledWith({ button: "wheel_down", column: 1, row: 2 });
+      expect(forwarded).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("drops a held partial sequence when the terminal stops", () => {
+    vi.useFakeTimers();
+    try {
+      const terminal = fakeTerminal();
+      const tapped = createWheelInputTap(terminal, () => {});
+      const forwarded = [];
+      tapped.start((data) => forwarded.push(data), () => {});
+      terminal.started.onInput("\x1b[<65;2");
+      tapped.stop();
+      vi.advanceTimersByTime(200);
+      expect(forwarded).toEqual([]);
+      expect(terminal.stopped).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("dispatches wheel events, withholds them, and forwards every other byte", () => {
     const terminal = fakeTerminal();
     const onWheel = vi.fn();

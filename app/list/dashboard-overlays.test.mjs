@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createChoiceOverlay, createCommandMenuOverlay, createSessionConfirmation, describeOverlay, filterChoiceOverlay, } from "./dashboard-overlays.mjs";
+import { createChoiceOverlay, createCommandMenuOverlay, createHelpOverlay, createSessionConfirmation, describeOverlay, filterChoiceOverlay, } from "./dashboard-overlays.mjs";
 const session = {
     schemaVersion: 1,
     revision: 2,
@@ -81,6 +81,14 @@ describe("dashboard overlays", () => {
         const described = describeOverlay(empty, { choiceRows: 8 });
         expect(described.title).toBe("Model 0/0 · zzz");
         expect(described.rows[0]).toMatchObject({ text: expect.stringContaining("zzz"), emphasis: true });
+    });
+    it("names only keys the list still answers", () => {
+        const keys = createHelpOverlay().bindings.map((binding) => binding.keys);
+        // Ctrl+J is the line-feed byte, which the list answers as Enter, and Tab no longer moves
+        // a launch-field cursor: every launch field is set through its slash command.
+        expect(keys.join(" ")).not.toContain("Ctrl+J");
+        expect(keys.join(" ")).not.toContain("Tab");
+        expect(keys.join(" ")).toContain("Ctrl+W");
     });
     it("starts a picker on the current value, or on the first when it is unset", () => {
         expect(createChoiceOverlay("isolation", "Isolation", ["worktree", "shared_directory"], "shared_directory")).toMatchObject({ kind: "choice", field: "isolation", index: 1 });

@@ -203,30 +203,29 @@ const PROCESS_STATES = ["LIVE", "SLEEPING", "EXITED", "STALE"];
 const OUTCOMES = ["NONE", "COMPLETED", "READY_FOR_REVIEW"];
 const SORT_KEYS = ["age", "id", "state", "model", "project", "activity"];
 const GROUPS = ["taskState", "cwd"];
-const COMPOSER_FIELDS = ["prompt", "cwd", "isolationMode", "modelProvider", "modelId", "thinkingLevel", "name"];
 function cycleValue(values, current) {
     if (current === undefined)
         return values[0];
     const index = values.indexOf(current);
     return index < 0 || index === values.length - 1 ? undefined : values[index + 1];
 }
-/**
- * The filter, sort, and group controls: one row each for the chord that runs it, the segment the
- * mouse hit-test measures, and what it does. Array order is the left-to-right order of the segments.
- * Ctrl+J is the same byte as Enter, which handleInput answers first, so only its click reaches here.
- */
 /** Matches StopClearGesture's default window; the hint must vanish exactly when the gesture does. */
 const STOP_CLEAR_WINDOW_MS = 500;
+/**
+ * The filter, sort, and group controls: the chord that runs one, and what it does.
+ * Ctrl+J carries the line-feed byte, which no terminal distinguishes from Enter, so the project
+ * filter answers to Ctrl+W instead.
+ */
 const CONTROLS = [
-    { key: Key.ctrl("f"), segment: (dashboard) => `/search:${dashboard.query.search ?? ""}`, activate: (dashboard) => { dashboard.focus = "search"; } },
-    { key: Key.ctrl("v"), segment: (dashboard) => `v:${dashboard.query.view}`, activate: (dashboard) => dashboard.cycleView() },
-    { key: Key.ctrl("t"), segment: (dashboard) => `t:${dashboard.query.taskStates?.join(",") ?? "all"}`, activate: (dashboard) => dashboard.setTaskStates(dashboard.singletonCycle(TASK_STATES, dashboard.query.taskStates)) },
-    { key: Key.ctrl("p"), segment: (dashboard) => `p:${dashboard.query.processStates?.join(",") ?? "all"}`, activate: (dashboard) => dashboard.setProcessStates(dashboard.singletonCycle(PROCESS_STATES, dashboard.query.processStates)) },
-    { key: Key.ctrl("o"), segment: (dashboard) => `o:${dashboard.query.outcomes?.join(",") ?? "all"}`, activate: (dashboard) => dashboard.setOutcomes(dashboard.singletonCycle(OUTCOMES, dashboard.query.outcomes)) },
-    { key: Key.ctrl("a"), segment: (dashboard) => `a:${dashboard.query.activityKinds?.join(",") ?? "all"}`, activate: (dashboard) => dashboard.cycleActivityFilter() },
-    { key: Key.ctrl("j"), segment: (dashboard) => `j:${dashboard.query.projectPaths?.join(",") ?? "all"}`, activate: (dashboard) => dashboard.setProjectPaths(dashboard.singletonCycle([...new Set(dashboard.sessions.map((session) => session.cwd))], dashboard.query.projectPaths)) },
-    { key: Key.ctrl("s"), segment: (dashboard) => `s:${dashboard.query.sort === undefined ? "none" : `${dashboard.query.sort.key}/${dashboard.query.sort.direction}`}`, activate: (dashboard) => dashboard.cycleSort() },
-    { key: Key.ctrl("b"), segment: (dashboard) => `g:${dashboard.query.groupBy ?? "none"}`, activate: (dashboard) => dashboard.setGrouping(cycleValue(GROUPS, dashboard.query.groupBy)) },
+    { key: Key.ctrl("f"), activate: (dashboard) => { dashboard.focus = "search"; } },
+    { key: Key.ctrl("v"), activate: (dashboard) => dashboard.cycleView() },
+    { key: Key.ctrl("t"), activate: (dashboard) => dashboard.setTaskStates(dashboard.singletonCycle(TASK_STATES, dashboard.query.taskStates)) },
+    { key: Key.ctrl("p"), activate: (dashboard) => dashboard.setProcessStates(dashboard.singletonCycle(PROCESS_STATES, dashboard.query.processStates)) },
+    { key: Key.ctrl("o"), activate: (dashboard) => dashboard.setOutcomes(dashboard.singletonCycle(OUTCOMES, dashboard.query.outcomes)) },
+    { key: Key.ctrl("a"), activate: (dashboard) => dashboard.cycleActivityFilter() },
+    { key: Key.ctrl("w"), activate: (dashboard) => dashboard.setProjectPaths(dashboard.singletonCycle([...new Set(dashboard.sessions.map((session) => session.cwd))], dashboard.query.projectPaths)) },
+    { key: Key.ctrl("s"), activate: (dashboard) => dashboard.cycleSort() },
+    { key: Key.ctrl("b"), activate: (dashboard) => dashboard.setGrouping(cycleValue(GROUPS, dashboard.query.groupBy)) },
 ];
 function fitLine(line, width) {
     const clipped = truncateToWidth(line.replace(/[\r\n\u2028\u2029]/gu, " "), Math.max(0, width), "");
@@ -234,21 +233,6 @@ function fitLine(line, width) {
 }
 function paintPlainLine(text, width, paint) {
     return paint(fitLine(stripVTControlCharacters(String(text)), width));
-}
-const COMPOSER_FIELD_LABELS = {
-    prompt: "prompt",
-    cwd: "cwd",
-    isolationMode: "isolation",
-    modelProvider: "model provider",
-    modelId: "model id",
-    thinkingLevel: "thinking",
-    name: "name",
-};
-/** The prompt's own rule, carrying the active launch field's name when the operator is editing one. */
-function composerRule(label, width, focused) {
-    const bare = "─".repeat(Math.max(0, width));
-    const named = label === "" || width < label.length + 6 ? bare : `${"─".repeat(width - label.length - 3)} ${label} ─`;
-    return paintPlainLine(named, width, focused ? jobwatchTheme.focusBorder : jobwatchTheme.text);
 }
 function sectionFooter(width, focused) {
     return paintPlainLine("─".repeat(Math.max(0, width)), width, focused ? jobwatchTheme.focusBorder : jobwatchTheme.text);
@@ -335,7 +319,6 @@ export class DashboardController {
     clearHintTimer;
     query = defaultQuery();
     focus = "list";
-    composerField = "prompt";
     composerDraft;
     launchDefaults;
     isDirectory;
@@ -487,7 +470,6 @@ export class DashboardController {
     /** Aim typed text at the prompt. The composer is not a focus stop, so this leaves focus on the list. */
     focusComposer() {
         this.focus = "list";
-        this.composerField = "prompt";
     }
     setComposerPrompt(prompt) {
         this.composerDraft = { ...this.composerDraft, prompt };
@@ -734,7 +716,7 @@ export class DashboardController {
             this.setError(Object.assign(new Error("The session changed before the action ran"), { code: selected.processState === "LIVE" || selected.ownership !== undefined ? "SESSION_LIVE" : "SESSION_CHANGED" }), "SESSION_CHANGED");
             return;
         }
-        const requestId = this.requestId();
+        let attemptRequestId = this.requestId();
         const { action, sessionId } = confirmation;
         const { revision } = selected;
         // The daemon's stop policy escalates SIGTERM to SIGKILL over seconds. Hand the request off and
@@ -752,7 +734,7 @@ export class DashboardController {
             let attemptRevision = revision;
             for (let attempt = 1; ; attempt += 1) {
                 try {
-                    await this.backend[action](sessionId, attemptRevision, requestId);
+                    await this.backend[action](sessionId, attemptRevision, attemptRequestId);
                     break;
                 }
                 catch (error) {
@@ -767,6 +749,9 @@ export class DashboardController {
                     if (current === undefined || destructiveAction(current) !== action)
                         throw error;
                     attemptRevision = current.revision;
+                    // The journal keys a command by request ID and refuses the same ID carrying a
+                    // different payload, so a re-aimed revision needs its own ID or it conflicts.
+                    attemptRequestId = this.requestId();
                     await new Promise((resolve) => setTimeout(resolve, 25));
                 }
             }
@@ -782,7 +767,7 @@ export class DashboardController {
         catch (error) {
             const typed = error;
             if (typed.code === "DELIVERY_UNKNOWN")
-                this.overlay = createDeliveryUnknownOverlay(typed.clientId ?? this.clientId, typed.requestId ?? requestId);
+                this.overlay = createDeliveryUnknownOverlay(typed.clientId ?? this.clientId, typed.requestId ?? attemptRequestId);
             else
                 this.setError(error, `${action.toUpperCase()}_FAILED`);
         }
@@ -862,20 +847,8 @@ export class DashboardController {
                 this.setSearch((this.query.search ?? "") + printable);
             return;
         }
-        if (matchesKey(data, Key.tab)) {
-            this.cycleComposerField(1);
-            return;
-        }
-        if (matchesKey(data, "shift+tab")) {
-            this.cycleComposerField(-1);
-            return;
-        }
-        if (this.composerField === "isolationMode" && (matchesKey(data, Key.left) || matchesKey(data, Key.right) || data === " ")) {
-            this.setIsolationMode(this.composerDraft.isolationMode === "worktree" ? "shared_directory" : "worktree");
-            return;
-        }
         if (matchesKey(data, Key.backspace)) {
-            this.editComposerField((value) => value.slice(0, -1));
+            this.setComposerPrompt(this.composerDraft.prompt.slice(0, -1));
             return;
         }
         // Escape closes the slash menu without touching the text, so a mistyped command stays editable.
@@ -887,6 +860,10 @@ export class DashboardController {
             return;
         }
         if (matchesKey(data, Key.left)) return;
+        // Tab used to move a launch-field cursor that typing ignored and Backspace obeyed. The
+        // fields are set through their slash commands now, so a lone Tab types nothing; a tab
+        // inside a paste still arrives as text and becomes a space.
+        if (matchesKey(data, Key.tab) || matchesKey(data, "shift+tab")) return;
         if ((matchesKey(data, Key.up) || matchesKey(data, Key.down)) && this.commandMenuOverlay() !== undefined) {
             this.moveCommandMenu(matchesKey(data, Key.up) ? -1 : 1);
             return;
@@ -936,16 +913,14 @@ export class DashboardController {
         else {
             // Typed and pasted text always composes a prompt, wherever the cursor sits in the list.
             const printable = this.printable(data);
-            if (printable !== undefined) {
-                this.composerField = "prompt";
-                this.editComposerField((value) => value + printable);
-            }
+            if (printable !== undefined)
+                this.setComposerPrompt(this.composerDraft.prompt + printable);
         }
     }
     /**
-     * Only wheel events arrive in production: the terminal tap in app/mouse-input.mjs forwards
-     * wheel notches and passes clicks through to pi-tui's own selection handling. The click
-     * branches below stay covered by tests but are unreachable until pi-tui exposes a click seam.
+     * Wheel notches and plain left clicks both arrive here: the terminal tap in app/mouse-input.mjs
+     * reports them and passes every other mouse report through to pi-tui's own selection handling.
+     * A click reaches whatever the layout drew under it, and nothing where the layout drew nothing.
      */
     handleMouse(event) {
         if (event.button === "wheel_up") {
@@ -957,27 +932,16 @@ export class DashboardController {
             return;
         }
         const layout = createDashboardLayout(this.width, this.height);
-        if (Math.floor(event.row) === 2) {
-            const column = Math.max(0, Math.floor(event.column));
-            let offset = 1;
-            const clicked = CONTROLS.find(({ segment }) => {
-                const width = segment(this).length;
-                const inside = column >= offset && column < offset + width;
-                offset += width + 1;
-                return inside;
-            });
-            (clicked ?? CONTROLS[0]).activate(this);
-            return;
-        }
-        if (Math.floor(event.row) === this.height - 3) {
+        const clicked = Math.floor(event.row);
+        // The prompt is the row under the dock's opening rule; everything else above the list
+        // (title, context, launch settings, border, column header) and below it is read-only.
+        if (this.height >= 4 && clicked === this.height - layout.dockRows + 1) {
             this.focusComposer();
             return;
         }
-        if (Math.floor(event.row) === this.height - 2) {
-            this.composerField = COMPOSER_FIELDS[1 + Math.min(COMPOSER_FIELDS.length - 2, Math.floor(Math.max(0, event.column) * (COMPOSER_FIELDS.length - 1) / Math.max(1, this.width)))];
+        if (clicked < layout.listTop || clicked >= layout.listTop + layout.listHeight)
             return;
-        }
-        const index = this.viewportOffset + Math.floor(event.row) - layout.listTop;
+        const index = this.viewportOffset + clicked - layout.listTop;
         const row = this.list.rows[index];
         if (row?.kind !== "session")
             return;
@@ -1003,10 +967,8 @@ export class DashboardController {
                 lines[1] = paintPlainLine(this.contextLine(), this.width, jobwatchTheme.keyHints);
             // One launch setting per row, above the list, so each is readable without truncation.
             if (layout.listTop >= 5) {
-                for (const [offset, [field, label, value]] of this.launchSettingRows().entries()) {
-                    const active = this.composerField === field;
-                    lines[2 + offset] = paintPlainLine(`${active ? " ❯ " : "   "}${label}: ${value}`, this.width, active ? jobwatchTheme.focusBorder : jobwatchTheme.surface);
-                }
+                for (const [offset, [label, value]] of this.launchSettingRows().entries())
+                    lines[2 + offset] = paintPlainLine(`   ${label}: ${value}`, this.width, jobwatchTheme.surface);
             }
             // The section border and column header always sit immediately above the first row.
             if (lines.length > layout.listTop - 2 && layout.listTop >= 2)
@@ -1023,9 +985,9 @@ export class DashboardController {
                 const dockTop = lines.length - layout.dockRows;
                 const draftPrompt = this.composerDraft.prompt;
                 // Flat rules above and below the prompt: a rounded top with a flat bottom read as a broken box.
-                lines[dockTop] = composerRule(this.composerField === "prompt" ? "" : COMPOSER_FIELD_LABELS[this.composerField], this.width, confirmingSharedLaunch);
+                lines[dockTop] = sectionFooter(this.width, confirmingSharedLaunch);
                 lines[dockTop + 1] = paintPlainLine(` ❯ ${draftPrompt}`, this.width, (text) => jobwatchTheme.text(text, false));
-                const form = layout.listTop >= 5 ? "" : ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
+                const form = layout.listTop >= 5 ? this.draftModelSummary() : ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
                 // The rule closes the prompt box; launch settings and the selected path are context below it.
                 const formRow = layout.dockRows >= 4 ? dockTop + 3 : dockTop + 2;
                 if (layout.dockRows >= 4) lines[dockTop + 2] = sectionFooter(this.width, confirmingSharedLaunch);
@@ -1117,12 +1079,20 @@ export class DashboardController {
         const next = this.query.view === "live" ? "done" : this.query.view === "done" ? "all" : "live";
         this.setView(next);
     }
-    /** The next session's settings, one per row: field key, label, and current value. */
+    /** The next session's settings, one per row: label and current value. */
     launchSettingRows() {
-        const draft = this.composerDraft;
         // Only the working directory earns a row: the MODEL column reports each session's own model,
         // and the rest are set through the slash menu when they matter.
-        return [["cwd", "cwd", draft.cwd]];
+        return [["cwd", this.composerDraft.cwd]];
+    }
+    /**
+     * The model the next launch will ask for, named only when the draft carries one. A draft
+     * outlives the dashboard that wrote it, and a model Pi refuses fails the launch itself, so the
+     * value that will be sent has to be readable without opening a picker to find it.
+     */
+    draftModelSummary() {
+        const { provider, id } = this.composerDraft.model;
+        return provider === "" && id === "" ? "" : ` model:${provider}/${id}`;
     }
     /** The selected session's working directory, plus any active filters. */
     contextLine() {
@@ -1168,34 +1138,6 @@ export class DashboardController {
         }
         const next = cycleValue(SORT_KEYS, current.key);
         this.setQuery({ ...this.query, sort: next === undefined ? undefined : { key: next, direction: "asc" } });
-    }
-    cycleComposerField(delta) {
-        const current = COMPOSER_FIELDS.indexOf(this.composerField);
-        this.composerField = COMPOSER_FIELDS[(current + delta + COMPOSER_FIELDS.length) % COMPOSER_FIELDS.length];
-    }
-    editComposerField(edit) {
-        switch (this.composerField) {
-            case "prompt":
-                this.setComposerPrompt(edit(this.composerDraft.prompt));
-                return;
-            case "cwd":
-                this.composerDraft = { ...this.composerDraft, cwd: edit(this.composerDraft.cwd) };
-                break;
-            case "modelProvider":
-                this.composerDraft = { ...this.composerDraft, model: { ...this.composerDraft.model, provider: edit(this.composerDraft.model.provider) } };
-                break;
-            case "modelId":
-                this.composerDraft = { ...this.composerDraft, model: { ...this.composerDraft.model, id: edit(this.composerDraft.model.id) } };
-                break;
-            case "thinkingLevel":
-                this.composerDraft = { ...this.composerDraft, thinkingLevel: edit(this.composerDraft.thinkingLevel) };
-                break;
-            case "name":
-                this.composerDraft = { ...this.composerDraft, name: edit(this.composerDraft.name) };
-                break;
-            case "isolationMode": return;
-        }
-        this.scheduleUiSave();
     }
     printable(data) {
         return decodeKittyPrintable(data) ?? pastedText(data);

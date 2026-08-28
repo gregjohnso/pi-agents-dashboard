@@ -77,6 +77,26 @@ function controller(backend, overrides = {}) {
         ...overrides,
     });
 }
+/**
+ * A destructive backend call that keys its command the way runtime/command-journal.mjs does:
+ * one request ID owns one exact payload, and the same ID with a changed revision is a conflict.
+ */
+function journalledDestructive(refuse) {
+    const revisionsById = new Map();
+    const requestIds = [];
+    return {
+        requestIds,
+        async call(_sessionId, revision, requestId) {
+            requestIds.push(requestId);
+            const recorded = revisionsById.get(requestId);
+            if (recorded !== undefined && recorded !== revision)
+                throw Object.assign(new Error("Request IDs were already used with a different command"), { code: "IDEMPOTENCY_CONFLICT" });
+            revisionsById.set(requestId, revision);
+            refuse(revision);
+            return { accepted: true };
+        },
+    };
+}
 async function processRenderedEvent(dashboard, backend, update) {
     const processing = Promise.resolve(backend.listener?.(update));
     dashboard.render();
@@ -197,11 +217,11 @@ describe("dashboard controller", () => {
     });
     it("keeps retrying a stop against the newest revision instead of failing on churn", async () => {
         const backend = new FakeBackend([session("a", { processState: "LIVE", revision: 4 })]);
-        backend.stop = vi.fn(async (_sessionId, revision) => {
+        const journal = journalledDestructive((revision) => {
             // A working session's record churns constantly, so the revision moves under the request.
             if (revision === 4) throw Object.assign(new Error("Session revision changed before Stop"), { code: "REVISION_CONFLICT" });
-            return { accepted: true };
         });
+        backend.stop = vi.fn(journal.call);
         const dashboard = controller(backend);
         await dashboard.open();
         dashboard.selectSession("a");
@@ -210,6 +230,9 @@ describe("dashboard controller", () => {
         dashboard.handleInput("\x18");
         await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledWith("a", 9, expect.any(String)));
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
+        // The journal keys a command by request ID and refuses the same ID with a changed payload,
+        // so a retry that reuses it can only fail; each attempt carries its own.
+        expect(new Set(journal.requestIds).size).toBe(journal.requestIds.length);
     });
     it("gives up a stop that keeps conflicting and says so", async () => {
         const backend = new FakeBackend([session("a", { processState: "LIVE", revision: 4 })]);
@@ -330,10 +353,10 @@ describe("dashboard controller", () => {
         // The record churns from background writes, and the frontend's cached copy can be many
         // revisions behind, so retrying against the cache conflicts forever.
         const backend = new FakeBackend([session("a", { taskState: "FAILED", processState: "EXITED", revision: 4 })]);
-        backend.delete = vi.fn(async (_sessionId, revision) => {
+        const journal = journalledDestructive((revision) => {
             if (revision !== 25) throw Object.assign(new Error("Session revision changed before Delete"), { code: "REVISION_CONFLICT" });
-            return { accepted: true };
         });
+        backend.delete = vi.fn(journal.call);
         const dashboard = controller(backend);
         await dashboard.open();
         // The daemon has moved on; the frontend still holds revision 4 because no event carried the change.
@@ -344,6 +367,7 @@ describe("dashboard controller", () => {
         dashboard.handleInput("\x18");
         await vi.waitFor(() => expect(backend.delete).toHaveBeenCalledWith("a", 25, expect.any(String)));
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
+        expect(new Set(journal.requestIds).size).toBe(journal.requestIds.length);
     });
     it("coalesces cursor saves across a burst of events and flushes on close", async () => {
         // Each save fsyncs the file and its directory, about 70ms on a network home, so one save per
@@ -592,7 +616,7 @@ describe("dashboard controller", () => {
         await opening;
         expect(unsubscribe).toHaveBeenCalledOnce();
     });
-    it("provides keyboard and mouse access to filters, sorting, grouping, search, and every launch field", async () => {
+    it("cycles every filter, sort, and grouping from its own chord", async () => {
         const dashboard = controller(new FakeBackend([
             session("a", { taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "approval", summary: "waiting", updatedAt: timestamp } }),
             session("b"),
@@ -610,17 +634,57 @@ describe("dashboard controller", () => {
         expect(dashboard.query).toMatchObject({ search: "w", taskStates: ["WORKING"], processStates: ["LIVE"], outcomes: ["NONE"], activityKinds: ["approval"], sort: { key: "age", direction: "asc" }, groupBy: "taskState" });
         expect(dashboard.selectedSessionId).toBe("a");
         expect(dashboard.render(80, 14).join("\n")).toContain("a");
-        dashboard.handleMouse({ row: 2, column: 2, button: "left" });
-        expect(dashboard.focus).toBe("search");
-        dashboard.focusComposer();
-        const fields = ["prompt", "cwd", "isolationMode", "modelProvider", "modelId", "thinkingLevel", "name"];
-        expect(dashboard.composerField).toBe(fields[0]);
-        for (const field of fields.slice(1)) {
-            dashboard.handleInput("\t");
-            expect(dashboard.composerField).toBe(field);
-        }
         // Only the working directory has a header row now; the rest are set through the slash menu.
         expect(dashboard.render(100, 16).join("\n")).toContain("cwd:");
+    });
+    it("cycles the project filter from Ctrl+W, because Ctrl+J is the Enter byte", async () => {
+        const openSelectedViewer = vi.fn(async () => {});
+        const dashboard = controller(new FakeBackend([session("a", { cwd: "/repo/alpha" })]), { openViewer: openSelectedViewer });
+        await dashboard.open();
+        // Ctrl+J is a line feed, so a terminal cannot tell it from Enter; it opens the selection.
+        dashboard.handleInput("\n");
+        await vi.waitFor(() => expect(openSelectedViewer).toHaveBeenCalledWith("a"));
+        expect(dashboard.query.projectPaths).toBeUndefined();
+
+        dashboard.handleInput("\x17");
+        expect(dashboard.query.projectPaths).toEqual(["/repo/alpha"]);
+    });
+    it("leaves the launch fields to the slash commands: Tab moves nothing and Backspace only trims the prompt", async () => {
+        const dashboard = controller(new FakeBackend([session("a")]));
+        await dashboard.open();
+        for (const character of "go") dashboard.handleInput(character);
+        // Tab used to move an invisible cursor that typing ignored and Backspace obeyed, so a
+        // Backspace after it silently ate the launch cwd.
+        dashboard.handleInput("\t");
+        dashboard.handleInput("\x7f");
+        expect(dashboard.composerDraft.prompt).toBe("g");
+        expect(dashboard.composerField).toBeUndefined();
+        dashboard.handleInput("\x1b[Z");
+        dashboard.handleInput("x");
+        expect(dashboard.composerDraft.prompt).toBe("gx");
+        expect(dashboard.composerDraft.cwd).toBe("/repo");
+        expect(dashboard.composerDraft.model).toEqual({ provider: "anthropic", id: "claude" });
+        expect(dashboard.composerDraft.name).toBe("new task");
+        expect(dashboard.composerDraft.isolationMode).toBe("worktree");
+    });
+    it("shows a persisted launch model, so a draft the operator cannot fix cannot poison a launch unseen", async () => {
+        // The menu hint reads /model [provider/id]; typing it literally persisted this draft, and
+        // /model now refuses the value that is still sitting in it.
+        const stored = {
+            schemaVersion: 1,
+            clientId: "stable-client",
+            cursor: { daemonEpoch: "epoch", sequence: "1" },
+            viewState: { query: { view: "live" } },
+            launchDraft: { prompt: "", cwd: "/repo", isolationMode: "worktree", model: { provider: "provider", id: "id" }, thinkingLevel: "", name: "" },
+        };
+        const dashboard = controller(new FakeBackend([session("a")]), { persistence: persistence(stored) });
+        await dashboard.open();
+        expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("model:provider/id"))).toBe(true);
+
+        // A draft that carries no model of its own says nothing: Pi's default is not a setting.
+        const plain = controller(new FakeBackend([session("a")]), { launchDefaults: { cwd: "/repo" } });
+        await plain.open();
+        expect(plain.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("model:"))).toBe(false);
     });
     describe("slash commands", () => {
         function typed(dashboard, text) {
@@ -1041,6 +1105,45 @@ describe("mouse clicks", () => {
         const layout = createDashboardLayout(100, 24);
         dashboard.handleMouse({ button: "left", column: 4, row: layout.listTop + 6 });
         expect(dashboard.selectedSessionId).toBe("a");
+    });
+
+    it("does nothing at all where the layout draws no target", async () => {
+        const backend = new FakeBackend([session("a", { cwd: "/repo/alpha" }), session("b", { cwd: "/repo/beta" })]);
+        const opened = [];
+        const dashboard = controller(backend, { openViewer: async (id) => { opened.push(id); } });
+        await dashboard.open();
+        dashboard.render(100, 24);
+        const layout = createDashboardLayout(100, 24);
+        const dockTop = 24 - layout.dockRows;
+        const before = { ...dashboard.query };
+        // The title, the selected session's path, the cwd row, the section border, the column
+        // header, both prompt rules, and the status line are all read-only.
+        for (const row of [0, 1, 2, layout.listTop - 2, layout.listTop - 1, dockTop, dockTop + 2, dockTop + 3]) {
+            for (const column of [0, 2, 40, 99]) {
+                dashboard.handleMouse({ button: "left", column, row });
+                expect(dashboard.query, `row ${row} column ${column}`).toEqual(before);
+                expect(dashboard.focus, `row ${row} column ${column}`).toBe("list");
+                expect(dashboard.selectedSessionId, `row ${row} column ${column}`).toBe("a");
+            }
+        }
+        expect(opened).toEqual([]);
+        expect(dashboard.composerDraft.cwd).toBe("/repo");
+    });
+
+    it("puts the search box away when the prompt row is clicked, wherever the dock sits", async () => {
+        for (const height of [24, 11]) {
+            const dashboard = controller(new FakeBackend([session("a")]));
+            await dashboard.open();
+            dashboard.render(100, height);
+            const layout = createDashboardLayout(100, height);
+            dashboard.handleInput("\x06");
+            expect(dashboard.focus).toBe("search");
+            // The cwd row is not a click target, so the search box keeps the keystrokes.
+            dashboard.handleMouse({ button: "left", column: 4, row: 2 });
+            expect(dashboard.focus, `height ${height}`).toBe("search");
+            dashboard.handleMouse({ button: "left", column: 4, row: height - layout.dockRows + 1 });
+            expect(dashboard.focus, `height ${height}`).toBe("list");
+        }
     });
 });
 describe("wheel scrolling", () => {

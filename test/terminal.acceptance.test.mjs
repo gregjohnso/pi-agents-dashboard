@@ -195,8 +195,9 @@ it("drives list navigation, search/filter/sort/group, metadata/help, composer, c
   f.dashboard.handleInput("\x18");
   await vi.waitFor(() => expect(f.backend.delete).toHaveBeenCalledWith("live", 5, "terminal-request"));
 
+  // Tab reaches no launch field any more, so it cannot move a cursor away from the prompt.
   f.dashboard.handleInput("\t");
-  expect(f.dashboard.composerField).toBe("cwd");
+  expect(f.dashboard.composerDraft.prompt).toBe("draft");
   f.dashboard.handleInput("\x03");
   await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith({ kind: "closed" }));
   expect(f.dashboard.composerDraft.prompt).toBe("draft");

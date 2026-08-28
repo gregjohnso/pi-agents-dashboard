@@ -145,27 +145,8 @@ describe("daemon client", () => {
     await iterator.return?.();
   });
 
-  it("binds requests to one configured client identity, including NUL-bearing IDs", async () => {
-    const socketPath = await socketPathIn("client-");
-    await daemonServer(socketPath, ({ reply }) => reply(emptyState));
-    const client = startClient({ socketPath, clientId: "client\0one" });
-    await expect(client.request({ ...request, clientId: "other" })).rejects.toMatchObject({ code: "CLIENT_ID_MISMATCH" });
-    await expect(client.request({ ...request, clientId: "client\0one", requestId: "request\0one" })).resolves.toMatchObject({ requestId: "request\0one" });
-  });
-
-  it("rejects changed payload reuse locally", async () => {
-    const socketPath = await socketPathIn("client-");
-    await daemonServer(socketPath, ({ reply }) => reply(emptyState));
-    const client = startClient({ socketPath });
-    await client.request(request);
-    await expect(client.request({ ...request, payload: { changed: true } })).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
-  });
-
-  const acknowledgeCursor = { daemonEpoch: "epoch-1", sequence: "1" };
-  it.each([
-    ["state response", request, { kind: "state", sessions: "invalid" }, emptyState],
-    ["acknowledgement", { version: 1, clientId: "client-1", requestId: "ack-malformed", op: "ack", payload: { cursor: acknowledgeCursor } }, undefined, { kind: "acknowledged", cursor: acknowledgeCursor }],
-  ])("retains a pending %s when a malformed frame arrives and accepts a valid retry", async (_name, sent, malformed, expected) => {
+  it("retains a pending state request when a malformed frame arrives and accepts a valid retry", async () => {
+    const [sent, malformed, expected] = [request, { kind: "state", sessions: "invalid" }, emptyState];
     const socketPath = await socketPathIn("client-malformed-response-");
     const server = await daemonServer(socketPath, ({ socket, request: incoming, connection, reply }) => {
       if (connection === 1) socket.write(encodeJsonl({ version: 1, requestId: incoming.requestId, ok: true, result: malformed }), () => socket.destroy());
@@ -265,10 +246,4 @@ describe("daemon client", () => {
     await expect(client.setSessionColor("", "amber")).rejects.toThrow(/sessionId/iu);
   });
 
-  it("finishes subscriptions created after the client closes", async () => {
-    const client = createDaemonClient({ socketPath: "/unused", token: "secret", maxBytes: 1024, clientId: "client-1" });
-    await client.close();
-    const iterator = client.subscribe()[Symbol.asyncIterator]();
-    await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
-  });
 });

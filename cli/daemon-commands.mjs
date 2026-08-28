@@ -8,7 +8,7 @@ import { cleanupStaleDaemon, inspectDaemonEndpoint } from "../runtime/daemon-lif
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
 import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "../runtime/process-signaler.mjs";
-import { createDaemonRequester, createPersistentDaemonRequester, loadCliClientIdentity, resolveRuntimeRoot } from "./session-commands.mjs";
+import { createDaemonRequester, createPersistentDaemonRequester, destructiveRequestTimeoutMs, loadCliClientIdentity, resolveRuntimeRoot } from "./session-commands.mjs";
 
 export { resolveRuntimeRoot };
 
@@ -127,9 +127,12 @@ export async function runDaemonCommand(command, options = {}) {
     if (current.status === "ABSENT") return { code: 3, error: { code: "DAEMON_ABSENT", message: "Daemon is not running" } };
     if (current.status !== "HEALTHY") return { code: current.status === "CONFLICT" ? 5 : 1, error: { code: "STOP_REFUSED", message: "Daemon identity is not healthy and exact" } };
     const clientId = options.request === undefined && options.composerRequest === undefined ? await loadCliClientIdentity({ root, randomId: options.randomId }) : undefined;
-    const persistent = clientId === undefined ? undefined : await createPersistentDaemonRequester({ root, clientId, timeoutMs: options.timeoutMs });
+    // A worker Stop only answers after the daemon's own SIGTERM-then-SIGKILL escalation, so a shorter deadline reports a false ambiguous delivery.
+    const persistent = clientId === undefined ? undefined : await (options.createPersistentRequester ?? createPersistentDaemonRequester)({ root, clientId, timeoutMs: await destructiveRequestTimeoutMs(root, undefined, options.timeoutMs) });
     const request = options.composerRequest ?? persistent?.request ?? options.request ?? createDaemonRequester({ root, clientId, timeoutMs: options.timeoutMs });
     const claimsComposer = options.composerRequest !== undefined || persistent !== undefined;
+    /** @type {string[]} */
+    let stoppedSessionIds = [];
     try {
       const state = await request("get_state", {});
       const liveSessions = state.sessions.filter((record) => record.ownership !== undefined || ["LIVE", "SLEEPING"].includes(record.processState));
@@ -150,6 +153,7 @@ export async function runDaemonCommand(command, options = {}) {
         catch (error) { if (error?.code === "DELIVERY_UNKNOWN" || (error?.code === "CONNECTION_CLOSED" && error?.submitted === true)) return { code: 1, error: { code: "DELIVERY_UNKNOWN", message: "A worker Stop delivery is ambiguous; daemon remains running" } }; throw error; }
         const refused = outcomes.find((outcome) => outcome?.kind !== "command" || outcome.status?.stage !== "COMPLETED");
         if (refused !== undefined) return { code: 1, error: { code: refused?.status?.stage === "DELIVERY_UNKNOWN" ? "DELIVERY_UNKNOWN" : "WORKER_STOP_REFUSED", message: "A worker stop did not complete; daemon remains running" }, result: refused };
+        stoppedSessionIds = liveSessions.map((record) => record.sessionId);
       }
     } finally { await persistent?.close(); }
     const ownership = { pid: current.publication.pid, startIdentity: current.publication.startIdentity, processGroupId: current.publication.processGroupId };
@@ -170,7 +174,7 @@ export async function runDaemonCommand(command, options = {}) {
         return { code: 5, error: { code: error?.code ?? "DAEMON_IDENTITY_CONFLICT", message: error instanceof Error ? error.message : "Daemon cleanup identity changed" } };
       }
     }
-    return endpoint?.status === "ABSENT" ? { code: 0, result: { kind: "daemon_stopped", root } } : { code: 1, error: { code: "DAEMON_STOP_TIMEOUT", message: "Daemon did not stop before the deadline" } };
+    return endpoint?.status === "ABSENT" ? { code: 0, result: { kind: "daemon_stopped", root, stoppedSessionIds } } : { code: 1, error: { code: "DAEMON_STOP_TIMEOUT", message: "Daemon did not stop before the deadline" } };
   }
   if (command === "restart") {
     const current = await inspectEndpoint(common);

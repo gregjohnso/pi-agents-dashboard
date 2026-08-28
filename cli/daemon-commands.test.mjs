@@ -1,6 +1,19 @@
-import { expect, it, vi } from "vitest";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, expect, it, vi } from "vitest";
 
 import { resolveRuntimeRoot, runDaemonCommand } from "./daemon-commands.mjs";
+
+const roots = [];
+afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
+
+async function stateRoot() {
+  const root = await mkdtemp(join(tmpdir(), "dashboard-daemon-cli-"));
+  roots.push(root);
+  return root;
+}
 
 it("uses one per-user state root regardless of effective Pi config root", () => {
   const envA = { HOME: "/home/user", PI_CONFIG_DIR: "/pi/a" };
@@ -63,6 +76,33 @@ it("claims composer on each exact worker before --stop-workers mutation", async 
     stopWorkers: true, yes: true, stopProcessGroup: async () => ({ disposition: "GRACEFUL" }),
   });
   expect(operations).toEqual(["get_state", "attach", "stop", "detach"]);
+});
+
+it("gives every worker stop the daemon's full escalation window and reports the sessions it stopped", async () => {
+  const root = await stateRoot();
+  await writeFile(join(root, "dashboard.json"), JSON.stringify({ stop: { gracefulMs: 7_000, terminateMs: 3_000 } }), { mode: 0o600 });
+  const publication = { pid: 321, startIdentity: "987654321", processGroupId: 654, tokenPath: join(root, "daemon", "control.token") };
+  const endpoints = [{ status: "HEALTHY", daemonState: "READY", publication }, { status: "ABSENT" }];
+  const timeouts = [];
+  const result = await runDaemonCommand("stop", {
+    root,
+    inspectEndpoint: async () => endpoints.shift() ?? { status: "ABSENT" },
+    createPersistentRequester: async ({ timeoutMs }) => {
+      timeouts.push(timeoutMs);
+      return {
+        request: async (op) => {
+          if (op === "get_state") return { kind: "state", sessions: [{ sessionId: "live", revision: 4, processState: "LIVE", ownership: { runId: "run" } }] };
+          if (op === "attach") return { kind: "attached", sessionId: "live", role: "composer" };
+          if (op === "detach") return { kind: "detached", sessionId: "live" };
+          return { kind: "command", status: { stage: "COMPLETED" } };
+        },
+        close: async () => {},
+      };
+    },
+    stopWorkers: true, yes: true, stopProcessGroup: async () => ({ disposition: "GRACEFUL" }),
+  });
+  expect(timeouts).toEqual([7_000 + 3_000 + 1_000]);
+  expect(result).toMatchObject({ code: 0, result: { kind: "daemon_stopped", stoppedSessionIds: ["live"] } });
 });
 
 it("keeps the daemon running when the stop socket disconnects after submission", async () => {

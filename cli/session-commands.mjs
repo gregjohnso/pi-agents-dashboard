@@ -23,6 +23,8 @@ const ATOMIC_PUBLICATION_UNSUPPORTED_CODES = new Set(["EPERM", "EOPNOTSUPP", "EN
 const PRIVATE_FILE_MODE = 0o600;
 const AUTHENTICATION_STATES = new Set(["STARTING", "RECONCILING", "READY", "FAILED"]);
 const DESTRUCTIVE_COMMANDS = new Set(["stop", "delete", "cleanup"]);
+/** Daemon operations the CLI sends that mutate nothing, so a lost answer leaves no delivery to resolve. */
+const READ_ONLY_OPERATIONS = new Set(["get_state"]);
 const DESTRUCTIVE_TIMEOUT_MARGIN_MS = 1_000;
 const DEFAULT_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateMs: 5_000 });
 /** Worst-case wait for the daemon's SIGTERM-then-SIGKILL escalation under the default policy. */
@@ -279,7 +281,7 @@ export function createDaemonRequester({ root = resolveRuntimeRoot(), clientId, m
         if (!settleValidated()) finish(fallback);
       };
       const transportClosed = (error) => finalizeTransport(submitted ? deliveryUnknown() : error ?? Object.assign(new Error("Daemon connection closed"), { code: "CONNECTION_CLOSED" }));
-      timer = setTimeout(() => finalizeTransport(submitted ? deliveryUnknown() : Object.assign(new Error("Daemon request timed out"), { code: "DAEMON_REQUEST_TIMEOUT" })), timeoutMs);
+      timer = setTimeout(() => finalizeTransport(submitted && !READ_ONLY_OPERATIONS.has(op) ? deliveryUnknown() : Object.assign(new Error("Daemon request timed out"), { code: "DAEMON_REQUEST_TIMEOUT" })), timeoutMs);
       socket.once("connect", () => socket.write(encoder.encode({ version: 1, token })));
       socket.on("error", transportClosed);
       socket.on("data", (chunk) => {

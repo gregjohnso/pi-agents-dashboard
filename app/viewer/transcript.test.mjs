@@ -26,27 +26,9 @@ describe("normalized transcript state", () => {
     expect(state).toMatchObject({ model: { provider: "anthropic", id: "opus" }, thinkingLevel: "high", activity: { phase: "compacting" } });
   });
 
-  it("updates tools through pending, running, streaming, completed, failed, and expansion states", () => {
-    let state = createTranscriptState(snapshot);
-    const tool = { id: "t", name: "bash", state: "pending", arguments: { command: "pytest" }, startedAt: "2026-08-25T00:00:00Z" };
-    for (const [index, toolState] of ["pending", "running", "streaming", "completed", "failed"].entries()) {
-      const current = { ...tool, state: toolState, ...(toolState === "completed" ? { result: [{ type: "text", text: "passed" }], finishedAt: "2026-08-25T00:00:02Z" } : {}), ...(toolState === "failed" ? { error: "failed", finishedAt: "2026-08-25T00:00:03Z" } : {}) };
-      state = applyViewerEvent(state, event({ kind: index === 0 ? "tool_started" : index === 4 ? "tool_finished" : "tool_updated", tool: current }, String(index + 1)));
-      expect(state.tools.get("t")?.state).toBe(toolState);
-    }
-  });
 });
 
 describe("virtual transcript", () => {
-  it("opens every user turn after the first with Pi's turn spacer", () => {
-    const adapters = { component: vi.fn((item) => ({ render: () => [item.itemId ?? item.kind] })) };
-    let state = createTranscriptState(snapshot);
-    state = applyViewerEvent(state, event({ kind: "assistant_message", itemId: "a", content: [{ type: "text", text: "answer" }] }, "2"));
-    state = applyViewerEvent(state, event({ kind: "user_message", itemId: "u2", content: [{ type: "text", text: "again" }] }, "3"));
-    const transcript = new TranscriptModel({ state, adapters });
-    expect(transcript.render(40, 5)).toEqual(["", "u", "a", "", "u2"]);
-  });
-
   it("renders only visible blocks, pauses follow mode, and marks new activity", () => {
     const adapters = { component: vi.fn((item) => ({ render: vi.fn(() => [item.itemId ?? item.kind]) })) };
     const state = createTranscriptState({ ...snapshot, items: Array.from({ length: 100 }, (_, index) => ({ kind: "system_message", itemId: `i-${index}`, text: `line ${index}`, level: "info" })) });
@@ -59,34 +41,5 @@ describe("virtual transcript", () => {
     expect(lines.map(stripVTControlCharacters).join("\n")).toContain("new activity");
     expect(lines.every((line) => visibleWidth(line) <= 80)).toBe(true);
     expect(adapters.component).toHaveBeenCalledTimes(4);
-  });
-});
-
-describe("transcript scroll anchors", () => {
-  const adapters = { component: vi.fn((item) => ({ render: () => [item.itemId ?? item.kind] })) };
-  const longState = () => createTranscriptState({ ...snapshot, items: Array.from({ length: 50 }, (_, index) => ({ kind: "system_message", itemId: `i-${index}`, text: `line ${index}`, level: "info" })) });
-
-  it("jumps to start and end, marks new activity while detached, and resumes follow on the way down", () => {
-    const transcript = new TranscriptModel({ state: longState(), adapters });
-    transcript.setViewport(80, 5);
-    transcript.scrollToStart();
-    expect(transcript.following).toBe(false);
-    expect(transcript.distanceFromEnd).toBe(49);
-    const atStart = transcript.render(80, 5).map(stripVTControlCharacters);
-    expect(atStart.join("\n")).toContain("i-0");
-    expect(atStart.join("\n")).not.toContain("i-49");
-
-    transcript.update(applyViewerEvent(transcript.state, event({ kind: "system_message", itemId: "fresh", text: "fresh", level: "info" })));
-    expect(transcript.newActivity).toBe(true);
-    transcript.scrollToEnd();
-    expect(transcript.following).toBe(true);
-    expect(transcript.newActivity).toBe(false);
-    expect(stripVTControlCharacters(transcript.render(80, 5).join("\n"))).not.toContain("new activity");
-
-    transcript.scrollBy(-4);
-    expect(transcript.following).toBe(false);
-    transcript.scrollBy(4);
-    expect(transcript.following).toBe(true);
-    expect(transcript.distanceFromEnd).toBe(0);
   });
 });

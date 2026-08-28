@@ -759,8 +759,10 @@ export class DashboardController {
                 lines[dockTop] = sectionBorder(this.composerField === "prompt" ? "" : COMPOSER_FIELD_LABELS[this.composerField], this.width, confirmingSharedLaunch);
                 lines[dockTop + 1] = paintPlainLine(` ❯ ${draftPrompt || "describe a task for a new session"}`, this.width, draftPrompt ? (text) => jobwatchTheme.text(text, false) : (text) => jobwatchTheme.muted(text, false));
                 const form = ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
-                lines[dockTop + 2] = paintPlainLine(this.status.kind === "error" ? ` ${this.status.code}: ${this.status.message}  ${form}` : form, this.width, this.status.kind === "error" ? jobwatchTheme.error : jobwatchTheme.surface);
-                if (layout.dockRows >= 5) lines[dockTop + 3] = sectionFooter(this.width, confirmingSharedLaunch);
+                // The rule closes the prompt box; launch settings and the selected path are context below it.
+                const formRow = layout.dockRows >= 5 ? dockTop + 3 : dockTop + 2;
+                if (layout.dockRows >= 5) lines[dockTop + 2] = sectionFooter(this.width, confirmingSharedLaunch);
+                lines[formRow] = paintPlainLine(this.status.kind === "error" ? ` ${this.status.code}: ${this.status.message}  ${form}` : form, this.width, this.status.kind === "error" ? jobwatchTheme.error : jobwatchTheme.surface);
                 if (layout.dockRows >= 6) lines[dockTop + 4] = paintPlainLine(this.selectedCwdLine(), this.width, jobwatchTheme.keyHints);
                 lines[lines.length - 1] = paintPlainLine(" Ctrl+C quit  ↑↓ navigate  Enter/→ open  ←/Esc back  type to compose  Tab fields  ^X action  ^G help", this.width, jobwatchTheme.keyHints);
             }

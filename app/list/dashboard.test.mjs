@@ -165,7 +165,7 @@ describe("dashboard controller", () => {
         const unfiltered = dashboard.render(100, 16).map(stripVTControlCharacters);
         expect(unfiltered[1]).not.toContain("search:");
         expect(unfiltered[1]).not.toContain("v:live");
-        expect(unfiltered.at(-3).trim()).toMatch(/^─+$/u);
+        expect(unfiltered.at(-4).trim()).toMatch(/^─+$/u);
 
         dashboard.selectSession("a");
         expect(stripVTControlCharacters(dashboard.render(100, 16).at(-2))).toContain("/repo/alpha");

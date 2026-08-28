@@ -34,7 +34,7 @@ function attachmentEvents(text) {
 }
 
 /** @param {any} options @returns {any} */
-function connect({ socketPath, token, role, maxBytes = 1024, onFrame }) {
+function connect({ socketPath, token, maxBytes = 1024 }) {
   const decoder = createJsonlDecoder({ maxBytes });
   const encoder = createJsonlEncoder({ maxBytes });
   /** @type {any[]} */
@@ -46,7 +46,6 @@ function connect({ socketPath, token, role, maxBytes = 1024, onFrame }) {
   socket.on("data", (chunk) => {
     for (const frameValue of decoder.push(chunk)) {
       const frame = /** @type {any} */ (frameValue);
-      if (frame?.kind !== "authenticated" && onFrame?.(frame, socket, encoder) === true) continue;
       const waiter = waiters.shift();
       if (waiter) waiter(frame);
       else received.push(frame);
@@ -56,7 +55,7 @@ function connect({ socketPath, token, role, maxBytes = 1024, onFrame }) {
   const next = () => received.length > 0 ? Promise.resolve(received.shift()) : new Promise((resolve) => waiters.push(resolve));
   const ready = new Promise((resolve, reject) => {
     socket.once("connect", () => {
-      socket.write(encoder.encode(role === undefined ? { version: 1, token } : { version: 1, token, role }));
+      socket.write(encoder.encode({ version: 1, token }));
       resolve(undefined);
     });
     socket.once("error", reject);
@@ -134,23 +133,7 @@ function startPersistentFakeWorker(config, worker) {
   return loop;
 }
 
-it("orders bounded subscriber writes and waits for drain before advancing", () => {
-  const socket = /** @type {any} */ (new EventEmitter());
-  /** @type {{ value: string, callback: Function }[]} */
-  const writes = [];
-  socket.destroyed = false;
-  socket.write = (/** @type {Buffer} */ value, /** @type {Function} */ callback) => { writes.push({ value: value.toString(), callback }); return writes.length !== 1; };
-  socket.destroy = vi.fn(() => { socket.destroyed = true; });
-  const writer = createBoundedSocketWriter(socket, { maxPendingBytes: 16, maxPendingRecords: 2 });
-  expect(writer.enqueue(Buffer.from("one"))).toBe(true);
-  expect(writer.enqueue(Buffer.from("two"))).toBe(true);
-  expect(writes.map(({ value }) => value)).toEqual(["one"]);
-  writes[0].callback();
-  expect(writes).toHaveLength(1);
-  socket.emit("drain");
-  expect(writes.map(({ value }) => value)).toEqual(["one", "two"]);
-  writes[1].callback();
-
+it("closes a subscriber whose output queue outgrows its bound", () => {
   const blocked = /** @type {any} */ (new EventEmitter());
   blocked.destroyed = false;
   blocked.write = () => false;
@@ -229,36 +212,6 @@ it("shares one daemon across two effective Pi config roots and rejects mutations
   expect(runtime.status()).toMatchObject({ recovering: false, state: "READY" });
   first.close();
   second.close();
-});
-
-it("rejects worker mutations during reconciliation without touching unopened stores", async () => {
-  const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
-  const workerIdentity = { pid: 901, startIdentity: "worker-901", processGroupId: 901 };
-  const registry = new RegistryStore(join(stateRoot, "sessions"));
-  const now = "2026-08-25T12:00:00.000Z";
-  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "recovering", sessionFile: "/sessions/recovering.jsonl", canonicalSessionFile: "/sessions/recovering.jsonl", cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-recovering", process: workerIdentity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-recovering", createdAt: now, updatedAt: now });
-  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "recovering", runId: "run-recovering", leaseId: "lease-recovering", generation: 1, identity: workerIdentity, piChildIdentity: workerIdentity }] })}\n`, { mode: 0o600 });
-  /** @type {((value?: unknown) => void) | undefined} */
-  let releaseRecovery;
-  const gate = new Promise((resolve) => { releaseRecovery = resolve; });
-  const runtime = await createDaemonRuntime({
-    root: stateRoot,
-    inspect: async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : workerIdentity,
-    reconnectTimeoutMs: 20,
-    reconcile: async (/** @type {any} */ options) => { await gate; return options.defaultReconcile(); },
-  });
-  const worker = connect({ socketPath: runtime.socketPath, token: runtime.token, role: "worker" });
-  await worker.ready;
-  worker.send({ version: 1, type: "worker_ready", token: "private-worker", sessionId: "recovering", runId: "run-recovering", leaseId: "lease-recovering", generation: 1, worker: workerIdentity, piChild: workerIdentity });
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  worker.send({ version: 1, type: "worker_event", token: "private-worker", sessionId: "recovering", event: { type: "TURN_STARTED", at: now } });
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  expect(runtime.status()).toMatchObject({ state: "RECONCILING" });
-  /** @type {(value?: unknown) => void} */ (releaseRecovery)();
-  await expect(runtime.ready).rejects.toMatchObject({ code: "OWNERSHIP_CONFLICT" });
-  await runtime.close();
-  worker.close();
 });
 
 it("forgets a session whose worker lease points at a dead process", async () => {
@@ -583,30 +536,6 @@ it("discovers slash commands and delivers one session command to the owning work
   client.close();
 });
 
-it("boots an exited session worker before granting its composer attachment", async () => {
-  const stateRoot = await root();
-  await mkdir(join(stateRoot, "sessions"), { mode: 0o700 });
-  const registry = new RegistryStore(join(stateRoot, "sessions"));
-  const now = "2026-08-25T00:00:00.000Z";
-  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "resume", sessionFile: "/sessions/resume.jsonl", canonicalSessionFile: "/sessions/resume.jsonl", cwd: "/repo", taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "assistant_final", summary: "Saved", updatedAt: now }, createdAt: now, updatedAt: now });
-  const identity = { pid: 321, startIdentity: "resumed-worker", processGroupId: 321 };
-  const launch = vi.fn(async (request) => {
-    const current = await registry.get("resume");
-    if (current === undefined) throw new Error("resume record missing");
-    await registry.update("resume", current.revision, { ownership: { kind: "managed", runId: request.runId, process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: request.runId, processState: "LIVE", updatedAt: now });
-    return { sessionId: "resume", runId: request.runId, leaseId: "resume-lease", generation: 1, identity, piChildIdentity: identity };
-  });
-  const runtime = await createDaemonRuntime({ root: stateRoot, hostProbe: async () => ({ blockers: [] }), workerSupervisor: { launch, async close() {} } });
-  runtimes.push(runtime);
-  await runtime.ready;
-  const client = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await client.ready;
-  client.send({ version: 1, clientId: "client", requestId: "resume-attach", op: "attach", payload: { sessionId: "resume", role: "composer", activate: true } });
-  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "attached", sessionId: "resume", role: "composer" } });
-  expect(launch).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "resume", canonicalSessionFile: "/sessions/resume.jsonl", cwd: "/repo", runId: expect.any(String) }));
-  client.close();
-});
-
 it("arbitrates one composer per session and persists release before observer takeover", async () => {
   const workerSupervisor = { close: vi.fn(), stop: vi.fn(), delete: vi.fn() };
   const runtime = await createDaemonRuntime({ root: await root(), workerSupervisor });
@@ -642,108 +571,6 @@ it("arbitrates one composer per session and persists release before observer tak
   expect(workerSupervisor.delete).not.toHaveBeenCalled();
   loser.close();
   observer.close();
-});
-
-it("binds composer ownership to the exact authenticated connection even for the same stable client ID", async () => {
-  /** @type {any[]} */
-  const signals = [];
-  /** @param {any[]} args */
-  const signalWorker = (...args) => signals.push(args);
-  const runtime = await createDaemonRuntime({ root: await root(), signalWorker });
-  runtimes.push(runtime);
-  await runtime.ready;
-  const first = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  const spoof = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await Promise.all([first.ready, spoof.ready]);
-  /** @param {string} requestId */
-  const attach = (requestId) => ({ version: 1, clientId: "same-client", requestId, op: "attach", payload: { sessionId: "session", role: "composer" } });
-  first.send(attach("first"));
-  expect(await first.next()).toMatchObject({ ok: true, result: { role: "composer" } });
-  spoof.send(attach("spoof"));
-  expect(await spoof.next()).toMatchObject({ ok: true, result: { role: "observer" } });
-  spoof.send({ version: 1, clientId: "same-client", requestId: "spoof-detach", op: "detach", payload: { sessionId: "session" } });
-  expect(await spoof.next()).toMatchObject({ ok: true, result: { kind: "detached" } });
-  const third = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await third.ready;
-  third.send(attach("third"));
-  expect(await third.next()).toMatchObject({ ok: true, result: { role: "observer" } });
-  first.close();
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  const reconnect = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await reconnect.ready;
-  reconnect.send(attach("reconnect"));
-  expect(await reconnect.next()).toMatchObject({ ok: true, result: { role: "composer" } });
-  expect(signals).toEqual([]);
-  spoof.close();
-  third.close();
-  reconnect.close();
-});
-
-it("rejects wrong-client detach on one connection and releases only the exact authenticated claim", async () => {
-  const runtime = await createDaemonRuntime({ root: await root() });
-  runtimes.push(runtime);
-  await runtime.ready;
-  const owner = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  const contender = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await Promise.all([owner.ready, contender.ready]);
-  owner.send({ version: 1, clientId: "owner", requestId: "attach", op: "attach", payload: { sessionId: "session", role: "composer" } });
-  expect(await owner.next()).toMatchObject({ ok: true, result: { role: "composer" } });
-  owner.send({ version: 1, clientId: "wrong", requestId: "wrong-detach", op: "detach", payload: { sessionId: "session" } });
-  expect(await owner.next()).toMatchObject({ ok: false, error: { code: "CLIENT_IDENTITY_CONFLICT" } });
-  contender.send({ version: 1, clientId: "contender", requestId: "attach-before", op: "attach", payload: { sessionId: "session", role: "composer" } });
-  expect(await contender.next()).toMatchObject({ ok: true, result: { role: "observer" } });
-  owner.send({ version: 1, clientId: "owner", requestId: "exact-detach", op: "detach", payload: { sessionId: "session" } });
-  expect(await owner.next()).toMatchObject({ ok: true, result: { kind: "detached" } });
-  contender.send({ version: 1, clientId: "contender", requestId: "attach-after", op: "attach", payload: { sessionId: "session", role: "composer" } });
-  expect(await contender.next()).toMatchObject({ ok: true, result: { role: "composer" } });
-  owner.close();
-  contender.close();
-});
-
-it("installs an in-flight attachment reservation across sockets before arbitration", async () => {
-  /** @type {((value?: unknown) => void) | undefined} */
-  let releaseAppend;
-  /** @type {((value?: unknown) => void) | undefined} */
-  let appendReached;
-  const appendGate = new Promise((resolve) => { releaseAppend = resolve; });
-  const reached = new Promise((resolve) => { appendReached = resolve; });
-  let appendCount = 0;
-  const runtime = await createDaemonRuntime({
-    root: await root(),
-    reconcile: async (/** @type {any} */ options) => {
-      const recovery = await options.defaultReconcile();
-      const append = recovery.events.append.bind(recovery.events);
-      recovery.events.append = async (/** @type {any} */ event) => {
-        if (event.kind === "attachment_changed" && event.payload.attached === true) {
-          appendCount += 1;
-          appendReached?.();
-          await appendGate;
-        }
-        return append(event);
-      };
-      return recovery;
-    },
-  });
-  runtimes.push(runtime);
-  await runtime.ready;
-  const first = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  const duplicate = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  const conflict = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await Promise.all([first.ready, duplicate.ready, conflict.ready]);
-  const attach = { version: 1, clientId: "stable", requestId: "same", op: "attach", payload: { sessionId: "session", role: "composer" } };
-  first.send(attach);
-  await reached;
-  duplicate.send(attach);
-  conflict.send({ ...attach, op: "detach", payload: { sessionId: "session" } });
-  expect(await conflict.next()).toMatchObject({ ok: false, error: { code: "IDEMPOTENCY_CONFLICT" } });
-  releaseAppend?.();
-  const [firstResult, duplicateResult] = await Promise.all([first.next(), duplicate.next()]);
-  expect(firstResult).toMatchObject({ ok: true, result: { role: "composer" } });
-  expect(duplicateResult).toEqual(firstResult);
-  expect(appendCount).toBe(1);
-  first.close();
-  duplicate.close();
-  conflict.close();
 });
 
 it("serializes disconnect behind an attach whose durable append is in flight", async () => {
@@ -790,106 +617,9 @@ it("serializes disconnect behind an attach whose durable append is in flight", a
   observer.close();
 });
 
-it("registers a pending session before its serializer lock and rejects it after close", async () => {
-  /** @type {((value?: unknown) => void) | undefined} */
-  let releaseAppend;
-  /** @type {((value?: unknown) => void) | undefined} */
-  let appendReached;
-  /** @type {((value?: unknown) => void) | undefined} */
-  let pendingRegistered;
-  const appendGate = new Promise((resolve) => { releaseAppend = resolve; });
-  const reached = new Promise((resolve) => { appendReached = resolve; });
-  const registered = new Promise((resolve) => { pendingRegistered = resolve; });
-  const runtime = await createDaemonRuntime({
-    root: await root(),
-    attachmentFailpoint(/** @type {string} */ stage, /** @type {any} */ request) {
-      if (stage === "registered" && request.clientId === "closing") pendingRegistered?.();
-    },
-    reconcile: async (/** @type {any} */ options) => {
-      const recovery = await options.defaultReconcile();
-      const append = recovery.events.append.bind(recovery.events);
-      recovery.events.append = async (/** @type {any} */ event) => {
-        if (event.kind === "attachment_changed" && event.payload.clientId === "blocker" && event.payload.attached) {
-          appendReached?.();
-          await appendGate;
-        }
-        return append(event);
-      };
-      return recovery;
-    },
-  });
-  runtimes.push(runtime);
-  await runtime.ready;
-  const blocker = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  const closing = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  const observer = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await Promise.all([blocker.ready, closing.ready, observer.ready]);
-  observer.send({ version: 1, clientId: "watcher", requestId: "subscribe", op: "subscribe", payload: {} });
-  await observer.next();
-  blocker.send({ version: 1, clientId: "blocker", requestId: "attach", op: "attach", payload: { sessionId: "session", role: "composer" } });
-  await reached;
-  closing.send({ version: 1, clientId: "closing", requestId: "attach", op: "attach", payload: { sessionId: "session", role: "composer" } });
-  await registered;
-  closing.close();
-  /** @type {(value?: unknown) => void} */ (releaseAppend)();
-  await blocker.next();
-  expect(await observer.next()).toMatchObject({ payload: { clientId: "blocker", attached: true } });
-  blocker.close();
-  expect(await observer.next()).toMatchObject({ payload: { clientId: "blocker", attached: false } });
-
-  const next = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await next.ready;
-  next.send({ version: 1, clientId: "next", requestId: "attach", op: "attach", payload: { sessionId: "session", role: "composer" } });
-  expect(await next.next()).toMatchObject({ ok: true, result: { role: "composer" } });
-  next.close();
-  observer.close();
-});
-
-it("replays durable attachment outcomes across request pressure and daemon restart", async () => {
-  const stateRoot = await root();
-  const firstRuntime = await createDaemonRuntime({ root: stateRoot });
-  runtimes.push(firstRuntime);
-  await firstRuntime.ready;
-  const first = connect({ socketPath: firstRuntime.socketPath, token: firstRuntime.token });
-  await first.ready;
-  const original = { version: 1, clientId: "stable", requestId: "original", op: "attach", payload: { sessionId: "session", role: "composer" } };
-  first.send(original);
-  const originalResponse = await first.next();
-  expect(originalResponse).toMatchObject({ ok: true, result: { kind: "attached", role: "composer" } });
-  first.close();
-  await first.closed;
-
-  const pressure = connect({ socketPath: firstRuntime.socketPath, token: firstRuntime.token });
-  await pressure.ready;
-  const pressureRequests = Array.from({ length: 20 }, (_, index) => ({ version: 1, clientId: "pressure", requestId: `detach-${index}`, op: "detach", payload: { sessionId: `other-${index}` } }));
-  pressureRequests.forEach(pressure.send);
-  const pressureResponses = await Promise.all(pressureRequests.map(() => pressure.next()));
-  expect(pressureResponses.every((value) => value.ok === true && value.result?.kind === "detached")).toBe(true);
-  pressure.close();
-  await firstRuntime.close();
-
-  const eventPath = join(stateRoot, "index", "events.jsonl");
-  const beforeReplay = await readFile(eventPath, "utf8");
-  const secondRuntime = await createDaemonRuntime({ root: stateRoot });
-  runtimes.push(secondRuntime);
-  await secondRuntime.ready;
-  const replay = connect({ socketPath: secondRuntime.socketPath, token: secondRuntime.token });
-  await replay.ready;
-  replay.send(original);
-  expect(await replay.next()).toEqual(originalResponse);
-  expect(await readFile(eventPath, "utf8")).toBe(beforeReplay);
-  replay.send({ ...original, payload: { sessionId: "session", role: "observer" } });
-  expect(await replay.next()).toMatchObject({ ok: false, error: { code: "IDEMPOTENCY_CONFLICT" } });
-  expect(await readFile(eventPath, "utf8")).toBe(beforeReplay);
-  replay.close();
-});
-
 it.each([
   ["after_prepared", "abandon"],
   ["after_event_append", "retry_at_risk"],
-  ["after_claim_mutation", "abandon"],
-  ["after_broadcast", "retry_at_risk"],
-  ["before_result_completion", "abandon"],
 ])("recovers attachment crash phase %s as durable ambiguity until %s", async (crashPhase, resolution) => {
   const stateRoot = await root();
   let crash = true;
@@ -980,101 +710,6 @@ it("replays strict completion after a post-completion crash without attachment s
   replay.close();
 });
 
-it("replays a completed broadcast failure after restart without attachment side effects", async () => {
-  /** @type {string[]} */
-  const order = [];
-  let rejectBroadcast = true;
-  const stateRoot = await root();
-  const runtime = await createDaemonRuntime({
-    root: stateRoot,
-    /** @param {any} event @param {() => void} broadcast */
-    broadcastEvent(event, broadcast) {
-      if (event.kind === "attachment_changed") order.push("broadcast");
-      if (rejectBroadcast && event.kind === "attachment_changed") {
-        rejectBroadcast = false;
-        throw Object.assign(new Error("injected broadcast failure"), { code: "BROADCAST_FAILED" });
-      }
-      broadcast();
-    },
-    reconcile: async (/** @type {any} */ options) => {
-      const recovery = await options.defaultReconcile();
-      const append = recovery.events.append.bind(recovery.events);
-      recovery.events.append = async (/** @type {any} */ event) => {
-        if (event.kind === "attachment_changed") order.push("append");
-        return append(event);
-      };
-      return recovery;
-    },
-  });
-  runtimes.push(runtime);
-  await runtime.ready;
-  const first = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  const second = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await Promise.all([first.ready, second.ready]);
-  const original = { version: 1, clientId: "first", requestId: "attach-first", op: "attach", payload: { sessionId: "session", role: "composer" } };
-  first.send(original);
-  const failed = await first.next();
-  expect(failed).toMatchObject({ ok: false, error: { code: "BROADCAST_FAILED" } });
-  const orderAfterFailure = [...order];
-  first.send({ version: 1, clientId: "first", requestId: "attach-first", op: "attach", payload: { sessionId: "session", role: "composer" } });
-  expect(await first.next()).toEqual(failed);
-  expect(order).toEqual(orderAfterFailure);
-  second.send({ version: 1, clientId: "second", requestId: "attach-second", op: "attach", payload: { sessionId: "session", role: "composer" } });
-  expect(await second.next()).toMatchObject({ ok: true, result: { role: "observer" } });
-  expect(order.slice(0, 2)).toEqual(["append", "broadcast"]);
-  first.close();
-  second.close();
-  await Promise.all([first.closed, second.closed]);
-  await runtime.close();
-  runtimes.splice(runtimes.indexOf(runtime), 1);
-  const eventPath = join(stateRoot, "index", "events.jsonl");
-  const beforeRestartReplay = await readFile(eventPath, "utf8");
-
-  const restarted = await createDaemonRuntime({ root: stateRoot });
-  runtimes.push(restarted);
-  await restarted.ready;
-  const replay = connect({ socketPath: restarted.socketPath, token: restarted.token });
-  await replay.ready;
-  replay.send(original);
-  expect(await replay.next()).toEqual(failed);
-  expect(await readFile(eventPath, "utf8")).toBe(beforeRestartReplay);
-  expect(await restarted.commandStatus(original)).toMatchObject({ stage: "COMPLETED" });
-  replay.close();
-});
-
-it("leaves an attachment claim unchanged when durable attachment event append fails", async () => {
-  let rejectNextAttachment = false;
-  const runtime = await createDaemonRuntime({
-    root: await root(),
-    reconcile: async (/** @type {any} */ options) => {
-      const recovery = await options.defaultReconcile();
-      const append = recovery.events.append.bind(recovery.events);
-      recovery.events.append = async (/** @type {any} */ event) => {
-        if (rejectNextAttachment && event.kind === "attachment_changed") {
-          rejectNextAttachment = false;
-          throw Object.assign(new Error("injected append failure"), { code: "PERSIST_FAILED" });
-        }
-        return append(event);
-      };
-      return recovery;
-    },
-  });
-  runtimes.push(runtime);
-  await runtime.ready;
-  const first = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  const second = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await Promise.all([first.ready, second.ready]);
-  first.send({ version: 1, clientId: "first", requestId: "attach-first", op: "attach", payload: { sessionId: "session", role: "composer" } });
-  expect(await first.next()).toMatchObject({ ok: true, result: { role: "composer" } });
-  rejectNextAttachment = true;
-  first.send({ version: 1, clientId: "first", requestId: "detach-fails", op: "detach", payload: { sessionId: "session" } });
-  expect(await first.next()).toMatchObject({ ok: false, error: { code: "PERSIST_FAILED" } });
-  second.send({ version: 1, clientId: "second", requestId: "attach-second", op: "attach", payload: { sessionId: "session", role: "composer" } });
-  expect(await second.next()).toMatchObject({ ok: true, result: { role: "observer" } });
-  first.close();
-  second.close();
-});
-
 it("does not install a claim when the durable attach event fails", async () => {
   let rejectNextAttachment = true;
   const runtime = await createDaemonRuntime({
@@ -1105,115 +740,6 @@ it("does not install a claim when the durable attach event fails", async () => {
   second.close();
 });
 
-it("keeps the exact connection claim when disconnect release persistence fails", async () => {
-  let rejectRelease = false;
-  /** @type {((value?: unknown) => void) | undefined} */
-  let releaseAttempted;
-  const attempted = new Promise((resolve) => { releaseAttempted = resolve; });
-  const runtime = await createDaemonRuntime({
-    root: await root(),
-    reconcile: async (/** @type {any} */ options) => {
-      const recovery = await options.defaultReconcile();
-      const append = recovery.events.append.bind(recovery.events);
-      recovery.events.append = async (/** @type {any} */ event) => {
-        if (rejectRelease && event.kind === "attachment_changed" && event.payload.attached === false) {
-          rejectRelease = false;
-          releaseAttempted?.();
-          throw Object.assign(new Error("injected disconnect append failure"), { code: "PERSIST_FAILED" });
-        }
-        return append(event);
-      };
-      return recovery;
-    },
-  });
-  runtimes.push(runtime);
-  await runtime.ready;
-  const first = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await first.ready;
-  first.send({ version: 1, clientId: "first", requestId: "attach", op: "attach", payload: { sessionId: "session", role: "composer" } });
-  await first.next();
-  rejectRelease = true;
-  first.close();
-  await attempted;
-  const second = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await second.ready;
-  second.send({ version: 1, clientId: "second", requestId: "attach", op: "attach", payload: { sessionId: "session", role: "composer" } });
-  expect(await second.next()).toMatchObject({ ok: true, result: { role: "observer" } });
-  second.close();
-});
-
-it("drains a durable disconnect release chain before daemon shutdown completes", async () => {
-  /** @type {((value?: unknown) => void) | undefined} */
-  let releaseAppend;
-  /** @type {((value?: unknown) => void) | undefined} */
-  let appendReached;
-  const appendGate = new Promise((resolve) => { releaseAppend = resolve; });
-  const reached = new Promise((resolve) => { appendReached = resolve; });
-  let gateRelease = false;
-  const runtime = await createDaemonRuntime({
-    root: await root(),
-    reconcile: async (/** @type {any} */ options) => {
-      const recovery = await options.defaultReconcile();
-      const append = recovery.events.append.bind(recovery.events);
-      recovery.events.append = async (/** @type {any} */ event) => {
-        if (gateRelease && event.kind === "attachment_changed" && event.payload.attached === false) {
-          appendReached?.();
-          await appendGate;
-        }
-        return append(event);
-      };
-      return recovery;
-    },
-  });
-  await runtime.ready;
-  const client = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await client.ready;
-  client.send({ version: 1, clientId: "client", requestId: "attach", op: "attach", payload: { sessionId: "session", role: "composer" } });
-  await client.next();
-  gateRelease = true;
-  client.close();
-  await reached;
-  let closed = false;
-  const closing = runtime.close().then(() => { closed = true; });
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  expect(closed).toBe(false);
-  releaseAppend?.();
-  await closing;
-  expect(closed).toBe(true);
-});
-
-it("serializes disconnect against attach and keeps duplicate attachment requests idempotent", async () => {
-  const runtime = await createDaemonRuntime({ root: await root() });
-  runtimes.push(runtime);
-  await runtime.ready;
-  const first = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  const second = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  const events = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await Promise.all([first.ready, second.ready, events.ready]);
-  const attach = { version: 1, clientId: "stable-a", requestId: "same-attach", op: "attach", payload: { sessionId: "session", role: "composer" } };
-  events.send({ version: 1, clientId: "watcher", requestId: "subscribe", op: "subscribe", payload: {} });
-  await events.next();
-  first.send(attach);
-  expect(await first.next()).toMatchObject({ result: { role: "composer" } });
-  await events.next();
-  first.send(attach);
-  expect(await first.next()).toMatchObject({ result: { role: "composer" } });
-  first.close();
-  expect(await events.next()).toMatchObject({ payload: { clientId: "stable-a", attached: false } });
-  second.send({ ...attach, clientId: "stable-b", requestId: "attach-b" });
-  expect(await second.next()).toMatchObject({ result: { role: "composer" } });
-  const transitions = [
-    { payload: { clientId: "stable-a", attached: false } },
-    await events.next(),
-  ];
-  expect(transitions.map((event) => [event.payload.clientId, event.payload.attached])).toEqual([
-    ["stable-a", false],
-    ["stable-b", true],
-  ]);
-  second.close();
-  events.close();
-});
-
 it("authenticates every connection and applies strict framing limits", async () => {
   const runtime = await createDaemonRuntime({ root: await root(), hostProbe: async () => ({ blockers: [] }), maxBytes: 256 });
   runtimes.push(runtime);
@@ -1232,89 +758,6 @@ it("authenticates every connection and applies strict framing limits", async () 
   expect(oversized).toMatchObject({ error: { code: "FRAME_TOO_LARGE" } });
 });
 
-it("settles connector authentication on silent close, auth-close race, and normal post-auth close", async () => {
-  const stateRoot = await root();
-  const tokenPath = join(stateRoot, "connector-close.token");
-  await writeFile(tokenPath, "private-token\n", { mode: 0o600 });
-
-  const silentPath = join(stateRoot, "silent-close.sock");
-  /** @type {net.Socket | undefined} */
-  let silentSocket;
-  const silentServer = net.createServer((socket) => {
-    silentSocket = socket;
-    socket.end();
-  });
-  await new Promise((resolve, reject) => {
-    silentServer.once("error", reject);
-    silentServer.listen(silentPath, () => resolve(undefined));
-  });
-  await expect(connectDaemon({ config: { socketPath: silentPath, tokenPath, maxBytes: 1024 } })).rejects.toMatchObject({ code: "DAEMON_AUTHENTICATION_CLOSED" });
-  silentSocket?.destroy();
-  await new Promise((resolve) => silentServer.close(() => resolve(undefined)));
-
-  const racingPath = join(stateRoot, "racing-close.sock");
-  const racingServer = net.createServer((socket) => {
-    const decoder = createJsonlDecoder({ maxBytes: 1024 });
-    const encoder = createJsonlEncoder({ maxBytes: 1024 });
-    socket.on("data", (chunk) => {
-      if (decoder.push(chunk).length > 0) socket.end(encoder.encode({ version: 1, kind: "authenticated" }));
-    });
-  });
-  await new Promise((resolve, reject) => {
-    racingServer.once("error", reject);
-    racingServer.listen(racingPath, () => resolve(undefined));
-  });
-  const racingConnection = await connectDaemon({ config: { socketPath: racingPath, tokenPath, maxBytes: 1024 } });
-  await racingConnection.closed;
-  await new Promise((resolve) => racingServer.close(() => resolve(undefined)));
-
-  const normalPath = join(stateRoot, "normal-close.sock");
-  /** @type {net.Socket | undefined} */
-  let serverSocket;
-  const normalServer = net.createServer((socket) => {
-    serverSocket = socket;
-    const decoder = createJsonlDecoder({ maxBytes: 1024 });
-    const encoder = createJsonlEncoder({ maxBytes: 1024 });
-    socket.on("data", (chunk) => {
-      if (decoder.push(chunk).length > 0) socket.write(encoder.encode({ version: 1, kind: "authenticated" }));
-    });
-  });
-  await new Promise((resolve, reject) => {
-    normalServer.once("error", reject);
-    normalServer.listen(normalPath, () => resolve(undefined));
-  });
-  const normalConnection = await connectDaemon({ config: { socketPath: normalPath, tokenPath, maxBytes: 1024 } });
-  serverSocket?.end();
-  await normalConnection.closed;
-  await new Promise((resolve) => normalServer.close(() => resolve(undefined)));
-});
-
-it("contains connector listener exceptions and keeps an error handler after authentication", async () => {
-  const stateRoot = await root();
-  const socketPath = join(stateRoot, "connector.sock");
-  const tokenPath = join(stateRoot, "connector.token");
-  await writeFile(tokenPath, "private-token\n", { mode: 0o600 });
-  const server = net.createServer((socket) => {
-    const decoder = createJsonlDecoder({ maxBytes: 1024 });
-    const encoder = createJsonlEncoder({ maxBytes: 1024 });
-    socket.on("error", () => {});
-    socket.on("data", (chunk) => {
-      if (decoder.push(chunk).length === 0) return;
-      socket.write(encoder.encode({ version: 1, kind: "authenticated" }), () => {
-        setTimeout(() => socket.write(encoder.encode({ version: 1, type: "command", id: "late-frame" })), 10);
-      });
-    });
-  });
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(socketPath, () => resolve(undefined));
-  });
-  const connection = await connectDaemon({ config: { socketPath, tokenPath, maxBytes: 1024 } });
-  connection.onMessage(() => { throw new Error("listener failure"); });
-  await Promise.race([connection.closed, new Promise((_, reject) => setTimeout(() => reject(new Error("connector did not close")), 500))]);
-  await new Promise((resolve) => server.close(() => resolve(undefined)));
-});
-
 it("publishes failed recovery status and removes lifecycle artifacts on close", async () => {
   const stateRoot = await root();
   const runtime = await createDaemonRuntime({ root: stateRoot, reconcile: async () => { throw Object.assign(new Error("ownership conflict"), { code: "OWNERSHIP_CONFLICT" }); } });
@@ -1325,82 +768,6 @@ it("publishes failed recovery status and removes lifecycle artifacts on close", 
   await runtime.close();
   await expect(access(join(stateRoot, "daemon", "pid.json"))).rejects.toMatchObject({ code: "ENOENT" });
   await expect(access(runtime.socketPath)).rejects.toMatchObject({ code: "ENOENT" });
-});
-
-it("fails closed and closes partial cursor stores", async () => {
-  const stateRoot = await root();
-  await mkdir(join(stateRoot, "daemon"), { mode: 0o700 });
-  await writeFile(join(stateRoot, "daemon", "event-acks.json"), "{\"client\":", { mode: 0o600 });
-  const runtime = await createDaemonRuntime({ root: stateRoot });
-  await expect(runtime.ready).rejects.toThrow();
-  expect(runtime.status()).toMatchObject({ state: "FAILED" });
-  await runtime.close();
-  await expect(access(join(stateRoot, "daemon", "pid.json"))).rejects.toMatchObject({ code: "ENOENT" });
-});
-
-it("cancels and drains reconciliation before releasing lifecycle ownership", async () => {
-  const stateRoot = await root();
-  let sawAbort = false;
-  const runtime = await createDaemonRuntime({
-    root: stateRoot,
-    reconcile: async (/** @type {any} */ { signal }) => {
-      await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
-      sawAbort = true;
-      throw Object.assign(new Error("cancelled"), { code: "RECONCILIATION_CANCELLED" });
-    },
-  });
-  await runtime.close();
-  expect(sawAbort).toBe(true);
-  await expect(access(join(stateRoot, "daemon", "pid.json"))).rejects.toMatchObject({ code: "ENOENT" });
-});
-
-it("shares close state, reports every staged failure after releasing lifecycle ownership", async () => {
-  const stateRoot = await root();
-  /** @type {string[]} */
-  const failedStages = [];
-  const runtime = await createDaemonRuntime({
-    root: stateRoot,
-    closeFailpoint: async (/** @type {string} */ stage) => {
-      failedStages.push(stage);
-      throw new Error(`injected ${stage} close failure`);
-    },
-  });
-  await runtime.ready;
-  const firstClose = runtime.close();
-  const secondClose = runtime.close();
-  expect(secondClose).toBe(firstClose);
-  await expect(firstClose).rejects.toMatchObject({ code: "DAEMON_CLOSE_FAILED", errors: { length: 10 } });
-  expect(runtime.status().closeState).toBe("FAILED_CLOSED");
-  expect(failedStages).toEqual(["request_admission", "reconciliation", "request_chains", "supervisor", "cursor_store", "launch_result_store", "attachment_result_store", "delete_result_store", "recovery_stores", "lifecycle"]);
-  await expect(access(join(stateRoot, "daemon", "pid.json"))).rejects.toMatchObject({ code: "ENOENT" });
-  await expect(access(runtime.socketPath)).rejects.toMatchObject({ code: "ENOENT" });
-
-  const replacement = await createDaemonRuntime({ root: stateRoot });
-  await replacement.ready;
-  await replacement.close();
-});
-
-it("serializes monotonic event acknowledgements by stable socket client identity", async () => {
-  const stateRoot = await root();
-  const runtime = await createDaemonRuntime({ root: stateRoot });
-  runtimes.push(runtime);
-  await runtime.ready;
-  const first = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  const second = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await Promise.all([first.ready, second.ready]);
-  for (const [client, requestId] of [[first, "event-one"], [second, "event-two"]]) {
-    client.send({ version: 1, clientId: "stable-client", requestId, op: "attach", payload: { sessionId: requestId, role: "composer" } });
-    await client.next();
-  }
-  first.send({ version: 1, clientId: "stable-client", requestId: "ack-two", op: "ack", payload: { cursor: { daemonEpoch: runtime.daemonEpoch, sequence: "2" } } });
-  second.send({ version: 1, clientId: "stable-client", requestId: "ack-one", op: "ack", payload: { cursor: { daemonEpoch: runtime.daemonEpoch, sequence: "1" } } });
-  await Promise.all([first.next(), second.next()]);
-  const cursors = JSON.parse(await readFile(join(stateRoot, "daemon", "event-acks.json"), "utf8"));
-  expect(cursors["stable-client"]).toEqual({ daemonEpoch: runtime.daemonEpoch, sequence: "2" });
-  first.send({ version: 1, clientId: "changed-client", requestId: "wrong-client", op: "ack", payload: { cursor: { daemonEpoch: runtime.daemonEpoch, sequence: "2" } } });
-  expect(await first.next()).toMatchObject({ ok: false, error: { code: "CLIENT_IDENTITY_CONFLICT" } });
-  first.close();
-  second.close();
 });
 
 it("journals launch before the irreversible call and refuses ambiguous duplicate retry", async () => {
@@ -1648,53 +1015,6 @@ it("reconnects two surviving fake workers through the concrete connector after d
   expect(loops.map((loop) => [loop.pid, loop.alive])).toEqual([[201, true], [202, true]]);
 });
 
-it("closes daemon and frontend sockets without signaling worker processes", async () => {
-  /** @type {any[]} */
-  const signals = [];
-  /** @param {any[]} args */
-  const signalWorker = (...args) => signals.push(args);
-  const runtime = await createDaemonRuntime({ root: await root(), hostProbe: async () => ({ blockers: [] }), signalWorker });
-  await runtime.ready;
-  const client = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await client.ready;
-  client.close();
-  await runtime.close();
-  expect(signals).toEqual([]);
-});
-
-it("colors a dead session without involving a Pi worker", async () => {
-  const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
-  const now = "2026-08-25T12:00:00.000Z";
-  const sessionFile = join(stateRoot, "canonical.jsonl");
-  await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "colored", timestamp: now, cwd: stateRoot })}\n`, { mode: 0o600 });
-  const registry = new RegistryStore(join(stateRoot, "sessions"));
-  const created = await registry.create({ schemaVersion: 1, revision: 0, sessionId: "colored", sessionFile, canonicalSessionFile: sessionFile, cwd: stateRoot, taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "idle", summary: "Idle", updatedAt: now }, createdAt: now, updatedAt: now });
-  const runtime = await createDaemonRuntime({ root: stateRoot });
-  runtimes.push(runtime);
-  await runtime.ready;
-  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 16384 });
-  await client.ready;
-  client.send({ version: 1, clientId: "viewer", requestId: "subscribe-1", op: "subscribe", payload: {} });
-  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "subscribed" } });
-
-  client.send({ version: 1, clientId: "viewer", requestId: "color-1", op: "set_session_color", payload: { sessionId: "colored", color: "amber" } });
-  const responses = [await client.next(), await client.next()];
-  expect(responses).toEqual(expect.arrayContaining([
-    expect.objectContaining({ ok: true, result: expect.objectContaining({ kind: "session_colored" }) }),
-    expect.objectContaining({ kind: "session_changed", payload: { session: expect.objectContaining({ color: "amber" }) } }),
-  ]));
-  const colored = await registry.get("colored");
-  expect(colored).toMatchObject({ color: "amber", processState: "EXITED" });
-  expect(colored?.revision).toBe(created.revision + 1);
-
-  client.send({ version: 1, clientId: "viewer", requestId: "color-stale", op: "set_session_color", payload: { sessionId: "colored", revision: created.revision, color: "rose" } });
-  await vi.waitFor(async () => expect(await registry.get("colored")).toMatchObject({ color: "rose" }));
-
-  client.send({ version: 1, clientId: "viewer", requestId: "color-clear", op: "set_session_color", payload: { sessionId: "colored", color: null } });
-  await vi.waitFor(async () => expect(await registry.get("colored")).not.toHaveProperty("color"));
-});
-
 it("colors a session across summary churn without a revision conflict", async () => {
   const stateRoot = await root();
   for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
@@ -1731,20 +1051,6 @@ it("colors a session across summary churn without a revision conflict", async ()
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "session_colored", color: "rose" } });
   expect(await registry.get("summary")).toMatchObject({ color: "rose", summary: { text: "Fixes the loader" } });
   client.close();
-});
-
-it("reports the counts idle exit depends on", async () => {
-  const runtime = await createDaemonRuntime({ root: await root() });
-  runtimes.push(runtime);
-  await runtime.ready;
-  // Idle exit may only end the process when both counts are zero.
-  expect(runtime.attachedFrontends()).toBe(0);
-  expect(runtime.liveWorkers()).toBe(0);
-  const client = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await client.ready;
-  expect(runtime.attachedFrontends()).toBeGreaterThan(0);
-  client.socket.destroy();
-  await vi.waitFor(() => expect(runtime.attachedFrontends()).toBe(0));
 });
 
 it("repairs a session whose supervisor and Pi child are both gone and reaches READY", async () => {

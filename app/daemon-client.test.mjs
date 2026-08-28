@@ -246,4 +246,21 @@ describe("daemon client", () => {
     await expect(client.setSessionColor("", "amber")).rejects.toThrow(/sessionId/iu);
   });
 
+  it("reads the installed Pi's model catalog and keeps the daemon's own refusal code", async () => {
+    const socketPath = await socketPathIn("client-models-");
+    const models = [{ provider: "anthropic", id: "claude-opus-4", thinking: true }, { provider: "google", id: "gemini-3-flash", thinking: false }];
+    /** @type {any[]} */
+    const payloads = [];
+    await daemonServer(socketPath, ({ socket, request: incoming, reply }) => {
+      payloads.push({ op: incoming.op, payload: incoming.payload });
+      if (payloads.length === 1) reply({ kind: "models", models });
+      else socket.write(encodeJsonl({ version: 1, requestId: incoming.requestId, ok: false, error: { code: "MODEL_CATALOG_FAILED", message: "Listing Pi models exited 1", retryable: false } }));
+    });
+    const client = startClient({ socketPath, maxBytes: 8192 });
+    await expect(client.getModels()).resolves.toEqual(models);
+    await expect(client.getModels()).rejects.toMatchObject({ code: "MODEL_CATALOG_FAILED", message: "Listing Pi models exited 1" });
+    expect(payloads.map((entry) => entry.op)).toEqual(["get_models", "get_models"]);
+    expect(payloads[0].payload).toEqual({});
+  });
+
 });

@@ -855,6 +855,25 @@ describe("daemon dashboard backend", () => {
         expect(stateReads).toBe(2);
         unsubscribe();
     });
+    it("reads the model catalog through get_models and names a daemon that cannot list one", async () => {
+        const models = [{ provider: "anthropic", id: "claude-opus-4", thinking: true }];
+        const operations = [];
+        let refusals = 0;
+        const client = {
+            async connect() { },
+            async request(request) {
+                operations.push(request.op);
+                if (refusals++ > 0) return { version: 1, requestId: request.requestId, ok: false, error: { code: "MODEL_CATALOG_TIMEOUT", message: "Listing Pi models timed out", retryable: true } };
+                return { version: 1, requestId: request.requestId, ok: true, result: { kind: "models", models } };
+            },
+            subscribe() { return { async *[Symbol.asyncIterator]() { } }; },
+            async close() { },
+        };
+        const backend = createDaemonDashboardBackend({ client, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
+        await expect(backend.getModels()).resolves.toEqual(models);
+        await expect(backend.getModels()).rejects.toMatchObject({ code: "MODEL_CATALOG_TIMEOUT", message: "Listing Pi models timed out" });
+        expect(operations).toEqual(["get_models", "get_models"]);
+    });
     it("processes replay once, acknowledges only successful events, and resumes from the acknowledged cursor", async () => {
         const zero = { daemonEpoch: "epoch", sequence: "0" };
         const one = { daemonEpoch: "epoch", sequence: "1" };

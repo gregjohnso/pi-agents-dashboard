@@ -160,6 +160,15 @@ export function createDaemonDashboardBackend({ client, clientId, preflight, requ
             }
             return { kind: "rejected", error: { code: "INVALID_RESPONSE", message: "Daemon returned the wrong launch result" } };
         },
+        /** Every model the installed Pi will accept, for the launch composer's picker. */
+        async getModels() {
+            const response = await request("get_models", {});
+            if (!response.ok)
+                throw Object.assign(new Error(response.error.message), response.error);
+            if (response.result.kind !== "models")
+                throw Object.assign(new Error("Daemon returned the wrong model catalog result"), { code: "INVALID_RESPONSE" });
+            return response.result.models;
+        },
         async refreshSummaries() {
             const response = await request("refresh_summaries", {});
             if (!response.ok)

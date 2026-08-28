@@ -11,7 +11,7 @@ import { createDashboardLayout, renderColumnHeader, } from "./dashboard-layout.m
 import { jobwatchTheme } from "./dashboard-theme.mjs";
 import { displaySessionState } from "./session-state.mjs";
 import { StopClearGesture } from "./stop-clear-gesture.mjs";
-import { destructiveAction, createChoiceOverlay, createCommandMenuOverlay, createDeliveryUnknownOverlay, createHelpOverlay, createMetadataOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, describeOverlay, } from "./dashboard-overlays.mjs";
+import { destructiveAction, createChoiceOverlay, createCommandMenuOverlay, createDeliveryUnknownOverlay, createHelpOverlay, createMetadataOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, describeOverlay, filterChoiceOverlay, } from "./dashboard-overlays.mjs";
 import { draftChoices, parseListCommand } from "./list-commands.mjs";
 import { createLaunchDraft, prepareLaunchRequest, } from "./launch-composer.mjs";
 import { VirtualSessionList } from "./virtual-session-list.mjs";
@@ -602,13 +602,16 @@ export class DashboardController {
         if (overlay?.kind !== "choice")
             return;
         const value = overlay.values[overlay.index];
-        if (value !== undefined && overlay.field === "model") {
+        // A filter that matches nothing leaves the picker open, so the operator can correct it.
+        if (value === undefined)
+            return;
+        if (overlay.field === "model") {
             const separator = value.indexOf("/");
             this.composerDraft = { ...this.composerDraft, model: { provider: value.slice(0, separator), id: value.slice(separator + 1) } };
         }
-        else if (value !== undefined && overlay.field === "thinking")
+        else if (overlay.field === "thinking")
             this.composerDraft = { ...this.composerDraft, thinkingLevel: value };
-        else if (value !== undefined)
+        else
             this.composerDraft = { ...this.composerDraft, isolationMode: value };
         this.closeChoice();
         this.scheduleUiSave();
@@ -618,6 +621,14 @@ export class DashboardController {
         if (overlay?.kind !== "choice")
             return;
         this.overlay = { ...overlay, index: Math.max(0, Math.min(overlay.index + delta, overlay.values.length - 1)) };
+        this.requestRender?.();
+    }
+    /** Retype the open picker's filter. Pi's catalog is too long to reach any row with arrows alone. */
+    filterChoice(edit) {
+        const overlay = this.overlay;
+        if (overlay?.kind !== "choice")
+            return;
+        this.overlay = filterChoiceOverlay(overlay, edit(overlay.filter ?? ""));
         this.requestRender?.();
     }
     closeChoice() {
@@ -811,6 +822,17 @@ export class DashboardController {
                 this.moveChoice(-1);
             else if (matchesKey(data, Key.down))
                 this.moveChoice(1);
+            else if (matchesKey(data, Key.pageDown))
+                this.moveChoice(Math.max(1, this.listHeight() - 1));
+            else if (matchesKey(data, Key.pageUp))
+                this.moveChoice(-Math.max(1, this.listHeight() - 1));
+            else if (matchesKey(data, Key.backspace))
+                this.filterChoice((filter) => filter.slice(0, -1));
+            else {
+                const printable = this.printable(data);
+                if (printable !== undefined)
+                    this.filterChoice((filter) => filter + printable);
+            }
             return;
         }
         if (this.focus === "search") {
@@ -1218,9 +1240,13 @@ export class DashboardController {
     }
     /** Draw a completion list in the rows directly above the prompt, newest entry nearest the prompt. */
     renderInlineMenu(lines, overlay, layout) {
-        const described = describeOverlay(overlay, { confirmationText: this.confirmationText, choiceRows: Math.max(1, layout.listHeight) });
+        // Two rows short of the list area, leaving room for the count-and-filter header and the key hint.
+        const described = describeOverlay(overlay, { confirmationText: this.confirmationText, choiceRows: Math.max(1, layout.listHeight - 2) });
+        // A picker over Pi's whole catalog needs its own header: the prompt that opened it is cleared,
+        // so the count and the typed filter have nowhere else to appear.
+        const describedRows = overlay.kind === "choice" ? [{ text: described.title, emphasis: true }, ...described.rows] : described.rows;
         const dockTop = lines.length - layout.dockRows;
-        const rows = described.rows.slice(0, Math.max(0, Math.min(described.rows.length, dockTop - layout.listTop)));
+        const rows = describedRows.slice(0, Math.max(0, Math.min(describedRows.length, dockTop - layout.listTop)));
         const start = Math.max(layout.listTop, dockTop - rows.length);
         rows.forEach((row, index) => {
             const text = typeof row === "string" ? row : String(row.text ?? "");

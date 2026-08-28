@@ -16,8 +16,8 @@ import { sessionEventForPiEvent } from "../runtime/session-event-mapping.mjs";
 
 const WIDTH = 100;
 const HEIGHT = 20;
-// Header, filters, section border, column header, then the first session row.
-const FIRST_ROW = 4;
+// Title, context, five launch settings, section border, column header, then the first session row.
+const FIRST_ROW = 9;
 const FRAMES = new Set(Array.from({ length: 10 }, (_, index) => spinnerFrame(index * SPINNER_INTERVAL_MS)));
 
 /** @type {any[]} */

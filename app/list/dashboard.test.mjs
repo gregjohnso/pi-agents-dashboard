@@ -467,8 +467,8 @@ describe("dashboard controller", () => {
             const rendered = dashboard.render(120, 32).map(stripVTControlCharacters);
             expect(rendered.some((line) => line.includes(title))).toBe(true);
             expect(rendered.some((line) => line.includes(content))).toBe(true);
-            // A floating panel never swallows the composer dock at an ordinary size.
-            expect(rendered.at(-1)).toContain("cwd:");
+            // A floating panel never swallows the prompt at an ordinary size.
+            expect(rendered.some((line) => line.includes("describe a task") || line.includes("❯"))).toBe(true);
         });
     });
     it("closes and surfaces a typed malformed-frame state without signaling workers", async () => {

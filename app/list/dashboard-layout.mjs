@@ -70,8 +70,9 @@ function columnsForWidth(width) {
 export function createDashboardLayout(width, height) {
     const normalizedWidth = normalizedDimension(width);
     const normalizedHeight = normalizedDimension(height);
-    const listTop = Math.min(4, normalizedHeight);
-    // Border, prompt, closing rule, launch settings. A short terminal drops the rule for a list row.
+    // Title, context, five launch settings, section border, column header.
+    const listTop = Math.min(normalizedHeight >= 18 ? 9 : 4, normalizedHeight);
+    // Border, prompt, closing rule, status. A short terminal drops the rule for a list row.
     const dockRows = normalizedHeight >= 12 ? 4 : 3;
     return {
         width: normalizedWidth,

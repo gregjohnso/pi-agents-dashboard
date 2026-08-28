@@ -357,6 +357,17 @@ async function createViewerRecovery({ root, daemonEpoch, registry }) {
       await publish(state);
       return persisted;
     },
+    /**
+     * One session's normalized transcript and cursor, read from memory. Unlike snapshot it reads no
+     * canonical history and publishes no snapshot, so background work never puts a durable write on
+     * a request the operator is waiting behind.
+     * @param {string} sessionId
+     */
+    transcript(sessionId) {
+      const state = sessions.get(sessionId);
+      if (state === undefined) return undefined;
+      return { sequence: state.store.currentCursor().sequence, items: state.normalizer.transcriptItems() };
+    },
     /** @param {string} sessionId @param {"composer" | "observer"} [role] */
     async snapshot(sessionId, role = "observer") {
       const state = sessions.get(sessionId);

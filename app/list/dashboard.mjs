@@ -217,6 +217,9 @@ function cycleValue(values, current) {
  */
 /** Matches StopClearGesture's default window; the hint must vanish exactly when the gesture does. */
 const STOP_CLEAR_WINDOW_MS = 500;
+// Summaries are background work: entering or leaving a session must never queue behind one, so the
+// refresh waits until the list has been drawn and the operator's first keys have had the socket.
+const SUMMARY_REFRESH_DELAY_MS = 750;
 const CONTROLS = [
     { key: Key.ctrl("f"), segment: (dashboard) => `/search:${dashboard.query.search ?? ""}`, activate: (dashboard) => { dashboard.focus = "search"; } },
     { key: Key.ctrl("v"), segment: (dashboard) => `v:${dashboard.query.view}`, activate: (dashboard) => dashboard.cycleView() },
@@ -323,6 +326,7 @@ export class DashboardController {
     renderWaiters = new Map();
     stopClearGesture;
     animationTimer;
+    summaryRefreshTimer;
     /** Launches sent but not yet answered, shown as STARTING rows so a prompt never looks lost. */
     pendingLaunches = [];
     stopRetryLimit;
@@ -406,7 +410,7 @@ export class DashboardController {
             this.unsubscribe = unsubscribe;
             this.status = { kind: "ready" };
             this.requestRender?.();
-            this.refreshSummaries();
+            this.scheduleSummaryRefresh(generation);
         }
         catch (error) {
             if (!this.isCurrentOpen(generation))
@@ -1181,6 +1185,16 @@ export class DashboardController {
     printable(data) {
         return decodeKittyPrintable(data) ?? pastedText(data);
     }
+    /** Ask for summaries once the list is interactive, so open never waits on background work. */
+    scheduleSummaryRefresh(generation) {
+        clearTimeout(this.summaryRefreshTimer);
+        this.summaryRefreshTimer = setTimeout(() => {
+            this.summaryRefreshTimer = undefined;
+            if (this.isCurrentOpen(generation))
+                this.refreshSummaries();
+        }, SUMMARY_REFRESH_DELAY_MS);
+        this.summaryRefreshTimer.unref?.();
+    }
     /** Ask the daemon for opt-in Activity summaries; absence of a summary model is not an error. */
     refreshSummaries() {
         if (typeof this.backend.refreshSummaries !== "function")
@@ -1376,6 +1390,8 @@ export class DashboardController {
         if (this.closePromise !== undefined)
             return this.closePromise;
         this.stopAnimation();
+        clearTimeout(this.summaryRefreshTimer);
+        this.summaryRefreshTimer = undefined;
         this.closed = true;
         this.openGeneration += 1;
         this.saveAdmissionGeneration += 1;

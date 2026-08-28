@@ -106,14 +106,25 @@ describe("dashboard controller", () => {
         expect(dashboard.selectedSessionId).not.toBe("s-09999");
         expect(dashboard.render(80, 14).length).toBeLessThanOrEqual(14);
     });
-    it("asks the daemon to refresh Activity summaries on open and on demand", async () => {
+    it("asks the daemon to refresh Activity summaries after open, not on the path that returns to the list", async () => {
         const backend = new FakeBackend([session("a")]);
         backend.refreshSummaries = vi.fn(async () => ["a"]);
         const dashboard = controller(backend);
         await dashboard.open();
-        await vi.waitFor(() => expect(backend.refreshSummaries).toHaveBeenCalledTimes(1));
+        expect(dashboard.status).toEqual({ kind: "ready" });
+        expect(backend.refreshSummaries).not.toHaveBeenCalled();
+        await vi.waitFor(() => expect(backend.refreshSummaries).toHaveBeenCalledTimes(1), { timeout: 5_000 });
         dashboard.handleInput("\x12");
         await vi.waitFor(() => expect(backend.refreshSummaries).toHaveBeenCalledTimes(2));
+    });
+    it("drops a scheduled summary refresh when the list closes first", async () => {
+        const backend = new FakeBackend([session("a")]);
+        backend.refreshSummaries = vi.fn(async () => ["a"]);
+        const dashboard = controller(backend);
+        await dashboard.open();
+        await dashboard.close();
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+        expect(backend.refreshSummaries).not.toHaveBeenCalled();
     });
     it("opens without summaries when the daemon has none configured", async () => {
         const backend = new FakeBackend([session("a")]);

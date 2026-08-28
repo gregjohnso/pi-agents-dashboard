@@ -554,5 +554,10 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     };
   }
 
-  return { consumeHistory, consumeFrame, applyViewerEvent, restore, checkpoint, restoreCheckpoint, consumeError, snapshot };
+  /** The normalized transcript items alone, for a caller that must not publish a snapshot. */
+  function transcriptItems() {
+    return [...items.values()];
+  }
+
+  return { consumeHistory, consumeFrame, applyViewerEvent, restore, checkpoint, restoreCheckpoint, consumeError, snapshot, transcriptItems };
 }

@@ -1,7 +1,7 @@
 import net from "node:net";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, expect, it, vi } from "vitest";
@@ -411,6 +411,39 @@ it("summarizes sessions only after the opt-in model is chosen and reuses cached 
   client.send({ version: 1, clientId: "viewer", requestId: "refresh-cached", op: "refresh_summaries", payload: {} });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "summaries_refreshing", sessionIds: [] } });
   expect(summarized).toHaveLength(1);
+  client.close();
+});
+
+it("selects sessions to summarize without republishing a durable viewer snapshot", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const now = "2026-08-25T12:00:00.000Z";
+  const sessionFile = join(stateRoot, "canonical.jsonl");
+  await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "quiet", timestamp: now, cwd: stateRoot })}\n${JSON.stringify({ type: "message", id: "user-1", parentId: null, timestamp: now, message: { role: "user", content: "fix the loader" } })}\n`, { mode: 0o600 });
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "quiet", sessionFile, canonicalSessionFile: sessionFile, cwd: stateRoot, taskState: "READY", processState: "SLEEPING", outcome: "NONE", activity: { kind: "idle", summary: "Idle", updatedAt: now }, createdAt: now, updatedAt: now });
+  /** @type {(value?: unknown) => void} */
+  let releaseSummary = () => {};
+  const summaryGate = new Promise((resolve) => { releaseSummary = resolve; });
+  const runtime = await createDaemonRuntime({ root: stateRoot, summarizeSession: async () => { await summaryGate; return { text: "Fixes the loader" }; } });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 16384 });
+  await client.ready;
+  client.send({ version: 1, clientId: "viewer", requestId: "settings-quiet", op: "set_settings", payload: { summaryModel: { provider: "anthropic", id: "haiku" } } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "settings" } });
+
+  // Selection must stay a memory read: republishing one snapshot per session put a durable write per
+  // session on the request the frontend makes when it returns to the list.
+  const snapshotPath = join(stateRoot, "index", "viewer", `${createHash("sha256").update("quiet").digest("hex")}.snapshot.json`);
+  // atomicWriteJson renames a fresh temporary file into place, so a republish always changes the inode.
+  const before = await stat(snapshotPath);
+  client.send({ version: 1, clientId: "viewer", requestId: "refresh-quiet", op: "refresh_summaries", payload: {} });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "summaries_refreshing", sessionIds: ["quiet"] } });
+  expect((await stat(snapshotPath)).ino).toBe(before.ino);
+
+  releaseSummary();
+  await vi.waitFor(async () => expect((await registry.get("quiet"))?.summary).toMatchObject({ text: "Fixes the loader" }));
   client.close();
 });
 

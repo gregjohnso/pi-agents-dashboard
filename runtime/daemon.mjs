@@ -757,7 +757,11 @@ export async function createDaemonRuntime({
           await context.publishSession(updated);
         }, "record_model");
       },
-      /** Refresh opt-in Activity summaries for every session whose transcript advanced. */
+      /**
+       * Refresh opt-in Activity summaries for every session whose transcript advanced. Selection reads
+       * the normalized transcript from memory rather than republishing each session's snapshot, so a
+       * frontend returning to the list does not wait behind one durable write per session.
+       */
       async refreshSummaries() {
         const { summaryModel } = settingsStore.current();
         if (summaryModel === null || context.recovery?.viewer === undefined) return [];
@@ -766,12 +770,12 @@ export async function createDaemonRuntime({
         const refreshed = [];
         for (const record of await registry.list()) {
           if (summarizing.has(record.sessionId)) continue;
-          const snapshot = await context.recovery.viewer.snapshot(record.sessionId, "observer").catch(() => undefined);
-          if (snapshot === undefined) continue;
-          const sourceCursor = snapshot.cursor.sequence;
+          const normalized = context.recovery.viewer.transcript(record.sessionId);
+          if (normalized === undefined) continue;
+          const sourceCursor = normalized.sequence;
           const summary = record.summary;
           if (summary !== undefined && summary.sourceCursor === sourceCursor && summary.model.provider === summaryModel.provider && summary.model.id === summaryModel.id) continue;
-          const transcript = summarizePromptInput(snapshot.items);
+          const transcript = summarizePromptInput(normalized.items);
           if (transcript.length === 0) continue;
           refreshed.push(record.sessionId);
           summarizing.add(record.sessionId);
@@ -781,6 +785,10 @@ export async function createDaemonRuntime({
               const text = typeof written === "string" ? written : written?.text;
               const writtenName = typeof written === "string" ? undefined : written?.name;
               if (typeof text !== "string" || text.trim().length === 0) return;
+              // The write stays under the lifecycle lock. It is the last writer that could race Stop's
+              // signaling-boundary revision check or Delete's revision-guarded remove, and the lock is
+              // what keeps every revision-guarded update from racing another writer. The hold is one
+              // registry read plus one atomic write; the summarizer itself ran outside it.
               await runSessionLifecycle(registry, record.sessionId, async () => {
                 const current = await registry.get(record.sessionId);
                 if (current === undefined) return;

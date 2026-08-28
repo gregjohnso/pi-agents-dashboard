@@ -11,6 +11,9 @@ export function signalProcessGroup(pgid, signal) {
   process.kill(-pgid, signal);
 }
 
+/** How often a stop window is rechecked, so a process that exits early does not cost the whole window. */
+export const EXIT_POLL_INTERVAL_MS = 25;
+
 /** @param {number} ms */
 export async function sleep(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
@@ -52,6 +55,8 @@ function sameIdentity(actual, expected) {
 /**
  * Gracefully stop and escalate signals only while PID/start-time/PGID ownership stays exact.
  *
+ * Each stop window is polled rather than slept through, so escalation follows the observed exit;
+ * a process that keeps matching still gets the whole window before the next signal.
  * The timing policy is the validated `config.stop` object from shared/config.ts.
  *
  * @param {{ pid: number, processGroupId: number, startIdentity: string }} ownership
@@ -95,6 +100,19 @@ export async function stopVerifiedProcessGroup(ownership, deps, policy) {
     }
   };
 
+  /** @param {number} windowMs */
+  const awaitBoundary = async (windowMs) => {
+    let remaining = windowMs;
+    let observed = "MATCH";
+    while (remaining > 0 && observed === "MATCH") {
+      const interval = Math.min(EXIT_POLL_INTERVAL_MS, remaining);
+      await deps.sleep(interval);
+      remaining -= interval;
+      observed = await inspect();
+    }
+    return observed;
+  };
+
   const initial = await inspect();
   if (initial !== "MATCH") {
     return { disposition: initial === "EXITED" ? "ALREADY_EXITED" : initial };
@@ -110,9 +128,8 @@ export async function stopVerifiedProcessGroup(ownership, deps, policy) {
     return { disposition: "CANCELLED" };
   }
   await deps.requestGraceful(ownership);
-  await deps.sleep(gracefulMs);
 
-  const terminateBoundary = await inspect();
+  const terminateBoundary = await awaitBoundary(gracefulMs);
   if (terminateBoundary !== "MATCH") {
     return {
       disposition: terminateBoundary === "EXITED" ? "GRACEFUL" : terminateBoundary,
@@ -122,9 +139,8 @@ export async function stopVerifiedProcessGroup(ownership, deps, policy) {
     return { disposition: "CANCELLED" };
   }
   await deps.signalProcessGroup(ownership.processGroupId, "SIGTERM");
-  await deps.sleep(terminateMs);
 
-  const killBoundary = await inspect();
+  const killBoundary = await awaitBoundary(terminateMs);
   if (killBoundary !== "MATCH") {
     return killBoundary === "EXITED"
       ? { disposition: "TERMINATED" }

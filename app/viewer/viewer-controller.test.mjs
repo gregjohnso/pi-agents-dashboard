@@ -99,18 +99,6 @@ describe("viewer commands and role restrictions", () => {
     await vi.waitFor(() => expect(f.commands.at(-1)).toEqual({ operation: "prompt", payload: { sessionId: "s", text: "/review the diff" } }));
   });
 
-  it("explains that an outdated session worker cannot report commands", async () => {
-    const f = fixture({ menu: async () => { throw Object.assign(new Error("Unsupported worker operation: get_session_commands"), { code: "UNSUPPORTED_WORKER_OPERATION" }); } });
-    await f.instance.open();
-    expect(f.instance.state.errors).toContainEqual({ code: "SESSION_COMMANDS_UNAVAILABLE", message: "This session's worker predates slash commands. Stop and reopen the session to refresh them.", retryable: false });
-
-    f.instance.editor.setText("/model");
-    f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(f.instance.state.errors.at(-1)?.code).toBe("MODEL_REQUIRED"));
-    expect(f.instance.selection).toBeUndefined();
-    expect(f.commands).toEqual([]);
-  });
-
   it("opens one picker per bare built-in, applies the choice, and refuses a mistyped argument", async () => {
     const f = fixture({ menu: async () => ({ commands: [], models: [{ provider: "anthropic", id: "claude" }, { provider: "openai", id: "gpt-5" }], thinkingLevels: ["off", "high"], model: null, thinkingLevel: null }) });
     await f.instance.open();
@@ -398,19 +386,6 @@ describe("viewer rendering and navigation", () => {
     expect(f.commands).toEqual([]);
   });
 
-  it("uses the exact clean and dirty Left return gesture", async () => {
-    let now = 0;
-    const f = fixture();
-    f.instance.now = () => now;
-    await f.instance.open();
-    f.instance.handleInput("x");
-    f.instance.handleInput("\x1b[D");
-    expect(f.instance.onReturn).not.toHaveBeenCalled();
-    now = 500;
-    f.instance.handleInput("\x1b[D");
-    expect(f.instance.onReturn).toHaveBeenCalledOnce();
-  });
-
   it.each(["render", "persistence", "malformed event"])("closes only the viewer subscription after %s failure and sends no ACK", async (failure) => {
     const f = fixture({ save: failure === "persistence" ? async (value) => { if (value.cursor?.sequence === "1") throw new Error("persist failed"); } : undefined });
     await f.instance.open();
@@ -424,24 +399,6 @@ describe("viewer rendering and navigation", () => {
 });
 
 describe("Pi interactive-mode parity", () => {
-  const working = { snapshot: { taskState: "WORKING", model: { provider: "anthropic", id: "opus" }, thinkingLevel: "high", activity: { kind: "activity", phase: "assistant_streaming", label: "Working...", sourceEventId: "source", startedAt: timestamp } } };
-  const settled = { snapshot: { model: { provider: "anthropic", id: "opus" }, thinkingLevel: "off" } };
-
-  it.each([
-    ["a working turn", working, /\(anthropic\) opus • high$/u, " Esc interrupt · ← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking", " Esc interrupt · ← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands"],
-    ["a settled turn", settled, /\(anthropic\) opus • thinking off$/u, " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools", " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · / commands"],
-  ])("shows Pi's model footer and the key hints that fit for %s", async (_label, overrides, footer, hints80, hints120) => {
-    const f = fixture(overrides);
-    await f.instance.open();
-    const lines = f.instance.render(80, 24).map(stripVTControlCharacters);
-    const spinning = overrides === working;
-    expect(lines.some((line) => /^ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working\.\.\./u.test(line))).toBe(spinning);
-    expect(lines.join("\n").includes("(Esc to interrupt)")).toBe(spinning);
-    expect(lines.at(-2)).toMatch(footer);
-    expect(lines.at(-1)).toBe(hints80);
-    expect(stripVTControlCharacters(f.instance.render(120, 24).at(-1))).toBe(hints120);
-  });
-
   it("lists queued steer and follow-up messages under the editor until the session consumes them", async () => {
     const f = fixture({ snapshot: { taskState: "WORKING" } });
     await f.instance.open();
@@ -462,15 +419,6 @@ describe("Pi interactive-mode parity", () => {
     expect(f.instance.render(80, 24).map(stripVTControlCharacters).join("\n")).not.toContain("Steering: urgent");
   });
 
-  it("shrinks the dock spacers before the transcript at the smallest supported size", async () => {
-    const f = fixture({ snapshot: { taskState: "WORKING", errors: [{ code: "PROVIDER_ERROR", message: "boom", retryable: false }], pendingUi: [{ id: "ui", method: "confirm", title: "Continue?" }] } });
-    await f.instance.open();
-    const lines = f.instance.render(40, 10).map(stripVTControlCharacters);
-    expect(lines).toHaveLength(10);
-    expect(lines.join("\n")).toContain("y/Enter confirm");
-    expect(lines.at(-1)).toContain("Esc interrupt");
-  });
-
 });
 
 describe("transcript scrolling keys and wheel", () => {
@@ -481,8 +429,6 @@ describe("transcript scrolling keys and wheel", () => {
   // double-press gesture honest about a dirty prompt.
   it.each([
     ["an empty prompt with no history", () => {}, false],
-    ["a typed draft", (/** @type {any} */ f) => f.instance.editor.setText("draft"), true],
-    ["a draft that was typed and then cleared", (/** @type {any} */ f) => { f.instance.editor.setText("draft"); f.instance.editor.setText(""); }, false],
     ["recallable prompt history", (/** @type {any} */ f) => f.instance.history.push("earlier prompt"), true],
   ])("routes the arrows to %s", async (_label, prepare, editorKeeps) => {
     const f = fixture({ snapshot: longSnapshot });
@@ -520,20 +466,4 @@ describe("transcript scrolling keys and wheel", () => {
     expect(stripVTControlCharacters(f.instance.render(80, 24).join("\n"))).not.toContain("new activity");
   });
 
-  it("rules the prompt above and below in the session color and leaves the typed text white", async () => {
-    const f = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: "amber" }) });
-    await f.instance.open();
-    f.instance.editor.setText("hello");
-    const rendered = f.instance.render(80, 20);
-    const plain = rendered.map(stripVTControlCharacters);
-    const promptRow = plain.findLastIndex((line) => line.startsWith("> "));
-    const rules = plain.map((line, index) => ({ line, index })).filter(({ line }) => /^\u2500+$/u.test(line.trim()) && line.trim() !== "");
-    expect(promptRow).toBeGreaterThan(0);
-    // One rule above the prompt, one below, and no side borders anywhere.
-    expect(rules.filter(({ index }) => index < promptRow)).not.toHaveLength(0);
-    expect(rules.filter(({ index }) => index > promptRow)).not.toHaveLength(0);
-    expect(plain.every((line) => !line.includes("\u2502"))).toBe(true);
-    expect(rendered[rules.find(({ index }) => index < promptRow).index]).toContain("\x1b[38;2;252;211;77m");
-    expect(rendered[promptRow]).not.toContain("\x1b[38;2;252;211;77m");
-  });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createSessionConfirmation, describeOverlay, } from "./dashboard-overlays.mjs";
+import { createChoiceOverlay, createCommandMenuOverlay, createSessionConfirmation, describeOverlay, } from "./dashboard-overlays.mjs";
 const session = {
     schemaVersion: 1,
     revision: 2,
@@ -40,5 +40,25 @@ describe("dashboard overlays", () => {
         // Clearing a session the operator just stopped reads differently from an unprompted Delete.
         expect(describeOverlay({ ...exited, clearingStopped: true }).title).toBe("Clear stopped session");
         expect(describeOverlay(exited).title).toBe("Confirm DELETE");
+    });
+    it("describes the command menu with its highlight, argument hints, and no match", () => {
+        const described = describeOverlay(createCommandMenuOverlay("/", 1));
+        expect(described.title).toBe("Commands");
+        expect(described.rows[0].text.startsWith("❯")).toBe(false);
+        expect(described.rows[1].text).toContain("❯");
+        expect(described.rows[1].text).toContain("/thinking [level]");
+        expect(describeOverlay(createCommandMenuOverlay("/zz", 0)).rows[0].text).toContain("/model");
+    });
+    it("windows a long picker around the selected value and counts it in the title", () => {
+        const values = Array.from({ length: 20 }, (_, index) => `provider/model-${index}`);
+        const described = describeOverlay(createChoiceOverlay("model", "Model", values, "provider/model-15"), { choiceRows: 5 });
+        expect(described.title).toBe("Model 16/20");
+        expect(described.rows).toHaveLength(6);
+        expect(described.rows.some((row) => row.text.includes("❯ provider/model-15"))).toBe(true);
+        expect(described.rows.at(-1)).toMatchObject({ emphasis: true });
+    });
+    it("starts a picker on the current value, or on the first when it is unset", () => {
+        expect(createChoiceOverlay("isolation", "Isolation", ["worktree", "shared_directory"], "shared_directory")).toMatchObject({ kind: "choice", field: "isolation", index: 1 });
+        expect(createChoiceOverlay("thinking", "Thinking", ["high", "off"], "").index).toBe(0);
     });
 });

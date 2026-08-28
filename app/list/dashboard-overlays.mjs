@@ -1,3 +1,8 @@
+import { LIST_COMMANDS, matchingListCommands } from "./list-commands.mjs";
+
+const DEFAULT_CHOICE_ROWS = 8;
+const CHOICE_KEYS = "↑↓ choose · Enter apply · Esc cancel";
+
 /** Describe one selected session without collapsing independent state fields. */
 export function createMetadataOverlay(session) {
     return {
@@ -14,6 +19,26 @@ export function createMetadataOverlay(session) {
         },
     };
 }
+/**
+ * Offer the commands a partly typed slash prompt still admits. The menu is derived from the
+ * prompt on every render, so it holds no state beyond which row is highlighted.
+ * @param {string} text @param {number} index
+ */
+export function createCommandMenuOverlay(text, index) {
+    const commands = matchingListCommands(text);
+    return { kind: "command_menu", commands, index: commands.length === 0 ? 0 : Math.max(0, Math.min(index, commands.length - 1)) };
+}
+
+/** Offer one bounded list of exact values for a launch field, starting on the current one. @param {string} field @param {string} title @param {string[]} values @param {string} current */
+export function createChoiceOverlay(field, title, values, current) {
+    return { kind: "choice", field, title, values: [...values], index: Math.max(0, values.indexOf(current)) };
+}
+
+/** Keep the highlighted row inside a panel that shows at most `maxRows` of them. @param {number} index @param {number} length @param {number} maxRows */
+function windowStart(index, length, maxRows) {
+    return Math.max(0, Math.min(index - Math.floor(maxRows / 2), length - maxRows));
+}
+
 /** Return the dashboard-only keyboard reference. */
 export function createHelpOverlay() {
     return {
@@ -29,6 +54,8 @@ export function createHelpOverlay() {
             { keys: "Ctrl+O / Ctrl+A / Ctrl+J", action: "cycle outcome, activity, project filters" },
             { keys: "Ctrl+S / Ctrl+B / Ctrl+L", action: "cycle sort, grouping; clear filters" },
             { keys: "Ctrl+R / Ctrl+E", action: "refresh activity summaries; show session metadata" },
+            { keys: "/model /thinking", action: "set the next session's model and thinking level" },
+            { keys: "/cwd /isolation /name", action: "set its directory, isolation, and name" },
             { keys: "? / Ctrl+G", action: "this help" },
             { keys: "Ctrl+C", action: "quit" },
         ],
@@ -74,6 +101,26 @@ export function createSessionConfirmation(session) {
  * `emphasis` marks rows the panel renders as muted guidance rather than data.
  */
 export function describeOverlay(overlay, options = {}) {
+    if (overlay.kind === "command_menu") {
+        if (overlay.commands.length === 0) return { title: "Commands", rows: [{ text: `Known: ${LIST_COMMANDS.join(" ")}`, emphasis: true }] };
+        const signatures = overlay.commands.map((command) => `${command.name} ${command.argumentHint}`.trim());
+        const signatureWidth = Math.max(...signatures.map((signature) => signature.length));
+        return {
+            title: "Commands",
+            rows: overlay.commands.map((command, index) => ({ text: `${index === overlay.index ? "❯" : " "} ${signatures[index].padEnd(signatureWidth)}  ${command.summary}` })),
+        };
+    }
+    if (overlay.kind === "choice") {
+        const maxRows = Math.max(1, options.choiceRows ?? DEFAULT_CHOICE_ROWS);
+        const start = windowStart(overlay.index, overlay.values.length, maxRows);
+        return {
+            title: `${overlay.title} ${overlay.index + 1}/${overlay.values.length}`,
+            rows: [
+                ...overlay.values.slice(start, start + maxRows).map((value, offset) => ({ text: `${start + offset === overlay.index ? "❯" : " "} ${value}` })),
+                { text: CHOICE_KEYS, emphasis: true },
+            ],
+        };
+    }
     if (overlay.kind === "help") {
         const keyWidth = Math.max(...overlay.bindings.map((binding) => binding.keys.length));
         return {

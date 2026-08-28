@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { stat } from "node:fs/promises";
 import { stripVTControlCharacters } from "node:util";
 
 import { decodeKittyPrintable, Key, matchesKey, truncateToWidth, visibleWidth, } from "@earendil-works/pi-tui";
@@ -10,9 +11,19 @@ import { createDashboardLayout, renderColumnHeader, } from "./dashboard-layout.m
 import { jobwatchTheme } from "./dashboard-theme.mjs";
 import { displaySessionState } from "./session-state.mjs";
 import { StopClearGesture } from "./stop-clear-gesture.mjs";
-import { destructiveAction, createDeliveryUnknownOverlay, createHelpOverlay, createMetadataOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, describeOverlay, } from "./dashboard-overlays.mjs";
+import { destructiveAction, createChoiceOverlay, createCommandMenuOverlay, createDeliveryUnknownOverlay, createHelpOverlay, createMetadataOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, describeOverlay, } from "./dashboard-overlays.mjs";
+import { draftChoices, parseListCommand } from "./list-commands.mjs";
 import { createLaunchDraft, prepareLaunchRequest, } from "./launch-composer.mjs";
 import { VirtualSessionList } from "./virtual-session-list.mjs";
+/** A path the operator may launch into: it must exist now and be a directory. @param {string} path */
+async function existingDirectory(path) {
+    try {
+        return (await stat(path)).isDirectory();
+    }
+    catch {
+        return false;
+    }
+}
 function cursorAfter(left, right) {
     if (left === undefined || left.daemonEpoch !== right.daemonEpoch)
         return true;
@@ -311,6 +322,11 @@ export class DashboardController {
     focus = "list";
     composerField = "prompt";
     composerDraft;
+    launchDefaults;
+    isDirectory;
+    /** Which command the slash menu highlights, and whether Escape has closed it for this text. */
+    commandMenuIndex = 0;
+    commandMenuClosed = false;
     overlay;
     status = { kind: "loading" };
     constructor(options) {
@@ -328,6 +344,8 @@ export class DashboardController {
         this.now = options.now ?? Date.now;
         this.stopRetryLimit = options.stopRetryLimit ?? 8;
         this.stopClearGesture = new StopClearGesture({ now: options.now });
+        this.launchDefaults = options.launchDefaults ?? {};
+        this.isDirectory = options.isDirectory ?? existingDirectory;
         this.composerDraft = createLaunchDraft({
             ...options.launchDefaults,
             sourceSessionId: options.sourceSessionId,
@@ -455,17 +473,132 @@ export class DashboardController {
     }
     setComposerPrompt(prompt) {
         this.composerDraft = { ...this.composerDraft, prompt };
+        // Every edit reopens the slash menu: a closed menu belongs to the text the operator escaped from.
+        this.commandMenuClosed = false;
+        if (!prompt.trim().startsWith("/"))
+            this.commandMenuIndex = 0;
         this.scheduleUiSave();
     }
     setIsolationMode(isolationMode) {
         this.composerDraft = { ...this.composerDraft, isolationMode };
         this.scheduleUiSave();
     }
+    /** The commands a slash prompt still admits, or undefined when the operator is not typing one. */
+    commandMenuOverlay() {
+        const prompt = this.composerDraft.prompt.trim();
+        if (this.focus !== "list" || this.commandMenuClosed || !prompt.startsWith("/"))
+            return undefined;
+        return createCommandMenuOverlay(prompt, this.commandMenuIndex);
+    }
+    moveCommandMenu(delta) {
+        const menu = this.commandMenuOverlay();
+        if (menu === undefined || menu.commands.length === 0)
+            return;
+        this.commandMenuIndex = Math.max(0, Math.min(menu.index + delta, menu.commands.length - 1));
+        this.requestRender?.();
+    }
+    /** The model and thinking values this frontend can name without asking the daemon or a worker. */
+    draftChoices() {
+        return draftChoices(this.composerDraft, this.sessions, this.launchDefaults);
+    }
+    /**
+     * Run one slash prompt as a dashboard command. It configures the next launch and never reaches
+     * a session; a refusal keeps the text so the operator can correct it in place.
+     */
+    async runListCommand() {
+        const menu = this.commandMenuOverlay();
+        const highlighted = menu?.commands[menu.index];
+        const typed = this.composerDraft.prompt.trim();
+        // A bare name the menu has narrowed to one command runs that command, so /mo means /model.
+        const text = highlighted !== undefined && !/\s/u.test(typed) ? highlighted.name : typed;
+        const choices = this.draftChoices();
+        const parsed = parseListCommand(text, choices);
+        if (parsed.kind === "rejected") {
+            this.status = { kind: "error", code: parsed.code, message: parsed.message };
+            this.requestRender?.();
+            return;
+        }
+        if (parsed.kind === "set_cwd" && !(await this.isDirectory(parsed.path))) {
+            this.status = { kind: "error", code: "CWD_NOT_A_DIRECTORY", message: `Not a directory: ${parsed.path}` };
+            this.requestRender?.();
+            return;
+        }
+        switch (parsed.kind) {
+            case "set_model":
+                this.composerDraft = { ...this.composerDraft, model: { ...parsed.model } };
+                break;
+            case "set_thinking":
+                this.composerDraft = { ...this.composerDraft, thinkingLevel: parsed.level };
+                break;
+            case "set_cwd":
+                this.composerDraft = { ...this.composerDraft, cwd: parsed.path };
+                break;
+            case "set_isolation":
+                this.composerDraft = { ...this.composerDraft, isolationMode: parsed.isolationMode };
+                break;
+            case "set_name":
+                this.composerDraft = { ...this.composerDraft, name: parsed.name };
+                break;
+            case "pick_model":
+                this.overlay = createChoiceOverlay("model", "Model", choices.models, `${this.composerDraft.model.provider}/${this.composerDraft.model.id}`);
+                this.focus = "choice";
+                break;
+            case "pick_thinking":
+                this.overlay = createChoiceOverlay("thinking", "Thinking", choices.thinkingLevels, this.composerDraft.thinkingLevel);
+                this.focus = "choice";
+                break;
+            case "pick_isolation":
+                this.overlay = createChoiceOverlay("isolation", "Isolation", ["worktree", "shared_directory"], this.composerDraft.isolationMode);
+                this.focus = "choice";
+                break;
+            case "help":
+                this.overlay = createHelpOverlay();
+                break;
+            case "not_a_command":
+                return;
+        }
+        this.setComposerPrompt("");
+        if (this.status.kind === "error")
+            this.status = { kind: "ready" };
+        this.requestRender?.();
+    }
+    /** Apply the highlighted value of an open picker to the draft. */
+    applyChoice() {
+        const overlay = this.overlay;
+        if (overlay?.kind !== "choice")
+            return;
+        const value = overlay.values[overlay.index];
+        if (value !== undefined && overlay.field === "model") {
+            const separator = value.indexOf("/");
+            this.composerDraft = { ...this.composerDraft, model: { provider: value.slice(0, separator), id: value.slice(separator + 1) } };
+        }
+        else if (value !== undefined && overlay.field === "thinking")
+            this.composerDraft = { ...this.composerDraft, thinkingLevel: value };
+        else if (value !== undefined)
+            this.composerDraft = { ...this.composerDraft, isolationMode: value };
+        this.closeChoice();
+        this.scheduleUiSave();
+    }
+    moveChoice(delta) {
+        const overlay = this.overlay;
+        if (overlay?.kind !== "choice")
+            return;
+        this.overlay = { ...overlay, index: Math.max(0, Math.min(overlay.index + delta, overlay.values.length - 1)) };
+        this.requestRender?.();
+    }
+    closeChoice() {
+        this.overlay = undefined;
+        this.focus = "list";
+        this.requestRender?.();
+    }
     async submitComposer() {
         const submitted = { ...this.composerDraft, model: { ...this.composerDraft.model } };
         const prompt = submitted.prompt;
         if (prompt.trim().length === 0)
             return;
+        // A slash prompt configures the next launch. It never starts a session, mistyped or not.
+        if (prompt.trim().startsWith("/"))
+            return this.runListCommand();
         // Clear the draft on the keystroke that sent it: a prompt still sitting in the box invites a
         // second Enter, which launches the same work twice while the daemon is still starting the first.
         this.composerDraft = { ...this.composerDraft, prompt: "" };
@@ -635,6 +768,17 @@ export class DashboardController {
                 this.confirmationText += printable;
             return;
         }
+        if (this.focus === "choice") {
+            if (matchesKey(data, Key.escape))
+                this.closeChoice();
+            else if (matchesKey(data, Key.enter))
+                this.applyChoice();
+            else if (matchesKey(data, Key.up))
+                this.moveChoice(-1);
+            else if (matchesKey(data, Key.down))
+                this.moveChoice(1);
+            return;
+        }
         if (this.focus === "search") {
             if (matchesKey(data, Key.enter) || matchesKey(data, Key.escape)) {
                 this.focus = "list";
@@ -665,7 +809,19 @@ export class DashboardController {
             this.editComposerField((value) => value.slice(0, -1));
             return;
         }
-        if (matchesKey(data, Key.escape) || matchesKey(data, Key.left)) return;
+        // Escape closes the slash menu without touching the text, so a mistyped command stays editable.
+        if (matchesKey(data, Key.escape)) {
+            if (this.commandMenuOverlay() !== undefined) {
+                this.commandMenuClosed = true;
+                this.requestRender?.();
+            }
+            return;
+        }
+        if (matchesKey(data, Key.left)) return;
+        if ((matchesKey(data, Key.up) || matchesKey(data, Key.down)) && this.commandMenuOverlay() !== undefined) {
+            this.moveCommandMenu(matchesKey(data, Key.up) ? -1 : 1);
+            return;
+        }
         if (matchesKey(data, Key.ctrl("x"))) {
             this.pressStopClear();
             return;
@@ -930,8 +1086,8 @@ export class DashboardController {
     editComposerField(edit) {
         switch (this.composerField) {
             case "prompt":
-                this.composerDraft = { ...this.composerDraft, prompt: edit(this.composerDraft.prompt) };
-                break;
+                this.setComposerPrompt(edit(this.composerDraft.prompt));
+                return;
             case "cwd":
                 this.composerDraft = { ...this.composerDraft, cwd: edit(this.composerDraft.cwd) };
                 break;
@@ -993,11 +1149,11 @@ export class DashboardController {
         this.status = { kind: "error", code: outcome.error.code, message: outcome.error.message };
     }
     renderOverlay(lines) {
-        const overlay = this.overlay;
+        const overlay = this.overlay ?? this.commandMenuOverlay();
         if (overlay === undefined || lines.length === 0)
             return;
-        const described = describeOverlay(overlay, { confirmationText: this.confirmationText });
         const layout = createDashboardLayout(this.width, this.height);
+        const described = describeOverlay(overlay, { confirmationText: this.confirmationText, choiceRows: Math.max(1, layout.listHeight - 2) });
         const areaTop = Math.min(layout.listTop, Math.max(0, lines.length - 1));
         // A short terminal leaves no list rows; the panel then borrows the space below it rather than covering the header.
         const areaHeight = Math.max(1, Math.min(Math.max(layout.listHeight, described.rows.length + 2), Math.max(1, lines.length - areaTop)));

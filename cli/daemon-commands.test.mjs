@@ -1,4 +1,6 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { EventEmitter } from "node:events";
+import { writeSync } from "node:fs";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -34,6 +36,44 @@ it("waits through transient unhealthy startup until the daemon is ready", async 
     spawnDaemon: () => ({ once() {} }),
   });
   expect(result).toMatchObject({ code: 0, result: { kind: "daemon_started", alreadyRunning: false } });
+});
+
+it.each([
+  ["exits", 1, /exited with code 1/u],
+  ["never becomes healthy", undefined, /startup deadline/u],
+])("reports the failing daemon child's own error output when it %s", async (_label, exitCode, summary) => {
+  const root = await stateRoot();
+  const result = await runDaemonCommand("start", {
+    root,
+    timeoutMs: 100,
+    inspectEndpoint: async () => ({ status: "ABSENT" }),
+    spawnDaemon: (_file, _argv, _env, stderr) => {
+      writeSync(stderr, "DashboardConfigError: dashboard.json is invalid\n");
+      const child = new EventEmitter();
+      if (exitCode !== undefined) setTimeout(() => child.emit("exit", exitCode), 5);
+      return child;
+    },
+  });
+  expect(result.code).toBe(1);
+  expect(result.error.code).toBe("DAEMON_START_FAILED");
+  expect(result.error.message).toMatch(summary);
+  expect(result.error.message).toContain("DashboardConfigError: dashboard.json is invalid");
+  expect(await readFile(join(root, "daemon", "startup.log"), "utf8")).toContain("DashboardConfigError");
+});
+
+it("reports a daemon child that could not be spawned at all", async () => {
+  const root = await stateRoot();
+  const result = await runDaemonCommand("start", {
+    root,
+    timeoutMs: 5_000,
+    inspectEndpoint: async () => ({ status: "ABSENT" }),
+    spawnDaemon: () => {
+      const child = new EventEmitter();
+      setTimeout(() => child.emit("error", Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" })), 5);
+      return child;
+    },
+  });
+  expect(result).toMatchObject({ code: 1, error: { code: "DAEMON_START_FAILED", message: expect.stringContaining("spawn ENOENT") } });
 });
 
 it("stops only through the verified daemon process-group boundary", async () => {

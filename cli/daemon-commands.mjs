@@ -1,6 +1,7 @@
 import net from "node:net";
+import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
-import { readFile, realpath } from "node:fs/promises";
+import { mkdir, open, readFile, realpath } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,6 +15,8 @@ export { resolveRuntimeRoot };
 
 const STATUS_CODES = { HEALTHY: 0, UNHEALTHY: 1, STALE: 1, ABSENT: 3, CONFLICT: 5 };
 const DEFAULT_STOP_POLICY = Object.freeze({ gracefulMs: 500, terminateMs: 500 });
+const STARTUP_LOG_MAX_BYTES = 1024 * 1024;
+const STARTUP_REPORT_BYTES = 4 * 1024;
 
 export async function daemonEntryPoint() {
   return realpath(resolve(dirname(fileURLToPath(import.meta.url)), "../runtime/daemon.mjs"));
@@ -65,19 +68,53 @@ async function requestDaemonStop(publication, { timeoutMs = 500 } = {}) {
   });
 }
 
-function spawnDaemon(file, argv, env) {
-  const child = spawn(process.execPath, [file, ...argv], { detached: true, shell: false, stdio: "ignore", env });
+/** @param {string} file @param {string[]} argv @param {NodeJS.ProcessEnv} env @param {number | "ignore"} stderr */
+function spawnDaemon(file, argv, env, stderr) {
+  const child = spawn(process.execPath, [file, ...argv], { detached: true, shell: false, stdio: ["ignore", "ignore", stderr], env });
   child.unref();
   return child;
+}
+
+/** Open the private log that keeps a failing daemon child's stderr instead of discarding it. @param {string} root */
+async function openStartupLog(root) {
+  try {
+    const directory = join(root, "daemon");
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const path = join(directory, "startup.log");
+    const handle = await open(path, "a+", 0o600);
+    await handle.chmod(0o600);
+    const { size } = await handle.stat();
+    if (size <= STARTUP_LOG_MAX_BYTES) return { path, handle, offset: size };
+    await handle.truncate(0);
+    return { path, handle, offset: 0 };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Read back only what this start attempt's child wrote. @param {{ path: string, handle: any, offset: number } | undefined} capture */
+async function readStartupOutput(capture) {
+  if (capture === undefined) return "";
+  try {
+    const { size } = await capture.handle.stat();
+    const start = Math.max(capture.offset, size - STARTUP_REPORT_BYTES);
+    if (size <= start) return "";
+    const { bytesRead, buffer } = await capture.handle.read(Buffer.alloc(size - start), 0, size - start, start);
+    return buffer.subarray(0, bytesRead).toString("utf8").trim();
+  } catch {
+    return "";
+  }
 }
 
 async function waitForStatus(root, desired, options) {
   const deadline = Date.now() + (options.timeoutMs ?? 15_000);
   let endpoint;
-  let childExitCode;
-  options.child?.once?.("exit", (/** @type {number | null} */ code) => { childExitCode = code; });
+  /** @type {any} */
+  let childFailure;
+  options.child?.once?.("exit", (/** @type {number | null} */ code) => { childFailure ??= { status: "PROCESS_EXITED", exitCode: code }; });
+  options.child?.once?.("error", (/** @type {unknown} */ error) => { childFailure ??= { status: "PROCESS_FAILED", error }; });
   while (Date.now() < deadline) {
-    if (childExitCode !== undefined) return { status: "PROCESS_EXITED", exitCode: childExitCode };
+    if (childFailure !== undefined) return childFailure;
     endpoint = await options.inspectEndpoint({ root, inspect: options.inspect, probe: options.probe });
     if (desired.includes(endpoint.status) && (!options.requireReady || endpoint.status !== "HEALTHY" || endpoint.daemonState === "READY" || endpoint.daemonState === undefined)) return endpoint;
     await new Promise((resolveWait) => setTimeout(resolveWait, 25));
@@ -103,12 +140,23 @@ export async function runDaemonCommand(command, options = {}) {
     const entry = await daemonEntryPoint();
     const argv = ["--root", root];
     if (options.piBin !== undefined) argv.push("--pi-bin", options.piBin);
-    const child = (options.spawnDaemon ?? spawnDaemon)(entry, argv, options.env ?? process.env);
-    child.once?.("error", () => {});
-    const endpoint = await waitForStatus(root, ["HEALTHY", "CONFLICT"], { ...options, inspect, probe, inspectEndpoint, requireReady: true, child });
-    if (endpoint?.status === "HEALTHY") return { code: 0, result: { kind: "daemon_started", alreadyRunning: false, root, publication: endpoint.publication } };
-    const ownershipConflict = endpoint?.status === "CONFLICT" || (endpoint?.status === "PROCESS_EXITED" && endpoint.exitCode === 5);
-    return { code: ownershipConflict ? 5 : 1, error: { code: ownershipConflict ? "DAEMON_RECOVERY_CONFLICT" : "DAEMON_START_FAILED", message: ownershipConflict ? "Daemon recovery found an ownership conflict" : "Daemon did not become healthy before the startup deadline" } };
+    const capture = await openStartupLog(root);
+    try {
+      const child = (options.spawnDaemon ?? spawnDaemon)(entry, argv, options.env ?? process.env, capture?.handle.fd ?? "ignore");
+      child.once?.("error", () => {});
+      const endpoint = await waitForStatus(root, ["HEALTHY", "CONFLICT"], { ...options, inspect, probe, inspectEndpoint, requireReady: true, child });
+      if (endpoint?.status === "HEALTHY") return { code: 0, result: { kind: "daemon_started", alreadyRunning: false, root, publication: endpoint.publication } };
+      if (endpoint?.status === "CONFLICT" || (endpoint?.status === "PROCESS_EXITED" && endpoint.exitCode === 5)) return { code: 5, error: { code: "DAEMON_RECOVERY_CONFLICT", message: "Daemon recovery found an ownership conflict" } };
+      const summary = endpoint?.status === "PROCESS_EXITED"
+        ? `Daemon exited with code ${endpoint.exitCode} before becoming healthy`
+        : endpoint?.status === "PROCESS_FAILED"
+          ? `Daemon could not be spawned: ${endpoint.error instanceof Error ? endpoint.error.message : String(endpoint.error)}`
+          : "Daemon did not become healthy before the startup deadline";
+      const output = await readStartupOutput(capture);
+      return { code: 1, error: { code: "DAEMON_START_FAILED", message: output !== "" ? `${summary}:\n${output}` : capture === undefined ? summary : `${summary}; ${capture.path} is empty` } };
+    } finally {
+      await capture?.handle.close().catch(() => {});
+    }
   }
   if (command === "recover") {
     const current = await inspectEndpoint(common);

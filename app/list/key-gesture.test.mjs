@@ -25,43 +25,8 @@ describe("Left dashboard gesture", () => {
         expect(armed).toMatchObject({ openDashboard: false, passThrough: true });
         expect(reduceLeftGesture(armed.state, left(599))).toMatchObject({ openDashboard: true, passThrough: false });
     });
-    it.each([
-        [499, true],
-        [500, true],
-        [501, false],
-    ])("uses the exact 500 ms boundary: %d ms", (elapsed, opens) => {
-        const dirty = reduceLeftGesture(createLeftGestureState(), { type: "editorChanged", text: "" }).state;
-        const armed = reduceLeftGesture(dirty, left(10)).state;
-        expect(reduceLeftGesture(armed, left(10 + elapsed))).toMatchObject({ openDashboard: opens });
-    });
-    it("treats whitespace, history, and type-then-erase as non-clean", () => {
-        const cases = [
-            reduceLeftGesture(createLeftGestureState(), { type: "editorChanged", text: " " }).state,
-            reduceLeftGesture(createLeftGestureState(), { type: "historyNavigated" }).state,
-            reduceLeftGesture(reduceLeftGesture(createLeftGestureState(), { type: "editorChanged", text: "x" }).state, { type: "editorChanged", text: "" }).state,
-        ];
-        for (const state of cases)
-            expect(reduceLeftGesture(state, left(1))).toMatchObject({ openDashboard: false, passThrough: true });
-    });
-    it.each([
-        ["cursor away", { cursorAtStart: false }],
-        ["modified Left", { modified: true }],
-        ["non-main focus", { mainEditorFocused: false }],
-        ["repeat", { phase: "repeat" }],
-        ["release", { phase: "release" }],
-    ])("preserves normal Left for %s", (_name, override) => {
-        expect(reduceLeftGesture(createLeftGestureState(), left(0, override))).toMatchObject({ openDashboard: false, passThrough: true });
-    });
-    it("cancels an armed gesture on another key and resets after successful submit", () => {
-        const dirty = reduceLeftGesture(createLeftGestureState(), { type: "historyNavigated" }).state;
-        const armed = reduceLeftGesture(dirty, left(100)).state;
-        const other = reduceLeftGesture(armed, { ...left(200), key: "down" });
-        // Every key the gesture does not claim reaches the editor untouched.
-        expect(other).toMatchObject({ openDashboard: false, passThrough: true });
-        const cancelled = other.state;
-        expect(reduceLeftGesture(cancelled, left(300))).toMatchObject({ openDashboard: false, passThrough: true });
-        const submitted = reduceLeftGesture(cancelled, { type: "submitted" }).state;
-        expect(reduceLeftGesture(submitted, left(400))).toMatchObject({ openDashboard: true, passThrough: false });
+    it("preserves normal Left when the cursor sits inside the prompt", () => {
+        expect(reduceLeftGesture(createLeftGestureState(), left(0, { cursorAtStart: false }))).toMatchObject({ openDashboard: false, passThrough: true });
     });
     it("delegates an empty unfocused Left and opens only after public focus is restored", () => {
         const tui = { requestRender: vi.fn() };

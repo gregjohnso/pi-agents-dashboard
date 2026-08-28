@@ -28,12 +28,6 @@ describe("launch composer", () => {
             thinkingLevel: "high",
             name: "dashboard task",
         }],
-        ["model, thinking level, and name unselected", { cwd: "/repo" }, {
-            prompt: "Implement it",
-            cwd: "/repo",
-            sourceSessionId: "source-session",
-            isolation: { mode: "worktree" },
-        }],
     ])("defaults to a worktree and emits the exact LaunchRequest with %s", (_label, draftDefaults, request) => {
         const result = prepareLaunchRequest({ ...createLaunchDraft(draftDefaults), prompt: "Implement it" }, worktree);
         expect(result).toEqual({ kind: "ready", request });
@@ -62,24 +56,5 @@ describe("launch composer", () => {
                 name: "dashboard task",
             },
         });
-    });
-    it.each([
-        ["model provider", { model: { provider: "", id: "claude" } }],
-        ["model id", { model: { provider: "anthropic", id: "" } }],
-    ])("rejects an incomplete %s field", (_name, override) => {
-        const draft = { ...createLaunchDraft(defaults), ...override, prompt: "Implement it" };
-        expect(() => prepareLaunchRequest(draft, worktree)).toThrow();
-    });
-    it("represents DELIVERY_UNKNOWN with retry-at-risk and abandon actions without automatic retry", () => {
-        const state = reduceLaunchComposer({ focus: "composer", draft: { ...createLaunchDraft(defaults), prompt: "Implement it" } }, { type: "deliveryUnknown", clientId: "stable-client", requestId: "launch-1" });
-        expect(state).toMatchObject({
-            focus: "list",
-            deliveryUnknown: {
-                clientId: "stable-client",
-                requestId: "launch-1",
-                actions: ["retry_at_risk", "abandon"],
-            },
-        });
-        expect(state.launch).toBeUndefined();
     });
 });

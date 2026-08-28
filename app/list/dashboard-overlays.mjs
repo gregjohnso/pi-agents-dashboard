@@ -1,7 +1,7 @@
 import { LIST_COMMANDS, matchingListCommands } from "./list-commands.mjs";
 
 const DEFAULT_CHOICE_ROWS = 8;
-const CHOICE_KEYS = "↑↓ choose · Enter apply · Esc cancel";
+const CHOICE_KEYS = "↑↓ choose · type to filter · Enter apply · Esc cancel";
 
 /** Describe one selected session without collapsing independent state fields. */
 export function createMetadataOverlay(session) {
@@ -31,7 +31,20 @@ export function createCommandMenuOverlay(text, index) {
 
 /** Offer one bounded list of exact values for a launch field, starting on the current one. @param {string} field @param {string} title @param {string[]} values @param {string} current */
 export function createChoiceOverlay(field, title, values, current) {
-    return { kind: "choice", field, title, values: [...values], index: Math.max(0, values.indexOf(current)) };
+    return { kind: "choice", field, title, allValues: [...values], values: [...values], index: Math.max(0, values.indexOf(current)), filter: "" };
+}
+
+/**
+ * Narrow a picker to the values containing the typed text, case-insensitively. Pi's catalog runs to
+ * hundreds of models, so filtering is how an operator reaches one; `allValues` keeps the whole list
+ * so widening the filter restores it.
+ * @param {any} overlay @param {string} filter
+ */
+export function filterChoiceOverlay(overlay, filter) {
+    const needle = filter.trim().toLowerCase();
+    const values = needle === "" ? [...overlay.allValues] : overlay.allValues.filter((/** @type {string} */ value) => value.toLowerCase().includes(needle));
+    const highlighted = overlay.values[overlay.index];
+    return { ...overlay, filter, values, index: Math.max(0, values.indexOf(highlighted)) };
 }
 
 /** Keep the highlighted row inside a panel that shows at most `maxRows` of them. @param {number} index @param {number} length @param {number} maxRows */
@@ -112,9 +125,14 @@ export function describeOverlay(overlay, options = {}) {
     }
     if (overlay.kind === "choice") {
         const maxRows = Math.max(1, options.choiceRows ?? DEFAULT_CHOICE_ROWS);
+        const filter = overlay.filter ?? "";
+        const suffix = filter === "" ? "" : ` · ${filter}`;
+        if (overlay.values.length === 0) {
+            return { title: `${overlay.title} 0/0${suffix}`, rows: [{ text: `Nothing matches ${filter}`, emphasis: true }, { text: CHOICE_KEYS, emphasis: true }] };
+        }
         const start = windowStart(overlay.index, overlay.values.length, maxRows);
         return {
-            title: `${overlay.title} ${overlay.index + 1}/${overlay.values.length}`,
+            title: `${overlay.title} ${overlay.index + 1}/${overlay.values.length}${suffix}`,
             rows: [
                 ...overlay.values.slice(start, start + maxRows).map((value, offset) => ({ text: `${start + offset === overlay.index ? "❯" : " "} ${value}` })),
                 { text: CHOICE_KEYS, emphasis: true },

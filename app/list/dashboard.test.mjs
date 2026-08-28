@@ -781,6 +781,59 @@ describe("dashboard controller", () => {
             expect(backend.requests).toEqual([]);
             expect(openSelectedViewer).not.toHaveBeenCalled();
         });
+        it("narrows a catalog-sized picker as the operator types and stays inside every width", async () => {
+            const models = Array.from({ length: 300 }, (_, index) => ({ provider: index % 2 ? "anthropic" : "openai", id: `model-${String(index).padStart(3, "0")}-with-a-deliberately-long-identifier`, thinking: true }));
+            const backend = new FakeBackend([]);
+            backend.getModels = vi.fn(async () => models);
+            const dashboard = controller(backend, { launchDefaults: { cwd: "/repo" } });
+            await dashboard.open();
+            typed(dashboard, "/model");
+            dashboard.handleInput("\r");
+            await vi.waitFor(() => expect(dashboard.overlay).toMatchObject({ kind: "choice", field: "model" }));
+            expect(dashboard.overlay.values).toHaveLength(300);
+            for (const width of [40, 55, 80, 120, 160]) {
+                for (const height of [24, 10]) {
+                    const lines = dashboard.render(width, height);
+                    expect(lines, `${width}x${height}`).toHaveLength(height);
+                    expect(lines.every((line) => visibleWidth(line) <= width), `${width}x${height}`).toBe(true);
+                }
+            }
+            // 300 rows never reach the screen: the picker draws one windowful of the list area.
+            expect(dashboard.render(80, 24).filter((line) => stripVTControlCharacters(line).includes("-with-a-deliberately-long-identifier")).length).toBeLessThanOrEqual(12);
+            typed(dashboard, "model-137");
+            expect(dashboard.overlay.values).toEqual(["anthropic/model-137-with-a-deliberately-long-identifier"]);
+            dashboard.handleInput("\r");
+            expect(dashboard.composerDraft.model).toEqual({ provider: "anthropic", id: "model-137-with-a-deliberately-long-identifier" });
+            expect(dashboard.overlay).toBeUndefined();
+        });
+        it("keeps a picker open when the typed filter matches nothing, and pages through a long one", async () => {
+            const models = Array.from({ length: 300 }, (_, index) => ({ provider: "openai", id: `model-${String(index).padStart(3, "0")}`, thinking: false }));
+            const backend = new FakeBackend([]);
+            backend.getModels = vi.fn(async () => models);
+            const dashboard = controller(backend, { launchDefaults: { cwd: "/repo" } });
+            await dashboard.open();
+            dashboard.resize(80, 24);
+            typed(dashboard, "/model");
+            dashboard.handleInput("\r");
+            await vi.waitFor(() => expect(dashboard.overlay).toMatchObject({ kind: "choice", field: "model" }));
+            // What was typed and how much it left must be on screen; the prompt was cleared to open the picker.
+            typed(dashboard, "model-13");
+            expect(dashboard.render(80, 24).map(stripVTControlCharacters).some((line) => line.includes("Model 1/10 · model-13"))).toBe(true);
+            typed(dashboard, "\x7f".repeat(8));
+            typed(dashboard, "zzz");
+            expect(dashboard.overlay.values).toEqual([]);
+            expect(dashboard.render(80, 24).map(stripVTControlCharacters).some((line) => line.includes("Nothing matches zzz"))).toBe(true);
+            // Enter with nothing to apply leaves the picker open so the filter can be corrected.
+            dashboard.handleInput("\r");
+            expect(dashboard.overlay).toMatchObject({ kind: "choice", field: "model", filter: "zzz" });
+            typed(dashboard, "\x7f\x7f\x7f");
+            expect(dashboard.overlay.values).toHaveLength(300);
+            expect(dashboard.overlay.index).toBe(0);
+            dashboard.handleInput("\x1b[6~");
+            expect(dashboard.overlay.index).toBeGreaterThan(1);
+            dashboard.handleInput("\x1b[5~");
+            expect(dashboard.overlay.index).toBe(0);
+        });
         it.each([40, 55, 80, 120, 160])("keeps the menu and the picker inside %i columns", async (width) => {
             const dashboard = controller(new FakeBackend([
                 session("a", { model: { provider: "a-very-long-provider-name", id: "an-even-longer-model-identifier-2026" } }),

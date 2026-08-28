@@ -646,6 +646,25 @@ describe("dashboard controller", () => {
         // Only the working directory has a header row now; the rest are set through the slash menu.
         expect(dashboard.render(100, 16).join("\n")).toContain("cwd:");
     });
+    it("shows a persisted launch model, so a draft the operator cannot fix cannot poison a launch unseen", async () => {
+        // The menu hint reads /model [provider/id]; typing it literally persisted this draft, and
+        // /model now refuses the value that is still sitting in it.
+        const stored = {
+            schemaVersion: 1,
+            clientId: "stable-client",
+            cursor: { daemonEpoch: "epoch", sequence: "1" },
+            viewState: { query: { view: "live" } },
+            launchDraft: { prompt: "", cwd: "/repo", isolationMode: "worktree", model: { provider: "provider", id: "id" }, thinkingLevel: "", name: "" },
+        };
+        const dashboard = controller(new FakeBackend([session("a")]), { persistence: persistence(stored) });
+        await dashboard.open();
+        expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("model:provider/id"))).toBe(true);
+
+        // A draft that carries no model of its own says nothing: Pi's default is not a setting.
+        const plain = controller(new FakeBackend([session("a")]), { launchDefaults: { cwd: "/repo" } });
+        await plain.open();
+        expect(plain.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("model:"))).toBe(false);
+    });
     describe("slash commands", () => {
         function typed(dashboard, text) {
             for (const character of text) dashboard.handleInput(character);

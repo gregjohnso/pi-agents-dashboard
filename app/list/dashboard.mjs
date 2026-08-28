@@ -1028,7 +1028,7 @@ export class DashboardController {
                 // Flat rules above and below the prompt: a rounded top with a flat bottom read as a broken box.
                 lines[dockTop] = composerRule(this.composerField === "prompt" ? "" : COMPOSER_FIELD_LABELS[this.composerField], this.width, confirmingSharedLaunch);
                 lines[dockTop + 1] = paintPlainLine(` ❯ ${draftPrompt || "describe a task for a new session"}`, this.width, draftPrompt ? (text) => jobwatchTheme.text(text, false) : (text) => jobwatchTheme.muted(text, false));
-                const form = layout.listTop >= 5 ? "" : ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
+                const form = layout.listTop >= 5 ? this.draftModelSummary() : ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
                 // The rule closes the prompt box; launch settings and the selected path are context below it.
                 const formRow = layout.dockRows >= 4 ? dockTop + 3 : dockTop + 2;
                 if (layout.dockRows >= 4) lines[dockTop + 2] = sectionFooter(this.width, confirmingSharedLaunch);
@@ -1126,6 +1126,15 @@ export class DashboardController {
         // Only the working directory earns a row: the MODEL column reports each session's own model,
         // and the rest are set through the slash menu when they matter.
         return [["cwd", "cwd", draft.cwd]];
+    }
+    /**
+     * The model the next launch will ask for, named only when the draft carries one. A draft
+     * outlives the dashboard that wrote it, and a model Pi refuses fails the launch itself, so the
+     * value that will be sent has to be readable without opening a picker to find it.
+     */
+    draftModelSummary() {
+        const { provider, id } = this.composerDraft.model;
+        return provider === "" && id === "" ? "" : ` model:${provider}/${id}`;
     }
     /** The selected session's working directory, plus any active filters. */
     contextLine() {

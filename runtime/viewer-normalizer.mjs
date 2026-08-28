@@ -5,6 +5,14 @@ const MAX_CANONICAL_ID_BYTES = 65_536;
 const MAX_SUMMARY_BYTES = 4_096;
 const MAX_TEXT_BYTES = 65_536;
 const DIALOG_METHODS = new Set(["confirm", "select", "input", "editor"]);
+/**
+ * The `extension_ui_request` methods Pi 0.84.3's RPC mode fires without waiting for a response
+ * (`dist/modes/rpc/rpc-mode.js`). They are display updates for Pi's own terminal interface, which
+ * this dashboard does not render, so none of them is a transcript card: one recorded run emitted
+ * 153 setWidget frames inside a single turn. Only `notify` carries text written for a person.
+ * `runtime/session-event-mapping.mjs` keeps the same split.
+ */
+const ONE_WAY_UI_METHODS = new Set(["notify", "setStatus", "setWidget", "setTitle", "set_editor_text"]);
 
 /** A typed, session-scoped Pi compatibility failure. */
 export class ViewerNormalizerError extends Error {
@@ -99,6 +107,11 @@ function toolFailureText(content) {
   return bound(content.filter((block) => block.type === "text").map((block) => block.text).join("\n") || "Tool failed", MAX_SUMMARY_BYTES);
 }
 
+/** Collapse a multi-line extension message into one bounded status line. @param {unknown} value */
+function singleLine(value) {
+  return typeof value === "string" ? value.replace(/\s+/gu, " ").trim() : "";
+}
+
 /** @param {unknown} value @param {string} fallback */
 function requiredString(value, fallback) {
   return typeof value === "string" && value.length > 0 ? bound(value, 256) : fallback;
@@ -127,6 +140,8 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     return payload;
   }
   const pendingUi = new Map();
+  /** @type {Set<string>} */
+  const reportedUiMethods = new Set();
   /** @type {any[]} */
   const errors = [];
   const emitted = new Map();
@@ -415,7 +430,16 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     }
     if (frame.type === "extension_ui_request") {
       if (!DIALOG_METHODS.has(frame.method)) {
-        return publish({ kind: "unknown_pi_event", piType: "extension_ui_request", summary: `Unsupported fire-and-forget Pi UI method (${requiredString(frame.method, "unknown")})` }, sourceId, at);
+        if (ONE_WAY_UI_METHODS.has(frame.method)) {
+          if (frame.method !== "notify") return [];
+          const message = singleLine(frame.message);
+          const label = frame.notifyType === "error" ? "Pi error" : frame.notifyType === "warning" ? "Pi warning" : "Pi notice";
+          return replaceActivity(frame.notifyType === "error" ? "error" : "thinking", label, sourceId, message === "" ? {} : { detail: bound(message, MAX_SUMMARY_BYTES) });
+        }
+        const method = requiredString(frame.method, "unknown");
+        if (reportedUiMethods.has(method)) return [];
+        reportedUiMethods.add(method);
+        return publish({ kind: "unknown_pi_event", piType: "extension_ui_request", summary: `Unsupported Pi UI method (${method})` }, sourceId, at);
       }
       if (typeof frame.id !== "string" || typeof frame.title !== "string") incompatible("PI_REQUIRED_SHAPE", "Pi UI request requires id and title");
       /** @type {any} */

@@ -1,8 +1,41 @@
 # Architecture review
 
-The first change should give every live worker one daemon transport. The second should replace the list event log with invalidation plus snapshot reads. Together they remove two failure-prone dual paths and an estimated 700 to 1,200 production lines. The daemon, worker process, ownership lease, and process identity checks should remain.
+Delete the unused dashboard features first, then give every live worker one daemon transport and replace list replay with invalidation plus snapshot reads. The reduced product removes both known command-shape failures before transport work starts. The daemon, worker process, ownership lease, process identity checks, worktree isolation, and opt-in summaries should remain.
 
 The three proposed diagnoses are mostly right. Claim (a) has two distinct failure mechanisms, not one. Claim (b) is right about the excess machinery and the observed startup crash, but the 3 ms snapshot cost is not measured in this repository. Claim (c) identifies a real data-model error, though two durable configuration objects would add state that the product does not need.
+
+## The daemon pattern supports many clients, but this implementation still assumes one frontend
+
+The intended process shape matches tmux, the Emacs daemon, a language server, and the Docker client and daemon. One server owns shared state. Short-lived clients connect over a versioned local protocol. A per-session process owns each long-lived Pi child. One connection may write a session while other connections observe it. The server, not a terminal, decides ownership and survives terminal loss.
+
+That comparison supports the daemon and worker split. It does not support the current amount of durable client bookkeeping. Attachment claims, list acknowledgements, viewer acknowledgements, and one shared `frontend-state.json` all describe client state that either dies with a socket or can be rebuilt from an authoritative snapshot. Established client-server designs keep durable server state about sessions and commands. They keep connection leases and screen state in memory or in files private to one client instance.
+
+The current frontend identity is also too broad for several terminals. Every dashboard loads the same CLI client ID and reads and replaces the same `frontend-state.json` ([app/standalone.mjs:75](../app/standalone.mjs#L75), [app/list/standalone-list.mjs:221](../app/list/standalone-list.mjs#L221)). Two dashboards can overwrite each other's selected row, launch draft, and cursor. The shared ID also makes request ownership harder to explain, even though attachment arbitration happens by socket. Removing the list cursor and viewer acknowledgements reduces the damage, but the remaining view state and draft still need a per-frontend home. A process-scoped connection ID should identify a live dashboard. A separate stable installation ID may remain for command recovery where durability requires it. Those two identities should not be one field.
+
+### Six untested client cases define the missing contract
+
+1. **Three dashboards open.** All three should receive list invalidations. Two may open the same session as observers while one socket holds composer. Their drafts and selected rows must not overwrite one another. Current tests cover two attachment requests in places, but no acceptance test mounts three complete dashboards against one daemon.
+2. **The writer terminal is killed.** Unix socket close should release the connection-scoped composer claim under the per-session lock. An accepted command continues through the command journal because terminal death does not prove that Pi missed it. Observers should receive a writer-availability notification. A stopped process whose socket remains open still owns composer; adding a heartbeat to override a live local socket would create another failure detector without evidence that it is needed.
+3. **Two clients race for one session.** The per-session lock should grant exactly one composer. The loser should open the viewer as an observer rather than fail with `SESSION_IN_USE`. A repeated claim from the winning socket should return composer. A repeated claim from another socket should return observer.
+4. **One client runs an old build.** The daemon needs an explicit compatibility refusal at the first incompatible operation. The current client cannot surface a refused `subscribe`: it sends an untracked request and discards the response ([app/daemon-client.mjs:112](../app/daemon-client.mjs#L112), [app/daemon-client.mjs:242](../app/daemon-client.mjs#L242)). No daemon response can add behavior to that running process. Use a two-release bridge. The bridge client tracks the subscription response and displays `Dashboard protocol changed. Exit and restart pi-agents.` on `CLIENT_RESTART_REQUIRED`; its daemon still serves bounded old replay. Only the following release removes replay and refuses old `subscribe`. This removes the synchronized manual-close step. A pre-bridge frontend can keep using the bridge daemon until it is restarted naturally.
+5. **A client disappears mid-command.** Socket loss must not cancel a command after journal acceptance. The daemon should finish delivery or record `DELIVERY_UNKNOWN`. A reconnect with the same durable request identity can inspect the result. Ephemeral viewer actions use fresh request IDs today, so the new writer may need to infer completion from the transcript or session state. Destructive CLI commands already persist pending request identity and should retain that stronger rule.
+6. **The writer changes.** The daemon currently records attachment events for the list, which ignores them, but does not give an open observer a useful viewer-level ownership transition. Attached viewers need a connection-scoped `session_access_changed` notification with their own role, whether a writer is present, and an in-memory generation. Do not expose another client's stable ID. Do not promote an observer automatically. Explicit acquisition after a vacancy keeps races server-arbitrated and makes the operator's writer choice visible.
+
+The read-only viewer is already mostly implemented. Viewer snapshots carry `composer` or `observer`, and observer input paths reject mutations ([app/viewer/viewer-controller.mjs:160](../app/viewer/viewer-controller.mjs#L160), [app/viewer/viewer-controller.mjs:256](../app/viewer/viewer-controller.mjs#L256)). The standalone adapter throws when the daemon grants observer ([app/list/standalone-list.mjs:69](../app/list/standalone-list.mjs#L69)). Accepting the granted role removes that contradiction. The remaining work is status, explicit acquisition, and role-change notification.
+
+### The reduced feature set changes the ranking
+
+Deleting `/stats`, `/tree`, and `/export` removes the entire parameterized `session_query` operation. Deleting `/auto-compact`, `/auto-retry`, `/steering`, and `/follow-up` removes the second settings projection and its `enabled` and `mode` mismatch. Deleting `/thinking` and its picker removes `set_thinking_level` and requested thinking level from launch. These deletions should land first because they remove failing callers before transport changes.
+
+The one-worker-route change still earns its startup risk, but its scope shrinks. It no longer repairs dashboard queries or settings passthrough. It still removes split frame delivery, duplicate reply tracking, current-launch versus recovered-worker behavior, and the missing graceful Stop route. Its estimated reduction falls from 350 to 600 lines to 250 to 450 lines after feature deletion. The operation matrix becomes prompt, follow-up message, steer, interrupt, user-interface response, model, compact, rename, menu, initial state, frames, and Stop.
+
+The confirmed-configuration change also shrinks. Only `model` remains a dashboard-selected runtime value. Pi-reported thinking level may remain visible as observed state, but the launch request and dashboard picker no longer write it. Model admission and Pi-confirmed model persistence remain useful.
+
+Replay narrowing no longer earns a separate change. Removing `session_query` deletes three of its four proposed read subtypes. Only `get_state` and `get_session_commands` remain, and neither caused the reported failure. A new direct-read dispatcher would add a second dispatch path just after transport unification removes one. Withdraw changes 7.1 and 7.2. Reconsider replay only with measured write cost or a concrete recovery failure.
+
+The feature deletions expose one additional simplification. Remove retired operations from the frontend, shared contract, daemon, worker dispatcher, Pi adapter, and tests in the same commit for each feature group. Do not leave generic `session_query`, generic settings payloads, or hidden adapter methods as extension seams. A smaller explicit operation set makes old-build refusal and command durability easier to audit.
+
+The revised order is feature deletion, read-only opening, one worker route, Pi-confirmed model, list invalidation, connection-scoped attachments with access notifications, viewer acknowledgement removal, and trash removal. List invalidation still precedes attachment-store deletion because current attachment recovery publishes list events. Trash removal remains independent after the baseline gate.
 
 ## Findings on the three claims
 
@@ -44,23 +77,23 @@ The launch resolver copies the requested model and thinking level into the new `
 
 The daemon already treats Pi as authority after a socket route appears. It calls `get_state` and overwrites `model` and `thinkingLevel` from Pi's response ([runtime/daemon.mjs:714](../runtime/daemon.mjs#L714), [runtime/daemon.mjs:738](../runtime/daemon.mjs#L738)). This correction does not run for a normal current-daemon launch because of claim (a).
 
-Do not add `requestedConfiguration` and `confirmedConfiguration` to every durable session unless the interface needs to display both. The command journal already retains the exact launch request ([runtime/command-journal.mjs:152](../runtime/command-journal.mjs#L152)). Keep requested values in that request and in the worker startup arguments. Leave `SessionRecord.model` and `thinkingLevel` absent until Pi's initial `get_state` response confirms them. Include that state in the worker-ready exchange, or query it through the single socket route before marking the worker ready. This gives each durable field one meaning and removes the false display without duplicating configuration.
+Do not add `requestedConfiguration` and `confirmedConfiguration` to every durable session unless the interface needs to display both. The command journal already retains the exact launch request ([runtime/command-journal.mjs:152](../runtime/command-journal.mjs#L152)). Keep the requested model in that request and in the worker startup arguments. Remove requested thinking level from the dashboard launch contract. Leave `SessionRecord.model` absent until Pi's initial `get_state` response confirms it. Pi-reported thinking level may remain observed state. Include initial state in the worker-ready exchange, or query it through the single socket route before marking the worker ready. This gives each durable field one meaning without duplicating configuration.
 
-## Ranked changes
+## Analysis of the remaining changes
 
-Estimates below are net production and test lines removed after replacement code. They are ranges, not counts from an implementation diff.
+The order in this section reflects the original review. The revised order is in the sequence section below. Estimates are net production and test lines removed after replacement code. They are ranges, not counts from an implementation diff.
 
 ### 1. Give every worker one control-socket route
 
-**Harm removed.** Current-daemon sessions gain the same query, settings, frame, reconnect, and graceful-stop behavior as adopted sessions. This addresses all failures in claim (a), including the full graceful wait before Stop escalation.
+**Harm removed.** Current-daemon sessions gain the same frame, reply, reconnect, and graceful-stop behavior as adopted sessions. Feature deletion removes the query and settings failures before this change. The route change still removes the full graceful wait before Stop escalation.
 
 **Delete or unify.** Remove `sessionHandles`, the route-versus-handle branches in `askWorker` and durable command delivery, the handle command projection, launch-channel pending replies, duplicate frame buffering, and the special statement that a parameterized ask must wait for reconnect ([runtime/daemon.mjs:631](../runtime/daemon.mjs#L631), [runtime/daemon.mjs:685](../runtime/daemon.mjs#L685), [runtime/worker-supervisor.mjs:603](../runtime/worker-supervisor.mjs#L603)). Keep the verified startup handshake, then transfer all ongoing traffic to `RecoveredWorkerRouter`.
 
-**Estimated reduction.** 350 to 600 lines, including dual-path tests.
+**Estimated reduction after feature deletion.** 250 to 450 lines, including dual-path tests.
 
 **Risk.** Startup ordering can strand a verified worker between IPC binding and socket adoption. A daemon restart during this handoff can also expose duplicate routes. The existing route generation and identity checks should remain the authority ([runtime/reconciliation.mjs:145](../runtime/reconciliation.mjs#L145), [runtime/reconciliation.mjs:209](../runtime/reconciliation.mjs#L209)).
 
-**Verification.** Add one integration matrix that launches through the real supervisor and runs every worker operation before any daemon restart: prompt, follow-up, steer, interrupt, UI response, menu, each settings command, each query, and Stop. Assert one socket route exists, IPC is closed after handoff, each request reaches Pi once, and graceful Stop returns before the configured window. Repeat after daemon restart against the same worker. Inject failures before Pi bind, after Pi bind, before route adoption, and after route adoption.
+**Verification.** Add one integration matrix that launches through the real supervisor and runs every remaining worker operation before any daemon restart: prompt, follow-up message, steer, interrupt, user-interface response, model, compact, rename, menu, initial state, frames, and Stop. Assert one socket route exists, IPC is closed after handoff, each request reaches Pi once, and graceful Stop returns before the configured window. Repeat after daemon restart against the same worker. Inject failures before Pi bind, after Pi bind, before route adoption, and after route adoption.
 
 ### 2. Replace list replay with coalesced invalidation and snapshots
 
@@ -88,17 +121,17 @@ Estimates below are net production and test lines removed after replacement code
 
 This change and list invalidation share the deletion of attachment events. Design them together even if implementation uses separate commits.
 
-### 4. Persist only Pi-confirmed runtime configuration
+### 4. Persist only Pi-confirmed model state
 
-**Harm removed.** Failed launches no longer display a model or thinking level that never ran. Successful rows get their values at readiness rather than after a daemon restart.
+**Harm removed.** Failed launches no longer display a model that never ran. Successful rows get the model at readiness rather than after a daemon restart.
 
-**Delete or unify.** Stop copying requested runtime values into the prepared `SessionRecord`. Reuse the initial Pi state already fetched by the worker ([runtime/installed-pi-worker.mjs:135](../runtime/installed-pi-worker.mjs#L135)). Apply its model and thinking level during the ready transition. Remove the reconnect-only correction as a special case and use the same state reconciliation for every route.
+**Delete or unify.** Stop copying the requested model into the prepared `SessionRecord`. Reuse the initial Pi state already fetched by the worker ([runtime/installed-pi-worker.mjs:135](../runtime/installed-pi-worker.mjs#L135)). Apply its model during the ready transition. Keep Pi-reported thinking level as observed state, but remove dashboard selection and mutation.
 
 **Estimated reduction.** 20 to 60 lines. This is primarily a semantic correction, not a large deletion.
 
-**Risk.** Pi may omit one field from `get_state`. Absence must remain unknown rather than falling back to the requested value. Reopening an inactive legacy session may still have old mixed-meaning fields until a migration or next confirmed run.
+**Risk.** Pi may omit the model from `get_state`. Absence must remain unknown rather than falling back to the requested value. An inactive legacy session may retain an old mixed-meaning model until its next confirmed run.
 
-**Verification.** Cover no-model default selection, accepted requested model, Pi substitution, invalid requested model, failure before Pi spawn, failure after Pi spawn but before ready, and daemon restart. Assert the list shows a value only when the test Pi returned it.
+**Verification.** Cover no-model default selection, accepted requested model, Pi substitution, invalid requested model, failure before Pi spawn, failure after Pi spawn but before ready, and daemon restart. Assert the list shows a model only when test Pi returned it.
 
 ### 5. Remove durable viewer acknowledgements, but keep ordered viewer events
 
@@ -136,9 +169,9 @@ PID reuse makes a PID-only stop unsafe. The code compares PID, start identity, a
 
 ### The command journal is required for Pi-mutating writes
 
-A socket or process can fail after bytes reach Pi but before the dashboard receives an acknowledgement. The daemon journal records acceptance and cross-process delivery state ([runtime/command-journal.mjs:13](../runtime/command-journal.mjs#L13)). The worker replay store records the narrower Pi stdin boundary ([runtime/worker.mjs:172](../runtime/worker.mjs#L172)). These are duplicate-looking records at different uncertainty boundaries. Keep both for prompt, follow-up, steer, interrupt, UI response, and settings changes.
+A socket or process can fail after bytes reach Pi but before the dashboard receives an acknowledgement. The daemon journal records acceptance and cross-process delivery state ([runtime/command-journal.mjs:13](../runtime/command-journal.mjs#L13)). The worker replay store records the narrower Pi stdin boundary ([runtime/worker.mjs:172](../runtime/worker.mjs#L172)). These are duplicate-looking records at different uncertainty boundaries. Keep both for prompt, follow-up messages, steer, interrupt, user-interface response, model changes, compact, and rename.
 
-Narrow the worker replay store to mutating operations. `get_state`, menu discovery, and session queries are read-only but currently enter the same durable replay path ([runtime/worker.mjs:12](../runtime/worker.mjs#L12), [runtime/worker.mjs:232](../runtime/worker.mjs#L232)). Dispatching reads without durable replay is a low-risk follow-up, with an estimated 30 to 80 lines removed. It does not rank above the six changes because it has not caused an operator-visible failure in the evidence reviewed.
+Do not add a separate direct-read dispatcher now. Removing `session_query` leaves initial state and menu discovery as the remaining reads. They have no documented operator-visible failure, and a second dispatcher would weaken the single-path goal. This withdraws the earlier replay-narrowing proposal.
 
 ### Viewer normalization and ordered delivery are required, but not every persistence layer is
 
@@ -158,11 +191,14 @@ Different sessions should proceed independently, while one session's launch, rou
 
 ## Sequence
 
-1. **Unify worker transport first.** It removes current command failures and creates one ready boundary. It also gives claim (c) a reliable place to persist Pi-confirmed state.
-2. **Apply confirmed configuration semantics next.** This is a small change on the new ready handshake and should stay in the same rollout or immediately follow it.
-3. **Design list invalidation and ephemeral attachments together.** Both delete attachment events from the list path. Implement them as separate commits with one shared protocol decision.
-4. **Remove durable viewer acknowledgements independently.** This can run in parallel with step 3 after the worker transport contract settles because it touches viewer subscription contracts and the shared daemon client.
-5. **Remove the trash transaction independently.** This can run in parallel with steps 1 through 4. It touches destructive-action recovery, not worker transport or list delivery.
-6. **Narrow durable worker replay to mutations last.** The unified transport makes read and write dispatch easier to separate, and the higher-harm changes provide better evidence about the final command boundary.
+1. **Delete the unused features.** Remove `session_query`, Pi settings passthrough, and dashboard thinking control from every layer.
+2. **Open observers read-only.** Accept the daemon's observer grant instead of returning `SESSION_IN_USE`.
+3. **Unify worker transport.** The smaller operation set still needs one frame, reply, reconnect, and Stop route.
+4. **Apply confirmed model semantics.** Use the new ready handshake for the one remaining dashboard-selected runtime value.
+5. **Replace list replay with invalidation.** Add explicit old-client refusal rather than replay compatibility in the new daemon.
+6. **Make attachments connection-scoped and notify viewers of access changes.** Remove their durable store after list events are gone.
+7. **Remove durable viewer acknowledgements and the trash transaction independently.** Both retain their rollback files in place.
+
+Do not implement replay narrowing. The deleted operations remove most proposed callers, and the remaining reads do not justify another dispatch path.
 
 Do not combine these into one rewrite. The safest checkpoints are one worker route, one list consistency model, one attachment lifetime, and one meaning for each session field. Each checkpoint should leave the full suite passing before the next deletion.

@@ -1,0 +1,100 @@
+# Architecture
+
+`pi-agents` has three dashboard process roles: one frontend, one daemon for a state root, and one worker for each live session. Each worker starts a separate installed `pi` child. The daemon owns durable dashboard state. Pi owns the agent and its canonical session file.
+
+## Process roles separate the interface, state, and Pi lifetime
+
+### The frontend handles terminal input and rendering
+
+[`bin/pi-agents.mjs`](../bin/pi-agents.mjs) selects one state root before loading the command-line interface. With no command, [`runDashboardApp`](../app/standalone.mjs) connects to or starts the daemon and opens [`createStandaloneList`](../app/list/standalone-list.mjs).
+
+The frontend renders the list and viewer. It sends version 1 requests over the daemon's Unix socket. It does not write session records or talk to Pi's remote procedure call (RPC) stream directly. Closing the frontend closes that socket and terminal interface only.
+
+### The daemon is the single state writer
+
+[`createDaemonRuntime`](../runtime/daemon.mjs) owns the session registry, command journal, ordered list event log, normalized viewer stores, attachment roles, and worker routes. It authenticates local socket connections with `daemon/control.token` and reconciles durable state before accepting mutations.
+
+All session-record writes run in this process through [`RegistryStore`](../runtime/registry-store.mjs). Per-session lifecycle operations use [`runSessionLifecycle`](../runtime/registry-store.mjs), which serializes changes for one session without serializing unrelated sessions.
+
+### A worker keeps one Pi process alive
+
+[`WorkerSupervisor`](../runtime/worker-supervisor.mjs) starts one detached [`runtime/worker.mjs`](../runtime/worker.mjs) process for a session. [`runInstalledPiWorker`](../runtime/installed-pi-worker.mjs) then starts the installed executable with arguments built by [`piRpcArgv`](../runtime/pi-rpc-adapter.mjs):
+
+```text
+pi --mode rpc --session <canonical-session-file>
+```
+
+The worker owns Pi's stdin, stdout, and stderr pipes. Pi treats the RPC stdin pipe as its lifetime. If the process holding that pipe disappears, the pipe closes and Pi exits. A live parent is therefore required for every session. The worker persists command delivery around writes to Pi, forwards commands and Pi frames or events, and reconnects to a restarted daemon.
+
+The daemon may exit without stopping a worker. The worker remains Pi's parent and reconnects through [`maintainDaemonConnection`](../runtime/worker.mjs). Closing the frontend or restarting the daemon therefore does not make Pi depend on a terminal or daemon socket.
+
+## A launch moves through five boundaries
+
+1. [`DashboardController.submitComposer`](../app/list/dashboard.mjs) treats a nonempty, non-slash line as a launch. The frontend canonicalizes the working directory and asks for exact confirmation when shared-directory isolation is selected.
+2. [`createDaemonDashboardBackend.launch`](../app/list/dashboard.mjs) sends a version 1 `launch` request. The daemon records its delivery stage in `queue/commands.jsonl` before starting work.
+3. [`createLaunchResolver`](../runtime/launch-resolver.mjs) repeats trusted isolation checks in the daemon. It creates a managed worktree or confirms the shared directory, asks Pi's public `SessionManager` for a canonical session file, and creates the initial `SessionRecord`.
+4. [`WorkerSupervisor.launch`](../runtime/worker-supervisor.mjs) resolves and probes the Pi executable, acquires the ownership lease, starts the detached worker, and verifies the worker and Pi process identities. The worker opens Pi in RPC mode and checks `get_state` against the canonical session path.
+5. After the worker reports ready, the daemon registers its route and delivers the launch prompt as the first durable `prompt` command. The list replaces its temporary `STARTING` row with the session record received from the event stream.
+
+A failure before a child owns the session marks the prepared record `FAILED`. Delivery that cannot be proved remains `DELIVERY_UNKNOWN`; the daemon does not guess whether Pi received it.
+
+## Events are ordered, cursor-based, and snapshot-first
+
+The daemon publishes each session or command change through [`createEventStore`](../runtime/event-store.mjs). It appends the version 1 event to `index/events.jsonl`, syncs it, assigns the next sequence in the current daemon epoch, and then broadcasts it. A cursor is the pair `daemonEpoch` and `sequence`.
+
+Both screens read a snapshot before subscribing:
+
+- [`DashboardController.open`](../app/list/dashboard.mjs) calls `get_state`, adopts the cursor covered by that snapshot, then subscribes after it.
+- [`ViewerController.open`](../app/viewer/viewer-controller.mjs) calls `get_viewer_snapshot`, builds the transcript from that snapshot, then subscribes after its per-session cursor.
+
+Consumers process an event before acknowledging its cursor. The frontend persists its list cursor and launch draft. It retains viewer drafts in memory while the app runs. Viewer acknowledgements are durable in the per-session viewer store.
+
+List subscriptions are bounded. If the frontend falls behind, [`createDaemonClient`](../app/daemon-client.mjs) drops the queued backlog and emits one `resynchronize` marker. [`createDaemonDashboardBackend`](../app/list/dashboard.mjs) then fetches a new state snapshot and resumes after the newest cursor covered by that snapshot. Falling behind is a request to resynchronize, not a terminal stream error.
+
+Viewer data has a separate ordered store per session. [`createViewerNormalizer`](../runtime/viewer-normalizer.mjs) converts Pi frames into the version 1 shapes in [`shared/viewer-contracts.mjs`](../shared/viewer-contracts.mjs). Frontends never receive raw Pi RPC frames.
+
+## Durable state is grouped by purpose
+
+[`resolveDashboardRoots`](../runtime/paths.mjs) selects `$PI_AGENTS_STATE_DIR`, or `${XDG_STATE_HOME:-$HOME/.local/state}/pi-agents`. The main contents are:
+
+```text
+<state root>/
+  dashboard.json
+  frontend-state.json
+  daemon/
+  sessions/
+  queue/
+  index/
+  runs/
+```
+
+- `dashboard.json` is the optional schema version 2 configuration.
+- `frontend-state.json` stores the frontend client identity, list cursor, view state, and launch draft.
+- `daemon/` stores daemon identity and coordination data. This includes `pid.json`, `control.sock`, `control.token`, `epoch`, `lifecycle.lock`, worker routes in `workers.json`, summary settings, event acknowledgements, request result stores, the latest `reconciliation.json`, and `startup.log`.
+- `sessions/<sessionId>.json` is the daemon-owned registry. Each version 1 record contains immutable session identity, revision, display state, isolation, ownership, and verified runtime identity when available.
+- `queue/commands.jsonl` is the durable command journal. It records acceptance, delivery attempts, acknowledgements, failures, and ambiguous delivery.
+- `index/events.jsonl` is the ordered list event log. `index/viewer/<sha256(sessionId)>.*` holds normalized viewer events, recovery checkpoints, the latest snapshot, and client acknowledgements.
+- `runs/<hash>/` holds one worker's stdout, stderr, durable Pi-delivery replay log, and rotating raw RPC and Pi stderr diagnostics.
+
+Two owned paths are outside the state root. Canonical Pi session files remain in the location chosen by Pi's `SessionManager`. Managed worktrees live under Pi's agent directory at `pi-agents/worktrees`.
+
+## Changes must preserve these invariants
+
+- **The daemon is the only writer of session records.** Frontends and workers send versioned messages. Registry creation, updates, and removal stay in the daemon through [`RegistryStore`](../runtime/registry-store.mjs).
+- **Ownership outlives uncertainty.** Release ownership only after both the supervisor and its Pi child are provably gone. PID alone is insufficient. [`WorkerSupervisor`](../runtime/worker-supervisor.mjs) compares PID, process start identity, and process-group ID, and retains the lease when a child identity is live or ambiguous.
+- **Delete only forgets dashboard state.** The production daemon has no trash callback. Delete removes the inactive `SessionRecord`; it does not unlink the canonical Pi session file or remove a worktree. Worktree cleanup remains a separate operation in [`isolation/cleanup.mjs`](../isolation/cleanup.mjs).
+- **Pi lifecycle event mapping has one home.** [`sessionEventForPiEvent`](../runtime/session-event-mapping.mjs) is the only mapping from Pi RPC events to dashboard session-state events. Viewer frame normalization is the separate read model in [`runtime/viewer-normalizer.mjs`](../runtime/viewer-normalizer.mjs).
+- **A revision guard covers the facts an operation uses.** Stop rechecks the exact ownership and process identity at the signaling boundary. Delete rechecks inactive state and record identity. The frontend may retry after unrelated display metadata changes only while the requested destructive action is still the same.
+- **Background work stays outside operator locks.** Summary inference runs before the short lifecycle write section in [`refreshSummaries`](../runtime/daemon.mjs). Viewer frame ingestion uses the separate frame coordinator in [`RecoveredWorkerRouter.runFrame`](../runtime/reconciliation.mjs). Do not hold a lifecycle or route lock across work that an operator keystroke does not depend on.
+- **Every process boundary is a versioned contract.** Frontend requests, daemon responses, and list events use [`shared/contracts.mjs`](../shared/contracts.mjs). Viewer snapshots and events use [`shared/viewer-contracts.mjs`](../shared/viewer-contracts.mjs). Worker IPC and replay records also carry version 1. Change parsers, producers, consumers, and contract tests together.
+
+## Directory map
+
+- `app/list/` contains list state, input, layout, overlays, launch composition, and daemon adaptation. Start with [`app/list/dashboard.mjs`](../app/list/dashboard.mjs).
+- `app/viewer/` contains the Pi-style transcript, editor control, overlays, and viewer slash handling. Start with [`app/viewer/viewer-controller.mjs`](../app/viewer/viewer-controller.mjs).
+- `app/daemon-client.mjs` owns reconnecting socket transport and subscription queues. `app/standalone.mjs` and `app/list/standalone-list.mjs` assemble the terminal application.
+- `runtime/` contains the daemon, registry, journals, recovery, worker supervision, Pi RPC adapter, normalization, and durable stores. Start with [`runtime/daemon.mjs`](../runtime/daemon.mjs).
+- `shared/` contains strict contracts shared across process boundaries.
+- `isolation/` contains launch preflight, managed worktrees, ownership locks, and explicit cleanup.
+- `cli/` contains administrative daemon and session commands. `bin/` contains the installed executable entry point.
+- `test/` contains cross-module integration and terminal acceptance tests. Unit tests sit beside their source as `*.test.mjs`.

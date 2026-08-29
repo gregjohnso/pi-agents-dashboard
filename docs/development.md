@@ -23,7 +23,7 @@ Focused runs use the raw vitest task:
 pixi run vitest -- run app/mouse-input.test.mjs --testTimeout=20000
 ```
 
-The suite is 788 tests across 84 files as of commit `c8718da`. A full run takes about 3 minutes on an unloaded machine and can take twice that under load.
+The suite is 788 tests across 84 files. A full run takes about 3 minutes on an unloaded machine and can take twice that under load.
 
 ## Tests
 
@@ -45,9 +45,7 @@ Comments earn their place. Keep a measured number, a stated ordering constraint,
 
 Prefer small additive edits. The daemon's failpoint seams, journal stage transitions, and lock ordering encode recovery behavior that is cheap to break and expensive to re-verify.
 
-## Traps
-
-Each of these cost real debugging time and none is derivable from reading the code.
+## Constraints that are not visible in the code
 
 **The wheel-input tap depends on pi-tui input ordering.** `TuiAltScreen.handleViewportInput` in pi-tui 0.84.3 parses wheel bytes and consumes them before any child dispatch, so a wheel event cannot reach a component. [app/mouse-input.mjs](../app/mouse-input.mjs) reads wheel reports ahead of the TUI and passes every other byte through untouched. Two canary tests at the end of [app/mouse-input.test.mjs](../app/mouse-input.test.mjs) assert that pi-tui still has no component mouse seam. When they fail, pi-tui grew one and this module should be deleted rather than patched.
 
@@ -59,6 +57,6 @@ Each of these cost real debugging time and none is derivable from reading the co
 
 **Anything that signals a process must revalidate identity immediately before the signal.** Use `stopVerifiedProcessGroup` ([runtime/process-signaler.mjs](../runtime/process-signaler.mjs)). Never call `process.kill` directly.
 
-**Renaming anything that crosses a process boundary is an outage, not a refactor.** A running daemon holds old code in memory while spawning workers from new code on disk. Renaming the worker token environment variable this way broke every launch until the daemon restarted. Version the contract, or accept both names for a release.
+**Renaming anything that crosses a process boundary is an outage, not a refactor.** A running daemon holds old code in memory while spawning workers from new code on disk, so a renamed environment variable, frame type, or path is read by one side and not the other until the daemon restarts. Version the contract, or accept both names for a release.
 
 **`test/package.acceptance.test.mjs` fails in a worktree whose `node_modules` is a symlink.** `npm pack` then emits bundled-dependency entries outside `package/node_modules/`, which the tarball filter does not exclude. That is a checkout-layout artifact, not a packaging defect.

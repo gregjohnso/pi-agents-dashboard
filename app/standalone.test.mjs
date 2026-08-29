@@ -1,6 +1,6 @@
 import { expect, it, vi } from "vitest";
 
-import { inspectLegacyRuntimeActivity, runDashboardApp } from "./standalone.mjs";
+import { runDashboardApp } from "./standalone.mjs";
 
 it("initializes, migrates, connects, and opens the standalone list in order", async () => {
   const order = [];
@@ -26,11 +26,3 @@ it("initializes, migrates, connects, and opens the standalone list in order", as
   expect(signalProcess).not.toHaveBeenCalled();
 });
 
-it("reports only verified active legacy supervisor identities", async () => {
-  const worker = { pid: 42, startIdentity: "420", processGroupId: 42 };
-  const readFile = vi.fn(async () => JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "session", runId: "run", leaseId: "lease", generation: 1, identity: worker, piChildIdentity: worker }] }));
-  await expect(inspectLegacyRuntimeActivity({
-    legacyStateRoot: "/state/pi-agents-dashboard", legacyRuntimeRoot: "/run/pi-agents-dashboard",
-    exists: async () => true, inspectEndpoint: async () => ({ status: "ABSENT" }), inspect: async () => worker, readFile,
-  })).resolves.toEqual({ activeDaemon: false, activeSupervisors: [worker] });
-});

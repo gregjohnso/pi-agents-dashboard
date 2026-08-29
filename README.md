@@ -57,9 +57,17 @@ Raw Pi remote procedure call (RPC) frames and Pi stderr can contain prompts, too
 
 Per run, raw RPC diagnostics use four rotating 8 MiB segments, for a 32 MiB maximum. Pi stderr uses one rotating 8 MiB limit. Rotation retains a bounded truncation marker; an oversized record is replaced by bounded byte-count and hash metadata. Rotation does not truncate the normalized transcript or canonical Pi session file.
 
+## State-root adoption
+
+This product shipped as `pi-dashboard` before it was named `pi-agents`. On startup, if `~/.local/state/pi-agents` does not exist and `~/.local/state/pi-dashboard` does, the executable adopts the older root by renaming the directory itself, once, and reports the rename on stderr. Nothing is copied and nothing is deleted, so every session, the command journal, and every worker lease move together or not at all. Setting `PI_AGENTS_STATE_DIR` skips adoption entirely.
+
+The rename waits while the older root still holds a live daemon or worker, because both hold their root as a plain string and would lose it mid-write. Until they stop, the run uses the older root and says so; it never runs against two roots at once. Restart once they have stopped and the rename happens then.
+
+If both roots exist and the older one holds sessions, startup refuses and names both paths with their session counts. That is a split this program will not resolve for you: stop the daemon in each root, move the sessions you keep into `~/.local/state/pi-agents`, and remove the other root.
+
 ## Legacy-state migration
 
-Legacy private state beneath `pi-agents-dashboard` roots migrates to `pi-agents` roots. Migration converts reviewed schema-version-1 configuration to schema version 2 while retaining canonical session-file and managed-worktree paths.
+Legacy private state beneath `pi-agents-dashboard` roots, the scaffold name older still, migrates to `pi-agents` roots by copy rather than by rename. Migration converts reviewed schema-version-1 configuration to schema version 2 while retaining canonical session-file and managed-worktree paths.
 
 Migration refuses a verified live legacy daemon or supervisor, unsafe ownership or modes, symlinks, malformed state, changed identities, and destination collisions. Staged files and the migration manifest are durably published before destination reconciliation. If migration is interrupted, the next start validates and resumes the same migration identity. A failure preserves the legacy source; successful reconciliation marks it migrated rather than deleting it.
 

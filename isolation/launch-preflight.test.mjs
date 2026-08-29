@@ -93,7 +93,7 @@ it.each([
     sourceBranch: "main",
     sourceDirty: false,
     piConfigRoot: shared.piConfigRoot,
-    worktreesRoot: join(shared.piConfigRoot, "pi-dashboard", "worktrees"),
+    worktreesRoot: join(shared.piConfigRoot, "pi-agents", "worktrees"),
   });
 });
 

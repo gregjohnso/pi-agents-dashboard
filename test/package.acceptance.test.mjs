@@ -9,7 +9,7 @@ import { afterAll, expect, it } from "vitest";
 
 const execFileAsync = promisify(execFile);
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const temporaryRoot = await mkdtemp(join(tmpdir(), "pi-dashboard-package-acceptance-"));
+const temporaryRoot = await mkdtemp(join(tmpdir(), "pi-agents-package-acceptance-"));
 const runtimeBin = dirname(process.execPath);
 const npm = join(runtimeBin, "npm");
 const npx = join(runtimeBin, "npx");
@@ -56,8 +56,8 @@ const tarball = join(temporaryRoot, packed[0].filename);
 it("ships one allowlisted standalone tarball without lifecycle, private, or development artifacts", async () => {
   const listing = (await run("tar", ["-tf", tarball])).stdout.trim().split("\n");
   const productFiles = listing.filter((path) => !path.startsWith("package/node_modules/"));
-  expect(packed[0]).toMatchObject({ name: "pi-dashboard", version: "0.0.0" });
-  expect(listing).toContain("package/bin/pi-dashboard.mjs");
+  expect(packed[0]).toMatchObject({ name: "pi-agents", version: "0.0.0" });
+  expect(listing).toContain("package/bin/pi-agents.mjs");
   expect(listing).toContain("package/README.md");
   expect(productFiles.some((path) => /(?:^|\/)(?:test|tests|__snapshots__)(?:\/|$)|\.test\.|\.integration\.test\.|runtime\/test-fixtures\.mjs$/u.test(path))).toBe(false);
   expect(productFiles.some((path) => /(?:^|\/)(?:\.superpowers|\.vscode|\.cache|diagnostics|sessions|worktrees)(?:\/|$)/u.test(path))).toBe(false);
@@ -68,7 +68,7 @@ it("ships one allowlisted standalone tarball without lifecycle, private, or deve
 
   const manifestText = (await run("tar", ["-xOf", tarball, "package/package.json"])).stdout;
   const manifest = JSON.parse(manifestText);
-  expect(manifest.bin).toEqual({ "pi-dashboard": "./bin/pi-dashboard.mjs" });
+  expect(manifest.bin).toEqual({ "pi-agents": "./bin/pi-agents.mjs" });
   expect(manifest.pi).toBeUndefined();
   for (const lifecycle of ["preinstall", "install", "postinstall", "prepare", "prepublish", "prepack", "postpack"]) {
     expect(manifest.scripts?.[lifecycle]).toBeUndefined();
@@ -80,16 +80,16 @@ it("starts package-relative code from a local install, a global install, and off
   const [localResult, globalResult, npxResult] = await Promise.all([
     (async () => {
       await run(npm, ["install", "--prefix", local.prefix, "--ignore-scripts", repository], local);
-      return run(join(local.prefix, "node_modules", ".bin", "pi-dashboard"), ["--help"], local);
+      return run(join(local.prefix, "node_modules", ".bin", "pi-agents"), ["--help"], local);
     })(),
     (async () => {
       await run(npm, ["install", "--global", "--prefix", global.prefix, "--ignore-scripts", tarball], global);
-      return run(join(global.prefix, "bin", "pi-dashboard"), ["--help"], global);
+      return run(join(global.prefix, "bin", "pi-agents"), ["--help"], global);
     })(),
-    run(npx, ["--yes", "--offline", "--cache", offlineNpx.cache, "--package", tarball, "pi-dashboard", "--help"], offlineNpx),
+    run(npx, ["--yes", "--offline", "--cache", offlineNpx.cache, "--package", tarball, "pi-agents", "--help"], offlineNpx),
   ]);
-  expect(localResult.stdout).toContain("Usage: pi-dashboard");
+  expect(localResult.stdout).toContain("Usage: pi-agents");
   expect(globalResult.stdout).toContain("With no arguments");
-  expect(npxResult.stdout).toContain("pi-dashboard session <command>");
+  expect(npxResult.stdout).toContain("pi-agents session <command>");
   await Promise.all([local, global, offlineNpx].map(({ state }) => expect(access(state)).rejects.toMatchObject({ code: "ENOENT" })));
 }, 120_000);

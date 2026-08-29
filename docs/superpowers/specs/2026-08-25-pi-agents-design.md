@@ -1,8 +1,8 @@
-# pi-dashboard design
+# pi-agents design
 
 **Status:** Draft for written review
 **Date:** 2026-08-25
-**Package and executable:** `pi-dashboard`
+**Package and executable:** `pi-agents`
 
 ## Document responsibility
 
@@ -10,14 +10,14 @@ This file is the authoritative product contract. It owns user-visible behavior, 
 
 This revision supersedes native Pi attachment and the blocked native-attachment task. The execution plan will replace that work with the standalone implementation sequence after this design is approved.
 
-## `pi-dashboard` is the canonical standalone app
+## `pi-agents` is the canonical standalone app
 
 **Decision:** Build a standalone, Jobwatch-style terminal app that launches installed Pi processes in remote procedure call (RPC) mode and renders its own interactive session viewer.
 
 **Canonical command:**
 
 ```bash
-pi-dashboard
+pi-agents
 ```
 
 **Current state:** The daemon, durable control protocol, registry, process supervision, dashboard list, and destructive workflows exist under the former `pi-agents-dashboard` name. Native attachment is not part of the replacement design.
@@ -26,7 +26,7 @@ pi-dashboard
 
 ### Terms
 
-- **App:** the standalone `pi-dashboard` terminal user interface (TUI).
+- **App:** the standalone `pi-agents` terminal user interface (TUI).
 - **List:** the Jobwatch-style home screen that shows sessions and launches work.
 - **Viewer:** the full-screen interactive view for one session.
 - **Daemon:** the per-user background process that owns durable state and process supervision.
@@ -39,7 +39,7 @@ pi-dashboard
 
 ### Goals
 
-1. Open a machine-wide dashboard by running `pi-dashboard` from any working directory.
+1. Open a machine-wide dashboard by running `pi-agents` from any working directory.
 2. Launch concurrent sessions through the installed `pi --mode rpc` executable.
 3. Keep runs alive after the app, terminal, or secure shell (SSH) connection closes.
 4. Show live and saved sessions across working directories in one dense list.
@@ -65,7 +65,7 @@ pi-dashboard
 
 ### Startup and exit
 
-Running `pi-dashboard` connects to or starts the per-user daemon, performs state migration when needed, and opens the list. It does not restore the last viewer automatically.
+Running `pi-agents` connects to or starts the per-user daemon, performs state migration when needed, and opens the list. It does not restore the last viewer automatically.
 
 Closing the app disconnects only that frontend. It does not stop the daemon or signal a supervisor or Pi child.
 
@@ -75,7 +75,7 @@ The list contains a persistent `describe a task for a new session` composer. `n`
 
 Standalone launch defaults are:
 
-- working directory: the directory where `pi-dashboard` started;
+- working directory: the directory where `pi-agents` started;
 - isolation: a managed Git worktree when the directory is in a Git repository;
 - model and thinking level: omitted unless the user selects them, allowing the installed Pi defaults to apply;
 - display name: optional;
@@ -142,7 +142,7 @@ At most one frontend holds the composer role for a session. Other frontends can 
 
 ### Public Pi UI components are the default building blocks
 
-`pi-dashboard` imports only public package-root exports from `@earendil-works/pi-tui` and `@earendil-works/pi-coding-agent`. It reuses the highest-level public component whose input can be produced safely from the normalized viewer protocol.
+`pi-agents` imports only public package-root exports from `@earendil-works/pi-tui` and `@earendil-works/pi-coding-agent`. It reuses the highest-level public component whose input can be produced safely from the normalized viewer protocol.
 
 | Need | Public Pi infrastructure |
 |---|---|
@@ -185,7 +185,7 @@ Ambiguous Stop or Delete delivery becomes `DELIVERY_UNKNOWN`. Only explicit `ret
 ### List layout
 
 ```text
- pi-dashboard
+ pi-agents
 ╭──────────────────────────────────────────────────────────────────────────╮
 │ Working 3   Ready 2   Failed 1   Sessions 48   Processes 5              │
 ╰──────────────────────────────────────────────────────────────────────────╯
@@ -387,9 +387,9 @@ Launch, resume, event mutation, Stop, Delete, and cleanup use the same per-sessi
 
 Git launches use isolated worktrees by default. Shared-directory mode does not relax session-file ownership. Cleanup requires authoritative late ownership reads and refuses dirty or unpushed work.
 
-## Existing state migrates to `pi-dashboard`
+## Existing state migrates to `pi-agents`
 
-Legacy state may exist beneath per-user runtime and state roots named `pi-agents-dashboard`. The new roots use `pi-dashboard`.
+Legacy state may exist beneath per-user runtime and state roots named `pi-agents-dashboard`. The new roots use `pi-agents`.
 
 Migration follows this sequence:
 
@@ -405,7 +405,7 @@ Migration follows this sequence:
 
 An interrupted migration restarts from the manifest. PREPARED or staged work is validated before reuse. Identity mismatch, destination collision, malformed legacy data, or failed reconciliation leaves the legacy source unchanged and reports a typed migration error.
 
-Legacy configuration schema version 1 converts to `pi-dashboard` schema version 2. Existing worker limits, timing values, history policy, and isolation records retain their reviewed values.
+Legacy configuration schema version 1 converts to `pi-agents` schema version 2. Existing worker limits, timing values, history policy, and isolation records retain their reviewed values.
 
 ## Failures preserve recoverable state
 
@@ -454,23 +454,23 @@ Legacy configuration schema version 1 converts to `pi-dashboard` schema version 
 Canonical installation is:
 
 ```bash
-npm install -g pi-dashboard
-pi-dashboard
+npm install -g pi-agents
+pi-agents
 ```
 
 Also supported:
 
 ```bash
-npx pi-dashboard
-pi-dashboard --pi-bin /absolute/path/to/pi
-npm install /absolute/path/to/pi-dashboard
+npx pi-agents
+pi-agents --pi-bin /absolute/path/to/pi
+npm install /absolute/path/to/pi-agents
 ```
 
 The package uses no npm lifecycle scripts and remains installable with `--ignore-scripts`. A global installation is sufficient because the standalone executable is canonical.
 
 `pi install` is not a supported installation path. The package contains no Pi extension entry point.
 
-The repository, package metadata, executable, visible UI, documentation, and new state roots use `pi-dashboard`. The private repository and local project directory are renamed during implementation. No npm publication occurs until standalone acceptance is approved.
+The repository, package metadata, executable, visible UI, documentation, and new state roots use `pi-agents`. The private repository and local project directory are renamed during implementation. No npm publication occurs until standalone acceptance is approved.
 
 ## First-release configuration is explicit
 
@@ -537,8 +537,8 @@ Command protocol version and normalized viewer protocol version are independent 
 
 ### Package acceptance
 
-- Packed and local-path npm installs expose `pi-dashboard` without lifecycle scripts.
-- `npx pi-dashboard` and a disposable global npm prefix resolve package-relative runtime files.
+- Packed and local-path npm installs expose `pi-agents` without lifecycle scripts.
+- `npx pi-agents` and a disposable global npm prefix resolve package-relative runtime files.
 - Package contents exclude private state, diagnostics, worktrees, sessions, `.superpowers`, `.vscode`, and development caches.
 - The app locates the configured or `PATH` Pi executable without importing private Pi modules.
 - UI imports resolve only through the public roots of `@earendil-works/pi-tui` and `@earendil-works/pi-coding-agent`; no deep `dist/` import ships.

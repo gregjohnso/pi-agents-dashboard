@@ -88,7 +88,7 @@ process.stdin.on("data", (chunk) => {
     input = input.slice(newline + 1);
     let response;
     if (command.type === "get_state") response = { id: command.id, type: "response", command: "get_state", success: true, data: { sessionId: "fake", sessionFile } };
-    else if (command.type === "__pi_dashboard_unknown_command__") response = { id: command.id, type: "response", command: command.type, success: false, error: "unknown command" };
+    else if (command.type === "__pi_agents_unknown_command__") response = { id: command.id, type: "response", command: command.type, success: false, error: "unknown command" };
     else if (["prompt", "follow_up", "steer"].includes(command.type) && typeof command.message !== "string") response = { id: command.id, type: "response", command: command.type, success: false, error: "message is required" };
     else if (command.type === "extension_ui_response" && typeof command.requestId !== "string") response = { id: command.id, type: "response", command: command.type, success: false, error: "requestId is required" };
     else response = { id: command.id, type: "response", command: command.type, success: true };
@@ -106,7 +106,7 @@ it("starts two bounded workers as distinct process-group leaders and opens sessi
     registry,
     ownership,
     runsDirectory: runs,
-    env: { ...process.env, PI_DASHBOARD_TEST_EXIT_MS: "700" },
+    env: { ...process.env, PI_AGENTS_TEST_EXIT_MS: "700" },
     startTimeoutMs: 2_000,
   });
 
@@ -140,7 +140,7 @@ it("fails the session with a process error when the Pi child exits unexpectedly"
     registry,
     ownership: new OwnershipManager(registry),
     runsDirectory: runs,
-    env: { ...process.env, PI_DASHBOARD_TEST_EXIT_MS: "300" },
+    env: { ...process.env, PI_AGENTS_TEST_EXIT_MS: "300" },
     startTimeoutMs: 2_000,
     launchStopPolicy: { gracefulMs: 100, terminateMs: 100 },
   });
@@ -158,7 +158,7 @@ it("refuses a second writer for one canonical session", async () => {
     registry,
     ownership: new OwnershipManager(registry),
     runsDirectory: runs,
-    env: { ...process.env, PI_DASHBOARD_TEST_EXIT_MS: "500" },
+    env: { ...process.env, PI_AGENTS_TEST_EXIT_MS: "500" },
     startTimeoutMs: 2_000,
   });
   const request = { sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, piPath: fakeEntry };
@@ -365,7 +365,7 @@ export async function connectDaemon({ config }) {
     registry,
     ownership: new OwnershipManager(registry),
     runsDirectory: runs,
-    env: { ...process.env, PI_DASHBOARD_TEST_EXIT_MS: "700" },
+    env: { ...process.env, PI_AGENTS_TEST_EXIT_MS: "700" },
     startTimeoutMs: 2_000,
   });
   const launched = await supervisor.launch({

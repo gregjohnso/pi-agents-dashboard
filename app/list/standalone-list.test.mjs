@@ -10,7 +10,7 @@ const roots = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
 
 async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), "pi-dashboard-frontend-state-"));
+  const root = await mkdtemp(join(tmpdir(), "pi-agents-frontend-state-"));
   roots.push(root);
   return join(root, "frontend-state.json");
 }

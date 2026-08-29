@@ -12,7 +12,7 @@ it("initializes, migrates, connects, and opens the standalone list in order", as
     env: { HOME: "/home/user", XDG_STATE_HOME: "/state", XDG_RUNTIME_DIR: "/run/user/1" },
     stdin: {}, stdout: {}, stderr: {},
     initialize: async () => { order.push("permissions"); },
-    migrate: async (roots) => { order.push("migration"); expect(roots).toMatchObject({ legacyStateRoot: "/state/pi-agents-dashboard", legacyRuntimeRoot: "/state/pi-agents-dashboard", destinationStateRoot: "/state/pi-dashboard", destinationRuntimeRoot: "/state/pi-dashboard" }); },
+    migrate: async (roots) => { order.push("migration"); expect(roots).toMatchObject({ legacyStateRoot: "/state/pi-agents-dashboard", legacyRuntimeRoot: "/state/pi-agents-dashboard", destinationStateRoot: "/state/pi-agents", destinationRuntimeRoot: "/state/pi-agents" }); },
     connectOrStart: async (options) => { order.push("daemon"); expect(options.piBin).toBe("/opt/pi"); return { close: closeFrontend }; },
     openList: async (options) => {
       order.push("list");

@@ -35,6 +35,7 @@ const WORKER_DELIVERED_COMMANDS = ["prompt", "steer", "follow_up", "interrupt", 
 const DURABLE_COMMANDS = new Set([...WORKER_DELIVERED_COMMANDS, "stop", "delete"]);
 const CONNECTOR_PATH = fileURLToPath(new URL("./daemon-connector.mjs", import.meta.url));
 const DEFAULT_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateMs: 5_000 });
+const WORKTREE_ROOT_DIRECTORIES = ["pi-agents", "pi-dashboard", "pi-agents-dashboard"];
 
 /** @param {unknown} value */
 function digest(value) {
@@ -1521,7 +1522,12 @@ export async function createDefaultDaemonRuntime({ root, piBin, env = process.en
   const piConfigPath = resolve(getAgentDir());
   await ensurePrivateDirectory(piConfigPath);
   const piConfigRoot = await fs.realpath(piConfigPath);
-  await sweepStaleWorktreeLocks({ worktreesRoot: join(piConfigRoot, "pi-dashboard", "worktrees"), startedAt: new Date().toISOString() }).catch(() => []);
+  // Worktrees created before the pi-agents rename keep their recorded absolute paths, so their
+  // ownership locks still live under the previous product directory and must still be swept.
+  const sweepStartedAt = new Date().toISOString();
+  for (const directory of WORKTREE_ROOT_DIRECTORIES) {
+    await sweepStaleWorktreeLocks({ worktreesRoot: join(piConfigRoot, directory, "worktrees"), startedAt: sweepStartedAt }).catch(() => []);
+  }
   const workerSupervisor = new WorkerSupervisor({
     registry,
     runsDirectory: join(root, "runs"),
@@ -1544,7 +1550,7 @@ export async function createDefaultDaemonRuntime({ root, piBin, env = process.en
 /** @param {NodeJS.ProcessEnv} [env] */
 export function defaultRuntimeRoot(env = process.env) {
   const home = env.HOME ?? homedir();
-  return resolve(env.PI_DASHBOARD_STATE_DIR ?? join(env.XDG_STATE_HOME ?? join(home, ".local", "state"), "pi-dashboard"));
+  return resolve(env.PI_AGENTS_STATE_DIR ?? join(env.XDG_STATE_HOME ?? join(home, ".local", "state"), "pi-agents"));
 }
 
 async function runMain() {
@@ -1554,7 +1560,7 @@ async function runMain() {
   const root = rootFlag >= 0 ? argv[rootFlag + 1] : defaultRuntimeRoot();
   const piBin = piBinFlag >= 0 ? argv[piBinFlag + 1] : undefined;
   const idleFlag = argv.indexOf("--idle-exit-ms");
-  const idleMs = idleFlag >= 0 ? Number(argv[idleFlag + 1]) : Number(process.env.PI_DASHBOARD_IDLE_EXIT_MS ?? 0);
+  const idleMs = idleFlag >= 0 ? Number(argv[idleFlag + 1]) : Number(process.env.PI_AGENTS_IDLE_EXIT_MS ?? 0);
   const runtime = await createDefaultDaemonRuntime({ root, piBin });
   try {
     await runtime.ready;

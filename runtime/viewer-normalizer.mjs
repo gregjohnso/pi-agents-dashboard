@@ -487,7 +487,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     if (frame.type === "stop_requested") return replaceActivity("stopping", "Stopping", sourceId);
     if (frame.type === "extension_error") return replaceActivity("error", "Pi extension error", sourceId, typeof frame.error === "string" ? { detail: bound(frame.error, MAX_SUMMARY_BYTES) } : {});
     if (["agent_end", "turn_start", "turn_end", "text_start", "text_end", "thinking_start", "thinking_end", "toolcall_delta", "toolcall_end", "bash_execution_update", "auto_retry_end", "summarization_retry_attempt_start", "summarization_retry_finished"].includes(frame.type)) return [];
-    const summary = frame.type === "pi_dashboard_frame_queue_overflow"
+    const summary = frame.type === "pi_agents_frame_queue_overflow"
       ? `Pi frame queue overflow: ${Number.isSafeInteger(frame.droppedFrames) ? frame.droppedFrames : "unknown"} frames omitted`
       : `Unsupported optional Pi event (${frame.type})`;
     return publish({ kind: "unknown_pi_event", piType: bound(frame.type, 4_096), summary: bound(summary, MAX_SUMMARY_BYTES) }, sourceId, at);

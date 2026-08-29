@@ -11,7 +11,7 @@ import { launchPreflight } from "./launch-preflight.mjs";
 import {
   acquireWorktreeOwnershipLock,
   createWorktree,
-  LEGACY_WORKTREE_OWNERSHIP_FILE,
+  LEGACY_WORKTREE_OWNERSHIP_FILES,
   WORKTREE_OWNERSHIP_FILE,
 } from "./worktree.mjs";
 
@@ -113,9 +113,9 @@ async function commit(isolation, name, contents) {
   await git(isolation.worktreePath, "commit", "-m", name);
 }
 
-it("recognizes the legacy ownership marker during cleanup", async () => {
+it.each(LEGACY_WORKTREE_OWNERSHIP_FILES)("recognizes the %s legacy ownership marker during cleanup", async (legacyFile) => {
   const isolation = await ownedWorktree();
-  await rename(await markerPath(isolation), await markerPath(isolation, LEGACY_WORKTREE_OWNERSHIP_FILE));
+  await rename(await markerPath(isolation), await markerPath(isolation, legacyFile));
   await expect(cleanupOwnedWorktree(isolation, noLiveOwnershipOptions)).resolves.toMatchObject({ disposition: "REMOVED" });
 });
 
@@ -240,7 +240,7 @@ it.each([
 
 it("cleans up after a dashboard that died holding the ownership lock", async () => {
   const isolation = await ownedWorktree();
-  const lockPath = `${isolation.worktreePath}.pi-dashboard-ownership.lock`;
+  const lockPath = `${isolation.worktreePath}.pi-agents-ownership.lock`;
   await mkdir(lockPath, { recursive: true, mode: 0o700 });
   await writeFile(
     join(lockPath, "dead-token"),

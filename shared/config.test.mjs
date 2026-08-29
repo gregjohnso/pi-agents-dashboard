@@ -42,7 +42,7 @@ it("preserves reviewed schema 1 limits, timings, history, and isolation-adjacent
 });
 
 it("validates and atomically serializes a mode-0600 complete configuration", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-dashboard-config-"));
+  const directory = await mkdtemp(join(tmpdir(), "pi-agents-config-"));
   const configPath = join(directory, "dashboard.json");
   try {
     await writeFile(configPath, '{"old":true}\n', { mode: 0o600 });

@@ -5,8 +5,8 @@ import { expect, it } from "vitest";
 const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 
 it("ships only the standalone executable", () => {
-  expect(manifest.name).toBe("pi-dashboard");
-  expect(manifest.bin).toEqual({ "pi-dashboard": "./bin/pi-dashboard.mjs" });
+  expect(manifest.name).toBe("pi-agents");
+  expect(manifest.bin).toEqual({ "pi-agents": "./bin/pi-agents.mjs" });
   expect(manifest.pi).toBeUndefined();
   expect(manifest.scripts.preinstall).toBeUndefined();
   expect(manifest.scripts.postinstall).toBeUndefined();

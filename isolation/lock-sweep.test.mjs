@@ -16,9 +16,9 @@ async function worktreesRoot() {
   return root;
 }
 
-/** @param {string} root @param {string} name @param {any} holder @param {number} ageMs */
-async function lock(root, name, holder, ageMs) {
-  const path = join(root, `${name}.pi-dashboard-ownership.lock`);
+/** @param {string} root @param {string} name @param {any} holder @param {number} ageMs @param {string} [suffix] */
+async function lock(root, name, holder, ageMs, suffix = ".pi-agents-ownership.lock") {
+  const path = join(root, `${name}${suffix}`);
   await mkdir(path, { mode: 0o700 });
   const record = { token: name, owner: { operation: "worktree_ownership" }, ...(holder === undefined ? {} : { holder }) };
   await writeFile(join(path, name), `${JSON.stringify(record)}\n`, { mode: 0o600 });
@@ -67,9 +67,9 @@ it("retains locks whose holder identity is incomplete", async () => {
 
   expect(removed).toEqual([]);
   expect((await readdir(root)).sort()).toEqual([
-    "legacy.pi-dashboard-ownership.lock",
-    "null-holder.pi-dashboard-ownership.lock",
-    "pid-only.pi-dashboard-ownership.lock",
+    "legacy.pi-agents-ownership.lock",
+    "null-holder.pi-agents-ownership.lock",
+    "pid-only.pi-agents-ownership.lock",
   ]);
 });
 
@@ -85,8 +85,18 @@ it("reclaims a dead holder and never a live one", async () => {
 
   const removed = await sweepStaleWorktreeLocks({ worktreesRoot: root, startedAt: startedAt(), inspect });
 
-  expect(removed).toEqual([join(root, "dead.pi-dashboard-ownership.lock")]);
-  expect((await readdir(root)).sort()).toEqual(["fresh.pi-dashboard-ownership.lock", "live.pi-dashboard-ownership.lock"]);
+  expect(removed).toEqual([join(root, "dead.pi-agents-ownership.lock")]);
+  expect((await readdir(root)).sort()).toEqual(["fresh.pi-agents-ownership.lock", "live.pi-agents-ownership.lock"]);
+});
+
+it.each([".pi-dashboard-ownership.lock", ".pi-agents-dashboard-ownership.lock"])("reclaims a dead holder's %s lock written under a previous product name", async (suffix) => {
+  const root = await worktreesRoot();
+  await lock(root, "dead", { pid: 4242, processGroupId: 4242, startIdentity: "9" }, 5 * 60_000, suffix);
+
+  const removed = await sweepStaleWorktreeLocks({ worktreesRoot: root, startedAt: startedAt(), inspect: absent });
+
+  expect(removed).toEqual([join(root, `dead${suffix}`)]);
+  expect(await readdir(root)).toEqual([]);
 });
 
 it("reclaims a holder whose PID was recycled by another process", async () => {
@@ -110,7 +120,7 @@ it("retains a lock whose holder process state is unreadable", async () => {
   const removed = await sweepStaleWorktreeLocks({ worktreesRoot: root, startedAt: startedAt(), inspect });
 
   expect(removed).toEqual([]);
-  expect(await readdir(root)).toEqual(["ambiguous.pi-dashboard-ownership.lock"]);
+  expect(await readdir(root)).toEqual(["ambiguous.pi-agents-ownership.lock"]);
 });
 
 it("retains a lock whose record changed between inspection and removal", async () => {
@@ -168,13 +178,13 @@ it("unlinks exactly the verified token entry and never removes recursively", asy
 it("keeps anything it cannot read as a lock and tolerates a missing root", async () => {
   const root = await worktreesRoot();
   await mkdir(join(root, "0fa4e7e1"), { mode: 0o700 });
-  const unreadable = join(root, "corrupt.pi-dashboard-ownership.lock");
+  const unreadable = join(root, "corrupt.pi-agents-ownership.lock");
   await mkdir(unreadable, { mode: 0o700 });
   await writeFile(join(unreadable, "entry"), "{not json}\n", { mode: 0o600 });
   const when = new Date(Date.now() - 5 * 60_000);
   await utimes(unreadable, when, when);
 
   expect(await sweepStaleWorktreeLocks({ worktreesRoot: root, startedAt: startedAt() })).toEqual([]);
-  expect((await readdir(root)).sort()).toEqual(["0fa4e7e1", "corrupt.pi-dashboard-ownership.lock"]);
+  expect((await readdir(root)).sort()).toEqual(["0fa4e7e1", "corrupt.pi-agents-ownership.lock"]);
   await expect(sweepStaleWorktreeLocks({ worktreesRoot: join(root, "missing"), startedAt: startedAt() })).resolves.toEqual([]);
 });

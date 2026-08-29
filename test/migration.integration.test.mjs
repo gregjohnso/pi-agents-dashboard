@@ -11,7 +11,7 @@ import { migrateLegacyState } from "../runtime/state-migration.mjs";
 async function attempt(mutator, expectedCode) {
   const parent = await mkdtemp(join(tmpdir(), "migration-unsafe-"));
   const legacyRoot = join(parent, "pi-agents-dashboard");
-  const destinationRoot = join(parent, "pi-dashboard");
+  const destinationRoot = join(parent, "pi-agents");
   await mkdir(legacyRoot, { mode: 0o700 });
   await writeFile(join(legacyRoot, "dashboard.json"), JSON.stringify({ schemaVersion: 1 }), { mode: 0o600 });
   try {
@@ -29,7 +29,7 @@ async function attempt(mutator, expectedCode) {
 it("publishes and reconciles exactly one real destination daemon", async () => {
   const parent = await mkdtemp(join(tmpdir(), "migration-real-daemon-"));
   const legacyRoot = join(parent, "pi-agents-dashboard");
-  const destinationRoot = join(parent, "pi-dashboard");
+  const destinationRoot = join(parent, "pi-agents");
   await mkdir(legacyRoot, { mode: 0o700 });
   await writeFile(join(legacyRoot, "dashboard.json"), JSON.stringify({ schemaVersion: 1 }), { mode: 0o600 });
   try {

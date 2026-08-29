@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
 
-const LOCK_SUFFIXES = [".pi-dashboard-ownership.lock", ".pi-agents-dashboard-ownership.lock"];
+const LOCK_SUFFIXES = [".pi-agents-ownership.lock", ".pi-dashboard-ownership.lock", ".pi-agents-dashboard-ownership.lock"];
 const ABSENT_PROCESS_CODES = ["ENOENT", "ESRCH"];
 
 /** @param {any} holder */

@@ -4,11 +4,11 @@ import { fileURLToPath } from "node:url";
 import { runDaemonCommand } from "./daemon-commands.mjs";
 import { runSessionCommand } from "./session-commands.mjs";
 
-const HELP = `Usage: pi-dashboard [--pi-bin /absolute/path/to/pi]
-       pi-dashboard daemon start|status|restart|recover|stop [--stop-workers --yes]
-       pi-dashboard session <command>
+const HELP = `Usage: pi-agents [--pi-bin /absolute/path/to/pi]
+       pi-agents daemon start|status|restart|recover|stop [--stop-workers --yes]
+       pi-agents session <command>
 
-With no arguments, pi-dashboard opens the machine-local session list.
+With no arguments, pi-agents opens the machine-local session list.
 `;
 
 async function defaultOpenApp(options) {
@@ -46,10 +46,10 @@ export async function runCli(argv = process.argv.slice(2), deps = {}) {
     }
     if (args[0] === "daemon") {
       const stopWorkers = args[1] === "stop" && args.length === 4 && args.includes("--stop-workers") && args.includes("--yes");
-      if (args.length !== 2 && !stopWorkers) result = { code: 2, error: { code: "INVALID_SYNTAX", message: "Usage: pi-dashboard daemon start|status|restart|recover|stop [--stop-workers --yes]" } };
+      if (args.length !== 2 && !stopWorkers) result = { code: 2, error: { code: "INVALID_SYNTAX", message: "Usage: pi-agents daemon start|status|restart|recover|stop [--stop-workers --yes]" } };
       else result = await (deps.runDaemonCommand ?? runDaemonCommand)(args[1], stopWorkers ? { ...deps.daemonOptions, stopWorkers: true, yes: true } : deps.daemonOptions);
     } else if (args[0] === "session") result = await (deps.runSessionCommand ?? runSessionCommand)(args.slice(1), deps.sessionOptions);
-    else result = { code: 2, error: { code: "INVALID_SYNTAX", message: "Usage: pi-dashboard [--pi-bin /absolute/path] | daemon ... | session ..." } };
+    else result = { code: 2, error: { code: "INVALID_SYNTAX", message: "Usage: pi-agents [--pi-bin /absolute/path] | daemon ... | session ..." } };
   } catch (error) {
     const conflictCodes = new Set(["OWNERSHIP_CONFLICT", "AMBIGUOUS_IDENTITY", "DAEMON_IDENTITY_CONFLICT", "PROCESS_IDENTITY_CONFLICT", "STALE_LEASE"]);
     result = { code: conflictCodes.has(error?.code) ? 5 : 1, error: { code: error?.code ?? "COMMAND_FAILED", message: error instanceof Error ? error.message : "Command failed" } };

@@ -50,7 +50,7 @@ process.stdin.on("data", (chunk) => {
       setTimeout(() => process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: false, error: "unknown command" })}\n`), Number(process.env.FAKE_PI_DELAYED_UNKNOWN_EXTENSION_UI_RESPONSE_MS));
       continue;
     }
-    if (type === "__pi_dashboard_unknown_command__") {
+    if (type === "__pi_agents_unknown_command__") {
       process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: process.env.FAKE_PI_UNKNOWN_SUCCESS === "1", error: process.env.FAKE_PI_UNKNOWN_SUCCESS === "1" ? undefined : "unknown command" })}\n`);
       continue;
     }
@@ -59,7 +59,7 @@ process.stdin.on("data", (chunk) => {
       continue;
     }
     if (type === "get_state") {
-      const reportedSessionFile = process.env.FAKE_PI_RUNTIME_STATE_SESSION_PATH !== undefined && !sessionFile.includes("pi-dashboard-probe-")
+      const reportedSessionFile = process.env.FAKE_PI_RUNTIME_STATE_SESSION_PATH !== undefined && !sessionFile.includes("pi-agents-probe-")
         ? process.env.FAKE_PI_RUNTIME_STATE_SESSION_PATH
         : process.env.FAKE_PI_STATE_SESSION_PATH ?? sessionFile;
       process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: true, data: { sessionId: "fake", sessionFile: reportedSessionFile, model: null, thinkingLevel: "off" } })}\n`);

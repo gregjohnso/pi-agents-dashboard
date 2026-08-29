@@ -814,7 +814,7 @@ describe("dashboard controller", () => {
             expect(backend.requests[0]).toMatchObject({ prompt: "ship it", model: { provider: "openai", id: "gpt-6" } });
         });
         it("takes an existing directory and refuses anything else by name", async () => {
-            const root = await mkdtemp(join(tmpdir(), "pi-dashboard-cwd-"));
+            const root = await mkdtemp(join(tmpdir(), "pi-agents-cwd-"));
             const file = join(root, "notes.txt");
             await writeFile(file, "", { mode: 0o600 });
             try {

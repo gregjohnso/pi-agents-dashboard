@@ -1,13 +1,13 @@
-# pi-dashboard task list
+# pi-agents task list
 
-**Plan:** `docs/superpowers/specs/2026-08-25-pi-dashboard-execution-plan.md`
-**Spec:** `docs/superpowers/specs/2026-08-25-pi-dashboard-design.md`
+**Plan:** `docs/superpowers/specs/2026-08-25-pi-agents-execution-plan.md`
+**Spec:** `docs/superpowers/specs/2026-08-25-pi-agents-design.md`
 **Status:** T17-T20 are integrated and reviewed; T21 is the final acceptance gate.
 **Integrated baseline:** `5a36be230521610f2445f8947c4c92760e874872`
 
 ## Document responsibility
 
-This file tracks owners, dependencies, deliverables, and gate status. The [design](2026-08-25-pi-dashboard-design.md) owns product behavior. The [execution plan](2026-08-25-pi-dashboard-execution-plan.md) owns files, interfaces, exact steps, and commands.
+This file tracks owners, dependencies, deliverables, and gate status. The [design](2026-08-25-pi-agents-design.md) owns product behavior. The [execution plan](2026-08-25-pi-agents-execution-plan.md) owns files, interfaces, exact steps, and commands.
 
 ## Tracking rules
 
@@ -69,7 +69,7 @@ integrated baseline
   - Depends on: integrated baseline.
   - Claimed files: package/lock, bin, CLI naming, config/contracts, paths/migration, daemon composer authorization, `app/list/**`, standalone shell.
   - Deliverables:
-    - package and executable named `pi-dashboard`;
+    - package and executable named `pi-agents`;
     - no package extension entry point or package registration CLI;
     - public Pi UI packages installed as standalone runtime dependencies;
     - schema 2 configuration and frozen viewer contracts;
@@ -231,7 +231,7 @@ integrated baseline
 - [x] T20 complete and reviewed.
 - [x] T21 complete and reviewed.
 - [x] R1-R6 have no undispositioned finding.
-- [x] Packed output exposes only `pi-dashboard` and excludes private/runtime/development artifacts.
+- [x] Packed output exposes only `pi-agents` and excludes private/runtime/development artifacts.
 - [x] Required capability failure starts no canonical writer.
 - [x] App and daemon closure leave verified runs alive.
 - [x] Migration preserves legacy source, canonical Pi session files, and worktrees.

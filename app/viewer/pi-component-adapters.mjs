@@ -47,8 +47,8 @@ export function adaptAssistantMessage(item, options = {}) {
       : part.type === "text"
         ? { type: "text", text: part.text }
         : { type: "text", text: `[${part.type}: ${part.attachmentId}]` }),
-    api: "pi-dashboard-normalized",
-    provider: options.provider ?? "pi-dashboard",
+    api: "pi-agents-normalized",
+    provider: options.provider ?? "pi-agents",
     model: options.model ?? "normalized-viewer",
     usage: { ...EMPTY_USAGE, cost: { ...EMPTY_USAGE.cost } },
     stopReason: options.streaming ? "pending" : "stop",

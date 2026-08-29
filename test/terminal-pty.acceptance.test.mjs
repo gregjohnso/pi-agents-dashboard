@@ -11,17 +11,17 @@ const SHOW_CURSOR = Buffer.from("\x1b[?25h");
 const ENABLE_AUTOWRAP = Buffer.from("\x1b[?7h");
 
 it("navigates to New Session, quits with Ctrl+C, and restores the real terminal", async () => {
-  const temporaryRoot = await mkdtemp(join(tmpdir(), "pi-dashboard-pty-"));
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "pi-agents-pty-"));
   const stateRoot = join(temporaryRoot, "state");
   const transcriptPath = join(temporaryRoot, "transcript");
   const env = {
     ...process.env,
-    PI_DASHBOARD_STATE_DIR: stateRoot,
+    PI_AGENTS_STATE_DIR: stateRoot,
     TERM: "xterm-256color",
     COLUMNS: "80",
     LINES: "24",
   };
-  const command = "node ./bin/pi-dashboard.mjs; code=$?; printf '\\n__STTY__\\n'; stty -a; exit \"$code\"";
+  const command = "node ./bin/pi-agents.mjs; code=$?; printf '\\n__STTY__\\n'; stty -a; exit \"$code\"";
   const child = spawn("script", ["-qfec", command, transcriptPath], {
     cwd: process.cwd(),
     env,
@@ -32,7 +32,7 @@ it("navigates to New Session, quits with Ctrl+C, and restores the real terminal"
   let stage = "startup";
   const onOutput = (chunk) => {
     output = Buffer.concat([output, Buffer.from(chunk)]);
-    if (stage === "startup" && output.includes(Buffer.from("pi-dashboard"))) {
+    if (stage === "startup" && output.includes(Buffer.from("pi-agents"))) {
       // Typing needs no navigation: the composer is not a focus stop.
       stage = "typing";
       child.stdin.write("x");
@@ -55,7 +55,7 @@ it("navigates to New Session, quits with Ctrl+C, and restores the real terminal"
     transcript = await readFile(transcriptPath);
   } finally {
     clearTimeout(timeout);
-    stopped = spawnSync("node", ["./bin/pi-dashboard.mjs", "daemon", "stop"], {
+    stopped = spawnSync("node", ["./bin/pi-agents.mjs", "daemon", "stop"], {
       cwd: process.cwd(), env, encoding: "utf8", timeout: 10_000,
     });
     await rm(temporaryRoot, { recursive: true, force: true });

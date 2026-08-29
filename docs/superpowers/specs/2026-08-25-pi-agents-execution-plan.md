@@ -1,18 +1,18 @@
-# pi-dashboard standalone implementation plan
+# pi-agents standalone implementation plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Convert the integrated dashboard foundation into the standalone `pi-dashboard` npm executable, launch installed Pi processes through RPC, normalize their saved and live data, render a Pi-style interactive chat viewer, and prove lifecycle and package acceptance.
+**Goal:** Convert the integrated dashboard foundation into the standalone `pi-agents` npm executable, launch installed Pi processes through RPC, normalize their saved and live data, render a Pi-style interactive chat viewer, and prove lifecycle and package acceptance.
 
 **Architecture:** One per-user daemon owns the registry, durable commands, normalized viewer events, attachment roles, and exact process identities. A detached supervisor owns each installed `pi --mode rpc --session <session-file>` child's pipes and reconnects to the daemon; the standalone app owns the terminal, Jobwatch-style list, and Pi-style viewer. The app consumes a versioned normalized viewer protocol and never reads raw Pi frames or session JSONL directly.
 
 **Tech stack:** Node.js 22.19+, plain ESM `.mjs` runtime and app modules checked by TypeScript 5.9, Vitest 4.1.9, public package-root exports from `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui`, Unix sockets, POSIX process groups, Git worktrees, npm, and Pixi.
 
-**Spec:** `docs/superpowers/specs/2026-08-25-pi-dashboard-design.md`
+**Spec:** `docs/superpowers/specs/2026-08-25-pi-agents-design.md`
 
 ## Document responsibility
 
-This file owns implementation order, files, shared interfaces, parallel lanes, test-first steps, commands, and milestone gates. The [design](2026-08-25-pi-dashboard-design.md) controls product behavior. The [task list](2026-08-25-pi-dashboard-tasklist.md) records execution status. A conflict is resolved in favor of the design.
+This file owns implementation order, files, shared interfaces, parallel lanes, test-first steps, commands, and milestone gates. The [design](2026-08-25-pi-agents-design.md) controls product behavior. The [task list](2026-08-25-pi-agents-tasklist.md) records execution status. A conflict is resolved in favor of the design.
 
 ## Integrated baseline
 
@@ -32,7 +32,7 @@ Historical extension and host-capability code is migration input, not release ar
 
 ## Global constraints
 
-- The canonical package, executable, user-visible name, new runtime root, repository name, and documentation name are `pi-dashboard`.
+- The canonical package, executable, user-visible name, new runtime root, repository name, and documentation name are `pi-agents`.
 - The product is a standalone terminal app. The npm package contains no Pi extension entry point, and `pi install` is unsupported.
 - Empty argv opens the Jobwatch-style list. `--pi-bin <absolute-path>` overrides configuration; configuration overrides `PATH` discovery.
 - The daemon derives trusted Pi configuration and runtime paths. Clients cannot provide a trusted configuration root.
@@ -102,14 +102,14 @@ No two mutation-capable lanes share a worktree. Read-only reviewers may inspect 
 ## File and responsibility map
 
 ```text
-pi-dashboard/
+pi-agents/
 ├── package.json                         # standalone package metadata and scripts
 ├── package-lock.json                    # deterministic runtime/UI dependencies
 ├── pixi.toml                            # typecheck, focused, integration, acceptance gates
 ├── tsconfig.json                        # checkJs for app, bin, cli, runtime, isolation, shared
 ├── README.md                            # standalone install, operation, recovery, support
 ├── bin/
-│   └── pi-dashboard.mjs                 # package-relative executable
+│   └── pi-agents.mjs                 # package-relative executable
 ├── app/
 │   ├── standalone.mjs                   # terminal and daemon composition root
 │   ├── standalone.test.mjs
@@ -345,7 +345,7 @@ T17 also extends `SessionRecord` with optional `runtime?: RunRuntimeIdentity` du
 - Modify: `pixi.toml`
 - Modify: `tsconfig.json`
 - Modify: `README.md`
-- Rename: `bin/pi-agents-dashboard.mjs` to `bin/pi-dashboard.mjs`
+- Rename: `bin/pi-agents-dashboard.mjs` to `bin/pi-agents.mjs`
 - Modify: `cli/main.mjs`
 - Modify: `cli/main.test.mjs`
 - Modify: `cli/daemon-commands.mjs`
@@ -402,8 +402,8 @@ Add behavioral assertions:
 
 ```js
 it("ships only the standalone executable", () => {
-  expect(manifest.name).toBe("pi-dashboard");
-  expect(manifest.bin).toEqual({ "pi-dashboard": "./bin/pi-dashboard.mjs" });
+  expect(manifest.name).toBe("pi-agents");
+  expect(manifest.bin).toEqual({ "pi-agents": "./bin/pi-agents.mjs" });
   expect(manifest.pi).toBeUndefined();
   expect(manifest.scripts.preinstall).toBeUndefined();
   expect(manifest.scripts.postinstall).toBeUndefined();
@@ -470,7 +470,7 @@ Expected: FAIL because viewer contracts and complete composer authorization are 
 
 Apply the full package/bin/UI/state rename. Pin `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui` at `0.84.3` as runtime dependencies and refresh the lockfile with `pixi run npm install`. Remove the package extension manifest and package registration CLI. Convert relocated app code to package-executable `.mjs` modules with JSDoc/checkJs types. Empty argv initializes private permissions, runs migration, connects to or starts the daemon, and opens the list.
 
-Implement schema 2 with the exact design defaults. Derive the legacy state/runtime roots named `pi-agents-dashboard` and the destination roots named `pi-dashboard` from the same per-user XDG locations. Migration stages only dashboard metadata/configuration, never canonical Pi sessions or worktrees. Publish a mode-`0600` manifest under mode-`0700` roots and preserve the legacy source after success.
+Implement schema 2 with the exact design defaults. Derive the legacy state/runtime roots named `pi-agents-dashboard` and the destination roots named `pi-agents` from the same per-user XDG locations. Migration stages only dashboard metadata/configuration, never canonical Pi sessions or worktrees. Publish a mode-`0600` manifest under mode-`0700` roots and preserve the legacy source after success.
 
 Freeze viewer contracts and enforce composer role on the daemon before command acceptance. Replace the list's obsolete session-open dependency with an injected `openViewer(sessionId)` boundary owned by `app-controller.mjs`; T20 supplies its implementation.
 
@@ -487,7 +487,7 @@ pixi run test
 pixi run pack-check
 ```
 
-Expected: all commands exit 0; packed output has `pi-dashboard`, `app/`, no extension manifest, and no private state.
+Expected: all commands exit 0; packed output has `pi-agents`, `app/`, no extension manifest, and no private state.
 
 - [ ] **Step 9: Commit T17**
 
@@ -907,10 +907,10 @@ Create one tarball with structured process spawning and isolated `HOME`, npm pre
 
 ```text
 npm install --prefix <tmp>/local --ignore-scripts <absolute-repository-path>
-<tmp>/local/node_modules/.bin/pi-dashboard --help
+<tmp>/local/node_modules/.bin/pi-agents --help
 npm install --global --prefix <tmp>/global --ignore-scripts <tarball>
-<tmp>/global/bin/pi-dashboard --help
-npx --yes --offline --cache <tmp>/cache --package <tarball> pi-dashboard --help
+<tmp>/global/bin/pi-agents --help
+npx --yes --offline --cache <tmp>/cache --package <tarball> pi-agents --help
 ```
 
 Assert package-relative startup from an unrelated cwd, no lifecycle scripts, and no private state, diagnostics, sessions, worktrees, `.superpowers`, `.vscode`, caches, legacy UI directories, or package extension manifest. Legacy product strings are allowed only in migration code/fixtures. Do not contact a registry.
@@ -995,7 +995,7 @@ pixi run git commit -m "test: attest standalone pi dashboard"
 
 - [ ] **Step 11: Record the post-acceptance repository rename gate**
 
-After T21 is accepted, rename the private repository remote and primary checkout to `pi-dashboard`. Do not rename canonical Pi session files or managed worktrees. Do not publish npm as part of this step.
+After T21 is accepted, rename the private repository remote and primary checkout to `pi-agents`. Do not rename canonical Pi session files or managed worktrees. Do not publish npm as part of this step.
 
 ## Review protocol
 

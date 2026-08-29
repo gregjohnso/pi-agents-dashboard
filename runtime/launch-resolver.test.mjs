@@ -11,7 +11,7 @@ const { createLaunchResolver } = launchResolver;
 
 it("materializes and validates a real Pi session header before launch", async () => {
   expect(launchResolver.materializePiSession).toBeTypeOf("function");
-  const root = await mkdtemp(join(tmpdir(), "pi-dashboard-materialized-session-"));
+  const root = await mkdtemp(join(tmpdir(), "pi-agents-materialized-session-"));
   const cwd = join(root, "cwd");
   const sessions = join(root, "sessions");
   await Promise.all([mkdir(cwd), mkdir(sessions)]);
@@ -32,7 +32,7 @@ it("rolls back an exact prepared session and worktree after a pre-child refusal"
   expect(launchResolver.rollbackPreparedLaunch).toBeTypeOf("function");
   /** @type {string[]} */
   const order = [];
-  const record = { revision: 0, ownership: undefined, isolation: { mode: "worktree", worktreePath: "/worktree", branch: "pi-dashboard/prepared" } };
+  const record = { revision: 0, ownership: undefined, isolation: { mode: "worktree", worktreePath: "/worktree", branch: "pi-agents/prepared" } };
   const registry = {
     get: vi.fn(async () => record),
     remove: vi.fn(async () => { order.push("registry"); }),
@@ -79,7 +79,7 @@ it("names a session from its initial prompt and keeps an explicit name", async (
 
 it("removes a prepared worktree when later session preparation fails", async () => {
   const cleanupWorktree = vi.fn(async () => ({ disposition: "REMOVED" }));
-  const createWorktree = vi.fn(async () => ({ mode: "worktree", worktreePath: "/worktree", branch: "pi-dashboard/prepared", workerCwd: "/worktree" }));
+  const createWorktree = vi.fn(async () => ({ mode: "worktree", worktreePath: "/worktree", branch: "pi-agents/prepared", workerCwd: "/worktree" }));
   const resolveLaunch = createLaunchResolver({
     registry: { list: vi.fn(async () => []) },
     piConfigRoot: "/pi/agent",
@@ -92,7 +92,7 @@ it("removes a prepared worktree when later session preparation fails", async () 
   });
 
   await expect(resolveLaunch({ payload: { prompt: "hello", cwd: "/repo", sourceSessionId: "source", isolation: { mode: "worktree" } } })).rejects.toThrow("session preparation failed");
-  expect(cleanupWorktree).toHaveBeenCalledWith({ mode: "worktree", worktreePath: "/worktree", branch: "pi-dashboard/prepared", workerCwd: "/worktree" }, { readLiveOwnership: expect.any(Function) });
+  expect(cleanupWorktree).toHaveBeenCalledWith({ mode: "worktree", worktreePath: "/worktree", branch: "pi-agents/prepared", workerCwd: "/worktree" }, { readLiveOwnership: expect.any(Function) });
 });
 
 it("builds an isolated canonical session launch from the daemon request", async () => {
@@ -108,13 +108,13 @@ it("builds an isolated canonical session launch from the daemon request", async 
     sourceDirty: false,
     sourceSessionId: "dashboard-client",
     piConfigRoot: "/pi/agent",
-    worktreesRoot: "/pi/agent/pi-dashboard/worktrees",
+    worktreesRoot: "/pi/agent/pi-agents/worktrees",
   }));
   const createWorktree = vi.fn(async () => ({
     mode: "worktree",
-    worktreePath: "/pi/agent/pi-dashboard/worktrees/session-id",
-    branch: "pi-dashboard/session-id",
-    workerCwd: "/pi/agent/pi-dashboard/worktrees/session-id/packages/app",
+    worktreePath: "/pi/agent/pi-agents/worktrees/session-id",
+    branch: "pi-agents/session-id",
+    workerCwd: "/pi/agent/pi-agents/worktrees/session-id/packages/app",
   }));
   const createPiSession = vi.fn(() => ({ sessionId: "session-id", sessionFile: "/pi/agent/sessions/project/session-id.jsonl" }));
   const ids = ["session-id", "run-id"];
@@ -146,7 +146,7 @@ it("builds an isolated canonical session launch from the daemon request", async 
   await expect(resolveLaunch(request)).resolves.toEqual({
     sessionId: "session-id",
     canonicalSessionFile: "/pi/agent/sessions/project/session-id.jsonl",
-    cwd: "/pi/agent/pi-dashboard/worktrees/session-id/packages/app",
+    cwd: "/pi/agent/pi-agents/worktrees/session-id/packages/app",
     runId: "run-id",
     initialPrompt: "who are you?",
     model: { provider: "openai", id: "gpt" },
@@ -158,7 +158,7 @@ it("builds an isolated canonical session launch from the daemon request", async 
       sessionId: "session-id",
       sessionFile: "/pi/agent/sessions/project/session-id.jsonl",
       canonicalSessionFile: "/pi/agent/sessions/project/session-id.jsonl",
-      cwd: "/pi/agent/pi-dashboard/worktrees/session-id/packages/app",
+      cwd: "/pi/agent/pi-agents/worktrees/session-id/packages/app",
       name: "identity",
       nameGenerated: false,
       model: { provider: "openai", id: "gpt" },
@@ -167,14 +167,14 @@ it("builds an isolated canonical session launch from the daemon request", async 
       processState: "EXITED",
       outcome: "NONE",
       activity: { kind: "launching", summary: "who are you?", updatedAt: "2026-08-25T12:00:00.000Z" },
-      isolation: { mode: "worktree", worktreePath: "/pi/agent/pi-dashboard/worktrees/session-id", branch: "pi-dashboard/session-id" },
+      isolation: { mode: "worktree", worktreePath: "/pi/agent/pi-agents/worktrees/session-id", branch: "pi-agents/session-id" },
       createdAt: "2026-08-25T12:00:00.000Z",
       updatedAt: "2026-08-25T12:00:00.000Z",
     },
   });
   expect(preflight).toHaveBeenCalledWith(request.payload, { piConfigRoot: "/pi/agent", currentOwnerSessionIds: [] });
   expect(createWorktree).toHaveBeenCalledWith(expect.any(Object), { worktreeId: "session-id" });
-  expect(createPiSession).toHaveBeenCalledWith("/pi/agent/pi-dashboard/worktrees/session-id/packages/app", "session-id");
+  expect(createPiSession).toHaveBeenCalledWith("/pi/agent/pi-agents/worktrees/session-id/packages/app", "session-id");
 });
 
 it("rejects a shared-directory launch when owners changed after frontend confirmation", async () => {

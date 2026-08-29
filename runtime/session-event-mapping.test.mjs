@@ -6,7 +6,7 @@ import { reduceSessionState } from "./state-reducer.mjs";
 const at = "2026-08-25T12:00:00.000Z";
 
 /**
- * One run as recorded under ~/.local/state/pi-dashboard/runs/*\/diagnostics/rpc.*.jsonl: every run
+ * One run as recorded under ~/.local/state/pi-agents/runs/*\/diagnostics/rpc.*.jsonl: every run
  * in every recording is `agent_start (turn_start turn_end)+ agent_end agent_settled`, with 1 to 35
  * turns per run.
  */

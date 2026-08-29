@@ -210,7 +210,7 @@ describe("viewer normalizer", () => {
 
   it("keeps a burst of one-way Pi UI updates out of the transcript", () => {
     // One recorded run emitted 153 consecutive setWidget requests inside a single turn
-    // (~/.local/state/pi-dashboard/runs/*/diagnostics/rpc.*.jsonl).
+    // (~/.local/state/pi-agents/runs/*/diagnostics/rpc.*.jsonl).
     const subject = normalizer();
     const events = [];
     for (let index = 0; index < 153; index += 1) {

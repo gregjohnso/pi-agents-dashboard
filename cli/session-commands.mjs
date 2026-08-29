@@ -59,7 +59,7 @@ function exactId(value) {
 /** Resolve the machine-local dashboard state root. @param {NodeJS.ProcessEnv} [env] */
 export function resolveRuntimeRoot(env = process.env) {
   const home = env.HOME ?? homedir();
-  return resolve(env.PI_DASHBOARD_STATE_DIR ?? join(env.XDG_STATE_HOME ?? join(home, ".local", "state"), "pi-dashboard"));
+  return resolve(env.PI_AGENTS_STATE_DIR ?? join(env.XDG_STATE_HOME ?? join(home, ".local", "state"), "pi-agents"));
 }
 
 /** @param {string} directory @param {any} [fsOps] */

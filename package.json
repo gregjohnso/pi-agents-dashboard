@@ -1,12 +1,12 @@
 {
-  "name": "pi-dashboard",
+  "name": "pi-agents",
   "version": "0.0.0",
   "type": "module",
   "engines": {
     "node": ">=22.19.0"
   },
   "bin": {
-    "pi-dashboard": "./bin/pi-dashboard.mjs"
+    "pi-agents": "./bin/pi-agents.mjs"
   },
   "files": [
     "app/**/*.mjs",

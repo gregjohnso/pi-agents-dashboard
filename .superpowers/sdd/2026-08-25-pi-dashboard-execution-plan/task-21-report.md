@@ -136,7 +136,7 @@ All 15 accepted findings were addressed without changing public viewer protocol 
 | 12 | Resolved, replaced, and closed overlays call `dispose` and restore focus exactly once. |
 | 13 | `STALE_IDENTITY` is a failed unresolved Stop, or `DELIVERY_UNKNOWN` after prior signaling; only exact terminal evidence clears ownership. |
 | 14 | Signaler regression pins every inspect, graceful request, 5,000 ms wait, TERM, second wait, KILL, and terminal inspect in exact order. |
-| 15 | Package metrics are retained in `/tmp/pi-dashboard-task-21-package-evidence.json` by acceptance and copied above; command and test counts follow. |
+| 15 | Package metrics are retained in `/tmp/pi-agents-task-21-package-evidence.json` by acceptance and copied above; command and test counts follow. |
 
 ### Fix-round command and test evidence
 

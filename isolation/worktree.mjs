@@ -10,11 +10,11 @@ import { ensurePrivateDirectory } from "../runtime/permissions.mjs";
 import { IsolationError } from "./launch-preflight.mjs";
 
 const execFileAsync = promisify(execFile);
-export const WORKTREE_OWNERSHIP_FILE = "pi-dashboard-owner.json";
-export const LEGACY_WORKTREE_OWNERSHIP_FILE = "pi-agents-dashboard-owner.json";
+export const WORKTREE_OWNERSHIP_FILE = "pi-agents-owner.json";
+export const LEGACY_WORKTREE_OWNERSHIP_FILES = ["pi-dashboard-owner.json", "pi-agents-dashboard-owner.json"];
 const WORKTREE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
-const WORKTREE_LOCK_SUFFIX = ".pi-dashboard-ownership.lock";
-const LEGACY_WORKTREE_LOCK_SUFFIX = ".pi-agents-dashboard-ownership.lock";
+const WORKTREE_LOCK_SUFFIX = ".pi-agents-ownership.lock";
+const LEGACY_WORKTREE_LOCK_SUFFIXES = [".pi-dashboard-ownership.lock", ".pi-agents-dashboard-ownership.lock"];
 
 /** @param {string} cwd @param {string[]} args */
 async function git(cwd, args) {
@@ -54,8 +54,10 @@ export async function acquireWorktreeOwnershipLock(worktreePath) {
   const locks = [];
   try {
     const lockPaths = [`${worktreePath}${WORKTREE_LOCK_SUFFIX}`];
-    try { await lstat(`${worktreePath}${LEGACY_WORKTREE_LOCK_SUFFIX}`); lockPaths.push(`${worktreePath}${LEGACY_WORKTREE_LOCK_SUFFIX}`); }
-    catch (error) { if (/** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT") throw error; }
+    for (const suffix of LEGACY_WORKTREE_LOCK_SUFFIXES) {
+      try { await lstat(`${worktreePath}${suffix}`); lockPaths.push(`${worktreePath}${suffix}`); }
+      catch (error) { if (/** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT") throw error; }
+    }
     // Locks written before holder identity existed carry no way to test liveness, so they may be
     // reclaimed only once the worktree they guard is gone and no live operation can still need them.
     let reclaimIdentityFreeLock = false;
@@ -139,7 +141,7 @@ export async function createWorktree(preflight, options) {
   }
 
   const canonicalPiConfigRoot = await realpath(preflight.piConfigRoot);
-  const dashboardRoot = join(canonicalPiConfigRoot, "pi-dashboard");
+  const dashboardRoot = join(canonicalPiConfigRoot, "pi-agents");
   const expectedWorktreesRoot = join(dashboardRoot, "worktrees");
   if (preflight.worktreesRoot !== expectedWorktreesRoot) {
     throw new IsolationError(
@@ -170,7 +172,7 @@ export async function createWorktree(preflight, options) {
   if (!isAbsolute(worktreePath) || resolve(worktreePath) !== worktreePath) {
     throw new IsolationError("INVALID_WORKTREE_PATH", "Derived worktree path is not canonical");
   }
-  const branch = `pi-dashboard/${options.worktreeId}`;
+  const branch = `pi-agents/${options.worktreeId}`;
   const lock = await acquireWorktreeOwnershipLock(worktreePath);
   try {
     try {

@@ -178,7 +178,7 @@ export class ViewerController {
     if (this.state === undefined) return Array.from({ length: height }, () => fit("Loading viewer…", width));
     const role = this.state.role.toUpperCase();
     const header = width >= 70
-      ? ` pi-dashboard · ${this.sessionId} · ${this.state.taskState}/${this.state.processState} · ${role}`
+      ? ` pi-agents · ${this.sessionId} · ${this.state.taskState}/${this.state.processState} · ${role}`
       : width >= 50
         ? ` ${this.sessionId} · ${this.state.taskState}/${this.state.processState} · ${role}`
         : ` ${this.state.taskState}/${this.state.processState} · ${role}`;

@@ -20,7 +20,7 @@ async function stateRoot() {
 it("uses one per-user state root regardless of effective Pi config root", () => {
   const envA = { HOME: "/home/user", PI_CONFIG_DIR: "/pi/a" };
   const envB = { HOME: "/home/user", PI_CONFIG_DIR: "/pi/b" };
-  expect(resolveRuntimeRoot(envA)).toBe("/home/user/.local/state/pi-dashboard");
+  expect(resolveRuntimeRoot(envA)).toBe("/home/user/.local/state/pi-agents");
   expect(resolveRuntimeRoot(envB)).toBe(resolveRuntimeRoot(envA));
 });
 

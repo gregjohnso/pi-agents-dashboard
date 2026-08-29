@@ -97,7 +97,7 @@ it("requires get_state to report the exact temporary non-canonical session", asy
   expect(report.commands).not.toContain("get_state");
   const starts = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line)).filter((entry) => entry.kind === "start");
   expect(starts.some((entry) => entry.argv.includes(canonicalSession))).toBe(false);
-  expect(starts.find((entry) => entry.argv.includes("--session")).argv.join(" ")).toContain("pi-dashboard-probe-");
+  expect(starts.find((entry) => entry.argv.includes("--session")).argv.join(" ")).toContain("pi-agents-probe-");
   expect(starts.some((entry) => entry.providerInvocation === true)).toBe(false);
 });
 

@@ -11,10 +11,10 @@ const roots = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
 
 async function fixture() {
-  const parent = await mkdtemp(join(tmpdir(), "pi-dashboard-migration-"));
+  const parent = await mkdtemp(join(tmpdir(), "pi-agents-migration-"));
   roots.push(parent);
   const legacyRoot = join(parent, "pi-agents-dashboard");
-  const destinationRoot = join(parent, "pi-dashboard");
+  const destinationRoot = join(parent, "pi-agents");
   await mkdir(join(legacyRoot, "sessions"), { recursive: true, mode: 0o700 });
   await writeFile(join(legacyRoot, "dashboard.json"), JSON.stringify({ schemaVersion: 1, workers: { maxLive: 2 } }), { mode: 0o600 });
   await writeFile(join(legacyRoot, "sessions", "one.json"), JSON.stringify({ schemaVersion: 1, revision: 0, sessionId: "one", sessionFile: "/canonical/sessions/one.jsonl", canonicalSessionFile: "/canonical/sessions/one.jsonl", cwd: "/repo", taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "none", summary: "idle", updatedAt: "2026-08-25T00:00:00.000Z" }, isolation: { mode: "worktree", worktreePath: "/worktrees/one", branch: "one" }, createdAt: "2026-08-25T00:00:00.000Z", updatedAt: "2026-08-25T00:00:00.000Z" }), { mode: 0o600 });

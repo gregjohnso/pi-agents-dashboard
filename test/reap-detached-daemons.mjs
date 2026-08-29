@@ -34,7 +34,7 @@ export function setup() {
 export function teardown() {
   // Off unless asked for: several suites can run concurrently on one machine, and a reaper that
   // cannot tell whose daemon it is would kill a neighbour's mid-run.
-  if (process.env.PI_DASHBOARD_REAP_TEST_DAEMONS !== "1") return;
+  if (process.env.PI_AGENTS_REAP_TEST_DAEMONS !== "1") return;
   const startedAt = Number(process.env.VITEST_RUN_STARTED_SECONDS ?? 0);
   const maxAge = startedAt > 0 ? Math.ceil(Date.now() / 1000) - startedAt + 60 : 3_600;
   let listing = "";

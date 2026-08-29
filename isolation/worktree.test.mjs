@@ -71,8 +71,8 @@ async function preflight(piConfigRoot, cwd = shared.root) {
 }
 
 it("reclaims an ownership lock abandoned by a dead dashboard process", async () => {
-  const worktreePath = join(await piConfigRoot(), "pi-dashboard", "worktrees", "run-stale");
-  const lockPath = `${worktreePath}.pi-dashboard-ownership.lock`;
+  const worktreePath = join(await piConfigRoot(), "pi-agents", "worktrees", "run-stale");
+  const lockPath = `${worktreePath}.pi-agents-ownership.lock`;
   await mkdir(lockPath, { recursive: true, mode: 0o700 });
   await writeFile(
     join(lockPath, "dead-token"),
@@ -87,8 +87,8 @@ it("reclaims an ownership lock abandoned by a dead dashboard process", async () 
 });
 
 it("reclaims an identity-free legacy lock only when its worktree is gone", async () => {
-  const worktreePath = join(await piConfigRoot(), "pi-dashboard", "worktrees", "run-legacy");
-  const lockPath = `${worktreePath}.pi-dashboard-ownership.lock`;
+  const worktreePath = join(await piConfigRoot(), "pi-agents", "worktrees", "run-legacy");
+  const lockPath = `${worktreePath}.pi-agents-ownership.lock`;
   const writeLegacyLock = async () => {
     await mkdir(lockPath, { recursive: true, mode: 0o700 });
     await writeFile(
@@ -111,7 +111,7 @@ it("reclaims an identity-free legacy lock only when its worktree is gone", async
 });
 
 it("refuses an ownership lock held by a live dashboard process", async () => {
-  const worktreesRoot = join(await piConfigRoot(), "pi-dashboard", "worktrees");
+  const worktreesRoot = join(await piConfigRoot(), "pi-agents", "worktrees");
   const worktreePath = join(worktreesRoot, "run-live");
   await mkdir(worktreesRoot, { recursive: true, mode: 0o700 });
   const held = await acquireWorktreeOwnershipLock(worktreePath);
@@ -132,25 +132,25 @@ it("creates an owned branch worktree with private roots, its ownership marker, a
 
   expect(result).toMatchObject({
     mode: "worktree",
-    worktreePath: join(configRoot, "pi-dashboard", "worktrees", "run-123"),
-    branch: "pi-dashboard/run-123",
-    workerCwd: join(configRoot, "pi-dashboard", "worktrees", "run-123", "packages", "app"),
+    worktreePath: join(configRoot, "pi-agents", "worktrees", "run-123"),
+    branch: "pi-agents/run-123",
+    workerCwd: join(configRoot, "pi-agents", "worktrees", "run-123", "packages", "app"),
     repositoryRoot: shared.root,
     baseCommit: expect.stringMatching(/^[0-9a-f]{40}$/u),
     ownershipId: expect.stringMatching(/^[0-9a-f-]{36}$/u),
   });
   await expect(access(result.workerCwd)).resolves.toBeUndefined();
   const { stdout: branch } = await git(result.worktreePath, "branch", "--show-current");
-  expect(branch.trim()).toBe("pi-dashboard/run-123");
+  expect(branch.trim()).toBe("pi-agents/run-123");
   const { stdout: gitDirectory } = await git(result.worktreePath, "rev-parse", "--git-dir");
-  await expect(access(join(gitDirectory.trim(), "pi-dashboard-owner.json"))).resolves.toBeUndefined();
-  expect((await stat(join(configRoot, "pi-dashboard"))).mode & 0o777).toBe(0o700);
-  expect((await stat(join(configRoot, "pi-dashboard", "worktrees"))).mode & 0o777).toBe(0o700);
+  await expect(access(join(gitDirectory.trim(), "pi-agents-owner.json"))).resolves.toBeUndefined();
+  expect((await stat(join(configRoot, "pi-agents"))).mode & 0o777).toBe(0o700);
+  expect((await stat(join(configRoot, "pi-agents", "worktrees"))).mode & 0o777).toBe(0o700);
 });
 
 it("rejects a pre-existing non-private dashboard worktree root", async () => {
   const configRoot = await piConfigRoot();
-  const worktreesRoot = join(configRoot, "pi-dashboard", "worktrees");
+  const worktreesRoot = join(configRoot, "pi-agents", "worktrees");
   await mkdir(worktreesRoot, { recursive: true, mode: 0o700 });
   await chmod(worktreesRoot, 0o755);
 
@@ -171,10 +171,10 @@ it("fails closed when an untracked source subdirectory is absent after checkout"
     await rm(untrackedSource, { recursive: true, force: true });
   }
   await expect(
-    access(join(configRoot, "pi-dashboard", "worktrees", "missing-source")),
+    access(join(configRoot, "pi-agents", "worktrees", "missing-source")),
   ).rejects.toMatchObject({ code: "ENOENT" });
   await expect(
-    git(shared.root, "rev-parse", "--verify", "refs/heads/pi-dashboard/missing-source"),
+    git(shared.root, "rev-parse", "--verify", "refs/heads/pi-agents/missing-source"),
   ).rejects.toBeDefined();
 });
 
@@ -198,11 +198,11 @@ it("keeps the rollback branch when HEAD changes during ownership publication", a
     shared.root,
     "rev-parse",
     "--verify",
-    "refs/heads/pi-dashboard/rollback-race^{commit}",
+    "refs/heads/pi-agents/rollback-race^{commit}",
   );
   expect(branchHead.trim()).not.toBe(preflightResult.baseCommit);
   await expect(
-    access(join(configRoot, "pi-dashboard", "worktrees", "rollback-race")),
+    access(join(configRoot, "pi-agents", "worktrees", "rollback-race")),
   ).resolves.toBeUndefined();
 });
 
@@ -216,12 +216,12 @@ it("creates from a canonicalized source-repository alias", async () => {
   });
 
   expect(result.repositoryRoot).toBe(shared.root);
-  expect(result.worktreePath).toBe(join(configRoot, "pi-dashboard", "worktrees", "canonical"));
+  expect(result.worktreePath).toBe(join(configRoot, "pi-agents", "worktrees", "canonical"));
 });
 
 it("reports branch collision and never falls back to shared directory", async () => {
   const configRoot = await piConfigRoot();
-  await git(shared.root, "branch", "pi-dashboard/branch-collision");
+  await git(shared.root, "branch", "pi-agents/branch-collision");
 
   await expect(
     createWorktree(await preflight(configRoot), { worktreeId: "branch-collision" }),
@@ -230,7 +230,7 @@ it("reports branch collision and never falls back to shared directory", async ()
 
 it("reports path collision and leaves the existing path intact", async () => {
   const configRoot = await piConfigRoot();
-  const collisionPath = join(configRoot, "pi-dashboard", "worktrees", "path-collision");
+  const collisionPath = join(configRoot, "pi-agents", "worktrees", "path-collision");
   await mkdir(collisionPath, { recursive: true, mode: 0o700 });
   await writeFile(join(collisionPath, "sentinel"), "keep\n");
 

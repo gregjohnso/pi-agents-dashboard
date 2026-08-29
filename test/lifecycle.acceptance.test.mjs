@@ -111,7 +111,7 @@ async function nextMatching(iterator, predicate) {
 }
 
 it("starts the production daemon with launch resolution and delivers the composer prompt", async () => {
-  const root = await setupRoot("pi-dashboard-production-launch-");
+  const root = await setupRoot("pi-agents-production-launch-");
   const executable = join(root, "pi");
   const log = join(root, "fake-pi.jsonl");
   await writeFile(executable, sourceFor("production"), { mode: 0o700 });
@@ -146,7 +146,7 @@ it("starts the production daemon with launch resolution and delivers the compose
 }, 30_000);
 
 it("keeps two mixed-version fake Pi children alive across frontend close and daemon restart, then replays later frames", async () => {
-  const root = await setupRoot("pi-dashboard-lifecycle-acceptance-");
+  const root = await setupRoot("pi-agents-lifecycle-acceptance-");
   const executable = join(root, "pi-current");
   const replacement = join(root, "pi-next");
   const log = join(root, "fake-pi.jsonl");
@@ -255,7 +255,7 @@ it("keeps two mixed-version fake Pi children alive across frontend close and dae
 }, 20_000);
 
 it("refuses a missing required capability before ownership, canonical writer, or run artifacts", async () => {
-  const root = await setupRoot("pi-dashboard-capability-acceptance-");
+  const root = await setupRoot("pi-agents-capability-acceptance-");
   const executable = join(root, "pi");
   await writeFile(executable, sourceFor("unsupported"), { mode: 0o700 });
   await chmod(executable, 0o700);

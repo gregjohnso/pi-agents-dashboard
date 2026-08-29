@@ -442,7 +442,7 @@ export class WorkerSupervisor {
       if (!this.#injectedSpawn) await this.#assertExecutable(executable);
       child = this.#spawn(process.execPath, argv, {
         cwd,
-        env: { ...this.#env, PI_DASHBOARD_WORKER_TOKEN: token },
+        env: { ...this.#env, PI_AGENTS_WORKER_TOKEN: token },
         detached: true,
         shell: false,
         stdio: ["ignore", stdoutHandle.fd, stderrHandle.fd, "ipc"],
@@ -686,7 +686,7 @@ export class WorkerSupervisor {
         frameListeners.add(listener);
         if (supervision.droppedFrameCount > 0) {
           const overflow = {
-            type: "pi_dashboard_frame_queue_overflow",
+            type: "pi_agents_frame_queue_overflow",
             droppedFrames: supervision.droppedFrameCount,
             droppedBytes: supervision.droppedFrameBytes,
             recovery: "snapshot_or_diagnostics",

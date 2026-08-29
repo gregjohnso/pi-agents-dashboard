@@ -57,7 +57,7 @@ function parseArgs(argv) {
 /** @param {NodeJS.Process} runtimeProcess */
 export async function runInstalledPiWorker(runtimeProcess) {
   const options = parseArgs(runtimeProcess.argv.slice(2));
-  const token = runtimeProcess.env.PI_DASHBOARD_WORKER_TOKEN;
+  const token = runtimeProcess.env.PI_AGENTS_WORKER_TOKEN;
   if (typeof token !== "string" || token.length === 0 || typeof runtimeProcess.send !== "function") throw new Error("Worker requires an authenticated IPC launch channel");
   /** @type {((message: any) => Promise<unknown>) | undefined} */
   let sendToDaemon;
@@ -200,6 +200,6 @@ export async function runInstalledPiWorker(runtimeProcess) {
     if (shuttingDown) return;
     void reportPiChildExit(code, signal).catch(() => {}).finally(() => diagnostics.close().catch(() => {}).finally(() => runtimeProcess.exit(0)));
   });
-  const testExitMs = Number(runtimeProcess.env.PI_DASHBOARD_TEST_EXIT_MS);
+  const testExitMs = Number(runtimeProcess.env.PI_AGENTS_TEST_EXIT_MS);
   if (Number.isSafeInteger(testExitMs) && testExitMs > 0) setTimeout(() => piChild.kill("SIGTERM"), testExitMs);
 }

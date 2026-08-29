@@ -42,7 +42,7 @@ const at = "2026-08-25T12:00:00.000Z";
 
 /** Start one daemon over a throwaway root that already owns a live, idle session. */
 async function daemonWithLiveSession(sessionId) {
-  const root = await mkdtemp(join(tmpdir(), "pi-dashboard-throbber-"));
+  const root = await mkdtemp(join(tmpdir(), "pi-agents-throbber-"));
   roots.push(root);
   for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(root, name), { mode: 0o700 });
   const registry = new RegistryStore(join(root, "sessions"));

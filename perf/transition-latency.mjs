@@ -25,24 +25,24 @@ const PHASE_LOG = option("phase-log", "");
 const STREAM_MS = option("stream-ms", "");
 
 const VIEWER_MARK = Buffer.from("COMPOSER");
-const LIST_MARK = Buffer.from("pi-dashboard");
+const LIST_MARK = Buffer.from("pi-agents");
 const QUIET_MS = 400;
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
 async function main() {
-  const root = await mkdtemp(join(BASE, "pi-dashboard-perf-"));
+  const root = await mkdtemp(join(BASE, "pi-agents-perf-"));
   const executable = join(root, "pi");
   await writeFile(executable, await readFile(fileURLToPath(new URL("../test/fixtures/fake-pi.mjs", import.meta.url)), "utf8"), { mode: 0o700 });
   await chmod(executable, 0o700);
   const env = {
     ...process.env,
-    PI_DASHBOARD_STATE_DIR: root,
+    PI_AGENTS_STATE_DIR: root,
     FAKE_PI_EVENT_AFTER_COMMAND: "follow_up",
     TERM: "xterm-256color",
     COLUMNS: "120",
     LINES: "40",
-    ...(PHASE_LOG === "" ? {} : { PI_DASHBOARD_PERF_LOG: PHASE_LOG, PI_DASHBOARD_DAEMON_PERF_LOG: `${PHASE_LOG}.daemon` }),
+    ...(PHASE_LOG === "" ? {} : { PI_AGENTS_PERF_LOG: PHASE_LOG, PI_AGENTS_DAEMON_PERF_LOG: `${PHASE_LOG}.daemon` }),
     ...(STREAM_MS === "" ? {} : { FAKE_PI_STREAM_MS: STREAM_MS }),
   };
 
@@ -73,7 +73,7 @@ async function main() {
   await client.close();
 
   const transcriptPath = join(root, "transcript");
-  const child = spawn("script", ["-qfec", `node ./bin/pi-dashboard.mjs --pi-bin ${executable}`, transcriptPath], { cwd: process.cwd(), env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
+  const child = spawn("script", ["-qfec", `node ./bin/pi-agents.mjs --pi-bin ${executable}`, transcriptPath], { cwd: process.cwd(), env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
 
   let buffer = Buffer.alloc(0);
   let bytes = 0;

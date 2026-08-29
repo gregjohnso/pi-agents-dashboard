@@ -1,4 +1,4 @@
-# pi-dashboard
+# pi-agents
 
 A machine-local standalone terminal dashboard for concurrent [Pi](https://github.com/badlogic/pi-mono) sessions.
 
@@ -7,20 +7,20 @@ A machine-local standalone terminal dashboard for concurrent [Pi](https://github
 Install the standalone executable globally, run it through npm, or install an absolute local checkout:
 
 ```bash
-npm install -g pi-dashboard
-pi-dashboard
+npm install -g pi-agents
+pi-agents
 
-npx pi-dashboard
-npm install /absolute/path/to/pi-dashboard
+npx pi-agents
+npm install /absolute/path/to/pi-agents
 ```
 
-The package has no npm lifecycle scripts and no Pi extension manifest. `pi install` is not supported. A global installation is sufficient; `pi-dashboard` resolves its runtime files relative to the installed package, not the current working directory.
+The package has no npm lifecycle scripts and no Pi extension manifest. `pi install` is not supported. A global installation is sufficient; `pi-agents` resolves its runtime files relative to the installed package, not the current working directory.
 
-Running `pi-dashboard` with no arguments connects to or starts the per-user daemon and opens the machine-wide session list. The process working directory becomes the default directory for a new launch. The app does not reopen the last viewer automatically.
+Running `pi-agents` with no arguments connects to or starts the per-user daemon and opens the machine-wide session list. The process working directory becomes the default directory for a new launch. The app does not reopen the last viewer automatically.
 
 Pi executable discovery uses this precedence:
 
-1. `pi-dashboard --pi-bin /absolute/path/to/pi`
+1. `pi-agents --pi-bin /absolute/path/to/pi`
 2. the validated `pi.executable` dashboard configuration
 3. `pi` found on `PATH`
 
@@ -43,13 +43,13 @@ The daemon persists registry records, command stages, normalized viewer events, 
 Administrative recovery commands are standalone:
 
 ```bash
-pi-dashboard daemon status
-pi-dashboard daemon restart
-pi-dashboard daemon recover
-pi-dashboard daemon stop
+pi-agents daemon status
+pi-agents daemon restart
+pi-agents daemon recover
+pi-agents daemon stop
 ```
 
-A normal daemon stop does not signal workers. Stopping the daemon and its workers together requires the explicit `pi-dashboard daemon stop --stop-workers --yes` form.
+A normal daemon stop does not signal workers. Stopping the daemon and its workers together requires the explicit `pi-agents daemon stop --stop-workers --yes` form.
 
 ## Diagnostics and privacy
 
@@ -59,7 +59,7 @@ Per run, raw RPC diagnostics use four rotating 8 MiB segments, for a 32 MiB maxi
 
 ## Legacy-state migration
 
-Legacy private state beneath `pi-agents-dashboard` roots migrates to `pi-dashboard` roots. Migration converts reviewed schema-version-1 configuration to schema version 2 while retaining canonical session-file and managed-worktree paths.
+Legacy private state beneath `pi-agents-dashboard` roots migrates to `pi-agents` roots. Migration converts reviewed schema-version-1 configuration to schema version 2 while retaining canonical session-file and managed-worktree paths.
 
 Migration refuses a verified live legacy daemon or supervisor, unsafe ownership or modes, symlinks, malformed state, changed identities, and destination collisions. Staged files and the migration manifest are durably published before destination reconciliation. If migration is interrupted, the next start validates and resumes the same migration identity. A failure preserves the legacy source; successful reconciliation marks it migrated rather than deleting it.
 
@@ -74,7 +74,7 @@ Managed-worktree cleanup is a separate full-ID confirmed action. It refuses live
 Ambiguous Stop or Delete delivery remains `DELIVERY_UNKNOWN` until explicitly resolved with the original full client and request IDs:
 
 ```bash
-pi-dashboard session resolve-delivery <full-client-id> <full-request-id> retry_at_risk|abandon --yes
+pi-agents session resolve-delivery <full-client-id> <full-request-id> retry_at_risk|abandon --yes
 ```
 
 ## Pi compatibility boundary

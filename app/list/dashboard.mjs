@@ -966,7 +966,7 @@ export class DashboardController {
             const confirmingSharedLaunch = this.focus === "confirmation";
             const lines = Array.from({ length: this.height }, () => "");
             if (lines.length > 0)
-                lines[0] = paintPlainLine(" pi-dashboard", this.width, jobwatchTheme.title);
+                lines[0] = paintPlainLine(" pi-agents", this.width, jobwatchTheme.title);
             if (lines.length > 1)
                 lines[1] = paintPlainLine(this.contextLine(), this.width, jobwatchTheme.keyHints);
             // One launch setting per row, above the list, so each is readable without truncation.

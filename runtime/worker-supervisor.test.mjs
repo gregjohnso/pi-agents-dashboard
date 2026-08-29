@@ -90,7 +90,7 @@ function fakeWorkerFactory({ order = [], helloOverrides = {}, readyOverrides = {
           child.emit("message", {
             version: 1,
             type: "pi_child",
-            token: options.env.PI_DASHBOARD_WORKER_TOKEN,
+            token: options.env.PI_AGENTS_WORKER_TOKEN,
             sessionId: argv[argv.indexOf("--session-id") + 1],
             runId: argv[argv.indexOf("--run-id") + 1],
             leaseId: argv[argv.indexOf("--lease-id") + 1],
@@ -108,7 +108,7 @@ function fakeWorkerFactory({ order = [], helloOverrides = {}, readyOverrides = {
           child.emit("message", {
             version: 1,
             type: "worker_ready",
-            token: options.env.PI_DASHBOARD_WORKER_TOKEN,
+            token: options.env.PI_AGENTS_WORKER_TOKEN,
             sessionId: argv[argv.indexOf("--session-id") + 1],
             runId: argv[argv.indexOf("--run-id") + 1],
             worker,
@@ -119,7 +119,7 @@ function fakeWorkerFactory({ order = [], helloOverrides = {}, readyOverrides = {
         });
       }
       if (message.type === "command" && commandBehavior === "success") {
-        queueMicrotask(() => child.emit("message", { version: 1, type: "command_result", token: options.env.PI_DASHBOARD_WORKER_TOKEN, id: message.id, ok: true, record: { stage: "RPC_ACKNOWLEDGED" } }));
+        queueMicrotask(() => child.emit("message", { version: 1, type: "command_result", token: options.env.PI_AGENTS_WORKER_TOKEN, id: message.id, ok: true, record: { stage: "RPC_ACKNOWLEDGED" } }));
       }
       if (message.type === "command" && commandBehavior === "disconnect") {
         queueMicrotask(() => child.disconnect());
@@ -128,7 +128,7 @@ function fakeWorkerFactory({ order = [], helloOverrides = {}, readyOverrides = {
         queueMicrotask(() => child.emit("message", {
           version: 1,
           type: "command_result",
-          token: options.env.PI_DASHBOARD_WORKER_TOKEN,
+          token: options.env.PI_AGENTS_WORKER_TOKEN,
           id: message.id,
           ok: false,
           error: {
@@ -159,7 +159,7 @@ function fakeWorkerFactory({ order = [], helloOverrides = {}, readyOverrides = {
       child.emit("message", {
         version: 1,
         type: "worker_hello",
-        token: options.env.PI_DASHBOARD_WORKER_TOKEN,
+        token: options.env.PI_AGENTS_WORKER_TOKEN,
         sessionId: argv[argv.indexOf("--session-id") + 1],
         runId: argv[argv.indexOf("--run-id") + 1],
         leaseId: argv[argv.indexOf("--lease-id") + 1],
@@ -289,7 +289,7 @@ it("bounds complete frames by bytes and reports an oversized dropped frame", asy
   const received = [];
   handle.onFrame((/** @type {Record<string, unknown>} */ nextFrame) => received.push(nextFrame));
   expect(received).toEqual([
-    { type: "pi_dashboard_frame_queue_overflow", droppedFrames: 1, droppedBytes: Buffer.byteLength(JSON.stringify(oversized)), recovery: "snapshot_or_diagnostics" },
+    { type: "pi_agents_frame_queue_overflow", droppedFrames: 1, droppedBytes: Buffer.byteLength(JSON.stringify(oversized)), recovery: "snapshot_or_diagnostics" },
     retained,
   ]);
   await supervisor.close();

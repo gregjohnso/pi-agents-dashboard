@@ -10,7 +10,7 @@ import { createViewerNormalizer } from "./viewer-normalizer.mjs";
 
 const PROBE_MAX_RECORD_BYTES = 65_536;
 const PROBE_DRAIN_MS = 50;
-const UNKNOWN_COMMAND = "__pi_dashboard_unknown_command__";
+const UNKNOWN_COMMAND = "__pi_agents_unknown_command__";
 const RPC_ADAPTER_VERSION = 1;
 /** @type {readonly ("get_state"|"prompt"|"follow_up"|"steer"|"abort"|"extension_ui_response")[]} */
 const REQUIRED_COMMANDS = ["get_state", "prompt", "follow_up", "steer", "abort", "extension_ui_response"];
@@ -164,7 +164,7 @@ export async function probePiCapabilities({ executable, spawnImpl = spawn, cache
   const cached = cache.get(key);
   if (cached !== undefined) return cached;
   const help = /** @type {string} */ (await probeHelp(executable.realpath, spawnImpl, timeoutMs, env));
-  const directory = await mkdtemp(join(tmpdir(), "pi-dashboard-probe-"));
+  const directory = await mkdtemp(join(tmpdir(), "pi-agents-probe-"));
   try {
     const temporarySessionFile = join(directory, "non-canonical-session.jsonl");
     const rpc = await probeRpc(executable.realpath, temporarySessionFile, spawnImpl, timeoutMs, env);

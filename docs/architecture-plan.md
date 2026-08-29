@@ -1,6 +1,6 @@
 # Architecture implementation plan
 
-After these 18 commits:
+After these 17 commits:
 
 - Commands work the same on a newly launched session and after a daemon restart. Graceful Stop no longer waits through its timeout solely because a route is absent.
 - Several terminals may open one session. Exactly one may type; the others remain read-only and can explicitly claim composer after it becomes vacant.
@@ -9,24 +9,22 @@ After these 18 commits:
 - Delete continues to forget only the dashboard row. It preserves the canonical Pi file and worktree.
 - The daemon and workers continue running when terminal clients exit.
 
-Approve the work as 18 green commits with five operator-machine gates protecting the live daemon and two live sessions. Estimated effort is 7 to 11 engineer-days. This is an estimate, not measured work. It includes tests, compatibility paths, gates, and documentation. It excludes review time and maintenance-window waits.
+Approve the work as 17 green commits in one release, with five operator-machine gates protecting the live daemon and two live sessions. Estimated effort is 6.5 to 10 engineer-days, down from 7 to 11 engineer-days. This is an estimate, not measured work. It includes tests, gates, and documentation. It excludes review time and maintenance-window waits.
 
 The resulting process model is one daemon per state root, many terminal clients, one worker per live Pi session, and at most one composer connection per session. Any number of observers may open a session read-only.
 
-## Approval decisions
+## The operator settled all eight decisions
 
-| # | Decision | Recommendation or settled answer |
+| # | Decision | Settled answer |
 |---|---|---|
-| 1 | Model admission validation | Recommended. Validate in the daemon after journal acceptance and before launch resolution. The frontend picker remains an early check; daemon validation covers command-line, stale frontend, and direct protocol clients. |
-| 2 | Refused launch artifacts | Recommended. A known admission refusal leaves a terminal `FAILED` journal result and no session record, Pi file, worktree, worker, or list row. A failure after preparation keeps the failed row because side effects and cleanup evidence exist. |
-| 3 | Unavailable model catalog | Recommended. Record the diagnostic and let Pi decide. `MODEL_CATALOG_FAILED` differs from `MODEL_UNKNOWN`. |
-| 4 | Unused trash seam | Recommended. Remove it. Delete continues to forget only the dashboard record. Any future command that deletes Pi files needs separate wording and recovery. |
-| 5 | List protocol compatibility | Settled as a two-release transition. The current frontend discards the `subscribe` response, so a new daemon cannot make that process show a refusal. First ship a bridge client that tracks the response and displays `Dashboard protocol changed. Exit and restart pi-agents.` on `CLIENT_RESTART_REQUIRED`; its daemon retains bounded old replay. In the following release, send `subscribe_list_changes` and reject old `subscribe`. A pre-bridge frontend keeps working against the bridge daemon until it restarts naturally. |
-| 6 | Retired durable files | Recommended. Ignore valid obsolete list, attachment, and viewer acknowledgement files in place. A corrupt retired file does not block startup. Do not delete files during rollout. |
-| 7 | Legacy trash transactions | Recommended. Ignore an absent or empty `delete-results.json`. Stop startup with `UNSUPPORTED_LEGACY_DELETE_TRANSACTION` for any nonempty entry. |
-| 8 | Worker IPC handoff | Recommended. Bind Pi identity, authenticate and adopt the socket, persist readiness, send `handoff_to_socket`, receive its acknowledgement, then disconnect inter-process communication (IPC). Without those messages, a new worker retains IPC for an older daemon still in memory. |
-
-Decisions 1 through 4 and 6 through 8 need operator approval before their commits begin. Decision 5 is settled.
+| 1 | Model admission validation | Validate in the daemon after journal acceptance and before launch resolution. The frontend picker remains an early check. Daemon validation covers command-line, stale frontend, and direct protocol clients. |
+| 2 | Refused launch artifacts | A known admission refusal leaves a terminal `FAILED` journal result and no session record, Pi file, worktree, worker, or list row. Its status-line message remains until the operator's next keystroke or action. A failure after preparation keeps the failed row because side effects and cleanup evidence exist. |
+| 3 | Unavailable model catalog | Record the diagnostic and let Pi decide. `MODEL_CATALOG_FAILED` remains distinct from `MODEL_UNKNOWN`. |
+| 4 | Unused trash seam | Remove it. Delete continues to forget only the dashboard record. Any future command that deletes Pi files needs separate wording and recovery. |
+| 5 | List protocol compatibility | Ship one release with `subscribe_list_changes` and refuse old `subscribe`. Dashboards must restart after this upgrade. An unrestarted dashboard discards the refusal response, shows an empty session list, receives no updates, and shows no restart instruction. This known empty display is why the upgrade procedure requires a dashboard restart rather than waiting for an on-screen message. The daemon refusal remains explicit for protocol clients that read responses and for diagnostics. |
+| 6 | Retired durable files | Ignore the obsolete files in place, whether valid or corrupt. Do not delete them during rollout. On the operator's machine on 2026-08-29, they are `index/events.jsonl` at 18 MB, `daemon/attachment-results.jsonl` at 679 KB, 14 `index/viewer/*.acks.json` files, and `daemon/event-acks.json` at 512 bytes. A later explicit cleanup command may reclaim them. This plan does not include that command. |
+| 7 | Legacy trash transactions | Ignore `daemon/delete-results.json` if present. Do not add `UNSUPPORTED_LEGACY_DELETE_TRANSACTION` or its tests. The file was absent on the operator's machine on 2026-08-29, and production never supplied a trash callback. No shipped code path could therefore create a nonempty file. |
+| 8 | Worker IPC handoff | Bind Pi identity, authenticate and adopt the socket, persist readiness, send `handoff_to_socket`, receive its acknowledgement, then disconnect inter-process communication (IPC). Without those messages, a new worker retains IPC for an older daemon still in memory. |
 
 ## Settled feature scope
 
@@ -63,11 +61,11 @@ Every commit preserves these invariants:
 | 1 | Baseline inspection | The live daemon and both sessions have an exact, recorded starting identity. | Gate 0 |
 | 2 | Changes 1 through 3 | Broken and Pi-owned controls no longer appear; `/model` and observed thinking remain. | |
 | 3 | Change 4 | A second or third terminal opens an occupied session read-only instead of showing `SESSION_IN_USE`. | |
-| 4 | Changes 5.1 through 5.3 | Commands, frames, replies, reconnect, and graceful Stop use the same route before and after daemon restart. | Gate 1 |
-| 5 | Change 6 | A row never shows an unconfirmed requested model. | Gate 2 |
-| 6 | Changes 7.0 through 7.3, with bridge deployment before 7.2 | Dashboard startup reads current rows instead of replaying history; old clients receive the restart instruction. | |
-| 7 | Changes 8.1 and 8.2 | Three dashboards keep independent state, see writer departure, and produce exactly one composer after a race. | Gate 3 |
-| 8 | Changes 9 and 10 | Obsolete acknowledgement files cannot block startup; Delete remains forget-only; retained files support rollback. | Gate 4 |
+| 4 | Changes 5.1 through 5.3 | Commands, frames, replies, reconnect, and graceful Stop use the same route before and after daemon restart. | |
+| 5 | Change 6 | A row never shows an unconfirmed requested model. | |
+| 6 | Changes 7.1 through 7.3 | Dashboard startup reads current rows instead of replaying history; old `subscribe` receives an explicit refusal. | |
+| 7 | Changes 8.1 and 8.2 | Three dashboards keep independent state, see writer departure, and produce exactly one composer after a race. | |
+| 8 | Changes 9 and 10 | Obsolete acknowledgement files cannot block startup; Delete remains forget-only; retained files support rollback. | Gates 1 through 4 |
 
 Work may proceed independently only as follows:
 
@@ -78,7 +76,7 @@ Work may proceed independently only as follows:
 Protocol rules apply throughout:
 
 - Worker readiness, socket adoption, and IPC handoff are one decision.
-- `subscribe_list_changes`, tracked legacy refusal, and `CLIENT_RESTART_REQUIRED` are one compatibility decision. Ship the bridge client while the daemon still supports old replay.
+- `subscribe_list_changes` and explicit refusal of old `subscribe` ship together. Dashboards must restart after the upgrade because the old frontend discards the refusal response.
 - A live dashboard gets a process-scoped connection ID. Durable command recovery may retain the stable installation ID and request ID.
 - `session_access_changed` carries `sessionId`, the receiving connection's role, `writerPresent`, and an in-memory generation. It carries no peer client ID.
 - Observers explicitly request composer after a vacancy. The per-session lock decides races. Accepted commands continue after disconnect.
@@ -165,21 +163,15 @@ Protocol rules apply throughout:
 
 ### Commit 6: `fix: record only Pi-confirmed session model`
 
-- **Tests:** In `runtime/launch-resolver.test.mjs`, keep requested model in worker arguments but not the prepared record. In `runtime/daemon.integration.test.mjs`, cover default selection, accepted request, Pi substitution, omitted model, failure before and after spawn, and restart. If decisions 1 through 3 are approved, cover catalog-listed, known absent, unavailable catalog, and no requested model.
-- **Implementation:** Stop copying requested model into the prepared record. Carry normalized initial Pi state through socket readiness and apply confirmed model in the same lifecycle write. Absence remains unknown. Keep Pi-reported thinking display-only.
+- **Tests:** In `runtime/launch-resolver.test.mjs`, keep requested model in worker arguments but not the prepared record. In `runtime/daemon.integration.test.mjs`, cover default selection, accepted request, Pi substitution, omitted model, failure before and after spawn, and restart. Cover catalog-listed, known absent, unavailable catalog, and no requested model. Assert `MODEL_CATALOG_FAILED` remains distinct from `MODEL_UNKNOWN`. A known admission refusal leaves a terminal `FAILED` journal result but no session record, Pi file, worktree, worker, or row. Its status-line message remains until the next keystroke or action. A failure after preparation retains its `FAILED` row.
+- **Implementation:** Validate model admission in the daemon after journal acceptance and before launch resolution. Stop copying requested model into the prepared record. Carry normalized initial Pi state through socket readiness and apply the confirmed model in the same lifecycle write. Absence remains unknown. A catalog failure records `MODEL_CATALOG_FAILED` and lets Pi decide. Keep Pi-reported thinking display-only. Keep a refusal on the status line until the operator's next keystroke or action; do not clear it on a timer.
 - **Stop:** One ready revision contains the Pi-confirmed model; every failure window leaves it absent; Gate 2 passes.
 
 ## Change 7: stale list history cannot crash dashboard startup
 
-**Outcome:** The dashboard starts from current registry state instead of replaying thousands of old list records. Burst updates converge to current rows without a queue that grows with the burst. A two-release bridge gives old frontends an explicit restart instruction before replay is removed.
+**Outcome:** The dashboard starts from current registry state instead of replaying thousands of old list records. Burst updates converge to current rows without a queue that grows with the burst. This ships in one release. Dashboards must restart after the upgrade.
 
-**Estimate:** 4 commits across 2 releases, 1.5 to 2.5 engineer-days, net deletion of 350 to 600 lines.
-
-### Commit 7.0: `feat: surface list protocol refusal`
-
-- **Tests:** In `app/daemon-client.test.mjs`, track subscription requests and route `CLIENT_RESTART_REQUIRED` plus the daemon's exact message to the subscriber error path. Add a bridge test where old replay still serves a pre-bridge client. The bridge client stops retrying and renders the instruction once.
-- **Implementation:** Track internal `subscribe` request ID and response in `app/daemon-client.mjs`. Propagate refusal to `DashboardController` as terminal. Keep old event storage and replay in the bridge daemon. Deploy this commit before replay removal.
-- **Stop:** A bridge frontend displays the instruction while a pre-bridge frontend still works against the bridge daemon.
+**Estimate:** 3 commits in 1 release, 1 to 2 engineer-days, net deletion of 350 to 600 lines.
 
 ### Commit 7.1: `feat: add race-safe list invalidation`
 
@@ -189,14 +181,14 @@ Protocol rules apply throughout:
 
 ### Commit 7.2: `refactor: publish list invalidations only`
 
-- **Tests:** Require `list_changed` after each durable session mutation and completed Delete. A tracked old `subscribe` receives `CLIENT_RESTART_REQUIRED` with the exact instruction. The bridge frontend displays it once and stops retrying. New roots omit `index/events.jsonl` and `daemon/event-acks.json`.
-- **Implementation:** Replace list events with an in-memory broadcaster in `runtime/daemon.mjs` and `runtime/reconciliation.mjs`. Reject old `subscribe`; do not replay retired events. Keep new-frontend fallback only against an old daemon.
-- **Stop:** Write, notification, and snapshot order is deterministic; an old frontend displays one instruction and exits its loop.
+- **Tests:** Require `list_changed` after each durable session mutation and completed Delete. An old `subscribe` receives an explicit protocol refusal with the exact restart instruction. Confirm that the old frontend discards this response, shows an empty session list, and receives no later list updates. New roots omit `index/events.jsonl` and `daemon/event-acks.json`.
+- **Implementation:** Replace list events with an in-memory broadcaster in `runtime/daemon.mjs` and `runtime/reconciliation.mjs`. Reject old `subscribe` with `Dashboard protocol changed. Exit and restart pi-agents.`; do not replay retired events. Keep new-frontend fallback only against an old daemon.
+- **Stop:** Write, notification, and snapshot order is deterministic. The daemon explicitly refuses an old subscription, and the documented upgrade requires dashboard restart rather than relying on the old frontend to display that refusal.
 
 ### Commit 7.3: `refactor: remove list cursor persistence`
 
 - **Tests:** Replace cursor-save tests with cursor-free view-state and draft tests. Load and discard a legacy cursor. Remove `runtime/event-store.test.mjs` only after production callers are gone.
-- **Implementation:** Remove list cursor saves, acknowledgements, replay queues, resynchronization markers, and cursor comparison. Delete `runtime/event-store.mjs`. Ignore a legacy cursor in `app/list/frontend-state.mjs` and obsolete event files during migration and recovery.
+- **Implementation:** Remove list cursor saves, acknowledgements, replay queues, resynchronization markers, and cursor comparison. Delete `runtime/event-store.mjs`. Ignore a legacy cursor in `app/list/frontend-state.mjs`. Ignore `index/events.jsonl` and `daemon/event-acks.json` in place even when corrupt.
 - **Stop:** New state omits cursor, legacy state loads, and no list event store opens.
 
 ## Change 8: three dashboards keep independent state and exactly one writer
@@ -214,7 +206,7 @@ Protocol rules apply throughout:
 ### Commit 8.2: `refactor: remove durable attachments and isolate frontend state`
 
 - **Tests:** Replace durable ordering tests with per-session lock tests. Ignore corrupt obsolete `daemon/attachment-results.jsonl`. Open three dashboards, change each draft and selection, close in different orders, and require independent state. Restarting the daemon clears claims while workers retain exact identity.
-- **Implementation:** Remove `AttachmentResultStore`, attach/detach journal transitions, attachment list events, failpoints, and recovery. Delete `runtime/attachment-result-store.mjs` and ignore its old file. Generate a process-scoped frontend connection ID at startup. Keep view state and launch drafts in that process; process death may lose an unsubmitted draft. Retain stable installation identity only for durable command recovery.
+- **Implementation:** Remove `AttachmentResultStore`, attach/detach journal transitions, attachment list events, failpoints, and recovery. Delete `runtime/attachment-result-store.mjs` and ignore `daemon/attachment-results.jsonl` in place even when corrupt. Generate a process-scoped frontend connection ID at startup. Keep view state and launch drafts in that process; process death may lose an unsubmitted draft. Retain stable installation identity only for durable command recovery.
 - **Stop:** No attachment artifact is created or reconciled; three dashboards retain independent state; Gate 3 passes.
 
 ## Change 9: obsolete acknowledgement files cannot block recovery
@@ -232,14 +224,14 @@ Protocol rules apply throughout:
 ### Commit 9.2: `refactor: retire viewer acknowledgement files`
 
 - **Tests:** Corrupt event, checkpoint, or snapshot state still fails; corrupt `.acks.json` is ignored. An old frontend's `ack_viewer` gets a no-op response and writes nothing.
-- **Implementation:** Remove acknowledgement loading and methods from `runtime/viewer-store.mjs`. Keep `ack_viewer` as a no-op for one compatibility release. Stop creating acknowledgement paths and ignore old files.
+- **Implementation:** Remove acknowledgement loading and methods from `runtime/viewer-store.mjs`. Keep `ack_viewer` as a no-op for one compatibility release. Stop creating acknowledgement paths and ignore every `index/viewer/*.acks.json` file in place even when corrupt.
 - **Stop:** No `.acks.json` changes, and Gate 4 transcript checks pass.
 
-## Change 10: Delete remains forget-only without unused recovery failures
+## Change 10: Delete remains forget-only without unused recovery
 
-**Outcome:** Delete still removes only the dashboard row and preserves the Pi file and worktree. Missing or empty legacy transaction state cannot fail startup; a nonempty legacy transaction still stops startup for explicit resolution.
+**Outcome:** Delete still removes only the dashboard row and preserves the Pi file and worktree. Legacy `daemon/delete-results.json` state is ignored if present because no shipped production path could create a nonempty file.
 
-**Estimate:** 2 commits, 0.5 to 1.5 engineer-days, net deletion of 200 to 400 lines.
+**Estimate:** 2 commits, 0.5 to 1 engineer-day, net deletion of 200 to 400 lines.
 
 ### Commit 10.1: `refactor: make Delete forget-only`
 
@@ -249,9 +241,11 @@ Protocol rules apply throughout:
 
 ### Commit 10.2: `refactor: retire trash recovery`
 
-- **Tests:** Start with absent, empty, and nonempty old delete-result files. The first two start; the third fails with `UNSUPPORTED_LEGACY_DELETE_TRANSACTION` before mutation.
-- **Implementation:** Remove the delete-result store, transaction phases, destructive failpoints, file fingerprints, and reconciliation. Retain the old file and add the nonempty guard.
-- **Stop:** Gate 0 found no production entry; temporary-root migration tests and Gate 4 Delete checks pass.
+- **Tests:** Start with absent, empty, nonempty, and corrupt old `daemon/delete-results.json` files. Every case starts without reading or mutating the file. Do not add `UNSUPPORTED_LEGACY_DELETE_TRANSACTION` tests.
+- **Implementation:** Remove the delete-result store, transaction phases, destructive failpoints, file fingerprints, reconciliation, and legacy guard. Ignore `daemon/delete-results.json` if present.
+- **Stop:** No production code reads, writes, validates, or deletes `daemon/delete-results.json`. Temporary-root migration tests and Gate 4 Delete checks pass.
+
+The guard is intentionally absent. On 2026-08-29, `daemon/delete-results.json` was absent on the operator's machine. Production never supplied a trash callback, so no shipped code path could have created a nonempty transaction.
 
 ## Withdrawn change: replay narrowing
 
@@ -263,23 +257,21 @@ Tests use a temporary state root. These gates never write state files directly, 
 
 ### Gate 0: read-only preflight
 
-Record the installed commit and daemon version; daemon PID, start identity, epoch, and recovery state; both live session IDs; worker and Pi identities; route generations; old durable file sizes; and whether `delete-results.json` has entries. Read one list and viewer snapshot through the public client.
+Record the installed commit and daemon version; daemon PID, start identity, epoch, and recovery state; both live session IDs; worker and Pi identities; route generations; and the retired files. The 2026-08-29 baseline is `index/events.jsonl` at 18 MB, `daemon/attachment-results.jsonl` at 679 KB, 14 `index/viewer/*.acks.json` files, `daemon/event-acks.json` at 512 bytes, and no `daemon/delete-results.json`. Read one list and viewer snapshot through the public client.
 
-Stop if identity is ambiguous, recovery is not `READY`, a trash transaction is nonempty, or a live session lacks exact worker and Pi identity.
+Stop if identity is ambiguous, recovery is not `READY`, or a live session lacks exact worker and Pi identity.
 
-### Gate 1: worker handoff
+### Gate 1: worker handoff and dashboard restart
 
-During the bridge release, restart only the daemon through the normal command and leave all terminal clients open. Pre-bridge frontends must continue on bounded old replay without a crash loop. A bridge frontend must surface `CLIENT_RESTART_REQUIRED` exactly when tested against a rehearsal daemon that refuses old `subscribe`.
+Install the single release, then restart only the daemon through the normal command. Leave one old dashboard open long enough to verify the daemon explicitly refuses its old `subscribe`. The old dashboard discards that response, shows an empty session list, receives no list updates, and shows no restart instruction. Record this expected empty display, then restart every dashboard immediately. Do not wait for a timer or on-screen refusal. Verify each restarted dashboard shows the current snapshot and receives later invalidations.
 
-During the replay-removal release, verify the frontends used for the gate have crossed the bridge. Restart the daemon normally. Any remaining bridge frontend must display `Dashboard protocol changed. Exit and restart pi-agents.` and stop retrying. No synchronized close-before-restart step is required.
+Verify both workers retain PID, start identity, process group, run ID, lease generation, and one route. Launch one disposable session and verify IPC closes only after Pi identity is bound, the socket is adopted, readiness is persisted, handoff is sent, and its acknowledgement arrives. Run every remaining operation and graceful Stop only on disposable work.
 
-Verify both workers retain PID, start identity, process group, run ID, lease generation, and one route. Launch one disposable session and verify IPC closes only after socket adoption. Run every remaining operation and graceful Stop only on disposable work.
-
-Stop on worker identity change, zero or two routes, duplicate delivery, lost frame, or escalation after successful graceful shutdown.
+Stop on worker identity change, zero or two routes, duplicate delivery, lost frame, an old subscription that the daemon does not explicitly refuse, a restarted dashboard that does not converge, or escalation after successful graceful shutdown.
 
 ### Gate 2: confirmed model
 
-Launch disposable default, valid named, substituted, and invalid model cases. Verify no row shows a model before Pi reports it, refusal leaves no launch artifacts, catalog failure lets Pi decide, and daemon restart retains workers and confirmed values.
+Launch disposable default, valid named, substituted, and invalid model cases. Verify no row shows a model before Pi reports it. Verify a known admission refusal writes a terminal `FAILED` journal result but creates no session record, Pi file, worktree, worker, or row. Confirm its status-line message survives timers and remains until the next keystroke or action. Verify a failure after preparation keeps its `FAILED` row, catalog failure lets Pi decide, `MODEL_CATALOG_FAILED` stays distinct from `MODEL_UNKNOWN`, and daemon restart retains workers and confirmed values.
 
 ### Gate 3: three dashboards and list convergence
 
@@ -301,11 +293,11 @@ Stop on transcript loss, path deletion, worker loss, or rollback failure.
 | 4 and 8 | Connection roles | Old frontend rejects observer; new frontend opens it. Claims die with sockets | None for worker lifetime | Restart daemon to clear claims |
 | 5 | Worker IPC and socket | New worker retains IPC with old daemon. Existing workers reconnect by socket | Restart daemon at Gate 1, never workers | Restart old daemon |
 | 6 | Session field meaning | Schema remains version 1; fields remain optional | Use disposable launches | Safe; new values have stronger provenance |
-| 7 | List protocol | Bridge tracks refusal while retaining old replay. Following release uses `subscribe_list_changes` and refuses tracked old `subscribe` | Restart after the instruction appears; no close-before-daemon-restart sequence | Restart old daemon and read registry snapshot |
+| 7 | List protocol | The new daemon uses `subscribe_list_changes` and explicitly refuses old `subscribe`. The old frontend discards the refusal, shows an empty session list, receives no updates, and shows no restart instruction | Restart every dashboard immediately after the daemon upgrade | Restart the old daemon; the new frontend falls back to its old subscription |
 | 9 | Viewer acknowledgement | New daemon answers old acknowledgement as a no-op for one release | None | Safe; old files remain |
-| 10 | Delete result file | Empty old store is accepted; nonempty store blocks startup | Resolve with old release before rollout | Safe; file remains |
+| 10 | Delete result file | `daemon/delete-results.json` is ignored if present. No shipped production path could have written a nonempty transaction | None | Safe; file remains |
 
-No change automatically deletes an obsolete durable file. This preserves rollback and avoids an implicit migration.
+No change automatically deletes an obsolete durable file. On 2026-08-29, the retained files were `index/events.jsonl` at 18 MB, `daemon/attachment-results.jsonl` at 679 KB, 14 `index/viewer/*.acks.json` files, and `daemon/event-acks.json` at 512 bytes. Valid and corrupt versions are ignored in place and do not block startup. A later explicit cleanup command may reclaim them, but this plan does not include one. Retention preserves rollback and avoids an implicit migration.
 
 ## File collisions
 

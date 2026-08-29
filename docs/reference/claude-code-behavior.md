@@ -88,7 +88,7 @@ spare/<nonce>.pty.sock.err
 | `spare/<nonce>.pty.sock.err` | PTY-host startup diagnostics. Empty files are valid. | [O][B] |
 | `pty-pids/` and sidecar files | Windows-oriented PID and exit sidecars defined by the build. They were not present in the Linux runtime inspected here. | [B] |
 
-**Adopt:** one independently adoptable worker per session. **Adapt:** keep our worker and Pi process instead of a PTY host and Claude agent. **Reject:** prewarmed spares until measured launch latency justifies them. See the [architecture plan](../architecture-plan.md#claude-code-evidence-changes-the-upgrade-path-not-the-viewer-contract). [O][B]
+**Adopt:** one independently adoptable worker per session. Keep our worker and Pi process because Pi cannot provide Claude Code's PTY repaint, readiness, and detach channels. **Measure now:** add a commit that records 30 cold launches, per-stage latency, machine load, and worker plus Pi resident memory after 60 idle seconds; use the result to decide whether to adopt one authenticated spare. See the [architecture plan](../architecture-plan.md#change-13-measure-whether-one-prewarmed-spare-earns-its-resident-cost). [O][B]
 
 ## The roster is an adoption record
 
@@ -124,7 +124,7 @@ The observed `dispatch` object contained `proto`, `short`, `nonce`, `sessionId`,
 
 An equivalent record needs protocol, stable session ID, worker PID and process-start identity, child identity when separate, authenticated route data, release, launch identity, and replacement state. Terminal modes, repaint marks, PTY authentication, Claude launch flags, and transcript paths are specific to this agent and viewer. [I, unverified]
 
-**Adopt:** exact process identity, authenticated route data, and a release field separate from protocol compatibility. **Adapt:** persist only Pi launch data needed for recovery. **Reject:** terminal and Claude-specific fields in our worker record. See [Changes 5.1 and 5.4](../architecture-plan.md#change-5-commands-work-on-every-session-and-stop-uses-its-graceful-route). [O][B]
+**Adopt:** exact process identity, authenticated route data, and a release field separate from protocol compatibility. Persist only Pi launch data needed for recovery. **Divergence kept:** omit terminal and Claude-specific fields because Pi cannot publish or consume them. See [Changes 5.1 and 5.4](../architecture-plan.md#change-5-commands-work-on-every-session-and-stop-uses-its-graceful-route). [O][B]
 
 ## Attach becomes usable after a native repaint
 
@@ -145,7 +145,7 @@ The PTY protocol uses a 5-byte header: a 4-byte big-endian payload length and a 
 
 The PTY host retains exactly 262,144 bytes of recent raw output in memory. Every new daemon connection receives `hello`, that tail, and `live`, in that order. The daemon also keeps a bounded recent-output ring for `logs` and `subscribe`; a normal subscription asks for 200 chunks. Neither ring is durable viewer history. [B]
 
-**Adopt:** authenticated attach and explicit readiness. **Adapt:** use our structured viewer until Pi can repaint its own native interface. **Reject:** treating the raw tail or boot frame as canonical history. See the [deferred PTY viewer decision](../architecture-plan.md#claude-code-evidence-changes-the-upgrade-path-not-the-viewer-contract). [B]
+**Adopt now:** authenticated `attach`, explicit readiness, and a `logs` command that returns a bounded 256 KiB diagnostic tail. Read that tail from the existing per-run log instead of adding a duplicate memory ring. **Divergence kept:** keep the structured viewer and do not treat raw output as canonical history because Pi cannot provide native repaint and readiness channels. See [Changes 11 and 12](../architecture-plan.md#change-11-logs-exposes-the-error-already-on-disk) and the [deferred PTY viewer decision](../architecture-plan.md#claude-code-evidence-changes-access-diagnostics-naming-and-the-upgrade-path). [B]
 
 ## Detach closes one attachment, not the session
 
@@ -159,7 +159,7 @@ The host pings connected PTY clients. After the first pong, it sends a ping ever
 
 Resume reads the roster, verifies PID plus process-start identity, reconnects to the PTY and rendezvous sockets with their tokens, restores terminal modes and readiness marks, and asks the agent to repaint. If the host has gone, replacement can use the retained dispatch and durable conversation state. [B]
 
-**Adopt:** attachment lifetime is connection-scoped and later attach starts from current state. **Adapt:** our workers survive daemon absence without a 60-second limit. **Reject:** host-level Left interception and the orphan timeout. See [Change 8.2 and the PTY viewer deferral](../architecture-plan.md#change-8-three-dashboards-keep-independent-state-and-exactly-one-writer). [B]
+**Adopt:** attachment lifetime is connection-scoped and later attach starts from current state. **Divergence kept:** our workers survive daemon absence indefinitely because a 60-second orphan timeout can terminate the operator's running work. **Divergence kept:** host-level Left interception remains deferred because Pi cannot emit the context-aware detach request. See [Change 8 and the PTY viewer deferral](../architecture-plan.md#change-8-every-client-can-write-and-frontend-state-stays-local). [B]
 
 ## Release changes adopt workers before replacing them
 
@@ -180,7 +180,7 @@ The live daemon log showed adoption from release 2.1.246 through the referenced 
 
 An equivalent implementation should serialize replacement per session, revalidate worker and child identities at the boundary, and use structured idle state only. It should leave newer or busy code running when automatic replacement is unsafe. [I, unverified]
 
-**Adopt:** identity-first adoption, stale marking, idle or explicit replacement, and downgrade refusal. **Adapt:** retain our stronger durable command stages across replacement. **Reject:** requiring every live worker to match the daemon release before list startup. See [Changes 5.4 and 5.5](../architecture-plan.md#commit-54-feat-adopt-compatible-workers-across-upgrades). [O][B]
+**Adopt:** identity-first adoption, stale marking, idle or explicit replacement, and downgrade refusal. Keep our durable command stages across replacement because dropping them would hide failed or ambiguous delivery. Do not require every live worker to match the daemon release before list startup. See [Changes 5.4 and 5.5](../architecture-plan.md#commit-54-feat-adopt-compatible-workers-across-upgrades). [O][B]
 
 ## Linux clients share one editor and one terminal size
 
@@ -190,9 +190,9 @@ All clients also share one PTY size. A resize from any client changes the agent'
 
 Windows instead removes existing attachers when a new one opens the session, using `EKICKED`. This is a platform branch, not Linux writer ownership. [B]
 
-Shared typing is Claude Code's observed behavior. This project deliberately chooses one composer connection plus read-only observers. [O][B]
+Shared typing is Claude Code's observed behavior. This project now adopts it. Any authenticated attached client may submit structured commands, and the daemon orders and journals them per session. [O][B]
 
-**Adopt:** any number of output subscribers and connection-scoped attachment state. **Adapt:** grant one composer under a per-session lock. **Reject:** shared typing and shared resize for our reconstructed viewer. See [Change 4 and Change 8](../architecture-plan.md#change-4-occupied-sessions-open-read-only). [B]
+**Adopt now:** any number of read-write clients and connection-scoped attachment state. Delete composer and observer roles, role grants and releases, takeover, `session_access_changed`, claim recovery, and `SESSION_IN_USE`. Keep per-client rendering instead of shared resize because the current viewer has no shared PTY to resize. See [Change 8](../architecture-plan.md#change-8-every-client-can-write-and-frontend-state-stays-local). [B]
 
 ## Structured state and terminal rendering remain separate
 
@@ -204,7 +204,13 @@ A rendezvous update is `{type: "state", patch: <partial-job-state>}`. The daemon
 
 Terminal bytes are rendering only. The bounded PTY tail supports reconnect and diagnostics. The conversation JSONL supplies durable logical history for the agent's own resume and repaint. Neither source determines row activity. [O][B]
 
-**Adopt:** rows use structured worker state and current snapshots. **Adapt:** map only facts Pi publishes instead of cloning Claude's state schema. **Reject:** deriving activity from terminal output, the canonical conversation file, or requested launch values. See [the structured-state invariant and Change 6](../architecture-plan.md#execution-rules-and-invariants). [O][B]
+**Adopt:** rows use structured worker state and current snapshots. Map only facts Pi publishes because Pi cannot publish Claude Code's private state schema. Do not derive activity from terminal output, the canonical conversation file, or requested launch values because inference can display false state and hide a worker failure. See [the structured-state invariant and Change 6](../architecture-plan.md#execution-rules-and-invariants). [O][B]
+
+## Operator commands use Claude Code's verbs
+
+Claude Code exposes `agents`, `attach`, `logs`, `stop`, and `rm`. These names separate listing, viewing, diagnostics, process shutdown, and record removal. [B]
+
+**Adopt now:** name the list entry point `agents`; name direct session opening `attach`; add `logs`; rename `session stop` to `stop`; and rename `session delete` to `rm`. Delete the old `session status`, `session stop`, and `session delete` parser branches rather than retaining aliases. Keep `session cleanup` and `session resolve-delivery` as recovery commands because they represent work that Claude Code's command set does not perform. See [Changes 11 and 12](../architecture-plan.md#change-11-logs-exposes-the-error-already-on-disk). [B]
 
 ## Sources
 

@@ -3,12 +3,13 @@ import { isAbsolute, join, resolve } from "node:path";
 
 import { SESSION_COLORS } from "../shared/contracts.mjs";
 import { atomicWriteJson } from "./atomic-file.mjs";
+import { traceSessionLock } from "./lock-trace.mjs";
 import { SessionCoordinator } from "./session-coordinator.mjs";
 
 const CREATE_COORDINATION_KEY = "\0registry-create";
-// Worker activity events and the summary pass rewrite records outside a color write's lock, so one lost
-// compare-and-swap is routine. The bound keeps the retry from spinning if a session churns without pause.
-const COLOR_WRITE_ATTEMPTS = 8;
+// Two writers can hold different per-session locks, so one lost compare-and-swap is routine.
+// The bound keeps the retry from spinning if a session churns without pause.
+const RECORD_WRITE_ATTEMPTS = 8;
 const TASK_STATES = new Set(["WORKING", "WAITING", "READY", "FAILED", "STOPPED"]);
 const PROCESS_STATES = new Set(["LIVE", "SLEEPING", "EXITED", "STALE"]);
 const OUTCOMES = new Set(["NONE", "COMPLETED", "READY_FOR_REVIEW"]);
@@ -259,30 +260,39 @@ export function registryCoordinationScope(registry) {
   return scope;
 }
 
-/** Serialize a complete ownership/revision lifecycle for one exact session. @param {RegistryStore} registry @param {string} sessionId @param {() => any | Promise<any>} operation */
-export function runSessionLifecycle(registry, sessionId, operation) {
-  return registryCoordinationScope(registry).lifecycle.run(sessionId, operation);
+/** Serialize a complete ownership/revision lifecycle for one exact session. @param {RegistryStore} registry @param {string} sessionId @param {() => any | Promise<any>} operation @param {string} [label] */
+export function runSessionLifecycle(registry, sessionId, operation, label = "lifecycle") {
+  const { lifecycle } = registryCoordinationScope(registry);
+  return traceSessionLock(label, sessionId, (traced) => lifecycle.run(sessionId, traced), operation);
 }
 
 /**
- * Write one session's operator-chosen color, re-reading the record when a concurrent write wins the
- * compare-and-swap. The color depends on nothing about the session, so metadata churn only costs a retry.
+ * Write one session's record, re-reading it and re-deriving the update when a concurrent write wins the
+ * compare-and-swap. RegistryStore.update still serializes the read-check-write for one session, so a
+ * lost swap costs a retry rather than a failure the caller has to handle.
  *
  * @param {RegistryStore} registry
  * @param {string} sessionId
- * @param {SessionColor | null} color
+ * @param {(current: SessionRecord) => Partial<SessionRecord> | undefined} derive fields to write, or undefined to leave the record alone
  * @returns {Promise<SessionRecord>}
  */
-export async function applySessionColor(registry, sessionId, color) {
+export async function applySessionUpdate(registry, sessionId, derive) {
   for (let attempt = 1; ; attempt += 1) {
     const current = await registry.get(sessionId);
     if (current === undefined) throw Object.assign(new Error("Session does not exist"), { code: "SESSION_NOT_FOUND" });
+    const update = derive(current);
+    if (update === undefined) return current;
     try {
-      return await registry.update(sessionId, current.revision, { color: color ?? undefined, updatedAt: new Date().toISOString() });
+      return await registry.update(sessionId, current.revision, update);
     } catch (error) {
-      if (attempt >= COLOR_WRITE_ATTEMPTS || /** @type {any} */ (error)?.code !== "REVISION_CONFLICT") throw error;
+      if (attempt >= RECORD_WRITE_ATTEMPTS || /** @type {any} */ (error)?.code !== "REVISION_CONFLICT") throw error;
     }
   }
+}
+
+/** Write one session's operator-chosen color. @param {RegistryStore} registry @param {string} sessionId @param {SessionColor | null} color */
+export function applySessionColor(registry, sessionId, color) {
+  return applySessionUpdate(registry, sessionId, () => ({ color: color ?? undefined, updatedAt: new Date().toISOString() }));
 }
 
 /** Atomic, compare-and-swap storage for canonical session records. */

@@ -1,5 +1,5 @@
 // Keypress-to-frame latency and byte volume for the list <-> viewer transition, under a real PTY.
-// Usage: node perf/transition-latency.mjs [--base <dir>] [--sessions N] [--items N] [--repeats N] [--label name]
+// Usage: node perf/transition-latency.mjs [--base <dir>] [--sessions N] [--items N] [--repeats N] [--label name] [--stream-ms N]
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -21,6 +21,8 @@ const ITEMS = Number(option("items", "60"));
 const REPEATS = Number(option("repeats", "7"));
 const LABEL = option("label", "run");
 const PHASE_LOG = option("phase-log", "");
+// Frames every STREAM_MS from every fake Pi, so the transition competes with its own session's ingest.
+const STREAM_MS = option("stream-ms", "");
 
 const VIEWER_MARK = Buffer.from("COMPOSER");
 const LIST_MARK = Buffer.from("pi-dashboard");
@@ -41,6 +43,7 @@ async function main() {
     COLUMNS: "120",
     LINES: "40",
     ...(PHASE_LOG === "" ? {} : { PI_DASHBOARD_PERF_LOG: PHASE_LOG, PI_DASHBOARD_DAEMON_PERF_LOG: `${PHASE_LOG}.daemon` }),
+    ...(STREAM_MS === "" ? {} : { FAKE_PI_STREAM_MS: STREAM_MS }),
   };
 
   // Start the daemon before the pseudo-terminal: a loaded box can miss the frontend's 15 s deadline.
@@ -97,9 +100,11 @@ async function main() {
     }
   }
 
-  async function quiesce() {
+  // A streaming session never goes quiet, so the wait is bounded rather than unconditional.
+  async function quiesce(maxMs = 5_000) {
+    const startedAt = Date.now();
     for (;;) {
-      if (Date.now() - lastOutputAt >= QUIET_MS) return;
+      if (Date.now() - lastOutputAt >= QUIET_MS || Date.now() - startedAt >= maxMs) return;
       await sleep(20);
     }
   }
@@ -179,7 +184,7 @@ async function main() {
     };
   };
   console.log(JSON.stringify({
-    label: LABEL, base: BASE, sessions: SESSIONS, items: ITEMS,
+    label: LABEL, base: BASE, sessions: SESSIONS, items: ITEMS, streamMs: STREAM_MS,
     loadavg: (await readFile("/proc/loadavg", "utf8")).trim(),
     keystroke: summarize(results.keystroke), enter: summarize(results.enter), back: summarize(results.back), raw: results,
   }, undefined, 2));

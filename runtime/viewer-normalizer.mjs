@@ -602,5 +602,10 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     return { ...state, ...boundedWindow(MAX_SNAPSHOT_BYTES - Buffer.byteLength(JSON.stringify(state))) };
   }
 
-  return { consumeHistory, consumeFrame, applyViewerEvent, restore, checkpoint, restoreCheckpoint, consumeError, snapshot };
+  /** The normalized transcript items alone, for a caller that must not publish a snapshot. */
+  function transcriptItems() {
+    return [...items.values()];
+  }
+
+  return { consumeHistory, consumeFrame, applyViewerEvent, restore, checkpoint, restoreCheckpoint, consumeError, snapshot, transcriptItems };
 }

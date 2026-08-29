@@ -18,7 +18,7 @@ import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "./process-signaler.mjs";
 import { RecoveredWorkerRouter, reconcileRuntime } from "./reconciliation.mjs";
 import { openSettingsStore, summarizePromptInput, summarizeWithPi } from "./summaries.mjs";
-import { RegistryStore, applySessionColor, runSessionLifecycle } from "./registry-store.mjs";
+import { RegistryStore, applySessionColor, applySessionUpdate, runSessionLifecycle } from "./registry-store.mjs";
 import { reduceSessionState } from "./state-reducer.mjs";
 import { createIdleExit } from "./idle-exit.mjs";
 import { spawn as spawnProcess } from "node:child_process";
@@ -699,7 +699,7 @@ export async function createDaemonRuntime({
         await router.register(handle);
         await context.recovery.viewer.ensure(handle.sessionId);
         handle.onFrame?.((/** @type {Record<string, unknown>} */ frame) => {
-          void runSessionLifecycle(registry, handle.sessionId, async () => {
+          void router.runFrame(handle.sessionId, async () => {
             await context.recovery.viewer.ingest(handle.sessionId, frame);
           }).catch(() => {});
         });
@@ -731,7 +731,7 @@ export async function createDaemonRuntime({
           const next = reduceSessionState(current, { type: streaming ? "TURN_STARTED" : "TURN_COMPLETED", at: new Date().toISOString() });
           const updated = await registry.update(current.sessionId, current.revision, { taskState: next.taskState, processState: next.processState, outcome: next.outcome, activity: next.activity, updatedAt: next.updatedAt });
           await context.publishSession(updated);
-        });
+        }, "reconcile_activity");
       },
       /**
        * Store the model and thinking level Pi reported, so the list shows what a session actually runs
@@ -755,9 +755,13 @@ export async function createDaemonRuntime({
             updatedAt: new Date().toISOString(),
           });
           await context.publishSession(updated);
-        });
+        }, "record_model");
       },
-      /** Refresh opt-in Activity summaries for every session whose transcript advanced. */
+      /**
+       * Refresh opt-in Activity summaries for every session whose transcript advanced. Selection reads
+       * the normalized transcript from memory rather than republishing each session's snapshot, so a
+       * frontend returning to the list does not wait behind one durable write per session.
+       */
       async refreshSummaries() {
         const { summaryModel } = settingsStore.current();
         if (summaryModel === null || context.recovery?.viewer === undefined) return [];
@@ -766,12 +770,12 @@ export async function createDaemonRuntime({
         const refreshed = [];
         for (const record of await registry.list()) {
           if (summarizing.has(record.sessionId)) continue;
-          const snapshot = await context.recovery.viewer.snapshot(record.sessionId, "observer").catch(() => undefined);
-          if (snapshot === undefined) continue;
-          const sourceCursor = snapshot.cursor.sequence;
+          const normalized = context.recovery.viewer.transcript(record.sessionId);
+          if (normalized === undefined) continue;
+          const sourceCursor = normalized.sequence;
           const summary = record.summary;
           if (summary !== undefined && summary.sourceCursor === sourceCursor && summary.model.provider === summaryModel.provider && summary.model.id === summaryModel.id) continue;
-          const transcript = summarizePromptInput(snapshot.items);
+          const transcript = summarizePromptInput(normalized.items);
           if (transcript.length === 0) continue;
           refreshed.push(record.sessionId);
           summarizing.add(record.sessionId);
@@ -781,6 +785,10 @@ export async function createDaemonRuntime({
               const text = typeof written === "string" ? written : written?.text;
               const writtenName = typeof written === "string" ? undefined : written?.name;
               if (typeof text !== "string" || text.trim().length === 0) return;
+              // The write stays under the lifecycle lock. It is the last writer that could race Stop's
+              // signaling-boundary revision check or Delete's revision-guarded remove, and the lock is
+              // what keeps every revision-guarded update from racing another writer. The hold is one
+              // registry read plus one atomic write; the summarizer itself ran outside it.
               await runSessionLifecycle(registry, record.sessionId, async () => {
                 const current = await registry.get(record.sessionId);
                 if (current === undefined) return;
@@ -789,7 +797,7 @@ export async function createDaemonRuntime({
                 const namesItself = typeof writtenName === "string" && writtenName.trim().length > 0 && current.nameGenerated !== false;
                 const updated = await registry.update(current.sessionId, current.revision, { summary: { text: text.trim().slice(0, 512), generatedAt: new Date().toISOString(), model: { ...summaryModel }, sourceCursor }, ...(namesItself ? { name: writtenName.trim().slice(0, 128), nameGenerated: true } : {}), updatedAt: new Date().toISOString() });
                 await context.publishSession(updated);
-              });
+              }, "summary_write");
             } catch {
             } finally {
               summarizing.delete(record.sessionId);
@@ -949,7 +957,7 @@ export async function createDaemonRuntime({
           await checkpoint("after_result_completion");
           if (durable.ok) return durable.result;
           throw Object.assign(new Error(durable.error.message), durable.error);
-        });
+        }, request.op);
         const reservation = { serialized, promise: operation };
         attachmentRequests.set(cacheKey, reservation);
         void operation.finally(() => {
@@ -971,7 +979,7 @@ export async function createDaemonRuntime({
           claims.delete(socket);
           if (claims.size === 0) attachmentClaims.delete(sessionId);
           context.broadcast(event);
-        })));
+        }, "release_attachments")));
         attachmentSessions.delete(socket);
       },
       /** @param {any} frame @param {any} connection @param {any} metadata @param {number} routeGeneration */
@@ -997,7 +1005,7 @@ export async function createDaemonRuntime({
           if (frame.version !== 1 || frame.sessionId !== metadata.sessionId || Object.keys(frame).some((key) => !allowed.includes(key)) || typeof frame.frame !== "object" || frame.frame === null || Array.isArray(frame.frame)) throw Object.assign(new Error("Invalid Pi viewer frame"), { code: "INVALID_WORKER_FRAME" });
           const viewer = context.recovery?.viewer ?? context.viewerRecovery;
           if (viewer === undefined) throw Object.assign(new Error("Viewer recovery is still initializing"), { code: "RECOVERING", retryable: true });
-          await router.runCurrent(metadata, connection, routeGeneration, async () => {
+          await router.runCurrentFrame(metadata, connection, routeGeneration, async () => {
             await viewer.ingest(frame.sessionId, frame.frame);
           });
           return;
@@ -1006,10 +1014,14 @@ export async function createDaemonRuntime({
         const eventKeys = ["version", "type", "token", "sessionId", "event"];
         if (frame.type !== "worker_event" || frame.version !== 1 || frame.sessionId !== metadata.sessionId || Object.keys(frame).some((key) => !eventKeys.includes(key)) || typeof frame.event !== "object" || frame.event === null || Array.isArray(frame.event)) throw Object.assign(new Error("Invalid worker frame"), { code: "INVALID_WORKER_FRAME" });
         await router.runCurrent(metadata, connection, routeGeneration, async () => {
-          const record = await registry.get(frame.sessionId);
-          if (record?.ownership === undefined || record.ownership.runId !== metadata.runId) throw Object.assign(new Error("Worker event ownership conflict"), { code: "OWNERSHIP_CONFLICT" });
-          const next = reduceSessionState(record, frame.event);
-          const updated = next === record ? record : await registry.update(record.sessionId, record.revision, { taskState: next.taskState, processState: next.processState, outcome: next.outcome, activity: next.activity, updatedAt: next.updatedAt });
+          // Re-read and re-reduce when another writer wins the compare-and-swap. Throwing here reaches
+          // the worker socket's error path, which destroys the connection: losing a race with a color,
+          // rename or summary write must not cost the supervisor its route.
+          const updated = await applySessionUpdate(registry, frame.sessionId, (current) => {
+            if (current.ownership === undefined || current.ownership.runId !== metadata.runId) throw Object.assign(new Error("Worker event ownership conflict"), { code: "OWNERSHIP_CONFLICT" });
+            const next = reduceSessionState(current, frame.event);
+            return next === current ? undefined : { taskState: next.taskState, processState: next.processState, outcome: next.outcome, activity: next.activity, updatedAt: next.updatedAt };
+          });
           await context.publishSession(updated);
         });
       },
@@ -1029,7 +1041,7 @@ export async function createDaemonRuntime({
             const updated = await applySessionColor(registry, request.payload.sessionId, request.payload.color);
             await context.publishSession(updated);
             return { kind: "session_colored", sessionId: updated.sessionId, revision: updated.revision, color: updated.color ?? null };
-          });
+          }, "set_session_color");
         }
         if (context.state !== "READY" && !duringRecovery) throw Object.assign(new Error(context.state === "FAILED" ? context.stateError?.message ?? "Daemon recovery failed" : "Daemon recovery is still in progress"), { code: context.state === "FAILED" ? context.stateError?.code ?? "RECOVERY_FAILED" : "RECOVERING", retryable: context.state !== "FAILED" });
         if (request.op === "get_viewer_snapshot") {
@@ -1113,7 +1125,7 @@ export async function createDaemonRuntime({
               await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
               await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
               return { kind: "launched", sessionId: persisted.sessionId };
-            });
+            }, "launch");
           } catch (error) {
             const launchError = /** @type {any} */ (error);
             const current = await context.recovery.journal.get(request);
@@ -1365,11 +1377,11 @@ export async function createDaemonRuntime({
             if (current === undefined || current.name === request.payload.name) return;
             const updated = await registry.update(current.sessionId, current.revision, { name: request.payload.name, nameGenerated: false, updatedAt: new Date().toISOString() });
             await context.publishSession(updated);
-          });
+          }, "set_session_name");
         }
         if (changed) {
           const publish = () => context.publishCommand(status);
-          if (typeof request.payload?.sessionId === "string") await runSessionLifecycle(registry, request.payload.sessionId, publish);
+          if (typeof request.payload?.sessionId === "string") await runSessionLifecycle(registry, request.payload.sessionId, publish, "publish_command");
           else await publish();
         }
         return { kind: "command", status };

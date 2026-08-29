@@ -116,6 +116,11 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
         for (const subscriber of subscribers) {
             if (subscriber.ended)
                 continue;
+            subscriber.observed = laterCursor(subscriber.observed, event.cursor);
+            // Falling behind is not fatal: the consumer owes a snapshot refetch, and every event
+            // until it takes that marker is already subsumed by the snapshot it will read.
+            if (subscriber.desynchronized)
+                continue;
             if (subscriber.waiter !== undefined) {
                 const waiter = subscriber.waiter;
                 subscriber.waiter = undefined;
@@ -129,9 +134,8 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                     subscriber.queue.splice(superseded, 1);
             }
             if (subscriber.queue.length >= subscriberLimit) {
-                subscriber.error = new DaemonClientError("SUBSCRIBER_OVERFLOW", "Client subscriber exceeded its bounded queue");
-                subscriber.ended = true;
-                subscribers.delete(subscriber);
+                subscriber.desynchronized = true;
+                subscriber.queue.length = 0;
             }
             else {
                 subscriber.queue.push(event);
@@ -328,6 +332,12 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
         async next() {
             if (subscriber.error !== undefined)
                 throw subscriber.error;
+            // Hand the resynchronization marker over before any later event, and resume queuing only
+            // once the consumer holds it, so nothing is dropped after the snapshot it will read.
+            if (subscriber.desynchronized === true) {
+                subscriber.desynchronized = false;
+                return { value: { kind: "resynchronize", cursor: subscriber.observed }, done: false };
+            }
             const event = subscriber.queue.shift();
             if (event !== undefined)
                 return { value: event, done: false };
@@ -376,7 +386,7 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
             return promise;
         },
         subscribe(after) {
-            const subscriber = { acknowledgedAfter: after, queue: [], ended: closed };
+            const subscriber = { acknowledgedAfter: after, observed: after, desynchronized: false, queue: [], ended: closed };
             if (!closed) {
                 subscribers.add(subscriber);
                 if (socket !== undefined && authenticated && !socket.destroyed) {

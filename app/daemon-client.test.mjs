@@ -181,6 +181,36 @@ describe("daemon client", () => {
     await iterator.return?.();
   });
 
+  // Operator-visible failure: the dashboard exited with "SUBSCRIBER_OVERFLOW: Client subscriber
+  // exceeded its bounded queue" whenever the daemon replayed more events than the queue holds.
+  it("asks a list subscriber that fell behind to resynchronize instead of ending it", async () => {
+    const socketPath = await socketPathIn("client-overflow-");
+    const session = (sessionId) => ({ schemaVersion: 1, revision: 1, sessionId, sessionFile: `/sessions/${sessionId}.jsonl`, canonicalSessionFile: `/sessions/${sessionId}.jsonl`, cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "assistant_final", summary: sessionId, updatedAt: "2026-01-01T00:00:00.000Z" }, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" });
+    const event = (sequence) => ({ version: 1, cursor: { daemonEpoch: "epoch-1", sequence: String(sequence) }, occurredAt: "2026-01-01T00:00:00.000Z", kind: "session_changed", payload: { session: session(`session-${sequence}`) } });
+    const server = await daemonServer(socketPath, ({ socket, reply }) => {
+      reply({ kind: "subscribed", cursor: { daemonEpoch: "epoch-1", sequence: "0" } });
+      for (let sequence = 1; sequence <= 13; sequence += 1) socket.write(encodeJsonl(event(sequence)));
+    });
+    const client = startClient({ socketPath, maxBytes: 8192, reconnectDelayMs: 1, subscriberLimit: 4, reconnect: false });
+    const iterator = client.subscribe({ daemonEpoch: "epoch-1", sequence: "0" })[Symbol.asyncIterator]();
+    /** @type {any[]} */
+    const delivered = [];
+    for (;;) {
+      const next = await within(iterator.next());
+      expect(next.done).toBe(false);
+      delivered.push(next.value);
+      if (next.value.kind === "resynchronize") break;
+    }
+    // The marker names the newest position the client saw, so the consumer can refetch a snapshot
+    // and skip everything the snapshot already contains.
+    expect(delivered.at(-1)).toEqual({ kind: "resynchronize", cursor: { daemonEpoch: "epoch-1", sequence: "13" } });
+    expect(delivered.filter((value) => value.kind === "session_changed").length).toBeLessThan(13);
+
+    server.socket?.write(encodeJsonl(event(14)));
+    await expect(within(iterator.next())).resolves.toMatchObject({ value: { cursor: { sequence: "14" } }, done: false });
+    await iterator.return?.();
+  });
+
   it("drops a malformed event and reconnects before dispatching a valid event", async () => {
     const socketPath = await socketPathIn("client-malformed-event-");
     const executable = { realpath: "/installed/pi", device: "1", inode: "2", size: 3, modifiedTimeNs: "4" };

@@ -374,7 +374,9 @@ export function parseDaemonResponse(value) {
   requireKeys(response, ["version", "requestId", "ok", "result"], [], "daemon response");
   const result = readRecord(response.result, "daemon response.result");
   const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "subscribed", "acknowledged", "viewer_snapshot", "viewer_subscribed", "viewer_acknowledged", "session_commands", "session_query", "settings", "models", "summaries_refreshing", "session_colored"], "daemon response.result.kind");
-  if (kind === "state") { requireKeys(result, ["kind", "sessions"], [], "daemon response.result"); if (!Array.isArray(result.sessions)) throw new TypeError("sessions must be an array"); result.sessions.forEach((session, index) => validateSession(session, `daemon response.result.sessions[${index}]`)); }
+  // `cursor` is the daemon's event position when the snapshot was taken, and it is optional: a
+  // daemon built before it existed answers with sessions alone and its clients must still work.
+  if (kind === "state") { requireKeys(result, ["kind", "sessions"], ["cursor"], "daemon response.result"); if (!Array.isArray(result.sessions)) throw new TypeError("sessions must be an array"); result.sessions.forEach((session, index) => validateSession(session, `daemon response.result.sessions[${index}]`)); if (Object.hasOwn(result, "cursor")) readCursor(result.cursor, "daemon response.result.cursor"); }
   else if (["launched", "detached"].includes(kind)) { requireKeys(result, ["kind", "sessionId"], [], "daemon response.result"); readIdentifier(result, "sessionId"); }
   else if (kind === "attached") { requireKeys(result, ["kind", "sessionId", "role"], [], "daemon response.result"); readIdentifier(result, "sessionId"); readEnum(result, "role", ["composer", "observer"]); }
   else if (kind === "command") { requireKeys(result, ["kind", "status"], [], "daemon response.result"); validateCommandStatus(result.status, "status"); }

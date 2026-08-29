@@ -1029,7 +1029,15 @@ export async function createDaemonRuntime({
       /** @param {any} request @param {net.Socket | undefined} socket @param {Set<net.Socket>} subscribers @param {string} [authenticatedClientId] */
       async handleRequest(request, socket, subscribers, authenticatedClientId = request.clientId, duringRecovery = false) {
         if (!context.admissionOpen) throw Object.assign(new Error("Daemon is shutting down"), { code: "SHUTTING_DOWN", retryable: true });
-        if (request.op === "get_state") return { kind: "state", sessions: await registry.list() };
+        if (request.op === "get_state") {
+          // Read the event position before the registry, never after: a snapshot newer than its own
+          // cursor only replays events it already contains, while a cursor newer than the snapshot
+          // would let a subscriber skip a change it never saw. Recovery has no event store yet, and
+          // a client that gets no cursor falls back to its own.
+          const cursor = context.recovery?.events?.currentCursor();
+          const sessions = await registry.list();
+          return cursor === undefined ? { kind: "state", sessions } : { kind: "state", sessions, cursor };
+        }
         if (request.op === "get_settings") return { kind: "settings", ...settingsStore.current() };
         if (request.op === "get_models") {
           // Listing models runs no inference; it asks the installed Pi what it will accept.

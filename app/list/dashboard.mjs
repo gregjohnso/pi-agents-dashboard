@@ -403,6 +403,9 @@ export class DashboardController {
                 if (persisted.launchDraft !== undefined) {
                     this.composerDraft = {
                         ...persisted.launchDraft,
+                        // Where the operator started this dashboard outranks where the last one ran:
+                        // a saved cwd would silently launch work into yesterday's directory.
+                        cwd: this.launchDefaults.cwd ?? persisted.launchDraft.cwd,
                         sourceSessionId: this.sourceSessionId,
                         model: { ...persisted.launchDraft.model },
                     };

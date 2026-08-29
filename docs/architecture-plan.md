@@ -35,7 +35,7 @@ The resulting process model is one daemon per state root, many terminal clients,
 5. Keep `/model`. Delete `/thinking`, its picker, `set_thinking_level`, and requested thinking level from dashboard launch.
 6. Keep summaries opt-in. Summary model settings remain dashboard settings, not Pi settings passthrough.
 
-Keep one composer and read-only observers. Claude Code's shared typing was considered and rejected because these clients send structured commands with durable delivery stages rather than raw terminal bytes.
+Keep one composer and read-only observers. Claude Code's [shared typing](reference/claude-code-behavior.md#linux-clients-share-one-editor-and-one-terminal-size) was considered and rejected because these clients send structured commands with durable delivery stages rather than raw terminal bytes.
 
 ## Execution rules and invariants
 
@@ -52,8 +52,8 @@ Every commit preserves these invariants:
 - A revision guard covers every fact used by a destructive operation.
 - Background work stays outside operator locks.
 - Every process boundary has a versioned contract.
-- Session rows use structured worker state only. Terminal bytes and the canonical JSONL never determine working state.
-- A daemon upgrade adopts compatible live workers before judging their release version. Stale workers continue until an idle replacement boundary or explicit operator action, and an older daemon never replaces a newer worker automatically.
+- Session rows use [structured worker state](reference/claude-code-behavior.md#structured-state-and-terminal-rendering-remain-separate) only. Terminal bytes and the canonical JSONL never determine working state.
+- A daemon upgrade [adopts compatible live workers before judging their release version](reference/claude-code-behavior.md#release-changes-adopt-workers-before-replacing-them). Stale workers continue until an idle replacement boundary or explicit operator action, and an older daemon never replaces a newer worker automatically.
 - One session has at most one composer connection and any number of observers.
 - Socket loss releases a composer claim but does not cancel an accepted command.
 - Worktree creation, locks, sweeps, cleanup, and opt-in summaries remain unchanged.
@@ -81,7 +81,7 @@ Protocol rules apply throughout:
 
 - Worker readiness, socket adoption, and IPC handoff are one decision.
 - `subscribe_list_changes` ships without old `subscribe` support or a new-frontend fallback. The operator restarts the daemon and every dashboard together.
-- Exact-identity socket adoption is the normal daemon-start path. Release skew is evaluated only after compatible live workers are adopted.
+- [Exact-identity socket adoption](reference/claude-code-behavior.md#the-roster-is-an-adoption-record) is the normal daemon-start path. Release skew is evaluated only after compatible live workers are adopted.
 - A live dashboard gets a process-scoped connection ID. Durable command recovery may retain the stable installation ID and request ID.
 - `session_access_changed` carries `sessionId`, the receiving connection's role, `writerPresent`, and an in-memory generation. It carries no peer client ID.
 - Observers explicitly request composer after a vacancy. The per-session lock decides races. Accepted commands continue after disconnect.
@@ -90,14 +90,14 @@ Protocol rules apply throughout:
 
 Adopt these findings in priority order:
 
-1. Adopt by socket and exact process identity now. Changes 5.1 through 5.3 already make authenticated socket adoption the normal daemon-start path and the readiness boundary. The gates verify PID plus process-start identity, so this needs no duplicate commit.
-2. Use structured row state only. The invariant above bars terminal-byte and canonical JSONL inference. Change 5.5 may use only structured idle state when replacing a stale worker.
-3. Handle release skew through adoption now. Changes 5.4 and 5.5 adopt compatible live workers before release comparison, mark old worker code stale, replace it at idle or by explicit action, and refuse automatic downgrade. This preserves live work across an upgrade; it does not support old releases after restart.
-4. Defer an owned pseudo-terminal (PTY) viewer. Reconsider it when Pi exposes structured state, command, repaint, and detach channels. Acceptance requires structured row state, durable command stages, authenticated Stop, one writer, late-attach repaint, and daemon-independent worker lifetime. Agent-aware detach is part of that viewer, not a host-level key binding.
-5. Defer a 256 KiB in-memory diagnostic tail. Existing run logs and rotating diagnostics already capture failures, and no `logs` command is in scope. Add a commit only when measured startup diagnosis needs recent output through a `logs` command. Acceptance requires a strict 256 KiB bound, process-local lifetime, secrets review, and no use as canonical viewer history.
-6. Defer prewarmed spares. Trigger reconsideration with measured Pi launch latency and resident memory. Acceptance requires a measured launch improvement that justifies resident memory, a bounded spare count, authenticated claiming, stale-version replacement, and cleanup tests.
+1. Adopt [socket authentication and exact process identity](reference/claude-code-behavior.md#the-roster-is-an-adoption-record) now. Changes 5.1 through 5.3 already make authenticated socket adoption the normal daemon-start path and the readiness boundary. The gates verify PID plus process-start identity, so this needs no duplicate commit.
+2. Use [structured row state](reference/claude-code-behavior.md#structured-state-and-terminal-rendering-remain-separate) only. The invariant above bars terminal-byte and canonical JSONL inference. Change 5.5 may use only structured idle state when replacing a stale worker.
+3. Handle [release skew through adoption](reference/claude-code-behavior.md#release-changes-adopt-workers-before-replacing-them) now. Changes 5.4 and 5.5 adopt compatible live workers before release comparison, mark old worker code stale, replace it at idle or by explicit action, and refuse automatic downgrade. This preserves live work across an upgrade; it does not support old releases after restart.
+4. Defer an [owned pseudo-terminal (PTY) viewer](reference/claude-code-behavior.md#attach-becomes-usable-after-a-native-repaint). Reconsider it when Pi exposes structured state, command, repaint, and detach channels. Acceptance requires structured row state, durable command stages, authenticated Stop, one writer, late-attach repaint, and daemon-independent worker lifetime. Agent-aware detach is part of that viewer, not a host-level key binding.
+5. Defer a [256 KiB in-memory diagnostic tail](reference/claude-code-behavior.md#attach-becomes-usable-after-a-native-repaint). Existing run logs and rotating diagnostics already capture failures, and no `logs` command is in scope. Add a commit only when measured startup diagnosis needs recent output through a `logs` command. Acceptance requires a strict 256 KiB bound, process-local lifetime, secrets review, and no use as canonical viewer history.
+6. Defer [prewarmed spares](reference/claude-code-behavior.md#each-session-has-one-pty-host-and-one-agent). Trigger reconsideration with measured Pi launch latency and resident memory. Acceptance requires a measured launch improvement that justifies resident memory, a bounded spare count, authenticated claiming, stale-version replacement, and cleanup tests.
 
-The evidence comes from Claude Code 2.1.251's process adoption, structured job state, repaint, release handling, and bounded raw-output tail. The detailed findings and source list remain in [Claude Code session model](claude-code-session-model.md).
+The implementable behavior is in the [Claude Code behavioral reference](reference/claude-code-behavior.md). The investigation and source list remain in [Claude Code session model](claude-code-session-model.md).
 
 ## Change 1: broken session queries disappear
 

@@ -1,6 +1,6 @@
 # Architecture implementation plan
 
-After these 17 commits:
+After these 19 commits:
 
 - Commands work the same on a newly launched session and after a daemon restart. Graceful Stop no longer waits through its timeout solely because a route is absent.
 - Several terminals may open one session. Exactly one may type; the others remain read-only and can explicitly claim composer after it becomes vacant.
@@ -9,7 +9,7 @@ After these 17 commits:
 - Delete continues to forget only the dashboard row. It preserves the canonical Pi file and worktree.
 - The daemon and workers continue running when terminal clients exit.
 
-Approve the work as 17 green commits in one release, with five operator-machine gates protecting the live daemon and two live sessions. Estimated effort is 6.5 to 10 engineer-days, down from 7 to 11 engineer-days. This is an estimate, not measured work. It includes tests, gates, and documentation. It excludes review time and maintenance-window waits.
+Approve the work as 19 green commits in one release, with five operator-machine gates protecting the live daemon and two live sessions. Estimated effort is 7.5 to 11.5 engineer-days, up from the previous 6.5 to 10 engineer-days. This is an estimate, not measured work. It includes tests, gates, and documentation. It excludes review time and maintenance-window waits.
 
 The resulting process model is one daemon per state root, many terminal clients, one worker per live Pi session, and at most one composer connection per session. Any number of observers may open a session read-only.
 
@@ -21,10 +21,10 @@ The resulting process model is one daemon per state root, many terminal clients,
 | 2 | Refused launch artifacts | A known admission refusal leaves a terminal `FAILED` journal result and no session record, Pi file, worktree, worker, or list row. Its status-line message remains until the operator's next keystroke or action. A failure after preparation keeps the failed row because side effects and cleanup evidence exist. |
 | 3 | Unavailable model catalog | Record the diagnostic and let Pi decide. `MODEL_CATALOG_FAILED` remains distinct from `MODEL_UNKNOWN`. |
 | 4 | Unused trash seam | Remove it. Delete continues to forget only the dashboard record. Any future command that deletes Pi files needs separate wording and recovery. |
-| 5 | List protocol compatibility | Ship one release with `subscribe_list_changes` and refuse old `subscribe`. Dashboards must restart after this upgrade. An unrestarted dashboard discards the refusal response, shows an empty session list, receives no updates, and shows no restart instruction. This known empty display is why the upgrade procedure requires a dashboard restart rather than waiting for an on-screen message. The daemon refusal remains explicit for protocol clients that read responses and for diagnostics. |
-| 6 | Retired durable files | Ignore the obsolete files in place, whether valid or corrupt. Do not delete them during rollout. On the operator's machine on 2026-08-29, they are `index/events.jsonl` at 18 MB, `daemon/attachment-results.jsonl` at 679 KB, 14 `index/viewer/*.acks.json` files, and `daemon/event-acks.json` at 512 bytes. A later explicit cleanup command may reclaim them. This plan does not include that command. |
-| 7 | Legacy trash transactions | Ignore `daemon/delete-results.json` if present. Do not add `UNSUPPORTED_LEGACY_DELETE_TRANSACTION` or its tests. The file was absent on the operator's machine on 2026-08-29, and production never supplied a trash callback. No shipped code path could therefore create a nonempty file. |
-| 8 | Worker IPC handoff | Bind Pi identity, authenticate and adopt the socket, persist readiness, send `handoff_to_socket`, receive its acknowledgement, then disconnect inter-process communication (IPC). Without those messages, a new worker retains IPC for an older daemon still in memory. |
+| 5 | List protocol rollout | Ship only `subscribe_list_changes`. Restart the daemon and every dashboard together. Do not add an old-daemon fallback or a special refusal for old `subscribe`; mixed releases are unsupported. |
+| 6 | Retired durable files | Stop opening obsolete files. Leave them on disk during rollout, but add no parser, corrupt-file branch, migration test, or explicit ignore path. Once no production code names them, they are ignored at zero code cost. On the operator's machine on 2026-08-29, they are `index/events.jsonl` at 18 MB, `daemon/attachment-results.jsonl` at 679 KB, 14 `index/viewer/*.acks.json` files, and `daemon/event-acks.json` at 512 bytes. |
+| 7 | Legacy trash transactions | Remove every reference to `daemon/delete-results.json`. Do not parse, validate, migrate, delete, or test old contents. The file was absent on the operator's machine on 2026-08-29, and production never supplied a trash callback. |
+| 8 | Worker socket handoff | Bind Pi identity, authenticate and adopt the socket, persist readiness, send `handoff_to_socket`, receive its acknowledgement, then disconnect inter-process communication (IPC). Socket adoption by exact process identity is the normal daemon-start path, not a migration fallback. |
 
 ## Settled feature scope
 
@@ -34,6 +34,8 @@ The resulting process model is one daemon per state root, many terminal clients,
 4. Keep worktree isolation, ownership locks, sweeps, and cleanup.
 5. Keep `/model`. Delete `/thinking`, its picker, `set_thinking_level`, and requested thinking level from dashboard launch.
 6. Keep summaries opt-in. Summary model settings remain dashboard settings, not Pi settings passthrough.
+
+Keep one composer and read-only observers. Claude Code's shared typing was considered and rejected because these clients send structured commands with durable delivery stages rather than raw terminal bytes.
 
 ## Execution rules and invariants
 
@@ -50,6 +52,8 @@ Every commit preserves these invariants:
 - A revision guard covers every fact used by a destructive operation.
 - Background work stays outside operator locks.
 - Every process boundary has a versioned contract.
+- Session rows use structured worker state only. Terminal bytes and the canonical JSONL never determine working state.
+- A daemon upgrade adopts compatible live workers before judging their release version. Stale workers continue until an idle replacement boundary or explicit operator action, and an older daemon never replaces a newer worker automatically.
 - One session has at most one composer connection and any number of observers.
 - Socket loss releases a composer claim but does not cancel an accepted command.
 - Worktree creation, locks, sweeps, cleanup, and opt-in summaries remain unchanged.
@@ -61,11 +65,11 @@ Every commit preserves these invariants:
 | 1 | Baseline inspection | The live daemon and both sessions have an exact, recorded starting identity. | Gate 0 |
 | 2 | Changes 1 through 3 | Broken and Pi-owned controls no longer appear; `/model` and observed thinking remain. | |
 | 3 | Change 4 | A second or third terminal opens an occupied session read-only instead of showing `SESSION_IN_USE`. | |
-| 4 | Changes 5.1 through 5.3 | Commands, frames, replies, reconnect, and graceful Stop use the same route before and after daemon restart. | |
+| 4 | Changes 5.1 through 5.5 | Commands, frames, replies, reconnect, and graceful Stop use one adopted route. A new daemon starts with compatible live workers, marks old worker code stale, and replaces it only at a safe boundary. | |
 | 5 | Change 6 | A row never shows an unconfirmed requested model. | |
-| 6 | Changes 7.1 through 7.3 | Dashboard startup reads current rows instead of replaying history; old `subscribe` receives an explicit refusal. | |
+| 6 | Changes 7.1 through 7.3 | Dashboard startup reads current rows instead of replaying history; one required snapshot cursor closes subscribe races. | |
 | 7 | Changes 8.1 and 8.2 | Three dashboards keep independent state, see writer departure, and produce exactly one composer after a race. | |
-| 8 | Changes 9 and 10 | Obsolete acknowledgement files cannot block startup; Delete remains forget-only; retained files support rollback. | Gates 1 through 4 |
+| 8 | Changes 9 and 10 | Obsolete acknowledgement and trash recovery code is gone; Delete remains forget-only. | Gates 1 through 4 |
 
 Work may proceed independently only as follows:
 
@@ -76,10 +80,24 @@ Work may proceed independently only as follows:
 Protocol rules apply throughout:
 
 - Worker readiness, socket adoption, and IPC handoff are one decision.
-- `subscribe_list_changes` and explicit refusal of old `subscribe` ship together. Dashboards must restart after the upgrade because the old frontend discards the refusal response.
+- `subscribe_list_changes` ships without old `subscribe` support or a new-frontend fallback. The operator restarts the daemon and every dashboard together.
+- Exact-identity socket adoption is the normal daemon-start path. Release skew is evaluated only after compatible live workers are adopted.
 - A live dashboard gets a process-scoped connection ID. Durable command recovery may retain the stable installation ID and request ID.
 - `session_access_changed` carries `sessionId`, the receiving connection's role, `writerPresent`, and an in-memory generation. It carries no peer client ID.
 - Observers explicitly request composer after a vacancy. The per-session lock decides races. Accepted commands continue after disconnect.
+
+## Claude Code evidence changes the upgrade path, not the viewer contract
+
+Adopt these findings in priority order:
+
+1. Adopt by socket and exact process identity now. Changes 5.1 through 5.3 already make authenticated socket adoption the normal daemon-start path and the readiness boundary. The gates verify PID plus process-start identity, so this needs no duplicate commit.
+2. Use structured row state only. The invariant above bars terminal-byte and canonical JSONL inference. Change 5.5 may use only structured idle state when replacing a stale worker.
+3. Handle release skew through adoption now. Changes 5.4 and 5.5 adopt compatible live workers before release comparison, mark old worker code stale, replace it at idle or by explicit action, and refuse automatic downgrade. This preserves live work across an upgrade; it does not support old releases after restart.
+4. Defer an owned pseudo-terminal (PTY) viewer. Reconsider it when Pi exposes structured state, command, repaint, and detach channels. Acceptance requires structured row state, durable command stages, authenticated Stop, one writer, late-attach repaint, and daemon-independent worker lifetime. Agent-aware detach is part of that viewer, not a host-level key binding.
+5. Defer a 256 KiB in-memory diagnostic tail. Existing run logs and rotating diagnostics already capture failures, and no `logs` command is in scope. Add a commit only when measured startup diagnosis needs recent output through a `logs` command. Acceptance requires a strict 256 KiB bound, process-local lifetime, secrets review, and no use as canonical viewer history.
+6. Defer prewarmed spares. Trigger reconsideration with measured Pi launch latency and resident memory. Acceptance requires a measured launch improvement that justifies resident memory, a bounded spare count, authenticated claiming, stale-version replacement, and cleanup tests.
+
+The evidence comes from Claude Code 2.1.251's process adoption, structured job state, repaint, release handling, and bounded raw-output tail. The detailed findings and source list remain in [Claude Code session model](claude-code-session-model.md).
 
 ## Change 1: broken session queries disappear
 
@@ -134,13 +152,13 @@ Protocol rules apply throughout:
 
 **Outcome:** Commands, frames, replies, reconnect, and graceful Stop behave the same on a newly launched session and after daemon restart. Stop no longer waits through the graceful timeout solely because the current launch lacks a route. The worker adopts one authenticated daemon socket before readiness, then releases startup IPC.
 
-**Estimate:** 3 commits, 2.5 to 4 engineer-days, net deletion of 250 to 450 lines after changes 1 through 3.
+**Estimate:** 5 commits, 4 to 6 engineer-days, net deletion of 200 to 400 lines after changes 1 through 3.
 
 ### Commit 5.1: `refactor: specify worker socket handoff`
 
-- **Tests:** Add `keeps IPC until the daemon adopts the authenticated socket route` in `runtime/worker-supervisor.test.mjs`; `new workers retain IPC when an old daemon never requests handoff` in `runtime/worker.integration.test.mjs`; and wrong run, lease, generation, token, and process identity cases in `runtime/reconciliation.failure.test.mjs`.
-- **Implementation:** Add internal version 1 `connect_socket`, `socket_ready`, `handoff_to_socket`, and `socket_handoff_complete` messages in `runtime/installed-pi-worker.mjs`, `runtime/worker-supervisor.mjs`, and `runtime/worker.mjs`. Keep route generation and exact identity authoritative in `runtime/reconciliation.mjs`. Keep IPC open unless the daemon requests handoff.
-- **Stop:** Temporary-root tests reach one authenticated route; the old-daemon fixture retains IPC.
+- **Tests:** Add `keeps IPC until the daemon adopts the authenticated socket route` in `runtime/worker-supervisor.test.mjs`; daemon-start adoption cases in `runtime/worker.integration.test.mjs`; and wrong run, lease, generation, token, and process identity cases in `runtime/reconciliation.failure.test.mjs`.
+- **Implementation:** Add internal version 1 `connect_socket`, `socket_ready`, `handoff_to_socket`, and `socket_handoff_complete` messages in `runtime/installed-pi-worker.mjs`, `runtime/worker-supervisor.mjs`, and `runtime/worker.mjs`. Make authenticated socket adoption the normal startup and restart path. Keep route generation and exact identity authoritative in `runtime/reconciliation.mjs`. Keep IPC open until the daemon acknowledges the adopted route.
+- **Stop:** Temporary-root tests reach one authenticated route on initial daemon start and restart.
 
 ### Commit 5.2: `refactor: move worker traffic to the socket`
 
@@ -154,6 +172,19 @@ Protocol rules apply throughout:
 - **Implementation:** Register bound identity, request connection, verify the route, persist readiness, complete handoff, then disconnect IPC. Route graceful shutdown through the locked socket and stop policy. Delete `sessionHandles`, route-versus-handle branches, launch-channel pending replies, and duplicate buffering.
 - **Risk:** IPC disconnect may look like worker exit; a daemon crash during handoff may strand the worker.
 - **Stop:** Every injected window converges to one route or a terminal failed launch, and Gate 1 passes.
+
+### Commit 5.4: `feat: adopt compatible workers across upgrades`
+
+- **Tests:** Start a new daemon against compatible live workers with older, equal, and newer release metadata. Require exact PID plus process-start identity and route authentication before startup becomes ready. Older workers remain live and become `STALE`; equal workers remain current; incompatible protocol versions remain unavailable without signaling their processes.
+- **Implementation:** Persist the dashboard release and worker protocol beside each worker identity. During ordinary daemon startup, adopt every protocol-compatible route first, then compare release versions. Expose stale code as worker metadata without refusing daemon or list startup. Do not add dual protocol parsers.
+- **Stop:** Gate 1 keeps both original worker identities and reports their release status after the new daemon starts.
+
+### Commit 5.5: `feat: replace stale workers at a safe boundary`
+
+- **Tests:** Keep a busy stale worker unchanged. Replace a stale worker only after structured state reports idle or an explicit operator command requests replacement. Preserve the canonical Pi session and command-journal stages. Refuse an automatic replacement when the worker release is newer than the daemon.
+- **Implementation:** Add one serialized replacement operation under the session lifecycle and ownership checks. Schedule it from structured idle state or the explicit administrative command. Revalidate worker and Pi identity at the replacement boundary. Record downgrade refusal as diagnostics and leave the newer worker running.
+- **Risk:** A false idle fact could interrupt work. Only structured worker state may open the automatic boundary.
+- **Stop:** Busy workers survive upgrades, idle stale workers replace once, explicit replacement uses the same guarded path, and automatic downgrade never signals the worker.
 
 ## Change 6: rows show only models that Pi confirmed
 
@@ -169,27 +200,27 @@ Protocol rules apply throughout:
 
 ## Change 7: stale list history cannot crash dashboard startup
 
-**Outcome:** The dashboard starts from current registry state instead of replaying thousands of old list records. Burst updates converge to current rows without a queue that grows with the burst. This ships in one release. Dashboards must restart after the upgrade.
+**Outcome:** The dashboard starts from current registry state instead of replaying thousands of old list records. Burst updates converge to current rows without a queue that grows with the burst. The daemon and dashboards upgrade together.
 
 **Estimate:** 3 commits in 1 release, 1 to 2 engineer-days, net deletion of 350 to 600 lines.
 
 ### Commit 7.1: `feat: add race-safe list invalidation`
 
 - **Tests:** In `app/list/dashboard.test.mjs`, cover changes before subscribe, during snapshot, after response, and during reconnect. Replace replay and acknowledgement assertions with final snapshot state. Send 10,000 invalidations and require bounded pending work and at most three reads for one burst plus one change during a read.
-- **Implementation:** Add `subscribe_list_changes` and payload-free `list_changed` to `shared/contracts.mjs`. Subscribe, mark dirty, read `get_state`, and refetch once after an in-read notification. Coalesce notifications. On old-daemon `UNKNOWN_OPERATION`, use tracked old subscription and treat detailed events as invalidations.
+- **Implementation:** Add `subscribe_list_changes` and payload-free `list_changed` to `shared/contracts.mjs`. Make the snapshot coverage `cursor` required in every successful `get_state` response. Subscribe, mark dirty, read `get_state`, and refetch once after an in-read notification. Coalesce notifications.
 - **Stop:** Every race converges and burst work stays bounded.
 
 ### Commit 7.2: `refactor: publish list invalidations only`
 
-- **Tests:** Require `list_changed` after each durable session mutation and completed Delete. An old `subscribe` receives an explicit protocol refusal with the exact restart instruction. Confirm that the old frontend discards this response, shows an empty session list, and receives no later list updates. New roots omit `index/events.jsonl` and `daemon/event-acks.json`.
-- **Implementation:** Replace list events with an in-memory broadcaster in `runtime/daemon.mjs` and `runtime/reconciliation.mjs`. Reject old `subscribe` with `Dashboard protocol changed. Exit and restart pi-agents.`; do not replay retired events. Keep new-frontend fallback only against an old daemon.
-- **Stop:** Write, notification, and snapshot order is deterministic. The daemon explicitly refuses an old subscription, and the documented upgrade requires dashboard restart rather than relying on the old frontend to display that refusal.
+- **Tests:** Require `list_changed` after each durable session mutation and completed Delete. Reject `subscribe` as an unknown operation through the ordinary strict contract. New roots omit `index/events.jsonl` and `daemon/event-acks.json`.
+- **Implementation:** Replace list events with an in-memory broadcaster in `runtime/daemon.mjs` and `runtime/reconciliation.mjs`. Remove `subscribe` from the contract and do not replay retired events. Add no fallback or special old-protocol response.
+- **Stop:** Write, notification, and snapshot order is deterministic. Production contains one list subscription protocol.
 
 ### Commit 7.3: `refactor: remove list cursor persistence`
 
-- **Tests:** Replace cursor-save tests with cursor-free view-state and draft tests. Load and discard a legacy cursor. Remove `runtime/event-store.test.mjs` only after production callers are gone.
-- **Implementation:** Remove list cursor saves, acknowledgements, replay queues, resynchronization markers, and cursor comparison. Delete `runtime/event-store.mjs`. Ignore a legacy cursor in `app/list/frontend-state.mjs`. Ignore `index/events.jsonl` and `daemon/event-acks.json` in place even when corrupt.
-- **Stop:** New state omits cursor, legacy state loads, and no list event store opens.
+- **Tests:** Replace cursor-save tests with view-state and draft tests. Require the `get_state` coverage cursor and remove `runtime/event-store.test.mjs` only after production callers are gone.
+- **Implementation:** Remove list cursor saves, acknowledgements, replay queues, resynchronization markers, and cursor comparison. Delete `runtime/event-store.mjs`. Keep the required snapshot coverage cursor in memory for the subscribe/read race. Remove all production references to `index/events.jsonl` and `daemon/event-acks.json`; the retired files then have no effect without an ignore branch.
+- **Stop:** New frontend state omits a persisted cursor, every `get_state` result includes its coverage cursor, and no list event store or retired path opens.
 
 ## Change 8: three dashboards keep independent state and exactly one writer
 
@@ -205,13 +236,13 @@ Protocol rules apply throughout:
 
 ### Commit 8.2: `refactor: remove durable attachments and isolate frontend state`
 
-- **Tests:** Replace durable ordering tests with per-session lock tests. Ignore corrupt obsolete `daemon/attachment-results.jsonl`. Open three dashboards, change each draft and selection, close in different orders, and require independent state. Restarting the daemon clears claims while workers retain exact identity.
-- **Implementation:** Remove `AttachmentResultStore`, attach/detach journal transitions, attachment list events, failpoints, and recovery. Delete `runtime/attachment-result-store.mjs` and ignore `daemon/attachment-results.jsonl` in place even when corrupt. Generate a process-scoped frontend connection ID at startup. Keep view state and launch drafts in that process; process death may lose an unsubmitted draft. Retain stable installation identity only for durable command recovery.
+- **Tests:** Replace durable ordering tests with per-session lock tests. Open three dashboards, change each draft and selection, close in different orders, and require independent state. Restarting the daemon clears claims while workers retain exact identity.
+- **Implementation:** Remove `AttachmentResultStore`, attach/detach journal transitions, attachment list events, failpoints, and recovery. Delete `runtime/attachment-result-store.mjs` and every production reference to `daemon/attachment-results.jsonl`. Generate a process-scoped frontend connection ID at startup. Keep view state and launch drafts in that process; process death may lose an unsubmitted draft. Retain stable installation identity only for durable command recovery.
 - **Stop:** No attachment artifact is created or reconciled; three dashboards retain independent state; Gate 3 passes.
 
 ## Change 9: obsolete acknowledgement files cannot block recovery
 
-**Outcome:** A corrupt `.acks.json` no longer blocks recovery. This is otherwise an internal deletion: acknowledgements do not control retention, while ordered viewer events, snapshots, queues, stable IDs, and resume behavior remain.
+**Outcome:** Viewer acknowledgement files no longer participate in recovery. Ordered viewer events, snapshots, queues, stable IDs, and resume behavior remain.
 
 **Estimate:** 2 commits, 0.5 to 1 engineer-day, net deletion of 100 to 180 lines.
 
@@ -223,13 +254,13 @@ Protocol rules apply throughout:
 
 ### Commit 9.2: `refactor: retire viewer acknowledgement files`
 
-- **Tests:** Corrupt event, checkpoint, or snapshot state still fails; corrupt `.acks.json` is ignored. An old frontend's `ack_viewer` gets a no-op response and writes nothing.
-- **Implementation:** Remove acknowledgement loading and methods from `runtime/viewer-store.mjs`. Keep `ack_viewer` as a no-op for one compatibility release. Stop creating acknowledgement paths and ignore every `index/viewer/*.acks.json` file in place even when corrupt.
-- **Stop:** No `.acks.json` changes, and Gate 4 transcript checks pass.
+- **Tests:** Corrupt event, checkpoint, or snapshot state still fails. Remove acknowledgement contract and file-format tests after production callers are gone.
+- **Implementation:** Remove acknowledgement loading and methods from `runtime/viewer-store.mjs`. Remove `ack_viewer` from the contract. Stop creating acknowledgement paths and remove every production reference to `index/viewer/*.acks.json`; retired files then have no effect without an ignore branch.
+- **Stop:** No `.acks.json` path or `ack_viewer` operation remains, and Gate 4 transcript checks pass.
 
 ## Change 10: Delete remains forget-only without unused recovery
 
-**Outcome:** Delete still removes only the dashboard row and preserves the Pi file and worktree. Legacy `daemon/delete-results.json` state is ignored if present because no shipped production path could create a nonempty file.
+**Outcome:** Delete still removes only the dashboard row and preserves the Pi file and worktree. The obsolete `daemon/delete-results.json` format disappears with its unused recovery code.
 
 **Estimate:** 2 commits, 0.5 to 1 engineer-day, net deletion of 200 to 400 lines.
 
@@ -241,17 +272,17 @@ Protocol rules apply throughout:
 
 ### Commit 10.2: `refactor: retire trash recovery`
 
-- **Tests:** Start with absent, empty, nonempty, and corrupt old `daemon/delete-results.json` files. Every case starts without reading or mutating the file. Do not add `UNSUPPORTED_LEGACY_DELETE_TRANSACTION` tests.
-- **Implementation:** Remove the delete-result store, transaction phases, destructive failpoints, file fingerprints, reconciliation, and legacy guard. Ignore `daemon/delete-results.json` if present.
-- **Stop:** No production code reads, writes, validates, or deletes `daemon/delete-results.json`. Temporary-root migration tests and Gate 4 Delete checks pass.
+- **Tests:** Remove delete-result transaction tests after the production callers are gone. Keep forget-only lifecycle and revision tests.
+- **Implementation:** Remove the delete-result store, transaction phases, destructive failpoints, file fingerprints, reconciliation, legacy guard, and every production reference to `daemon/delete-results.json`.
+- **Stop:** No production or test code names `daemon/delete-results.json`. Gate 4 Delete checks pass.
 
-The guard is intentionally absent. On 2026-08-29, `daemon/delete-results.json` was absent on the operator's machine. Production never supplied a trash callback, so no shipped code path could have created a nonempty transaction.
+The guard and compatibility parser are intentionally absent. On 2026-08-29, `daemon/delete-results.json` was absent on the operator's machine. Production never supplied a trash callback, so no shipped code path could have created a nonempty transaction.
 
 ## Withdrawn change: replay narrowing
 
 Do not implement the earlier replay-narrowing proposal. It is separate from active commits 7.1 and 7.2 above. Deleting `session_query` removes three proposed read subtypes. Initial state and menu discovery have no documented failure. A direct-read dispatcher would add a second worker path immediately after change 5 removes one. Reconsider only with a measured replay cost or concrete recovery failure.
 
-## Operator-machine gates
+## Operator gates protect live sessions, not old releases
 
 Tests use a temporary state root. These gates never write state files directly, signal workers, or run a second daemon against production.
 
@@ -261,13 +292,13 @@ Record the installed commit and daemon version; daemon PID, start identity, epoc
 
 Stop if identity is ambiguous, recovery is not `READY`, or a live session lacks exact worker and Pi identity.
 
-### Gate 1: worker handoff and dashboard restart
+### Gate 1: worker adoption and coordinated client restart
 
-Install the single release, then restart only the daemon through the normal command. Leave one old dashboard open long enough to verify the daemon explicitly refuses its old `subscribe`. The old dashboard discards that response, shows an empty session list, receives no list updates, and shows no restart instruction. Record this expected empty display, then restart every dashboard immediately. Do not wait for a timer or on-screen refusal. Verify each restarted dashboard shows the current snapshot and receives later invalidations.
+Install the single release, exit every dashboard, then restart only the daemon through the normal command. Start new dashboards after daemon readiness. Verify each dashboard reads a `get_state` response with the required coverage cursor, shows the current snapshot, and receives later invalidations. Do not run mixed frontend and daemon releases.
 
-Verify both workers retain PID, start identity, process group, run ID, lease generation, and one route. Launch one disposable session and verify IPC closes only after Pi identity is bound, the socket is adopted, readiness is persisted, handoff is sent, and its acknowledgement arrives. Run every remaining operation and graceful Stop only on disposable work.
+Verify both original workers retain PID, start identity, process group, run ID, lease generation, and one route. Confirm the new daemon adopts them before release comparison, marks older compatible worker code stale without refusing startup, and does not replace a busy worker. Launch one disposable session and verify IPC closes only after Pi identity is bound, the socket is adopted, readiness is persisted, handoff is sent, and its acknowledgement arrives. Exercise idle and explicit stale replacement only on disposable sessions. Run every remaining operation and graceful Stop only on disposable work.
 
-Stop on worker identity change, zero or two routes, duplicate delivery, lost frame, an old subscription that the daemon does not explicitly refuse, a restarted dashboard that does not converge, or escalation after successful graceful shutdown.
+Stop on original worker identity change, zero or two routes, duplicate delivery, lost frame, startup refusal caused only by stale compatible worker code, automatic downgrade, a new dashboard that does not converge, or escalation after successful graceful shutdown.
 
 ### Gate 2: confirmed model
 
@@ -277,27 +308,21 @@ Launch disposable default, valid named, substituted, and invalid model cases. Ve
 
 Open three new dashboards. Verify independent drafts and selections, final rows matching `get_state`, 100 or more state changes converging without queue growth, one writer and two observers on one session, read-only observer behavior, writer terminal kill releasing the claim, notification to both observers, and exactly one winner when both claim.
 
-Restart the daemon. Verify claims clear, workers retain identity, and obsolete list and attachment files do not grow or block startup.
+Restart the daemon. Verify claims clear, workers retain identity, and no production code opens obsolete list or attachment paths.
 
-### Gate 4: final compatibility and rollback
+### Gate 4: final viewer and Delete behavior
 
-With both original workers live, force frontend reconnect during viewer events and verify no missing or duplicate transcript item. Verify no viewer acknowledgement file changes. Delete one disposable inactive session and verify its Pi file and worktree remain. Roll back to the previous release and verify it can read all retained durable state.
+With both original workers live, force frontend reconnect during viewer events and verify no missing or duplicate transcript item. Verify no production code opens a viewer acknowledgement path. Delete one disposable inactive session and verify its Pi file and worktree remain.
 
-Stop on transcript loss, path deletion, worker loss, or rollback failure.
+Stop on transcript loss, a retired path opening, path deletion, or worker loss.
 
-## Compatibility and rollback
+## Upgrade policy protects live work without backward compatibility
 
-| Change | Boundary | Mixed-version behavior | Operator action | Rollback |
-|---|---|---|---|---|
-| 1 to 3 | Frontend, daemon, worker requests | Old clients may send removed operations and receive `FEATURE_REMOVED`; new clients do not advertise them | Restart a stale frontend when it shows a removed command | Revert; no migration |
-| 4 and 8 | Connection roles | Old frontend rejects observer; new frontend opens it. Claims die with sockets | None for worker lifetime | Restart daemon to clear claims |
-| 5 | Worker IPC and socket | New worker retains IPC with old daemon. Existing workers reconnect by socket | Restart daemon at Gate 1, never workers | Restart old daemon |
-| 6 | Session field meaning | Schema remains version 1; fields remain optional | Use disposable launches | Safe; new values have stronger provenance |
-| 7 | List protocol | The new daemon uses `subscribe_list_changes` and explicitly refuses old `subscribe`. The old frontend discards the refusal, shows an empty session list, receives no updates, and shows no restart instruction | Restart every dashboard immediately after the daemon upgrade | Restart the old daemon; the new frontend falls back to its old subscription |
-| 9 | Viewer acknowledgement | New daemon answers old acknowledgement as a no-op for one release | None | Safe; old files remain |
-| 10 | Delete result file | `daemon/delete-results.json` is ignored if present. No shipped production path could have written a nonempty transaction | None | Safe; file remains |
+The release supports one frontend protocol, one daemon protocol, and current durable formats. The operator restarts every dashboard and the daemon together. The plan removes the old-daemon list fallback, special handling for old `subscribe`, the `ack_viewer` no-op, optional `get_state.cursor`, legacy frontend cursor loading, retired-file parsers and corrupt-file branches, and rollback checks against the previous release. It also removes dual route branches once socket adoption is ready.
 
-No change automatically deletes an obsolete durable file. On 2026-08-29, the retained files were `index/events.jsonl` at 18 MB, `daemon/attachment-results.jsonl` at 679 KB, 14 `index/viewer/*.acks.json` files, and `daemon/event-acks.json` at 512 bytes. Valid and corrupt versions are ignored in place and do not block startup. A later explicit cleanup command may reclaim them, but this plan does not include one. Retention preserves rollback and avoids an implicit migration.
+Retired files remain on disk because leaving an unreferenced path alone costs no production code. No implementation or test parses, validates, migrates, deletes, or explicitly ignores `index/events.jsonl`, `daemon/event-acks.json`, `daemon/attachment-results.jsonl`, `index/viewer/*.acks.json`, or `daemon/delete-results.json`.
+
+One mixed-release case remains by design. A new daemon adopts protocol-compatible live workers by authenticated socket and exact process identity, then marks old code stale. It keeps a busy stale worker alive until structured state reports idle or the operator explicitly requests replacement. This exception protects unsaved live work. It is not support for starting old workers, old frontends, old protocols, or old on-disk formats. Automatic downgrade is refused.
 
 ## File collisions
 
@@ -311,7 +336,7 @@ No change automatically deletes an obsolete durable file. On 2026-08-29, the ret
 | `app/daemon-client.mjs` and test | 7, 8, 9 | List protocol, access, acknowledgements |
 | `runtime/worker.mjs` and tests | 1, 2, 3, 5 | Feature deletions before transport |
 | `runtime/worker-supervisor.mjs` and tests | 2, 3, 5, 6 | Feature deletions, handoff, confirmed model |
-| `runtime/state-migration.mjs` and test | 7, 8, 9, 10 | One compatibility pass after each retired artifact |
+| `runtime/state-migration.mjs` and test | 7, 8, 9, 10 | Delete retired-format branches; do not add replacement parsers |
 | `docs/architecture.md`, `docs/development.md` | all | Update serially after production commits |
 
 ## Exclusions
@@ -320,7 +345,9 @@ No change automatically deletes an obsolete durable file. On 2026-08-29, the ret
 - Keep summaries opt-in and do not call a summary provider in tests.
 - Keep ordered viewer events; list invalidation does not replace them.
 - Do not add local-socket heartbeats, auto-promotion, or cancellation of accepted commands on disconnect.
-- Do not compact, rewrite, or delete historical state files.
-- Keep state migration separate; do not fold launch results into the journal or change its schema.
+- Do not compact, rewrite, delete, parse, or migrate retired historical state files.
+- Keep state migration separate for current formats; do not fold launch results into the journal or change its schema.
 - Do not add a second worker read dispatcher.
+- Do not infer row activity from terminal output or the canonical Pi JSONL.
+- Do not add old frontend, protocol, durable-format, or rollback support. The only release-skew path adopts compatible live workers to protect current work.
 - Do not claim the unmeasured 3 ms list snapshot latency. Measure it at Gate 3 before making a performance claim.

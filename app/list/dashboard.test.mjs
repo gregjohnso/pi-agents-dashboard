@@ -43,9 +43,11 @@ class FakeBackend {
         this.snapshot = { sessions };
     }
     async getSnapshot() { return this.snapshot; }
-    subscribe(_after, listener, onError) {
+    subscribe(after, listener, onError) {
+        this.subscribedAfter = after;
         this.listener = listener;
         this.errorListener = onError;
+        if (this.subscribeFailure !== undefined) throw this.subscribeFailure;
         return () => { this.unsubscribed += 1; };
     }
     async preflightLaunch(draft) {
@@ -535,6 +537,41 @@ describe("dashboard controller", () => {
         expect(dashboard.status).toMatchObject({ kind: "error", code: "MALFORMED_FRAME" });
         await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith({ kind: "error", code: "MALFORMED_FRAME", message: "invalid event" }));
         expect(backend.stop).not.toHaveBeenCalled();
+    });
+    // Operator-visible failure: a dashboard whose persisted cursor was thousands of events behind
+    // made the daemon replay the whole log at once, and the list died before it drew a row.
+    it("subscribes from the daemon's own position, not from a persisted cursor thousands of events behind", async () => {
+        const backend = new FakeBackend([session("a"), session("b")]);
+        backend.snapshot = { sessions: backend.snapshot.sessions, cursor: { daemonEpoch: "epoch", sequence: "6778" } };
+        const saved = persistence({ schemaVersion: 1, clientId: "stable-client", cursor: { daemonEpoch: "epoch", sequence: "2" }, viewState: {}, launchDraft: {} });
+        const dashboard = controller(backend, { persistence: saved });
+        await dashboard.open();
+        expect(dashboard.status).toEqual({ kind: "ready" });
+        expect(backend.subscribedAfter).toEqual({ daemonEpoch: "epoch", sequence: "6778" });
+        expect(dashboard.sessions.map((record) => record.sessionId)).toEqual(["a", "b"]);
+        await dashboard.close();
+        expect(saved.saved.at(-1)?.cursor).toEqual({ daemonEpoch: "epoch", sequence: "6778" });
+    });
+    it("keeps the persisted cursor against a daemon that does not report its position", async () => {
+        const backend = new FakeBackend([session("a")]);
+        const saved = persistence({ schemaVersion: 1, clientId: "stable-client", cursor: { daemonEpoch: "epoch", sequence: "2" }, viewState: {}, launchDraft: {} });
+        const dashboard = controller(backend, { persistence: saved });
+        await dashboard.open();
+        expect(backend.subscribedAfter).toEqual({ daemonEpoch: "epoch", sequence: "2" });
+        await dashboard.close();
+    });
+    // Operator-visible failure: every crash rewrote frontend-state.json with a cursor at the start of
+    // the log, or with no cursor at all, so the next start replayed the same flood.
+    it("never persists a cursor behind the position it reached, even when open fails", async () => {
+        const backend = new FakeBackend([session("a")]);
+        backend.snapshot = { sessions: backend.snapshot.sessions, cursor: { daemonEpoch: "epoch", sequence: "6778" } };
+        backend.subscribeFailure = Object.assign(new Error("Client subscriber exceeded its bounded queue"), { code: "SUBSCRIBER_OVERFLOW" });
+        const saved = persistence({ schemaVersion: 1, clientId: "stable-client", cursor: { daemonEpoch: "epoch", sequence: "2" }, viewState: {}, launchDraft: {} });
+        const dashboard = controller(backend, { persistence: saved });
+        await dashboard.open();
+        await dashboard.close();
+        expect(saved.saved.length).toBeGreaterThan(0);
+        for (const state of saved.saved) expect(state.cursor).toEqual({ daemonEpoch: "epoch", sequence: "6778" });
     });
     it("restores safe view state and cursor but never stale composer ownership", async () => {
         const saved = persistence({
@@ -1038,6 +1075,68 @@ describe("daemon dashboard backend", () => {
         expect(updates[0]?.snapshot.sessions).toEqual([]);
         expect(stateReads).toBe(2);
         unsubscribe();
+    });
+    // Operator-visible failure: a session that changed while the client was behind kept its old row
+    // forever, because the dropped session_changed was never replaced by an authoritative read.
+    it("resynchronizes from the snapshot on overflow and shows the session that changed during the gap", async () => {
+        const resynchronize = { kind: "resynchronize", cursor: { daemonEpoch: "epoch", sequence: "9" } };
+        // A late event from before the snapshot must not put the stale row back.
+        const stale = { version: 1, cursor: { daemonEpoch: "epoch", sequence: "4" }, occurredAt: timestamp, kind: "session_changed", payload: { session: session("a", { revision: 2 }) } };
+        const requests = [];
+        let stateReads = 0;
+        const client = {
+            async connect() { },
+            async request(request) {
+                requests.push(request);
+                if (request.op === "get_state") {
+                    stateReads += 1;
+                    return { version: 1, requestId: request.requestId, ok: true, result: { kind: "state", sessions: [session("a", { revision: stateReads === 1 ? 1 : 7, taskState: stateReads === 1 ? "READY" : "WORKING" })], cursor: { daemonEpoch: "epoch", sequence: stateReads === 1 ? "1" : "9" } } };
+                }
+                return { version: 1, requestId: request.requestId, ok: true, result: { kind: "acknowledged", cursor: request.payload.cursor } };
+            },
+            subscribe() { return { async *[Symbol.asyncIterator]() { yield resynchronize; yield stale; } }; },
+            async close() { },
+        };
+        const backend = createDaemonDashboardBackend({ client, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
+        expect((await backend.getSnapshot()).cursor).toEqual({ daemonEpoch: "epoch", sequence: "1" });
+        const updates = [];
+        const unsubscribe = await backend.subscribe({ daemonEpoch: "epoch", sequence: "1" }, (update) => { updates.push(update); }, () => { });
+        await vi.waitFor(() => expect(updates).toHaveLength(1));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        unsubscribe();
+        expect(updates[0].snapshot.sessions).toEqual([expect.objectContaining({ sessionId: "a", taskState: "WORKING", revision: 7 })]);
+        expect(updates[0].cursor).toEqual({ daemonEpoch: "epoch", sequence: "9" });
+        // The snapshot already contains the dropped events, so the client acknowledges where it now stands.
+        expect(requests.filter((request) => request.op === "ack").map((request) => request.payload.cursor)).toEqual([{ daemonEpoch: "epoch", sequence: "9" }]);
+        expect(stateReads).toBe(2);
+    });
+    it("resynchronizes against a daemon that does not report its position", async () => {
+        const resynchronize = { kind: "resynchronize", cursor: { daemonEpoch: "epoch", sequence: "9" } };
+        let stateReads = 0;
+        const client = {
+            async connect() { },
+            async request(request) {
+                if (request.op === "get_state") {
+                    stateReads += 1;
+                    return { version: 1, requestId: request.requestId, ok: true, result: { kind: "state", sessions: [session("a", { revision: 7, taskState: "WORKING" })] } };
+                }
+                return { version: 1, requestId: request.requestId, ok: true, result: { kind: "acknowledged", cursor: request.payload.cursor } };
+            },
+            subscribe() { return { async *[Symbol.asyncIterator]() { yield resynchronize; } }; },
+            async close() { },
+        };
+        const backend = createDaemonDashboardBackend({ client, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
+        expect((await backend.getSnapshot()).cursor).toBeUndefined();
+        const updates = [];
+        const unsubscribe = await backend.subscribe(undefined, (update) => { updates.push(update); }, () => { });
+        await vi.waitFor(() => expect(updates).toHaveLength(1));
+        unsubscribe();
+        // Without a daemon-reported position the newest cursor the client saw is the one it reached.
+        expect(updates[0].cursor).toEqual({ daemonEpoch: "epoch", sequence: "9" });
+        expect(updates[0].snapshot.sessions).toEqual([expect.objectContaining({ taskState: "WORKING" })]);
+        // The snapshot is refetched, not reused: a row that changed during the gap is only correct
+        // because the daemon was asked again.
+        expect(stateReads).toBe(2);
     });
     it("reads the model catalog through get_models and names a daemon that cannot list one", async () => {
         const models = [{ provider: "anthropic", id: "claude-opus-4", thinking: true }];

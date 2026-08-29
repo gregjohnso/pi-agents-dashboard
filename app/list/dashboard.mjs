@@ -29,6 +29,12 @@ function cursorAfter(left, right) {
         return true;
     return BigInt(right.sequence) > BigInt(left.sequence);
 }
+/** The newer of two positions in one daemon's event log; a missing position loses to any real one. */
+function latestCursor(current, candidate) {
+    if (candidate === undefined)
+        return current;
+    return current === undefined || cursorAfter(current, candidate) ? candidate : current;
+}
 function daemonFailure(response) {
     return { code: response.error.code, message: response.error.message };
 }
@@ -47,7 +53,9 @@ export function createDaemonDashboardBackend({ client, clientId, preflight, requ
         sessions.clear();
         for (const session of response.result.sessions)
             sessions.set(session.sessionId, session);
-        return { sessions: [...sessions.values()] };
+        // A daemon built before the state result carried a position answers without one; the caller
+        // then falls back to the newest cursor it has seen for itself.
+        return { sessions: [...sessions.values()], cursor: response.result.cursor };
     };
     const requestAsComposer = async (operation, sessionId, revision, exactRequestId) => {
         const transaction = client.createTransactionClient?.() ?? client;
@@ -110,6 +118,20 @@ export function createDaemonDashboardBackend({ client, clientId, preflight, requ
                         if (next.done || !active)
                             return;
                         const event = next.value;
+                        // Falling behind means resynchronize, not exit: the snapshot is authoritative,
+                        // so refetch it and continue from the newest position it covers.
+                        if (event.kind === "resynchronize") {
+                            const refreshed = await refreshState();
+                            const cursor = latestCursor(event.cursor, refreshed.cursor);
+                            acknowledged = latestCursor(acknowledged, cursor);
+                            await listener({ snapshot: { sessions: refreshed.sessions }, cursor, event });
+                            if (cursor !== undefined) {
+                                const acknowledgement = await request("ack", { cursor });
+                                if (!acknowledgement.ok)
+                                    throw Object.assign(new Error(acknowledgement.error.message), acknowledgement.error);
+                            }
+                            continue;
+                        }
                         if (!cursorAfter(acknowledged, event.cursor))
                             continue;
                         let snapshot = { sessions: [...sessions.values()] };
@@ -390,6 +412,10 @@ export class DashboardController {
             if (!this.isCurrentOpen(generation))
                 return;
             this.applySnapshot(snapshot);
+            // The snapshot already contains every event up to the position the daemon reported with
+            // it, so start there rather than replaying a persisted cursor of any age. A daemon that
+            // reports no position leaves the persisted cursor in place.
+            this.advanceCursor(snapshot.cursor);
             const unsubscribe = await this.backend.subscribe(this.cursor, (update) => this.trackEvent(update, generation), (error) => { if (this.isCurrentOpen(generation))
                 this.fail(error); });
             if (!this.isCurrentOpen(generation)) {
@@ -1250,7 +1276,7 @@ export class DashboardController {
             // Each save fsyncs the file and its directory, which costs ~70ms on a network home. Events
             // arrive in bursts while an agent streams, so coalesce: a snapshot is complete state, and a
             // cursor that lags by one burst only replays events this dashboard has already applied.
-            this.cursor = update.cursor;
+            this.advanceCursor(update.cursor);
             // One save per burst. Cursors advance monotonically, so a later event's save also makes this
             // one durable; only the last event in the queue pays the fsync, and it still pays it before
             // its acknowledgement. Saving per event costs ~70ms each on a network home.
@@ -1314,6 +1340,15 @@ export class DashboardController {
         for (const waiter of this.renderWaiters.values())
             waiter.reject(error);
         this.renderWaiters.clear();
+    }
+    /**
+     * Move this frontend's position forward to a cursor it is synchronized to. A cursor is never
+     * moved back: persisting a position the frontend has already passed replays those events on the
+     * next start, which is what filled the bounded queue in the first place.
+     */
+    advanceCursor(cursor) {
+        if (cursor !== undefined && cursorAfter(this.cursor, cursor))
+            this.cursor = cursor;
     }
     persistedState(cursor = this.cursor) {
         const { sourceSessionId: _sourceSessionId, ...launchDraft } = this.composerDraft;

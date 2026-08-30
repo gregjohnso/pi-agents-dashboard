@@ -118,7 +118,6 @@ function viewerFixture(snapshotOverrides = {}, options = {}) {
     async getSnapshot() { return viewerSnapshot(snapshotOverrides); },
     subscribe(_sessionId, _cursor, next) { listener = next; return () => {}; },
     async command(operation, payload) { commands.push({ operation, payload }); },
-    async ack() {},
   };
   const persistence = { async load() {}, async save() {} };
   const onReturn = options.onReturn ?? vi.fn();

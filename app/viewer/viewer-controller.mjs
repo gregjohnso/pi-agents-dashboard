@@ -551,6 +551,10 @@ export class ViewerController {
    * Rebuild against a daemon that just came back. A restarted daemon holds no attachment claims and
    * issues a new epoch, so this viewer's composer role and cursor both died with the old process:
    * reclaim the role if it is free, then resubscribe from a fresh snapshot.
+   *
+   * The applied event IDs cross into the rebuilt state. Their effects are already in the snapshot,
+   * and the resumed subscription can hand the last event over again, which only a stable event ID
+   * absorbs: a placeholder or an unrecognized Pi event has no other identity to replace on.
    */
   async resynchronize() {
     this.unsubscribe?.();
@@ -561,7 +565,9 @@ export class ViewerController {
     }
     try {
       const snapshot = parseViewerSnapshot(await this.client.getSnapshot(this.sessionId));
+      const applied = this.state?.eventIds ?? [];
       this.state = createTranscriptState(snapshot);
+      for (const eventId of applied) this.state.eventIds.add(eventId);
       this.editor.disableSubmit = snapshot.role !== "composer";
       this.transcript.update(this.state);
       this.installOverlay();
@@ -598,7 +604,6 @@ export class ViewerController {
       this.installOverlay();
       await this.requestRender();
       await this.persistence.save(this.persisted(event.cursor));
-      await this.client.ack(this.sessionId, event.cursor);
     } catch (error) {
       await this.close({ persist: false });
       throw error;

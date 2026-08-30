@@ -6,9 +6,19 @@ import { createJsonlDecoder, createJsonlEncoder } from "./jsonl.mjs";
 const MAX_RPC_FRAME_BYTES = 16 * 1024 * 1024;
 const MAX_STDERR_BYTES = 256 * 1024;
 const MAX_PRELISTENER_FRAME_BYTES = 1024 * 1024;
+/**
+ * How long one Pi RPC command may go unanswered before it becomes ambiguous. Pi answers `prompt`
+ * after preflight rather than after the turn, so the slowest synchronous answer is `compact`, which
+ * is one model call; `summaries.mjs` already bounds one Pi inference at 60 s, and this doubles that
+ * for a long transcript on a loaded machine. Without it the worker's serialized command queue waits
+ * on a silent Pi forever.
+ */
+const DEFAULT_RPC_REQUEST_TIMEOUT_MS = 120_000;
+/** Expired IDs kept so a late answer is dropped instead of read as an uncorrelated response. */
+const MAX_EXPIRED_REQUEST_IDS = 256;
 
 /** @typedef {(command: string, argv: string[], options: any) => any} SpawnLike */
-/** @typedef {{ command: string, resolve(value: unknown): void, reject(error: unknown): void }} PendingRequest */
+/** @typedef {{ command: string, resolve(value: unknown): void, reject(error: unknown): void, timer: ReturnType<typeof setTimeout> }} PendingRequest */
 
 /** A typed failure at the documented Pi JSONL boundary. */
 export class PiRpcError extends Error {
@@ -68,6 +78,9 @@ export class PiRpcAdapter {
   #decoder;
   /** @type {Map<string, PendingRequest>} */
   #pending = new Map();
+  /** @type {Set<string>} */
+  #expired = new Set();
+  #requestTimeoutMs;
   /** @type {Set<(frame: Record<string, unknown>) => void>} */
   #frameListeners = new Set();
   /** @type {Set<(event: Record<string, unknown>) => void>} */
@@ -86,13 +99,15 @@ export class PiRpcAdapter {
   #diagnostics;
   #diagnosticBytes = Buffer.alloc(0);
 
-  /** @param {{ input: NodeJS.WritableStream, output: NodeJS.ReadableStream, process?: import("node:child_process").ChildProcess, ownedProcess?: boolean, diagnostics?: { append(record: Uint8Array): Promise<unknown> | unknown }, maxRecordBytes?: number }} options */
-  constructor({ input, output, process: child, ownedProcess = false, diagnostics, maxRecordBytes = MAX_RPC_FRAME_BYTES }) {
+  /** @param {{ input: NodeJS.WritableStream, output: NodeJS.ReadableStream, process?: import("node:child_process").ChildProcess, ownedProcess?: boolean, diagnostics?: { append(record: Uint8Array): Promise<unknown> | unknown }, maxRecordBytes?: number, requestTimeoutMs?: number }} options */
+  constructor({ input, output, process: child, ownedProcess = false, diagnostics, maxRecordBytes = MAX_RPC_FRAME_BYTES, requestTimeoutMs = DEFAULT_RPC_REQUEST_TIMEOUT_MS }) {
     if (typeof input?.write !== "function" || typeof output?.on !== "function") {
       throw new TypeError("Pi RPC requires writable input and readable output streams");
     }
     if (!Number.isSafeInteger(maxRecordBytes) || maxRecordBytes <= 0) throw new TypeError("maxRecordBytes must be a positive integer");
+    if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs <= 0) throw new TypeError("requestTimeoutMs must be a positive integer");
     if (diagnostics !== undefined && typeof diagnostics.append !== "function") throw new TypeError("diagnostics must expose append(record)");
+    this.#requestTimeoutMs = requestTimeoutMs;
     this.#input = input;
     this.#output = output;
     this.#process = child;
@@ -142,10 +157,10 @@ export class PiRpcAdapter {
 
   /**
    * Connect the adapter to one installed Pi child's owned pipes.
-   * @param {{ input: NodeJS.WritableStream, output: NodeJS.ReadableStream, diagnostics?: { append(record: Uint8Array): Promise<unknown> | unknown }, maxRecordBytes?: number, process?: import("node:child_process").ChildProcess }} options
+   * @param {{ input: NodeJS.WritableStream, output: NodeJS.ReadableStream, diagnostics?: { append(record: Uint8Array): Promise<unknown> | unknown }, maxRecordBytes?: number, requestTimeoutMs?: number, process?: import("node:child_process").ChildProcess }} options
    */
-  static connect({ input, output, diagnostics, maxRecordBytes, process: child }) {
-    return new PiRpcAdapter({ input, output, diagnostics, maxRecordBytes, process: child });
+  static connect({ input, output, diagnostics, maxRecordBytes, requestTimeoutMs, process: child }) {
+    return new PiRpcAdapter({ input, output, diagnostics, maxRecordBytes, requestTimeoutMs, process: child });
   }
 
   /** @param {Uint8Array} chunk */
@@ -192,13 +207,12 @@ export class PiRpcAdapter {
           this.#fail(new PiRpcError("MALFORMED_RPC_OUTPUT", "Pi emitted an uncorrelated RPC response"));
           return;
         }
-        const pending = this.#pending.get(frame.id);
+        const pending = this.#takePending(frame.id);
         if (pending === undefined) {
-          if (frame.command === "extension_ui_response") continue;
+          if (frame.command === "extension_ui_response" || this.#expired.delete(frame.id)) continue;
           this.#fail(new PiRpcError("MALFORMED_RPC_OUTPUT", "Pi emitted an unknown RPC response"));
           return;
         }
-        this.#pending.delete(frame.id);
         try {
           pending.resolve(validateResponse(frame, frame.id, pending.command));
         } catch (error) {
@@ -226,11 +240,23 @@ export class PiRpcAdapter {
     }
   }
 
+  /** Take one pending request out of correlation and stop its expiry timer. @param {string} id */
+  #takePending(id) {
+    const pending = this.#pending.get(id);
+    if (pending === undefined) return undefined;
+    this.#pending.delete(id);
+    clearTimeout(pending.timer);
+    return pending;
+  }
+
   /** @param {PiRpcError} error */
   #fail(error) {
     if (this.#failed !== undefined || this.#closed) return;
     this.#failed = error;
-    for (const pending of this.#pending.values()) pending.reject(error);
+    for (const pending of this.#pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
     this.#pending.clear();
   }
 
@@ -239,11 +265,22 @@ export class PiRpcAdapter {
     if (this.#closed) throw new PiRpcError("RPC_CLOSED", "Pi RPC adapter is closed");
     if (this.#failed !== undefined) throw this.#failed;
     const id = randomUUID();
-    const result = new Promise((resolve, reject) => this.#pending.set(id, { command: type, resolve, reject }));
+    const result = new Promise((resolve, reject) => {
+      // Expiry rejects one request and leaves the adapter live, so a single unanswered command
+      // cannot end a session. The ID is remembered because a late answer is otherwise read as an
+      // uncorrelated response, which is fatal.
+      const timer = setTimeout(() => {
+        if (this.#takePending(id) === undefined) return;
+        this.#expired.add(id);
+        while (this.#expired.size > MAX_EXPIRED_REQUEST_IDS) this.#expired.delete(/** @type {string} */ (this.#expired.values().next().value));
+        reject(new PiRpcError("RPC_TIMEOUT", `Pi did not answer ${type} within ${this.#requestTimeoutMs} ms`));
+      }, this.#requestTimeoutMs);
+      this.#pending.set(id, { command: type, resolve, reject, timer });
+    });
     try {
       await writeAll(this.#input, this.#encoder.encode({ id, type, ...fields }));
     } catch (cause) {
-      this.#pending.delete(id);
+      this.#takePending(id);
       const error = new PiRpcError("RPC_WRITE_FAILED", "Pi RPC command write failed", { cause });
       this.#fail(error);
       throw error;
@@ -312,8 +349,12 @@ export class PiRpcAdapter {
     if (this.#closed) return;
     this.#closed = true;
     const error = new PiRpcError("RPC_CLOSED", "Pi RPC adapter is closed");
-    for (const pending of this.#pending.values()) pending.reject(error);
+    for (const pending of this.#pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
     this.#pending.clear();
+    this.#expired.clear();
     if (this.#ownedProcess && typeof this.#input.end === "function") this.#input.end();
   }
 }

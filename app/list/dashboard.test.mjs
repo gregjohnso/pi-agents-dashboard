@@ -1032,6 +1032,7 @@ describe("daemon dashboard backend", () => {
     it.each([
         ["stop", "a disconnected composer socket", Object.assign(new Error("socket closed"), { code: "CONNECTION_CLOSED", submitted: true })],
         ["delete", "a malformed daemon frame", Object.assign(new Error("malformed daemon frame"), { code: "MALFORMED_FRAME" })],
+        ["stop", "an unparseable response for this request", Object.assign(new Error("unparseable response"), { code: "MALFORMED_RESPONSE", submitted: true })],
     ])("classifies %s interrupted by %s as delivery unknown", async (operation, _label, failure) => {
         const requests = [];
         const transaction = {

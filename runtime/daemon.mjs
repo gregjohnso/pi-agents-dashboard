@@ -36,6 +36,12 @@ const WORKER_DELIVERED_COMMANDS = ["prompt", "steer", "follow_up", "interrupt", 
 const DURABLE_COMMANDS = new Set([...WORKER_DELIVERED_COMMANDS, "stop", "delete"]);
 const CONNECTOR_PATH = fileURLToPath(new URL("./daemon-connector.mjs", import.meta.url));
 const DEFAULT_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateMs: 5_000 });
+/**
+ * How long the daemon waits for one worker's reply before the command becomes ambiguous. A worker
+ * bounds each Pi command at 120 s and delivers them serially, so this leaves room for one command
+ * expiring behind another before the daemon stops waiting on a worker that answers nothing.
+ */
+const WORKER_REQUEST_TIMEOUT_MS = 300_000;
 const WORKTREE_ROOT_DIRECTORIES = ["pi-agents", "pi-dashboard", "pi-agents-dashboard"];
 
 /** @param {unknown} value */
@@ -341,8 +347,8 @@ export function createBoundedSocketWriter(socket, { maxPendingBytes, maxPendingR
   };
 }
 
-/** @param {{ socketPath: string, token: string, maxBytes: number, context: any }} options */
-function createSocketServer({ socketPath, token, maxBytes, context }) {
+/** @param {{ socketPath: string, token: string, maxBytes: number, workerRequestTimeoutMs: number, context: any }} options */
+function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutMs, context }) {
   const sockets = new Set();
   const subscribers = new Set();
   const viewerSubscriptions = new Map();
@@ -389,11 +395,20 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
     /** @param {any} message @param {any} expected */
     const requestWorker = (message, expected) => new Promise((resolveRequest, rejectRequest) => {
       const id = message.id;
+      /** @type {any} */
       const pending = { ...expected, resolve: resolveRequest, reject: rejectRequest, connection: workerConnection };
+      // A worker that never answers leaves the command's delivery unknown, not failed: its bytes may
+      // already have reached Pi.
+      pending.timer = setTimeout(() => {
+        if (context.workerPending.get(id) !== pending) return;
+        context.workerPending.delete(id);
+        rejectRequest(Object.assign(new Error("Worker did not answer within the delivery bound"), { code: "DELIVERY_UNKNOWN" }));
+      }, workerRequestTimeoutMs);
       context.workerPending.set(id, pending);
       send(message).catch((error) => {
         if (context.workerPending.get(id) !== pending) return;
         context.workerPending.delete(id);
+        clearTimeout(pending.timer);
         rejectRequest(error);
       });
     });
@@ -412,6 +427,7 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
       for (const [id, pending] of context.workerPending) {
         if (pending.connection === workerConnection && context.workerPending.get(id) === pending) {
           context.workerPending.delete(id);
+          clearTimeout(pending.timer);
           pending.reject(Object.assign(new Error("Worker delivery became ambiguous"), { code: "DELIVERY_UNKNOWN" }));
         }
       }
@@ -544,6 +560,7 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
       accepting = false;
       for (const [id, pending] of context.workerPending) {
         context.workerPending.delete(id);
+        clearTimeout(pending.timer);
         pending.reject(Object.assign(new Error("Daemon shutdown made worker delivery ambiguous"), { code: "DELIVERY_UNKNOWN" }));
       }
       for (const socket of sockets) socket.pause();
@@ -567,6 +584,7 @@ export async function createDaemonRuntime({
   hostProbe = checkDefaultHost,
   reconcile,
   reconnectTimeoutMs = 15_000,
+  workerRequestTimeoutMs = WORKER_REQUEST_TIMEOUT_MS,
   workerSupervisor,
   resolveLaunchRequest,
   summarizeSession,
@@ -586,6 +604,7 @@ export async function createDaemonRuntime({
 } = {}) {
   if (typeof root !== "string" || resolve(root) !== root) throw new TypeError("Daemon runtime root must be an absolute canonical path");
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 128) throw new TypeError("maxBytes must be at least 128");
+  if (!Number.isSafeInteger(workerRequestTimeoutMs) || workerRequestTimeoutMs <= 0) throw new TypeError("workerRequestTimeoutMs must be a positive integer");
   if (typeof randomId !== "function") throw new TypeError("randomId must be a function");
   if (typeof responseWriter !== "function" || typeof closeFailpoint !== "function" || typeof attachmentFailpoint !== "function" || typeof destructiveFailpoint !== "function" || typeof signalProcessGroupImpl !== "function" || typeof sleepImpl !== "function") throw new TypeError("Daemon runtime seams must be functions");
   if (!Number.isSafeInteger(stopPolicy?.gracefulMs) || stopPolicy.gracefulMs <= 0 || !Number.isSafeInteger(stopPolicy?.terminateMs) || stopPolicy.terminateMs <= 0) throw new TypeError("stopPolicy must contain approved positive integer waits");
@@ -985,6 +1004,7 @@ export async function createDaemonRuntime({
             else validateWorkerFailure(frame.error);
             if (context.workerPending.get(frame.id) !== pending) return;
             context.workerPending.delete(frame.id);
+            clearTimeout(pending.timer);
             frame.ok ? pending.resolve(frame.record) : pending.reject(Object.assign(new Error(frame.error.message), { code: frame.error.deliveryUnknown ? "DELIVERY_UNKNOWN" : frame.error.code, delivered: frame.error.deliveryUnknown !== true }));
           });
           return;
@@ -1379,7 +1399,7 @@ export async function createDaemonRuntime({
       },
     };
     const socketPath = join(daemonDirectory, "control.sock");
-    socketServer = createSocketServer({ socketPath, token, maxBytes, context });
+    socketServer = createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutMs, context });
     await socketServer.listen();
     socketOwned = true;
     context.broadcast = (/** @type {any} */ event) => {

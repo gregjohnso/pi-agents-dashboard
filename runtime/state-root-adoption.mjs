@@ -77,6 +77,11 @@ export async function adoptRenamedStateRoot({ env = process.env, fsOps = fs, ins
 
   if (await inspectRoot(previousRoot, fsOps) === undefined) return { status: "NOTHING_TO_ADOPT", root };
   if (await inspectRoot(root, fsOps) !== undefined) {
+    // Any command creates `cli/` in the destination root, so its mere existence proves nothing.
+    // Only sessions on both sides are a split an operator must resolve by hand.
+    if (await countSessionRecords(root, fsOps) === 0) {
+      return { status: "DESTINATION_ROOT_EMPTY", root: previousRoot, message: `Using ${previousRoot}: ${root} holds no sessions yet.` };
+    }
     if (await countSessionRecords(previousRoot, fsOps) > 0) throw await splitRootsError(root, previousRoot, fsOps);
     return { status: "PREVIOUS_ROOT_EMPTY", root, message: `Ignoring ${previousRoot}: it holds no sessions and ${root} is already in use.` };
   }

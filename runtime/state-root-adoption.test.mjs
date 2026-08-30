@@ -144,3 +144,18 @@ it("keeps the previous root readable when a concurrent start published a competi
   await expect(adoptRenamedStateRoot({ env, fsOps, inspectActivity: quiet })).rejects.toMatchObject({ code: "STATE_ROOTS_SPLIT" });
   expect(JSON.parse(await readFile(join(previousRoot, "sessions", "alpha.json"), "utf8"))).toEqual({ sessionId: "alpha" });
 });
+
+it("uses the legacy root when the destination exists but holds no sessions", async () => {
+  // Any command creates `cli/` in the destination root; that must not read as a split and refuse
+  // to start, which stranded the operator's six sessions behind STATE_ROOTS_SPLIT.
+  const parent = await mkdtemp(join(tmpdir(), "pi-agents-roots-"));
+  const previousRoot = join(parent, "pi-dashboard");
+  const root = join(parent, "pi-agents");
+  await mkdir(join(previousRoot, "sessions"), { recursive: true });
+  await writeFile(join(previousRoot, "sessions", "one.json"), "{}");
+  await mkdir(join(root, "cli"), { recursive: true });
+
+  const adoption = await adoptRenamedStateRoot({ env: { HOME: parent, XDG_STATE_HOME: parent }, inspectActivity: async () => ({ activeDaemon: false, activeSupervisors: [], unverifiable: false }) });
+
+  expect(adoption).toMatchObject({ status: "DESTINATION_ROOT_EMPTY", root: previousRoot });
+});

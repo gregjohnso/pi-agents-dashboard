@@ -54,9 +54,9 @@ it("prints standalone help without opening the app", async () => {
   expect(await runCli(["--help"], { openApp, io: output.io })).toBe(0);
   const help = output.stdout.join("");
   expect(help).toContain("With no arguments");
-  for (const advertised of ["pi-agents agents", "pi-agents attach", "pi-agents stop|rm", "session cleanup", "session resolve-delivery"]) expect(help).toContain(advertised);
-  // Commit 11 adds logs and Commit 5.4 adds respawn; advertising them before they answer would report a bug.
-  for (const absent of ["logs", "respawn", "session status", "session stop", "session delete"]) expect(help).not.toContain(absent);
+  for (const advertised of ["pi-agents agents", "pi-agents attach", "pi-agents stop|rm", "pi-agents respawn", "session cleanup", "session resolve-delivery"]) expect(help).toContain(advertised);
+  // Commit 11 adds logs; advertising it before it answers would report a bug.
+  for (const absent of ["logs", "session status", "session stop", "session delete"]) expect(help).not.toContain(absent);
   expect(openApp).not.toHaveBeenCalled();
 });
 
@@ -72,6 +72,7 @@ it("prints exactly one JSON object and uses syntax exit code 2", async () => {
 it.each([
   ["stop", ["stop", "full-session-id", "--revision", "3", "--yes"]],
   ["rm", ["rm", "full-session-id", "--revision", "3", "--yes"]],
+  ["respawn", ["respawn", "full-session-id", "--revision", "3", "--yes"]],
 ])("routes the top-level %s verb without prefix resolution", async (_name, argv) => {
   const output = capture();
   const runSessionCommand = async (received) => {

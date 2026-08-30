@@ -28,6 +28,7 @@ const inactive = {
 
 const stopArgv = ["stop", "exact-session-id", "--revision", "4", "--yes"];
 const rmArgv = ["rm", "exact-session-id", "--revision", "4", "--yes"];
+const respawnArgv = ["respawn", "exact-session-id", "--revision", "4", "--yes"];
 const authenticated = { version: 1, kind: "authenticated", state: "READY", recovering: false, daemonEpoch: "epoch", pid: 1 };
 
 /** @param {string} operation @param {string} stage @param {string} clientId @param {string} requestId */
@@ -120,6 +121,9 @@ it.each([
   ["missing confirmation", ["stop", "exact-session-id", "--revision", "4"]],
   ["path-like session ID", ["stop", "sessions/exact-session-id", "--revision", "4", "--yes"]],
   ["unknown flag", ["stop", "exact-session-id", "--revision", "4", "--yes", "--force"]],
+  ["respawn without confirmation", ["respawn", "exact-session-id", "--revision", "4"]],
+  ["respawn without a revision", ["respawn", "exact-session-id", "--yes"]],
+  ["respawn on a path-like session ID", ["respawn", "sessions/exact-session-id", "--revision", "4", "--yes"]],
 ])("rejects strict destructive grammar: %s", async (_name, argv) => {
   const request = vi.fn();
   await expect(runSessionCommand(argv, { request })).resolves.toMatchObject({ code: 2, error: { code: "INVALID_SYNTAX" } });
@@ -144,6 +148,27 @@ it("sends rm as the delete operation and records delete as the pending action", 
   expect(request.mock.calls[0][0]).toBe("delete");
   const { path } = await pendingAfterAmbiguousDelete(root, request);
   expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ action: "delete", sessionId: "exact-session-id", revision: 4 });
+});
+
+// respawn ends a worker's process group, so it takes the same convention as stop and rm: a full
+// identifier, an exact revision, and explicit confirmation, with its own durable pending action.
+it("claims composer, sends the exact revision-bound respawn, and records respawn as the pending action", async () => {
+  const root = await stateRoot();
+  const operations = [];
+  const request = vi.fn(async (op, payload, requestId) => {
+    operations.push([op, payload]);
+    if (op === "attach") return { kind: "attached", sessionId: "exact-session-id", role: "composer" };
+    if (op === "detach") return { kind: "detached", sessionId: "exact-session-id" };
+    return { kind: "command", status: { stage: "DELIVERY_UNKNOWN", clientId: "cli-stable", requestId } };
+  });
+  await expect(runSessionCommand(respawnArgv, { root, randomId: () => "stable", composerRequest: request })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN" } });
+  expect(operations).toEqual([
+    ["attach", { sessionId: "exact-session-id", role: "composer" }],
+    ["respawn", { sessionId: "exact-session-id", revision: 4 }],
+    ["detach", { sessionId: "exact-session-id" }],
+  ]);
+  const [name] = (await readdir(join(root, "cli", "pending"))).filter((candidate) => candidate.endsWith(".json"));
+  expect(JSON.parse(await readFile(join(root, "cli", "pending", name), "utf8"))).toMatchObject({ action: "respawn", sessionId: "exact-session-id", revision: 4 });
 });
 
 it("reads every session row for agents without opening the list", async () => {

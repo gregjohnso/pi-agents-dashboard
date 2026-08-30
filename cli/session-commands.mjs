@@ -27,7 +27,9 @@ const AUTHENTICATION_STATES = new Set(["STARTING", "RECONCILING", "READY", "FAIL
  * `rm` is Claude Code's verb for the operator; the wire operation and the pending record stay
  * `delete` because a running daemon and an earlier release already wrote that spelling.
  */
-const SESSION_OPERATIONS = new Map([["stop", "stop"], ["rm", "delete"], ["cleanup", "cleanup"]]);
+const SESSION_OPERATIONS = new Map([["stop", "stop"], ["rm", "delete"], ["respawn", "respawn"], ["cleanup", "cleanup"]]);
+/** Operations that end a worker's process group, so a lost answer leaves a delivery to resolve. */
+const DESTRUCTIVE_OPERATIONS = new Set(["stop", "delete", "respawn"]);
 /** Daemon operations the CLI sends that mutate nothing, so a lost answer leaves no delivery to resolve. */
 const READ_ONLY_OPERATIONS = new Set(["get_state"]);
 const DESTRUCTIVE_TIMEOUT_MARGIN_MS = 1_000;
@@ -194,7 +196,7 @@ function validateExpectedResult(op, payload, clientId, requestId, result) {
     if (result.kind !== "state") throw unexpected("Daemon returned the wrong result kind for get_state");
     return;
   }
-  if (op === "stop" || op === "delete") {
+  if (DESTRUCTIVE_OPERATIONS.has(op)) {
     const status = result.kind === "command" ? result.status : undefined;
     if (status?.clientId !== clientId || status.requestId !== requestId || status.operation !== op || !["COMPLETED", "DELIVERY_UNKNOWN", "FAILED"].includes(status.stage)) {
       throw unexpected(`Daemon returned an unexpected ${op} command status`);
@@ -228,13 +230,13 @@ export async function createPersistentDaemonRequester({ root = resolveRuntimeRoo
         const response = await Promise.race([
           client.request({ version: 1, clientId, requestId, op, payload }),
           fatal,
-          new Promise((_, reject) => { timer = setTimeout(() => reject(Object.assign(new Error("Daemon request timed out"), ["stop", "delete"].includes(op) ? { code: "DELIVERY_UNKNOWN", clientId, requestId } : { code: "DAEMON_REQUEST_TIMEOUT" })), timeoutMs); }),
+          new Promise((_, reject) => { timer = setTimeout(() => reject(Object.assign(new Error("Daemon request timed out"), DESTRUCTIVE_OPERATIONS.has(op) ? { code: "DELIVERY_UNKNOWN", clientId, requestId } : { code: "DAEMON_REQUEST_TIMEOUT" })), timeoutMs); }),
         ]);
         if (!response.ok) throw Object.assign(new Error(response.error.message), response.error);
         validateExpectedResult(op, payload, clientId, requestId, response.result);
         return response.result;
       } catch (error) {
-        const destructive = ["stop", "delete"].includes(op);
+        const destructive = DESTRUCTIVE_OPERATIONS.has(op);
         const responseUnvalidated = ["INVALID_DAEMON_RESPONSE", "UNEXPECTED_DAEMON_RESPONSE", "MALFORMED_RESPONSE"].includes(error?.code);
         if (destructive && (responseUnvalidated || (error?.code === "CONNECTION_CLOSED" && error?.submitted === true))) throw Object.assign(new Error("Destructive command delivery is ambiguous"), { code: "DELIVERY_UNKNOWN", clientId, requestId, submitted: true });
         throw error;
@@ -343,7 +345,7 @@ function parse(argv) {
   const [sessionId, ...flags] = args;
   const operation = SESSION_OPERATIONS.get(command);
   if (operation === undefined || !exactId(sessionId)) {
-    return { error: "Usage: pi-agents stop|rm <full-id> --revision <n> --yes | pi-agents session cleanup <full-id> --revision <n> --yes | pi-agents session resolve-delivery <full-client-id> <full-request-id> retry_at_risk|abandon --yes" };
+    return { error: "Usage: pi-agents stop|rm|respawn <full-id> --revision <n> --yes | pi-agents session cleanup <full-id> --revision <n> --yes | pi-agents session resolve-delivery <full-client-id> <full-request-id> retry_at_risk|abandon --yes" };
   }
 
   let revision;
@@ -612,7 +614,7 @@ export async function runSessionCommand(argv, options = {}) {
     return { code: 0, result };
   }
 
-  if (parsed.command === "stop" || parsed.command === "rm") {
+  if (DESTRUCTIVE_OPERATIONS.has(parsed.operation)) {
     const clientId = await loadCliClientIdentity({ root, randomId: options.randomId });
     const existing = await readPending(root, parsed.operation, parsed.sessionId, parsed.revision);
     const pending = existing.entry === undefined

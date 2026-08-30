@@ -70,13 +70,16 @@ The operator-facing commands use the same verbs as Claude Code's background sess
 | `pi-agents attach <full-session-id>` | Opens one session's viewer directly. Returning ends the attachment, not the session. |
 | `pi-agents stop <full-session-id> --revision <n> --yes` | Stops that session's worker and its Pi process. |
 | `pi-agents rm <full-session-id> --revision <n> --yes` | Forgets the dashboard record. It does not delete Pi's session file or remove a worktree. |
+| `pi-agents respawn <full-session-id> --revision <n> --yes` | Restarts that session's worker on the installed release. It refuses while the session is working or waiting on you, rather than interrupting the turn. |
+
+An upgraded daemon adopts your running sessions rather than refusing them, and restarts a worker left on older code by itself once Pi settles that session. `respawn` is how you ask for that restart at a moment you choose. A worker newer than the daemon is never downgraded.
 
 Session IDs are exact; a prefix does not match. `--revision <n>` is the `revision` in `pi-agents agents --json`, and the command refuses when the row changed underneath it.
 
 Two recovery commands have no Claude Code equivalent and stay under `session`:
 
 - `pi-agents session cleanup <full-session-id> --revision <n> --yes` removes a stopped session's managed worktree.
-- `pi-agents session resolve-delivery <full-client-id> <full-request-id> retry_at_risk|abandon --yes` settles a `stop` or `rm` whose delivery the daemon left ambiguous.
+- `pi-agents session resolve-delivery <full-client-id> <full-request-id> retry_at_risk|abandon --yes` settles a `stop`, `rm`, or `respawn` whose delivery the daemon left ambiguous.
 
 Add `--json` to any command for one machine-readable object on standard output.
 

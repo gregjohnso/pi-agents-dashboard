@@ -12,6 +12,16 @@ it("reports only verified active supervisor identities", async () => {
   })).resolves.toEqual({ activeDaemon: false, activeSupervisors: [worker], unverifiable: false });
 });
 
+// Operator-visible failure: a worker the daemon marked for replacement is still a live supervisor. A
+// preflight that refused to read it would report the state root unmigratable for a field it ignores.
+it("reads a supervisor whose run is marked for replacement", async () => {
+  const marked = async () => JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "session", runId: "run", leaseId: "lease", generation: 1, identity: worker, piChildIdentity: worker, proto: 1, cliVersion: "1.4.2", routeGeneration: 2, pendingRespawn: "upgrade" }] });
+  await expect(inspectRuntimeActivity({
+    stateRoot: "/state/pi-agents", runtimeRoot: "/state/pi-agents",
+    exists: async () => true, inspectEndpoint: async () => ({ status: "ABSENT" }), inspect: async () => worker, readFile: marked,
+  })).resolves.toEqual({ activeDaemon: false, activeSupervisors: [worker], unverifiable: false });
+});
+
 it.each(["HEALTHY", "UNHEALTHY"])("treats a %s publication as a live daemon", async (status) => {
   const publication = { pid: 7, startIdentity: "70", processGroupId: 7 };
   await expect(inspectRuntimeActivity({

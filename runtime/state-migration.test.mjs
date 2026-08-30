@@ -108,6 +108,8 @@ it.each([
   ["runs/one/worker-replay.jsonl", `${JSON.stringify({ clientId: "", requestId: "request", op: "stop", stage: "RECEIVED", at: "now" })}\n`],
   ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, proto: 0 }] })],
   ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, routeGeneration: 0 }] })],
+  ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, pendingRespawn: "later" }] })],
+  ["cli/pending/one.json", JSON.stringify({ schemaVersion: 1, action: "restart", sessionId: "one", revision: 3, clientId: "client", requestId: "request" })],
   ["unknown-state.json", JSON.stringify({ value: true })],
 ])("refuses malformed legacy artifact %s", async (relative, text) => {
   const paths = await fixture();
@@ -141,6 +143,24 @@ it("migrates worker metadata carrying the adopted protocol, release, and route g
 
   await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {} })).resolves.toMatchObject({ status: "MIGRATED" });
   expect(JSON.parse(await readFile(join(paths.destinationRoot, "daemon", "workers.json"), "utf8"))).toEqual(metadata);
+});
+
+// Operator-visible failure: a replacement the daemon promised before it signalled must survive a
+// state-root migration, and so must the operator's own pending respawn. Refusing either strands the
+// session behind MALFORMED_LEGACY_STATE.
+it("migrates a worker awaiting replacement and a pending respawn request", async () => {
+  const paths = await fixture();
+  const identity = { pid: 42, startIdentity: "42", processGroupId: 42 };
+  const metadata = { schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, identity, piChildIdentity: identity, token: "run-token", proto: 1, cliVersion: "1.4.2", routeGeneration: 3, pendingRespawn: "upgrade" }] };
+  const pending = { schemaVersion: 1, action: "respawn", sessionId: "one", revision: 3, clientId: "client", requestId: "request" };
+  await mkdir(join(paths.legacyRoot, "daemon"), { recursive: true, mode: 0o700 });
+  await mkdir(join(paths.legacyRoot, "cli", "pending"), { recursive: true, mode: 0o700 });
+  await writeFile(join(paths.legacyRoot, "daemon", "workers.json"), JSON.stringify(metadata), { mode: 0o600 });
+  await writeFile(join(paths.legacyRoot, "cli", "pending", "one.json"), JSON.stringify(pending), { mode: 0o600 });
+
+  await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {} })).resolves.toMatchObject({ status: "MIGRATED" });
+  expect(JSON.parse(await readFile(join(paths.destinationRoot, "daemon", "workers.json"), "utf8"))).toEqual(metadata);
+  expect(JSON.parse(await readFile(join(paths.destinationRoot, "cli", "pending", "one.json"), "utf8"))).toEqual(pending);
 });
 
 it("recovers mutable PUBLISHED output only after the reconciliation marker is durable", async () => {

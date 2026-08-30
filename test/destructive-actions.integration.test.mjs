@@ -67,7 +67,7 @@ function connect(runtime, role = "frontend") {
     send(value) {
       if (value.op === "attach") attachmentRoles.set(value.payload.sessionId, value.payload.role);
       else if (value.op === "detach") attachmentRoles.delete(value.payload.sessionId);
-      else if (["prompt", "follow_up", "steer", "interrupt", "ui_response", "stop", "delete"].includes(value.op) && (value.op !== "stop" && value.op !== "delete" || Number.isSafeInteger(value.payload.revision)) && !attachmentRoles.has(value.payload.sessionId)) {
+      else if (["prompt", "follow_up", "steer", "interrupt", "ui_response", "stop", "delete", "respawn"].includes(value.op) && (!["stop", "delete", "respawn"].includes(value.op) || Number.isSafeInteger(value.payload.revision)) && !attachmentRoles.has(value.payload.sessionId)) {
         attachmentRoles.set(value.payload.sessionId, "composer");
         socket.write(encoder.encode({ version: 1, clientId: value.clientId, requestId: `automatic-composer-${automaticAttachment++}`, op: "attach", payload: { sessionId: value.payload.sessionId, role: "composer" } }));
       }
@@ -139,6 +139,70 @@ it("journals Stop before exact-group escalation and leaves task/outcome independ
   const stopped = await registry.get(session.sessionId);
   expect(stopped).toMatchObject({ processState: "EXITED", taskState: "STOPPED", outcome: "READY_FOR_REVIEW" });
   expect(stopped.ownership).toBeUndefined();
+  const journal = await readFile(join(root, "queue", "commands.jsonl"), "utf8");
+  expect(journal.indexOf('"stage":"DELIVERY_ATTEMPTED"')).toBeLessThan(journal.lastIndexOf('"stage":"WORKER_ACKNOWLEDGED"'));
+  frontend.close();
+  workerSocket.close();
+});
+
+// Operator-visible failure: an upgrade that replaced a worker without the destructive convention would
+// end a session the operator never named, at a revision he never read. respawn takes the same full
+// identifier, exact revision, and confirmation as stop and rm, and touches no Pi file.
+it("respawns a stale worker through the guarded destructive path and preserves the canonical Pi session", async () => {
+  const root = await fixtureRoot();
+  const worker = { pid: 9401, startIdentity: "940100", processGroupId: 9401 };
+  let alive = true;
+  const registry = new RegistryStore(join(root, "sessions"));
+  const session = record(root, "respawn-target", {
+    processState: "LIVE",
+    ownership: { kind: "managed", runId: "run-respawn", process: worker, acquiredAt: "2026-08-25T12:00:00.000Z", heartbeatAt: "2026-08-25T12:00:00.000Z" },
+    latestRunId: "run-respawn",
+  });
+  await writeFile(session.canonicalSessionFile, "session\n");
+  await registry.create(session);
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: session.sessionId, runId: "run-respawn", leaseId: "lease-respawn", generation: 1, identity: worker, piChildIdentity: worker, cliVersion: "1.9.0" }] })}\n`, { mode: 0o600 });
+  const signals = [];
+  const launches = [];
+  const diagnostics = [];
+  const runtime = await createDaemonRuntime({
+    root,
+    cliVersion: "2.0.0",
+    recordDiagnostic: (entry) => { diagnostics.push(entry); },
+    reconnectTimeoutMs: 1_000,
+    stopPolicy: { gracefulMs: 1, terminateMs: 1 },
+    sleepImpl: async () => {},
+    inspect: async (pid) => {
+      if (pid === process.pid) return { pid, startIdentity: "1", processGroupId: process.pid };
+      if (pid === worker.pid && alive) return worker;
+      throw Object.assign(new Error("gone"), { code: "ESRCH" });
+    },
+    signalProcessGroupImpl(pgid, signal) {
+      signals.push({ pgid, signal });
+      if (signal === "SIGTERM") alive = false;
+    },
+    workerSupervisor: { useRouter() {}, async launch(request) { launches.push(request.sessionId); return { sessionId: request.sessionId }; }, async close() {} },
+  });
+  runtimes.push(runtime);
+  const workerSocket = connect(runtime, "worker");
+  await workerSocket.next();
+  workerSocket.send({ version: 1, type: "worker_ready", token: "respawn-token", sessionId: session.sessionId, runId: "run-respawn", leaseId: "lease-respawn", generation: 1, worker, piChild: worker });
+  await runtime.ready;
+  const frontend = connect(runtime);
+  await frontend.next();
+
+  frontend.send(request("client", "no-revision", "respawn", { sessionId: session.sessionId }));
+  expect(await frontend.next()).toMatchObject({ ok: false, error: { code: "REVISION_REQUIRED" } });
+  frontend.send(request("client", "wrong-revision", "respawn", { sessionId: session.sessionId, revision: 7 }));
+  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "FAILED", error: { code: "REVISION_CONFLICT" } } } });
+  expect(signals).toEqual([]);
+  expect(diagnostics).toEqual([expect.objectContaining({ event: "respawn_refused", sessionId: session.sessionId, code: "REVISION_CONFLICT" })]);
+
+  frontend.send(request("client", "respawn-request", "respawn", { sessionId: session.sessionId, revision: 0 }));
+  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { operation: "respawn", stage: "COMPLETED" } } });
+
+  expect(signals).toEqual([{ pgid: worker.processGroupId, signal: "SIGTERM" }]);
+  expect(launches).toEqual(["respawn-target"]);
+  expect(await readFile(session.canonicalSessionFile, "utf8")).toBe("session\n");
   const journal = await readFile(join(root, "queue", "commands.jsonl"), "utf8");
   expect(journal.indexOf('"stage":"DELIVERY_ATTEMPTED"')).toBeLessThan(journal.lastIndexOf('"stage":"WORKER_ACKNOWLEDGED"'));
   frontend.close();

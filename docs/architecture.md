@@ -38,6 +38,19 @@ The daemon may exit without stopping a worker. The worker remains Pi's parent an
 
 A failure before a child owns the session marks the prepared record `FAILED`. Delivery that cannot be proved remains `DELIVERY_UNKNOWN`; the daemon does not guess whether Pi received it.
 
+## A worker behind the daemon's release is replaced only at an idle boundary
+
+A daemon adopts every protocol-compatible live worker before it compares releases, so an upgrade never refuses a running session. A worker whose recorded `cliVersion` is behind the daemon's, or absent, is then replaced by [`replaceStaleWorker`](../runtime/daemon.mjs), which runs once, serialized under the session lifecycle lock, from one of two boundaries:
+
+- Pi settling the run. [`sessionEventForPiEvent`](../runtime/session-event-mapping.mjs) maps `agent_settled` to `TURN_COMPLETED`, and the row it reduces to opens the boundary. Only that reduced record decides: [`idleForRespawn`](../runtime/daemon.mjs) requires `taskState: READY`, `processState: LIVE`, and no blocking user-interface request. Terminal bytes and the canonical Pi session file may never open it, and `WAITING` is Pi blocked on a person rather than an idle session.
+- `pi-agents respawn <full-session-id> --revision <n> --yes`, which takes the same full identifier, exact revision, and explicit confirmation as `stop` and `rm`. It refuses a session that is not idle rather than interrupting a running turn.
+
+At the boundary the operation re-reads every fact it rests on: the revision, the adopted route, both recorded process identities, the release, and the idle state. A worker newer than the daemon is never downgraded: the automatic boundary passes over it, and an explicit `respawn` refuses it. Every refusal the guarded operation reaches is recorded as a daemon diagnostic and leaves the worker running.
+
+Before anything is signalled, the run's private metadata gains `pendingRespawn: "upgrade"`, so a daemon that dies mid-replacement resumes the guarded operation after it has adopted that worker again. The replacement then stops the worker through the same exact-identity boundary Stop uses, forgets the run, and launches a new one. Automatic replacements are bounded to three in flight across sessions, so one upgrade does not restart every idle session at once.
+
+See [`docs/reference/claude-code-behavior.md`](reference/claude-code-behavior.md#release-changes-adopt-workers-before-replacing-them).
+
 ## Events are ordered, cursor-based, and snapshot-first
 
 The daemon publishes each session or command change through [`createEventStore`](../runtime/event-store.mjs). It appends the version 1 event to `index/events.jsonl`, syncs it, assigns the next sequence in the current daemon epoch, and then broadcasts it. A cursor is the pair `daemonEpoch` and `sequence`.
@@ -70,7 +83,7 @@ Viewer data has a separate ordered store per session. [`createViewerNormalizer`]
 
 - `dashboard.json` is the optional schema version 2 configuration.
 - `frontend-state.json` stores the frontend client identity, list cursor, view state, and launch draft.
-- `daemon/` stores daemon identity and coordination data. This includes `pid.json`, `control.sock`, `control.token`, `epoch`, `lifecycle.lock`, worker routes in `workers.json`, summary settings, event acknowledgements, request result stores, the latest `reconciliation.json`, and `startup.log`. `workers.json` is a mode-0600 owned file because it holds each run's private socket token. A run is written there before its worker is spawned and both process identities are absent until the launch binds them. The token is never rotated during adoption, so a replacement daemon authenticates the same live run; a respawn mints a new one, and terminal reconciliation removes the whole entry. Each entry also records the worker socket protocol as integer `proto`, the release the worker was spawned from as optional `cliVersion`, and the `routeGeneration` of its last successful adoption. A record written before those fields existed carries none of them; an authenticated live version-1 route supplies `proto`, and an absent `cliVersion` means the release is unknown.
+- `daemon/` stores daemon identity and coordination data. This includes `pid.json`, `control.sock`, `control.token`, `epoch`, `lifecycle.lock`, worker routes in `workers.json`, summary settings, event acknowledgements, request result stores, the latest `reconciliation.json`, and `startup.log`. Daemon diagnostics, including a refused worker replacement, are one JSON line each on the daemon's stderr, which `daemon/startup.log` captures. `workers.json` is a mode-0600 owned file because it holds each run's private socket token. A run is written there before its worker is spawned and both process identities are absent until the launch binds them. The token is never rotated during adoption, so a replacement daemon authenticates the same live run; a respawn mints a new one, and terminal reconciliation removes the whole entry. Each entry also records the worker socket protocol as integer `proto`, the release the worker was spawned from as optional `cliVersion`, and the `routeGeneration` of its last successful adoption. A record written before those fields existed carries none of them; an authenticated live version-1 route supplies `proto`, and an absent `cliVersion` means the release is unknown. An entry gains `pendingRespawn: "upgrade"` before the daemon signals a replacement, and loses it with the entry when that run ends.
 - `sessions/<sessionId>.json` is the daemon-owned registry. Each version 1 record contains immutable session identity, revision, display state, isolation, ownership, and verified runtime identity when available.
 - `queue/commands.jsonl` is the durable command journal. It records acceptance, delivery attempts, acknowledgements, failures, and ambiguous delivery.
 - `index/events.jsonl` is the ordered list event log. `index/viewer/<sha256(sessionId)>.*` holds normalized viewer events, recovery checkpoints, the latest snapshot, and client acknowledgements.
@@ -99,5 +112,5 @@ Two owned paths are outside the state root. Canonical Pi session files remain in
 - `runtime/` contains the daemon, registry, journals, recovery, worker supervision, Pi RPC adapter, normalization, and durable stores. Start with [`runtime/daemon.mjs`](../runtime/daemon.mjs).
 - `shared/` contains strict contracts shared across process boundaries.
 - `isolation/` contains launch preflight, managed worktrees, ownership locks, and explicit cleanup.
-- `cli/` contains the operator verbs `agents`, `attach`, `stop`, and `rm`, plus administrative daemon and session-recovery commands. `bin/` contains the installed executable entry point.
+- `cli/` contains the operator verbs `agents`, `attach`, `stop`, `rm`, and `respawn`, plus administrative daemon and session-recovery commands. `bin/` contains the installed executable entry point.
 - `test/` contains cross-module integration and terminal acceptance tests. Unit tests sit beside their source as `*.test.mjs`.

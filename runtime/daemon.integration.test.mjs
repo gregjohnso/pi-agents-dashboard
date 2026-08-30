@@ -1248,6 +1248,142 @@ it("adopts live workers of every release and reports each one's release and rout
   frontend.close();
 }, 20_000);
 
+/**
+ * Build one live adopted worker whose release is `cliVersion`, plus the daemon seams that observe a
+ * replacement: the signals it sends, the launches it asks for, and the diagnostics it records.
+ * @param {{ sessionId: string, cliVersion?: string, taskState: import("../shared/contracts.mjs").TaskState, activityKind?: string, pendingRespawn?: string }} options
+ */
+async function replaceableWorker({ sessionId, cliVersion, taskState, activityKind = "assistant_final", pendingRespawn }) {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const now = "2026-08-25T12:00:00.000Z";
+  const identity = { pid: 401, startIdentity: "40100", processGroupId: 401 };
+  const piChildIdentity = { pid: 402, startIdentity: "40200", processGroupId: 401 };
+  let alive = true;
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId, sessionFile: join(stateRoot, `${sessionId}.jsonl`), canonicalSessionFile: join(stateRoot, `${sessionId}.jsonl`), cwd: stateRoot, taskState, processState: "LIVE", outcome: "NONE", activity: { kind: activityKind, summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: `run-${sessionId}`, process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: `run-${sessionId}`, createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId, runId: `run-${sessionId}`, leaseId: `lease-${sessionId}`, generation: 1, identity, piChildIdentity, ...(cliVersion === undefined ? {} : { cliVersion }), ...(pendingRespawn === undefined ? {} : { pendingRespawn }) }] })}\n`, { mode: 0o600 });
+  /** @type {Array<[number, string]>} */
+  const signals = [];
+  /** @type {string[]} */
+  const launches = [];
+  /** @type {any[]} */
+  const diagnostics = [];
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    cliVersion: "2.0.0",
+    reconnectTimeoutMs: 2_000,
+    stopPolicy: { gracefulMs: 20, terminateMs: 20 },
+    sleepImpl: async () => {},
+    inspect: async (/** @type {number} */ pid) => {
+      if (pid === process.pid) return { pid, startIdentity: "1", processGroupId: process.pid };
+      if (!alive) throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      return pid === identity.pid ? identity : piChildIdentity;
+    },
+    signalProcessGroupImpl: (/** @type {number} */ pgid, /** @type {string} */ signal) => {
+      signals.push([pgid, signal]);
+      if (signal === "SIGTERM") alive = false;
+    },
+    recordDiagnostic: (/** @type {any} */ entry) => { diagnostics.push(entry); },
+    workerSupervisor: { useRouter() {}, async launch(/** @type {any} */ request) { launches.push(request.sessionId); return { sessionId: request.sessionId }; }, async close() {} },
+  });
+  runtimes.push(runtime);
+  const loop = startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId, runId: `run-${sessionId}`, leaseId: `lease-${sessionId}`, generation: 1, identity, piChildIdentity, token: `${sessionId}-token` });
+  await runtime.ready;
+  await vi.waitFor(() => expect(runtime.status().connectedWorkers).toContain(sessionId), { timeout: 5_000, interval: 25 });
+  return { stateRoot, registry, runtime, loop, identity, signals, launches, diagnostics, now };
+}
+
+/** Attach one composer frontend, which every durable command still requires. @param {any} runtime @param {string} sessionId */
+async function composer(runtime, sessionId) {
+  const frontend = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 64 * 1024 });
+  await frontend.ready;
+  frontend.send({ version: 1, clientId: "client", requestId: "attach", op: "attach", payload: { sessionId, role: "composer" } });
+  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "attached", role: "composer" } });
+  return frontend;
+}
+
+// Operator-visible failure: replacing a worker mid-turn ends the run the operator is waiting on. The
+// only fact that may open the boundary is Pi's own settled state reduced onto the row.
+it("keeps a busy stale worker running and replaces it at the next structured idle boundary", async () => {
+  const live = await replaceableWorker({ sessionId: "busy", cliVersion: "1.9.0", taskState: "WORKING", activityKind: "tool" });
+
+  await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+  expect(live.signals).toEqual([]);
+  expect(live.launches).toEqual([]);
+  expect(await live.registry.get("busy")).toMatchObject({ taskState: "WORKING", ownership: { runId: "run-busy" } });
+
+  await live.loop.sendEvent({ type: "TURN_COMPLETED", at: live.now });
+
+  await vi.waitFor(() => expect(live.launches).toEqual(["busy"]), { timeout: 8_000, interval: 25 });
+  await live.loop.stop();
+  expect(live.signals).toEqual([[live.identity.processGroupId, "SIGTERM"]]);
+  const replaced = await live.registry.get("busy");
+  expect(replaced).toMatchObject({ taskState: "READY", processState: "EXITED" });
+  expect(replaced?.ownership).toBeUndefined();
+  // The replaced run's private metadata, including its pending replacement, goes with the run.
+  expect(JSON.parse(await readFile(join(live.stateRoot, "daemon", "workers.json"), "utf8")).workers).toEqual([]);
+}, 20_000);
+
+// Operator-visible failure: a daemon that died between promising a replacement and completing it would
+// leave the operator on the worker it had already decided to replace, with nothing on disk saying so.
+it("resumes a replacement its predecessor promised, after it has adopted that worker again", async () => {
+  const live = await replaceableWorker({ sessionId: "resumed", cliVersion: "1.9.0", taskState: "READY", pendingRespawn: "upgrade" });
+
+  await vi.waitFor(() => expect(live.launches).toEqual(["resumed"]), { timeout: 8_000, interval: 25 });
+  await live.loop.stop();
+  expect(live.signals).toEqual([[live.identity.processGroupId, "SIGTERM"]]);
+  expect(JSON.parse(await readFile(join(live.stateRoot, "daemon", "workers.json"), "utf8")).workers).toEqual([]);
+}, 20_000);
+
+// Operator-visible failure: an explicit respawn that interrupted a running turn would destroy work the
+// operator could not get back, and WAITING blocks on the operator rather than being idle.
+it.each(/** @type {Array<[string, import("../shared/contracts.mjs").TaskState, string]>} */ ([
+  ["working", "WORKING", "tool"],
+  ["waiting on a person", "WAITING", "blocking_request"],
+]))("refuses an explicit respawn while the session is %s and never signals it", async (_name, taskState, activityKind) => {
+  const live = await replaceableWorker({ sessionId: "guarded", cliVersion: "1.9.0", taskState, activityKind });
+  const frontend = await composer(live.runtime, "guarded");
+
+  frontend.send({ version: 1, clientId: "client", requestId: "respawn-busy", op: "respawn", payload: { sessionId: "guarded", revision: 0 } });
+
+  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { operation: "respawn", stage: "FAILED", error: { code: "SESSION_BUSY" } } } });
+  expect(live.signals).toEqual([]);
+  expect(live.launches).toEqual([]);
+  expect(live.diagnostics).toEqual([expect.objectContaining({ event: "respawn_refused", sessionId: "guarded", code: "SESSION_BUSY" })]);
+  expect(await live.registry.get("guarded")).toMatchObject({ revision: 0, taskState, ownership: { runId: "run-guarded" } });
+  frontend.close();
+}, 20_000);
+
+// Operator-visible failure: an older daemon that replaced a newer worker would silently downgrade the
+// operator's running session, and a worker with no recorded release is unknown rather than newer.
+it("replaces an idle worker of unknown release on request and refuses to downgrade a newer one", async () => {
+  const newer = await replaceableWorker({ sessionId: "guarded", cliVersion: "2.1.0", taskState: "READY" });
+  const newerFrontend = await composer(newer.runtime, "guarded");
+  newerFrontend.send({ version: 1, clientId: "client", requestId: "respawn-newer", op: "respawn", payload: { sessionId: "guarded", revision: 0 } });
+  expect(await newerFrontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "FAILED", error: { code: "WORKER_NEWER_THAN_DAEMON" } } } });
+  expect(newer.signals).toEqual([]);
+  expect(newer.launches).toEqual([]);
+  // An idle newer worker is never replaced on its own either.
+  await newer.loop.sendEvent({ type: "TURN_COMPLETED", at: newer.now });
+  await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+  expect(newer.launches).toEqual([]);
+  newerFrontend.close();
+  await newer.loop.stop();
+
+  const unknown = await replaceableWorker({ sessionId: "nameless", taskState: "READY" });
+  // Idle and replaceable, but with no promise on disk and no settled turn, nothing replaces it alone.
+  expect(unknown.launches).toEqual([]);
+  const frontend = await composer(unknown.runtime, "nameless");
+  frontend.send({ version: 1, clientId: "client", requestId: "respawn-unknown", op: "respawn", payload: { sessionId: "nameless", revision: 0 } });
+
+  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { operation: "respawn", stage: "COMPLETED" } } });
+  expect(unknown.signals).toEqual([[unknown.identity.processGroupId, "SIGTERM"]]);
+  expect(unknown.launches).toEqual(["nameless"]);
+  frontend.close();
+  await unknown.loop.stop();
+}, 30_000);
+
 it("colors a session across summary churn without a revision conflict", async () => {
   const stateRoot = await root();
   for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });

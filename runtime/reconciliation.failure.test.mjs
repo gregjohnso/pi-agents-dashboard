@@ -363,6 +363,34 @@ it("continues route generations across a replacement daemon", async () => {
   await router.close();
 });
 
+// Operator-visible failure: a daemon that recorded no replacement intent before it signalled would
+// forget an interrupted upgrade on restart, leaving the operator's session on the worker the daemon
+// had already decided to replace.
+it("carries one run's persisted pending replacement across adoption by a replacement daemon", async () => {
+  const root = await fixture();
+  const live = await liveWorker(root, "marked", { cliVersion: "1.9.0", proto: 1, routeGeneration: 1, pendingRespawn: "upgrade" });
+  const router = await releaseRouter(root, [live], "2.0.0");
+
+  await expect(router.adopt(live.ready, fakeConnection())).resolves.toMatchObject({ routeGeneration: 2 });
+
+  expect(router.pendingRespawn("marked")).toBe("upgrade");
+  expect(await persistedWorkers(root)).toEqual([{ ...live.metadata, routeGeneration: 2 }]);
+  await router.close();
+});
+
+it("records a durable pending replacement only for the run that still owns the session", async () => {
+  const root = await fixture();
+  const live = await liveWorker(root, "superseded", { cliVersion: "1.9.0" });
+  const router = await releaseRouter(root, [live], "2.0.0");
+
+  await expect(router.markPendingRespawn("superseded", "other-run")).rejects.toMatchObject({ code: "OWNERSHIP_CONFLICT" });
+  expect(await persistedWorkers(root)).toEqual([live.metadata]);
+
+  await router.markPendingRespawn("superseded", "run-superseded");
+  expect(await persistedWorkers(root)).toEqual([{ ...live.metadata, pendingRespawn: "upgrade" }]);
+  await router.close();
+});
+
 it("inherits nothing from a run that was reserved but never spawned its worker", async () => {
   const root = await fixture();
   const metadataPath = join(root, "daemon", "workers.json");

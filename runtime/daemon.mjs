@@ -33,7 +33,16 @@ initializeRuntimePermissions();
 const DEFAULT_MAX_BYTES = 1024 * 1024;
 const MAX_ATTACHMENT_REQUESTS = 4096;
 const WORKER_DELIVERED_COMMANDS = ["prompt", "steer", "follow_up", "interrupt", "ui_response", "session_command"];
-const DURABLE_COMMANDS = new Set([...WORKER_DELIVERED_COMMANDS, "stop", "delete"]);
+const DURABLE_COMMANDS = new Set([...WORKER_DELIVERED_COMMANDS, "stop", "delete", "respawn"]);
+/** Stop dispositions that prove the signalled process group is gone. */
+const TERMINAL_STOP_DISPOSITIONS = ["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "KILLED"];
+/** Release statuses whose worker this daemon replaces. A newer worker is never downgraded. */
+const REPLACEABLE_RELEASES = new Set(["STALE", "UNKNOWN"]);
+/**
+ * Automatic upgrade respawns in flight across sessions. An idle boundary is never urgent, and an
+ * unbounded burst would restart every session at once the first time an upgraded daemon starts.
+ */
+const MAX_UPGRADE_RESPAWNS = 3;
 const CONNECTOR_PATH = fileURLToPath(new URL("./daemon-connector.mjs", import.meta.url));
 /** This package's manifest. Its version is the release recorded for every worker this daemon spawns. */
 const PACKAGE_MANIFEST_PATH = fileURLToPath(new URL("../package.json", import.meta.url));
@@ -277,6 +286,18 @@ function sameProcessIdentity(left, right) {
   return left?.pid === right?.pid && left?.startIdentity === right?.startIdentity && left?.processGroupId === right?.processGroupId;
 }
 
+/**
+ * Report whether one row sits at a safe worker-replacement boundary.
+ *
+ * Only the reduced record decides. Terminal bytes and the canonical Pi session file may never open
+ * this boundary, and WAITING is Pi blocked on a person rather than an idle session, so a false idle
+ * fact cannot cost the operator a running turn.
+ * @param {any} record
+ */
+function idleForRespawn(record) {
+  return record?.taskState === "READY" && record.processState === "LIVE" && record.activity?.kind !== "blocking_request";
+}
+
 /** Capture a regular, canonical session file identity without following a symlink replacement. @param {string} path */
 async function inspectSessionFile(path) {
   if (typeof path !== "string" || resolve(path) !== path) throw Object.assign(new Error("Session file path is not canonical"), { code: "SESSION_PATH_UNSAFE" });
@@ -504,7 +525,7 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
               version: 1,
               requestId: typeof frame?.requestId === "string" ? frame.requestId : "invalid-request",
               ok: false,
-              error: dashboardError(revisionRequired ? "REVISION_REQUIRED" : "INVALID_REQUEST", revisionRequired ? "Stop and Delete require an exact registry revision" : "Invalid client request"),
+              error: dashboardError(revisionRequired ? "REVISION_REQUIRED" : "INVALID_REQUEST", revisionRequired ? "Stop, Delete, and Respawn require an exact registry revision" : "Invalid client request"),
             });
             return;
           }
@@ -615,6 +636,7 @@ export async function createDaemonRuntime({
   closeFailpoint = async () => {},
   attachmentFailpoint = () => {},
   destructiveFailpoint = async () => {},
+  recordDiagnostic = (/** @type {any} */ entry) => { process.stderr.write(`${JSON.stringify(entry)}\n`); },
   stopPolicy = DEFAULT_STOP_POLICY,
   signalProcessGroupImpl = signalProcessGroup,
   sleepImpl = sleep,
@@ -626,7 +648,7 @@ export async function createDaemonRuntime({
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 128) throw new TypeError("maxBytes must be at least 128");
   if (!Number.isSafeInteger(workerRequestTimeoutMs) || workerRequestTimeoutMs <= 0) throw new TypeError("workerRequestTimeoutMs must be a positive integer");
   if (typeof randomId !== "function") throw new TypeError("randomId must be a function");
-  if (typeof responseWriter !== "function" || typeof closeFailpoint !== "function" || typeof attachmentFailpoint !== "function" || typeof destructiveFailpoint !== "function" || typeof signalProcessGroupImpl !== "function" || typeof sleepImpl !== "function") throw new TypeError("Daemon runtime seams must be functions");
+  if (typeof responseWriter !== "function" || typeof closeFailpoint !== "function" || typeof attachmentFailpoint !== "function" || typeof destructiveFailpoint !== "function" || typeof recordDiagnostic !== "function" || typeof signalProcessGroupImpl !== "function" || typeof sleepImpl !== "function") throw new TypeError("Daemon runtime seams must be functions");
   if (!Number.isSafeInteger(stopPolicy?.gracefulMs) || stopPolicy.gracefulMs <= 0 || !Number.isSafeInteger(stopPolicy?.terminateMs) || stopPolicy.terminateMs <= 0) throw new TypeError("stopPolicy must contain approved positive integer waits");
   if (trashSessionFile !== undefined && typeof trashSessionFile !== "function") throw new TypeError("trashSessionFile must be a function when supplied");
   await ensureLayout(root);
@@ -658,6 +680,8 @@ export async function createDaemonRuntime({
     const summarizing = new Set();
     const launchingSessions = new Set();
     const sessionStarts = new Map();
+    /** Sessions whose automatic upgrade respawn is in flight, which bounds the burst after an upgrade. @type {Set<string>} */
+    const upgradeRespawns = new Set();
     /** @type {Map<string, Map<net.Socket, { clientId: string, role: "composer" | "observer" }>>} */
     const attachmentClaims = new Map();
     /** @type {Map<string, { serialized: string, promise: Promise<any> }>} */
@@ -751,6 +775,72 @@ export async function createDaemonRuntime({
           stale: ["STALE", "UNKNOWN"].includes(router.releaseStatus(session.sessionId)),
           routeGeneration: route.routeGeneration,
         };
+      },
+      /** Record one refusal or failure to replace a worker; the worker itself keeps running. @param {string} sessionId @param {unknown} error */
+      recordRespawnRefusal(sessionId, error) {
+        const refusal = /** @type {any} */ (error);
+        recordDiagnostic({ event: "respawn_refused", sessionId, code: refusal?.code ?? "RESPAWN_FAILED", message: error instanceof Error ? error.message : "Respawn failed", at: new Date().toISOString() });
+      },
+      /**
+       * Replace one out-of-date worker, serialized under this session's lifecycle lock.
+       *
+       * Every fact the decision rests on is re-read here rather than carried from whatever opened the
+       * boundary: the revision, the adopted route, both recorded process identities, the release, and
+       * the idle state. The replacement runs to the same exact-identity signalling boundary Stop uses,
+       * so nothing is signalled that is not still the process this session recorded.
+       * @param {string} sessionId @param {{ revision?: number, beforeSignal?: () => Promise<unknown> }} [options]
+       */
+      async replaceStaleWorker(sessionId, { revision, beforeSignal = async () => {} } = {}) {
+        /** @param {string} code @param {string} message */
+        const refusal = (code, message) => Object.assign(new Error(message), { code });
+        return router.runSession(sessionId, async (/** @type {any} */ { metadata, route, forget }) => {
+          const record = await registry.get(sessionId);
+          if (record === undefined) throw refusal("SESSION_NOT_FOUND", "The exact session does not exist");
+          if (revision !== undefined && record.revision !== revision) throw refusal("REVISION_CONFLICT", "Session revision changed before respawn");
+          if (route === undefined || metadata?.token === undefined || record.ownership === undefined || metadata.runId !== record.ownership.runId || !sameProcessIdentity(metadata.identity, record.ownership.process)) {
+            throw refusal("WORKER_UNAVAILABLE", "No adopted worker route owns this session");
+          }
+          const release = router.releaseStatus(sessionId);
+          if (release === "NEWER") throw refusal("WORKER_NEWER_THAN_DAEMON", "Respawn refuses to downgrade a worker newer than this daemon");
+          if (!REPLACEABLE_RELEASES.has(release)) throw refusal("WORKER_CURRENT", "This session's worker already runs this daemon's release");
+          if (!idleForRespawn(record)) throw refusal("SESSION_BUSY", "Respawn refuses a session that is not idle");
+          // The intent is durable before anything is signalled, so a daemon that dies mid-replacement
+          // resumes the guarded operation after it has adopted the worker again.
+          await router.markPendingRespawn(sessionId, metadata.runId);
+          await beforeSignal();
+          const disposition = await stopVerifiedProcessGroup(record.ownership.process, {
+            inspect,
+            requestGraceful: async () => { await route.connection.send({ version: 1, type: "shutdown", token: metadata.token }).catch(() => {}); },
+            signalProcessGroup: signalProcessGroupImpl,
+            sleep: sleepImpl,
+          }, stopPolicy);
+          if (!TERMINAL_STOP_DISPOSITIONS.includes(disposition.disposition)) throw refusal(disposition.disposition, `Respawn stopped short of proof at the exact identity boundary: ${disposition.disposition}`);
+          const latest = await registry.get(sessionId);
+          if (latest?.ownership?.runId === record.ownership.runId) {
+            const exited = reduceSessionState(latest, { type: "WORKER_EXITED", at: new Date().toISOString() });
+            const updated = await registry.update(latest.sessionId, latest.revision, { ownership: undefined, taskState: exited.taskState, processState: exited.processState, outcome: latest.outcome, activity: exited.activity, updatedAt: exited.updatedAt });
+            await context.publishSession(updated);
+          }
+          // The replaced run's private metadata, including its pending replacement, goes with the run.
+          await forget();
+          await context.ensureSessionWorker(sessionId);
+        });
+      },
+      /**
+       * Open the automatic replacement boundary for one session whose structured state is idle. A
+       * worker already on this release needs no replacement and a newer one is never downgraded, so
+       * neither reaches the guarded operation from here.
+       * @param {string} sessionId @param {any} record
+       */
+      scheduleUpgradeRespawn(sessionId, record) {
+        // A daemon that does not know its own release cannot judge a worker's, and replaces nothing.
+        if (cliVersion === undefined || !idleForRespawn(record)) return;
+        if (upgradeRespawns.size >= MAX_UPGRADE_RESPAWNS || upgradeRespawns.has(sessionId)) return;
+        if (router.route(sessionId) === undefined || !REPLACEABLE_RELEASES.has(router.releaseStatus(sessionId))) return;
+        upgradeRespawns.add(sessionId);
+        void context.replaceStaleWorker(sessionId)
+          .catch((/** @type {unknown} */ error) => context.recordRespawnRefusal(sessionId, error))
+          .finally(() => upgradeRespawns.delete(sessionId));
       },
       /**
        * Re-derive task state from Pi after a reconnect: a turn can both finish and start while the
@@ -1063,17 +1153,26 @@ export async function createDaemonRuntime({
         if (context.state !== "READY") throw Object.assign(new Error("Daemon recovery is still in progress"), { code: "RECOVERING", retryable: true });
         const eventKeys = ["version", "type", "token", "sessionId", "event"];
         if (frame.type !== "worker_event" || frame.version !== 1 || frame.sessionId !== metadata.sessionId || Object.keys(frame).some((key) => !eventKeys.includes(key)) || typeof frame.event !== "object" || frame.event === null || Array.isArray(frame.event)) throw Object.assign(new Error("Invalid worker frame"), { code: "INVALID_WORKER_FRAME" });
+        /** @type {string | undefined} */
+        let previousTaskState;
+        /** @type {any} */
+        let settled;
         await router.runCurrent(metadata, connection, routeGeneration, async () => {
           // Re-read and re-reduce when another writer wins the compare-and-swap. Throwing here reaches
           // the worker socket's error path, which destroys the connection: losing a race with a color,
           // rename or summary write must not cost the supervisor its route.
           const updated = await applySessionUpdate(registry, frame.sessionId, (current) => {
             if (current.ownership === undefined || current.ownership.runId !== metadata.runId) throw Object.assign(new Error("Worker event ownership conflict"), { code: "OWNERSHIP_CONFLICT" });
+            previousTaskState = current.taskState;
             const next = reduceSessionState(current, frame.event);
             return next === current ? undefined : { taskState: next.taskState, processState: next.processState, outcome: next.outcome, activity: next.activity, updatedAt: next.updatedAt };
           });
+          settled = updated;
           await context.publishSession(updated);
         });
+        // Pi settling this run is the one fact that opens an automatic replacement boundary, and it
+        // opens it once per turn rather than on every event a settled session goes on to emit.
+        if (previousTaskState !== "READY") context.scheduleUpgradeRespawn(metadata.sessionId, settled);
       },
       /** @param {any} request @param {net.Socket | undefined} socket @param {Set<net.Socket>} subscribers @param {string} [authenticatedClientId] */
       async handleRequest(request, socket, subscribers, authenticatedClientId = request.clientId, duringRecovery = false) {
@@ -1295,7 +1394,7 @@ export async function createDaemonRuntime({
                 if (current?.stage === "DELIVERY_ATTEMPTED") return context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
                 throw error;
               }
-              const observedTerminal = ["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "KILLED"].includes(disposition.disposition);
+              const observedTerminal = TERMINAL_STOP_DISPOSITIONS.includes(disposition.disposition);
               if (disposition.disposition === "KILL_REQUESTED" || disposition.signaled === true) {
                 return context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
               }
@@ -1316,6 +1415,24 @@ export async function createDaemonRuntime({
               await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
               return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
             });
+          } else if (request.op === "respawn") {
+            try {
+              await context.replaceStaleWorker(request.payload.sessionId, {
+                revision: request.payload.revision,
+                beforeSignal: () => context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED"),
+              });
+              await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
+              status = await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
+            } catch (error) {
+              context.recordRespawnRefusal(request.payload.sessionId, error);
+              const respawnError = /** @type {any} */ (error);
+              const current = await context.recovery.journal.get(request);
+              // Past the signalling boundary this command cannot report a clean failure: the worker it
+              // signalled may already be gone, exactly as Stop reports its own ambiguity.
+              status = current?.stage === "DELIVERY_ATTEMPTED"
+                ? await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN")
+                : await context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError(respawnError?.code ?? "RESPAWN_FAILED", error instanceof Error ? error.message : "Respawn failed"));
+            }
           } else if (request.op === "delete") {
             const history = await context.recovery.journal.history(request);
             const retryAtRisk = history.some((/** @type {any} */ prior, /** @type {number} */ index) => prior.stage === "DELIVERY_UNKNOWN" && history[index + 1]?.stage === "ACCEPTED");
@@ -1485,6 +1602,11 @@ export async function createDaemonRuntime({
         }
         context.state = "READY";
         await updateDaemonLifecycleState(claim, "READY");
+        // A replacement an earlier daemon promised resumes only now, after its worker was adopted. A
+        // session that is busy again waits for its next idle boundary instead.
+        for (const sessionId of router.connectedSessionIds()) {
+          if (router.pendingRespawn(sessionId) !== undefined) context.scheduleUpgradeRespawn(sessionId, await registry.get(sessionId));
+        }
         return context.recovery;
       } catch (error) {
         context.state = "FAILED";

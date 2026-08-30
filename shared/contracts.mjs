@@ -31,7 +31,7 @@ const ENVELOPE_KEYS = ["version", "clientId", "requestId", "op", "payload"];
 export const SESSION_COLORS = ["sky", "green", "amber", "rose", "cyan", "gray"];
 /** @typedef {"sky"|"green"|"amber"|"rose"|"cyan"|"gray"} SessionColor */
 
-const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries", "set_session_color", "get_models"];
+const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "respawn", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries", "set_session_color", "get_models"];
 const COMMAND_STAGES = ["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED", "DELIVERY_UNKNOWN", "FAILED"];
 const SESSION_COMMANDS = ["set_model", "compact", "set_session_name", "abort_retry"];
 const MAX_MENU_ENTRIES = 1_000;
@@ -207,7 +207,8 @@ export function parseClientRequest(value) {
     return { ...base, payload: payload.activate === true ? { ...parsed, activate: true } : parsed };
   }
   if (["detach", "interrupt"].includes(op)) return { ...base, payload: readSessionPayload(request.payload, op) };
-  if (["stop", "delete"].includes(op)) return { ...base, payload: readDestructivePayload(request.payload, op) };
+  // respawn ends one worker's process group, so it carries the same exact revision as stop and delete.
+  if (["stop", "delete", "respawn"].includes(op)) return { ...base, payload: readDestructivePayload(request.payload, op) };
   if (["prompt", "steer", "follow_up"].includes(op)) {
     const payload = readRecord(request.payload, `${op} payload`); rejectUnknownKeys(payload, ["sessionId", "text"], `${op} payload`);
     return { ...base, payload: { sessionId: readIdentifier(payload, "sessionId", `${op} payload.sessionId`), text: readText(payload, "text", `${op} payload.text`) } };

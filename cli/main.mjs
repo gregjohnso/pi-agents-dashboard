@@ -8,13 +8,14 @@ const HELP = `Usage: pi-agents [--pi-bin /absolute/path/to/pi]
        pi-agents agents [--json]
        pi-agents attach <full-session-id>
        pi-agents stop|rm <full-session-id> --revision <n> --yes
+       pi-agents respawn <full-session-id> --revision <n> --yes
        pi-agents daemon start|status|restart|recover|stop [--stop-workers --yes]
        pi-agents session cleanup <full-session-id> --revision <n> --yes
        pi-agents session resolve-delivery <full-client-id> <full-request-id> retry_at_risk|abandon --yes
 
 With no arguments, pi-agents opens the machine-local session list.
 `;
-const SESSION_VERBS = new Set(["stop", "rm"]);
+const SESSION_VERBS = new Set(["stop", "rm", "respawn"]);
 /** Recovery operations Claude Code has no verb for, so they stay under the session namespace. */
 const RECOVERY_VERBS = new Set(["cleanup", "resolve-delivery"]);
 const RECOVERY_USAGE = "Usage: pi-agents session cleanup <full-id> --revision <n> --yes | session resolve-delivery <full-client-id> <full-request-id> retry_at_risk|abandon --yes";
@@ -72,7 +73,7 @@ export async function runCli(argv = process.argv.slice(2), deps = {}) {
       result = RECOVERY_VERBS.has(args[1])
         ? await (deps.runSessionCommand ?? runSessionCommand)(args.slice(1), deps.sessionOptions)
         : { code: 2, error: { code: "INVALID_SYNTAX", message: RECOVERY_USAGE } };
-    } else result = { code: 2, error: { code: "INVALID_SYNTAX", message: "Usage: pi-agents [--pi-bin /absolute/path] | agents | attach ... | stop ... | rm ... | daemon ... | session ..." } };
+    } else result = { code: 2, error: { code: "INVALID_SYNTAX", message: "Usage: pi-agents [--pi-bin /absolute/path] | agents | attach ... | stop ... | rm ... | respawn ... | daemon ... | session ..." } };
   } catch (error) {
     const conflictCodes = new Set(["OWNERSHIP_CONFLICT", "AMBIGUOUS_IDENTITY", "DAEMON_IDENTITY_CONFLICT", "PROCESS_IDENTITY_CONFLICT", "STALE_LEASE"]);
     result = { code: conflictCodes.has(error?.code) ? 5 : 1, error: { code: error?.code ?? "COMMAND_FAILED", message: error instanceof Error ? error.message : "Command failed" } };

@@ -19,6 +19,12 @@ const LAUNCH_CONTROL_TYPES = ["pi_child", "worker_ready"];
 const MAX_RESERVATION_BUFFERED_FRAMES = 256;
 /** The worker socket protocol this daemon speaks, recorded per worker and independent of any release. */
 const WORKER_PROTOCOL_VERSION = 1;
+/**
+ * The one reason a run is marked for replacement: its code is behind the daemon's, or unknown. The
+ * mark is written before the daemon signals anything, so a restart resumes the guarded replacement
+ * instead of leaving the operator on a worker the daemon had already decided to replace.
+ */
+const PENDING_RESPAWN_UPGRADE = "upgrade";
 const SEMANTIC_VERSION = /^(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?$/u;
 
 /**
@@ -228,10 +234,10 @@ function validIdentity(value) {
  * @param {any} worker
  */
 function validateWorkerMetadata(worker) {
-  const allowed = ["sessionId", "runId", "leaseId", "generation", "identity", "piChildIdentity", "token", "proto", "cliVersion", "routeGeneration"];
+  const allowed = ["sessionId", "runId", "leaseId", "generation", "identity", "piChildIdentity", "token", "proto", "cliVersion", "routeGeneration", "pendingRespawn"];
   const bound = worker?.identity !== undefined || worker?.piChildIdentity !== undefined;
   const counter = (/** @type {unknown} */ value) => value === undefined || (Number.isSafeInteger(value) && /** @type {number} */ (value) > 0);
-  if (typeof worker !== "object" || worker === null || Array.isArray(worker) || Object.keys(worker).some((key) => !allowed.includes(key)) || [worker.sessionId, worker.runId, worker.leaseId].some((value) => typeof value !== "string" || value.length === 0) || !Number.isSafeInteger(worker.generation) || worker.generation <= 0 || (bound && (!validIdentity(worker.identity) || !validIdentity(worker.piChildIdentity))) || (worker.token !== undefined && (typeof worker.token !== "string" || worker.token.length === 0)) || !counter(worker.proto) || !counter(worker.routeGeneration) || (worker.cliVersion !== undefined && (typeof worker.cliVersion !== "string" || worker.cliVersion.length === 0))) throw new TypeError("Worker recovery metadata record is invalid");
+  if (typeof worker !== "object" || worker === null || Array.isArray(worker) || Object.keys(worker).some((key) => !allowed.includes(key)) || [worker.sessionId, worker.runId, worker.leaseId].some((value) => typeof value !== "string" || value.length === 0) || !Number.isSafeInteger(worker.generation) || worker.generation <= 0 || (bound && (!validIdentity(worker.identity) || !validIdentity(worker.piChildIdentity))) || (worker.token !== undefined && (typeof worker.token !== "string" || worker.token.length === 0)) || !counter(worker.proto) || !counter(worker.routeGeneration) || (worker.pendingRespawn !== undefined && worker.pendingRespawn !== PENDING_RESPAWN_UPGRADE) || (worker.cliVersion !== undefined && (typeof worker.cliVersion !== "string" || worker.cliVersion.length === 0))) throw new TypeError("Worker recovery metadata record is invalid");
   return worker;
 }
 
@@ -419,6 +425,27 @@ export class RecoveredWorkerRouter {
   /** Compare one worker's recorded release with this daemon's, which callers do only after adoption. @param {string} sessionId */
   releaseStatus(sessionId) {
     return workerReleaseStatus(this.#workers.get(sessionId)?.cliVersion, this.#cliVersion);
+  }
+
+  /**
+   * Record that this exact run is to be replaced, before anything signals it. Only the run that still
+   * owns the session may be marked, so a mark can never outlive the run it was decided for; the entry
+   * and its mark are removed together when the run ends.
+   * @param {string} sessionId @param {string} runId
+   */
+  async markPendingRespawn(sessionId, runId) {
+    return this.#serializeRoute(sessionId, async () => {
+      const worker = this.#workers.get(sessionId);
+      if (worker === undefined || worker.runId !== runId) throw Object.assign(new Error("Pending replacement does not match the run that owns this session"), { code: "OWNERSHIP_CONFLICT" });
+      if (worker.pendingRespawn === PENDING_RESPAWN_UPGRADE) return;
+      worker.pendingRespawn = PENDING_RESPAWN_UPGRADE;
+      await this.#persist();
+    }, "router_mark_respawn");
+  }
+
+  /** @param {string} sessionId */
+  pendingRespawn(sessionId) {
+    return this.#workers.get(sessionId)?.pendingRespawn;
   }
 
   connectedSessionIds() {

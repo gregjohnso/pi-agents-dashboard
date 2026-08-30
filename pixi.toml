@@ -5,6 +5,8 @@ platforms = ["linux-64"]
 [dependencies]
 nodejs = ">=22.19,<23"
 git = "*"
+python = ">=3.14.7,<3.15"
+submitit = ">=1.5.4,<2"
 
 [tasks]
 install = "npm install"
@@ -16,3 +18,6 @@ test-integration = "npm run test:integration"
 test-acceptance = "npm run test:acceptance"
 test = "npm test"
 pack-check = "npm run pack:check"
+# Opt-in SLURM measurement. Runs real Pi inference; it is not part of any test task.
+measure-cold-launch = "python ./perf/cold_launch_launcher.py"
+measure-cold-launch-reduce = "node ./perf/cold-launch-reduce.mjs"

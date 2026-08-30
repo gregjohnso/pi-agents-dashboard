@@ -126,6 +126,16 @@ An equivalent record needs protocol, stable session ID, worker PID and process-s
 
 **Adopt:** exact process identity, authenticated route data, and a release field separate from protocol compatibility. Persist only Pi launch data needed for recovery. **Divergence kept:** omit terminal and Claude-specific fields because Pi cannot publish or consume them. See [Changes 5.1 and 5.4](../architecture-plan.md#change-5-commands-work-on-every-session-and-stop-uses-its-graceful-route). [O][B]
 
+### Startup readiness has no handoff messages
+
+Claude Code does not hand a worker from launch IPC to its durable sockets. The daemon creates the PTY and rendezvous socket paths before spawn and connects to both directly. On the PTY socket, the host sends framed control `"hello"`, its retained output tail, and framed control `"live"`. The daemon's rendezvous connector sets its internal `workerReady` Boolean when that connection opens. There is no `"ready"` frame, handoff request, or handoff acknowledgement in this path. [B]
+
+`"hello"` and `"live"` are not names for our `connect_socket` or transport switch. Claude Code's `"hello"` reports the child PID and host version after connection, making it the equivalent of our existing `worker_hello` identity handshake. Rename that handshake to `hello`. Claude Code's `"live"` marks the boundary between the retained PTY tail and new terminal bytes, so reusing it for a launch-IPC command would assign Claude Code's name to different behavior. Our `connect_socket`, `handoff_to_socket`, and `socket_handoff_complete` messages therefore remain project-specific. The equivalent readiness mark changes from `socket_ready` to `workerReady`. Pi requires an explicit handoff because the current worker starts with launch IPC and later adopts one RPC socket. [B]
+
+The build also makes a weaker readiness claim than this plan. Fresh launch sets `workerReady` from the rendezvous connection callback rather than from a named authentication-success acknowledgement. Roster adoption sets `workerReady` before reconnecting the saved PTY and rendezvous sockets. Authentication failures are reported later as `"auth-required"`, `"auth-rejected"`, or `"reply-rejected"`. Our sequence deliberately requires authenticated adoption before persisting readiness and disconnecting launch IPC; the observed path does not suggest moving or removing one of our steps. [B]
+
+The attach control protocol calls its connection-scoped identifier `attachId`, not `connectionId`. Both the `"attach"` and `"resize"` operations accept `attachId`, and the daemon keys its in-memory attacher map with that value. Use `attachId` for the dashboard process's socket-scoped identity while retaining `clientId` and `requestId` for durable command recovery. [B]
+
 ## Attach becomes usable after a native repaint
 
 The control client opens `control.sock` and sends one newline-terminated object. The attach request is `{proto: 1, op: "attach", short, auth, cols, rows, attachId, caps, holdingFrame}`. `auth` is the control key. `attachId` distinguishes this connection. `caps` can report readiness-mark support, terminal and multiplexer details, Secure Shell use, color level, theme, hyperlink and synchronized-output support, and related rendering capabilities. Dimensions are bounded from 1 through 10,000. [B]

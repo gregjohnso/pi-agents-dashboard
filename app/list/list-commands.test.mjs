@@ -43,6 +43,10 @@ describe("list slash commands", () => {
     it("carries a working directory through for the caller to check", () => {
         expect(parseListCommand("/cwd /repo/alpha", choices)).toEqual({ kind: "set_cwd", path: "/repo/alpha" });
         expect(parseListCommand("/cwd", choices)).toMatchObject({ kind: "rejected", code: "CWD_REQUIRED" });
+        // `/cwd ~/projects` reached the daemon literally and was refused as CWD_NOT_A_DIRECTORY.
+        expect(parseListCommand("/cwd ~/projects", choices)).toMatchObject({ kind: "set_cwd", path: `${process.env.HOME}/projects` });
+        expect(parseListCommand("/cwd ~", choices)).toMatchObject({ kind: "set_cwd", path: process.env.HOME });
+        expect(parseListCommand("/cwd /tmp/~keep", choices)).toMatchObject({ kind: "set_cwd", path: "/tmp/~keep" });
     });
     it("names both isolation modes and refuses anything else", () => {
         expect(parseListCommand("/isolation worktree", choices)).toEqual({ kind: "set_isolation", isolationMode: "worktree" });

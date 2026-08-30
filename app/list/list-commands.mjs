@@ -1,6 +1,14 @@
 /** @typedef {{models:string[],modelsUnavailable?:{code:string,message:string}}} DraftChoices */
 /** @typedef {{name:string,argumentHint:string,summary:string}} ListCommand */
 
+/** Expand a leading `~`, which a shell would have expanded but the composer never sees. @param {string} path */
+function expandHome(path) {
+    const home = process.env.HOME;
+    if (home === undefined || home === "") return path;
+    if (path === "~") return home;
+    return path.startsWith("~/") ? `${home}${path.slice(1)}` : path;
+}
+
 /** The dashboard's own commands. Each one configures the next launch; none of them reaches a session. */
 export const LIST_COMMAND_MENU = [
     { name: "/model", argumentHint: "[provider/id]", summary: "model for the next session" },
@@ -102,7 +110,7 @@ export function parseListCommand(text, choices) {
     }
     if (name === "/cwd") {
         if (argument === "") return rejected("CWD_REQUIRED", "Type a directory: /cwd <path>");
-        return { kind: "set_cwd", path: argument };
+        return { kind: "set_cwd", path: expandHome(argument) };
     }
     if (name === "/isolation") {
         if (argument === "") return { kind: "pick_isolation" };

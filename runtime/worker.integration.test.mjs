@@ -62,7 +62,8 @@ async function waitForExit(pid, timeoutMs = 5_000) {
 }
 
 /** @param {RegistryStore} registry @param {string} sessionId @param {number} [timeoutMs] */
-async function waitForOwnershipRelease(registry, sessionId, timeoutMs = 5_000) {
+// A hard wait, not a vitest budget: --testTimeout cannot extend it, so it failed above about load 13.
+async function waitForOwnershipRelease(registry, sessionId, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs;
   while ((await registry.get(sessionId))?.ownership !== undefined) {
     if (Date.now() >= deadline) throw new Error(`Ownership for ${sessionId} was not released`);

@@ -89,7 +89,7 @@ it("lists every session from the previous state root after startup under the new
   expect(started).toMatchObject({ code: 0, result: { kind: "daemon_started" } });
 
   expect(await listSessionsThroughDaemon(root)).toEqual(["alpha", "beta", "delta", "gamma"]);
-}, 30_000);
+});
 
 it("recovers a crashed previous daemon whose publication still names the previous root", async () => {
   const { previousRoot, root, env } = await previousStateRoot(["alpha", "beta"]);
@@ -103,7 +103,7 @@ it("recovers a crashed previous daemon whose publication still names the previou
   expect(recovered).toMatchObject({ code: 0, result: { publication: { tokenPath: join(root, "daemon", "control.token") } } });
 
   expect(await listSessionsThroughDaemon(root)).toEqual(["alpha", "beta"]);
-}, 30_000);
+});
 
 it("adopts from the executable itself, before any command resolves a state root", async () => {
   const { parent, previousRoot, root, env } = await previousStateRoot(["alpha", "beta", "gamma", "delta"]);
@@ -116,7 +116,7 @@ it("adopts from the executable itself, before any command resolves a state root"
   expect(await readdir(parent)).toEqual(["pi-agents"]);
   expect((await readdir(join(root, "sessions"))).sort()).toEqual(["alpha.json", "beta.json", "delta.json", "gamma.json"]);
   await expect(lstat(previousRoot)).rejects.toMatchObject({ code: "ENOENT" });
-}, 30_000);
+});
 
 it("keeps using the previous root when the new root exists but holds no sessions", async () => {
   // Inverted 2026-08-30: any command creates `cli/` in the new root, so refusing on its mere

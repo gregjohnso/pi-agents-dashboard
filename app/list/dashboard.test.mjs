@@ -156,27 +156,31 @@ describe("dashboard controller", () => {
         await vi.waitFor(() => expect(backend.refreshSummaries).toHaveBeenCalled());
         expect(dashboard.status).toEqual({ kind: "ready" });
     });
-    it("shows the selected session's working directory and a filter chip only once a filter is set", async () => {
+    it("names the selected session and adds a filter chip only once a filter is set", async () => {
         const dashboard = controller(new FakeBackend([
             session("a", { cwd: "/repo/alpha" }),
             session("b", { cwd: "/repo/beta" }),
         ]));
         await dashboard.open();
         const unfiltered = dashboard.render(100, 16).map(stripVTControlCharacters);
+        // Inverted 2026-08-30: the line showed the session cwd, which for an isolated session is a bare
+        // worktree UUID that names nothing the operator recognises.
+        expect(unfiltered[1]).toContain("a");
+        expect(unfiltered[1]).not.toContain("/repo/alpha");
         expect(unfiltered[1]).not.toContain("search:");
         expect(unfiltered[1]).not.toContain("v:live");
         expect(unfiltered.at(-2).trim()).toMatch(/^─+$/u);
 
-        // The selected session's path sits at the top, above the list.
+        // The selected session's name sits at the top, above the list, and follows the selection.
         dashboard.selectSession("a");
-        expect(stripVTControlCharacters(dashboard.render(100, 16)[1])).toContain("/repo/alpha");
+        expect(stripVTControlCharacters(dashboard.render(100, 16)[1]).trim()).toMatch(/^a\b/u);
         dashboard.selectSession("b");
-        expect(stripVTControlCharacters(dashboard.render(100, 16)[1])).toContain("/repo/beta");
+        expect(stripVTControlCharacters(dashboard.render(100, 16)[1]).trim()).toMatch(/^b\b/u);
 
         dashboard.setSearch("beta");
         const filtered = dashboard.render(100, 16);
-        // Path and active filters share the one context line.
-        expect(stripVTControlCharacters(filtered[1])).toContain("/repo/beta");
+        // Name and active filters share the one context line.
+        expect(stripVTControlCharacters(filtered[1])).toContain("b");
         expect(stripVTControlCharacters(filtered[1])).toContain("search:beta");
     });
     // Ctrl+X on a live session is a Stop; only a second press inside the window clears it, and
@@ -416,7 +420,9 @@ describe("dashboard controller", () => {
         // The daemon publishes the session before it answers the launch, so the placeholder must yield
         // to the real record instead of sitting at STARTING beside it.
         dashboard.applySnapshot({ sessions: [session("real", { name: "Ship It", processState: "LIVE", taskState: "READY", createdAt: new Date().toISOString() })] });
-        const rows = dashboard.render(100, 24).map(stripVTControlCharacters);
+        const rendered = dashboard.render(100, 24).map(stripVTControlCharacters);
+        // The context line names the selected session too, so count list rows rather than every line.
+        const rows = rendered.slice(rendered.findIndex((line) => line.includes("NAME")) + 1);
         expect(rows.filter((line) => line.includes("Ship It"))).toHaveLength(1);
         expect(rows.some((line) => line.includes("STARTING"))).toBe(false);
         release();

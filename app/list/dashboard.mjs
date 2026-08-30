@@ -1225,10 +1225,12 @@ export class DashboardController {
     contextLine() {
         const selected = this.selectedSession();
         const filters = this.activeFilterSummary().trim();
-        const cwd = selected === undefined ? "" : selected.cwd;
-        if (cwd === "" && filters === "")
+        // Name the selected agent, not its worktree: an isolated session's cwd is a bare UUID that
+        // tells the operator nothing about which row the line describes.
+        const subject = selected === undefined ? "" : (selected.name ?? "").trim() === "" ? selected.sessionId.slice(0, 8) : `${selected.name}`;
+        if (subject === "" && filters === "")
             return "";
-        return ` ${[cwd, filters].filter((segment) => segment !== "").join("  ·  ")}`;
+        return ` ${[subject, filters].filter((segment) => segment !== "").join("  ·  ")}`;
     }
     /** Show filter state only once something is filtered; the keys themselves live in the footer and in Help. */
     activeFilterSummary() {

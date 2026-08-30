@@ -23,7 +23,7 @@ Focused runs use the raw vitest task:
 pixi run vitest -- run app/mouse-input.test.mjs --testTimeout=20000
 ```
 
-The suite is 788 tests across 84 files. A full run takes about 3 minutes on an unloaded machine and can take twice that under load.
+The suite is 818 tests across 87 files. A full run takes about 3 minutes on an unloaded machine and can take twice that under load.
 
 ## Tests
 
@@ -36,6 +36,26 @@ No test may run model inference or make a provider request. Bounded fake executa
 Every test builds its own state root with `mkdtemp` and passes it explicitly. A test that starts a daemon is responsible for stopping it.
 
 Real-process acceptance suites are timing sensitive. On a loaded shared machine they fail as timeouts; rerun a suspicious failure in isolation with a longer `--testTimeout` before believing it.
+
+## Measurements
+
+`perf/` holds measurements, not tests. They spawn real processes, and the cold-launch driver runs real model inference, so no collected test file imports one and `pixi run test` never executes one. Neither `tsconfig.json` nor `tsconfig.app.json` covers `perf/`.
+
+[perf/transition-latency.mjs](../perf/transition-latency.mjs) times the list-to-viewer transition under a real pseudo-terminal, using the fake Pi.
+
+[perf/cold-launch.mjs](../perf/cold-launch.mjs) takes one cold-launch sample against the installed Pi: journal acceptance, worker spawn, Pi child spawn, readiness persistence, and the first viewer snapshot read after the row already shows persisted readiness, plus worker and Pi resident set size after 60 idle seconds. It spends provider tokens and refuses to start outside a SLURM allocation. [perf/cold_launch_launcher.py](../perf/cold_launch_launcher.py) submits 30 independent samples as one `map_array` on `l40-reserved`, then reduces them:
+
+```bash
+pixi run measure-cold-launch --out <directory>
+```
+
+Every sample builds its own state root, its own Pi agent directory holding only symbolic links to credentials and the model catalog, and its own disposable Git repository, then removes all three.
+
+Four of the five instants need no product change. Journal acceptance comes from the command journal's `acceptedAt`. The worker and Pi child spawn instants come from the Linux process start ticks already stored in the session record's ownership and runtime identities, converted through the boot instant; each sample re-derives its own start the same way and records the residual, which measured about 100 ms and is mostly Node's own startup. The first usable snapshot comes from the measuring client's clock. Only readiness persistence has no durable trace, because the row's `updatedAt` moves on as soon as the first turn starts; [runtime/launch-trace.mjs](../runtime/launch-trace.mjs) supplies it and writes nothing at all unless `PI_AGENTS_LAUNCH_TRACE` names a destination.
+
+The result of the first run is recorded in [cold-launch-measurement.md](cold-launch-measurement.md).
+
+Samples run at most six at a time. Thirty concurrent samples made `pi --help` exceed the daemon's 5 s capability-probe timeout on a shared network filesystem, and 28 of 30 launches failed with `PI_PROBE_TIMEOUT`.
 
 ## Code
 

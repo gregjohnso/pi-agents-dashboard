@@ -4,6 +4,7 @@ import { mkdir, open } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { recordLaunchStage } from "./launch-trace.mjs";
 import { OwnershipManager } from "./ownership.mjs";
 import { probePiCapabilities } from "./pi-capability-probe.mjs";
 import { assertPiExecutableIdentity, resolvePiExecutable } from "./pi-executable.mjs";
@@ -528,6 +529,7 @@ export class WorkerSupervisor {
       }
 
       await this.#writeWorkerEventLocked(supervision, { type: "WORKER_READY", at: new Date().toISOString() }, "launching");
+      recordLaunchStage("ready_persisted", sessionId);
       if (supervision.exit.terminal || supervision.lifecycle !== "launching") {
         await this.#reconcileTerminalLocked(supervision);
         throw new WorkerSupervisorError("WORKER_PROCESS_EXITED", "Worker exited after readiness");

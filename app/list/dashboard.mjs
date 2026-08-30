@@ -1311,7 +1311,9 @@ export class DashboardController {
             this.requestRender?.();
             return;
         }
-        if (outcome.kind === "error")
+        // A refused launch must hand the typed prompt back. The backend answers a FAILED command with
+        // `rejected`, never `error`, so matching only `error` silently ate the draft on every refusal.
+        if (outcome.kind === "error" || outcome.kind === "rejected")
             this.restoreDraft(request.prompt);
         if (outcome.kind === "delivery_unknown") {
             this.focus = "list";

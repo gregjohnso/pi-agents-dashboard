@@ -452,6 +452,19 @@ describe("dashboard controller", () => {
         expect(dashboard.composerDraft.prompt).toBe("retry me");
         expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("STARTING"))).toBe(false);
     });
+    it("keeps the typed prompt when the daemon refuses the launch outright", async () => {
+        // The backend answers a FAILED command with `rejected`; matching only `error` ate the draft,
+        // so a MODEL_UNKNOWN refusal lost what the operator typed while the fixture test still passed.
+        const backend = new FakeBackend([]);
+        backend.launch = vi.fn(async () => ({ kind: "rejected", error: { code: "MODEL_UNKNOWN", message: "openai-codex/nope is not installed" } }));
+        const dashboard = controller(backend);
+        await dashboard.open();
+        for (const character of "keep this") dashboard.handleInput(character);
+        dashboard.handleInput("\r");
+        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "MODEL_UNKNOWN" }));
+        expect(dashboard.composerDraft.prompt).toBe("keep this");
+        expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("STARTING"))).toBe(false);
+    });
     it("keeps a refused launch on the status line through timer-driven changes until the next command", async () => {
         const backend = new FakeBackend([session("a")]);
         backend.refreshSummaries = vi.fn(async () => ["a"]);
@@ -473,7 +486,9 @@ describe("dashboard controller", () => {
         expect(dashboard.status).toMatchObject({ kind: "error", code: "MODEL_UNKNOWN" });
         expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("MODEL_UNKNOWN"))).toBe(true);
 
-        // The operator's next command clears it.
+        // The refusal handed the prompt back, so clear it before typing the next command.
+        expect(dashboard.composerDraft.prompt).toBe("ship it");
+        dashboard.setComposerPrompt("");
         for (const character of "/help") dashboard.handleInput(character);
         dashboard.handleInput("\r");
         expect(dashboard.status).toEqual({ kind: "ready" });

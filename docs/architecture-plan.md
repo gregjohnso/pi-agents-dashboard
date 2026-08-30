@@ -36,7 +36,7 @@ The resulting process model is one daemon per state root, many read-write termin
 5. Keep `/model`. Delete `/thinking`, its picker, `set_thinking_level`, and requested thinking level from dashboard launch.
 6. Keep summaries opt-in. Summary model settings remain dashboard settings, not Pi settings passthrough.
 
-Adopt Claude Code's [shared typing](reference/claude-code-behavior.md#linux-clients-share-one-editor-and-one-terminal-size). This reverses the operator's earlier settled choice to keep one composer and read-only observers. The daemon already serializes each session's work and journals every accepted command, so a second client adds ordered commands rather than untracked terminal-byte interleaving. Delete roles, grants, releases, takeover races, access-change notifications, recovery for claims, and `SESSION_IN_USE`.
+7. Any client may write. Approved by the operator on 2026-08-29, replacing his earlier choice of one composer with read-only observers. This adopts Claude Code's [shared typing](reference/claude-code-behavior.md#linux-clients-share-one-editor-and-one-terminal-size). The daemon already serializes each session's work and journals every accepted command, so a second client adds ordered commands rather than untracked terminal-byte interleaving. Delete roles, grants, releases, takeover races, access-change notifications, recovery for claims, and `SESSION_IN_USE`.
 
 ## Execution rules and invariants
 

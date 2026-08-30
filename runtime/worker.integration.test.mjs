@@ -92,7 +92,7 @@ async function setup(ids) {
   const fakeEntry = join(root, "fake-rpc-entry.mjs");
   await writeFile(fakeEntry, `#!/usr/bin/env node
 import { writeFile } from "node:fs/promises";
-if (process.argv.includes("--help")) { process.stdout.write("pi fake\\n--mode rpc\\n"); process.exit(0); }
+if (process.argv.includes("--version")) { process.stdout.write("1.0.0\\n"); process.exit(0); }
 const sessionIndex = process.argv.indexOf("--session");
 if (sessionIndex === -1) throw new Error("missing --session");
 const sessionFile = process.argv[sessionIndex + 1];

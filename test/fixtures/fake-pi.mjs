@@ -8,11 +8,9 @@ const log = (entry) => {
 };
 
 log({ kind: "start", argv: process.argv.slice(2), providerInvocation: false });
-if (process.argv.includes("--help")) {
-  process.stdout.write(process.env.FAKE_PI_STOCK_HELP === "1"
-    ? "pi - AI coding assistant\n\nOptions:\n  --mode <mode>  Output mode: text (default), json, or rpc\n"
-    : `pi ${process.env.FAKE_PI_VERSION ?? "1.0.0"}\n--mode rpc\n`);
-  process.exit(0);
+if (process.argv.includes("--version")) {
+  process.stdout.write(process.env.FAKE_PI_VERSION_OUTPUT ?? `${process.env.FAKE_PI_VERSION ?? "1.0.0"}\n`);
+  process.exit(Number(process.env.FAKE_PI_VERSION_EXIT ?? "0"));
 }
 
 const sessionIndex = process.argv.indexOf("--session");

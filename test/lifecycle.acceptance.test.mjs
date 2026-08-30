@@ -114,7 +114,7 @@ it("starts the production daemon with launch resolution and delivers the compose
   const root = await setupRoot("pi-agents-production-launch-");
   const executable = join(root, "pi");
   const log = join(root, "fake-pi.jsonl");
-  await writeFile(executable, sourceFor("production"), { mode: 0o700 });
+  await writeFile(executable, sourceFor("0.84.0"), { mode: 0o700 });
   await chmod(executable, 0o700);
   const env = { ...process.env, FAKE_PI_LOG: log, FAKE_PI_EVENT_AFTER_COMMAND: "prompt", FAKE_PI_ONE_WAY_EXTENSION_UI_RESPONSE: "1" };
   let client;
@@ -150,7 +150,7 @@ it("keeps two mixed-version fake Pi children alive across frontend close and dae
   const executable = join(root, "pi-current");
   const replacement = join(root, "pi-next");
   const log = join(root, "fake-pi.jsonl");
-  await writeFile(executable, sourceFor("A"), { mode: 0o700 });
+  await writeFile(executable, sourceFor("0.84.1"), { mode: 0o700 });
   await chmod(executable, 0o700);
 
   const registry = new RegistryStore(join(root, "sessions"));
@@ -191,7 +191,7 @@ it("keeps two mixed-version fake Pi children alive across frontend close and dae
   const launchPayload = { prompt: "bounded fake task", cwd: root, sourceSessionId: "source", isolation: { mode: "shared_directory", confirmedCwd: root, ownerSessionIds: [] } };
   const launchedOne = first.request(request("frontend-before", "launch-one", "launch", launchPayload));
 
-  await writeFile(replacement, sourceFor("B"), { mode: 0o700 });
+  await writeFile(replacement, sourceFor("0.84.2"), { mode: 0o700 });
   await chmod(replacement, 0o700);
   const firstResponse = await launchedOne;
   expect(firstResponse).toMatchObject({ ok: true, result: { kind: "launched", sessionId: "one" } });
@@ -202,15 +202,16 @@ it("keeps two mixed-version fake Pi children alive across frontend close and dae
 
   const beforeRecords = await Promise.all([registry.get("one"), registry.get("two")]);
   expect(beforeRecords).toEqual([
-    expect.objectContaining({ sessionId: "one", canonicalSessionFile: join(root, "canonical", "one.jsonl"), runtime: expect.objectContaining({ piVersion: "A", rpcAdapterVersion: 1 }) }),
-    expect.objectContaining({ sessionId: "two", canonicalSessionFile: join(root, "canonical", "two.jsonl"), runtime: expect.objectContaining({ piVersion: "B", rpcAdapterVersion: 1 }) }),
+    expect.objectContaining({ sessionId: "one", canonicalSessionFile: join(root, "canonical", "one.jsonl"), runtime: expect.objectContaining({ piVersion: "0.84.1", rpcAdapterVersion: 1 }) }),
+    expect.objectContaining({ sessionId: "two", canonicalSessionFile: join(root, "canonical", "two.jsonl"), runtime: expect.objectContaining({ piVersion: "0.84.2", rpcAdapterVersion: 1 }) }),
   ]);
   expect(beforeRecords[0].runtime.executable).not.toEqual(beforeRecords[1].runtime.executable);
   expect(new Set(handles.flatMap((handle) => [handle.identity.pid, handle.piChildIdentity.pid])).size).toBe(4);
   expect(handles.every((handle) => handle.identity.processGroupId === handle.identity.pid && handle.piChildIdentity.processGroupId === handle.identity.processGroupId)).toBe(true);
 
   const probeLog = (await readFile(log, "utf8")).trim().split("\n").map(JSON.parse);
-  expect(probeLog.filter((entry) => entry.kind === "start" && entry.argv.includes("--help"))).toHaveLength(2);
+  expect(probeLog.filter((entry) => entry.kind === "start" && entry.argv.includes("--version"))).toHaveLength(2);
+  expect(probeLog.filter((entry) => entry.kind === "start" && entry.argv.includes("--help"))).toHaveLength(0);
   expect(probeLog.filter((entry) => entry.kind === "start" && entry.argv.includes("--mode")).every((entry) => entry.argv.slice(0, 4).join(" ") === `--mode rpc --session ${entry.argv[3]}` && entry.providerInvocation === false)).toBe(true);
   expect(probeLog.filter((entry) => entry.kind === "command").every((entry) => entry.providerInvocation === false)).toBe(true);
 
@@ -230,8 +231,8 @@ it("keeps two mixed-version fake Pi children alive across frontend close and dae
   expect(secondRuntime.daemonEpoch).toBe(firstRuntime.daemonEpoch);
   const afterRestart = await Promise.all([registry.get("one"), registry.get("two")]);
   expect(afterRestart.map((value) => [value.sessionId, value.canonicalSessionFile, value.runtime.piVersion, value.ownership.runId])).toEqual([
-    ["one", join(root, "canonical", "one.jsonl"), "A", "run-one"],
-    ["two", join(root, "canonical", "two.jsonl"), "B", "run-two"],
+    ["one", join(root, "canonical", "one.jsonl"), "0.84.1", "run-one"],
+    ["two", join(root, "canonical", "two.jsonl"), "0.84.2", "run-two"],
   ]);
 
   const second = createDaemonClient({ socketPath: secondRuntime.socketPath, token: secondRuntime.token, clientId: "frontend-after", reconnect: false, maxBytes: 256 * 1024 });
@@ -258,7 +259,7 @@ it("keeps two mixed-version fake Pi children alive across frontend close and dae
 it("refuses a missing required capability before ownership, canonical writer, or run artifacts", async () => {
   const root = await setupRoot("pi-agents-capability-acceptance-");
   const executable = join(root, "pi");
-  await writeFile(executable, sourceFor("unsupported"), { mode: 0o700 });
+  await writeFile(executable, sourceFor("0.84.4"), { mode: 0o700 });
   await chmod(executable, 0o700);
   const registry = new RegistryStore(join(root, "sessions"));
   const session = record(root, "unsupported");

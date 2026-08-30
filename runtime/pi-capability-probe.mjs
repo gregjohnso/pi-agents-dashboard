@@ -12,6 +12,8 @@ const PROBE_MAX_RECORD_BYTES = 65_536;
 const PROBE_DRAIN_MS = 50;
 const UNKNOWN_COMMAND = "__pi_agents_unknown_command__";
 const RPC_ADAPTER_VERSION = 1;
+/** Pi 0.84.3 prints only `0.84.3` here; anything that is not a whole semantic version is not a version. */
+const REPORTED_VERSION = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/u;
 /** @type {readonly ("get_state"|"prompt"|"follow_up"|"steer"|"abort"|"extension_ui_response")[]} */
 const REQUIRED_COMMANDS = ["get_state", "prompt", "follow_up", "steer", "abort", "extension_ui_response"];
 
@@ -34,27 +36,38 @@ function boundedChild(child, timeoutMs, start) {
   });
 }
 
-/** @param {string} executable @param {any} spawnImpl @param {number} timeoutMs @param {NodeJS.ProcessEnv} env */
-async function probeHelp(executable, spawnImpl, timeoutMs, env) {
-  const child = spawnImpl(executable, ["--help"], { env, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+/**
+ * Read the installed Pi's own version. Pi 0.84.3's `--help` carries a description banner and no
+ * version at all, so `--version` is the only place the version exists. An executable that cannot
+ * report one is not refused: the required commands and events below decide admission, and a wrong
+ * version string is worse than an absent one because every later release comparison would read it
+ * as a real release.
+ * @param {string} executable @param {any} spawnImpl @param {number} timeoutMs @param {NodeJS.ProcessEnv} env
+ * @returns {Promise<string|null>}
+ */
+async function probeVersion(executable, spawnImpl, timeoutMs, env) {
+  const child = spawnImpl(executable, ["--version"], { env, shell: false, stdio: ["ignore", "pipe", "pipe"] });
   return boundedChild(child, timeoutMs, (finish) => {
     /** @type {Buffer[]} */
     const chunks = [];
     let bytes = 0;
     child.stdout?.on("data", (/** @type {Buffer} */ chunk) => {
       bytes += chunk.byteLength;
-      if (bytes > PROBE_MAX_RECORD_BYTES) return finish(Object.assign(new Error("Pi --help exceeded the probe byte limit"), { code: "PI_PROBE_HELP_FAILED" }));
+      if (bytes > PROBE_MAX_RECORD_BYTES) return finish(undefined, null);
       chunks.push(Buffer.from(chunk));
     });
     child.once("exit", (/** @type {number | null} */ code) => {
-      if (code !== 0) return finish(Object.assign(new Error("Pi --help failed"), { code: "PI_PROBE_HELP_FAILED" }));
+      if (code !== 0) return finish(undefined, null);
+      let output;
       try {
-        finish(undefined, new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)));
-      } catch (cause) {
-        finish(Object.assign(new Error("Pi --help was not valid UTF-8", { cause }), { code: "PI_PROBE_HELP_FAILED" }));
+        output = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks));
+      } catch {
+        return finish(undefined, null);
       }
+      const line = output.split("\n").map((entry) => entry.trim()).find((entry) => entry.length > 0) ?? "";
+      finish(undefined, REPORTED_VERSION.test(line) ? line : null);
     });
-  });
+  }).catch(() => null);
 }
 
 /** @param {string} executable @param {string} sessionFile @param {any} spawnImpl @param {number} timeoutMs @param {NodeJS.ProcessEnv} env */
@@ -163,7 +176,7 @@ export async function probePiCapabilities({ executable, spawnImpl = spawn, cache
   const key = `${piExecutableCacheKey(executable)}\0adapter:${RPC_ADAPTER_VERSION}`;
   const cached = cache.get(key);
   if (cached !== undefined) return cached;
-  const help = /** @type {string} */ (await probeHelp(executable.realpath, spawnImpl, timeoutMs, env));
+  const reportedVersion = await probeVersion(executable.realpath, spawnImpl, timeoutMs, env);
   const directory = await mkdtemp(join(tmpdir(), "pi-agents-probe-"));
   try {
     const temporarySessionFile = join(directory, "non-canonical-session.jsonl");
@@ -180,7 +193,6 @@ export async function probePiCapabilities({ executable, spawnImpl = spawn, cache
     const unknownCommandValid = unknownResponse?.success === false && typeof unknownResponse.error === "string" && /unknown command/iu.test(unknownResponse.error);
     const temporarySessionValid = commands.includes("get_state");
     const rpcMode = temporarySessionValid;
-    const reportedVersion = /^pi\s+(.+)$/imu.exec(help)?.[1]?.trim() ?? null;
     const requiredLiveEvents = requiredEventProbe();
     const missingRequired = [
       ...(!rpcMode ? ["rpcMode"] : []),

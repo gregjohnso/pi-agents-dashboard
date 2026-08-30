@@ -1090,12 +1090,10 @@ export class DashboardController {
             const lines = Array.from({ length: this.height }, () => "");
             if (lines.length > 0)
                 lines[0] = paintPlainLine(" pi-agents", this.width, jobwatchTheme.title);
-            if (lines.length > 1)
-                lines[1] = paintPlainLine(this.contextLine(), this.width, jobwatchTheme.keyHints);
             // One launch setting per row, above the list, so each is readable without truncation.
-            if (layout.listTop >= 5) {
+            if (layout.listTop >= 4) {
                 for (const [offset, [label, value]] of this.launchSettingRows().entries())
-                    lines[2 + offset] = paintPlainLine(`   ${label}: ${value}`, this.width, jobwatchTheme.surface);
+                    lines[1 + offset] = paintPlainLine(`   ${label}: ${value}`, this.width, jobwatchTheme.surface);
             }
             // The section border and column header always sit immediately above the first row.
             if (lines.length > layout.listTop - 2 && layout.listTop >= 2)
@@ -1114,7 +1112,7 @@ export class DashboardController {
                 // Flat rules above and below the prompt: a rounded top with a flat bottom read as a broken box.
                 lines[dockTop] = sectionFooter(this.width, confirmingSharedLaunch);
                 lines[dockTop + 1] = draftPrompt === "" ? promptPlaceholderLine(this.width) : paintPlainLine(` ❯ ${draftPrompt}`, this.width, (text) => jobwatchTheme.text(text, false));
-                const form = layout.listTop >= 5 ? this.draftModelSummary() : ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} name:${this.composerDraft.name}`;
+                const form = layout.listTop >= 4 ? this.draftModelSummary() : ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} name:${this.composerDraft.name}`;
                 // The rule closes the prompt box; launch settings and the selected path are context below it.
                 const formRow = layout.dockRows >= 4 ? dockTop + 3 : dockTop + 2;
                 if (layout.dockRows >= 4) lines[dockTop + 2] = sectionFooter(this.width, confirmingSharedLaunch);
@@ -1122,6 +1120,9 @@ export class DashboardController {
                 lines[formRow] = this.stopClearArmed
                     ? paintPlainLine(" ctrl+x to confirm", this.width, jobwatchTheme.error)
                     : paintPlainLine(this.status.kind === "error" ? ` ${this.status.code}: ${this.status.message}  ${form}` : form, this.width, this.status.kind === "error" ? jobwatchTheme.error : jobwatchTheme.surface);
+                // Which session the list is pointing at, read last: it describes the selection, not the launch.
+                if (formRow + 1 < lines.length)
+                    lines[formRow + 1] = paintPlainLine(this.contextLine(), this.width, jobwatchTheme.keyHints);
 
             }
             this.renderOverlay(lines);

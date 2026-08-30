@@ -163,25 +163,24 @@ describe("dashboard controller", () => {
         ]));
         await dashboard.open();
         const unfiltered = dashboard.render(100, 16).map(stripVTControlCharacters);
-        // Inverted 2026-08-30: the line showed the session cwd, which for an isolated session is a bare
-        // worktree UUID that names nothing the operator recognises.
-        expect(unfiltered[1]).toContain("a");
-        expect(unfiltered[1]).not.toContain("/repo/alpha");
-        expect(unfiltered[1]).not.toContain("search:");
-        expect(unfiltered[1]).not.toContain("v:live");
-        expect(unfiltered.at(-2).trim()).toMatch(/^─+$/u);
+        // Inverted 2026-08-30: the line named the session cwd, a bare worktree UUID, and sat above the
+        // list; it now names the session and reads last, under the prompt.
+        expect(unfiltered.at(-1)).toContain("a");
+        expect(unfiltered.at(-1)).not.toContain("/repo/alpha");
+        expect(unfiltered.at(-1)).not.toContain("search:");
+        expect(unfiltered.at(-1)).not.toContain("v:live");
 
         // The selected session's name sits at the top, above the list, and follows the selection.
         dashboard.selectSession("a");
-        expect(stripVTControlCharacters(dashboard.render(100, 16)[1]).trim()).toMatch(/^a\b/u);
+        expect(stripVTControlCharacters(dashboard.render(100, 16).at(-1)).trim()).toMatch(/^a\b/u);
         dashboard.selectSession("b");
-        expect(stripVTControlCharacters(dashboard.render(100, 16)[1]).trim()).toMatch(/^b\b/u);
+        expect(stripVTControlCharacters(dashboard.render(100, 16).at(-1)).trim()).toMatch(/^b\b/u);
 
         dashboard.setSearch("beta");
         const filtered = dashboard.render(100, 16);
         // Name and active filters share the one context line.
-        expect(stripVTControlCharacters(filtered[1])).toContain("b");
-        expect(stripVTControlCharacters(filtered[1])).toContain("search:beta");
+        expect(stripVTControlCharacters(filtered.at(-1))).toContain("b");
+        expect(stripVTControlCharacters(filtered.at(-1))).toContain("search:beta");
     });
     // Ctrl+X on a live session is a Stop; only a second press inside the window clears it, and
     // both presses confirm. app/list/stop-clear-gesture.test.mjs owns the window's exact edges.
@@ -422,7 +421,9 @@ describe("dashboard controller", () => {
         dashboard.applySnapshot({ sessions: [session("real", { name: "Ship It", processState: "LIVE", taskState: "READY", createdAt: new Date().toISOString() })] });
         const rendered = dashboard.render(100, 24).map(stripVTControlCharacters);
         // The context line names the selected session too, so count list rows rather than every line.
-        const rows = rendered.slice(rendered.findIndex((line) => line.includes("NAME")) + 1);
+        const header = rendered.findIndex((line) => line.includes("NAME"));
+        const dockTop = rendered.findIndex((line, index) => index > header && line.trim().startsWith("─"));
+        const rows = rendered.slice(header + 1, dockTop);
         expect(rows.filter((line) => line.includes("Ship It"))).toHaveLength(1);
         expect(rows.some((line) => line.includes("STARTING"))).toBe(false);
         release();

@@ -11,7 +11,6 @@ import { assertPiExecutableIdentity, resolvePiExecutable } from "./pi-executable
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "./process-signaler.mjs";
 import { registryCoordinationScope } from "./registry-store.mjs";
-import { sessionCommandPayload } from "./session-command-projection.mjs";
 import { reduceSessionState } from "./state-reducer.mjs";
 
 const DEFAULT_WORKER_PATH = fileURLToPath(new URL("./worker.mjs", import.meta.url));
@@ -256,7 +255,6 @@ export class WorkerSupervisor {
     if (!supervision.exit.terminal && !verifiedTerminal) return;
     supervision.lifecycle = "terminal";
     const handle = supervision.handle;
-    handle?.terminal();
     supervision.exit.detach();
     supervision.reservation?.close();
     supervision.handle = undefined;
@@ -551,7 +549,6 @@ export class WorkerSupervisor {
       piChildIdentity: supervision.piChildIdentity,
       pid: identity.pid,
       processGroupId: identity.processGroupId,
-      terminal() {},
       /** Drop the daemon's end of this worker's route; the worker reconnects on its own. */
       detach() {
         supervision.route?.connection.close?.();

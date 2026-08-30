@@ -7,6 +7,7 @@ import { afterEach, expect, it } from "vitest";
 
 import { OwnershipManager } from "./ownership.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
+import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "./process-signaler.mjs";
 import { RecoveredWorkerRouter } from "./reconciliation.mjs";
 import { RegistryStore } from "./registry-store.mjs";
 import { createWorkerControlSocket } from "./test-fixtures.mjs";
@@ -321,7 +322,6 @@ it("reconnects after daemon restart from a socket-only launch and retains the ru
     router,
     ownership: new OwnershipManager(registry),
     runsDirectory: runs,
-    env: { ...process.env, PI_AGENTS_TEST_EXIT_MS: "4000" },
     startTimeoutMs: 5_000,
   });
   const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-reconnect", piPath: fakeEntry, ...launchSeams, reconnectDelaysMs: [5, 10] });
@@ -348,7 +348,15 @@ it("reconnects after daemon restart from a socket-only launch and retains the ru
     .map((entry) => readFile(join(entry.parentPath ?? runDirectory, entry.name), "utf8").catch(() => "")));
   expect(captured.filter((text) => text.includes(reserved.token))).toEqual([]);
   expect(captured.length).toBeGreaterThan(0);
-  await waitForExit(launched.pid, 6_000);
+
+  // Ending the run over the reconnected route, rather than waiting out a self-exit timer, keeps this
+  // test to its own subject and pins that the readopted route can still carry a graceful shutdown.
+  await expect(stopVerifiedProcessGroup(launched.identity, {
+    inspect: inspectProcessIdentity,
+    requestGraceful: async () => { await reconnected.connection.send({ version: 1, type: "shutdown", token: reconnected.metadata.token }); },
+    signalProcessGroup,
+    sleep,
+  }, { gracefulMs: 5_000, terminateMs: 5_000 })).resolves.toMatchObject({ disposition: "GRACEFUL" });
   await waitForOwnershipRelease(registry, "one", 5_000);
 });
 
@@ -387,4 +395,51 @@ it("issues a new token only for a new run and removes the old entry at terminal 
   await rename(root, renamed);
   await expect(stat(join(renamed, "runs", String(runHash), "worker.stderr.log"))).resolves.toMatchObject({ size: expect.any(Number) });
   await rename(renamed, root);
+});
+
+// Operator-visible failure: a daemon restart is the moment a socket-only launch has nothing left in
+// memory to identify its worker with. If the replacement daemon cannot authenticate the live run
+// from durable state, the session goes unreachable while its worker and Pi child keep running.
+it("adopts a live socket-only worker into a replacement daemon from its persisted run token", async () => {
+  const { root, runs, registry, fakeEntry, router, control, launchSeams } = await setup(["one"]);
+  const supervisor = new WorkerSupervisor({
+    registry,
+    router,
+    ownership: new OwnershipManager(registry),
+    runsDirectory: runs,
+    startTimeoutMs: 5_000,
+  });
+  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-restart", piPath: fakeEntry, ...launchSeams, reconnectDelaysMs: [5, 10] });
+  const [reserved] = await workerEntries(root);
+  expect(reserved).toMatchObject({ sessionId: "one", runId: "run-restart", identity: launched.identity, piChildIdentity: launched.piChildIdentity });
+
+  // A daemon restart takes the router and the control socket with it; the worker keeps running.
+  await control.close();
+  controlSockets.splice(controlSockets.indexOf(control), 1);
+  await router.close();
+
+  const replacement = new RecoveredWorkerRouter({ registry, inspect: inspectProcessIdentity, metadataPath: join(root, "daemon", "workers.json") });
+  await replacement.load();
+  // The replacement daemon knows this run only from what the launch persisted before it spawned.
+  expect(replacement.metadata("one")).toMatchObject({ runId: "run-restart", token: reserved.token, identity: launched.identity, piChildIdentity: launched.piChildIdentity });
+  expect(replacement.route("one")).toBeUndefined();
+  controlSockets.push(await createWorkerControlSocket({ root, router: replacement, registry }));
+
+  await waitUntil(() => replacement.route("one") !== undefined);
+  const adopted = replacement.route("one");
+  expect(adopted.metadata.token).toBe(reserved.token);
+  expect(adopted.routeGeneration).toBeGreaterThan(0);
+  await expect(adopted.connection.request({ version: 1, type: "command", token: adopted.metadata.token, id: "after-restart", command: { clientId: "restart-client", requestId: "restart-request", op: "prompt", text: "still alive" } }, {}))
+    .resolves.toMatchObject({ stage: "RPC_ACKNOWLEDGED" });
+  // The restart never touched the worker: it is the same process group the launch spawned.
+  expect(await inspectProcessIdentity(launched.pid)).toEqual(launched.identity);
+
+  // Graceful Stop over the readopted route, which is the reason the restart has to reach the worker.
+  await expect(supervisor.stop(launched, {
+    inspect: inspectProcessIdentity,
+    requestGraceful: async () => { await adopted.connection.send({ version: 1, type: "shutdown", token: adopted.metadata.token }); },
+    signalProcessGroup,
+    sleep,
+  }, { gracefulMs: 5_000, terminateMs: 5_000 })).resolves.toMatchObject({ disposition: "GRACEFUL" });
+  await waitForOwnershipRelease(registry, "one", 5_000);
 });

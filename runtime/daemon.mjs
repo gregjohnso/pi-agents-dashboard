@@ -655,8 +655,6 @@ export async function createDaemonRuntime({
     const summarizing = new Set();
     const launchingSessions = new Set();
     const sessionStarts = new Map();
-    /** Launch-channel handles for workers that have not yet reconnected over the control socket. @type {Map<string, any>} */
-    const sessionHandles = new Map();
     /** @type {Map<string, Map<net.Socket, { clientId: string, role: "composer" | "observer" }>>} */
     const attachmentClaims = new Map();
     /** @type {Map<string, { serialized: string, promise: Promise<any> }>} */
@@ -709,20 +707,11 @@ export async function createDaemonRuntime({
           { clientId, requestId, op, durableRequest, metadata, routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation },
         );
       },
-      /** Ask this session's worker one non-durable question over whichever channel owns it. @param {any} request */
+      /** Ask this session's worker one non-durable question over its adopted route. @param {any} request */
       async askWorker(request) {
-        const sessionId = request.payload.sessionId;
-        const route = router.route(sessionId);
-        const handle = sessionHandles.get(sessionId);
-        if (route?.connection !== undefined && route.metadata?.token !== undefined) return context.sendWorkerCommand(route, context.nextCommandId(), request);
-        if (typeof handle?.request === "function") return handle.request(request.op);
-        if (handle !== undefined) sessionHandles.delete(sessionId);
-        throw Object.assign(new Error("No exact recovered worker owns this session"), { code: "WORKER_UNAVAILABLE" });
-      },
-      /** The launch registered and adopted its own route; this only opens the viewer stream. @param {any} handle */
-      async activateWorker(handle) {
-        sessionHandles.set(handle.sessionId, handle);
-        await context.recovery.viewer.ensure(handle.sessionId);
+        const route = router.route(request.payload.sessionId);
+        if (route?.connection === undefined || route.metadata?.token === undefined) throw Object.assign(new Error("No exact recovered worker owns this session"), { code: "WORKER_UNAVAILABLE" });
+        return context.sendWorkerCommand(route, context.nextCommandId(), request);
       },
       /** Deliver one durable command over this session's adopted route. @param {any} request */
       async deliverOverRoute(request) {
@@ -843,7 +832,7 @@ export async function createDaemonRuntime({
       },
       /** @param {string} sessionId */
       async ensureSessionWorker(sessionId) {
-        if (router.route(sessionId) !== undefined || sessionHandles.has(sessionId)) return;
+        if (router.route(sessionId) !== undefined) return;
         const pending = sessionStarts.get(sessionId);
         if (pending !== undefined) return pending;
         const start = (async () => {
@@ -879,7 +868,8 @@ export async function createDaemonRuntime({
               daemonConnector: CONNECTOR_PATH,
               daemonConnectConfig: { socketPath: join(daemonDirectory, "control.sock"), tokenPath, maxBytes },
             });
-            await context.activateWorker(handle);
+            // The launch registered and adopted its own route; this only opens the viewer stream.
+            await context.recovery.viewer.ensure(handle.sessionId);
           } finally {
             launchingSessions.delete(sessionId);
           }
@@ -1150,7 +1140,8 @@ export async function createDaemonRuntime({
               let handle;
               try {
                 handle = await workerSupervisor.launch({ ...launch, daemonConnector: CONNECTOR_PATH, daemonConnectConfig: { socketPath: join(daemonDirectory, "control.sock"), tokenPath, maxBytes } });
-                await context.activateWorker(handle);
+                // The launch registered and adopted its own route; this only opens the viewer stream.
+                await context.recovery.viewer.ensure(handle.sessionId);
               } finally {
                 launchingSessions.delete(launch.sessionId);
               }
@@ -1223,11 +1214,7 @@ export async function createDaemonRuntime({
           const route = router.route(request.payload.sessionId);
           const connection = route?.connection;
           const metadata = route?.metadata;
-          if (connection !== undefined) sessionHandles.delete(request.payload.sessionId);
-          const launchHandle = sessionHandles.get(request.payload.sessionId);
-          if (WORKER_DELIVERED_COMMANDS.includes(request.op) && connection === undefined && typeof launchHandle?.deliver === "function") {
-            status = await launchHandle.deliver(request, context.recovery.journal);
-          } else if (WORKER_DELIVERED_COMMANDS.includes(request.op)) {
+          if (WORKER_DELIVERED_COMMANDS.includes(request.op)) {
             if (connection === undefined || metadata?.token === undefined) {
               status = await context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("WORKER_UNAVAILABLE", "No exact recovered worker owns this session"));
             } else {
@@ -1412,7 +1399,6 @@ export async function createDaemonRuntime({
             });
           }
         }
-        if (["stop", "delete"].includes(request.op) && status.stage === "COMPLETED") sessionHandles.delete(request.payload.sessionId);
         if (request.op === "session_command" && request.payload.command === "set_session_name" && status.stage === "COMPLETED") {
           await runSessionLifecycle(registry, request.payload.sessionId, async () => {
             const current = await registry.get(request.payload.sessionId);

@@ -36,7 +36,7 @@ function attachmentEvents(text) {
 }
 
 /** @param {any} options @returns {any} */
-function connect({ socketPath, token, maxBytes = 1024 }) {
+function connect({ socketPath, token, role, maxBytes = 1024 }) {
   const decoder = createJsonlDecoder({ maxBytes });
   const encoder = createJsonlEncoder({ maxBytes });
   /** @type {any[]} */
@@ -57,7 +57,7 @@ function connect({ socketPath, token, maxBytes = 1024 }) {
   const next = () => received.length > 0 ? Promise.resolve(received.shift()) : new Promise((resolve) => waiters.push(resolve));
   const ready = new Promise((resolve, reject) => {
     socket.once("connect", () => {
-      socket.write(encoder.encode({ version: 1, token }));
+      socket.write(encoder.encode({ version: 1, token, ...(role === undefined ? {} : { role }) }));
       resolve(undefined);
     });
     socket.once("error", reject);
@@ -534,7 +534,7 @@ it("reaches a freshly launched worker over its adopted startup route before any 
         await registry.update("fresh", current.revision, { ownership: { kind: "managed", runId: "run-fresh", process: identity, acquiredAt: createdAt, heartbeatAt: createdAt }, latestRunId: "run-fresh", processState: "LIVE", updatedAt: createdAt });
         await router.register({ sessionId: "fresh", runId: "run-fresh", leaseId: "lease-fresh", generation: 1, identity, piChildIdentity: piChild });
         await router.adopt({ version: 1, type: "worker_ready", token: "fresh-run-token", sessionId: "fresh", runId: "run-fresh", leaseId: "lease-fresh", generation: 1, worker: identity, piChild }, connection);
-        return { sessionId: "fresh", runId: "run-fresh", leaseId: "lease-fresh", generation: 1, identity, piChildIdentity: piChild, ready: true, terminal() {}, detach() { closeRoute(undefined); } };
+        return { sessionId: "fresh", runId: "run-fresh", leaseId: "lease-fresh", generation: 1, identity, piChildIdentity: piChild, ready: true, detach() { closeRoute(undefined); } };
       },
       async close() {},
     },
@@ -1387,5 +1387,169 @@ it("refuses an activating attach while the recorded Pi child of a gone superviso
   expect(await client.next()).toMatchObject({ ok: false, error: { code: "WORKER_STILL_LIVE", retryable: false } });
   expect(launch).not.toHaveBeenCalled();
   expect(JSON.parse(await readFile(join(stateRoot, "daemon", "workers.json"), "utf8")).workers).toHaveLength(1);
+  client.close();
+});
+
+// Operator-visible failure: after the worker of a session this daemon launched died, reopening that
+// session did nothing at all, because the launch left a record of itself that claimed the session
+// forever. The route is the only thing that may answer "is a worker already running here".
+it("relaunches a session whose launched worker died during this daemon's lifetime", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const createdAt = "2026-08-25T00:00:00.000Z";
+  const identity = { pid: 551, startIdentity: "relaunch-worker", processGroupId: 551 };
+  const piChild = { pid: 552, startIdentity: "relaunch-pi", processGroupId: 551 };
+  let workersLive = true;
+  const inspect = async (/** @type {number} */ pid) => {
+    if (pid === process.pid) return { pid, startIdentity: "daemon", processGroupId: process.pid };
+    if (!workersLive) throw Object.assign(new Error("gone"), { code: "ESRCH" });
+    return pid === identity.pid ? identity : piChild;
+  };
+  /** @type {(value?: unknown) => void} */
+  let closeRoute = () => {};
+  const connection = {
+    closed: new Promise((resolve) => { closeRoute = resolve; }),
+    close: () => closeRoute(undefined),
+    async send() {},
+    async request() { return { stage: "RPC_ACKNOWLEDGED" }; },
+  };
+  /** @type {any} */
+  let router;
+  const launch = vi.fn(async (/** @type {any} */ request) => {
+    if (launch.mock.calls.length > 1) return { sessionId: "relaunch", runId: request.runId, leaseId: "lease-relaunch-2", generation: 2, identity, piChildIdentity: piChild, ready: true };
+    await router.reserve({ sessionId: "relaunch", runId: "run-relaunch", leaseId: "lease-relaunch", generation: 1, token: "relaunch-run-token" });
+    const current = await registry.get("relaunch");
+    if (current === undefined) throw new Error("relaunch record missing");
+    await registry.update("relaunch", current.revision, { ownership: { kind: "managed", runId: "run-relaunch", process: identity, acquiredAt: createdAt, heartbeatAt: createdAt }, latestRunId: "run-relaunch", processState: "LIVE", updatedAt: createdAt });
+    await router.register({ sessionId: "relaunch", runId: "run-relaunch", leaseId: "lease-relaunch", generation: 1, identity, piChildIdentity: piChild });
+    await router.adopt({ version: 1, type: "worker_ready", token: "relaunch-run-token", sessionId: "relaunch", runId: "run-relaunch", leaseId: "lease-relaunch", generation: 1, worker: identity, piChild }, connection);
+    return { sessionId: "relaunch", runId: "run-relaunch", leaseId: "lease-relaunch", generation: 1, identity, piChildIdentity: piChild, ready: true, detach() { closeRoute(undefined); } };
+  });
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    inspect,
+    hostProbe: async () => ({ blockers: [] }),
+    resolveLaunchRequest: async () => ({
+      sessionId: "relaunch", canonicalSessionFile: "/sessions/relaunch.jsonl", cwd: "/repo", runId: "run-relaunch",
+      sessionRecord: { schemaVersion: 1, revision: 0, sessionId: "relaunch", sessionFile: "/sessions/relaunch.jsonl", canonicalSessionFile: "/sessions/relaunch.jsonl", cwd: "/repo", taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "launching", summary: "start", updatedAt: createdAt }, isolation: { mode: "shared_directory", canonicalCwd: "/repo" }, createdAt, updatedAt: createdAt },
+    }),
+    workerSupervisor: {
+      /** @param {any} suppliedRouter */
+      useRouter(suppliedRouter) { router = suppliedRouter; },
+      launch,
+      async close() {},
+    },
+  });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
+  await client.ready;
+  client.send({ version: 1, clientId: "viewer", requestId: "launch-relaunch", op: "launch", payload: { prompt: "start", cwd: "/repo", sourceSessionId: "source", isolation: { mode: "shared_directory", confirmedCwd: "/repo", ownerSessionIds: [] } } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "launched", sessionId: "relaunch" } });
+  expect(launch).toHaveBeenCalledTimes(1);
+
+  // The worker and its Pi child die: the route closes and nothing owns the session any more.
+  workersLive = false;
+  closeRoute(undefined);
+  const live = await registry.get("relaunch");
+  if (live === undefined) throw new Error("relaunch record missing");
+  await registry.update("relaunch", live.revision, { ownership: undefined, taskState: "STOPPED", processState: "EXITED", updatedAt: createdAt });
+  await vi.waitFor(() => expect(router.route("relaunch")).toBeUndefined());
+
+  client.send({ version: 1, clientId: "viewer", requestId: "reopen-relaunch", op: "attach", payload: { sessionId: "relaunch", role: "composer", activate: true } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "attached", sessionId: "relaunch" } });
+  expect(launch).toHaveBeenCalledTimes(2);
+  client.close();
+});
+
+// Operator-visible failure: a transcript that reorders or loses the frames a worker emitted between
+// its startup connection and its adopted route. Those frames have nowhere to go until the route
+// exists, so they are held and replayed, and the replay must not overtake later frames.
+it("orders viewer frames across startup route adoption", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const createdAt = "2026-08-25T00:00:00.000Z";
+  const identity = { pid: 561, startIdentity: "ordered-worker", processGroupId: 561 };
+  const piChild = { pid: 562, startIdentity: "ordered-pi", processGroupId: 561 };
+  const inspect = async (/** @type {number} */ pid) => pid === identity.pid ? identity : pid === piChild.pid ? piChild : { pid, startIdentity: "daemon", processGroupId: pid };
+  /** @param {any} frame */
+  const piFrame = (frame) => ({ version: 1, type: "pi_frame", token: "ordered-run-token", sessionId: "ordered", frame });
+  /** @param {number} index */
+  const message = (index) => piFrame({ type: "message_end", message: { role: "user", content: `frame ${index}`, timestamp: Date.parse(createdAt) + index } });
+  // A turn marker is not fingerprint-deduplicated the way a repeated message is, so a frame ingested
+  // twice at the boundary shows up as an extra durable event rather than being silently absorbed.
+  const turnStart = piFrame({ type: "agent_start" });
+  /** @type {any} */
+  let router;
+  /** @type {any} */
+  let runtime;
+  /** @type {any} */
+  let worker;
+  runtime = await createDaemonRuntime({
+    root: stateRoot,
+    inspect,
+    hostProbe: async () => ({ blockers: [] }),
+    resolveLaunchRequest: async () => ({
+      sessionId: "ordered", canonicalSessionFile: "/sessions/ordered.jsonl", cwd: "/repo", runId: "run-ordered",
+      sessionRecord: { schemaVersion: 1, revision: 0, sessionId: "ordered", sessionFile: "/sessions/ordered.jsonl", canonicalSessionFile: "/sessions/ordered.jsonl", cwd: "/repo", taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "launching", summary: "start", updatedAt: createdAt }, isolation: { mode: "shared_directory", canonicalCwd: "/repo" }, createdAt, updatedAt: createdAt },
+    }),
+    workerSupervisor: {
+      /** @param {any} suppliedRouter */
+      useRouter(suppliedRouter) { router = suppliedRouter; },
+      async launch() {
+        const reservation = await router.reserve({ sessionId: "ordered", runId: "run-ordered", leaseId: "lease-ordered", generation: 1, token: "ordered-run-token" });
+        worker = connect({ socketPath: runtime.socketPath, token: runtime.token, role: "worker", maxBytes: 8192 });
+        await worker.ready;
+        worker.send({ version: 1, type: "hello", token: "ordered-run-token", sessionId: "ordered", runId: "run-ordered", leaseId: "lease-ordered", generation: 1, worker: identity });
+        // These three reach the daemon while the hello is still waiting for the spawned PID.
+        worker.send(message(0));
+        worker.send(message(1));
+        worker.send(turnStart);
+        reservation.spawned(identity.pid);
+        await reservation.connected(4_000);
+        const current = await registry.get("ordered");
+        if (current === undefined) throw new Error("ordered record missing");
+        await registry.update("ordered", current.revision, { ownership: { kind: "managed", runId: "run-ordered", process: identity, acquiredAt: createdAt, heartbeatAt: createdAt }, latestRunId: "run-ordered", processState: "LIVE", updatedAt: createdAt });
+        worker.send({ version: 1, type: "worker_ready", token: "ordered-run-token", sessionId: "ordered", runId: "run-ordered", leaseId: "lease-ordered", generation: 1, worker: identity, piChild });
+        const ready = await reservation.waitFor("worker_ready", 4_000);
+        // This one arrives while the route is being adopted.
+        worker.send(message(2));
+        await router.register({ sessionId: "ordered", runId: "run-ordered", leaseId: "lease-ordered", generation: 1, identity, piChildIdentity: piChild });
+        const route = await router.adopt(ready, reservation.connection);
+        reservation.adopt(route);
+        return { sessionId: "ordered", runId: "run-ordered", leaseId: "lease-ordered", generation: 1, identity, piChildIdentity: piChild, ready: true, detach() { route.connection.close?.(); } };
+      },
+      async close() {},
+    },
+  });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 65536 });
+  await client.ready;
+  client.send({ version: 1, clientId: "viewer", requestId: "launch-ordered", op: "launch", payload: { prompt: "start", cwd: "/repo", sourceSessionId: "source", isolation: { mode: "shared_directory", confirmedCwd: "/repo", ownerSessionIds: [] } } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "launched", sessionId: "ordered" } });
+
+  // And these two arrive over the adopted route.
+  worker.send(message(3));
+  worker.send(message(4));
+
+  await vi.waitFor(async () => {
+    client.send({ version: 1, clientId: "viewer", requestId: `ordered-${randomUUID()}`, op: "get_viewer_snapshot", payload: { sessionId: "ordered" } });
+    const response = await client.next();
+    expect(response.result.snapshot.items).toHaveLength(5);
+  }, { timeout: 4_000 });
+  client.send({ version: 1, clientId: "viewer", requestId: "ordered-final", op: "get_viewer_snapshot", payload: { sessionId: "ordered" } });
+  const snapshot = /** @type {any} */ (await client.next());
+  expect(snapshot.result.snapshot.items.map((/** @type {any} */ item) => item.content[0].text))
+    .toEqual([0, 1, 2, 3, 4].map((index) => `frame ${index}`));
+
+  // Each frame crossed the boundary exactly once, in source order, with a distinct stable ID.
+  const durable = (await readFile(join(stateRoot, "index", "viewer", `${createHash("sha256").update("ordered").digest("hex")}.events.jsonl`), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  expect(durable.map((/** @type {any} */ event) => event.payload.kind === "user_message" ? event.payload.content[0].text : event.payload.kind))
+    .toEqual(["frame 0", "frame 1", "turn_state", "activity", "frame 2", "frame 3", "frame 4"]);
+  expect(new Set(durable.map((/** @type {any} */ event) => event.eventId)).size).toBe(durable.length);
+  worker.close();
   client.close();
 });

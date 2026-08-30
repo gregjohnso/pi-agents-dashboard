@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { writeSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -81,14 +81,19 @@ it("stops only through the verified daemon process-group boundary", async () => 
   const endpoints = [{ status: "HEALTHY", daemonState: "READY", publication }, { status: "ABSENT" }];
   /** @type {any[]} */
   const calls = [];
+  let exited = false;
   const result = await runDaemonCommand("stop", {
     root: "/state",
-    inspect: async () => publication,
+    inspect: async () => {
+      if (exited) throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+      return publication;
+    },
     inspectEndpoint: async () => endpoints.shift() ?? { status: "ABSENT" },
     request: async () => ({ kind: "state", sessions: [] }),
     stopProcessGroup: async (ownership, deps, policy) => {
       calls.push({ ownership, policy });
       await deps.requestGraceful(ownership);
+      exited = true;
       return { disposition: "GRACEFUL" };
     },
     requestGraceful: async (ownership) => { calls.push({ graceful: ownership }); },
@@ -161,6 +166,68 @@ it("keeps the daemon running when the stop socket disconnects after submission",
   })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN" } });
   expect(operations.slice(0, 3)).toEqual(["get_state", "attach", "stop"]);
   expect(stopProcessGroup).not.toHaveBeenCalled();
+});
+
+it("leaves exactly one daemon when restart cannot prove the old one is gone", async () => {
+  // The daemon removes pid.json as the last step of its own shutdown, so an absent publication
+  // proves only that the endpoint was released. Tonight that read as success three times and left
+  // three daemons live on one state root.
+  const root = await stateRoot();
+  const old = { pid: 4242, startIdentity: "111222333", processGroupId: 4242 };
+  /** @type {Map<number, any>} */
+  const live = new Map([[old.pid, old]]);
+  /** @type {any} */
+  let publication = { ...old, tokenPath: join(root, "daemon", "control.token") };
+  /** @type {string[][]} */
+  const spawned = [];
+
+  const result = await runDaemonCommand("restart", {
+    root,
+    timeoutMs: 200,
+    stopPolicy: { gracefulMs: 1, terminateMs: 1 },
+    request: async () => ({ kind: "state", sessions: [] }),
+    inspect: async (/** @type {number} */ pid) => {
+      const identity = live.get(pid);
+      if (identity === undefined) throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+      return identity;
+    },
+    inspectEndpoint: async () => publication === undefined ? { status: "ABSENT", canCleanup: false } : { status: "HEALTHY", daemonState: "READY", publication },
+    requestGraceful: async () => { publication = undefined; },
+    signalProcessGroup: () => {},
+    spawnDaemon: (/** @type {string} */ _file, /** @type {string[]} */ argv) => {
+      const pid = 5000 + spawned.length;
+      spawned.push(argv);
+      live.set(pid, { pid, startIdentity: "999888777", processGroupId: pid });
+      publication = { pid, startIdentity: "999888777", processGroupId: pid, tokenPath: join(root, "daemon", "control.token") };
+      return { once() {} };
+    },
+  });
+
+  expect(spawned).toEqual([]);
+  expect([...live.keys()]).toEqual([old.pid]);
+  expect(result).toMatchObject({ code: 5, error: { code: "DAEMON_STILL_RUNNING" } });
+}, 20_000);
+
+it("starts where the operator's sessions already are when no root is given", async () => {
+  // A start that resolves its own root opened an empty one beside six live sessions, and the list
+  // came up blank.
+  const parent = await stateRoot();
+  const previousRoot = join(parent, "pi-dashboard");
+  await mkdir(join(previousRoot, "sessions"), { recursive: true, mode: 0o700 });
+  await writeFile(join(previousRoot, "sessions", "alpha.json"), "{}", { mode: 0o600 });
+  /** @type {string[][]} */
+  const spawned = [];
+  const endpoints = [{ status: "ABSENT" }, { status: "HEALTHY", daemonState: "READY", publication: { pid: 321 } }];
+
+  const result = await runDaemonCommand("start", {
+    env: { HOME: parent, XDG_STATE_HOME: parent },
+    inspectEndpoint: async () => endpoints.shift() ?? { status: "HEALTHY", daemonState: "READY", publication: { pid: 321 } },
+    spawnDaemon: (/** @type {string} */ _file, /** @type {string[]} */ argv) => { spawned.push(argv); return { once() {} }; },
+  });
+
+  expect(result).toMatchObject({ code: 0, result: { kind: "daemon_started" } });
+  expect(spawned).toEqual([["--root", result.result.root]]);
+  expect(await readdir(join(result.result.root, "sessions"))).toEqual(["alpha.json"]);
 });
 
 it("maps absent, unhealthy, and identity-conflict status to stable exit codes", async () => {

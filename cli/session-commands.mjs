@@ -22,7 +22,12 @@ const PRIVATE_DIRECTORY_MODE = 0o700;
 const ATOMIC_PUBLICATION_UNSUPPORTED_CODES = new Set(["EPERM", "EOPNOTSUPP", "ENOTSUP", "ENOSYS", "EXDEV"]);
 const PRIVATE_FILE_MODE = 0o600;
 const AUTHENTICATION_STATES = new Set(["STARTING", "RECONCILING", "READY", "FAILED"]);
-const DESTRUCTIVE_COMMANDS = new Set(["stop", "delete", "cleanup"]);
+/**
+ * Operator verbs mapped to the daemon operation and durable pending action each keeps.
+ * `rm` is Claude Code's verb for the operator; the wire operation and the pending record stay
+ * `delete` because a running daemon and an earlier release already wrote that spelling.
+ */
+const SESSION_OPERATIONS = new Map([["stop", "stop"], ["rm", "delete"], ["cleanup", "cleanup"]]);
 /** Daemon operations the CLI sends that mutate nothing, so a lost answer leaves no delivery to resolve. */
 const READ_ONLY_OPERATIONS = new Set(["get_state"]);
 const DESTRUCTIVE_TIMEOUT_MARGIN_MS = 1_000;
@@ -50,8 +55,8 @@ export async function destructiveRequestTimeoutMs(root, override, requested) {
   return Math.max(escalation, requested ?? 0);
 }
 
-/** @param {unknown} value */
-function exactId(value) {
+/** Accept only a full identifier the caller typed exactly, never a prefix or a path. @param {unknown} value */
+export function exactId(value) {
   return typeof value === "string" && value.length > 0 && value.trim() === value &&
     !value.includes("/") && !value.includes("\0") && value !== "." && value !== "..";
 }
@@ -336,10 +341,10 @@ function parse(argv) {
   }
 
   const [sessionId, ...flags] = args;
-  if (!["status", ...DESTRUCTIVE_COMMANDS].includes(command) || !exactId(sessionId)) {
-    return { error: "Usage: session status <full-id> | session stop|delete|cleanup <full-id> --revision <n> --yes | session resolve-delivery <full-client-id> <full-request-id> retry_at_risk|abandon --yes" };
+  const operation = SESSION_OPERATIONS.get(command);
+  if (operation === undefined || !exactId(sessionId)) {
+    return { error: "Usage: pi-agents stop|rm <full-id> --revision <n> --yes | pi-agents session cleanup <full-id> --revision <n> --yes | pi-agents session resolve-delivery <full-client-id> <full-request-id> retry_at_risk|abandon --yes" };
   }
-  if (command === "status") return flags.length === 0 ? { command, sessionId } : { error: "Status accepts no flags" };
 
   let revision;
   let confirmed = false;
@@ -359,7 +364,7 @@ function parse(argv) {
     return { error: "Destructive session commands require --revision <non-negative integer> --yes" };
   }
   if (!confirmed || !Number.isSafeInteger(revision)) return { error: "Destructive session commands require --revision <non-negative integer> --yes" };
-  return { command, sessionId, revision };
+  return { command, operation, sessionId, revision };
 }
 
 /** @param {string} action @param {string} sessionId @param {number} revision */
@@ -584,6 +589,14 @@ function classifyCommandResult(result) {
   return { code: 0, result };
 }
 
+/** Read every machine-local session row without opening the list. */
+export async function runAgentsCommand(options = {}) {
+  const root = options.root ?? resolveRuntimeRoot(options.env);
+  const request = options.request ?? createDaemonRequester({ root, clientId: await loadCliClientIdentity({ root, randomId: options.randomId }), timeoutMs: options.timeoutMs });
+  const state = await request("get_state", {});
+  return { code: 0, result: { kind: "agents", sessions: state.sessions } };
+}
+
 /** Run an exact-ID session command. */
 export async function runSessionCommand(argv, options = {}) {
   const parsed = parse(argv);
@@ -599,21 +612,11 @@ export async function runSessionCommand(argv, options = {}) {
     return { code: 0, result };
   }
 
-  if (parsed.command === "status") {
-    const clientId = options.request === undefined ? await loadCliClientIdentity({ root, randomId: options.randomId }) : undefined;
-    const request = options.request ?? createDaemonRequester({ root, clientId, timeoutMs: options.timeoutMs });
-    const state = await request("get_state", {});
-    const session = state?.sessions?.find((candidate) => candidate.sessionId === parsed.sessionId);
-    return session === undefined
-      ? { code: 1, error: { code: "SESSION_NOT_FOUND", message: `Unknown exact session ID: ${parsed.sessionId}` } }
-      : { code: 0, result: { kind: "session_status", session } };
-  }
-
-  if (parsed.command === "stop" || parsed.command === "delete") {
+  if (parsed.command === "stop" || parsed.command === "rm") {
     const clientId = await loadCliClientIdentity({ root, randomId: options.randomId });
-    const existing = await readPending(root, parsed.command, parsed.sessionId, parsed.revision);
+    const existing = await readPending(root, parsed.operation, parsed.sessionId, parsed.revision);
     const pending = existing.entry === undefined
-      ? await putPending(root, { action: parsed.command, sessionId: parsed.sessionId, revision: parsed.revision, clientId, requestId: randomUUID() }, options.pendingFailpoint)
+      ? await putPending(root, { action: parsed.operation, sessionId: parsed.sessionId, revision: parsed.revision, clientId, requestId: randomUUID() }, options.pendingFailpoint)
       : existing;
     if (pending.entry.clientId !== clientId) throw Object.assign(new Error("Persistent CLI identity changed while a destructive request remains pending"), { code: "CLI_CLIENT_IDENTITY_CHANGED", pendingClientId: pending.entry.clientId, currentClientId: clientId, requestId: pending.entry.requestId });
     const destructiveTimeoutMs = await destructiveRequestTimeoutMs(root, options.stopPolicy, options.timeoutMs);
@@ -630,7 +633,7 @@ export async function runSessionCommand(argv, options = {}) {
         if (attachment?.kind !== "attached" || attachment.role !== "composer") throw Object.assign(new Error("Daemon refused the composer role"), { code: "ATTACHMENT_REQUIRED" });
         attached = true;
       }
-      const result = await request(parsed.command, { sessionId: parsed.sessionId, revision: parsed.revision }, pending.entry.requestId);
+      const result = await request(parsed.operation, { sessionId: parsed.sessionId, revision: parsed.revision }, pending.entry.requestId);
       canDetach = true;
       if (result?.kind === "command" && ["COMPLETED", "FAILED"].includes(result.status?.stage)) await clearPending(root, pending.path, pending, options.pendingFailpoint);
       return classifyCommandResult(result);

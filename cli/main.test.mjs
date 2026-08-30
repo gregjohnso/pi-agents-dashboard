@@ -23,11 +23,40 @@ it("accepts only exact --pi-bin standalone syntax", async () => {
   expect(await runCli(["--pi-bin", "relative"], { cwd: "/repo", openApp, io: capture().io })).toBe(2);
 });
 
+it("opens the list from the agents verb", async () => {
+  const openApp = vi.fn(async () => {});
+  const code = await runCli(["agents"], { cwd: "/repo", openApp, io: capture().io });
+  expect(code).toBe(0);
+  expect(openApp).toHaveBeenCalledWith(expect.objectContaining({ cwd: "/repo" }));
+});
+
+it("prints agents rows for --json without opening the app", async () => {
+  const output = capture();
+  const openApp = vi.fn(async () => {});
+  const runAgentsCommand = vi.fn(async () => ({ code: 0, result: { kind: "agents", sessions: [{ sessionId: "exact-session-id", revision: 4 }] } }));
+  expect(await runCli(["agents", "--json"], { openApp, runAgentsCommand, io: output.io })).toBe(0);
+  expect(openApp).not.toHaveBeenCalled();
+  expect(JSON.parse(output.stdout[0])).toMatchObject({ ok: true, kind: "agents", sessions: [{ sessionId: "exact-session-id" }] });
+});
+
+it("routes attach to one exact session and rejects other attach grammar", async () => {
+  const attachSession = vi.fn(async () => ({ code: 0, result: { kind: "detached", sessionId: "exact-session-id" } }));
+  expect(await runCli(["attach", "exact-session-id"], { attachSession, io: capture().io })).toBe(0);
+  expect(attachSession).toHaveBeenCalledWith("exact-session-id", undefined);
+  expect(await runCli(["attach"], { attachSession, io: capture().io })).toBe(2);
+  expect(await runCli(["attach", "a", "b"], { attachSession, io: capture().io })).toBe(2);
+  expect(attachSession).toHaveBeenCalledTimes(1);
+});
+
 it("prints standalone help without opening the app", async () => {
   const output = capture();
   const openApp = vi.fn(async () => {});
   expect(await runCli(["--help"], { openApp, io: output.io })).toBe(0);
-  expect(output.stdout.join("")).toContain("With no arguments");
+  const help = output.stdout.join("");
+  expect(help).toContain("With no arguments");
+  for (const advertised of ["pi-agents agents", "pi-agents attach", "pi-agents stop|rm", "session cleanup", "session resolve-delivery"]) expect(help).toContain(advertised);
+  // Commit 11 adds logs and Commit 5.4 adds respawn; advertising them before they answer would report a bug.
+  for (const absent of ["logs", "respawn", "session status", "session stop", "session delete"]) expect(help).not.toContain(absent);
   expect(openApp).not.toHaveBeenCalled();
 });
 
@@ -40,13 +69,35 @@ it("prints exactly one JSON object and uses syntax exit code 2", async () => {
   expect(output.stderr).toEqual([]);
 });
 
-it("routes exact confirmed session commands without prefix resolution", async () => {
+it.each([
+  ["stop", ["stop", "full-session-id", "--revision", "3", "--yes"]],
+  ["rm", ["rm", "full-session-id", "--revision", "3", "--yes"]],
+])("routes the top-level %s verb without prefix resolution", async (_name, argv) => {
   const output = capture();
-  const runSessionCommand = async (argv) => {
-    expect(argv).toEqual(["delete", "full-session-id", "--revision", "3", "--yes"]);
+  const runSessionCommand = async (received) => {
+    expect(received).toEqual(argv);
     return { code: 0, result: { kind: "command", status: { stage: "COMPLETED" } } };
   };
-  const code = await runCli(["session", "delete", "full-session-id", "--revision", "3", "--yes", "--json"], { io: output.io, runSessionCommand });
+  const code = await runCli([...argv, "--json"], { io: output.io, runSessionCommand });
   expect(code).toBe(0);
   expect(JSON.parse(output.stdout[0])).toMatchObject({ ok: true, kind: "command" });
+});
+
+it.each([
+  ["status", ["session", "status", "full-session-id"]],
+  ["stop", ["session", "stop", "full-session-id", "--revision", "3", "--yes"]],
+  ["delete", ["session", "delete", "full-session-id", "--revision", "3", "--yes"]],
+])("rejects the retired session %s form as ordinary syntax", async (_name, argv) => {
+  const runSessionCommand = vi.fn(async () => ({ code: 0, result: { kind: "command", status: { stage: "COMPLETED" } } }));
+  expect(await runCli(argv, { io: capture().io, runSessionCommand })).toBe(2);
+  expect(runSessionCommand).not.toHaveBeenCalled();
+});
+
+it.each([
+  ["cleanup", ["cleanup", "full-session-id", "--revision", "3", "--yes"]],
+  ["resolve-delivery", ["resolve-delivery", "full-client-id", "full-request-id", "abandon", "--yes"]],
+])("keeps recovery command %s under the session namespace", async (_name, argv) => {
+  const runSessionCommand = vi.fn(async () => ({ code: 0, result: { kind: "command", status: { stage: "COMPLETED" } } }));
+  expect(await runCli(["session", ...argv], { io: capture().io, runSessionCommand })).toBe(0);
+  expect(runSessionCommand).toHaveBeenCalledWith(argv, undefined);
 });

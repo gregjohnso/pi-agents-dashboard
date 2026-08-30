@@ -26,7 +26,7 @@ import { spawn as spawnProcess } from "node:child_process";
 import { createModelCatalog } from "./pi-model-catalog.mjs";
 import { WorkerSupervisor } from "./worker-supervisor.mjs";
 import { loadDashboardConfig } from "../shared/config.mjs";
-import { parseClientRequest } from "../shared/contracts.mjs";
+import { parseClientRequest, piConfirmedModel } from "../shared/contracts.mjs";
 
 initializeRuntimePermissions();
 
@@ -872,23 +872,23 @@ export async function createDaemonRuntime({
         }, "reconcile_activity");
       },
       /**
-       * Store the model and thinking level Pi reported, so the list shows what a session actually runs
-       * rather than only what the launch happened to ask for.
+       * Store the model and thinking level Pi reported on reconnect. A launch already records Pi's
+       * model at readiness; this keeps a row current after a daemon restart, and it is the only writer
+       * of the thinking level Pi restored for itself.
        * @param {any} metadata @param {any} state
        */
       async recordSessionModel(metadata, state) {
-        const model = state?.model;
+        const model = piConfirmedModel(state);
         const thinkingLevel = state?.thinkingLevel;
-        const named = typeof model?.provider === "string" && typeof model?.id === "string";
-        if (!named && typeof thinkingLevel !== "string") return;
+        if (model === undefined && typeof thinkingLevel !== "string") return;
         await runSessionLifecycle(registry, metadata.sessionId, async () => {
           const current = await registry.get(metadata.sessionId);
           if (current === undefined || current.ownership?.runId !== metadata.runId) return;
-          const sameModel = !named || (current.model?.provider === model.provider && current.model?.id === model.id);
+          const sameModel = model === undefined || (current.model?.provider === model.provider && current.model?.id === model.id);
           const sameThinking = typeof thinkingLevel !== "string" || current.thinkingLevel === thinkingLevel;
           if (sameModel && sameThinking) return;
           const updated = await registry.update(current.sessionId, current.revision, {
-            ...(named ? { model: { provider: model.provider, id: model.id } } : {}),
+            ...(model === undefined ? {} : { model }),
             ...(typeof thinkingLevel === "string" ? { thinkingLevel } : {}),
             updatedAt: new Date().toISOString(),
           });

@@ -4,6 +4,7 @@ import { mkdir, open } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { piConfirmedModel } from "../shared/contracts.mjs";
 import { recordLaunchStage } from "./launch-trace.mjs";
 import { OwnershipManager } from "./ownership.mjs";
 import { probePiCapabilities } from "./pi-capability-probe.mjs";
@@ -467,7 +468,9 @@ export class WorkerSupervisor {
       supervision.route = route;
       reservation.adopt(route);
 
-      await this.#writeWorkerEventLocked(supervision, { type: "WORKER_READY", at: new Date().toISOString() }, "launching");
+      // The model Pi reported when the worker read its initial state is recorded in the same write
+      // that persists readiness, so a new session shows what it runs without waiting for a reconnect.
+      await this.#writeWorkerEventLocked(supervision, { type: "WORKER_READY", at: new Date().toISOString() }, "launching", piConfirmedModel(ready));
       recordLaunchStage("ready_persisted", sessionId);
       if (supervision.exit.terminal || supervision.lifecycle !== "launching") {
         await this.#reconcileTerminalLocked(supervision);
@@ -497,8 +500,8 @@ export class WorkerSupervisor {
     }
   }
 
-  /** @param {any} supervision @param {any} event @param {"launching" | "active"} lifecycle */
-  async #writeWorkerEventLocked(supervision, event, lifecycle) {
+  /** @param {any} supervision @param {any} event @param {"launching" | "active"} lifecycle @param {{provider:string,id:string}} [confirmedModel] */
+  async #writeWorkerEventLocked(supervision, event, lifecycle, confirmedModel) {
     const launchEvent = lifecycle === "launching";
     // A crashed Pi child only moves the record toward EXITED, and its report races the supervisor exit it
     // caused, so it stays writable until the lease is released.
@@ -522,7 +525,9 @@ export class WorkerSupervisor {
       return undefined;
     }
     const next = reduceSessionState(current, event);
-    const updated = next === current ? current : await this.#registry.update(supervision.sessionId, current.revision, {
+    const confirms = confirmedModel !== undefined && (current.model?.provider !== confirmedModel.provider || current.model?.id !== confirmedModel.id);
+    const updated = next === current && !confirms ? current : await this.#registry.update(supervision.sessionId, current.revision, {
+      ...(confirms ? { model: confirmedModel } : {}),
       taskState: next.taskState,
       processState: next.processState,
       outcome: next.outcome,

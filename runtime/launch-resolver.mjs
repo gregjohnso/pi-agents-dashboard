@@ -166,7 +166,8 @@ export function createLaunchResolver({
         sessionRecord.name = name;
         sessionRecord.nameGenerated = payload.name === undefined;
       }
-      if (payload.model !== undefined) sessionRecord.model = { ...payload.model };
+      // Only the worker receives the requested model. The row records the model Pi confirms at
+      // readiness, so a launch that dies first shows no model rather than one it never ran.
       return {
         sessionId,
         canonicalSessionFile: piSession.sessionFile,

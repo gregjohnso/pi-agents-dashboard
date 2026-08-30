@@ -459,9 +459,14 @@ export class RecoveredWorkerRouter {
     return traceSessionLock(label, sessionId, (traced) => this.#lifecycle.runNested(sessionId, traced), action);
   }
 
-  /** @param {any} frame @param {any} connection */
+  /**
+   * Adopt one authenticated route from a worker's readiness frame. The frame may carry the model Pi
+   * reported when the worker read its initial state; adoption only admits it, and the launch decides
+   * whether to record it.
+   * @param {any} frame @param {any} connection
+   */
   async adopt(frame, connection) {
-    const allowed = ["version", "type", "token", "sessionId", "runId", "leaseId", "generation", "worker", "piChild"];
+    const allowed = ["version", "type", "token", "sessionId", "runId", "leaseId", "generation", "worker", "piChild", "model"];
     if (typeof frame !== "object" || frame === null || Array.isArray(frame) || Object.keys(frame).some((key) => !allowed.includes(key)) || frame.version !== 1 || frame.type !== "worker_ready") throw Object.assign(new Error("Invalid worker ready frame"), { code: "INVALID_WORKER_FRAME" });
     return this.#serializeRoute(frame.sessionId, async () => {
       const expected = this.#workers.get(frame.sessionId);

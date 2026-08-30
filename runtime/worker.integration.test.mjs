@@ -106,7 +106,7 @@ process.stdin.on("data", (chunk) => {
     const command = JSON.parse(input.slice(0, newline));
     input = input.slice(newline + 1);
     let response;
-    if (command.type === "get_state") response = { id: command.id, type: "response", command: "get_state", success: true, data: { sessionId: "fake", sessionFile } };
+    if (command.type === "get_state") response = { id: command.id, type: "response", command: "get_state", success: true, data: { sessionId: "fake", sessionFile, ...(process.env.FAKE_RPC_MODEL === undefined ? {} : { model: JSON.parse(process.env.FAKE_RPC_MODEL) }) } };
     else if (command.type === "__pi_agents_unknown_command__") response = { id: command.id, type: "response", command: command.type, success: false, error: "unknown command" };
     else if (["prompt", "follow_up", "steer"].includes(command.type) && typeof command.message !== "string") response = { id: command.id, type: "response", command: command.type, success: false, error: "message is required" };
     else if (command.type === "extension_ui_response" && typeof command.requestId !== "string") response = { id: command.id, type: "response", command: command.type, success: false, error: "requestId is required" };
@@ -156,6 +156,26 @@ it("starts two bounded workers as distinct process-group leaders and opens sessi
   await expect(inspectProcessIdentity(two.identity.pid)).resolves.toEqual(two.identity);
   await Promise.all([waitForExit(one.identity.pid), waitForExit(two.identity.pid)]);
   await Promise.all([waitForOwnershipRelease(registry, "one"), waitForOwnershipRelease(registry, "two")]);
+});
+
+it("records the model the launched worker read from Pi at readiness", async () => {
+  const { root, runs, registry, fakeEntry, router, launchSeams } = await setup(["one"]);
+  const supervisor = new WorkerSupervisor({
+    registry,
+    router,
+    ownership: new OwnershipManager(registry),
+    runsDirectory: runs,
+    env: { ...process.env, PI_AGENTS_TEST_EXIT_MS: "700", FAKE_RPC_MODEL: JSON.stringify({ provider: "openai-codex", id: "gpt-5.6-sol" }) },
+    startTimeoutMs: 5_000,
+  });
+  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-model", piPath: fakeEntry, model: { provider: "anthropic", id: "requested" }, ...launchSeams });
+
+  // Readiness is the first write that may name a model, and it names the one Pi reported rather
+  // than the one the launch asked for.
+  expect(await registry.get("one")).toMatchObject({ model: { provider: "openai-codex", id: "gpt-5.6-sol" } });
+  await supervisor.close();
+  await waitForExit(launched.identity.pid);
+  await waitForOwnershipRelease(registry, "one");
 });
 
 it("fails the session with a process error when the Pi child exits unexpectedly", async () => {

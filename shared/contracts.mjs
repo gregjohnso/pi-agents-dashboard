@@ -86,6 +86,18 @@ function readModel(value, path) {
   return { provider: readIdentifier(model, "provider", `${path}.provider`), id: readIdentifier(model, "id", `${path}.id`) };
 }
 
+/**
+ * The model Pi named in one state it reported, or undefined when it named none. Absence is
+ * meaningful: a row without a model means Pi has not told us which one it runs, never the model a
+ * launch happened to ask for.
+ * @param {unknown} state @returns {{provider:string,id:string} | undefined}
+ */
+export function piConfirmedModel(state) {
+  const model = /** @type {any} */ (state)?.model;
+  if (typeof model?.provider !== "string" || model.provider.length === 0 || typeof model.id !== "string" || model.id.length === 0) return undefined;
+  return { provider: model.provider, id: model.id };
+}
+
 /** @param {unknown} value @param {string} path */
 function validateProcessIdentity(value, path) {
   const identity = readRecord(value, path);

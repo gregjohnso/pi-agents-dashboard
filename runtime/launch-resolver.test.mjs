@@ -146,7 +146,8 @@ it("builds an isolated canonical session launch from the daemon request", async 
     },
   };
 
-  await expect(resolveLaunch(request)).resolves.toEqual({
+  const resolved = await resolveLaunch(request);
+  expect(resolved).toEqual({
     sessionId: "session-id",
     canonicalSessionFile: "/pi/agent/sessions/project/session-id.jsonl",
     cwd: "/pi/agent/pi-agents/worktrees/session-id/packages/app",
@@ -164,7 +165,6 @@ it("builds an isolated canonical session launch from the daemon request", async 
       cwd: "/pi/agent/pi-agents/worktrees/session-id/packages/app",
       name: "identity",
       nameGenerated: false,
-      model: { provider: "openai", id: "gpt" },
       taskState: "READY",
       processState: "EXITED",
       outcome: "NONE",
@@ -177,6 +177,10 @@ it("builds an isolated canonical session launch from the daemon request", async 
       updatedAt: "2026-08-25T12:00:00.000Z",
     },
   });
+  // The requested model reaches Pi through the worker's arguments and never the prepared row: a
+  // launch that dies before Pi starts must not display a model it never ran.
+  expect(resolved.sessionRecord).not.toHaveProperty("model");
+  expect(resolved.model).toEqual({ provider: "openai", id: "gpt" });
   expect(preparedRunHash).not.toContain("/");
   expect(preflight).toHaveBeenCalledWith(request.payload, { piConfigRoot: "/pi/agent", currentOwnerSessionIds: [] });
   expect(createWorktree).toHaveBeenCalledWith(expect.any(Object), { worktreeId: "session-id" });

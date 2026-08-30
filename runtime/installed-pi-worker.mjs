@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
+import { piConfirmedModel } from "../shared/contracts.mjs";
 import { openPiExecutableBinding } from "./pi-executable.mjs";
 import { PiRpcAdapter, piRpcArgv } from "./pi-rpc-adapter.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
@@ -173,7 +174,10 @@ export async function runInstalledPiWorker(runtimeProcess) {
   transportMessageHandler = onTransportMessage;
   for (const pending of pendingParentMessages.splice(0)) onTransportMessage(pending.message, pending.send);
   if (shuttingDown) return;
-  const ready = { version: 1, type: "worker_ready", token, sessionId: options.sessionId, runId: options.runId, leaseId: options.leaseId, generation: options.generation, worker: supervisorIdentity, piChild: piChildIdentity };
+  // Pi is the authority on which model this session runs, and its initial state is the first moment
+  // it says so. Readiness carries that answer, so a row shows a model without waiting for a reconnect.
+  const confirmedModel = piConfirmedModel(initialState);
+  const ready = { version: 1, type: "worker_ready", token, sessionId: options.sessionId, runId: options.runId, leaseId: options.leaseId, generation: options.generation, worker: supervisorIdentity, piChild: piChildIdentity, ...(confirmedModel === undefined ? {} : { model: confirmedModel }) };
   await launchConnection.send(ready);
 
   void Promise.resolve(launchConnection.closed).finally(() => {

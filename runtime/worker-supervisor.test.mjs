@@ -265,6 +265,38 @@ it("creates and binds the registry before activation and reports ready after aut
   });
 });
 
+it("records the model Pi confirmed at readiness and leaves it absent when Pi named none", async () => {
+  const { runs, registry, ownership, router } = await setup(["one", "two"]);
+  const confirming = fakeWorkerFactory({ router, readyOverrides: { model: { provider: "openai-codex", id: "gpt-5.6-sol" } } });
+  const confirmingSupervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, spawnImpl: confirming.spawnImpl, inspect, randomId: () => "confirmed-model-token" });
+  await confirmingSupervisor.launch({
+    sessionId: "one",
+    canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile,
+    cwd: "/repo",
+    runId: "run-confirmed-model",
+    model: { provider: "anthropic", id: "requested" },
+  });
+
+  // The request still reaches Pi through the worker's arguments; only the row waits for Pi's answer.
+  expect(confirming.calls[0].argv).toEqual(expect.arrayContaining(["--model-provider", "anthropic", "--model-id", "requested"]));
+  expect(await getRecord(registry, "one")).toMatchObject({ processState: "LIVE", model: { provider: "openai-codex", id: "gpt-5.6-sol" } });
+
+  const silent = fakeWorkerFactory({ router });
+  const silentSupervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, spawnImpl: silent.spawnImpl, inspect, randomId: () => "unconfirmed-model-token" });
+  await silentSupervisor.launch({
+    sessionId: "two",
+    canonicalSessionFile: (await getRecord(registry, "two")).canonicalSessionFile,
+    cwd: "/repo",
+    runId: "run-unconfirmed-model",
+    model: { provider: "anthropic", id: "requested" },
+  });
+
+  // Absence means Pi has not said yet. It never falls back to what the launch asked for.
+  expect(await getRecord(registry, "two")).not.toHaveProperty("model");
+  await confirmingSupervisor.close();
+  await silentSupervisor.close();
+});
+
 it("authenticates and adopts the startup socket before activation, and persists the run token privately", async () => {
   const { runs, registry, ownership, router, metadataPath, workers: persisted } = await setup();
   const workers = fakeWorkerFactory({ router, holdHello: true });

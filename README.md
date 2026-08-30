@@ -59,6 +59,27 @@ Pi owns the slash prefix in the viewer. The viewer passes unknown slash-prefixed
 
 Press Escape while a turn is working to interrupt it. After the turn settles, press Escape again to return to the list. When Pi is idle, Escape returns immediately. Closing the dashboard does not stop Pi.
 
+## Run commands without opening the list
+
+The operator-facing commands use the same verbs as Claude Code's background sessions.
+
+| Command | What it does |
+| --- | --- |
+| `pi-agents agents` | Opens the session list. Same as `pi-agents` with no arguments. |
+| `pi-agents agents --json` | Prints every session row as one JSON object and exits. It reads only and does not start the daemon. |
+| `pi-agents attach <full-session-id>` | Opens one session's viewer directly. Returning ends the attachment, not the session. |
+| `pi-agents stop <full-session-id> --revision <n> --yes` | Stops that session's worker and its Pi process. |
+| `pi-agents rm <full-session-id> --revision <n> --yes` | Forgets the dashboard record. It does not delete Pi's session file or remove a worktree. |
+
+Session IDs are exact; a prefix does not match. `--revision <n>` is the `revision` in `pi-agents agents --json`, and the command refuses when the row changed underneath it.
+
+Two recovery commands have no Claude Code equivalent and stay under `session`:
+
+- `pi-agents session cleanup <full-session-id> --revision <n> --yes` removes a stopped session's managed worktree.
+- `pi-agents session resolve-delivery <full-client-id> <full-request-id> retry_at_risk|abandon --yes` settles a `stop` or `rm` whose delivery the daemon left ambiguous.
+
+Add `--json` to any command for one machine-readable object on standard output.
+
 ## Upgrading
 
 Restart the daemon and every open dashboard after upgrading:

@@ -9,6 +9,7 @@ import { cleanupStaleDaemon, inspectDaemonEndpoint } from "../runtime/daemon-lif
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
 import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "../runtime/process-signaler.mjs";
+import { adoptRenamedStateRoot } from "../runtime/state-root-adoption.mjs";
 import { createDaemonRequester, createPersistentDaemonRequester, destructiveRequestTimeoutMs, loadCliClientIdentity, resolveRuntimeRoot } from "./session-commands.mjs";
 
 export { resolveRuntimeRoot };
@@ -17,6 +18,9 @@ const STATUS_CODES = { HEALTHY: 0, UNHEALTHY: 1, STALE: 1, ABSENT: 3, CONFLICT: 
 const DEFAULT_STOP_POLICY = Object.freeze({ gracefulMs: 500, terminateMs: 500 });
 const STARTUP_LOG_MAX_BYTES = 1024 * 1024;
 const STARTUP_REPORT_BYTES = 4 * 1024;
+// How long a stopped daemon may keep matching its published identity after the endpoint is gone.
+const PROCESS_EXIT_PROOF_MS = 2_000;
+const PROCESS_EXIT_POLL_MS = 25;
 
 export async function daemonEntryPoint() {
   return realpath(resolve(dirname(fileURLToPath(import.meta.url)), "../runtime/daemon.mjs"));
@@ -106,6 +110,29 @@ async function readStartupOutput(capture) {
   }
 }
 
+/**
+ * Prove one published daemon process is gone, by the same exact identity that authorized signaling it.
+ *
+ * @param {any} publication @param {(pid: number) => Promise<any>} inspect
+ * @returns {Promise<{ reason: string, identity?: any, error?: unknown } | undefined>} the survivor, or undefined once it is gone
+ */
+async function waitForProcessExit(publication, inspect) {
+  const deadline = Date.now() + PROCESS_EXIT_PROOF_MS;
+  for (;;) {
+    /** @type {any} */
+    let actual;
+    try {
+      actual = await inspect(publication.pid);
+    } catch (error) {
+      if (error instanceof Error && ["ENOENT", "ESRCH"].includes(/** @type {NodeJS.ErrnoException} */ (error).code ?? "")) return undefined;
+      return { reason: "AMBIGUOUS_IDENTITY", error };
+    }
+    if (actual?.pid !== publication.pid || actual?.startIdentity !== publication.startIdentity || actual?.processGroupId !== publication.processGroupId) return undefined;
+    if (Date.now() >= deadline) return { reason: "STILL_RUNNING", identity: actual };
+    await new Promise((resolveWait) => setTimeout(resolveWait, PROCESS_EXIT_POLL_MS));
+  }
+}
+
 async function waitForStatus(root, desired, options) {
   const deadline = Date.now() + (options.timeoutMs ?? 15_000);
   let endpoint;
@@ -123,7 +150,17 @@ async function waitForStatus(root, desired, options) {
 }
 
 export async function runDaemonCommand(command, options = {}) {
-  const root = options.root ?? resolveRuntimeRoot(options.env);
+  let root = options.root ?? resolveRuntimeRoot(options.env);
+  if (command === "start" && options.root === undefined) {
+    // Starting is the only command that creates a state root, so it is the last place that can
+    // refuse to leave the operator's sessions behind in the root this build shipped under. Every
+    // start path takes the same adopt, defer, or refuse decision rather than opening an empty root.
+    try {
+      root = (await (options.adoptStateRoot ?? adoptRenamedStateRoot)({ env: options.env ?? process.env })).root;
+    } catch (error) {
+      return { code: 1, error: { code: /** @type {any} */ (error)?.code ?? "STATE_ROOT_UNUSABLE", message: error instanceof Error ? error.message : "State root cannot be resolved" } };
+    }
+  }
   const inspect = options.inspect ?? inspectProcessIdentity;
   const probe = options.probe ?? probeDaemon;
   const inspectEndpoint = options.inspectEndpoint ?? inspectDaemonEndpoint;
@@ -222,7 +259,13 @@ export async function runDaemonCommand(command, options = {}) {
         return { code: 5, error: { code: error?.code ?? "DAEMON_IDENTITY_CONFLICT", message: error instanceof Error ? error.message : "Daemon cleanup identity changed" } };
       }
     }
-    return endpoint?.status === "ABSENT" ? { code: 0, result: { kind: "daemon_stopped", root, stoppedSessionIds } } : { code: 1, error: { code: "DAEMON_STOP_TIMEOUT", message: "Daemon did not stop before the deadline" } };
+    if (endpoint?.status !== "ABSENT") return { code: 1, error: { code: "DAEMON_STOP_TIMEOUT", message: "Daemon did not stop before the deadline" } };
+    // The daemon removes its publication as the last step of its own shutdown, so an absent
+    // endpoint proves only that the endpoint was released. A hung or unkillable process still owns
+    // the root, and restart would start a second daemon beside it.
+    const survivor = await waitForProcessExit(current.publication, inspect);
+    if (survivor !== undefined) return { code: 5, error: { code: "DAEMON_STILL_RUNNING", message: `Daemon ${current.publication.pid} still matches its published process identity after stop: ${survivor.reason}` } };
+    return { code: 0, result: { kind: "daemon_stopped", root, stoppedSessionIds } };
   }
   if (command === "restart") {
     const current = await inspectEndpoint(common);

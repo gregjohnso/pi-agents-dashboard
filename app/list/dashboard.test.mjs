@@ -723,7 +723,7 @@ describe("dashboard controller", () => {
             clientId: "stable-client",
             cursor: { daemonEpoch: "epoch", sequence: "1" },
             viewState: { query: { view: "live" } },
-            launchDraft: { prompt: "", cwd: "/repo", isolationMode: "worktree", model: { provider: "provider", id: "id" }, thinkingLevel: "", name: "" },
+            launchDraft: { prompt: "", cwd: "/repo", isolationMode: "worktree", model: { provider: "provider", id: "id" }, name: "" },
         };
         const dashboard = controller(new FakeBackend([session("a")]), { persistence: persistence(stored) });
         await dashboard.open();
@@ -744,16 +744,28 @@ describe("dashboard controller", () => {
             dashboard.handleInput("/");
             const menu = dashboard.render(80, 24).map(stripVTControlCharacters);
             expect(menu.some((line) => line.includes("/model"))).toBe(true);
-            for (const command of ["/model", "/thinking", "/cwd", "/isolation", "/name", "/help"]) {
+            for (const command of ["/model", "/cwd", "/isolation", "/name", "/help"]) {
                 expect(menu.some((line) => line.includes(command))).toBe(true);
             }
+            expect(menu.some((line) => line.includes("/thinking"))).toBe(false);
             // Down drives the menu, not the session list, while a slash prompt is open.
             dashboard.handleInput("\x1b[B");
+            dashboard.handleInput("\x1b[B");
             expect(dashboard.selectedSessionId).toBe("a");
-            expect(dashboard.render(80, 24).some((line) => stripVTControlCharacters(line).includes("❯ /thinking"))).toBe(true);
+            expect(dashboard.render(80, 24).some((line) => stripVTControlCharacters(line).includes("❯ /isolation"))).toBe(true);
             dashboard.handleInput("\r");
-            expect(dashboard.overlay).toMatchObject({ kind: "choice", field: "thinking" });
+            expect(dashboard.overlay).toMatchObject({ kind: "choice", field: "isolation" });
             expect(dashboard.composerDraft.prompt).toBe("");
+        });
+        it("selects no thinking level for the next launch, in the draft or through a command", async () => {
+            const dashboard = controller(new FakeBackend([session("a")]), { launchDefaults: { cwd: "/repo", thinkingLevel: "high" } });
+            await dashboard.open();
+            expect(Object.hasOwn(dashboard.composerDraft, "thinkingLevel")).toBe(false);
+            typed(dashboard, "/thinking high");
+            dashboard.handleInput("\r");
+            await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "UNKNOWN_LIST_COMMAND" }));
+            expect(dashboard.overlay).toBeUndefined();
+            expect(Object.hasOwn(dashboard.composerDraft, "thinkingLevel")).toBe(false);
         });
         it("closes the menu on Escape and keeps the typed text editable", async () => {
             const showsMenu = (dashboard) => dashboard.render(80, 24).some((line) => stripVTControlCharacters(line).includes("/model"));

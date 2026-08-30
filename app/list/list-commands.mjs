@@ -1,25 +1,16 @@
-/** @typedef {{models:string[],thinkingLevels:string[],modelsUnavailable?:{code:string,message:string}}} DraftChoices */
+/** @typedef {{models:string[],modelsUnavailable?:{code:string,message:string}}} DraftChoices */
 /** @typedef {{name:string,argumentHint:string,summary:string}} ListCommand */
 
 /** The dashboard's own commands. Each one configures the next launch; none of them reaches a session. */
 export const LIST_COMMAND_MENU = [
     { name: "/model", argumentHint: "[provider/id]", summary: "model for the next session" },
-    { name: "/thinking", argumentHint: "[level]", summary: "thinking level for the next session" },
     { name: "/cwd", argumentHint: "<path>", summary: "working directory for the next session" },
     { name: "/isolation", argumentHint: "[worktree|shared]", summary: "worktree or shared directory" },
     { name: "/name", argumentHint: "[text]", summary: "session name; empty lets the agent name it" },
     { name: "/help", argumentHint: "", summary: "the dashboard's keys and commands" },
 ];
 export const LIST_COMMANDS = LIST_COMMAND_MENU.map((command) => command.name);
-/**
- * Pi's own thinking scale, in its off-to-max order, exactly as `pi --thinking <level>` accepts it.
- * Pi names the levels only in its help text and over a live session's RPC, so the list carries them
- * rather than parsing prose on the path an operator uses. It is not a validator: a level typed in
- * full is passed through and Pi refuses it at launch. The canary at the end of list-commands.test.mjs
- * re-reads `pi --help` and fails when the installed Pi's levels stop matching.
- */
-export const PI_THINKING_LEVELS = Object.freeze(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
-export const EMPTY_DRAFT_CHOICES = Object.freeze({ models: Object.freeze([]), thinkingLevels: Object.freeze([]) });
+export const EMPTY_DRAFT_CHOICES = Object.freeze({ models: Object.freeze([]) });
 
 const ISOLATION_MODES = { worktree: "worktree", shared: "shared_directory", shared_directory: "shared_directory" };
 const MAX_SESSION_NAME = 128;
@@ -57,7 +48,7 @@ function modelValue(model) {
 }
 
 /**
- * The values a picker can offer: the draft's own value, whatever the session records in memory
+ * The models a picker can offer: the draft's own value, whatever the session records in memory
  * report, the launch defaults, and Pi's own catalog when the caller has read it. A cold dashboard
  * has none of the first three, so the catalog is what makes its picker complete.
  * @param {any} draft @param {any[]} sessions @param {any} [defaults] @param {{provider:string,id:string}[]} [catalog] @returns {DraftChoices}
@@ -65,19 +56,15 @@ function modelValue(model) {
 export function draftChoices(draft, sessions, defaults, catalog = []) {
     const sources = [draft, ...sessions, defaults ?? {}];
     const models = new Set();
-    const thinkingLevels = new Set();
     for (const source of sources) {
         const model = modelValue(source?.model);
         if (model !== undefined) models.add(model);
-        if (typeof source?.thinkingLevel === "string" && source.thinkingLevel !== "") thinkingLevels.add(source.thinkingLevel);
     }
     for (const entry of catalog) {
         const model = modelValue(entry);
         if (model !== undefined) models.add(model);
     }
-    // Thinking reads as a scale, so Pi's own order beats alphabetical; anything unnamed follows it.
-    const unnamed = [...thinkingLevels].filter((level) => !PI_THINKING_LEVELS.includes(level)).sort();
-    return { models: [...models].sort(), thinkingLevels: [...PI_THINKING_LEVELS, ...unnamed] };
+    return { models: [...models].sort() };
 }
 
 /** @param {string} code @param {string} message @returns {{kind:"rejected",code:string,message:string}} */
@@ -89,7 +76,7 @@ function rejected(code, message) {
  * Resolve one submitted list prompt into a draft edit, a picker, or a refusal.
  * A slash prompt never launches and never touches an existing session.
  * @param {string} text @param {DraftChoices} choices
- * @returns {{kind:"not_a_command"}|{kind:"set_model",model:{provider:string,id:string}}|{kind:"pick_model"}|{kind:"set_thinking",level:string}|{kind:"pick_thinking"}|{kind:"set_cwd",path:string}|{kind:"set_isolation",isolationMode:string}|{kind:"pick_isolation"}|{kind:"set_name",name:string}|{kind:"help"}|{kind:"rejected",code:string,message:string}}
+ * @returns {{kind:"not_a_command"}|{kind:"set_model",model:{provider:string,id:string}}|{kind:"pick_model"}|{kind:"set_cwd",path:string}|{kind:"set_isolation",isolationMode:string}|{kind:"pick_isolation"}|{kind:"set_name",name:string}|{kind:"help"}|{kind:"rejected",code:string,message:string}}
  */
 export function parseListCommand(text, choices) {
     const { name, argument } = split(text);
@@ -112,14 +99,6 @@ export function parseListCommand(text, choices) {
         if (choices.models.length > 0 && !choices.models.includes(argument))
             return rejected("MODEL_UNKNOWN", `Pi does not offer ${argument}. Press Enter on /model to pick one.`);
         return { kind: "set_model", model: { provider, id } };
-    }
-    if (name === "/thinking") {
-        if (argument === "") {
-            return choices.thinkingLevels.length === 0
-                ? rejected("THINKING_CHOICES_UNKNOWN", "No thinking level is known here yet. Type /thinking <level>.")
-                : { kind: "pick_thinking" };
-        }
-        return { kind: "set_thinking", level: argument };
     }
     if (name === "/cwd") {
         if (argument === "") return rejected("CWD_REQUIRED", "Type a directory: /cwd <path>");

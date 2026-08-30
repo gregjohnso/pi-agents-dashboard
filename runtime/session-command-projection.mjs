@@ -8,7 +8,6 @@
  */
 export function sessionCommandPayload(payload) {
   if (payload.command === "set_model") return { command: "set_model", model: { ...payload.model } };
-  if (payload.command === "set_thinking_level") return { command: "set_thinking_level", level: payload.level };
   if (payload.command === "set_session_name") return { command: "set_session_name", name: payload.name };
   if (payload.command === "abort_retry") return { command: "abort_retry" };
   return payload.instructions === undefined ? { command: "compact" } : { command: "compact", instructions: payload.instructions };

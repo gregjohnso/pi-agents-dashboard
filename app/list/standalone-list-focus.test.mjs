@@ -44,7 +44,7 @@ function mountedDashboard() {
   };
   const controller = new DashboardController({
     backend, persistence: { async load() {}, async save() {} }, openViewer: async () => {},
-    clientId: "host-client", launchDefaults: { cwd: "/repo", model: { provider: "anthropic", id: "claude" }, thinkingLevel: "high", name: "task" },
+    clientId: "host-client", launchDefaults: { cwd: "/repo", model: { provider: "anthropic", id: "claude" }, name: "task" },
     requestRender: () => tui.requestRender(),
   });
   let depth = 0;

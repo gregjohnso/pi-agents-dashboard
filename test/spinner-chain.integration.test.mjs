@@ -102,7 +102,7 @@ async function mountDashboard(runtime, clientId) {
     persistence: { async load() { return undefined; }, async save() {} },
     openViewer: async () => {},
     clientId, sourceSessionId: `dashboard-${clientId}`,
-    launchDefaults: { cwd: "/repo", model: { provider: "anthropic", id: "claude" }, thinkingLevel: "high", name: "task" },
+    launchDefaults: { cwd: "/repo", model: { provider: "anthropic", id: "claude" }, name: "task" },
     requestRender: () => { rows.push(stripVTControlCharacters(controller.render(WIDTH, HEIGHT)[FIRST_ROW])); },
   });
   await controller.open();

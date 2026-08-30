@@ -74,7 +74,7 @@ async function seedRoot(clientId, cursor) {
   lines.push(JSON.stringify({ version: 1, cursor: { daemonEpoch: EPOCH, sequence: String(LOG_LENGTH) }, occurredAt: AT, kind: "session_changed", payload: { session: sessionRecord(root, "beta", { taskState: "WORKING", processState: "LIVE" }) } }));
   await writeFile(join(root, "index", "events.jsonl"), `${lines.join("\n")}\n`, { mode: 0o600 });
 
-  const launchDraft = { prompt: "", cwd: root, isolationMode: "worktree", model: { provider: "", id: "" }, thinkingLevel: "", name: "" };
+  const launchDraft = { prompt: "", cwd: root, isolationMode: "worktree", model: { provider: "", id: "" }, name: "" };
   await writeFile(join(root, "frontend-state.json"), `${JSON.stringify({ schemaVersion: 1, clientId, ...(cursor === undefined ? {} : { cursor }), viewState: {}, launchDraft })}\n`, { mode: 0o600 });
   return root;
 }

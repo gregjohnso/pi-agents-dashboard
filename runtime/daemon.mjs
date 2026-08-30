@@ -827,8 +827,8 @@ export async function createDaemonRuntime({
               canonicalSessionFile: record.canonicalSessionFile,
               cwd: record.cwd,
               runId: randomUUID(),
+              // Pi restores its own thinking level from the canonical session file, so a restart asks for none.
               ...(record.model === undefined ? {} : { model: record.model }),
-              ...(record.thinkingLevel === undefined ? {} : { thinkingLevel: record.thinkingLevel }),
               ...(record.name === undefined ? {} : { name: record.name }),
               daemonConnector: CONNECTOR_PATH,
               daemonConnectConfig: { socketPath: join(daemonDirectory, "control.sock"), tokenPath, maxBytes },
@@ -1155,8 +1155,7 @@ export async function createDaemonRuntime({
           const menu = (await context.askWorker(request))?.result ?? {};
           return {
             kind: "session_commands", sessionId: request.payload.sessionId,
-            commands: menu.commands ?? [], models: menu.models ?? [], thinkingLevels: menu.thinkingLevels ?? [],
-            model: menu.model ?? null, thinkingLevel: menu.thinkingLevel ?? null,
+            commands: menu.commands ?? [], models: menu.models ?? [], model: menu.model ?? null,
           };
         }
         if (!DURABLE_COMMANDS.has(request.op)) throw Object.assign(new Error(`Unsupported daemon operation: ${request.op}`), { code: "UNSUPPORTED_OPERATION" });

@@ -96,7 +96,6 @@ function modelItems(menu) {
  */
 const SELECTION_PICKERS = {
   MODEL_REQUIRED: { command: "/model", title: () => "Select a model", items: modelItems },
-  THINKING_LEVEL_REQUIRED: { command: "/thinking", title: () => "Select a thinking level", items: (menu) => menu.thinkingLevels.map((/** @type {string} */ level) => ({ value: level, label: level })) },
   SUMMARY_MODEL_REQUIRED: { command: "/model-summary", title: () => "Select a dashboard summary model", items: (menu) => [{ value: "off", label: "off · disable summaries" }, ...modelItems(menu)] },
   SESSION_COLOR_REQUIRED: { command: "/color", title: () => "Select a session color", items: () => [{ value: "default", label: "default · no tint" }, ...SESSION_COLORS.map((color) => ({ value: color, label: color }))] },
 };
@@ -320,9 +319,7 @@ export class ViewerController {
       this.menu = {
         commands: Array.isArray(menu?.commands) ? menu.commands : [],
         models: Array.isArray(menu?.models) ? menu.models : [],
-        thinkingLevels: Array.isArray(menu?.thinkingLevels) ? menu.thinkingLevels : [],
         model: menu?.model ?? null,
-        thinkingLevel: menu?.thinkingLevel ?? null,
         color: menu?.color ?? null,
         name: typeof menu?.name === "string" ? menu.name : undefined,
       };

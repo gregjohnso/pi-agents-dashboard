@@ -43,12 +43,11 @@ function validateResponse(response, expectedId, command) {
 /**
  * Build the one argument list a worker launches Pi with. `installed-pi-worker.mjs` spawns it for
  * real and `PiRpcAdapter.start` reuses it, so the flag set cannot drift between the two.
- * @param {{ sessionFile: string, model?: { provider: string, id: string }, thinkingLevel?: string, name?: string }} options
+ * @param {{ sessionFile: string, model?: { provider: string, id: string }, name?: string }} options
  */
-export function piRpcArgv({ sessionFile, model, thinkingLevel, name }) {
+export function piRpcArgv({ sessionFile, model, name }) {
   const argv = ["--mode", "rpc", "--session", sessionFile];
   if (model !== undefined) argv.push("--provider", model.provider, "--model", model.id);
-  if (thinkingLevel !== undefined) argv.push("--thinking", thinkingLevel);
   if (name !== undefined) argv.push("--name", name);
   return argv;
 }
@@ -127,11 +126,11 @@ export class PiRpcAdapter {
 
   /**
    * Start an installed Pi executable with structured arguments.
-   * @param {{ executable: string, cwd: string, sessionFile: string, model?: { provider: string, id: string }, thinkingLevel?: string, name?: string, env?: NodeJS.ProcessEnv, spawnImpl?: SpawnLike }} options
+   * @param {{ executable: string, cwd: string, sessionFile: string, model?: { provider: string, id: string }, name?: string, env?: NodeJS.ProcessEnv, spawnImpl?: SpawnLike }} options
    */
-  static async start({ executable, cwd, sessionFile, model, thinkingLevel, name, env = process.env, spawnImpl = spawn }) {
+  static async start({ executable, cwd, sessionFile, model, name, env = process.env, spawnImpl = spawn }) {
     if (typeof executable !== "string" || typeof cwd !== "string" || typeof sessionFile !== "string") throw new TypeError("executable, cwd, and sessionFile are required");
-    const child = spawnImpl(executable, piRpcArgv({ sessionFile, model, thinkingLevel, name }), {
+    const child = spawnImpl(executable, piRpcArgv({ sessionFile, model, name }), {
       cwd,
       env,
       shell: false,
@@ -277,11 +276,8 @@ export class PiRpcAdapter {
   async getState() { return this.#request("get_state"); }
   async getCommands() { return this.#request("get_commands"); }
   async getAvailableModels() { return this.#request("get_available_models"); }
-  async getAvailableThinkingLevels() { return this.#request("get_available_thinking_levels"); }
   /** @param {{ provider: string, id: string }} model */
   async setModel(model) { return this.#request("set_model", { provider: model.provider, modelId: model.id }); }
-  /** @param {string} level */
-  async setThinkingLevel(level) { return this.#request("set_thinking_level", { level }); }
   /** @param {string} name */
   async setSessionName(name) { return this.#request("set_session_name", { name }); }
   /** @param {string} [instructions] */

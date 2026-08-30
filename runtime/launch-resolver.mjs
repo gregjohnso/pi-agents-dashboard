@@ -162,7 +162,6 @@ export function createLaunchResolver({
         sessionRecord.nameGenerated = payload.name === undefined;
       }
       if (payload.model !== undefined) sessionRecord.model = { ...payload.model };
-      if (payload.thinkingLevel !== undefined) sessionRecord.thinkingLevel = payload.thinkingLevel;
       return {
         sessionId,
         canonicalSessionFile: piSession.sessionFile,
@@ -171,7 +170,6 @@ export function createLaunchResolver({
         initialPrompt: payload.prompt,
         sessionRecord,
         ...(payload.model === undefined ? {} : { model: { ...payload.model } }),
-        ...(payload.thinkingLevel === undefined ? {} : { thinkingLevel: payload.thinkingLevel }),
         ...(name === undefined ? {} : { name }),
         ...(piSession.identity === undefined ? {} : { preparedSessionIdentity: piSession.identity }),
       };

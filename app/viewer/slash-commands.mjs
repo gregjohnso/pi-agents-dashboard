@@ -1,7 +1,7 @@
 import { SESSION_COLORS } from "../../shared/contracts.mjs";
 
 /** @typedef {{name:string,source:string,description?:string,argumentHint?:string}} MenuCommand */
-/** @typedef {{commands:MenuCommand[],models:{provider:string,id:string}[],thinkingLevels:string[],model:{provider:string,id:string}|null,thinkingLevel:string|null,summaryModel?:{provider:string,id:string}|null,name?:string|null,color?:string|null}} SessionMenu */
+/** @typedef {{commands:MenuCommand[],models:{provider:string,id:string}[],model:{provider:string,id:string}|null,summaryModel?:{provider:string,id:string}|null,name?:string|null,color?:string|null}} SessionMenu */
 
 const BUILTIN_SOURCE = "builtin";
 const DEFAULT_COLOR = "default";
@@ -10,7 +10,7 @@ const DEFAULT_COLOR = "default";
 const REBIND_COMMANDS = { "/fork": "fork", "/clone": "clone", "/switch": "switch_session" };
 
 /** @type {SessionMenu} */
-export const EMPTY_SESSION_MENU = { commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, summaryModel: null };
+export const EMPTY_SESSION_MENU = { commands: [], models: [], model: null, summaryModel: null };
 
 /** @param {{provider:string,id:string}} model */
 function modelValue(model) {
@@ -38,7 +38,6 @@ export function sessionSlashCommands(menu) {
   const models = menu.models.map(modelValue);
   const builtins = [
     { name: "model", description: menu.model === null ? "Select the session model" : `Model: ${modelValue(menu.model)}`, argumentHint: "<provider/id>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, models) },
-    { name: "thinking", description: menu.thinkingLevel === null ? "Set the thinking level" : `Thinking: ${menu.thinkingLevel}`, argumentHint: "<level>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, menu.thinkingLevels) },
     { name: "model-summary", description: menu.summaryModel == null ? "Dashboard summaries: off" : `Dashboard summaries: ${modelValue(menu.summaryModel)}`, argumentHint: "<provider/id|off>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, ["off", ...models]) },
     { name: "rename", description: menu.name == null ? "Name this session" : `Name: ${menu.name}`, argumentHint: "<name>", source: BUILTIN_SOURCE },
     { name: "color", description: menu.color == null ? "Set this session's dashboard color" : `Color: ${menu.color}`, argumentHint: "<color>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, [DEFAULT_COLOR, ...SESSION_COLORS]) },
@@ -76,11 +75,6 @@ export function parseSlashSubmission(text, menu) {
     const selected = menu.models.find((model) => modelValue(model) === argument);
     if (selected === undefined) return { kind: "rejected", code: "UNKNOWN_MODEL", message: `Unknown model: ${argument}` };
     return { kind: "session_command", payload: { command: "set_model", model: { ...selected } } };
-  }
-  if (name === "/thinking") {
-    if (argument.length === 0) return { kind: "rejected", code: "THINKING_LEVEL_REQUIRED", message: menu.thinkingLevels.length === 0 ? "This session reported no thinking levels. Stop and reopen it to refresh Pi's command menu." : `Choose a thinking level: ${menu.thinkingLevels.join(", ")}` };
-    if (!menu.thinkingLevels.includes(argument)) return { kind: "rejected", code: "UNKNOWN_THINKING_LEVEL", message: `Unknown thinking level: ${argument}` };
-    return { kind: "session_command", payload: { command: "set_thinking_level", level: argument } };
   }
   if (name === "/model-summary") {
     if (argument.length === 0) return { kind: "rejected", code: "SUMMARY_MODEL_REQUIRED", message: menu.models.length === 0 ? "This session reported no models. Stop and reopen it to refresh Pi's command menu." : `Choose a summary model or off: ${menu.models.map(modelValue).join(", ")}` };

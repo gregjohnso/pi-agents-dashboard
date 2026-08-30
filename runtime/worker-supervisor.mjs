@@ -352,7 +352,7 @@ export class WorkerSupervisor {
 
   /**
    * Launch one session worker. Same-session launches serialize; different sessions overlap after admission.
-   * @param {{ sessionId: string, canonicalSessionFile: string, cwd: string, runId: string, sessionRecord?: import("../shared/contracts.mjs").SessionRecord, model?: { provider: string, id: string }, thinkingLevel?: string, name?: string, piPath?: string, daemonConnector?: string, daemonConnectConfig?: Record<string, unknown>, reconnectDelaysMs?: number[] }} request
+   * @param {{ sessionId: string, canonicalSessionFile: string, cwd: string, runId: string, sessionRecord?: import("../shared/contracts.mjs").SessionRecord, model?: { provider: string, id: string }, name?: string, piPath?: string, daemonConnector?: string, daemonConnectConfig?: Record<string, unknown>, reconnectDelaysMs?: number[] }} request
    */
   launch(request) {
     if (typeof request?.sessionId !== "string" || request.sessionId.length === 0) return Promise.reject(new TypeError("sessionId is required"));
@@ -366,8 +366,8 @@ export class WorkerSupervisor {
     });
   }
 
-  /** @param {{ sessionId: string, canonicalSessionFile: string, cwd: string, runId: string, sessionRecord?: import("../shared/contracts.mjs").SessionRecord, model?: { provider: string, id: string }, thinkingLevel?: string, name?: string, piPath?: string, daemonConnector?: string, daemonConnectConfig?: Record<string, unknown>, reconnectDelaysMs?: number[] }} request */
-  async #launch({ sessionId, canonicalSessionFile, cwd, runId, sessionRecord, model, thinkingLevel, name, piPath, daemonConnector, daemonConnectConfig = {}, reconnectDelaysMs = [100, 250, 500, 1_000, 2_000] }) {
+  /** @param {{ sessionId: string, canonicalSessionFile: string, cwd: string, runId: string, sessionRecord?: import("../shared/contracts.mjs").SessionRecord, model?: { provider: string, id: string }, name?: string, piPath?: string, daemonConnector?: string, daemonConnectConfig?: Record<string, unknown>, reconnectDelaysMs?: number[] }} request */
+  async #launch({ sessionId, canonicalSessionFile, cwd, runId, sessionRecord, model, name, piPath, daemonConnector, daemonConnectConfig = {}, reconnectDelaysMs = [100, 250, 500, 1_000, 2_000] }) {
     if ([canonicalSessionFile, cwd, runId].some((value) => typeof value !== "string" || value.length === 0)) throw new TypeError("Worker launch fields must be non-empty strings");
     let record = await this.#registry.get(sessionId);
     if (record === undefined) {
@@ -428,7 +428,6 @@ export class WorkerSupervisor {
         "--diagnostics-directory", diagnosticsDirectory,
       ];
       if (model !== undefined) argv.push("--model-provider", model.provider, "--model-id", model.id);
-      if (thinkingLevel !== undefined) argv.push("--thinking-level", thinkingLevel);
       if (name !== undefined) argv.push("--name", name);
       if (daemonConnector !== undefined) {
         if (typeof daemonConnector !== "string" || daemonConnector.length === 0) throw new TypeError("daemonConnector must be a non-empty string");

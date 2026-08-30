@@ -66,7 +66,7 @@ export function createHelpOverlay() {
             { keys: "Ctrl+O / Ctrl+A / Ctrl+W", action: "cycle outcome, activity, project filters" },
             { keys: "Ctrl+S / Ctrl+B / Ctrl+L", action: "cycle sort, grouping; clear filters" },
             { keys: "Ctrl+R / Ctrl+E", action: "refresh activity summaries; show session metadata" },
-            { keys: "/model /thinking", action: "set the next session's model and thinking level" },
+            { keys: "/model", action: "set the next session's model" },
             { keys: "/cwd /isolation /name", action: "set its directory, isolation, and name" },
             { keys: "? / Ctrl+G", action: "this help" },
             { keys: "Ctrl+C", action: "quit" },

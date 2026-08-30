@@ -498,7 +498,7 @@ it("reaches a freshly launched worker over its launch channel before any socket 
   const requested = [];
   /** @type {any[]} */
   const deliveries = [];
-  const menu = { commands: [], models: [{ provider: "anthropic", id: "claude" }], thinkingLevels: ["off"], model: null, thinkingLevel: null };
+  const menu = { commands: [], models: [{ provider: "anthropic", id: "claude" }], model: null };
   const runtime = await createDaemonRuntime({
     root: stateRoot,
     hostProbe: async () => ({ blockers: [] }),
@@ -572,6 +572,8 @@ it("refuses a session query and serves session toggles from the owning worker", 
   expect(await client.next()).toMatchObject({ ok: false, error: { code: "INVALID_REQUEST" } });
   client.send({ version: 1, clientId: "viewer", requestId: "steering", op: "session_command", payload: { sessionId: "query", command: "set_steering_mode", mode: "one-at-a-time" } });
   expect(await client.next()).toMatchObject({ ok: false, error: { code: "INVALID_REQUEST" } });
+  client.send({ version: 1, clientId: "viewer", requestId: "thinking", op: "session_command", payload: { sessionId: "query", command: "set_thinking_level", level: "high" } });
+  expect(await client.next()).toMatchObject({ ok: false, error: { code: "INVALID_REQUEST" } });
 
   // The retry brake outlives the settings passthrough, and it is the only zero-argument variant left.
   client.send({ version: 1, clientId: "viewer", requestId: "abort-retry", op: "session_command", payload: { sessionId: "query", command: "abort_retry" } });
@@ -596,7 +598,7 @@ it("discovers slash commands and delivers one session command to the owning work
   await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "menu", runId: "run-menu", leaseId: "lease-menu", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
   const runtime = await createDaemonRuntime({ root: stateRoot, inspect });
   runtimes.push(runtime);
-  const menu = { commands: [{ name: "/review", source: "extension", description: "Review" }], models: [{ provider: "anthropic", id: "claude" }], thinkingLevels: ["off", "high"], model: { provider: "anthropic", id: "claude" }, thinkingLevel: "high" };
+  const menu = { commands: [{ name: "/review", source: "extension", description: "Review" }], models: [{ provider: "anthropic", id: "claude" }], model: { provider: "anthropic", id: "claude" }, thinkingLevels: ["off", "high"], thinkingLevel: "high" };
   const worker = startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "menu", runId: "run-menu", leaseId: "lease-menu", generation: 1, identity, piChildIdentity: piChild, token: "menu-token", results: { get_session_commands: menu } });
   await runtime.ready;
   const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
@@ -604,7 +606,10 @@ it("discovers slash commands and delivers one session command to the owning work
   client.send({ version: 1, clientId: "viewer", requestId: "attach-menu", op: "attach", payload: { sessionId: "menu", role: "composer" } });
   expect(await client.next()).toMatchObject({ ok: true, result: { role: "composer" } });
   client.send({ version: 1, clientId: "viewer", requestId: "menu-request", op: "get_session_commands", payload: { sessionId: "menu" } });
-  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "session_commands", sessionId: "menu", ...menu } });
+  const served = /** @type {any} */ (await client.next());
+  // A worker may still report Pi's thinking values; the daemon serves the menu without them.
+  expect(served).toMatchObject({ ok: true, result: { kind: "session_commands", sessionId: "menu", commands: menu.commands, models: menu.models, model: menu.model } });
+  for (const key of ["thinkingLevels", "thinkingLevel"]) expect(Object.hasOwn(served.result, key), key).toBe(false);
   client.send({ version: 1, clientId: "viewer", requestId: "model-request", op: "session_command", payload: { sessionId: "menu", command: "set_model", model: { provider: "anthropic", id: "claude" } } });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
   client.send({ version: 1, clientId: "viewer", requestId: "rename-request", op: "session_command", payload: { sessionId: "menu", command: "set_session_name", name: "Coverage loader" } });

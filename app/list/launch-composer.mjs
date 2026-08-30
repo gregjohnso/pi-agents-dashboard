@@ -15,7 +15,6 @@ export function createLaunchDraft(defaults) {
             provider: defaults.model?.provider ?? "",
             id: defaults.model?.id ?? "",
         },
-        thinkingLevel: defaults.thinkingLevel ?? "",
         name: defaults.name ?? "",
     };
 }
@@ -52,7 +51,6 @@ export function prepareLaunchRequest(draft, preflight, confirmation) {
             : { mode: "shared_directory", confirmedCwd: preflight.canonicalCwd, ownerSessionIds: [...preflight.ownerSessionIds] },
     };
     if (draft.model.provider !== "") request.model = { ...draft.model };
-    if (draft.thinkingLevel !== "") request.thinkingLevel = draft.thinkingLevel;
     if (draft.name.trim() !== "") request.name = draft.name;
     return { kind: "ready", request };
 }

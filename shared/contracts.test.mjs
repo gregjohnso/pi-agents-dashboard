@@ -31,7 +31,6 @@ const acceptedRequests = [
   ["set_session_color", { sessionId: "session", color: "amber" }],
   ["set_session_color", { sessionId: "session", color: null }],
   ["session_command", { sessionId: "session", command: "set_model", model: { provider: "anthropic", id: "claude" } }],
-  ["session_command", { sessionId: "session", command: "set_thinking_level", level: "high" }],
   ["session_command", { sessionId: "session", command: "compact", instructions: "keep decisions" }],
   ["session_command", { sessionId: "session", command: "abort_retry" }],
 ];
@@ -48,6 +47,8 @@ const rejectedRequests = [
   ["session rebinding through new_session", "session_command", { sessionId: "session", command: "new_session" }, /command/iu],
   ["session rebinding through switch_session", "session_command", { sessionId: "session", command: "switch_session", sessionPath: "/other.jsonl" }, /command/iu],
   ["session rebinding through fork", "session_command", { sessionId: "session", command: "fork", entryId: "entry" }, /command/iu],
+  ["a thinking level Pi owns", "session_command", { sessionId: "session", command: "set_thinking_level", level: "high" }, /command/iu],
+  ["a requested thinking level at launch", "launch", { prompt: "Run tests", cwd: "/repo", sourceSessionId: "source", isolation: { mode: "worktree" }, thinkingLevel: "high" }, /unknown/iu],
   ["automatic compaction", "session_command", { sessionId: "session", command: "set_auto_compaction", enabled: true }, /command/iu],
   ["automatic retry", "session_command", { sessionId: "session", command: "set_auto_retry", enabled: false }, /command/iu],
   ["the steering queue mode", "session_command", { sessionId: "session", command: "set_steering_mode", mode: "all" }, /command/iu],
@@ -62,8 +63,8 @@ const sessionRecord = { schemaVersion: 1, revision: 1, sessionId: "s", sessionFi
 const menu = {
   kind: "session_commands", sessionId: "session",
   commands: [{ name: "/compact", source: "builtin", description: "Compact", argumentHint: "[instructions]" }, { name: "/review", source: "extension" }],
-  models: [{ provider: "anthropic", id: "claude" }], thinkingLevels: ["off", "high"],
-  model: { provider: "anthropic", id: "claude" }, thinkingLevel: "high",
+  models: [{ provider: "anthropic", id: "claude" }],
+  model: { provider: "anthropic", id: "claude" },
 };
 const modelCatalog = { kind: "models", models: [{ provider: "anthropic", id: "claude-opus-4", thinking: true }, { provider: "google", id: "gemini-3-flash", thinking: false }] };
 
@@ -85,6 +86,8 @@ const acceptedResponses = [
 /** Every daemon response the wire must refuse. @type {Array<[string, Record<string, any>, RegExp]>} */
 const rejectedResponses = [
   ["unknown menu field", ok({ ...menu, unknown: true }), /unknown/iu],
+  ["thinking values in the session command menu", ok({ ...menu, thinkingLevels: ["off", "high"] }), /unknown/iu],
+  ["an observed thinking level in the session command menu", ok({ ...menu, thinkingLevel: "high" }), /unknown/iu],
   ["invented menu command source", ok({ ...menu, commands: [{ name: "/x", source: "invented" }] }), /source/iu],
   ["empty session summary text", ok({ kind: "state", sessions: [{ ...sessionRecord, summary: { ...sessionRecord.summary, text: "" } }] }), /summary\.text/u],
   ["a state cursor whose sequence is not canonical", ok({ kind: "state", sessions: [], cursor: { daemonEpoch: "epoch", sequence: "01" } }), /sequence/u],

@@ -7,7 +7,7 @@ import { PassThrough } from "node:stream";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { PiRpcAdapter } from "./pi-rpc-adapter.mjs";
-import { createWorkerCommandDispatcher, createWorkerReplayStore, replayDeliveryIsAmbiguous } from "./worker.mjs";
+import { collectSessionMenu, createWorkerCommandDispatcher, createWorkerReplayStore, replayDeliveryIsAmbiguous } from "./worker.mjs";
 
 /** @type {string[]} */
 const cleanup = [];
@@ -58,7 +58,6 @@ it("uses the public RPC entry with structured argv and an exact environment", as
     cwd: "/tmp/a cwd",
     sessionFile: "/tmp/session ; not-shell.jsonl",
     model: { provider: "fake-provider", id: "model with spaces" },
-    thinkingLevel: "high",
     name: "name; still one arg",
     env: { PATH: "/exact/path", SAFE: "value" },
     executable: "/installed/pi",
@@ -76,8 +75,6 @@ it("uses the public RPC entry with structured argv and an exact environment", as
       "fake-provider",
       "--model",
       "model with spaces",
-      "--thinking",
-      "high",
       "--name",
       "name; still one arg",
     ],
@@ -242,16 +239,14 @@ it("exposes the retry brake but no session query and no settings passthrough", a
   await adapter.close();
 });
 
-it("discovers commands and applies model, thinking, and compaction changes", async () => {
+it("discovers commands and applies model and compaction changes, but no thinking change", async () => {
   /** @type {any[]} */
   const sent = [];
   /** @type {Record<string, any>} */
   const data = {
     get_commands: { commands: [{ name: "review", description: "Review", source: "extension" }] },
     get_available_models: { models: [{ provider: "anthropic", id: "claude" }] },
-    get_available_thinking_levels: { levels: ["off", "high"] },
     set_model: { provider: "anthropic", id: "claude" },
-    set_thinking_level: undefined,
     compact: { compacted: true },
   };
   const child = fakeRpcProcess((command, process) => {
@@ -262,14 +257,43 @@ it("discovers commands and applies model, thinking, and compaction changes", asy
 
   await expect(adapter.getCommands()).resolves.toEqual(data.get_commands);
   await expect(adapter.getAvailableModels()).resolves.toEqual(data.get_available_models);
-  await expect(adapter.getAvailableThinkingLevels()).resolves.toEqual(data.get_available_thinking_levels);
   await expect(adapter.setModel({ provider: "anthropic", id: "claude" })).resolves.toEqual(data.set_model);
-  await expect(adapter.setThinkingLevel("high")).resolves.toBeUndefined();
   await expect(adapter.compact("keep decisions")).resolves.toEqual(data.compact);
-  expect(sent.map(({ type }) => type)).toEqual(["get_commands", "get_available_models", "get_available_thinking_levels", "set_model", "set_thinking_level", "compact"]);
-  expect(sent[3]).toMatchObject({ provider: "anthropic", modelId: "claude" });
-  expect(sent[5]).toMatchObject({ customInstructions: "keep decisions" });
+  for (const method of ["getAvailableThinkingLevels", "setThinkingLevel"]) expect(/** @type {any} */ (adapter)[method], method).toBeUndefined();
+  expect(sent.map(({ type }) => type)).toEqual(["get_commands", "get_available_models", "set_model", "compact"]);
+  expect(sent[2]).toMatchObject({ provider: "anthropic", modelId: "claude" });
+  expect(sent[3]).toMatchObject({ customInstructions: "keep decisions" });
   await adapter.close();
+});
+
+it("collects a session menu with no thinking values and never asks Pi for them", async () => {
+  const getAvailableThinkingLevels = vi.fn(async () => ({ levels: ["off", "high"] }));
+  const menu = await collectSessionMenu({
+    getState: async () => ({ model: { provider: "anthropic", id: "claude" }, thinkingLevel: "high" }),
+    getCommands: async () => ({ commands: [{ name: "review", source: "extension" }] }),
+    getAvailableModels: async () => ({ models: [{ provider: "anthropic", id: "claude" }] }),
+    getAvailableThinkingLevels,
+  });
+
+  expect(menu).toEqual({
+    commands: [{ name: "/review", source: "extension" }],
+    models: [{ provider: "anthropic", id: "claude" }],
+    model: { provider: "anthropic", id: "claude" },
+  });
+  expect(getAvailableThinkingLevels).not.toHaveBeenCalled();
+});
+
+it("refuses a thinking level the worker no longer applies to Pi", async () => {
+  /** @type {any[]} */
+  const records = [];
+  const replay = await createWorkerReplayStore({ append: async (record) => { records.push(record); } });
+  const setThinkingLevel = vi.fn();
+  const dispatcher = createWorkerCommandDispatcher({ replay, adapter: { setThinkingLevel } });
+
+  await expect(dispatcher.deliver({ clientId: "client", requestId: "thinking", op: "session_command", sessionCommand: { command: "set_thinking_level", level: "high" } }))
+    .rejects.toMatchObject({ code: "INVALID_SESSION_COMMAND" });
+  expect(setThinkingLevel).not.toHaveBeenCalled();
+  expect(records.map((record) => record.stage)).toEqual(["RECEIVED", "FAILED"]);
 });
 
 it("sends one-way UI responses without blocking the next correlated command", async () => {

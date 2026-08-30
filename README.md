@@ -44,7 +44,6 @@ A slash command in the list changes the next launch only. It does not change a r
 | Command | Next-launch setting |
 | --- | --- |
 | `/model [provider/id]` | Model. Omit the value to open a picker. |
-| `/thinking [level]` | Thinking level. Omit the value to open a picker. |
 | `/cwd <path>` | Working directory. |
 | `/isolation [worktree\|shared]` | Managed Git worktree or the shared directory. Omit the value to open a picker. |
 | `/name [text]` | Session name. An empty value lets the agent name it. |

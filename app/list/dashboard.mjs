@@ -550,7 +550,7 @@ export class DashboardController {
             return [];
         }
     }
-    /** The model and thinking values a picker can offer, given Pi's catalog if the caller read it. */
+    /** The models a picker can offer, given Pi's catalog if the caller read it. */
     draftChoices(catalog = []) {
         const choices = draftChoices(this.composerDraft, this.sessions, this.launchDefaults, catalog);
         return this.modelCatalogFailure === undefined ? choices : { ...choices, modelsUnavailable: this.modelCatalogFailure };
@@ -582,9 +582,6 @@ export class DashboardController {
             case "set_model":
                 this.composerDraft = { ...this.composerDraft, model: { ...parsed.model } };
                 break;
-            case "set_thinking":
-                this.composerDraft = { ...this.composerDraft, thinkingLevel: parsed.level };
-                break;
             case "set_cwd":
                 this.composerDraft = { ...this.composerDraft, cwd: parsed.path };
                 break;
@@ -596,10 +593,6 @@ export class DashboardController {
                 break;
             case "pick_model":
                 this.overlay = createChoiceOverlay("model", "Model", choices.models, `${this.composerDraft.model.provider}/${this.composerDraft.model.id}`);
-                this.focus = "choice";
-                break;
-            case "pick_thinking":
-                this.overlay = createChoiceOverlay("thinking", "Thinking", choices.thinkingLevels, this.composerDraft.thinkingLevel);
                 this.focus = "choice";
                 break;
             case "pick_isolation":
@@ -630,8 +623,6 @@ export class DashboardController {
             const separator = value.indexOf("/");
             this.composerDraft = { ...this.composerDraft, model: { provider: value.slice(0, separator), id: value.slice(separator + 1) } };
         }
-        else if (overlay.field === "thinking")
-            this.composerDraft = { ...this.composerDraft, thinkingLevel: value };
         else
             this.composerDraft = { ...this.composerDraft, isolationMode: value };
         this.closeChoice();
@@ -1020,7 +1011,7 @@ export class DashboardController {
                 // Flat rules above and below the prompt: a rounded top with a flat bottom read as a broken box.
                 lines[dockTop] = sectionFooter(this.width, confirmingSharedLaunch);
                 lines[dockTop + 1] = paintPlainLine(` ❯ ${draftPrompt}`, this.width, (text) => jobwatchTheme.text(text, false));
-                const form = layout.listTop >= 5 ? this.draftModelSummary() : ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} thinking:${this.composerDraft.thinkingLevel} name:${this.composerDraft.name}`;
+                const form = layout.listTop >= 5 ? this.draftModelSummary() : ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} name:${this.composerDraft.name}`;
                 // The rule closes the prompt box; launch settings and the selected path are context below it.
                 const formRow = layout.dockRows >= 4 ? dockTop + 3 : dockTop + 2;
                 if (layout.dockRows >= 4) lines[dockTop + 2] = sectionFooter(this.width, confirmingSharedLaunch);

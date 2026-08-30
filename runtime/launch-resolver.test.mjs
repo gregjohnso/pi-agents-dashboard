@@ -138,6 +138,7 @@ it("builds an isolated canonical session launch from the daemon request", async 
       sourceSessionId: "dashboard-client",
       isolation: { mode: "worktree" },
       model: { provider: "openai", id: "gpt" },
+      // The wire refuses this field now; a payload that still carries one reaches neither Pi nor the record.
       thinkingLevel: "high",
       name: "identity",
     },
@@ -150,7 +151,6 @@ it("builds an isolated canonical session launch from the daemon request", async 
     runId: "run-id",
     initialPrompt: "who are you?",
     model: { provider: "openai", id: "gpt" },
-    thinkingLevel: "high",
     name: "identity",
     sessionRecord: {
       schemaVersion: 1,
@@ -162,7 +162,6 @@ it("builds an isolated canonical session launch from the daemon request", async 
       name: "identity",
       nameGenerated: false,
       model: { provider: "openai", id: "gpt" },
-      thinkingLevel: "high",
       taskState: "READY",
       processState: "EXITED",
       outcome: "NONE",

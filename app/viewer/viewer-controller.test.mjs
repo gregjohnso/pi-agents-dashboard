@@ -85,7 +85,7 @@ describe("viewer commands and role restrictions", () => {
   });
 
   it("discovers slash commands, applies model selection, and reloads the menu", async () => {
-    const menu = { commands: [{ name: "/review", source: "extension" }], models: [{ provider: "anthropic", id: "claude" }], thinkingLevels: ["off", "high"], model: null, thinkingLevel: "off" };
+    const menu = { commands: [{ name: "/review", source: "extension" }], models: [{ provider: "anthropic", id: "claude" }], model: null };
     const loaded = [];
     const f = fixture({ menu: async () => { loaded.push("menu"); return menu; } });
     await f.instance.open();
@@ -103,7 +103,7 @@ describe("viewer commands and role restrictions", () => {
   });
 
   it("opens one picker per bare built-in, applies the choice, and refuses a mistyped argument", async () => {
-    const f = fixture({ menu: async () => ({ commands: [], models: [{ provider: "anthropic", id: "claude" }, { provider: "openai", id: "gpt-5" }], thinkingLevels: ["off", "high"], model: null, thinkingLevel: null }) });
+    const f = fixture({ menu: async () => ({ commands: [], models: [{ provider: "anthropic", id: "claude" }, { provider: "openai", id: "gpt-5" }], model: null }) });
     await f.instance.open();
 
     f.instance.editor.setText("/model");
@@ -115,13 +115,6 @@ describe("viewer commands and role restrictions", () => {
     await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "session_command", payload: { sessionId: "s", command: "set_model", model: { provider: "openai", id: "gpt-5" } } }]));
     expect(f.instance.selection).toBeUndefined();
 
-    f.instance.editor.setText("/thinking");
-    f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
-    f.instance.handleInput("\x1b");
-    expect(f.instance.selection).toBeUndefined();
-    expect(f.commands).toHaveLength(1);
-
     // Only a bare command opens a picker: a mistyped argument is a rejection the operator has to fix.
     f.instance.editor.setText("/model invented/model");
     f.instance.handleInput("\r");
@@ -130,7 +123,7 @@ describe("viewer commands and role restrictions", () => {
     expect(f.commands).toHaveLength(1);
   });
 
-  it.each(["/auto-compact", "/steering", "/follow-up"])("prompts the session with %s instead of opening a settings picker", async (text) => {
+  it.each(["/thinking", "/auto-compact", "/steering", "/follow-up"])("prompts the session with %s instead of opening a settings picker", async (text) => {
     const f = fixture();
     await f.instance.open();
 
@@ -167,7 +160,7 @@ describe("viewer commands and role restrictions", () => {
     const colored = [];
     // The daemon owns the color: it comes back on the reloaded menu, not from viewer-local state.
     let stored = /** @type {string | null} */ (null);
-    const f = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: stored }) });
+    const f = fixture({ menu: async () => ({ commands: [], models: [], model: null, color: stored }) });
     f.client.setSessionColor = async (/** @type {string} */ sessionId, /** @type {string | null} */ color) => {
       colored.push({ sessionId, color });
       stored = color;
@@ -203,14 +196,14 @@ describe("viewer commands and role restrictions", () => {
     expect(afterFailure).not.toContain("\x1b[38;2;253;164;175m");
 
     // The color lives on the session record, so reopening paints the prompt box with no fresh /color.
-    const reopened = fixture({ menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: "amber" }) });
+    const reopened = fixture({ menu: async () => ({ commands: [], models: [], model: null, color: "amber" }) });
     await reopened.instance.open();
     expect(reopened.instance.render(80, 20).join("\n")).toContain("\x1b[38;2;252;211;77m");
   });
 
   it("names the session on the prompt's top rule", async () => {
     const framed = { ...editor(), render: () => ["─".repeat(60), "> do 3", "─".repeat(60)] };
-    const f = fixture({ editor: framed, menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: null, name: "recurse agent investigation" }) });
+    const f = fixture({ editor: framed, menu: async () => ({ commands: [], models: [], model: null, color: null, name: "recurse agent investigation" }) });
     await f.instance.open();
     const plain = f.instance.render(80, 20).map(stripVTControlCharacters);
     const promptRow = plain.findLastIndex((line) => line.startsWith("> "));
@@ -221,7 +214,7 @@ describe("viewer commands and role restrictions", () => {
 
   it("leaves the rule bare when the session has no name", async () => {
     const framed = { ...editor(), render: () => ["─".repeat(60), "> do 3", "─".repeat(60)] };
-    const f = fixture({ editor: framed, menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: null }) });
+    const f = fixture({ editor: framed, menu: async () => ({ commands: [], models: [], model: null, color: null }) });
     await f.instance.open();
     const plain = f.instance.render(80, 20).map(stripVTControlCharacters);
     const promptRow = plain.findLastIndex((line) => line.startsWith("> "));
@@ -231,7 +224,7 @@ describe("viewer commands and role restrictions", () => {
   it("colors the border Pi's editor already draws instead of adding rules", async () => {
     // Pi's editor renders its own frame; adding ours put four rules on screen instead of two.
     const framed = { ...editor(), render: () => ["─".repeat(20), "> hello", "─".repeat(20)] };
-    const f = fixture({ editor: framed, menu: async () => ({ commands: [], models: [], thinkingLevels: [], model: null, thinkingLevel: null, color: "amber" }) });
+    const f = fixture({ editor: framed, menu: async () => ({ commands: [], models: [], model: null, color: "amber" }) });
     await f.instance.open();
     const rendered = f.instance.render(80, 20);
     const plain = rendered.map(stripVTControlCharacters);

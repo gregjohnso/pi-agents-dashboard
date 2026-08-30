@@ -49,7 +49,7 @@ function parseArgs(argv) {
     sessionId: values.get("session-id"), canonicalSessionFile: values.get("canonical-session-file"), cwd: values.get("cwd"), runId: values.get("run-id"),
     leaseId: values.get("lease-id"), generation, replayPath: values.get("replay-path"), piExecutable: values.get("pi-executable"), executable, capabilities,
     diagnosticsDirectory: values.get("diagnostics-directory"), model: values.has("model-provider") ? { provider: values.get("model-provider"), id: values.get("model-id") } : undefined,
-    thinkingLevel: values.get("thinking-level"), name: values.get("name"), daemonConnector: values.get("daemon-connector"), daemonConnectConfig, reconnectDelaysMs,
+    name: values.get("name"), daemonConnector: values.get("daemon-connector"), daemonConnectConfig, reconnectDelaysMs,
   };
 }
 
@@ -103,7 +103,7 @@ export async function runInstalledPiWorker(runtimeProcess) {
 
   const executableBinding = await openPiExecutableBinding(options.executable);
   const diagnostics = await openRotatingDiagnostics({ directory: options.diagnosticsDirectory });
-  const argv = piRpcArgv({ sessionFile: options.canonicalSessionFile, model: options.model, thinkingLevel: options.thinkingLevel, name: options.name });
+  const argv = piRpcArgv({ sessionFile: options.canonicalSessionFile, model: options.model, name: options.name });
   let piChild;
   try {
     piChild = spawn(executableBinding.executionPath, argv, { cwd: options.cwd, env: runtimeProcess.env, detached: false, shell: false, stdio: ["pipe", "pipe", "pipe", executableBinding.handle.fd] });

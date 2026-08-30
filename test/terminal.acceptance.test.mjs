@@ -50,7 +50,7 @@ function dashboardFixture(sessions, overrides = {}) {
     backend, persistence, openViewer, onClose,
     clientId: "terminal-client",
     requestId: () => "terminal-request",
-    launchDefaults: { cwd: "/repo", model: { provider: "", id: "" }, thinkingLevel: "", name: "" },
+    launchDefaults: { cwd: "/repo", model: { provider: "", id: "" }, name: "" },
     requestRender: () => {},
     now: () => Date.parse(timestamp) + 12 * 60 * 60 * 1_000,
   });

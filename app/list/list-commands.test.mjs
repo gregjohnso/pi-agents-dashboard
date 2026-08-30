@@ -1,12 +1,9 @@
-import { spawn } from "node:child_process";
-
 import { describe, expect, it } from "vitest";
 
-import { resolvePiExecutable } from "../../runtime/pi-executable.mjs";
-import { LIST_COMMANDS, PI_THINKING_LEVELS, commandName, draftChoices, matchingListCommands, parseListCommand } from "./list-commands.mjs";
+import { LIST_COMMANDS, commandName, draftChoices, matchingListCommands, parseListCommand } from "./list-commands.mjs";
 
-const choices = { models: ["anthropic/claude", "google/gemini"], thinkingLevels: ["off", "high"] };
-const unknown = { models: [], thinkingLevels: [] };
+const choices = { models: ["anthropic/claude", "google/gemini"] };
+const unknown = { models: [] };
 
 describe("list slash commands", () => {
     it("leaves a prompt that does not begin with a slash alone", () => {
@@ -32,16 +29,16 @@ describe("list slash commands", () => {
     });
     it("opens a picker for a bare choice command and says so when it knows no values", () => {
         expect(parseListCommand("/model", choices)).toEqual({ kind: "pick_model" });
-        expect(parseListCommand("/thinking", choices)).toEqual({ kind: "pick_thinking" });
         expect(parseListCommand("/model", unknown)).toMatchObject({ kind: "rejected", code: "MODEL_CHOICES_UNKNOWN", message: expect.stringContaining("/model provider/id") });
         expect(parseListCommand("/model", { ...unknown, models: ["anthropic/claude"] })).toEqual({ kind: "pick_model" });
-        expect(parseListCommand("/thinking", unknown)).toMatchObject({ kind: "rejected", code: "THINKING_CHOICES_UNKNOWN", message: expect.stringContaining("/thinking") });
     });
-    it("sets any typed thinking level, including one the scale does not name", () => {
-        expect(parseListCommand("/thinking high", choices)).toEqual({ kind: "set_thinking", level: "high" });
-        expect(parseListCommand("/thinking xhigh", choices)).toEqual({ kind: "set_thinking", level: "xhigh" });
-        // The scale is what the picker offers, not a validator: Pi refuses an unknown level at launch.
-        expect(parseListCommand("/thinking ludicrous", choices)).toEqual({ kind: "set_thinking", level: "ludicrous" });
+    it.each(["/thinking", "/thinking high", "/thinking ludicrous"])("refuses %s, because the next launch selects no thinking level", (text) => {
+        expect(parseListCommand(text, choices)).toMatchObject({ kind: "rejected", code: "UNKNOWN_LIST_COMMAND" });
+    });
+    it("names no thinking command in the launch menu and offers no thinking values", () => {
+        expect(LIST_COMMANDS).not.toContain("/thinking");
+        expect(matchingListCommands("/t")).toEqual([]);
+        expect(draftChoices({ model: { provider: "anthropic", id: "opus" }, thinkingLevel: "max" }, [{ thinkingLevel: "high" }], { thinkingLevel: "low" })).toEqual({ models: ["anthropic/opus"] });
     });
     it("carries a working directory through for the caller to check", () => {
         expect(parseListCommand("/cwd /repo/alpha", choices)).toEqual({ kind: "set_cwd", path: "/repo/alpha" });
@@ -69,30 +66,25 @@ describe("list slash commands", () => {
             for (const known of LIST_COMMANDS) expect(rejected.message).toContain(known);
         }
     });
-    it("sources model and thinking choices from the draft, the visible sessions, and the launch defaults", () => {
+    it("sources model choices from the draft, the visible sessions, and the launch defaults", () => {
         const sessions = [
             { model: { provider: "google", id: "gemini" }, thinkingLevel: "off" },
             { model: { provider: "anthropic", id: "claude" } },
             { thinkingLevel: "high" },
             {},
         ];
-        const draft = { model: { provider: "anthropic", id: "opus" }, thinkingLevel: "max" };
-        const defaults = { model: { provider: "openai", id: "gpt" }, thinkingLevel: "low" };
+        const draft = { model: { provider: "anthropic", id: "opus" } };
+        const defaults = { model: { provider: "openai", id: "gpt" } };
         expect(draftChoices(draft, sessions, defaults)).toEqual({
             models: ["anthropic/claude", "anthropic/opus", "google/gemini", "openai/gpt"],
-            thinkingLevels: [...PI_THINKING_LEVELS],
         });
-        expect(draftChoices({ model: { provider: "", id: "" }, thinkingLevel: "" }, [], undefined)).toEqual({ models: [], thinkingLevels: [...PI_THINKING_LEVELS] });
-    });
-    it("offers Pi's whole thinking scale in its own order, plus any level seen that it does not name", () => {
-        const seen = draftChoices({ model: { provider: "", id: "" }, thinkingLevel: "ludicrous" }, [{ thinkingLevel: "high" }], undefined);
-        expect(seen.thinkingLevels).toEqual([...PI_THINKING_LEVELS, "ludicrous"]);
+        expect(draftChoices({ model: { provider: "", id: "" } }, [], undefined)).toEqual({ models: [] });
     });
     it("offers Pi's own catalog alongside what the frontend has seen, without duplicating either", () => {
         const catalog = [{ provider: "openai", id: "gpt-6", thinking: true }, { provider: "anthropic", id: "claude", thinking: true }, { provider: "", id: "", thinking: false }];
-        const cold = draftChoices({ model: { provider: "", id: "" }, thinkingLevel: "" }, [], undefined, catalog);
+        const cold = draftChoices({ model: { provider: "", id: "" } }, [], undefined, catalog);
         expect(cold.models).toEqual(["anthropic/claude", "openai/gpt-6"]);
-        const seen = draftChoices({ model: { provider: "anthropic", id: "claude" }, thinkingLevel: "" }, [], undefined, catalog);
+        const seen = draftChoices({ model: { provider: "anthropic", id: "claude" } }, [], undefined, catalog);
         expect(seen.models).toEqual(["anthropic/claude", "openai/gpt-6"]);
     });
     it("names why it has no models to offer and still takes a model typed in full", () => {
@@ -105,31 +97,8 @@ describe("list slash commands", () => {
     });
 });
 
-/** Read `pi --help`. It runs no inference, opens no session, and writes nothing. @param {string} executable */
-async function piHelp(executable) {
-    return new Promise((resolve, reject) => {
-        const child = spawn(executable, ["--help"], { stdio: ["ignore", "pipe", "pipe"], shell: false });
-        let stdout = "";
-        child.stdout.on("data", (chunk) => { stdout += String(chunk); });
-        child.once("error", reject);
-        child.once("exit", (code) => { if (code === 0) resolve(stdout); else reject(new Error(`pi --help exited ${code}`)); });
-    });
-}
-
-describe("installed pi thinking scale", () => {
-    const upgradeNotice = "The installed pi no longer names exactly the thinking levels PI_THINKING_LEVELS lists in app/list/list-commands.mjs, verified against pi 0.84.3. Update the constant to Pi's own off-to-max order; do not invent one.";
-
-    it("still names exactly the levels the list offers, in Pi's own order", async () => {
-        // No skip when pi is missing: a canary that quietly stops running stops being a canary.
-        const executable = await resolvePiExecutable({ pathEnv: process.env.PATH ?? "" });
-        const line = (await piHelp(executable.realpath)).split("\n").find((row) => row.trimStart().startsWith("--thinking"));
-        expect(line, upgradeNotice).toBeDefined();
-        const levels = String(line).slice(String(line).indexOf(":") + 1).split(",").map((level) => level.trim()).filter((level) => level !== "");
-        expect(levels, upgradeNotice).toEqual([...PI_THINKING_LEVELS]);
-    });
-
 describe("model values checked against Pi's catalog", () => {
-    const catalog = { models: ["anthropic/claude-opus-5", "openai-codex/gpt-5.6-sol"], thinkingLevels: ["high"] };
+    const catalog = { models: ["anthropic/claude-opus-5", "openai-codex/gpt-5.6-sol"] };
 
     it("refuses a model the catalog does not list, naming it", () => {
         // The menu hint reads /model [provider/id]; typing it literally launched a session Pi killed.
@@ -141,7 +110,6 @@ describe("model values checked against Pi's catalog", () => {
     });
 
     it("accepts anything when the catalog is unavailable, so an offline daemon cannot block a launch", () => {
-        expect(parseListCommand("/model local/whatever", { models: [], thinkingLevels: [] })).toMatchObject({ kind: "set_model", model: { provider: "local", id: "whatever" } });
+        expect(parseListCommand("/model local/whatever", { models: [] })).toMatchObject({ kind: "set_model", model: { provider: "local", id: "whatever" } });
     });
-});
 });

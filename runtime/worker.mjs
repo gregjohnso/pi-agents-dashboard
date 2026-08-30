@@ -29,7 +29,6 @@ export async function collectSessionMenu(adapter) {
   const state = await adapter.getState();
   const discovered = typeof adapter.getCommands === "function" ? await adapter.getCommands().catch(() => undefined) : undefined;
   const available = typeof adapter.getAvailableModels === "function" ? await adapter.getAvailableModels().catch(() => undefined) : undefined;
-  const levels = typeof adapter.getAvailableThinkingLevels === "function" ? await adapter.getAvailableThinkingLevels().catch(() => undefined) : undefined;
   const commands = (Array.isArray(discovered?.commands) ? discovered.commands : [])
     .map((/** @type {any} */ entry) => menuCommand(entry, "extension"))
     .filter((/** @type {any} */ entry) => entry !== undefined)
@@ -38,11 +37,8 @@ export async function collectSessionMenu(adapter) {
     .filter((/** @type {any} */ model) => typeof model?.provider === "string" && model.provider.length > 0 && typeof model?.id === "string" && model.id.length > 0)
     .map((/** @type {any} */ model) => ({ provider: model.provider, id: model.id }))
     .slice(0, MAX_MENU_ENTRIES);
-  const thinkingLevels = (Array.isArray(levels?.levels) ? levels.levels : [])
-    .filter((/** @type {unknown} */ level) => typeof level === "string" && level.length > 0)
-    .slice(0, MAX_MENU_ENTRIES);
   const model = typeof state?.model?.provider === "string" && typeof state?.model?.id === "string" ? { provider: state.model.provider, id: state.model.id } : null;
-  return { commands, models, thinkingLevels, model, thinkingLevel: typeof state?.thinkingLevel === "string" && state.thinkingLevel.length > 0 ? state.thinkingLevel : null };
+  return { commands, models, model };
 }
 
 /** Reject an unusable session command before any Pi write, so failures are never ambiguous. @param {any} request */
@@ -50,10 +46,6 @@ function assertSessionCommand(request) {
   const invalid = (/** @type {string} */ message) => Object.assign(new TypeError(message), { code: "INVALID_SESSION_COMMAND" });
   if (request?.command === "set_model") {
     if (typeof request.model?.provider !== "string" || typeof request.model?.id !== "string") throw invalid("session_command model is invalid");
-    return;
-  }
-  if (request?.command === "set_thinking_level") {
-    if (typeof request.level !== "string" || request.level.length === 0) throw invalid("session_command level is invalid");
     return;
   }
   if (request?.command === "set_session_name") {
@@ -67,7 +59,6 @@ function assertSessionCommand(request) {
 /** @param {any} adapter @param {any} request */
 function applySessionCommand(adapter, request) {
   if (request.command === "set_model") return adapter.setModel({ provider: request.model.provider, id: request.model.id });
-  if (request.command === "set_thinking_level") return adapter.setThinkingLevel(request.level);
   if (request.command === "set_session_name") return adapter.setSessionName(request.name.trim());
   if (request.command === "abort_retry") return adapter.abortRetry();
   return adapter.compact(typeof request.instructions === "string" && request.instructions.length > 0 ? request.instructions : undefined);

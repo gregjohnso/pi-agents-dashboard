@@ -15,7 +15,7 @@ import { parseViewerSnapshot } from "./viewer-contracts.mjs";
 /** @typedef {{text:string,generatedAt:string,model:{provider:string,id:string},sourceCursor:string}} SessionSummary */
 /** @typedef {{schemaVersion:1,revision:number,sessionId:string,sessionFile:string,canonicalSessionFile:string,cwd:string,name?:string,nameGenerated?:boolean,color?:SessionColor,model?:{provider:string,id:string},thinkingLevel?:string,taskState:TaskState,processState:ProcessState,outcome:Outcome,activity:{kind:string,summary:string,updatedAt:string},ownership?:WorkerOwnership,isolation?:IsolationRecord,latestRunId?:string,runtime?:RunRuntimeIdentity,summary?:SessionSummary,createdAt:string,updatedAt:string}} SessionRecord */
 /** @typedef {{mode:"worktree"}|{mode:"shared_directory",confirmedCwd:string,ownerSessionIds:string[]}} LaunchIsolation */
-/** @typedef {{prompt:string,cwd:string,sourceSessionId:string,isolation:LaunchIsolation,model?:{provider:string,id:string},thinkingLevel?:string,name?:string}} LaunchRequest */
+/** @typedef {{prompt:string,cwd:string,sourceSessionId:string,isolation:LaunchIsolation,model?:{provider:string,id:string},name?:string}} LaunchRequest */
 /** @typedef {{provider:string,id:string,thinking:boolean}} CatalogModel */
 /** @typedef {{daemonEpoch:string,sequence:string}} EventCursor */
 /** @typedef {{daemonEpoch:string,sessionId:string,sequence:string}} ViewerCursor */
@@ -33,7 +33,7 @@ export const SESSION_COLORS = ["sky", "green", "amber", "rose", "cyan", "gray"];
 
 const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries", "set_session_color", "get_models"];
 const COMMAND_STAGES = ["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED", "DELIVERY_UNKNOWN", "FAILED"];
-const SESSION_COMMANDS = ["set_model", "set_thinking_level", "compact", "set_session_name", "abort_retry"];
+const SESSION_COMMANDS = ["set_model", "compact", "set_session_name", "abort_retry"];
 const MAX_MENU_ENTRIES = 1_000;
 // Matches MAX_MODELS in runtime/pi-model-catalog.mjs, which stops reading `pi --list-models` there.
 const MAX_CATALOG_MODELS = 2_000;
@@ -132,7 +132,7 @@ function readJsonValue(value, path) {
 /** @param {unknown} value @returns {LaunchRequest} */
 function readLaunchRequest(value) {
   const launch = readRecord(value, "launch payload");
-  rejectUnknownKeys(launch, ["prompt", "cwd", "sourceSessionId", "isolation", "model", "thinkingLevel", "name"], "launch payload");
+  rejectUnknownKeys(launch, ["prompt", "cwd", "sourceSessionId", "isolation", "model", "name"], "launch payload");
   const isolation = readRecord(launch.isolation, "launch payload.isolation");
   const mode = readEnum(isolation, "mode", ["worktree", "shared_directory"], "launch payload.isolation.mode");
   /** @type {LaunchIsolation} */
@@ -150,7 +150,6 @@ function readLaunchRequest(value) {
     sourceSessionId: readIdentifier(launch, "sourceSessionId", "launch payload.sourceSessionId"), isolation: parsedIsolation,
   };
   if (Object.hasOwn(launch, "model")) Object.assign(parsed, { model: readModel(launch.model, "launch payload.model") });
-  if (Object.hasOwn(launch, "thinkingLevel")) Object.assign(parsed, { thinkingLevel: readIdentifier(launch, "thinkingLevel", "launch payload.thinkingLevel") });
   if (Object.hasOwn(launch, "name")) Object.assign(parsed, { name: readText(launch, "name", "launch payload.name") });
   return parsed;
 }
@@ -235,10 +234,6 @@ export function parseClientRequest(value) {
       rejectUnknownKeys(payload, ["sessionId", "command", "model"], "session_command payload");
       return { ...base, payload: { sessionId, command, model: readModel(payload.model, "session_command payload.model") } };
     }
-    if (command === "set_thinking_level") {
-      rejectUnknownKeys(payload, ["sessionId", "command", "level"], "session_command payload");
-      return { ...base, payload: { sessionId, command, level: readIdentifier(payload, "level", "session_command payload.level") } };
-    }
     if (command === "set_session_name") {
       rejectUnknownKeys(payload, ["sessionId", "command", "name"], "session_command payload");
       const name = readText(payload, "name", "session_command payload.name");
@@ -322,9 +317,9 @@ function validateRuntimeIdentity(value, path) {
 /** @param {Record<string, any>} result */
 function validateSessionCommands(result) {
   const path = "daemon response.result";
-  requireKeys(result, ["kind", "sessionId", "commands", "models", "thinkingLevels", "model", "thinkingLevel"], [], path);
+  requireKeys(result, ["kind", "sessionId", "commands", "models", "model"], [], path);
   readIdentifier(result, "sessionId", `${path}.sessionId`);
-  for (const key of ["commands", "models", "thinkingLevels"]) {
+  for (const key of ["commands", "models"]) {
     if (!Array.isArray(result[key]) || result[key].length > MAX_MENU_ENTRIES) throw new TypeError(`${path}.${key} must be a bounded array`);
   }
   result.commands.forEach((/** @type {unknown} */ entry, /** @type {number} */ index) => {
@@ -335,11 +330,7 @@ function validateSessionCommands(result) {
     for (const key of ["description", "argumentHint"]) if (Object.hasOwn(command, key) && typeof command[key] !== "string") throw new TypeError(`${path}.commands[${index}].${key} must be a string`);
   });
   result.models.forEach((/** @type {unknown} */ entry, /** @type {number} */ index) => readModel(entry, `${path}.models[${index}]`));
-  result.thinkingLevels.forEach((/** @type {unknown} */ level, /** @type {number} */ index) => {
-    if (typeof level !== "string" || level.length === 0) throw new TypeError(`${path}.thinkingLevels[${index}] must be a non-empty string`);
-  });
   if (result.model !== null) readModel(result.model, `${path}.model`);
-  if (result.thinkingLevel !== null && (typeof result.thinkingLevel !== "string" || result.thinkingLevel.length === 0)) throw new TypeError(`${path}.thinkingLevel must be a non-empty string or null`);
 }
 
 /** Parse one strict version-1 daemon response. @param {unknown} value @returns {DaemonResponse} */

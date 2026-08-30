@@ -46,7 +46,8 @@ describe("dashboard overlays", () => {
         expect(described.title).toBe("Commands");
         expect(described.rows[0].text.startsWith("❯")).toBe(false);
         expect(described.rows[1].text).toContain("❯");
-        expect(described.rows[1].text).toContain("/thinking [level]");
+        expect(described.rows[1].text).toContain("/cwd <path>");
+        expect(described.rows.every((/** @type {{text:string}} */ row) => !row.text.includes("/thinking"))).toBe(true);
         expect(describeOverlay(createCommandMenuOverlay("/zz", 0)).rows[0].text).toContain("/model");
     });
     it("windows a long picker around the selected value and counts it in the title", () => {
@@ -89,9 +90,11 @@ describe("dashboard overlays", () => {
         expect(keys.join(" ")).not.toContain("Ctrl+J");
         expect(keys.join(" ")).not.toContain("Tab");
         expect(keys.join(" ")).toContain("Ctrl+W");
+        // Thinking is Pi's to set, so the help text offers no key or command for it.
+        expect(createHelpOverlay().bindings.map((binding) => `${binding.keys} ${binding.action}`).join(" ")).not.toContain("thinking");
     });
     it("starts a picker on the current value, or on the first when it is unset", () => {
         expect(createChoiceOverlay("isolation", "Isolation", ["worktree", "shared_directory"], "shared_directory")).toMatchObject({ kind: "choice", field: "isolation", index: 1 });
-        expect(createChoiceOverlay("thinking", "Thinking", ["high", "off"], "").index).toBe(0);
+        expect(createChoiceOverlay("model", "Model", ["anthropic/claude", "openai/gpt"], "").index).toBe(0);
     });
 });

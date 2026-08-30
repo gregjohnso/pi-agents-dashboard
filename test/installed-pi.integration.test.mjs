@@ -31,12 +31,13 @@ async function setup() {
   return { root, runs, registry, executable, sessionFile, log: join(root, "pi.log") };
 }
 
-it("omits optional launch flags by default and includes only selected model, thinking, and name flags", async () => {
+it("omits optional launch flags by default and includes only selected model and name flags", async () => {
   const { root, runs, registry, executable, sessionFile, log } = await setup();
   const supervisor = new WorkerSupervisor({ registry, runsDirectory: runs, configuredPiPath: executable, env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_EXIT_MS: "700" }, startTimeoutMs: 2_000 });
   await supervisor.launch({ sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-options", model: { provider: "fake provider", id: "model;id" }, thinkingLevel: "high", name: "name with spaces" });
   const childStart = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line)).find((entry) => entry.kind === "start" && entry.argv.includes(sessionFile));
-  expect(childStart.argv).toEqual(["--mode", "rpc", "--session", sessionFile, "--provider", "fake provider", "--model", "model;id", "--thinking", "high", "--name", "name with spaces"]);
+  // Pi restores its own thinking level from the session file, so no launch selects one.
+  expect(childStart.argv).toEqual(["--mode", "rpc", "--session", sessionFile, "--provider", "fake provider", "--model", "model;id", "--name", "name with spaces"]);
   await supervisor.close();
 });
 

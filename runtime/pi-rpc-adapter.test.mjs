@@ -36,6 +36,14 @@ function fakeRpcProcess(onCommand = () => {}) {
   return child;
 }
 
+/** Resolve to `"stalled"` when a promise outlives the wait, so a hang reads as a hang. @param {Promise<any>} promise @param {number} ms */
+async function settledWithin(promise, ms) {
+  return Promise.race([
+    promise.then((value) => ({ value }), (error) => error),
+    new Promise((resolve) => setTimeout(() => resolve("stalled"), ms)),
+  ]);
+}
+
 it("uses the public RPC entry with structured argv and an exact environment", async () => {
   /** @type {any[]} */
   const calls = [];
@@ -294,6 +302,50 @@ it("refuses a thinking level the worker no longer applies to Pi", async () => {
     .rejects.toMatchObject({ code: "INVALID_SESSION_COMMAND" });
   expect(setThinkingLevel).not.toHaveBeenCalled();
   expect(records.map((record) => record.stage)).toEqual(["RECEIVED", "FAILED"]);
+});
+
+// Operator-visible failure: a Pi that answers nothing held the worker's serialized command queue
+// open forever, so every later command for that session waited behind it with no error to show.
+it("expires a request Pi never answers and keeps the adapter usable", async () => {
+  const child = fakeRpcProcess((command, process) => {
+    if (command.type === "get_state") process.stdout.write(`${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true, data: { sessionId: "still-usable" } })}\n`);
+  });
+  const adapter = PiRpcAdapter.connect({ input: child.stdin, output: child.stdout, requestTimeoutMs: 20 });
+
+  expect(await settledWithin(adapter.prompt("never answered"), 500)).toMatchObject({ code: "RPC_TIMEOUT", acknowledged: false });
+  expect(await settledWithin(adapter.getState(), 500)).toEqual({ value: { sessionId: "still-usable" } });
+  await adapter.close();
+});
+
+it("ignores a late response for an expired request instead of failing the whole adapter", async () => {
+  /** @type {any} */
+  let held;
+  const child = fakeRpcProcess((command, process) => {
+    if (command.type === "prompt") held = command;
+    else process.stdout.write(`${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true, data: { sessionId: "still-usable" } })}\n`);
+  });
+  const adapter = PiRpcAdapter.connect({ input: child.stdin, output: child.stdout, requestTimeoutMs: 20 });
+
+  expect(await settledWithin(adapter.prompt("answered too late"), 500)).toMatchObject({ code: "RPC_TIMEOUT" });
+  child.stdout.write(`${JSON.stringify({ id: held.id, type: "response", command: "prompt", success: true })}\n`);
+  expect(await settledWithin(adapter.getState(), 500)).toEqual({ value: { sessionId: "still-usable" } });
+  await adapter.close();
+});
+
+// The bytes may already have reached Pi, so an expiry is ambiguous delivery, never a failure.
+it("records an expired Pi request as ambiguous delivery", async () => {
+  /** @type {any[]} */
+  const records = [];
+  const replay = await createWorkerReplayStore({ append: async (record) => { records.push(record); } });
+  const child = fakeRpcProcess(() => {});
+  const adapter = PiRpcAdapter.connect({ input: child.stdin, output: child.stdout, requestTimeoutMs: 20 });
+  const dispatcher = createWorkerCommandDispatcher({ replay, adapter });
+
+  expect(await settledWithin(dispatcher.deliver({ clientId: "client", requestId: "expired", op: "prompt", text: "hello" }), 500))
+    .toMatchObject({ code: "DELIVERY_UNKNOWN", deliveryUnknown: true });
+  expect(records.map((record) => record.stage)).toEqual(["RECEIVED", "RPC_WRITE_STARTED", "DELIVERY_UNKNOWN"]);
+  expect(records.at(-1).error).toMatchObject({ code: "RPC_TIMEOUT" });
+  await adapter.close();
 });
 
 it("sends one-way UI responses without blocking the next correlated command", async () => {

@@ -237,7 +237,23 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                         continue;
                     }
                     if (typeof record === "object" && record !== null && Object.hasOwn(record, "requestId")) {
-                        const response = parseDaemonResponse(record);
+                        let response;
+                        try {
+                            response = parseDaemonResponse(record);
+                        }
+                        catch (error) {
+                            // A skewed response frame belongs to exactly one request. Rejecting that one
+                            // request keeps the connection, so a two-field contract skew cannot become a
+                            // reconnect-and-resend storm. A frame no request owns still falls through to
+                            // the fatal path below.
+                            const claimed = /** @type {{ requestId?: unknown }} */ (record).requestId;
+                            const owner = typeof claimed === "string" ? pending.get(claimed) : undefined;
+                            if (owner === undefined)
+                                throw error;
+                            pending.delete(/** @type {string} */ (claimed));
+                            owner.reject(Object.assign(new DaemonClientError("MALFORMED_RESPONSE", error instanceof Error ? error.message : "Daemon response could not be parsed"), { submitted: true, cause: error }));
+                            continue;
+                        }
                         const item = pending.get(response.requestId);
                         if (item === undefined)
                             continue;

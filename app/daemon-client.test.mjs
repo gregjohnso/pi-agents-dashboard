@@ -145,18 +145,50 @@ describe("daemon client", () => {
     await iterator.return?.();
   });
 
-  it("retains a pending state request when a malformed frame arrives and accepts a valid retry", async () => {
-    const [sent, malformed, expected] = [request, { kind: "state", sessions: "invalid" }, emptyState];
+  // Operator-visible failure: a two-field response skew froze the dashboard. The unparseable frame
+  // destroyed the connection, and every reconnect resent the request that provoked it.
+  it("rejects only the request whose response cannot be parsed and keeps the connection", async () => {
+    const malformed = { kind: "state", sessions: "invalid" };
     const socketPath = await socketPathIn("client-malformed-response-");
-    const server = await daemonServer(socketPath, ({ socket, request: incoming, connection, reply }) => {
-      if (connection === 1) socket.write(encodeJsonl({ version: 1, requestId: incoming.requestId, ok: true, result: malformed }), () => socket.destroy());
-      else reply(expected);
+    const server = await daemonServer(socketPath, ({ socket, request: incoming, reply }) => {
+      if (incoming.requestId === "skewed-request") socket.write(encodeJsonl({ version: 1, requestId: incoming.requestId, ok: true, result: malformed }));
+      else reply(emptyState);
     });
     const client = startClient({ socketPath, reconnectDelayMs: 1 });
     /** @type {any[]} */
     const fatalErrors = [];
     client.onFatalError?.((error) => fatalErrors.push(error));
-    await expect(within(client.request(sent))).resolves.toMatchObject({ ok: true, result: expected });
+    await expect(within(client.request({ ...request, requestId: "skewed-request" }))).rejects.toMatchObject({ code: "MALFORMED_RESPONSE", submitted: true });
+    await expect(within(client.request({ ...request, requestId: "sound-request" }))).resolves.toMatchObject({ ok: true, result: emptyState });
+    expect({ connections: server.connections, requests: server.requests }).toEqual({ connections: 1, requests: 2 });
+    expect(fatalErrors).toEqual([]);
+  });
+
+  // Operator-visible failure: one unparseable response frame produced 6676 reconnects at about 222
+  // per second against the live daemon, because reconnect resent every pending request.
+  it("does not reconnect and resend a request whose response cannot be parsed", async () => {
+    const socketPath = await socketPathIn("client-response-storm-");
+    const server = await daemonServer(socketPath, ({ socket, request: incoming }) => {
+      socket.write(encodeJsonl({ version: 1, requestId: incoming.requestId, ok: true, result: { kind: "state", sessions: "invalid" } }));
+    });
+    const client = startClient({ socketPath, reconnectDelayMs: 1 });
+    await expect(within(client.request(request))).rejects.toMatchObject({ code: "MALFORMED_RESPONSE" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect({ connections: server.connections, requests: server.requests }).toEqual({ connections: 1, requests: 1 });
+  });
+
+  // A frame no request can own tells the client nothing about what to retry, so it stays fatal.
+  it("keeps an unparseable frame that belongs to no request fatal without failing a live request", async () => {
+    const socketPath = await socketPathIn("client-unattributed-");
+    const server = await daemonServer(socketPath, ({ socket, connection, reply }) => {
+      if (connection === 1) socket.write(encodeJsonl({ version: 1, requestId: "belongs-to-nobody", ok: true, result: { kind: "state", sessions: "invalid" } }));
+      else reply(emptyState);
+    });
+    const client = startClient({ socketPath, reconnectDelayMs: 1 });
+    /** @type {any[]} */
+    const fatalErrors = [];
+    client.onFatalError?.((error) => fatalErrors.push(error));
+    await expect(within(client.request(request))).resolves.toMatchObject({ ok: true, result: emptyState });
     expect(server.connections).toBe(2);
     expect(fatalErrors).toEqual([expect.objectContaining({ code: "MALFORMED_FRAME" })]);
   });
@@ -211,22 +243,34 @@ describe("daemon client", () => {
     await iterator.return?.();
   });
 
-  it("drops a malformed event and reconnects before dispatching a valid event", async () => {
+  // A broadcast frame belongs to no request, so dropping it would leave a gap in an ordered stream
+  // that no consumer can name or refetch. It stays fatal, and the reconnect resubscribes.
+  it("keeps a malformed event fatal, resubscribes, and retains the request it interrupted", async () => {
     const socketPath = await socketPathIn("client-malformed-event-");
     const executable = { realpath: "/installed/pi", device: "1", inode: "2", size: 3, modifiedTimeNs: "4" };
     const identity = { pid: 10, startIdentity: "start", processGroupId: 10 };
     const runtime = { executable, piVersion: "1.0.0", capabilities: { executable, reportedVersion: "1.0.0", rpcMode: true, jsonl: true, commands: ["get_state", "prompt", "follow_up", "steer", "abort", "extension_ui_response"], events: ["required_live_events"], missingRequired: [] }, rpcAdapterVersion: 1, viewerProtocolVersion: 1, supervisor: identity, piChild: identity };
     const session = { schemaVersion: 1, revision: 1, sessionId: "s", sessionFile: "/sessions/s.jsonl", canonicalSessionFile: "/sessions/s.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "launching", summary: "Starting", updatedAt: "2026-01-01T00:00:00.000Z" }, runtime, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" };
     const validEvent = { version: 1, cursor: { daemonEpoch: "epoch-1", sequence: "1" }, occurredAt: "2026-01-01T00:00:00.000Z", kind: "session_changed", payload: { session } };
-    const server = await daemonServer(socketPath, ({ socket, connection, reply }) => {
+    const server = await daemonServer(socketPath, ({ socket, request: incoming, connection, reply }) => {
+      if (incoming.op !== "subscribe") {
+        if (connection === 2) reply(emptyState);
+        return;
+      }
       reply({ kind: "subscribed", cursor: { daemonEpoch: "epoch-1", sequence: "0" } });
-      if (connection === 1) socket.write(encodeJsonl({ ...validEvent, cursor: { daemonEpoch: "epoch-1", sequence: 1 } }), () => socket.destroy());
+      if (connection === 1) socket.write(encodeJsonl({ ...validEvent, cursor: { daemonEpoch: "epoch-1", sequence: 1 } }));
       else socket.write(encodeJsonl(validEvent));
     });
     const client = startClient({ socketPath, maxBytes: 4096, reconnectDelayMs: 1 });
+    /** @type {any[]} */
+    const fatalErrors = [];
+    client.onFatalError?.((error) => fatalErrors.push(error));
+    const interrupted = client.request(request);
     const iterator = client.subscribe({ daemonEpoch: "epoch-1", sequence: "0" })[Symbol.asyncIterator]();
     await expect(within(iterator.next())).resolves.toMatchObject({ value: validEvent, done: false });
+    await expect(within(interrupted)).resolves.toMatchObject({ ok: true, result: emptyState });
     expect(server.connections).toBe(2);
+    expect(fatalErrors).toEqual([expect.objectContaining({ code: "MALFORMED_FRAME" })]);
     await iterator.return?.();
   });
 

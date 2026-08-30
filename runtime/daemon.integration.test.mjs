@@ -94,6 +94,7 @@ function startPersistentFakeWorker(config, worker) {
           commandCount += 1;
           commandIds.push(frame.id);
           commands.push(frame.command);
+          if (worker.silent === true) return;
           if (worker.results !== undefined) {
             void connection.send({ version: 1, type: "command_result", token: worker.token, id: frame.id, ok: true, record: { clientId: frame.command.clientId, requestId: frame.command.requestId, op: frame.command.op, stage: "RPC_ACKNOWLEDGED", at: new Date().toISOString(), result: worker.results[frame.command.op] ?? null } });
             return;
@@ -594,6 +595,35 @@ it("refuses a session query and serves session toggles from the owning worker", 
   const delivered = worker.commands.filter((/** @type {any} */ command) => !["get_session_commands", "get_state"].includes(command.op));
   expect(delivered.map((/** @type {any} */ command) => command.op)).toEqual(["session_command"]);
   expect(delivered[0].sessionCommand).toEqual({ command: "abort_retry" });
+  client.close();
+});
+
+// Operator-visible failure: a Pi that answers nothing left the request pending in the daemon with
+// no reply and no journal movement, so the dashboard showed a command that never finished.
+it("bounds a worker request that is never answered and records it as ambiguous", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const identity = { pid: 441, startIdentity: "silent-worker", processGroupId: 441 };
+  const piChild = { pid: 442, startIdentity: "silent-pi", processGroupId: 441 };
+  const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === 441 ? identity : piChild;
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const now = "2026-08-25T12:00:00.000Z";
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "silent", sessionFile: "/sessions/silent.jsonl", canonicalSessionFile: "/sessions/silent.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-silent", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-silent", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "silent", runId: "run-silent", leaseId: "lease-silent", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  const runtime = await createDaemonRuntime({ root: stateRoot, inspect, workerRequestTimeoutMs: 150 });
+  runtimes.push(runtime);
+  const worker = startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "silent", runId: "run-silent", leaseId: "lease-silent", generation: 1, identity, piChildIdentity: piChild, token: "silent-token", silent: true });
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
+  await client.ready;
+  client.send({ version: 1, clientId: "viewer", requestId: "attach-silent", op: "attach", payload: { sessionId: "silent", role: "composer" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+
+  client.send({ version: 1, clientId: "viewer", requestId: "prompt-silent", op: "prompt", payload: { sessionId: "silent", text: "hello" } });
+  const settled = await Promise.race([client.next(), new Promise((resolve) => setTimeout(() => resolve("stalled"), 3_000))]);
+  // Ambiguous, never FAILED: the command's bytes may already have reached Pi.
+  expect(settled).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "DELIVERY_UNKNOWN" } } });
+  expect(worker.commands.filter((/** @type {any} */ command) => command.op === "prompt")).toHaveLength(1);
   client.close();
 });
 

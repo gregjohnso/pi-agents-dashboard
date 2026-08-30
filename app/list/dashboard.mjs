@@ -73,7 +73,7 @@ export function createDaemonDashboardBackend({ client, clientId, preflight, requ
             attached = true;
             try { response = await transactionRequest(operation, { sessionId, revision }, exactRequestId); }
             catch (error) {
-                if (["CONNECTION_CLOSED", "MALFORMED_FRAME", "INVALID_DAEMON_RESPONSE", "UNEXPECTED_DAEMON_RESPONSE"].includes(error?.code)) throw Object.assign(new Error(`${operation === "stop" ? "Stop" : "Delete"} delivery is ambiguous`), { code: "DELIVERY_UNKNOWN", clientId, requestId: exactRequestId });
+                if (["CONNECTION_CLOSED", "MALFORMED_FRAME", "MALFORMED_RESPONSE", "INVALID_DAEMON_RESPONSE", "UNEXPECTED_DAEMON_RESPONSE"].includes(error?.code)) throw Object.assign(new Error(`${operation === "stop" ? "Stop" : "Delete"} delivery is ambiguous`), { code: "DELIVERY_UNKNOWN", clientId, requestId: exactRequestId });
                 throw error;
             }
             return response;

@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
-import { DEFAULT_STOP_ESCALATION_MS, createDaemonRequester, destructiveRequestTimeoutMs, loadCliClientIdentity, runAgentsCommand, runSessionCommand } from "./session-commands.mjs";
+import { DEFAULT_STOP_ESCALATION_MS, createDaemonRequester, createPersistentDaemonRequester, destructiveRequestTimeoutMs, loadCliClientIdentity, runAgentsCommand, runSessionCommand } from "./session-commands.mjs";
 
 const roots = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
@@ -363,6 +363,16 @@ it.each([
   const server = await daemonServer(root, (socket, encoder) => socket.write(encoder.encode(frame)));
   const requester = createDaemonRequester({ root, clientId: "cli-stable", maxBytes: 4096, timeoutMs: 200 });
   await expect(requester("get_state", {}, "strict-request")).rejects.toMatchObject({ code });
+  await closeServer(server);
+});
+
+// The request reached the daemon and its answer was unusable, so the delete may already have run.
+it("classifies a destructive response that cannot be parsed as delivery unknown", async () => {
+  const root = await stateRoot();
+  const server = await daemonServer(root, (socket, encoder, frame) => socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "command", status: { stage: "MYSTERY" } } })));
+  const requester = await createPersistentDaemonRequester({ root, clientId: "cli-stable", maxBytes: 4096, timeoutMs: 2_000 });
+  await expect(requester.request("delete", { sessionId: "exact", revision: 1 }, "unparseable-request")).rejects.toMatchObject({ code: "DELIVERY_UNKNOWN", clientId: "cli-stable", requestId: "unparseable-request", submitted: true });
+  await requester.close();
   await closeServer(server);
 });
 

@@ -287,6 +287,82 @@ it("keeps a live worker's token in mode-0600 worker metadata across reconciliati
   await recovered.close();
 });
 
+/** Build one adoptable live worker whose recorded metadata carries the supplied release fields. @param {string} root @param {string} sessionId @param {Record<string, any>} fields */
+async function liveWorker(root, sessionId, fields) {
+  const pid = 700 + [...sessionId].reduce((total, character) => total + character.charCodeAt(0), 0) % 90;
+  const worker = { pid, startIdentity: `${sessionId}-worker`, processGroupId: pid };
+  const piChild = { pid: pid + 100, startIdentity: `${sessionId}-pi`, processGroupId: pid };
+  const registry = new RegistryStore(join(root, "sessions"));
+  await registry.create(record(sessionId, worker));
+  return {
+    worker, piChild,
+    metadata: { sessionId, runId: `run-${sessionId}`, leaseId: `lease-${sessionId}`, generation: 1, identity: worker, piChildIdentity: piChild, token: `${sessionId}-token`, ...fields },
+    ready: { version: 1, type: "worker_ready", token: `${sessionId}-token`, sessionId, runId: `run-${sessionId}`, leaseId: `lease-${sessionId}`, generation: 1, worker, piChild },
+  };
+}
+
+/** @param {string} root @param {any[]} workers @param {string} cliVersion */
+async function releaseRouter(root, workers, cliVersion) {
+  const identities = new Map(workers.flatMap(({ worker, piChild }) => [[worker.pid, worker], [piChild.pid, piChild]]));
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: workers.map((entry) => entry.metadata) })}\n`, { mode: 0o600 });
+  const registry = new RegistryStore(join(root, "sessions"));
+  const router = new RecoveredWorkerRouter({ registry, cliVersion, metadataPath: join(root, "daemon", "workers.json"), inspect: async (/** @type {number} */ pid) => identities.get(pid) ?? Promise.reject(Object.assign(new Error("gone"), { code: "ESRCH" })) });
+  await router.load();
+  return router;
+}
+
+/** @param {string} root */
+async function persistedWorkers(root) {
+  return JSON.parse(await readFile(join(root, "daemon", "workers.json"), "utf8")).workers;
+}
+
+// Operator-visible failure: a replacement daemon that compared releases before adopting would refuse
+// a live worker for being out of date, and the operator would lose an unsaved session to an upgrade.
+it("adopts every protocol-compatible route before comparing releases and persists the generation it adopted", async () => {
+  const root = await fixture();
+  const older = await liveWorker(root, "older", { cliVersion: "1.9.0" });
+  const equal = await liveWorker(root, "equal", { cliVersion: "2.0.0" });
+  const newer = await liveWorker(root, "newer", { cliVersion: "2.1.0" });
+  const unknown = await liveWorker(root, "unknown", {});
+  // A release this daemon cannot compare is unknown, never a downgrade.
+  const unparseable = await liveWorker(root, "unparseable", { cliVersion: "nightly-2026-08-30" });
+  const router = await releaseRouter(root, [older, equal, newer, unknown, unparseable], "2.0.0");
+
+  for (const live of [older, equal, newer, unknown, unparseable]) {
+    await expect(router.adopt(live.ready, fakeConnection())).resolves.toMatchObject({ routeGeneration: 1 });
+  }
+
+  // A live authenticated version-1 route is what supplies the protocol a baseline record never wrote.
+  expect(await persistedWorkers(root)).toEqual(expect.arrayContaining([expect.objectContaining({ sessionId: "unknown", proto: 1, routeGeneration: 1 })]));
+  expect((await persistedWorkers(root)).every((/** @type {any} */ entry) => entry.proto === 1 && entry.routeGeneration === 1)).toBe(true);
+  expect(["older", "equal", "newer", "unknown", "unparseable"].map((sessionId) => router.releaseStatus(sessionId))).toEqual(["STALE", "CURRENT", "NEWER", "UNKNOWN", "UNKNOWN"]);
+  await router.close();
+});
+
+it("leaves a worker whose recorded protocol this daemon does not speak unavailable and untouched", async () => {
+  const root = await fixture();
+  const future = await liveWorker(root, "future", { proto: 2, cliVersion: "9.0.0" });
+  const router = await releaseRouter(root, [future], "2.0.0");
+
+  await expect(router.adopt(future.ready, fakeConnection())).rejects.toMatchObject({ code: "WORKER_PROTOCOL_INCOMPATIBLE" });
+
+  expect(router.route("future")).toBeUndefined();
+  expect(await persistedWorkers(root)).toEqual([future.metadata]);
+  await router.close();
+});
+
+// Gate 1 records the first public route-generation baseline and later gates compare against it, so a
+// generation that restarts at one on every daemon start reports a reconnect that never happened.
+it("continues route generations across a replacement daemon", async () => {
+  const root = await fixture();
+  const live = await liveWorker(root, "resumed", { cliVersion: "2.0.0", proto: 1, routeGeneration: 3 });
+  const router = await releaseRouter(root, [live], "2.0.0");
+
+  await expect(router.adopt(live.ready, fakeConnection())).resolves.toMatchObject({ routeGeneration: 4 });
+  expect(await persistedWorkers(root)).toEqual([{ ...live.metadata, routeGeneration: 4 }]);
+  await router.close();
+});
+
 it("inherits nothing from a run that was reserved but never spawned its worker", async () => {
   const root = await fixture();
   const metadataPath = join(root, "daemon", "workers.json");

@@ -17,6 +17,31 @@ import { createViewerStore } from "./viewer-store.mjs";
 const LAUNCH_CONTROL_TYPES = ["pi_child", "worker_ready"];
 /** A startup connection holds only what the launch has not consumed yet; a flood is a defect, not backpressure. */
 const MAX_RESERVATION_BUFFERED_FRAMES = 256;
+/** The worker socket protocol this daemon speaks, recorded per worker and independent of any release. */
+const WORKER_PROTOCOL_VERSION = 1;
+const SEMANTIC_VERSION = /^(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?$/u;
+
+/**
+ * Compare one worker's release with this daemon's release. Callers compare only after the route is
+ * adopted, so an old worker never blocks startup.
+ *
+ * Only the numeric major, minor, and patch parts decide the answer; a prerelease or build suffix on
+ * the same triple is the same release. Anything absent or unparseable is UNKNOWN, which follows the
+ * stale path and is never treated as a downgrade.
+ *
+ * @param {unknown} workerVersion @param {unknown} daemonVersion
+ * @returns {"CURRENT" | "STALE" | "NEWER" | "UNKNOWN"}
+ */
+function workerReleaseStatus(workerVersion, daemonVersion) {
+  const worker = typeof workerVersion === "string" ? SEMANTIC_VERSION.exec(workerVersion) : null;
+  const daemon = typeof daemonVersion === "string" ? SEMANTIC_VERSION.exec(daemonVersion) : null;
+  if (worker === null || daemon === null) return "UNKNOWN";
+  for (let part = 1; part <= 3; part += 1) {
+    const difference = Number(worker[part]) - Number(daemon[part]);
+    if (difference !== 0) return difference < 0 ? "STALE" : "NEWER";
+  }
+  return "CURRENT";
+}
 
 /** @param {any} left @param {any} right */
 function sameIdentity(left, right) {
@@ -203,9 +228,10 @@ function validIdentity(value) {
  * @param {any} worker
  */
 function validateWorkerMetadata(worker) {
-  const allowed = ["sessionId", "runId", "leaseId", "generation", "identity", "piChildIdentity", "token", "cliVersion"];
+  const allowed = ["sessionId", "runId", "leaseId", "generation", "identity", "piChildIdentity", "token", "proto", "cliVersion", "routeGeneration"];
   const bound = worker?.identity !== undefined || worker?.piChildIdentity !== undefined;
-  if (typeof worker !== "object" || worker === null || Array.isArray(worker) || Object.keys(worker).some((key) => !allowed.includes(key)) || [worker.sessionId, worker.runId, worker.leaseId].some((value) => typeof value !== "string" || value.length === 0) || !Number.isSafeInteger(worker.generation) || worker.generation <= 0 || (bound && (!validIdentity(worker.identity) || !validIdentity(worker.piChildIdentity))) || (worker.token !== undefined && (typeof worker.token !== "string" || worker.token.length === 0)) || (worker.cliVersion !== undefined && (typeof worker.cliVersion !== "string" || worker.cliVersion.length === 0))) throw new TypeError("Worker recovery metadata record is invalid");
+  const counter = (/** @type {unknown} */ value) => value === undefined || (Number.isSafeInteger(value) && /** @type {number} */ (value) > 0);
+  if (typeof worker !== "object" || worker === null || Array.isArray(worker) || Object.keys(worker).some((key) => !allowed.includes(key)) || [worker.sessionId, worker.runId, worker.leaseId].some((value) => typeof value !== "string" || value.length === 0) || !Number.isSafeInteger(worker.generation) || worker.generation <= 0 || (bound && (!validIdentity(worker.identity) || !validIdentity(worker.piChildIdentity))) || (worker.token !== undefined && (typeof worker.token !== "string" || worker.token.length === 0)) || !counter(worker.proto) || !counter(worker.routeGeneration) || (worker.cliVersion !== undefined && (typeof worker.cliVersion !== "string" || worker.cliVersion.length === 0))) throw new TypeError("Worker recovery metadata record is invalid");
   return worker;
 }
 
@@ -256,13 +282,15 @@ export class RecoveredWorkerRouter {
   /** @type {Map<string, LaunchReservation>} */
   #reservations = new Map();
   #bindTimeoutMs;
+  #cliVersion;
 
-  /** @param {{ registry: RegistryStore, inspect(pid: number): Promise<any>, metadataPath: string, bindTimeoutMs?: number }} options */
-  constructor({ registry, inspect, metadataPath, bindTimeoutMs = 15_000 }) {
+  /** @param {{ registry: RegistryStore, inspect(pid: number): Promise<any>, metadataPath: string, bindTimeoutMs?: number, cliVersion?: string }} options */
+  constructor({ registry, inspect, metadataPath, bindTimeoutMs = 15_000, cliVersion = undefined }) {
     this.#registry = registry;
     this.#inspect = inspect;
     this.#metadataPath = metadataPath;
     this.#bindTimeoutMs = bindTimeoutMs;
+    this.#cliVersion = cliVersion;
     this.#lifecycle = registryCoordinationScope(registry).lifecycle;
   }
 
@@ -280,6 +308,9 @@ export class RecoveredWorkerRouter {
         // replacement daemon inherits nothing from it.
         if (worker.identity === undefined) continue;
         this.#workers.set(worker.sessionId, worker);
+        // Route generations continue across daemon restarts, so a public generation that changed
+        // reports a real reconnect rather than this daemon's own counter starting over.
+        if (worker.routeGeneration !== undefined) this.#routeGenerations.set(worker.sessionId, worker.routeGeneration);
       }
     } catch (error) {
       if (!(error instanceof Error) || /** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT") throw error;
@@ -306,6 +337,7 @@ export class RecoveredWorkerRouter {
         leaseId: launch.leaseId,
         generation: launch.generation,
         token: launch.token,
+        proto: WORKER_PROTOCOL_VERSION,
         ...(launch.cliVersion === undefined ? {} : { cliVersion: launch.cliVersion }),
       });
       this.#workers.set(launch.sessionId, worker);
@@ -354,6 +386,7 @@ export class RecoveredWorkerRouter {
         identity: handle.identity,
         piChildIdentity: handle.piChildIdentity,
         ...(carried?.token === undefined ? {} : { token: carried.token }),
+        proto: WORKER_PROTOCOL_VERSION,
         ...(carried?.cliVersion === undefined ? {} : { cliVersion: carried.cliVersion }),
       });
       await this.#persist();
@@ -383,6 +416,11 @@ export class RecoveredWorkerRouter {
     return this.#workers.get(sessionId);
   }
 
+  /** Compare one worker's recorded release with this daemon's, which callers do only after adoption. @param {string} sessionId */
+  releaseStatus(sessionId) {
+    return workerReleaseStatus(this.#workers.get(sessionId)?.cliVersion, this.#cliVersion);
+  }
+
   connectedSessionIds() {
     return [...this.#routes.keys()];
   }
@@ -402,6 +440,9 @@ export class RecoveredWorkerRouter {
       const expected = this.#workers.get(frame.sessionId);
       if (expected === undefined || expected.runId !== frame.runId || expected.leaseId !== frame.leaseId || expected.generation !== frame.generation || !sameIdentity(expected.identity, frame.worker) || !sameIdentity(expected.piChildIdentity, frame.piChild)) throw Object.assign(new Error("Worker ownership or generation conflicts with durable state"), { code: "OWNERSHIP_CONFLICT" });
       if (expected.token !== undefined && expected.token !== frame.token) throw Object.assign(new Error("Worker authentication failed"), { code: "WORKER_AUTHENTICATION_FAILED" });
+      // Protocol compatibility is decided before anything else about this worker, and an incompatible
+      // one simply stays unreachable: nothing here signals the process it belongs to.
+      if (expected.proto !== undefined && expected.proto !== WORKER_PROTOCOL_VERSION) throw Object.assign(new Error(`Worker speaks protocol ${expected.proto}, not ${WORKER_PROTOCOL_VERSION}`), { code: "WORKER_PROTOCOL_INCOMPATIBLE" });
       const routeGeneration = (this.#routeGenerations.get(frame.sessionId) ?? 0) + 1;
       this.#routeGenerations.set(frame.sessionId, routeGeneration);
       const record = await this.#registry.get(frame.sessionId);
@@ -416,8 +457,11 @@ export class RecoveredWorkerRouter {
       if (expected.token === undefined) {
         if (typeof frame.token !== "string" || frame.token.length === 0) throw Object.assign(new Error("Worker authentication token is missing"), { code: "WORKER_AUTHENTICATION_FAILED" });
         expected.token = frame.token;
-        await this.#persist();
       }
+      // An authenticated live version-1 route is itself the proof of a baseline record's protocol.
+      expected.proto = WORKER_PROTOCOL_VERSION;
+      expected.routeGeneration = routeGeneration;
+      await this.#persist();
       const previous = this.#routes.get(frame.sessionId);
       const route = { connection, metadata: expected, routeGeneration };
       this.#routes.set(frame.sessionId, route);

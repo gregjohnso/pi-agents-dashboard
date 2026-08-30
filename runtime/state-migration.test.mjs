@@ -106,6 +106,8 @@ it.each([
   ["frontend-state.json", JSON.stringify({ schemaVersion: 1, clientId: "client", viewState: {}, launchDraft: null })],
   ["runs/one/worker-replay.jsonl", `${JSON.stringify({ clientId: "client", requestId: "request", op: "stop", stage: "UNKNOWN", at: "now" })}\n`],
   ["runs/one/worker-replay.jsonl", `${JSON.stringify({ clientId: "", requestId: "request", op: "stop", stage: "RECEIVED", at: "now" })}\n`],
+  ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, proto: 0 }] })],
+  ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, routeGeneration: 0 }] })],
   ["unknown-state.json", JSON.stringify({ value: true })],
 ])("refuses malformed legacy artifact %s", async (relative, text) => {
   const paths = await fixture();
@@ -126,6 +128,19 @@ it.each([
   await expect(migrateLegacyState(options)).rejects.toThrow("crash");
   await mutate(paths);
   await expect(migrateLegacyState({ ...options, failpoint: async () => {} })).rejects.toMatchObject({ code });
+});
+
+// Operator-visible failure: the fields a live daemon writes when it adopts a worker must survive a
+// state-root migration. Refusing them strands every live session behind MALFORMED_LEGACY_STATE.
+it("migrates worker metadata carrying the adopted protocol, release, and route generation", async () => {
+  const paths = await fixture();
+  const identity = { pid: 42, startIdentity: "42", processGroupId: 42 };
+  const metadata = { schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, identity, piChildIdentity: identity, token: "run-token", proto: 1, cliVersion: "1.4.2", routeGeneration: 3 }] };
+  await mkdir(join(paths.legacyRoot, "daemon"), { recursive: true, mode: 0o700 });
+  await writeFile(join(paths.legacyRoot, "daemon", "workers.json"), JSON.stringify(metadata), { mode: 0o600 });
+
+  await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {} })).resolves.toMatchObject({ status: "MIGRATED" });
+  expect(JSON.parse(await readFile(join(paths.destinationRoot, "daemon", "workers.json"), "utf8"))).toEqual(metadata);
 });
 
 it("recovers mutable PUBLISHED output only after the reconciliation marker is durable", async () => {

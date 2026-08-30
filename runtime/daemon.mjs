@@ -35,6 +35,8 @@ const MAX_ATTACHMENT_REQUESTS = 4096;
 const WORKER_DELIVERED_COMMANDS = ["prompt", "steer", "follow_up", "interrupt", "ui_response", "session_command"];
 const DURABLE_COMMANDS = new Set([...WORKER_DELIVERED_COMMANDS, "stop", "delete"]);
 const CONNECTOR_PATH = fileURLToPath(new URL("./daemon-connector.mjs", import.meta.url));
+/** This package's manifest. Its version is the release recorded for every worker this daemon spawns. */
+const PACKAGE_MANIFEST_PATH = fileURLToPath(new URL("../package.json", import.meta.url));
 const DEFAULT_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateMs: 5_000 });
 /**
  * How long the daemon waits for one worker's reply before the command becomes ambiguous. A worker
@@ -618,6 +620,7 @@ export async function createDaemonRuntime({
   sleepImpl = sleep,
   trashSessionFile,
   broadcastEvent,
+  cliVersion,
 } = {}) {
   if (typeof root !== "string" || resolve(root) !== root) throw new TypeError("Daemon runtime root must be an absolute canonical path");
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 128) throw new TypeError("maxBytes must be at least 128");
@@ -642,7 +645,7 @@ export async function createDaemonRuntime({
     const daemonEpoch = await privateText(epochPath, () => epochCandidate);
     if (daemonEpoch !== epochCandidate) throw Object.assign(new Error("Daemon epoch changed during lifecycle claim"), { code: "DAEMON_IDENTITY_CONFLICT" });
     const registry = new RegistryStore(join(root, "sessions"));
-    const router = new RecoveredWorkerRouter({ registry, inspect, metadataPath: join(daemonDirectory, "workers.json") });
+    const router = new RecoveredWorkerRouter({ registry, inspect, metadataPath: join(daemonDirectory, "workers.json"), cliVersion });
     workerSupervisor?.useRouter?.(router);
     await router.load();
     /** @type {(value?: unknown) => void} */
@@ -727,6 +730,27 @@ export async function createDaemonRuntime({
         }
         await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
         return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
+      },
+      /**
+       * Add this session's adopted worker to one public row, so a reader of `agents --json` can tell
+       * an adopted worker from a stale one without inspecting daemon memory.
+       *
+       * Adoption is not a session change, so it colours a read instead of writing a revision: an
+       * operator's exact revision has to survive a daemon restart, and a revision-guarded Stop that
+       * failed after every restart would teach the operator to retry past the guard. The release
+       * comparison happens here, after the route is already adopted; an absent release is unknown,
+       * which the row reports as stale.
+       * @param {any} session
+       */
+      withWorkerAdoption(session) {
+        const route = router.route(session.sessionId);
+        if (route === undefined || route.metadata?.runId !== session.ownership?.runId) return session;
+        return {
+          ...session,
+          ...(route.metadata.cliVersion === undefined ? {} : { workerCliVersion: route.metadata.cliVersion }),
+          stale: ["STALE", "UNKNOWN"].includes(router.releaseStatus(session.sessionId)),
+          routeGeneration: route.routeGeneration,
+        };
       },
       /**
        * Re-derive task state from Pi after a reconnect: a turn can both finish and start while the
@@ -1060,7 +1084,7 @@ export async function createDaemonRuntime({
           // would let a subscriber skip a change it never saw. Recovery has no event store yet, and
           // a client that gets no cursor falls back to its own.
           const cursor = context.recovery?.events?.currentCursor();
-          const sessions = await registry.list();
+          const sessions = (await registry.list()).map((session) => context.withWorkerAdoption(session));
           return cursor === undefined ? { kind: "state", sessions } : { kind: "state", sessions, cursor };
         }
         if (request.op === "get_settings") return { kind: "settings", ...settingsStore.current() };
@@ -1542,6 +1566,7 @@ export async function createDaemonRuntime({
 
 /** Build the production launch seams used by the detached daemon entry point. @param {{root:string,piBin?:string,env?:NodeJS.ProcessEnv}} options */
 export async function createDefaultDaemonRuntime({ root, piBin, env = process.env }) {
+  const cliVersion = JSON.parse(await fs.readFile(PACKAGE_MANIFEST_PATH, "utf8")).version;
   const configText = await readPrivateText(join(root, "dashboard.json"));
   const config = loadDashboardConfig(configText === undefined ? {} : JSON.parse(configText));
   const configuredPiPath = piBin ?? config.pi.executable;
@@ -1563,6 +1588,7 @@ export async function createDefaultDaemonRuntime({ root, piBin, env = process.en
     env,
     startTimeoutMs: config.daemon.startTimeoutMs,
     launchStopPolicy: config.stop,
+    cliVersion,
   });
   return createDaemonRuntime({
     root,
@@ -1571,6 +1597,7 @@ export async function createDefaultDaemonRuntime({ root, piBin, env = process.en
     summaryExecutable: configuredPiPath ?? "pi",
     summaryEnv: env,
     stopPolicy: config.stop,
+    cliVersion,
   });
 }
 

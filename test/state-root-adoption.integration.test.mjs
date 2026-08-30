@@ -53,7 +53,8 @@ async function previousStateRoot(sessionIds) {
     await writeFile(join(previousRoot, "canonical", `${sessionId}.jsonl`), "", { mode: 0o600 });
   }
   // A worker lease records process identities and no path at all, so it must still validate once
-  // the root it was written under has a different name.
+  // the root it was written under has a different name. It carries no `cliVersion` and no `proto`,
+  // exactly like the operator's live workers, so adoption must not depend on either.
   const identity = { pid: DEAD_PID, startIdentity: "1", processGroupId: DEAD_PID };
   await writeFile(join(previousRoot, "daemon", "workers.json"), JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: sessionIds[0], runId: "run-adopted", leaseId: "lease-adopted", generation: 1, identity, piChildIdentity: identity }] }), { mode: 0o600 });
   return { parent, previousRoot, root: join(parent, "pi-agents"), env: { HOME: parent, XDG_STATE_HOME: parent } };

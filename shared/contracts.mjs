@@ -13,7 +13,7 @@ import { parseViewerSnapshot } from "./viewer-contracts.mjs";
 /** @typedef {{kind:"managed",runId:string,process:ProcessIdentity,acquiredAt:string,heartbeatAt:string}} WorkerOwnership */
 /** @typedef {{mode:"worktree",worktreePath:string,branch:string}|{mode:"shared_directory",canonicalCwd:string}} IsolationRecord */
 /** @typedef {{text:string,generatedAt:string,model:{provider:string,id:string},sourceCursor:string}} SessionSummary */
-/** @typedef {{schemaVersion:1,revision:number,sessionId:string,sessionFile:string,canonicalSessionFile:string,cwd:string,name?:string,nameGenerated?:boolean,color?:SessionColor,model?:{provider:string,id:string},thinkingLevel?:string,taskState:TaskState,processState:ProcessState,outcome:Outcome,activity:{kind:string,summary:string,updatedAt:string},ownership?:WorkerOwnership,isolation?:IsolationRecord,latestRunId?:string,runHash?:string,runtime?:RunRuntimeIdentity,summary?:SessionSummary,createdAt:string,updatedAt:string}} SessionRecord */
+/** @typedef {{schemaVersion:1,revision:number,sessionId:string,sessionFile:string,canonicalSessionFile:string,cwd:string,name?:string,nameGenerated?:boolean,color?:SessionColor,model?:{provider:string,id:string},thinkingLevel?:string,taskState:TaskState,processState:ProcessState,outcome:Outcome,activity:{kind:string,summary:string,updatedAt:string},ownership?:WorkerOwnership,isolation?:IsolationRecord,latestRunId?:string,runHash?:string,runtime?:RunRuntimeIdentity,summary?:SessionSummary,workerCliVersion?:string,stale?:boolean,routeGeneration?:number,createdAt:string,updatedAt:string}} SessionRecord */
 /** @typedef {{mode:"worktree"}|{mode:"shared_directory",confirmedCwd:string,ownerSessionIds:string[]}} LaunchIsolation */
 /** @typedef {{prompt:string,cwd:string,sourceSessionId:string,isolation:LaunchIsolation,model?:{provider:string,id:string},name?:string}} LaunchRequest */
 /** @typedef {{provider:string,id:string,thinking:boolean}} CatalogModel */
@@ -282,7 +282,7 @@ function validateError(value, path) {
 /** @param {unknown} value @param {string} path */
 function validateSession(value, path) {
   const session = readRecord(value, path);
-  requireKeys(session, ["schemaVersion", "revision", "sessionId", "sessionFile", "canonicalSessionFile", "cwd", "taskState", "processState", "outcome", "activity", "createdAt", "updatedAt"], ["name", "nameGenerated", "color", "model", "thinkingLevel", "ownership", "isolation", "latestRunId", "runHash", "runtime", "summary"], path);
+  requireKeys(session, ["schemaVersion", "revision", "sessionId", "sessionFile", "canonicalSessionFile", "cwd", "taskState", "processState", "outcome", "activity", "createdAt", "updatedAt"], ["name", "nameGenerated", "color", "model", "thinkingLevel", "ownership", "isolation", "latestRunId", "runHash", "runtime", "summary", "workerCliVersion", "stale", "routeGeneration"], path);
   if (Object.hasOwn(session, "nameGenerated") && typeof session.nameGenerated !== "boolean") throw new TypeError(`${path}.nameGenerated must be a boolean`);
   if (Object.hasOwn(session, "color") && !SESSION_COLORS.includes(session.color)) throw new TypeError(`${path}.color must be one of: ${SESSION_COLORS.join(", ")}`);
   if (Object.hasOwn(session, "summary")) {
@@ -302,6 +302,12 @@ function validateSession(value, path) {
   for (const key of ["name", "thinkingLevel", "latestRunId"]) if (Object.hasOwn(session, key)) readIdentifier(session, key, `${path}.${key}`);
   // A run directory is named relative to the current state root, so a renamed root still resolves it.
   if (Object.hasOwn(session, "runHash") && (readIdentifier(session, "runHash", `${path}.runHash`).includes("/") || session.runHash.startsWith("."))) throw new TypeError(`${path}.runHash must be a root-relative directory name`);
+  // The adopted worker's release and route, added when the daemon reads a row rather than stored on
+  // the record, so a reader can tell adoption from staleness without inspecting daemon memory. An
+  // absent release is unknown, which the row reports as stale.
+  if (Object.hasOwn(session, "workerCliVersion")) readIdentifier(session, "workerCliVersion", `${path}.workerCliVersion`);
+  if (Object.hasOwn(session, "stale") && typeof session.stale !== "boolean") throw new TypeError(`${path}.stale must be a boolean`);
+  if (Object.hasOwn(session, "routeGeneration") && (!Number.isSafeInteger(session.routeGeneration) || session.routeGeneration <= 0)) throw new TypeError(`${path}.routeGeneration must be a positive safe integer`);
   if (Object.hasOwn(session, "model")) readModel(session.model, `${path}.model`);
   if (Object.hasOwn(session, "ownership")) { const ownership = readRecord(session.ownership, `${path}.ownership`); requireKeys(ownership, ["kind", "runId", "process", "acquiredAt", "heartbeatAt"], [], `${path}.ownership`); if (ownership.kind !== "managed") throw new TypeError(`${path}.ownership.kind is invalid`); for (const key of ["runId", "acquiredAt", "heartbeatAt"]) readIdentifier(ownership, key, `${path}.ownership.${key}`); validateProcessIdentity(ownership.process, `${path}.ownership.process`); }
   if (Object.hasOwn(session, "isolation")) { const isolation = readRecord(session.isolation, `${path}.isolation`); const mode = readEnum(isolation, "mode", ["worktree", "shared_directory"], `${path}.isolation.mode`); if (mode === "worktree") { requireKeys(isolation, ["mode", "worktreePath", "branch"], [], `${path}.isolation`); readIdentifier(isolation, "worktreePath", `${path}.isolation.worktreePath`); readIdentifier(isolation, "branch", `${path}.isolation.branch`); } else { requireKeys(isolation, ["mode", "canonicalCwd"], [], `${path}.isolation`); readIdentifier(isolation, "canonicalCwd", `${path}.isolation.canonicalCwd`); } }

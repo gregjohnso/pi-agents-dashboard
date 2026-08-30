@@ -23,7 +23,7 @@ Focused runs use the raw vitest task:
 pixi run vitest -- run app/mouse-input.test.mjs --testTimeout=20000
 ```
 
-The suite is 818 tests across 87 files. A full run takes about 3 minutes on an unloaded machine and can take twice that under load.
+The suite is 884 tests across 90 files. A full run takes about 3 minutes on an unloaded machine and can take twice that under load.
 
 ## Tests
 

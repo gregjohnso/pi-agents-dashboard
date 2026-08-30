@@ -1187,6 +1187,67 @@ it("reconnects two surviving fake workers through the concrete connector after d
   expect(loops.map((loop) => [loop.pid, loop.alive])).toEqual([[201, true], [202, true]]);
 });
 
+// Operator-visible failure: a replacement daemon that compared releases before adopting refused its
+// own live workers for holding older code, and the operator's only cure was a manual restart that
+// ended the sessions. Adoption comes first, and the row says which worker is out of date.
+it("adopts live workers of every release and reports each one's release and route generation in its row", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const now = "2026-08-25T12:00:00.000Z";
+  /** @type {Array<[string, string | undefined]>} */
+  const releases = [["older", "1.9.0"], ["equal", "2.0.0"], ["newer", "2.1.0"], ["unknown", undefined]];
+  const workers = releases.map(([sessionId, cliVersion], index) => {
+    const pid = 301 + index * 2;
+    return {
+      sessionId, runId: `run-${sessionId}`, leaseId: `lease-${sessionId}`, generation: 1,
+      identity: { pid, startIdentity: `worker-${sessionId}`, processGroupId: pid },
+      piChildIdentity: { pid: pid + 1, startIdentity: `pi-${sessionId}`, processGroupId: pid },
+      token: `${sessionId}-token`,
+      ...(cliVersion === undefined ? {} : { cliVersion }),
+    };
+  });
+  const identities = new Map(workers.flatMap((worker) => [[worker.identity.pid, worker.identity], [worker.piChildIdentity.pid, worker.piChildIdentity]]));
+  /** @param {number} pid */
+  const inspect = async (pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : identities.get(pid) ?? Promise.reject(Object.assign(new Error("gone"), { code: "ENOENT" }));
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  for (const worker of workers) {
+    await registry.create({ schemaVersion: 1, revision: 0, sessionId: worker.sessionId, sessionFile: `/sessions/${worker.sessionId}.jsonl`, canonicalSessionFile: `/sessions/${worker.sessionId}.jsonl`, cwd: "/repo", taskState: "WAITING", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: worker.runId, process: worker.identity, acquiredAt: now, heartbeatAt: now }, latestRunId: worker.runId, createdAt: now, updatedAt: now });
+  }
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: workers.map(({ token: _token, ...worker }) => worker) })}\n`, { mode: 0o600 });
+
+  const runtime = await createDaemonRuntime({ root: stateRoot, inspect, hostProbe: async () => ({ blockers: [] }), reconnectTimeoutMs: 2_000, cliVersion: "2.0.0" });
+  runtimes.push(runtime);
+  const loops = workers.map((worker) => startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, worker));
+  await runtime.ready;
+  const frontend = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 64 * 1024 });
+  // An older or unknown worker never refuses daemon startup.
+  expect(await frontend.ready).toMatchObject({ kind: "authenticated", state: "READY" });
+  let read = 0;
+  const rows = async () => {
+    read += 1;
+    frontend.send({ version: 1, clientId: "client", requestId: `state-${read}`, op: "get_state", payload: {} });
+    const response = await frontend.next();
+    return Object.fromEntries(response.result.sessions.map((/** @type {any} */ session) => [session.sessionId, session]));
+  };
+  const adopted = await vi.waitFor(async () => {
+    const current = await rows();
+    expect(Object.values(current).map((/** @type {any} */ session) => session.routeGeneration)).toEqual([1, 1, 1, 1]);
+    return current;
+  }, { timeout: 4_000, interval: 50 });
+
+  expect(adopted.older).toMatchObject({ workerCliVersion: "1.9.0", stale: true });
+  expect(adopted.equal).toMatchObject({ workerCliVersion: "2.0.0", stale: false });
+  // A newer worker is live, not stale, and this commit never replaces it.
+  expect(adopted.newer).toMatchObject({ workerCliVersion: "2.1.0", stale: false });
+  expect(adopted.unknown.workerCliVersion).toBeUndefined();
+  expect(adopted.unknown).toMatchObject({ stale: true });
+  expect(loops.map((loop) => loop.alive)).toEqual([true, true, true, true]);
+  // Adoption colours the read; it writes no revision, so an exact-revision Stop survives a restart.
+  expect(Object.values(adopted).map((/** @type {any} */ session) => session.revision)).toEqual([0, 0, 0, 0]);
+  expect((await registry.get("older"))?.stale).toBeUndefined();
+  frontend.close();
+}, 20_000);
+
 it("colors a session across summary churn without a revision conflict", async () => {
   const stateRoot = await root();
   for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });

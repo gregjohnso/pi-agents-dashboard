@@ -274,15 +274,17 @@ it("authenticates and adopts the startup socket before activation, and persists 
   await waitUntil(async () => workers.children.length === 1);
   // The run and its token are durable before the worker is spawned, so a replacement daemon can
   // authenticate the same run.
-  expect(await persisted()).toEqual([{ sessionId: "one", runId: "run-startup", leaseId: expect.any(String), generation: 1, token: "startup-socket-token", cliVersion: "9.9.9" }]);
+  expect(await persisted()).toEqual([{ sessionId: "one", runId: "run-startup", leaseId: expect.any(String), generation: 1, token: "startup-socket-token", proto: 1, cliVersion: "9.9.9" }]);
   expect((await stat(metadataPath)).mode & 0o777).toBe(0o600);
   expect(workers.calls[0].options.stdio).toEqual(["ignore", expect.any(Number), expect.any(Number)]);
   expect(workers.calls[0].options.env.NODE_CHANNEL_FD).toBeUndefined();
 
   await workers.children[0].connect();
   const handle = await launched;
-  expect(router.route("one")).toMatchObject({ metadata: { sessionId: "one", token: "startup-socket-token" }, connection: workers.children[0].connection });
-  expect(await persisted()).toEqual([{ sessionId: "one", runId: "run-startup", leaseId: handle.leaseId, generation: 1, identity: handle.identity, piChildIdentity: handle.piChildIdentity, token: "startup-socket-token", cliVersion: "9.9.9" }]);
+  const adopted = router.route("one");
+  expect(adopted).toMatchObject({ metadata: { sessionId: "one", token: "startup-socket-token" }, connection: workers.children[0].connection });
+  expect(adopted.routeGeneration).toBeGreaterThan(0);
+  expect(await persisted()).toEqual([{ sessionId: "one", runId: "run-startup", leaseId: handle.leaseId, generation: 1, identity: handle.identity, piChildIdentity: handle.piChildIdentity, token: "startup-socket-token", proto: 1, cliVersion: "9.9.9", routeGeneration: adopted.routeGeneration }]);
   await supervisor.close();
 });
 

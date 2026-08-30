@@ -16,8 +16,9 @@ import { sessionEventForPiEvent } from "../runtime/session-event-mapping.mjs";
 
 const WIDTH = 100;
 const HEIGHT = 20;
-// Title, context, working directory, section border, column header, then the first session row.
-const FIRST_ROW = 5;
+// Title, working directory, section border, column header, then the first session row. The context
+// line moved into the dock in a1bdf1e.
+const FIRST_ROW = 4;
 const FRAMES = new Set(Array.from({ length: 10 }, (_, index) => spinnerFrame(index * SPINNER_INTERVAL_MS)));
 
 /** @type {any[]} */
@@ -53,6 +54,8 @@ async function daemonWithLiveSession(sessionId) {
     ownership: { kind: "managed", runId: `run-${sessionId}`, process: identity, acquiredAt: at, heartbeatAt: at },
     latestRunId: `run-${sessionId}`, createdAt: at, updatedAt: at,
   });
+  // No `cliVersion` and no `proto`, exactly like the operator's live workers: adoption must not
+  // depend on them. Their UNKNOWN release status is pinned in runtime/daemon.integration.test.mjs.
   await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId, runId: `run-${sessionId}`, leaseId: `lease-${sessionId}`, generation: 1, identity, piChildIdentity }] })}\n`, { mode: 0o600 });
   const runtime = await createDaemonRuntime({
     root,

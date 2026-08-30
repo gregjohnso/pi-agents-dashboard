@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
-import { DEFAULT_STOP_ESCALATION_MS, createDaemonRequester, createPersistentDaemonRequester, destructiveRequestTimeoutMs, loadCliClientIdentity, runAgentsCommand, runSessionCommand } from "./session-commands.mjs";
+import { DEFAULT_STOP_ESCALATION_MS, createDaemonRequester, createPersistentDaemonRequester, destructiveRequestTimeoutMs, loadCliClientIdentity, runAgentsCommand, runLogsCommand, runSessionCommand } from "./session-commands.mjs";
 
 const roots = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
@@ -524,4 +524,168 @@ it("derives the destructive deadline from the daemon stop policy and never short
   await writeFile(join(configured, "dashboard.json"), JSON.stringify({ stop: { gracefulMs: 7_000, terminateMs: 3_000 } }), { mode: 0o600 });
   await expect(destructiveRequestTimeoutMs(configured)).resolves.toBe(7_000 + 3_000 + 1_000);
   await expect(destructiveRequestTimeoutMs(await stateRoot(), undefined, 200)).resolves.toBe(DEFAULT_STOP_ESCALATION_MS);
+});
+
+const runHash = "a".repeat(64);
+const logSession = { sessionId: "exact-session-id", revision: 4, runHash };
+
+/** One get_state responder holding at most one row. @param {any} [session] */
+function stateWith(session) {
+  return async (/** @type {string} */ op) => {
+    expect(op).toBe("get_state");
+    return { kind: "state", sessions: session === undefined ? [] : [session] };
+  };
+}
+
+/** Build one run directory the way the supervisor and the rotating diagnostics writer do.
+ * @param {string} root @param {{ worker?: string | Buffer, segments?: Record<string, string | Buffer> }} contents
+ */
+async function runFixture(root, { worker, segments = {} } = {}) {
+  const directory = join(root, "runs", runHash);
+  await mkdir(join(directory, "diagnostics"), { recursive: true, mode: 0o700 });
+  if (worker !== undefined) await writeFile(join(directory, "worker.stderr.log"), worker, { mode: 0o600 });
+  for (const [name, text] of Object.entries(segments)) await writeFile(join(directory, "diagnostics", name), text, { mode: 0o600 });
+  return directory;
+}
+
+/** @param {string} root */
+async function startupLog(root, text = "DashboardConfigError: dashboard.json is invalid\n") {
+  await mkdir(join(root, "daemon"), { recursive: true, mode: 0o700 });
+  const path = join(root, "daemon", "startup.log");
+  await writeFile(path, text, { mode: 0o600 });
+  return path;
+}
+
+it("prints the whole daemon startup log when no session is named and it fits the bound", async () => {
+  const root = await stateRoot();
+  const path = await startupLog(root);
+  const result = await runLogsCommand(undefined, { root });
+  expect(result.code).toBe(0);
+  expect(result.result.sources).toEqual([{ path, bytes: 48, truncated: false }]);
+  expect(result.result.text).toBe(`==> ${path} <==\nDashboardConfigError: dashboard.json is invalid\n`);
+});
+
+it("reads the newest Pi stderr segment before worker stderr and names both full paths", async () => {
+  const root = await stateRoot();
+  const directory = await runFixture(root, {
+    worker: "worker stderr line\n",
+    segments: { "stderr.00000000.jsonl": "retired segment\n", "stderr.00000009.jsonl": "newest segment\n", "rpc.00000009.jsonl": "rpc traffic\n" },
+  });
+  const result = await runLogsCommand("exact-session-id", { root, request: stateWith(logSession) });
+  expect(result.code).toBe(0);
+  expect(result.result.sources.map((/** @type {any} */ source) => source.path)).toEqual([
+    join(directory, "diagnostics", "stderr.00000009.jsonl"),
+    join(directory, "worker.stderr.log"),
+  ]);
+  expect(result.result.text).toContain("newest segment");
+  expect(result.result.text).not.toContain("retired segment");
+  expect(result.result.text).not.toContain("rpc traffic");
+});
+
+it("reads a prepared session's run directory before any worker metadata exists", async () => {
+  const root = await stateRoot();
+  await runFixture(root, {
+    worker: "WORKER_PROCESS_EXITED: Worker exited before worker_hello (SIGTERM)\n",
+    segments: { "stderr.00000000.jsonl": '{"type":"pi_stderr","text":"pi: unknown model claude-nope"}\n' },
+  });
+  const prepared = { sessionId: "exact-session-id", revision: 0, taskState: "FAILED", processState: "EXITED", latestRunId: "run-1", runHash };
+  expect(prepared.ownership).toBeUndefined();
+  const result = await runLogsCommand("exact-session-id", { root, request: stateWith(prepared) });
+  expect(result.code).toBe(0);
+  const { text } = result.result;
+  expect(text).toContain("pi: unknown model claude-nope");
+  expect(text.indexOf("unknown model")).toBeLessThan(text.indexOf("WORKER_PROCESS_EXITED"));
+});
+
+it("resolves the run directory under the current root after that root is renamed in place", async () => {
+  const root = await stateRoot();
+  await runFixture(root, { worker: "worker stderr line\n", segments: { "stderr.00000000.jsonl": "pi complaint\n" } });
+  const renamed = `${root}-renamed`;
+  roots.push(renamed);
+  await rename(root, renamed);
+  const result = await runLogsCommand("exact-session-id", { root: renamed, request: stateWith(logSession) });
+  expect(result.result.sources.map((/** @type {any} */ source) => source.path)).toEqual([
+    join(renamed, "runs", runHash, "diagnostics", "stderr.00000000.jsonl"),
+    join(renamed, "runs", runHash, "worker.stderr.log"),
+  ]);
+  expect(result.result.text).toContain("pi complaint");
+});
+
+it("gives the Pi segment the whole 262144-byte budget first and still names the starved worker log", async () => {
+  const root = await stateRoot();
+  const directory = await runFixture(root, { worker: "worker stderr line\n", segments: { "stderr.00000000.jsonl": `${"p".repeat(300_000)}\n` } });
+  const result = await runLogsCommand("exact-session-id", { root, request: stateWith(logSession) });
+  expect(result.result.sources).toEqual([
+    { path: join(directory, "diagnostics", "stderr.00000000.jsonl"), bytes: 262_144, truncated: true },
+    { path: join(directory, "worker.stderr.log"), bytes: 0, truncated: true },
+  ]);
+  expect(result.result.text).toContain(join(directory, "worker.stderr.log"));
+  expect(result.result.text).not.toContain("worker stderr line");
+});
+
+// 26 bytes into a 41-byte segment lands inside a two-byte character.
+it("emits only complete UTF-8 when the bound cuts into a character", async () => {
+  const root = await stateRoot();
+  await runFixture(root, { segments: { "stderr.00000000.jsonl": `${"é".repeat(20)}\n` } });
+  const result = await runLogsCommand("exact-session-id", { root, maxTailBytes: 26, request: stateWith(logSession) });
+  expect(result.result.sources[0]).toMatchObject({ bytes: 26, truncated: true });
+  expect(result.result.text).not.toContain("\uFFFD");
+  expect(result.result.text).toBe(`==> ${join(root, "runs", runHash, "diagnostics", "stderr.00000000.jsonl")} (tail) <==\n${"é".repeat(12)}\n`);
+});
+
+// A killed writer leaves the last character half on disk; it must not reach the operator as U+FFFD.
+it("emits only complete UTF-8 when the log itself ends mid-character", async () => {
+  const root = await stateRoot();
+  await runFixture(root, { worker: Buffer.concat([Buffer.from("worker ok\n"), Buffer.from([0xc3])]) });
+  const result = await runLogsCommand("exact-session-id", { root, request: stateWith(logSession) });
+  expect(result.result.sources[0]).toMatchObject({ bytes: 11, truncated: false });
+  expect(result.result.text).not.toContain("\uFFFD");
+  expect(result.result.text.endsWith("worker ok\n")).toBe(true);
+});
+
+it("refuses a symbolic link where an owned regular log belongs", async () => {
+  const root = await stateRoot();
+  const directory = await runFixture(root, { segments: { "stderr.00000000.jsonl": "pi complaint\n" } });
+  const target = join(root, "outside.log");
+  await writeFile(target, "not this file\n", { mode: 0o600 });
+  await symlink(target, join(directory, "worker.stderr.log"));
+  await expect(runLogsCommand("exact-session-id", { root, request: stateWith(logSession) }))
+    .resolves.toMatchObject({ code: 1, error: { code: "LOG_SOURCE_UNSAFE" } });
+});
+
+it("refuses a log source replaced between its identity check and the end of the read", async () => {
+  const root = await stateRoot();
+  const path = await startupLog(root);
+  const logFailpoint = async (/** @type {string} */ stage) => {
+    if (stage !== "after_read") return;
+    await rm(path);
+    await writeFile(path, "a different file entirely\n", { mode: 0o600 });
+  };
+  await expect(runLogsCommand(undefined, { root, logFailpoint }))
+    .resolves.toMatchObject({ code: 1, error: { code: "LOG_SOURCE_UNSAFE" } });
+});
+
+it.each([["parent escape", "../outside"], ["nested path", "nested/hash"], ["current directory", "."], ["empty name", ""]])(
+  "refuses a run hash that is not a root-relative directory name: %s",
+  async (_name, badHash) => {
+    const root = await stateRoot();
+    await expect(runLogsCommand("exact-session-id", { root, request: stateWith({ ...logSession, runHash: badHash }) }))
+      .resolves.toMatchObject({ code: 1, error: { code: "LOG_SOURCE_UNSAFE" } });
+  },
+);
+
+it("names every path it searched when the session has no readable log", async () => {
+  const root = await stateRoot();
+  const result = await runLogsCommand("exact-session-id", { root, request: stateWith(logSession) });
+  expect(result).toMatchObject({ code: 1, error: { code: "LOGS_NOT_FOUND" } });
+  expect(result.error.message).toContain(join(root, "runs", runHash, "worker.stderr.log"));
+  await expect(runLogsCommand("exact-session-id", { root, request: stateWith({ sessionId: "exact-session-id", revision: 4 }) }))
+    .resolves.toMatchObject({ code: 1, error: { code: "LOGS_NOT_FOUND" } });
+});
+
+it("refuses an unknown exact session ID and a prefix of a known one", async () => {
+  const root = await stateRoot();
+  const request = stateWith(logSession);
+  await expect(runLogsCommand("exact-session", { root, request })).resolves.toMatchObject({ code: 1, error: { code: "SESSION_NOT_FOUND" } });
+  await expect(runLogsCommand("sessions/exact-session-id", { root, request: vi.fn() })).resolves.toMatchObject({ code: 2, error: { code: "INVALID_SYNTAX" } });
 });

@@ -682,15 +682,13 @@ export async function createDaemonRuntime({
           { clientId, requestId, op, durableRequest, metadata, routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation },
         );
       },
-      /** Ask this session's worker one non-durable question over whichever channel owns it. @param {any} request @param {Record<string, unknown>} [fields] */
-      async askWorker(request, fields = {}) {
+      /** Ask this session's worker one non-durable question over whichever channel owns it. @param {any} request */
+      async askWorker(request) {
         const sessionId = request.payload.sessionId;
         const route = router.route(sessionId);
         const handle = sessionHandles.get(sessionId);
-        if (route?.connection !== undefined && route.metadata?.token !== undefined) return context.sendWorkerCommand(route, context.nextCommandId(), request, fields);
-        // The launch channel carries no extra command fields yet, so a parameterised ask waits for the socket route.
-        if (typeof handle?.request === "function" && Object.keys(fields).length === 0) return handle.request(request.op);
-        if (typeof handle?.request === "function") throw Object.assign(new Error("This session is still starting; retry once it is connected"), { code: "WORKER_RECONNECTING", retryable: true });
+        if (route?.connection !== undefined && route.metadata?.token !== undefined) return context.sendWorkerCommand(route, context.nextCommandId(), request);
+        if (typeof handle?.request === "function") return handle.request(request.op);
         if (handle !== undefined) sessionHandles.delete(sessionId);
         throw Object.assign(new Error("No exact recovered worker owns this session"), { code: "WORKER_UNAVAILABLE" });
       },
@@ -1170,11 +1168,6 @@ export async function createDaemonRuntime({
             commands: menu.commands ?? [], models: menu.models ?? [], thinkingLevels: menu.thinkingLevels ?? [],
             model: menu.model ?? null, thinkingLevel: menu.thinkingLevel ?? null,
           };
-        }
-        if (request.op === "session_query") {
-          const sessionQuery = { query: request.payload.query, ...(request.payload.outputPath === undefined ? {} : { outputPath: request.payload.outputPath }) };
-          const rows = (await context.askWorker(request, { sessionQuery }))?.result ?? [];
-          return { kind: "session_query", sessionId: request.payload.sessionId, query: request.payload.query, rows: Array.isArray(rows) ? rows : [] };
         }
         if (!DURABLE_COMMANDS.has(request.op)) throw Object.assign(new Error(`Unsupported daemon operation: ${request.op}`), { code: "UNSUPPORTED_OPERATION" });
         if (!duringRecovery) {

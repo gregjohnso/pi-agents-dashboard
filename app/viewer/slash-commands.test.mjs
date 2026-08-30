@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 
-import { parseSlashSubmission } from "./slash-commands.mjs";
+import { parseSlashSubmission, sessionSlashCommands } from "./slash-commands.mjs";
 
 /** @type {import("./slash-commands.mjs").SessionMenu} */
 const menu = {
@@ -12,9 +12,6 @@ const menu = {
 };
 
 it.each([
-  ["session tree", "/tree", { kind: "session_query", payload: { query: "get_tree" } }],
-  ["default export", "/export", { kind: "session_query", payload: { query: "export_html" } }],
-  ["export to a path", "/export /tmp/out.html", { kind: "session_query", payload: { query: "export_html", outputPath: "/tmp/out.html" } }],
   ["auto-retry on", "/auto-retry on", { kind: "session_command", payload: { command: "set_auto_retry", enabled: true } }],
   ["follow-up mode", "/follow-up all", { kind: "session_command", payload: { command: "set_follow_up_mode", mode: "all" } }],
   ["retry abort", "/abort-retry", { kind: "session_command", payload: { command: "abort_retry" } }],
@@ -38,4 +35,13 @@ it.each([
   ["/color chartreuse", "UNKNOWN_SESSION_COLOR"],
 ])("rejects %s with its own code and without contacting the session", (text, code) => {
   expect(parseSlashSubmission(text, menu)).toMatchObject({ kind: "rejected", code });
+});
+
+it.each(["/stats", "/tree", "/export", "/export /tmp/out.html"])("has no session query behind %s", (text) => {
+  expect(parseSlashSubmission(text, menu)).toEqual({ kind: "prompt", text });
+});
+
+it("offers no session query in the viewer command menu", () => {
+  const names = new Set(sessionSlashCommands(menu).map((command) => command.name));
+  for (const name of ["stats", "tree", "export"]) expect(names.has(name), name).toBe(false);
 });

@@ -31,14 +31,11 @@ const ENVELOPE_KEYS = ["version", "clientId", "requestId", "op", "payload"];
 export const SESSION_COLORS = ["sky", "green", "amber", "rose", "cyan", "gray"];
 /** @typedef {"sky"|"green"|"amber"|"rose"|"cyan"|"gray"} SessionColor */
 
-const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "session_query", "get_settings", "set_settings", "refresh_summaries", "set_session_color", "get_models"];
+const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries", "set_session_color", "get_models"];
 const COMMAND_STAGES = ["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED", "DELIVERY_UNKNOWN", "FAILED"];
 const SESSION_COMMANDS = ["set_model", "set_thinking_level", "compact", "set_session_name", "set_auto_compaction", "set_auto_retry", "abort_retry", "set_steering_mode", "set_follow_up_mode"];
 // Pi's own vocabulary for both queue modes; anything else is refused before it reaches a worker.
 const QUEUE_MODES = ["all", "one-at-a-time"];
-// Read-only Pi commands the dashboard may serve. Session-rebinding commands are deliberately absent.
-const SESSION_QUERIES = ["get_session_stats", "get_tree", "export_html"];
-const MAX_QUERY_ROWS = 500;
 const MAX_MENU_ENTRIES = 1_000;
 // Matches MAX_MODELS in runtime/pi-model-catalog.mjs, which stops reading `pi --list-models` there.
 const MAX_CATALOG_MODELS = 2_000;
@@ -232,16 +229,6 @@ export function parseClientRequest(value) {
     return { ...base, payload: { cursor: readCursor(payload.cursor, "ack payload.cursor") } };
   }
   if (["get_viewer_snapshot", "get_session_commands"].includes(op)) return { ...base, payload: readSessionPayload(request.payload, op) };
-  if (op === "session_query") {
-    const payload = readRecord(request.payload, "session_query payload");
-    const query = readEnum(payload, "query", SESSION_QUERIES, "session_query payload.query");
-    const sessionId = readIdentifier(payload, "sessionId", "session_query payload.sessionId");
-    rejectUnknownKeys(payload, query === "export_html" ? ["sessionId", "query", "outputPath"] : ["sessionId", "query"], "session_query payload");
-    if (query === "export_html" && Object.hasOwn(payload, "outputPath")) {
-      return { ...base, payload: { sessionId, query, outputPath: readIdentifier(payload, "outputPath", "session_query payload.outputPath") } };
-    }
-    return { ...base, payload: { sessionId, query } };
-  }
   if (op === "session_command") {
     const payload = readRecord(request.payload, "session_command payload");
     const command = readEnum(payload, "command", SESSION_COMMANDS, "session_command payload.command");
@@ -373,7 +360,7 @@ export function parseDaemonResponse(value) {
   if (!response.ok) { requireKeys(response, ["version", "requestId", "ok", "error"], [], "daemon response"); validateError(response.error, "daemon response.error"); return response; }
   requireKeys(response, ["version", "requestId", "ok", "result"], [], "daemon response");
   const result = readRecord(response.result, "daemon response.result");
-  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "subscribed", "acknowledged", "viewer_snapshot", "viewer_subscribed", "viewer_acknowledged", "session_commands", "session_query", "settings", "models", "summaries_refreshing", "session_colored"], "daemon response.result.kind");
+  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "subscribed", "acknowledged", "viewer_snapshot", "viewer_subscribed", "viewer_acknowledged", "session_commands", "settings", "models", "summaries_refreshing", "session_colored"], "daemon response.result.kind");
   // `cursor` is the daemon's event position when the snapshot was taken, and it is optional: a
   // daemon built before it existed answers with sessions alone and its clients must still work.
   if (kind === "state") { requireKeys(result, ["kind", "sessions"], ["cursor"], "daemon response.result"); if (!Array.isArray(result.sessions)) throw new TypeError("sessions must be an array"); result.sessions.forEach((session, index) => validateSession(session, `daemon response.result.sessions[${index}]`)); if (Object.hasOwn(result, "cursor")) readCursor(result.cursor, "daemon response.result.cursor"); }
@@ -381,15 +368,6 @@ export function parseDaemonResponse(value) {
   else if (kind === "attached") { requireKeys(result, ["kind", "sessionId", "role"], [], "daemon response.result"); readIdentifier(result, "sessionId"); readEnum(result, "role", ["composer", "observer"]); }
   else if (kind === "command") { requireKeys(result, ["kind", "status"], [], "daemon response.result"); validateCommandStatus(result.status, "status"); }
   else if (kind === "session_commands") validateSessionCommands(result);
-  else if (kind === "session_query") {
-    requireKeys(result, ["kind", "sessionId", "query", "rows"], [], "daemon response.result");
-    readIdentifier(result, "sessionId", "daemon response.result.sessionId");
-    readEnum(result, "query", SESSION_QUERIES, "daemon response.result.query");
-    if (!Array.isArray(result.rows) || result.rows.length > MAX_QUERY_ROWS) throw new TypeError("daemon response.result.rows must be a bounded array");
-    result.rows.forEach((/** @type {unknown} */ row, /** @type {number} */ index) => {
-      if (typeof row !== "string" || row.length > 2_000) throw new TypeError(`daemon response.result.rows[${index}] must be a bounded string`);
-    });
-  }
   else if (kind === "settings") {
     requireKeys(result, ["kind", "summaryModel"], [], "daemon response.result");
     if (result.summaryModel !== null) readModel(result.summaryModel, "daemon response.result.summaryModel");

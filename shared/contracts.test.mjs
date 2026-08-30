@@ -38,10 +38,6 @@ const acceptedRequests = [
   ["session_command", { sessionId: "session", command: "abort_retry" }],
   ["session_command", { sessionId: "session", command: "set_steering_mode", mode: "all" }],
   ["session_command", { sessionId: "session", command: "set_follow_up_mode", mode: "one-at-a-time" }],
-  ["session_query", { sessionId: "session", query: "get_session_stats" }],
-  ["session_query", { sessionId: "session", query: "get_tree" }],
-  ["session_query", { sessionId: "session", query: "export_html" }],
-  ["session_query", { sessionId: "session", query: "export_html", outputPath: "/tmp/session.html" }],
 ];
 
 /** Every request the wire must refuse, beyond the per-variant unknown-field matrix. @type {Array<[string, string, Record<string, any>, RegExp]>} */
@@ -58,7 +54,10 @@ const rejectedRequests = [
   ["session rebinding through fork", "session_command", { sessionId: "session", command: "fork", entryId: "entry" }, /command/iu],
   ["steering mode outside Pi's vocabulary", "session_command", { sessionId: "session", command: "set_steering_mode", mode: "invented" }, /mode/iu],
   ["non-boolean auto retry", "session_command", { sessionId: "session", command: "set_auto_retry", enabled: "yes" }, /enabled/iu],
-  ["transcript-reading query", "session_query", { sessionId: "session", query: "get_messages" }, /query/iu],
+  ["session statistics", "session_query", { sessionId: "session", query: "get_session_stats" }, /operation/iu],
+  ["the entry tree", "session_query", { sessionId: "session", query: "get_tree" }, /operation/iu],
+  ["an HTML export", "session_query", { sessionId: "session", query: "export_html" }, /operation/iu],
+  ["an HTML export to a caller-chosen path", "session_query", { sessionId: "session", query: "export_html", outputPath: "/tmp/session.html" }, /operation/iu],
 ];
 
 const sessionRecord = { schemaVersion: 1, revision: 1, sessionId: "s", sessionFile: "/s.jsonl", canonicalSessionFile: "/s.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "idle", summary: "Idle", updatedAt: "2026-01-01T00:00:00.000Z" }, summary: { text: "Refactored the loader and ran tests", generatedAt: "2026-01-01T00:00:00.000Z", model: { provider: "anthropic", id: "haiku" }, sourceCursor: "42" }, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" };
@@ -68,7 +67,6 @@ const menu = {
   models: [{ provider: "anthropic", id: "claude" }], thinkingLevels: ["off", "high"],
   model: { provider: "anthropic", id: "claude" }, thinkingLevel: "high",
 };
-const queryResult = { kind: "session_query", sessionId: "session", query: "get_session_stats", rows: ["messages: 12", "tokens: 3400"] };
 const modelCatalog = { kind: "models", models: [{ provider: "anthropic", id: "claude-opus-4", thinking: true }, { provider: "google", id: "gemini-3-flash", thinking: false }] };
 
 /** @param {Record<string, any>} result */
@@ -81,7 +79,6 @@ const acceptedResponses = [
   ["summaries disabled", ok({ kind: "settings", summaryModel: null })],
   ["session state carrying a bounded summary", ok({ kind: "state", sessions: [sessionRecord] })],
   ["session state carrying the daemon's event position", ok({ kind: "state", sessions: [sessionRecord], cursor: { daemonEpoch: "epoch", sequence: "6778" } })],
-  ["session query rows", ok(queryResult)],
   ["the installed Pi's model catalog", ok(modelCatalog)],
   ["an empty model catalog", ok({ kind: "models", models: [] })],
   ["typed failure", { version: 1, requestId: "request", ok: false, error: { code: "DENIED", message: "denied", retryable: false } }],
@@ -93,8 +90,7 @@ const rejectedResponses = [
   ["invented menu command source", ok({ ...menu, commands: [{ name: "/x", source: "invented" }] }), /source/iu],
   ["empty session summary text", ok({ kind: "state", sessions: [{ ...sessionRecord, summary: { ...sessionRecord.summary, text: "" } }] }), /summary\.text/u],
   ["a state cursor whose sequence is not canonical", ok({ kind: "state", sessions: [], cursor: { daemonEpoch: "epoch", sequence: "01" } }), /sequence/u],
-  ["unknown query result field", ok({ ...queryResult, unknown: true }), /unknown/iu],
-  ["non-string query rows", ok({ ...queryResult, rows: [{ nested: true }] }), /rows/iu],
+  ["session query rows", ok({ kind: "session_query", sessionId: "session", query: "get_session_stats", rows: ["messages: 12"] }), /kind/iu],
   ["unknown model catalog field", ok({ ...modelCatalog, unknown: true }), /unknown/iu],
   ["unknown field on a catalog model", ok({ kind: "models", models: [{ provider: "anthropic", id: "claude", thinking: true, unknown: true }] }), /unknown/iu],
   ["a catalog model without a thinking flag", ok({ kind: "models", models: [{ provider: "anthropic", id: "claude" }] }), /thinking/iu],

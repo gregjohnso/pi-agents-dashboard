@@ -93,12 +93,6 @@ export function createDaemonViewerClient({ client, clientId }) {
     async setSessionColor(sessionId, color) {
       return client.setSessionColor(sessionId, color);
     },
-    /** @param {string} sessionId @param {Record<string, any>} payload */
-    async query(sessionId, payload) {
-      const result = await request("session_query", { sessionId, ...payload });
-      if (result?.kind !== "session_query") throw Object.assign(new Error("Daemon returned the wrong session query result"), { code: "INVALID_RESPONSE" });
-      return result;
-    },
     /** @param {Record<string, any>} payload */
     async setSettings(payload) {
       const result = await request("set_settings", payload);

@@ -29,7 +29,6 @@ function fixture(overrides = {}) {
     onConnectionChange(next) { connectionListener = next; return () => { connectionListener = undefined; }; },
     ...(overrides.attach === undefined ? {} : { attach: async (sessionId) => { attached.push(sessionId); return overrides.attach(sessionId); } }),
     async command(operation, payload) { commands.push({ operation, payload }); return overrides.command?.(operation, payload); },
-    ...(overrides.query === undefined ? {} : { query: overrides.query }),
     ...(overrides.menu === undefined ? {} : { menu: overrides.menu }),
     async ack(_sessionId, cursor) { order.push(`ack:${cursor.sequence}`); },
   };
@@ -145,22 +144,15 @@ describe("viewer commands and role restrictions", () => {
     expect(f.commands).toHaveLength(3);
   });
 
-  it("answers /stats, /help, /new, and /resume in the viewer without prompting the session", async () => {
-    const f = fixture({ query: async (_sessionId, payload) => ({ rows: [`query:${payload.query}`, "messageCount: 12"] }) });
+  it("answers /help, /new, and /resume in the viewer without prompting the session", async () => {
+    const f = fixture();
     await f.instance.open();
-
-    f.instance.editor.setText("/stats");
-    f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(f.instance.overlay?.title).toBe("Session stats"));
-    expect(f.instance.render(80, 24).join("\n")).toContain("messageCount: 12");
-    f.instance.handleInput("\x1b");
-    expect(f.instance.overlay).toBeUndefined();
 
     f.instance.editor.setText("/help");
     f.instance.handleInput("\r");
     await vi.waitFor(() => expect(f.instance.overlay?.title).toBe("Viewer help"));
     const help = f.instance.render(80, 24).join("\n");
-    expect(help).toContain("/stats");
+    expect(help).not.toContain("/stats");
     expect(help).toContain("/auto-compact");
     expect(help).toContain("Esc");
     f.instance.handleInput("\x1b");

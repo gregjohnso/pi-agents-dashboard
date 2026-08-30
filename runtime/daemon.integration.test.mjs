@@ -546,7 +546,7 @@ it("reaches a freshly launched worker over its launch channel before any socket 
   client.close();
 });
 
-it("serves read-only session queries and session toggles from the owning worker", async () => {
+it("refuses a session query and serves session toggles from the owning worker", async () => {
   const stateRoot = await root();
   for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const identity = { pid: 431, startIdentity: "query-worker", processGroupId: 431 };
@@ -558,7 +558,7 @@ it("serves read-only session queries and session toggles from the owning worker"
   await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "query", runId: "run-query", leaseId: "lease-query", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
   const runtime = await createDaemonRuntime({ root: stateRoot, inspect });
   runtimes.push(runtime);
-  const worker = startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "query", runId: "run-query", leaseId: "lease-query", generation: 1, identity, piChildIdentity: piChild, token: "query-token", results: { session_query: ["messageCount: 12", "totalTokens: 3400"] } });
+  const worker = startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "query", runId: "run-query", leaseId: "lease-query", generation: 1, identity, piChildIdentity: piChild, token: "query-token", results: {} });
   await runtime.ready;
   const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
   await client.ready;
@@ -566,7 +566,7 @@ it("serves read-only session queries and session toggles from the owning worker"
   expect(await client.next()).toMatchObject({ ok: true, result: { role: "composer" } });
 
   client.send({ version: 1, clientId: "viewer", requestId: "stats-request", op: "session_query", payload: { sessionId: "query", query: "get_session_stats" } });
-  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "session_query", sessionId: "query", query: "get_session_stats", rows: ["messageCount: 12", "totalTokens: 3400"] } });
+  expect(await client.next()).toMatchObject({ ok: false, error: { code: "INVALID_REQUEST" } });
 
   client.send({ version: 1, clientId: "viewer", requestId: "auto-compact", op: "session_command", payload: { sessionId: "query", command: "set_auto_compaction", enabled: false } });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
@@ -575,9 +575,9 @@ it("serves read-only session queries and session toggles from the owning worker"
 
   // get_state is the daemon's own reconnect probe, not a frontend request.
   const delivered = worker.commands.filter((/** @type {any} */ command) => !["get_session_commands", "get_state"].includes(command.op));
-  expect(delivered[0]).toMatchObject({ op: "session_query", sessionQuery: { query: "get_session_stats" } });
-  expect(delivered[1].sessionCommand).toEqual({ command: "set_auto_compaction", enabled: false });
-  expect(delivered[2].sessionCommand).toEqual({ command: "set_steering_mode", mode: "one-at-a-time" });
+  expect(delivered.map((/** @type {any} */ command) => command.op)).toEqual(["session_command", "session_command"]);
+  expect(delivered[0].sessionCommand).toEqual({ command: "set_auto_compaction", enabled: false });
+  expect(delivered[1].sessionCommand).toEqual({ command: "set_steering_mode", mode: "one-at-a-time" });
   client.close();
 });
 

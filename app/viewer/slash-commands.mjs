@@ -45,9 +45,6 @@ export function sessionSlashCommands(menu) {
     { name: "rename", description: menu.name == null ? "Name this session" : `Name: ${menu.name}`, argumentHint: "<name>", source: BUILTIN_SOURCE },
     { name: "color", description: menu.color == null ? "Set this session's dashboard color" : `Color: ${menu.color}`, argumentHint: "<color>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, [DEFAULT_COLOR, ...SESSION_COLORS]) },
     { name: "compact", description: "Compact the conversation", argumentHint: "[instructions]", source: BUILTIN_SOURCE },
-    { name: "stats", description: "Show this session's Pi statistics", source: BUILTIN_SOURCE },
-    { name: "tree", description: "Show this session's entry tree", source: BUILTIN_SOURCE },
-    { name: "export", description: "Export this session to HTML", argumentHint: "[path]", source: BUILTIN_SOURCE },
     { name: "auto-compact", description: "Turn automatic compaction on or off", argumentHint: "<on|off>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, TOGGLES) },
     { name: "auto-retry", description: "Turn automatic retry on or off", argumentHint: "<on|off>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, TOGGLES) },
     { name: "steering", description: "How queued steering messages are delivered", argumentHint: "<all|one-at-a-time>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, QUEUE_MODES) },
@@ -72,7 +69,7 @@ export function sessionSlashCommands(menu) {
  * Resolve one submitted editor line into a prompt or an exact session command.
  * @param {string} text
  * @param {SessionMenu} menu
- * @returns {{kind:"prompt",text:string}|{kind:"session_command",payload:Record<string,any>}|{kind:"session_query",payload:Record<string,any>}|{kind:"settings",payload:Record<string,any>}|{kind:"session_color",color:string|null}|{kind:"dashboard",action:"new_session"|"session_list"}|{kind:"help"}|{kind:"rejected",code:string,message:string}}
+ * @returns {{kind:"prompt",text:string}|{kind:"session_command",payload:Record<string,any>}|{kind:"settings",payload:Record<string,any>}|{kind:"session_color",color:string|null}|{kind:"dashboard",action:"new_session"|"session_list"}|{kind:"help"}|{kind:"rejected",code:string,message:string}}
  */
 export function parseSlashSubmission(text, menu) {
   const trimmed = text.trim();
@@ -112,9 +109,6 @@ export function parseSlashSubmission(text, menu) {
   if (name === "/compact") {
     return { kind: "session_command", payload: argument.length === 0 ? { command: "compact" } : { command: "compact", instructions: argument } };
   }
-  if (name === "/stats") return { kind: "session_query", payload: { query: "get_session_stats" } };
-  if (name === "/tree") return { kind: "session_query", payload: { query: "get_tree" } };
-  if (name === "/export") return { kind: "session_query", payload: argument.length === 0 ? { query: "export_html" } : { query: "export_html", outputPath: argument } };
   if (name === "/auto-compact" || name === "/auto-retry") {
     if (!TOGGLES.includes(argument)) return { kind: "rejected", code: "TOGGLE_REQUIRED", message: `Use ${name} on or ${name} off` };
     return { kind: "session_command", payload: { command: name === "/auto-compact" ? "set_auto_compaction" : "set_auto_retry", enabled: argument === "on" } };

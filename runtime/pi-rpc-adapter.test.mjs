@@ -183,6 +183,16 @@ it("fails unsupported operations before recording RPC_WRITE_STARTED", async () =
   expect(records.map((record) => record.stage)).toEqual(["RECEIVED", "FAILED"]);
 });
 
+it("refuses a session query the worker no longer dispatches", async () => {
+  /** @type {any[]} */
+  const records = [];
+  const replay = await createWorkerReplayStore({ append: async (record) => { records.push(record); } });
+  const dispatcher = createWorkerCommandDispatcher({ replay, adapter: {} });
+
+  await expect(dispatcher.deliver({ clientId: "client", requestId: "stats", op: "session_query" })).rejects.toMatchObject({ code: "UNSUPPORTED_WORKER_OPERATION" });
+  expect(records.map((record) => record.stage)).toEqual(["RECEIVED", "FAILED"]);
+});
+
 it("persists exact invalid RPC bytes before fatal decoding", async () => {
   const child = fakeRpcProcess((_command, process) => process.stdout.write(Buffer.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xff, 0x22, 0x7d, 0x0a])));
   const diagnostics = { append: vi.fn(async () => {}) };
@@ -216,36 +226,27 @@ it("rejects malformed Pi output, retains stderr, and does not respawn", async ()
   await adapter.close();
 });
 
-it("forwards read-only queries and session toggles with Pi's own parameter names", async () => {
+it("forwards session toggles with Pi's own parameter names and exposes no session query", async () => {
   /** @type {any[]} */
   const sent = [];
-  /** @type {Record<string, any>} */
-  const data = {
-    get_session_stats: { messageCount: 12, totalTokens: 3400 },
-    get_tree: { tree: { id: "root" }, leafId: "leaf-1" },
-    export_html: { path: "/tmp/session.html" },
-  };
   const child = fakeRpcProcess((command, process) => {
     sent.push(command);
-    process.stdout.write(`${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true, data: data[command.type] })}\n`);
+    process.stdout.write(`${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true })}\n`);
   });
   const adapter = PiRpcAdapter.connect({ input: child.stdin, output: child.stdout, maxRecordBytes: 4_096 });
 
-  await expect(adapter.getSessionStats()).resolves.toEqual(data.get_session_stats);
-  await expect(adapter.getTree()).resolves.toEqual(data.get_tree);
-  await expect(adapter.exportHtml("/tmp/session.html")).resolves.toEqual(data.export_html);
+  for (const method of ["getSessionStats", "getTree", "exportHtml"]) expect(/** @type {any} */ (adapter)[method], method).toBeUndefined();
   await expect(adapter.setAutoCompaction(false)).resolves.toBeUndefined();
   await expect(adapter.setAutoRetry(true)).resolves.toBeUndefined();
   await expect(adapter.abortRetry()).resolves.toBeUndefined();
   await expect(adapter.setSteeringMode("all")).resolves.toBeUndefined();
   await expect(adapter.setFollowUpMode("one-at-a-time")).resolves.toBeUndefined();
 
-  expect(sent.map(({ type }) => type)).toEqual(["get_session_stats", "get_tree", "export_html", "set_auto_compaction", "set_auto_retry", "abort_retry", "set_steering_mode", "set_follow_up_mode"]);
-  expect(sent[2]).toMatchObject({ outputPath: "/tmp/session.html" });
-  expect(sent[3]).toMatchObject({ enabled: false });
-  expect(sent[4]).toMatchObject({ enabled: true });
-  expect(sent[6]).toMatchObject({ mode: "all" });
-  expect(sent[7]).toMatchObject({ mode: "one-at-a-time" });
+  expect(sent.map(({ type }) => type)).toEqual(["set_auto_compaction", "set_auto_retry", "abort_retry", "set_steering_mode", "set_follow_up_mode"]);
+  expect(sent[0]).toMatchObject({ enabled: false });
+  expect(sent[1]).toMatchObject({ enabled: true });
+  expect(sent[3]).toMatchObject({ mode: "all" });
+  expect(sent[4]).toMatchObject({ mode: "one-at-a-time" });
   await adapter.close();
 });
 

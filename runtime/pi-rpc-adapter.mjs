@@ -286,10 +286,6 @@ export class PiRpcAdapter {
   async setSessionName(name) { return this.#request("set_session_name", { name }); }
   /** @param {string} [instructions] */
   async compact(instructions) { return this.#request("compact", instructions === undefined ? {} : { customInstructions: instructions }); }
-  async getSessionStats() { return this.#request("get_session_stats"); }
-  async getTree() { return this.#request("get_tree"); }
-  /** @param {string} [outputPath] */
-  async exportHtml(outputPath) { return this.#request("export_html", outputPath === undefined ? {} : { outputPath }); }
   /** @param {boolean} enabled */
   async setAutoCompaction(enabled) { return this.#request("set_auto_compaction", { enabled }); }
   /** @param {boolean} enabled */

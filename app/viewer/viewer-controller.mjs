@@ -5,8 +5,6 @@ import { SESSION_COLORS } from "../../shared/contracts.mjs";
 import { parseViewerEvent, parseViewerSnapshot } from "../../shared/viewer-contracts.mjs";
 import { createPiComponentAdapters } from "./pi-component-adapters.mjs";
 import { EMPTY_SESSION_MENU, parseSlashSubmission, sessionSlashCommands } from "./slash-commands.mjs";
-
-const QUERY_TITLES = { get_session_stats: "Session stats", get_tree: "Session tree", export_html: "Session export" };
 import { CommandSelectionOverlay, PendingUiOverlay, TextPanelOverlay, renderStatusIndicator, renderSystemCard } from "./overlays.mjs";
 import { ReturnGesture } from "./return-gesture.mjs";
 import { TranscriptModel, applyViewerEvent, createTranscriptState } from "./transcript.mjs";
@@ -403,12 +401,6 @@ export class ViewerController {
       this.onDashboardAction(submission.action);
       return;
     }
-    if (submission.kind === "session_query") {
-      const rows = await this.runQuery(submission.payload);
-      if (rows !== undefined) this.openTextPanel(QUERY_TITLES[submission.payload.query] ?? "Session", rows);
-      this.clearEditor();
-      return;
-    }
     if (submission.kind === "session_color") {
       if (!await this.sendSessionColor(submission.color)) return;
       await this.loadMenu();
@@ -505,22 +497,6 @@ export class ViewerController {
       "Home/End  jump to the start or end · wheel scrolls",
       "Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · Ctrl+C interrupt",
     ];
-  }
-
-  /** @param {Record<string, any>} payload */
-  async runQuery(payload) {
-    if (typeof this.client.query !== "function") {
-      await this.recordError({ code: "SESSION_QUERY_UNAVAILABLE", message: "This frontend cannot run session queries", retryable: false });
-      return undefined;
-    }
-    try {
-      const result = await this.client.query(this.sessionId, payload);
-      return Array.isArray(result?.rows) ? result.rows : [];
-    } catch (error) {
-      const typed = /** @type {any} */ (error);
-      await this.recordError({ code: typed?.code ?? "SESSION_QUERY_FAILED", message: error instanceof Error ? error.message : "Session query failed", retryable: typed?.retryable === true });
-      return undefined;
-    }
   }
 
   /** Apply the dashboard's session color. Registry metadata only: no Pi worker is involved. @param {string | null} color */

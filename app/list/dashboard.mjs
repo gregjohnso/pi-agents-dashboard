@@ -262,6 +262,17 @@ function fitLine(line, width) {
 function paintPlainLine(text, width, paint) {
     return paint(fitLine(stripVTControlCharacters(String(text)), width));
 }
+/**
+ * The empty prompt: placeholder text under a dimmed block cursor on its first character, so the
+ * caret reads as resting where typing will land rather than as literal text to keep.
+ * @param {number} width
+ */
+function promptPlaceholderLine(width) {
+    const placeholder = "describe a task for a new session";
+    const painted = `${jobwatchTheme.text(" ❯ ", false)}${jobwatchTheme.placeholderCursor(placeholder.slice(0, 1))}${jobwatchTheme.muted(placeholder.slice(1), false)}`;
+    const padding = Math.max(0, width - (3 + placeholder.length));
+    return `${painted}${jobwatchTheme.muted(" ".repeat(padding), false)}`;
+}
 function sectionFooter(width, focused) {
     return paintPlainLine("─".repeat(Math.max(0, width)), width, focused ? jobwatchTheme.focusBorder : jobwatchTheme.text);
 }
@@ -1102,7 +1113,7 @@ export class DashboardController {
                 const draftPrompt = this.composerDraft.prompt;
                 // Flat rules above and below the prompt: a rounded top with a flat bottom read as a broken box.
                 lines[dockTop] = sectionFooter(this.width, confirmingSharedLaunch);
-                lines[dockTop + 1] = paintPlainLine(` ❯ ${draftPrompt}`, this.width, (text) => jobwatchTheme.text(text, false));
+                lines[dockTop + 1] = draftPrompt === "" ? promptPlaceholderLine(this.width) : paintPlainLine(` ❯ ${draftPrompt}`, this.width, (text) => jobwatchTheme.text(text, false));
                 const form = layout.listTop >= 5 ? this.draftModelSummary() : ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} name:${this.composerDraft.name}`;
                 // The rule closes the prompt box; launch settings and the selected path are context below it.
                 const formRow = layout.dockRows >= 4 ? dockTop + 3 : dockTop + 2;

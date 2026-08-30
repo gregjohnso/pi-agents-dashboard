@@ -67,6 +67,10 @@ export const jobwatchTheme = {
     overlayText(text) {
         return paint(text, JOBWATCH_ANSI.text, false, JOBWATCH_ANSI.surfaceBackground);
     },
+    /** A dimmed block over one character: the cursor at rest, not a selection. */
+    placeholderCursor(text) {
+        return `${JOBWATCH_ANSI.selectionBackground}${JOBWATCH_ANSI.gray}${text}${JOBWATCH_ANSI.reset}`;
+    },
     overlayMuted(text) {
         return paint(text, JOBWATCH_ANSI.gray, false, JOBWATCH_ANSI.surfaceBackground);
     },

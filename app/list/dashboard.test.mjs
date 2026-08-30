@@ -1395,3 +1395,19 @@ describe("wheel scrolling", () => {
         expect(dashboard.selectedSessionId).toBe("b");
     });
 });
+
+it("rests a dimmed cursor on the placeholder's first character until the operator types", async () => {
+  // An empty prompt must read as a caret waiting, not as text the operator has to delete.
+  const dashboard = controller(new FakeBackend([]));
+  await dashboard.open();
+
+  const rows = dashboard.render(80, 20).map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  expect(rows.join("\n")).toContain("describe a task for a new session");
+  const cursorRow = dashboard.render(80, 20).find((line) => line.includes("escribe a task"));
+  expect(cursorRow).toContain(`${JOBWATCH_ANSI.selectionBackground}${JOBWATCH_ANSI.gray}d`);
+
+  dashboard.setComposerPrompt("hello");
+  const typed = dashboard.render(80, 20).join("\n");
+  expect(typed).not.toContain("describe a task for a new session");
+  expect(typed).toContain("hello");
+});

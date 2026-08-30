@@ -4,7 +4,7 @@ exports[`pins the complete list and viewer surfaces at 40x10 1`] = `
 {
   "list": [
     " pi-agents                              ",
-    " /worktrees/研究/非常に長いプロジェクト ",
+    " 検証 🚀 résumé                         ",
     "╭─ Sessions ────────────────────────────",
     "  NAME       STATE    ACTIVITY          ",
     "⠋ 検証 🚀 r… WORKING  bash: pytest 検…  ",
@@ -33,7 +33,7 @@ exports[`pins the complete list and viewer surfaces at 55x16 1`] = `
 {
   "list": [
     " pi-agents                                             ",
-    " /worktrees/研究/非常に長いプロジェクト名/dashboard    ",
+    " 検証 🚀 résumé                                        ",
     "   cwd: /repo                                          ",
     "╭─ Sessions ───────────────────────────────────────────",
     "  NAME               STATE    ACTIVITY           AGE   ",
@@ -74,7 +74,7 @@ exports[`pins the complete list and viewer surfaces at 80x24 1`] = `
 {
   "list": [
     " pi-agents                                                                      ",
-    " /worktrees/研究/非常に長いプロジェクト名/dashboard                             ",
+    " 検証 🚀 résumé                                                                 ",
     "   cwd: /repo                                                                   ",
     "╭─ Sessions ────────────────────────────────────────────────────────────────────",
     "  NAME                       STATE     ACTIVITY        MODEL            AGE     ",
@@ -131,7 +131,7 @@ exports[`pins the complete list and viewer surfaces at 120x32 1`] = `
 {
   "list": [
     " pi-agents                                                                                                              ",
-    " /worktrees/研究/非常に長いプロジェクト名/dashboard                                                                     ",
+    " 検証 🚀 résumé                                                                                                         ",
     "   cwd: /repo                                                                                                           ",
     "╭─ Sessions ────────────────────────────────────────────────────────────────────────────────────────────────────────────",
     "  NAME                             STATE     ACTIVITY                                          MODEL            AGE     ",
@@ -204,7 +204,7 @@ exports[`pins the complete list and viewer surfaces at 160x40 1`] = `
 {
   "list": [
     " pi-agents                                                                                                                                                      ",
-    " /worktrees/研究/非常に長いプロジェクト名/dashboard                                                                                                             ",
+    " 検証 🚀 résumé                                                                                                                                                 ",
     "   cwd: /repo                                                                                                                                                   ",
     "╭─ Sessions ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
     "  NAME                             STATE     ACTIVITY                                                                                  MODEL            AGE     ",

@@ -151,7 +151,9 @@ it.each(dimensions)("pins the complete list and viewer surfaces at %ix%i", async
   expect(listLines).toHaveLength(height);
   expect(viewerLines).toHaveLength(height);
   expect([...listLines, ...viewerLines].every((line) => visibleWidth(line) <= width)).toBe(true);
-  expect({ list: listLines.map(stripVTControlCharacters), viewer: viewerLines.map(stripVTControlCharacters) }).toMatchSnapshot();
+  // The working indicator prints wall-clock elapsed time, so it differs run to run; pin the layout, not the clock.
+  const steady = (line) => stripVTControlCharacters(line).replace(/Elapsed \d+\.\d+s/, "Elapsed 0.0s");
+  expect({ list: listLines.map(steady), viewer: viewerLines.map(steady) }).toMatchSnapshot();
   await Promise.all([list.dashboard.close(), viewer.controller.close()]);
 });
 

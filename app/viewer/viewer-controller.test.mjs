@@ -115,33 +115,29 @@ describe("viewer commands and role restrictions", () => {
     await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "session_command", payload: { sessionId: "s", command: "set_model", model: { provider: "openai", id: "gpt-5" } } }]));
     expect(f.instance.selection).toBeUndefined();
 
-    f.instance.editor.setText("/steering");
-    f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
-    expect(f.instance.render(80, 24).join("\n")).toContain("one-at-a-time");
-    f.instance.handleInput("\x1b[B");
-    f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(f.commands.at(-1)).toEqual({ operation: "session_command", payload: { sessionId: "s", command: "set_steering_mode", mode: "one-at-a-time" } }));
-
-    f.instance.editor.setText("/auto-compact");
-    f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
-    f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(f.commands.at(-1)).toEqual({ operation: "session_command", payload: { sessionId: "s", command: "set_auto_compaction", enabled: true } }));
-
-    f.instance.editor.setText("/follow-up");
+    f.instance.editor.setText("/thinking");
     f.instance.handleInput("\r");
     await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
     f.instance.handleInput("\x1b");
     expect(f.instance.selection).toBeUndefined();
-    expect(f.commands).toHaveLength(3);
+    expect(f.commands).toHaveLength(1);
 
     // Only a bare command opens a picker: a mistyped argument is a rejection the operator has to fix.
-    f.instance.editor.setText("/auto-compact maybe");
+    f.instance.editor.setText("/model invented/model");
     f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(f.instance.render(80, 24).join("\n")).toContain("TOGGLE_REQUIRED"));
+    await vi.waitFor(() => expect(f.instance.render(80, 24).join("\n")).toContain("UNKNOWN_MODEL"));
     expect(f.instance.selection).toBeUndefined();
-    expect(f.commands).toHaveLength(3);
+    expect(f.commands).toHaveLength(1);
+  });
+
+  it.each(["/auto-compact", "/steering", "/follow-up"])("prompts the session with %s instead of opening a settings picker", async (text) => {
+    const f = fixture();
+    await f.instance.open();
+
+    f.instance.editor.setText(text);
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.commands.at(-1)).toEqual({ operation: "prompt", payload: { sessionId: "s", text } }));
+    expect(f.instance.selection).toBeUndefined();
   });
 
   it("answers /help, /new, and /resume in the viewer without prompting the session", async () => {
@@ -153,7 +149,7 @@ describe("viewer commands and role restrictions", () => {
     await vi.waitFor(() => expect(f.instance.overlay?.title).toBe("Viewer help"));
     const help = f.instance.render(80, 24).join("\n");
     expect(help).not.toContain("/stats");
-    expect(help).toContain("/auto-compact");
+    expect(help).not.toContain("/auto-compact");
     expect(help).toContain("Esc");
     f.instance.handleInput("\x1b");
 

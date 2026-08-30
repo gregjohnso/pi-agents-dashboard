@@ -620,6 +620,26 @@ it("does not charge an ownership-free stale LIVE record against managed capacity
   await expect(supervisor.launch({ sessionId: "two", canonicalSessionFile: (await getRecord(registry, "two")).canonicalSessionFile, cwd: "/repo", runId: "stale-live-cap" })).resolves.toMatchObject({ sessionId: "two" });
 });
 
+// The launch channel used to rebuild the session_command payload inline, keeping only model, level,
+// name, and instructions. Every other field was dropped, so a command carrying one reached the worker
+// stripped and was refused there. One projection is the fix; this pins that the duplicate is gone.
+it("projects a session command onto the launch channel exactly as the daemon does", async () => {
+  const { root, runs, registry, ownership } = await setup();
+  const workers = fakeWorkerFactory({ commandBehavior: "success" });
+  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "projection-token" });
+  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-projection" });
+  const journal = await createCommandJournal({ path: join(root, "commands.jsonl") });
+
+  await launched.deliver(/** @type {any} */ ({ version: 1, clientId: "client", requestId: "rename", op: "session_command", payload: { sessionId: "one", command: "set_session_name", name: "Coverage loader" } }), journal);
+  await launched.deliver(/** @type {any} */ ({ version: 1, clientId: "client", requestId: "brake", op: "session_command", payload: { sessionId: "one", command: "abort_retry" } }), journal);
+
+  const child = workers.children.at(-1);
+  const projected = child.send.mock.calls.map((/** @type {any[]} */ call) => call[0]).filter((/** @type {any} */ message) => message.type === "command").map((/** @type {any} */ message) => message.command.sessionCommand);
+  expect(projected).toEqual([{ command: "set_session_name", name: "Coverage loader" }, { command: "abort_retry" }]);
+  await journal.close();
+  await supervisor.close();
+});
+
 it("journals exact command stages before delivery and preserves request identity", async () => {
   /** @type {string[]} */
   const order = [];

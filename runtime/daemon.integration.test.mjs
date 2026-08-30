@@ -569,15 +569,18 @@ it("refuses a session query and serves session toggles from the owning worker", 
   expect(await client.next()).toMatchObject({ ok: false, error: { code: "INVALID_REQUEST" } });
 
   client.send({ version: 1, clientId: "viewer", requestId: "auto-compact", op: "session_command", payload: { sessionId: "query", command: "set_auto_compaction", enabled: false } });
-  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  expect(await client.next()).toMatchObject({ ok: false, error: { code: "INVALID_REQUEST" } });
   client.send({ version: 1, clientId: "viewer", requestId: "steering", op: "session_command", payload: { sessionId: "query", command: "set_steering_mode", mode: "one-at-a-time" } });
+  expect(await client.next()).toMatchObject({ ok: false, error: { code: "INVALID_REQUEST" } });
+
+  // The retry brake outlives the settings passthrough, and it is the only zero-argument variant left.
+  client.send({ version: 1, clientId: "viewer", requestId: "abort-retry", op: "session_command", payload: { sessionId: "query", command: "abort_retry" } });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
 
   // get_state is the daemon's own reconnect probe, not a frontend request.
   const delivered = worker.commands.filter((/** @type {any} */ command) => !["get_session_commands", "get_state"].includes(command.op));
-  expect(delivered.map((/** @type {any} */ command) => command.op)).toEqual(["session_command", "session_command"]);
-  expect(delivered[0].sessionCommand).toEqual({ command: "set_auto_compaction", enabled: false });
-  expect(delivered[1].sessionCommand).toEqual({ command: "set_steering_mode", mode: "one-at-a-time" });
+  expect(delivered.map((/** @type {any} */ command) => command.op)).toEqual(["session_command"]);
+  expect(delivered[0].sessionCommand).toEqual({ command: "abort_retry" });
   client.close();
 });
 

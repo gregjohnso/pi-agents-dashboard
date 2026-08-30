@@ -10,6 +10,7 @@ import { assertPiExecutableIdentity, resolvePiExecutable } from "./pi-executable
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "./process-signaler.mjs";
 import { registryCoordinationScope } from "./registry-store.mjs";
+import { sessionCommandPayload } from "./session-command-projection.mjs";
 import { reduceSessionState } from "./state-reducer.mjs";
 
 const DEFAULT_WORKER_PATH = fileURLToPath(new URL("./worker.mjs", import.meta.url));
@@ -659,13 +660,7 @@ export class WorkerSupervisor {
         try {
           const result = new Promise((resolveResult, rejectResult) => pending.set(id, { resolve: resolveResult, reject: rejectResult }));
           const payload = /** @type {{ text?: string, uiRequestId?: string, response?: unknown, command?: string, model?: unknown, level?: string, name?: string, instructions?: string }} */ (command.payload);
-          const sessionCommand = command.op !== "session_command" ? undefined : {
-            command: payload.command,
-            ...(payload.model === undefined ? {} : { model: payload.model }),
-            ...(payload.level === undefined ? {} : { level: payload.level }),
-            ...(payload.name === undefined ? {} : { name: payload.name }),
-            ...(payload.instructions === undefined ? {} : { instructions: payload.instructions }),
-          };
+          const sessionCommand = command.op !== "session_command" ? undefined : sessionCommandPayload(payload);
           await sendMessage(child, { version: 1, type: "command", token, id, command: { clientId: command.clientId, requestId: command.requestId, op: command.op, text: payload.text, response: command.op === "ui_response" ? { requestId: payload.uiRequestId, response: payload.response } : undefined, sessionCommand, retryAtRisk } });
           await result;
           await journal.transition(key, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");

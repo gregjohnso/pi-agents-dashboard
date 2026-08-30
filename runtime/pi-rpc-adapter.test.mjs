@@ -226,7 +226,7 @@ it("rejects malformed Pi output, retains stderr, and does not respawn", async ()
   await adapter.close();
 });
 
-it("forwards session toggles with Pi's own parameter names and exposes no session query", async () => {
+it("exposes the retry brake but no session query and no settings passthrough", async () => {
   /** @type {any[]} */
   const sent = [];
   const child = fakeRpcProcess((command, process) => {
@@ -235,18 +235,10 @@ it("forwards session toggles with Pi's own parameter names and exposes no sessio
   });
   const adapter = PiRpcAdapter.connect({ input: child.stdin, output: child.stdout, maxRecordBytes: 4_096 });
 
-  for (const method of ["getSessionStats", "getTree", "exportHtml"]) expect(/** @type {any} */ (adapter)[method], method).toBeUndefined();
-  await expect(adapter.setAutoCompaction(false)).resolves.toBeUndefined();
-  await expect(adapter.setAutoRetry(true)).resolves.toBeUndefined();
+  for (const method of ["getSessionStats", "getTree", "exportHtml", "setAutoCompaction", "setAutoRetry", "setSteeringMode", "setFollowUpMode"]) expect(/** @type {any} */ (adapter)[method], method).toBeUndefined();
   await expect(adapter.abortRetry()).resolves.toBeUndefined();
-  await expect(adapter.setSteeringMode("all")).resolves.toBeUndefined();
-  await expect(adapter.setFollowUpMode("one-at-a-time")).resolves.toBeUndefined();
 
-  expect(sent.map(({ type }) => type)).toEqual(["set_auto_compaction", "set_auto_retry", "abort_retry", "set_steering_mode", "set_follow_up_mode"]);
-  expect(sent[0]).toMatchObject({ enabled: false });
-  expect(sent[1]).toMatchObject({ enabled: true });
-  expect(sent[3]).toMatchObject({ mode: "all" });
-  expect(sent[4]).toMatchObject({ mode: "one-at-a-time" });
+  expect(sent.map(({ type }) => type)).toEqual(["abort_retry"]);
   await adapter.close();
 });
 

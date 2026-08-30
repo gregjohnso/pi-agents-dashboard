@@ -286,15 +286,7 @@ export class PiRpcAdapter {
   async setSessionName(name) { return this.#request("set_session_name", { name }); }
   /** @param {string} [instructions] */
   async compact(instructions) { return this.#request("compact", instructions === undefined ? {} : { customInstructions: instructions }); }
-  /** @param {boolean} enabled */
-  async setAutoCompaction(enabled) { return this.#request("set_auto_compaction", { enabled }); }
-  /** @param {boolean} enabled */
-  async setAutoRetry(enabled) { return this.#request("set_auto_retry", { enabled }); }
   async abortRetry() { return this.#request("abort_retry"); }
-  /** @param {"all"|"one-at-a-time"} mode */
-  async setSteeringMode(mode) { return this.#request("set_steering_mode", { mode }); }
-  /** @param {"all"|"one-at-a-time"} mode */
-  async setFollowUpMode(mode) { return this.#request("set_follow_up_mode", { mode }); }
 
   /** @param {(frame: Record<string, unknown>) => void} listener */
   onFrame(listener) {

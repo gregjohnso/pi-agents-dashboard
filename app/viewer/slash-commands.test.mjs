@@ -12,8 +12,6 @@ const menu = {
 };
 
 it.each([
-  ["auto-retry on", "/auto-retry on", { kind: "session_command", payload: { command: "set_auto_retry", enabled: true } }],
-  ["follow-up mode", "/follow-up all", { kind: "session_command", payload: { command: "set_follow_up_mode", mode: "all" } }],
   ["retry abort", "/abort-retry", { kind: "session_command", payload: { command: "abort_retry" } }],
   ["plain text", "explain this", { kind: "prompt", text: "explain this" }],
   ["discovered command", "/review now", { kind: "prompt", text: "/review now" }],
@@ -44,4 +42,21 @@ it.each(["/stats", "/tree", "/export", "/export /tmp/out.html"])("has no session
 it("offers no session query in the viewer command menu", () => {
   const names = new Set(sessionSlashCommands(menu).map((command) => command.name));
   for (const name of ["stats", "tree", "export"]) expect(names.has(name), name).toBe(false);
+});
+
+it.each(["/auto-compact on", "/auto-retry off", "/steering all", "/follow-up one-at-a-time"])("sends %s to Pi as a prompt instead of a settings passthrough", (text) => {
+  expect(parseSlashSubmission(text, menu)).toEqual({ kind: "prompt", text });
+});
+
+it("offers no Pi settings passthrough in the viewer command menu", () => {
+  const names = new Set(sessionSlashCommands(menu).map((command) => command.name));
+  for (const name of ["auto-compact", "auto-retry", "steering", "follow-up"]) expect(names.has(name), name).toBe(false);
+});
+
+// Pi's auto-retry defaults to on and a retry lives between agent_end and agent_settled, where `abort`
+// has no current operation to cancel. This is the only control that stops a retry storm without
+// stopping the session, so it outlives the settings commands removed alongside it.
+it("keeps the retry brake after the settings passthrough is gone", () => {
+  expect(parseSlashSubmission("/abort-retry", menu)).toEqual({ kind: "session_command", payload: { command: "abort_retry" } });
+  expect(sessionSlashCommands(menu).find((command) => command.name === "abort-retry")?.description).toMatch(/without stopping the session/i);
 });

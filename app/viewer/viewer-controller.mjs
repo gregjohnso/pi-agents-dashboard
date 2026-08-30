@@ -91,8 +91,7 @@ function modelItems(menu) {
 }
 
 /**
- * One Pi selection list per rejection code a bare built-in command can raise. `command` is undefined
- * where the submitted name is itself the command, so /steering and /follow-up share one entry.
+ * One Pi selection list per rejection code a bare built-in command can raise.
  * @type {Record<string, { command?: string, title: (submitted?: string) => string, items: (menu: any) => { value: string, label: string }[] }>}
  */
 const SELECTION_PICKERS = {
@@ -100,8 +99,6 @@ const SELECTION_PICKERS = {
   THINKING_LEVEL_REQUIRED: { command: "/thinking", title: () => "Select a thinking level", items: (menu) => menu.thinkingLevels.map((/** @type {string} */ level) => ({ value: level, label: level })) },
   SUMMARY_MODEL_REQUIRED: { command: "/model-summary", title: () => "Select a dashboard summary model", items: (menu) => [{ value: "off", label: "off · disable summaries" }, ...modelItems(menu)] },
   SESSION_COLOR_REQUIRED: { command: "/color", title: () => "Select a session color", items: () => [{ value: "default", label: "default · no tint" }, ...SESSION_COLORS.map((color) => ({ value: color, label: color }))] },
-  QUEUE_MODE_REQUIRED: { title: (submitted) => `Select a ${submitted === "/steering" ? "steering" : "follow-up"} delivery mode`, items: () => [{ value: "all", label: "all · deliver every queued message" }, { value: "one-at-a-time", label: "one-at-a-time · deliver one per turn" }] },
-  TOGGLE_REQUIRED: { title: (submitted) => `Turn ${submitted === "/auto-retry" ? "automatic retry" : "automatic compaction"} on or off`, items: () => [{ value: "on", label: "on" }, { value: "off", label: "off" }] },
 };
 
 /** Own one standalone normalized Pi chat subscription and its composer role. */

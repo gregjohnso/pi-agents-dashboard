@@ -33,9 +33,7 @@ export const SESSION_COLORS = ["sky", "green", "amber", "rose", "cyan", "gray"];
 
 const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries", "set_session_color", "get_models"];
 const COMMAND_STAGES = ["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED", "DELIVERY_UNKNOWN", "FAILED"];
-const SESSION_COMMANDS = ["set_model", "set_thinking_level", "compact", "set_session_name", "set_auto_compaction", "set_auto_retry", "abort_retry", "set_steering_mode", "set_follow_up_mode"];
-// Pi's own vocabulary for both queue modes; anything else is refused before it reaches a worker.
-const QUEUE_MODES = ["all", "one-at-a-time"];
+const SESSION_COMMANDS = ["set_model", "set_thinking_level", "compact", "set_session_name", "abort_retry"];
 const MAX_MENU_ENTRIES = 1_000;
 // Matches MAX_MODELS in runtime/pi-model-catalog.mjs, which stops reading `pi --list-models` there.
 const MAX_CATALOG_MODELS = 2_000;
@@ -246,15 +244,6 @@ export function parseClientRequest(value) {
       const name = readText(payload, "name", "session_command payload.name");
       if (name.length > 128) throw new TypeError("session_command payload.name must be at most 128 characters");
       return { ...base, payload: { sessionId, command, name } };
-    }
-    if (command === "set_auto_compaction" || command === "set_auto_retry") {
-      rejectUnknownKeys(payload, ["sessionId", "command", "enabled"], "session_command payload");
-      if (typeof payload.enabled !== "boolean") throw new TypeError("session_command payload.enabled must be a boolean");
-      return { ...base, payload: { sessionId, command, enabled: payload.enabled } };
-    }
-    if (command === "set_steering_mode" || command === "set_follow_up_mode") {
-      rejectUnknownKeys(payload, ["sessionId", "command", "mode"], "session_command payload");
-      return { ...base, payload: { sessionId, command, mode: readEnum(payload, "mode", QUEUE_MODES, "session_command payload.mode") } };
     }
     if (command === "abort_retry") {
       rejectUnknownKeys(payload, ["sessionId", "command"], "session_command payload");

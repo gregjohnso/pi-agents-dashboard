@@ -19,6 +19,7 @@ import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "./process-s
 import { RecoveredWorkerRouter, reconcileRuntime } from "./reconciliation.mjs";
 import { openSettingsStore, summarizePromptInput, summarizeWithPi } from "./summaries.mjs";
 import { RegistryStore, applySessionColor, applySessionUpdate, runSessionLifecycle } from "./registry-store.mjs";
+import { sessionCommandPayload } from "./session-command-projection.mjs";
 import { reduceSessionState } from "./state-reducer.mjs";
 import { createIdleExit } from "./idle-exit.mjs";
 import { spawn as spawnProcess } from "node:child_process";
@@ -251,17 +252,6 @@ async function createDeleteResultStore(path) {
 function validateWorkerSuccess(record, pending) {
   const allowed = ["clientId", "requestId", "op", "stage", "at", "result", "stderr"];
   if (typeof record !== "object" || record === null || Array.isArray(record) || Object.keys(record).some((key) => !allowed.includes(key)) || record.clientId !== pending.clientId || record.requestId !== pending.requestId || record.op !== pending.op || record.stage !== "RPC_ACKNOWLEDGED" || typeof record.at !== "string") throw Object.assign(new Error("Worker result does not match the pending durable command"), { code: "INVALID_WORKER_RESULT" });
-}
-
-/** Project one validated session_command payload onto its exact worker request. @param {any} payload */
-function sessionCommandPayload(payload) {
-  if (payload.command === "set_model") return { command: "set_model", model: { ...payload.model } };
-  if (payload.command === "set_thinking_level") return { command: "set_thinking_level", level: payload.level };
-  if (payload.command === "set_session_name") return { command: "set_session_name", name: payload.name };
-  if (payload.command === "set_auto_compaction" || payload.command === "set_auto_retry") return { command: payload.command, enabled: payload.enabled };
-  if (payload.command === "set_steering_mode" || payload.command === "set_follow_up_mode") return { command: payload.command, mode: payload.mode };
-  if (payload.command === "abort_retry") return { command: "abort_retry" };
-  return payload.instructions === undefined ? { command: "compact" } : { command: "compact", instructions: payload.instructions };
 }
 
 /** Report whether an exact recorded process identity is provably gone. @param {any} identity @param {(pid: number) => Promise<any>} inspect */

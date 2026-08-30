@@ -33,11 +33,7 @@ const acceptedRequests = [
   ["session_command", { sessionId: "session", command: "set_model", model: { provider: "anthropic", id: "claude" } }],
   ["session_command", { sessionId: "session", command: "set_thinking_level", level: "high" }],
   ["session_command", { sessionId: "session", command: "compact", instructions: "keep decisions" }],
-  ["session_command", { sessionId: "session", command: "set_auto_compaction", enabled: true }],
-  ["session_command", { sessionId: "session", command: "set_auto_retry", enabled: false }],
   ["session_command", { sessionId: "session", command: "abort_retry" }],
-  ["session_command", { sessionId: "session", command: "set_steering_mode", mode: "all" }],
-  ["session_command", { sessionId: "session", command: "set_follow_up_mode", mode: "one-at-a-time" }],
 ];
 
 /** Every request the wire must refuse, beyond the per-variant unknown-field matrix. @type {Array<[string, string, Record<string, any>, RegExp]>} */
@@ -52,8 +48,10 @@ const rejectedRequests = [
   ["session rebinding through new_session", "session_command", { sessionId: "session", command: "new_session" }, /command/iu],
   ["session rebinding through switch_session", "session_command", { sessionId: "session", command: "switch_session", sessionPath: "/other.jsonl" }, /command/iu],
   ["session rebinding through fork", "session_command", { sessionId: "session", command: "fork", entryId: "entry" }, /command/iu],
-  ["steering mode outside Pi's vocabulary", "session_command", { sessionId: "session", command: "set_steering_mode", mode: "invented" }, /mode/iu],
-  ["non-boolean auto retry", "session_command", { sessionId: "session", command: "set_auto_retry", enabled: "yes" }, /enabled/iu],
+  ["automatic compaction", "session_command", { sessionId: "session", command: "set_auto_compaction", enabled: true }, /command/iu],
+  ["automatic retry", "session_command", { sessionId: "session", command: "set_auto_retry", enabled: false }, /command/iu],
+  ["the steering queue mode", "session_command", { sessionId: "session", command: "set_steering_mode", mode: "all" }, /command/iu],
+  ["the follow-up queue mode", "session_command", { sessionId: "session", command: "set_follow_up_mode", mode: "one-at-a-time" }, /command/iu],
   ["session statistics", "session_query", { sessionId: "session", query: "get_session_stats" }, /operation/iu],
   ["the entry tree", "session_query", { sessionId: "session", query: "get_tree" }, /operation/iu],
   ["an HTML export", "session_query", { sessionId: "session", query: "export_html" }, /operation/iu],

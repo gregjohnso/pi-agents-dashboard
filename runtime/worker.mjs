@@ -11,7 +11,6 @@ initializeRuntimePermissions();
 const MAX_REPLAY_RECORD_BYTES = 1024 * 1024;
 const WORKER_OPERATIONS = new Set(["prompt", "steer", "follow_up", "interrupt", "ui_response", "get_state", "get_session_commands", "session_command"]);
 const MAX_MENU_ENTRIES = 1_000;
-const QUEUE_MODES = ["all", "one-at-a-time"];
 
 /** @param {any} value @param {string} fallbackSource */
 function menuCommand(value, fallbackSource) {
@@ -61,14 +60,6 @@ function assertSessionCommand(request) {
     if (typeof request.name !== "string" || request.name.trim().length === 0) throw invalid("session_command name is invalid");
     return;
   }
-  if (request?.command === "set_auto_compaction" || request?.command === "set_auto_retry") {
-    if (typeof request.enabled !== "boolean") throw invalid("session_command enabled is invalid");
-    return;
-  }
-  if (request?.command === "set_steering_mode" || request?.command === "set_follow_up_mode") {
-    if (!QUEUE_MODES.includes(request.mode)) throw invalid("session_command mode is invalid");
-    return;
-  }
   if (request?.command === "abort_retry") return;
   if (request?.command !== "compact") throw invalid(`session_command is unsupported: ${request?.command ?? "missing"}`);
 }
@@ -78,11 +69,7 @@ function applySessionCommand(adapter, request) {
   if (request.command === "set_model") return adapter.setModel({ provider: request.model.provider, id: request.model.id });
   if (request.command === "set_thinking_level") return adapter.setThinkingLevel(request.level);
   if (request.command === "set_session_name") return adapter.setSessionName(request.name.trim());
-  if (request.command === "set_auto_compaction") return adapter.setAutoCompaction(request.enabled);
-  if (request.command === "set_auto_retry") return adapter.setAutoRetry(request.enabled);
   if (request.command === "abort_retry") return adapter.abortRetry();
-  if (request.command === "set_steering_mode") return adapter.setSteeringMode(request.mode);
-  if (request.command === "set_follow_up_mode") return adapter.setFollowUpMode(request.mode);
   return adapter.compact(typeof request.instructions === "string" && request.instructions.length > 0 ? request.instructions : undefined);
 }
 

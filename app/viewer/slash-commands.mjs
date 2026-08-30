@@ -4,8 +4,6 @@ import { SESSION_COLORS } from "../../shared/contracts.mjs";
 /** @typedef {{commands:MenuCommand[],models:{provider:string,id:string}[],thinkingLevels:string[],model:{provider:string,id:string}|null,thinkingLevel:string|null,summaryModel?:{provider:string,id:string}|null,name?:string|null,color?:string|null}} SessionMenu */
 
 const BUILTIN_SOURCE = "builtin";
-const QUEUE_MODES = ["all", "one-at-a-time"];
-const TOGGLES = ["on", "off"];
 const DEFAULT_COLOR = "default";
 // Pi rebinds its running process to another session file for these; the dashboard binds one worker to one
 // canonical file, so it refuses by name rather than desynchronising the registry and the viewer stream.
@@ -45,11 +43,7 @@ export function sessionSlashCommands(menu) {
     { name: "rename", description: menu.name == null ? "Name this session" : `Name: ${menu.name}`, argumentHint: "<name>", source: BUILTIN_SOURCE },
     { name: "color", description: menu.color == null ? "Set this session's dashboard color" : `Color: ${menu.color}`, argumentHint: "<color>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, [DEFAULT_COLOR, ...SESSION_COLORS]) },
     { name: "compact", description: "Compact the conversation", argumentHint: "[instructions]", source: BUILTIN_SOURCE },
-    { name: "auto-compact", description: "Turn automatic compaction on or off", argumentHint: "<on|off>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, TOGGLES) },
-    { name: "auto-retry", description: "Turn automatic retry on or off", argumentHint: "<on|off>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, TOGGLES) },
-    { name: "steering", description: "How queued steering messages are delivered", argumentHint: "<all|one-at-a-time>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, QUEUE_MODES) },
-    { name: "follow-up", description: "How queued follow-up messages are delivered", argumentHint: "<all|one-at-a-time>", source: BUILTIN_SOURCE, getArgumentCompletions: (prefix) => completions(prefix, QUEUE_MODES) },
-    { name: "abort-retry", description: "Stop the current retry loop", source: BUILTIN_SOURCE },
+    { name: "abort-retry", description: "Stop an in-progress retry without stopping the session", source: BUILTIN_SOURCE },
     { name: "new", description: "Open the dashboard's New Session composer", source: BUILTIN_SOURCE },
     { name: "resume", description: "Return to the dashboard session list", source: BUILTIN_SOURCE },
     { name: "fork", description: "Unavailable: forking rebinds Pi's session file", source: BUILTIN_SOURCE },
@@ -108,14 +102,6 @@ export function parseSlashSubmission(text, menu) {
   }
   if (name === "/compact") {
     return { kind: "session_command", payload: argument.length === 0 ? { command: "compact" } : { command: "compact", instructions: argument } };
-  }
-  if (name === "/auto-compact" || name === "/auto-retry") {
-    if (!TOGGLES.includes(argument)) return { kind: "rejected", code: "TOGGLE_REQUIRED", message: `Use ${name} on or ${name} off` };
-    return { kind: "session_command", payload: { command: name === "/auto-compact" ? "set_auto_compaction" : "set_auto_retry", enabled: argument === "on" } };
-  }
-  if (name === "/steering" || name === "/follow-up") {
-    if (!QUEUE_MODES.includes(argument)) return { kind: "rejected", code: "QUEUE_MODE_REQUIRED", message: `Choose a mode: ${QUEUE_MODES.join(", ")}` };
-    return { kind: "session_command", payload: { command: name === "/steering" ? "set_steering_mode" : "set_follow_up_mode", mode: argument } };
   }
   if (name === "/abort-retry") return { kind: "session_command", payload: { command: "abort_retry" } };
   if (name === "/new") return { kind: "dashboard", action: "new_session" };

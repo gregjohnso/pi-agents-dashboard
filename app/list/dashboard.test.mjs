@@ -452,6 +452,32 @@ describe("dashboard controller", () => {
         expect(dashboard.composerDraft.prompt).toBe("retry me");
         expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("STARTING"))).toBe(false);
     });
+    it("keeps a refused launch on the status line through timer-driven changes until the next command", async () => {
+        const backend = new FakeBackend([session("a")]);
+        backend.refreshSummaries = vi.fn(async () => ["a"]);
+        // The daemon's shape for a refused launch: a terminal FAILED command status, not a transport error.
+        backend.launch = vi.fn(async () => ({ kind: "rejected", error: { code: "MODEL_UNKNOWN", message: "Pi does not offer openai/id" } }));
+        const dashboard = controller(backend);
+        await dashboard.open();
+        for (const character of "ship it") dashboard.handleInput(character);
+        dashboard.handleInput("\r");
+        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "MODEL_UNKNOWN" }));
+
+        // Every later change the operator did not make: the summary-refresh timer, a subscription
+        // update, and repeated renders. None of them may take the refusal off the screen.
+        await vi.waitFor(() => expect(backend.refreshSummaries).toHaveBeenCalled(), { timeout: 5_000 });
+        const update = Promise.resolve(backend.listener?.({ snapshot: { sessions: [session("a", { revision: 2 })] }, cursor: { daemonEpoch: "epoch", sequence: "2" } }));
+        // A queued event drains on a host render, so keep rendering until it lands.
+        const ticker = setInterval(() => dashboard.render(100, 24), 5);
+        try { await update; } finally { clearInterval(ticker); }
+        expect(dashboard.status).toMatchObject({ kind: "error", code: "MODEL_UNKNOWN" });
+        expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("MODEL_UNKNOWN"))).toBe(true);
+
+        // The operator's next command clears it.
+        for (const character of "/help") dashboard.handleInput(character);
+        dashboard.handleInput("\r");
+        expect(dashboard.status).toEqual({ kind: "ready" });
+    });
     it("launches worktrees and requires exact canonical shared-directory confirmation", async () => {
         const backend = new FakeBackend([]);
         const dashboard = controller(backend);

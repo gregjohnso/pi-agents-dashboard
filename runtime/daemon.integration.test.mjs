@@ -1013,6 +1013,70 @@ it("replays a durably terminal launch after deterministic response loss without 
   retry.close();
 });
 
+it("refuses a launch naming a model Pi does not offer, before anything is prepared", async () => {
+  const stateRoot = await root();
+  const resolveLaunchRequest = vi.fn(async () => ({ sessionId: "admitted" }));
+  const launch = vi.fn(async () => { throw Object.assign(new Error("launch reached the supervisor"), { code: "LAUNCH_REACHED" }); });
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    hostProbe: async () => ({ blockers: [] }),
+    modelCatalog: { models: async () => [{ provider: "openai-codex", id: "gpt-5.6-sol", thinking: true }] },
+    resolveLaunchRequest,
+    workerSupervisor: { launch, async close() {} },
+  });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 4096 });
+  await client.ready;
+
+  // The model of the operator's saved draft: a provider and an id Pi never offered.
+  const refused = { version: 1, clientId: "launcher", requestId: "unknown-model", op: "launch", payload: { prompt: "go", cwd: "/repo", sourceSessionId: "source", isolation: { mode: "worktree" }, model: { provider: "openai", id: "id" } } };
+  client.send(refused);
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "FAILED", error: { code: "MODEL_UNKNOWN" } } } });
+  // Nothing was prepared: the refusal precedes resolution, so there is no record, worktree, Pi file,
+  // worker, list event, or row to clean up.
+  expect(resolveLaunchRequest).not.toHaveBeenCalled();
+  expect(launch).not.toHaveBeenCalled();
+  expect(await new RegistryStore(join(stateRoot, "sessions")).list()).toEqual([]);
+  const events = (await readFile(join(stateRoot, "index", "events.jsonl"), "utf8")).trim();
+  expect(events.length === 0 ? [] : events.split("\n").map((line) => JSON.parse(line).kind).filter((kind) => kind === "session_changed")).toEqual([]);
+  expect((await readFile(join(stateRoot, "queue", "commands.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line).status.stage)).toEqual(["ACCEPTED", "FAILED"]);
+  expect(await runtime.commandStatus(refused)).toMatchObject({ stage: "FAILED", error: { code: "MODEL_UNKNOWN" } });
+
+  // A model Pi does offer passes the same check and reaches launch resolution.
+  client.send({ version: 1, clientId: "launcher", requestId: "known-model", op: "launch", payload: { prompt: "go", cwd: "/repo", sourceSessionId: "source", isolation: { mode: "worktree" }, model: { provider: "openai-codex", id: "gpt-5.6-sol" } } });
+  expect(await client.next()).toMatchObject({ ok: false, error: { code: "LAUNCH_REACHED" } });
+  expect(resolveLaunchRequest).toHaveBeenCalledTimes(1);
+  client.close();
+});
+
+it("lets Pi decide when its model catalog is unavailable, and records that as a distinct diagnostic", async () => {
+  const stateRoot = await root();
+  /** @type {any[]} */
+  const diagnostics = [];
+  const resolveLaunchRequest = vi.fn(async () => ({ sessionId: "undecided" }));
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    hostProbe: async () => ({ blockers: [] }),
+    modelCatalog: { models: async () => { throw Object.assign(new Error("Listing Pi models exited 1"), { code: "MODEL_CATALOG_FAILED" }); } },
+    recordDiagnostic: (/** @type {any} */ entry) => { diagnostics.push(entry); },
+    resolveLaunchRequest,
+    workerSupervisor: { async launch() { throw Object.assign(new Error("launch reached the supervisor"), { code: "LAUNCH_REACHED" }); }, async close() {} },
+  });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 4096 });
+  await client.ready;
+
+  client.send({ version: 1, clientId: "launcher", requestId: "catalog-down", op: "launch", payload: { prompt: "go", cwd: "/repo", sourceSessionId: "source", isolation: { mode: "worktree" }, model: { provider: "openai", id: "id" } } });
+  // A catalog Pi could not list refuses nothing: Pi itself decides whether it accepts the model.
+  expect(await client.next()).toMatchObject({ ok: false, error: { code: "LAUNCH_REACHED" } });
+  expect(resolveLaunchRequest).toHaveBeenCalledTimes(1);
+  expect(diagnostics).toContainEqual(expect.objectContaining({ event: "model_catalog_unavailable", code: "MODEL_CATALOG_FAILED" }));
+  expect(diagnostics.some((/** @type {any} */ entry) => entry.code === "MODEL_UNKNOWN")).toBe(false);
+  client.close();
+});
+
 it("waits for an admitted launch chain before lifecycle release", async () => {
   const stateRoot = await root();
   /** @type {((value?: unknown) => void) | undefined} */

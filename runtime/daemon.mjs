@@ -1247,6 +1247,25 @@ export async function createDaemonRuntime({
             const status = await context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("LAUNCH_UNAVAILABLE", "Daemon launch resolver is unavailable"));
             return { kind: "command", status };
           }
+          const requestedModel = request.payload.model;
+          if (requestedModel !== undefined) {
+            /** @type {any[] | undefined} */
+            let catalog;
+            try {
+              catalog = await modelCatalog.models();
+            } catch (error) {
+              // A catalog Pi could not list refuses nothing: Pi decides what it accepts. This stays a
+              // diagnostic, and a distinct one from a model Pi listed and does not have.
+              const failure = /** @type {any} */ (error);
+              recordDiagnostic({ event: "model_catalog_unavailable", code: failure?.code ?? "MODEL_CATALOG_FAILED", message: error instanceof Error ? error.message : "Listing Pi models failed", at: new Date().toISOString() });
+            }
+            // Admission runs before resolution, so a refused model leaves no record, Pi file, worktree,
+            // worker, or row to clean up. The frontend picker is an earlier check, not this one.
+            if (catalog !== undefined && !catalog.some((/** @type {any} */ model) => model.provider === requestedModel.provider && model.id === requestedModel.id)) {
+              const status = await context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("MODEL_UNKNOWN", `Pi does not offer ${requestedModel.provider}/${requestedModel.id}`));
+              return { kind: "command", status };
+            }
+          }
           await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
           /** @type {any} */
           let launch;

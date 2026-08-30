@@ -1,3 +1,4 @@
+import { appendFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
@@ -120,16 +121,26 @@ export function createDaemonViewerClient({ client, clientId }) {
 }
 
 /** Run one list-to-viewer transition and restore the list after any failure. @param {any} options */
+/** Opt-in stage timing for a viewer transition, so latency can be measured where the operator sits. */
+function markTransition(stage, startedAt) {
+  const path = process.env.PI_AGENTS_UI_TIMING;
+  if (path === undefined || path === "") return;
+  try { appendFileSync(path, `${new Date().toISOString()} ${stage} ${Math.round(performance.now() - startedAt)}ms\n`); } catch {}
+}
+
 export async function runViewerTransition({ sessionId, viewerClient, controller, createViewer, activateViewer, activateList, restoreListFocus, onRestoreClosed, shouldRestore }) {
+  const startedAt = performance.now();
   let attached = false;
   let restoreList = false;
   let viewer;
   let failure;
   try {
     await viewerClient.attach(sessionId);
+    markTransition("attached", startedAt);
     attached = true;
     restoreList = true;
     await controller.close();
+    markTransition("list-closed", startedAt);
     viewer = createViewer();
     activateViewer(viewer);
     // Leaving the viewer must not wait for a request its open is still making: the viewer's own close
@@ -138,7 +149,9 @@ export async function runViewerTransition({ sessionId, viewerClient, controller,
     const opened = viewer.open();
     opened.catch(() => {});
     await Promise.race([opened, viewer.closed]);
+    markTransition("viewer-open", startedAt);
     await viewer.closed;
+    markTransition("viewer-closed", startedAt);
     if (viewer.openError !== undefined) throw viewer.openError;
   } catch (error) {
     failure = error;
@@ -148,7 +161,7 @@ export async function runViewerTransition({ sessionId, viewerClient, controller,
     // network home one detach measured 4.3 to 6.4 s of durable daemon writes. The client keeps the
     // promise so a later attach for this session still waits behind it; the operator does not.
     if (attached) void viewerClient.detach(sessionId).catch(() => {});
-    if (restoreList && shouldRestore()) await controller.open();
+    if (restoreList && shouldRestore()) { await controller.open(); markTransition("list-reopened", startedAt); }
     if (shouldRestore()) {
       if (controller.closed) onRestoreClosed?.();
       else {

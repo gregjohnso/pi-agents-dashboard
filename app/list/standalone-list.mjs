@@ -132,8 +132,14 @@ export async function runViewerTransition({ sessionId, viewerClient, controller,
     await controller.close();
     viewer = createViewer();
     activateViewer(viewer);
-    await viewer.open();
+    // Leaving the viewer must not wait for a request its open is still making: the viewer's own close
+    // ends this transition. A failed open closes the viewer too, and records why on `openError`, so the
+    // rejection is read from there rather than awaited here.
+    const opened = viewer.open();
+    opened.catch(() => {});
+    await Promise.race([opened, viewer.closed]);
     await viewer.closed;
+    if (viewer.openError !== undefined) throw viewer.openError;
   } catch (error) {
     failure = error;
   } finally {

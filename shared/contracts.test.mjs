@@ -74,6 +74,9 @@ const ok = (result) => ({ version: 1, requestId: "request", ok: true, result });
 /** Every daemon response shape the frozen version-1 wire accepts. @type {Array<[string, Record<string, any>]>} */
 const acceptedResponses = [
   ["session command menu", ok(menu)],
+  // A running daemon that predates the thinking-control removal still answers with these two keys.
+  // Refusing them made every viewer open against that daemon fail to parse and never answer.
+  ["session command menu from a daemon that predates the thinking-control removal", ok({ ...menu, thinkingLevels: ["off", "high"], thinkingLevel: "off" })],
   ["summary settings", ok({ kind: "settings", summaryModel: { provider: "anthropic", id: "haiku" } })],
   ["summaries disabled", ok({ kind: "settings", summaryModel: null })],
   ["session state carrying a bounded summary", ok({ kind: "state", sessions: [sessionRecord] })],
@@ -86,8 +89,6 @@ const acceptedResponses = [
 /** Every daemon response the wire must refuse. @type {Array<[string, Record<string, any>, RegExp]>} */
 const rejectedResponses = [
   ["unknown menu field", ok({ ...menu, unknown: true }), /unknown/iu],
-  ["thinking values in the session command menu", ok({ ...menu, thinkingLevels: ["off", "high"] }), /unknown/iu],
-  ["an observed thinking level in the session command menu", ok({ ...menu, thinkingLevel: "high" }), /unknown/iu],
   ["invented menu command source", ok({ ...menu, commands: [{ name: "/x", source: "invented" }] }), /source/iu],
   ["empty session summary text", ok({ kind: "state", sessions: [{ ...sessionRecord, summary: { ...sessionRecord.summary, text: "" } }] }), /summary\.text/u],
   ["a state cursor whose sequence is not canonical", ok({ kind: "state", sessions: [], cursor: { daemonEpoch: "epoch", sequence: "01" } }), /sequence/u],

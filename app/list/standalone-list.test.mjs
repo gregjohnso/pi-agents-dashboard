@@ -124,6 +124,42 @@ it("restores the list without waiting for the detach round trip", async () => {
   resolveDetach();
 });
 
+it("returns to the list while the viewer's open is still in flight", async () => {
+  // Escape closes the viewer. A daemon request the open is still waiting on must not hold the list
+  // back: that is what left the operator inside a session with no way out.
+  let resolveClosed;
+  const viewerClient = { attach: vi.fn(async () => {}), detach: vi.fn(async () => {}) };
+  const controller = { closed: false, close: vi.fn(async () => { controller.closed = true; }), open: vi.fn(async () => { controller.closed = false; }) };
+  const viewer = { open: vi.fn(() => new Promise(() => {})), closed: new Promise((resolve) => { resolveClosed = resolve; }), close: vi.fn(async () => {}) };
+  const activateList = vi.fn();
+  const restoreListFocus = vi.fn();
+  const transition = runViewerTransition({
+    sessionId: "session", viewerClient, controller, createViewer: () => viewer,
+    activateViewer() {}, activateList, restoreListFocus, shouldRestore: () => true,
+  });
+  await vi.waitFor(() => expect(viewer.open).toHaveBeenCalledOnce());
+  resolveClosed();
+  await expect(transition).resolves.toEqual({ kind: "returned" });
+  expect(controller.open).toHaveBeenCalledOnce();
+  expect(activateList).toHaveBeenCalledOnce();
+  expect(restoreListFocus).toHaveBeenCalledOnce();
+});
+
+it("reports a viewer that failed to open on the list", async () => {
+  const failure = Object.assign(new Error("Unknown viewer session"), { code: "SESSION_NOT_FOUND" });
+  const failures = [];
+  const viewerClient = { attach: vi.fn(async () => {}), detach: vi.fn(async () => {}) };
+  const controller = { closed: false, close: vi.fn(async () => { controller.closed = true; }), open: vi.fn(async () => { controller.closed = false; }), setError(error, fallback) { failures.push(error?.code ?? fallback); } };
+  // ViewerController records openError before it closes itself, which is where the transition reads it.
+  const viewer = { openError: failure, open: vi.fn(async () => { throw failure; }), closed: Promise.resolve(), close: vi.fn(async () => {}) };
+  const transition = await runViewerTransition({
+    sessionId: "session", viewerClient, controller, createViewer: () => viewer,
+    activateViewer() {}, activateList() {}, restoreListFocus() {}, shouldRestore: () => true,
+  });
+  expect(transition).toEqual({ kind: "failed", error: failure });
+  expect(failures).toEqual(["SESSION_NOT_FOUND"]);
+});
+
 it("holds a reattach behind the same session's in-flight detach", async () => {
   const order = [];
   let resolveDetach;

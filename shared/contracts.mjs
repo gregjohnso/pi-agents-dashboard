@@ -317,7 +317,11 @@ function validateRuntimeIdentity(value, path) {
 /** @param {Record<string, any>} result */
 function validateSessionCommands(result) {
   const path = "daemon response.result";
-  requireKeys(result, ["kind", "sessionId", "commands", "models", "model"], [], path);
+  // `thinkingLevels` and `thinkingLevel` left this response when the dashboard dropped its thinking
+  // control. A daemon started before that still sends both, and it outlives the frontend that talks
+  // to it, so they are accepted and ignored rather than refused: refusing them made the menu response
+  // unparseable, which killed the connection and left the viewer waiting for an answer that never came.
+  requireKeys(result, ["kind", "sessionId", "commands", "models", "model"], ["thinkingLevels", "thinkingLevel"], path);
   readIdentifier(result, "sessionId", `${path}.sessionId`);
   for (const key of ["commands", "models"]) {
     if (!Array.isArray(result[key]) || result[key].length > MAX_MENU_ENTRIES) throw new TypeError(`${path}.${key} must be a bounded array`);

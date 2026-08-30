@@ -89,6 +89,7 @@ describe("viewer commands and role restrictions", () => {
     const loaded = [];
     const f = fixture({ menu: async () => { loaded.push("menu"); return menu; } });
     await f.instance.open();
+    await f.instance.menuLoaded;
     expect(loaded).toEqual(["menu"]);
     expect(f.instance.editor.autocompleteProvider).toBeDefined();
 
@@ -100,6 +101,29 @@ describe("viewer commands and role restrictions", () => {
     f.instance.editor.setText("/review the diff");
     f.instance.handleInput("\r");
     await vi.waitFor(() => expect(f.commands.at(-1)).toEqual({ operation: "prompt", payload: { sessionId: "s", text: "/review the diff" } }));
+  });
+
+  it("renders and leaves before the session menu answers", async () => {
+    // The menu is a worker round trip. While open() awaited it, a daemon that never answered kept the
+    // operator inside the transition: the viewer drew but Escape could not get back to the list.
+    let releaseMenu;
+    const f = fixture({ menu: () => new Promise((resolve) => { releaseMenu = () => resolve({ commands: [], models: [], model: null, color: "amber" }); }) });
+    await f.instance.open();
+    expect(stripVTControlCharacters(f.instance.render(80, 12).join("\n"))).toContain("hello");
+    f.instance.handleInput("\x1b");
+    expect(f.instance.onReturn).toHaveBeenCalledOnce();
+
+    releaseMenu();
+    await f.instance.menuLoaded;
+    expect(f.instance.render(80, 20).join("\n")).toContain("\x1b[38;2;252;211;77m");
+  });
+
+  it("records why an open failed before it closes", async () => {
+    const failure = Object.assign(new Error("Unknown viewer session"), { code: "SESSION_NOT_FOUND" });
+    const f = fixture();
+    f.client.getSnapshot = async () => { throw failure; };
+    await expect(f.instance.open()).rejects.toThrow(failure);
+    expect(f.instance.openError).toBe(failure);
   });
 
   it("opens one picker per bare built-in, applies the choice, and refuses a mistyped argument", async () => {
@@ -167,6 +191,7 @@ describe("viewer commands and role restrictions", () => {
       return { kind: "session_colored", sessionId, revision: 8, color };
     };
     await f.instance.open();
+    await f.instance.menuLoaded;
 
     f.instance.editor.setText("/color");
     f.instance.handleInput("\r");
@@ -198,6 +223,7 @@ describe("viewer commands and role restrictions", () => {
     // The color lives on the session record, so reopening paints the prompt box with no fresh /color.
     const reopened = fixture({ menu: async () => ({ commands: [], models: [], model: null, color: "amber" }) });
     await reopened.instance.open();
+    await reopened.instance.menuLoaded;
     expect(reopened.instance.render(80, 20).join("\n")).toContain("\x1b[38;2;252;211;77m");
   });
 
@@ -205,6 +231,7 @@ describe("viewer commands and role restrictions", () => {
     const framed = { ...editor(), render: () => ["─".repeat(60), "> do 3", "─".repeat(60)] };
     const f = fixture({ editor: framed, menu: async () => ({ commands: [], models: [], model: null, color: null, name: "recurse agent investigation" }) });
     await f.instance.open();
+    await f.instance.menuLoaded;
     const plain = f.instance.render(80, 20).map(stripVTControlCharacters);
     const promptRow = plain.findLastIndex((line) => line.startsWith("> "));
     // The name rides the rule above the prompt, right-aligned, so the operator sees which session they type into.
@@ -216,6 +243,7 @@ describe("viewer commands and role restrictions", () => {
     const framed = { ...editor(), render: () => ["─".repeat(60), "> do 3", "─".repeat(60)] };
     const f = fixture({ editor: framed, menu: async () => ({ commands: [], models: [], model: null, color: null }) });
     await f.instance.open();
+    await f.instance.menuLoaded;
     const plain = f.instance.render(80, 20).map(stripVTControlCharacters);
     const promptRow = plain.findLastIndex((line) => line.startsWith("> "));
     expect(plain[promptRow - 1]).toMatch(/^─+$/u);
@@ -226,6 +254,7 @@ describe("viewer commands and role restrictions", () => {
     const framed = { ...editor(), render: () => ["─".repeat(20), "> hello", "─".repeat(20)] };
     const f = fixture({ editor: framed, menu: async () => ({ commands: [], models: [], model: null, color: "amber" }) });
     await f.instance.open();
+    await f.instance.menuLoaded;
     const rendered = f.instance.render(80, 20);
     const plain = rendered.map(stripVTControlCharacters);
     expect(plain.filter((line) => /^─+$/u.test(line.trim()) && line.trim() !== "")).toHaveLength(2);

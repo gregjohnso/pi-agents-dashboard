@@ -155,12 +155,16 @@ export class ViewerController {
       this.editor.focused = snapshot.role === "composer";
       this.transcript = new TranscriptModel({ state: this.state, adapters: this.adapters });
       this.installOverlay();
-      await this.loadMenu();
       const unsubscribe = await this.client.subscribe(this.sessionId, initial.cursor, (event) => this.processEvent(event), (error) => this.fail(error));
       if (this.closedState) unsubscribe?.(); else this.unsubscribe = unsubscribe;
       this.watchConnection = this.client.onConnectionChange?.((status) => this.onConnection(status));
       await this.requestRender();
+      // The menu is a round trip to this session's worker and Pi. Nothing the first frame draws needs
+      // it, so it loads behind the open: a worker that answers slowly, or not at all, can no longer
+      // hold the operator inside the list-to-viewer transition.
+      this.menuLoaded = this.loadMenu().then(() => this.requestRender()).catch((error) => this.fail(error));
     } catch (error) {
+      this.openError = error;
       await this.close({ persist: false });
       throw error;
     }

@@ -23,19 +23,23 @@ function fixture(overrides = {}) {
   const order = [];
   const saved = [];
   const attached = [];
+  const subscribed = [];
+  let snapshots = 0;
   const client = {
-    async getSnapshot() { order.push("snapshot"); return snapshot(overrides.snapshot); },
-    subscribe(_sessionId, _cursor, next) { listener = next; return () => order.push("unsubscribe"); },
+    async getSnapshot() { order.push("snapshot"); return snapshot(typeof overrides.snapshot === "function" ? overrides.snapshot(snapshots++) : overrides.snapshot); },
+    subscribe(_sessionId, cursor, next) { subscribed.push(cursor); listener = next; return () => order.push("unsubscribe"); },
     onConnectionChange(next) { connectionListener = next; return () => { connectionListener = undefined; }; },
     ...(overrides.attach === undefined ? {} : { attach: async (sessionId) => { attached.push(sessionId); return overrides.attach(sessionId); } }),
     async command(operation, payload) { commands.push({ operation, payload }); return overrides.command?.(operation, payload); },
     ...(overrides.menu === undefined ? {} : { menu: overrides.menu }),
+    // A trap, not a seam the viewer uses: the resume cursor is the frontend's own, and nothing here
+    // may report it to the daemon.
     async ack(_sessionId, cursor) { order.push(`ack:${cursor.sequence}`); },
   };
   const persistence = { async load() { return overrides.persisted; }, async save(value) { await overrides.save?.(value); saved.push(structuredClone(value)); order.push(`persist:${value.cursor?.sequence ?? "draft"}`); } };
   const dashboard = [];
   const instance = new ViewerController({ sessionId: "s", client, editor: overrides.editor ?? editor(), persistence, requestRender: async () => { order.push("render"); }, onReturn: vi.fn(), now: () => 0, onDashboardAction: (action) => dashboard.push(action) });
-  return { instance, client, commands, order, saved, dashboard, attached, emit: (event) => listener(event), connection: (status) => connectionListener(status) };
+  return { instance, client, commands, order, saved, dashboard, attached, subscribed, emit: (event) => listener(event), connection: (status) => connectionListener(status) };
 }
 
 describe("viewer commands and role restrictions", () => {
@@ -46,7 +50,7 @@ describe("viewer commands and role restrictions", () => {
     await vi.waitFor(() => expect(f.commands).toHaveLength(1));
     const eventStart = f.order.length;
     await f.emit({ version: 1, sessionId: "s", eventId: "e1", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "turn_state", working: true } });
-    expect(f.order.slice(eventStart, eventStart + 3)).toEqual(["render", "persist:1", "ack:1"]);
+    expect(f.order.slice(eventStart, eventStart + 2)).toEqual(["render", "persist:1"]);
     f.instance.editor.setText("next"); f.instance.handleInput("\r");
     f.instance.submitSteer("urgent"); f.instance.handleInput("\x03");
     await vi.waitFor(() => expect(f.commands.map(({ operation }) => operation)).toEqual(["prompt", "follow_up", "steer", "interrupt"]));
@@ -400,7 +404,7 @@ describe("viewer rendering and navigation", () => {
         for (const [index, payload] of payloads.entries()) await next({ version: 1, sessionId: "s", eventId: `ordered-${index + 1}`, cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: String(index + 1) }, timestamp, payload });
         return () => {};
       },
-      async ack() {}, async command() {},
+      async command() {},
     };
     const instance = new ViewerController({ sessionId: "s", client, editor: editor(), persistence: { async load() {}, async save() {} }, requestRender: async () => {} });
     await instance.open();
@@ -433,7 +437,7 @@ describe("viewer rendering and navigation", () => {
     expect(f.commands).toEqual([]);
   });
 
-  it.each(["render", "persistence", "malformed event"])("closes only the viewer subscription after %s failure and sends no ACK", async (failure) => {
+  it.each(["render", "persistence", "malformed event"])("closes only the viewer subscription after %s failure without advancing the resume cursor", async (failure) => {
     const f = fixture({ save: failure === "persistence" ? async (value) => { if (value.cursor?.sequence === "1") throw new Error("persist failed"); } : undefined });
     await f.instance.open();
     if (failure === "render") f.instance.requestRender = async () => { throw new Error("render failed"); };
@@ -441,7 +445,69 @@ describe("viewer rendering and navigation", () => {
     await expect(f.emit(value)).rejects.toThrow();
     expect(f.order).toContain("unsubscribe");
     expect(f.order.some((entry) => entry.startsWith("ack:"))).toBe(false);
+    expect(f.saved.some((state) => state.cursor?.sequence === "1")).toBe(false);
     expect(f.commands).toEqual([]);
+  });
+});
+
+describe("frontend resume across a reconnect", () => {
+  // Three windows where the socket can drop around one event. The frontend advances its resume
+  // cursor only after the event is applied and drawn, so the resumed subscription can hand the
+  // boundary event over a second time; its stable event ID has to absorb that. The daemon is never
+  // told where this viewer stands.
+  const at = { daemonEpoch: "epoch", sessionId: "s", sequence: "1" };
+  const boundary = (payload) => ({ version: 1, sessionId: "s", eventId: "boundary", cursor: at, timestamp, payload });
+  const identities = (instance) => instance.state.items.map((item) => item.itemId ?? item.attachment?.id ?? item.piType);
+  const empty = { items: [], tools: [] };
+
+  // Each case pairs one event payload with the snapshot a daemon that already published it returns,
+  // and with the transcript identity that must appear exactly once.
+  const kinds = [
+    ["user_message", { kind: "user_message", itemId: "b", content: [{ type: "text", text: "boundary" }] }, (payload) => ({ items: [payload], tools: [] }), "b"],
+    ["system_message", { kind: "system_message", itemId: "b", text: "boundary", level: "info" }, (payload) => ({ items: [payload], tools: [] }), "b"],
+    ["image_placeholder", { kind: "image_placeholder", attachment: { id: "b", path: "b.png", mediaType: "image/png", width: 1, height: 1 } }, (payload) => ({ items: [payload], tools: [] }), "b"],
+    ["unknown_pi_event", { kind: "unknown_pi_event", piType: "future", summary: "boundary" }, (payload) => ({ items: [payload], tools: [] }), "future"],
+    ["tool_started", { kind: "tool_started", tool: { id: "b", name: "bash", state: "running", arguments: {}, startedAt: timestamp } }, (payload) => ({ items: [], tools: [payload.tool] }), "tool:b"],
+  ];
+  const republished = (asSnapshot, payload) => (call) => (call === 0 ? empty : { ...asSnapshot(payload), cursor: at });
+
+  it.each(kinds)("keeps one %s item when the socket drops before the event is processed", async (_name, payload, asSnapshot, identity) => {
+    const f = fixture({ snapshot: republished(asSnapshot, payload), attach: async () => ({ role: "composer" }) });
+    await f.instance.open();
+    await f.connection({ connected: false });
+    await f.connection({ connected: true });
+
+    expect(identities(f.instance)).toEqual([identity]);
+    expect(f.subscribed.at(-1)).toEqual(at);
+    expect(f.order.filter((entry) => entry.startsWith("ack:"))).toEqual([]);
+  });
+
+  it.each(kinds)("keeps one %s item when the socket drops after the event is drawn but before the cursor advances", async (_name, payload, asSnapshot, identity) => {
+    const f = fixture({ snapshot: republished(asSnapshot, payload), attach: async () => ({ role: "composer" }) });
+    await f.instance.open();
+    await f.emit(boundary(payload));
+    expect(identities(f.instance)).toEqual([identity]);
+
+    await f.connection({ connected: false });
+    await f.connection({ connected: true });
+    await f.emit(boundary(payload));
+
+    expect(identities(f.instance)).toEqual([identity]);
+    expect(f.order.filter((entry) => entry.startsWith("ack:"))).toEqual([]);
+  });
+
+  it("continues without a gap when the socket drops after the resume cursor advanced", async () => {
+    const [, payload, asSnapshot, identity] = kinds[0];
+    const f = fixture({ snapshot: republished(asSnapshot, payload), attach: async () => ({ role: "composer" }) });
+    await f.instance.open();
+    await f.emit(boundary(payload));
+    await f.connection({ connected: false });
+    await f.connection({ connected: true });
+
+    expect(f.subscribed.at(-1)).toEqual(at);
+    await f.emit({ version: 1, sessionId: "s", eventId: "next", cursor: { ...at, sequence: "2" }, timestamp, payload: { kind: "system_message", itemId: "n", text: "after the drop", level: "info" } });
+    expect(identities(f.instance)).toEqual([identity, "n"]);
+    expect(f.order.filter((entry) => entry.startsWith("ack:"))).toEqual([]);
   });
 });
 

@@ -274,7 +274,37 @@ describe("daemon client", () => {
     await iterator.return?.();
   });
 
-  it("gets viewer snapshots, subscribes by session cursor, and acknowledges only after consumer processing", async () => {
+  it("resumes a viewer subscription from the applied cursor, not the delivered one", async () => {
+    const socketPath = await socketPathIn("viewer-resume-");
+    /** @type {any[]} */
+    const subscriptions = [];
+    const zero = { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "0" };
+    const one = { ...zero, sequence: "1" };
+    const event = { version: 1, sessionId: "session-1", eventId: "event-1", cursor: one, timestamp: "2026-08-25T00:00:00.000Z", payload: { kind: "user_message", itemId: "user-1", content: [{ type: "text", text: "hello" }] } };
+    const server = await daemonServer(socketPath, ({ socket, request: incoming, reply }) => {
+      if (incoming.op !== "subscribe_viewer") return;
+      subscriptions.push(incoming.payload.after);
+      reply({ kind: "viewer_subscribed", cursor: incoming.payload.after });
+      if (subscriptions.length === 1) socket.write(encodeJsonl(event));
+    });
+    const client = startClient({ socketPath, reconnectDelayMs: 1, maxBytes: 4096 });
+    const subscription = client.subscribeViewer("session-1", zero)[Symbol.asyncIterator]();
+    await waitFor(() => subscriptions.length === 1);
+    await expect(within(subscription.next())).resolves.toMatchObject({ value: { eventId: "event-1" }, done: false });
+
+    // Handed over is not applied: a drop here has to replay the event rather than skip it.
+    server.socket?.destroy();
+    await waitFor(() => subscriptions.length === 2);
+    expect(subscriptions[1]).toEqual(zero);
+
+    subscription.applied(one);
+    server.socket?.destroy();
+    await waitFor(() => subscriptions.length === 3);
+    expect(subscriptions[2]).toEqual(one);
+    await subscription.return?.();
+  });
+
+  it("gets viewer snapshots and subscribes by session cursor", async () => {
     const socketPath = await socketPathIn("viewer-client-");
     /** @type {string[]} */
     const operations = [];

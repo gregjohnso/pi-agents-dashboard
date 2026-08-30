@@ -15,9 +15,18 @@ async function fixture() {
   return join(root, "frontend-state.json");
 }
 
-it("adapts the installed daemon client to origin replay, mutation, ACK, and detach", async () => {
+it("adapts the installed daemon client to origin replay, mutation, applied cursors, and detach", async () => {
   const requests = [];
-  const events = { async *[Symbol.asyncIterator]() { yield { eventId: "one" }; } };
+  const order = [];
+  const events = {
+    [Symbol.asyncIterator]() {
+      const queue = [{ eventId: "one", cursor: { sequence: "1" } }];
+      return {
+        async next() { const value = queue.shift(); return value === undefined ? { value: undefined, done: true } : { value, done: false }; },
+        applied(cursor) { order.push(`applied:${cursor.sequence}`); },
+      };
+    },
+  };
   const watchers = [];
   const client = {
     async request(value) {
@@ -29,7 +38,6 @@ it("adapts the installed daemon client to origin replay, mutation, ACK, and deta
     },
     async getViewerSnapshot(sessionId) { return { sessionId }; },
     subscribeViewer(sessionId, cursor) { expect([sessionId, cursor.sequence]).toEqual(["session", "0"]); return events; },
-    async ackViewer(cursor) { return cursor; },
     onConnectionChange(listener) { watchers.push(listener); return () => watchers.pop(); },
   };
   const viewer = createDaemonViewerClient({ client, clientId: "client" });
@@ -39,13 +47,17 @@ it("adapts the installed daemon client to origin replay, mutation, ACK, and deta
   expect(watchers).toHaveLength(1);
   await viewer.attach("session");
   const received = [];
-  const unsubscribe = viewer.subscribe("session", { sequence: "0" }, async (event) => { received.push(event); }, () => {});
+  const unsubscribe = viewer.subscribe("session", { sequence: "0" }, async (event) => { received.push(event); order.push(`process:${event.eventId}`); }, () => {});
   await new Promise((resolve) => setTimeout(resolve, 0));
   await viewer.command("interrupt", { sessionId: "session" });
-  await viewer.ack("session", { sequence: "1" });
   await viewer.detach("session");
   unsubscribe();
-  expect(received).toEqual([{ eventId: "one" }]);
+  expect(received).toEqual([{ eventId: "one", cursor: { sequence: "1" } }]);
+  // The resume cursor moves only once the consumer has drawn the event: a drop before that replays
+  // it, and a drop after it skips nothing.
+  expect(order).toEqual(["process:one", "applied:1"]);
+  // Nothing here reports a viewer cursor to the daemon.
+  expect(viewer.ack).toBeUndefined();
   expect(requests.map(({ op }) => op)).toEqual(["attach", "interrupt", "detach"]);
 });
 

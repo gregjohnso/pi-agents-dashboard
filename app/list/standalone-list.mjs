@@ -109,13 +109,13 @@ export function createDaemonViewerClient({ client, clientId }) {
             const value = await iterator.next();
             if (value.done || !active) return;
             await next(value.value);
+            iterator.applied(value.value.cursor);
           }
         } catch (error) { if (active) onError(error); }
       })();
       return () => { active = false; void iterator.return?.(); };
     },
     command(operation, payload) { return request(operation, payload); },
-    ack(_sessionId, cursor) { return client.ackViewer(cursor); },
     onConnectionChange(listener) { return client.onConnectionChange?.(listener); },
   };
 }

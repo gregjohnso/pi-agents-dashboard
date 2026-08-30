@@ -108,7 +108,7 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
             send({ version: 1, clientId, requestId: randomUUID(), op: "subscribe", payload: subscriber.acknowledgedAfter === undefined ? {} : { after: subscriber.acknowledgedAfter } });
         }
         for (const subscriber of viewerSubscribers) {
-            send({ version: 1, clientId, requestId: randomUUID(), op: "subscribe_viewer", payload: { sessionId: subscriber.sessionId, ...(subscriber.acknowledgedAfter === undefined ? {} : { after: subscriber.acknowledgedAfter }) } });
+            send({ version: 1, clientId, requestId: randomUUID(), op: "subscribe_viewer", payload: { sessionId: subscriber.sessionId, ...(subscriber.resumeAfter === undefined ? {} : { after: subscriber.resumeAfter }) } });
         }
     };
     const dispatchEvent = (event) => {
@@ -164,12 +164,6 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
     const applyAcknowledgement = (cursor) => {
         for (const subscriber of subscribers)
             subscriber.acknowledgedAfter = laterCursor(subscriber.acknowledgedAfter, cursor);
-    };
-    const applyViewerAcknowledgement = (cursor) => {
-        for (const subscriber of viewerSubscribers) {
-            if (subscriber.sessionId === cursor.sessionId)
-                subscriber.acknowledgedAfter = laterViewerCursor(subscriber.acknowledgedAfter, cursor);
-        }
     };
     const waitForRetry = (milliseconds) => new Promise((resolve) => {
         if (closed || milliseconds === 0) {
@@ -267,8 +261,6 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                         }
                         if (item.request.op === "ack" && response.ok && response.result.kind === "acknowledged")
                             applyAcknowledgement(response.result.cursor);
-                        if (item.request.op === "ack_viewer" && response.ok && response.result.kind === "viewer_acknowledged")
-                            applyViewerAcknowledgement(response.result.cursor);
                         item.resolve(response);
                     }
                     else if (typeof record === "object" && record !== null && Object.hasOwn(record, "eventId")) {
@@ -434,7 +426,7 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                 throw new TypeError("sessionId is required");
             if (after !== undefined && after.sessionId !== sessionId)
                 throw new DaemonClientError("VIEWER_SESSION_MISMATCH", "Viewer cursor belongs to another session");
-            const subscriber = { sessionId, acknowledgedAfter: after, queue: [], ended: closed };
+            const subscriber = { sessionId, resumeAfter: after, queue: [], ended: closed };
             if (!closed) {
                 viewerSubscribers.add(subscriber);
                 if (socket !== undefined && authenticated && !socket.destroyed) {
@@ -444,7 +436,15 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                     void startReconnectLoop().catch(() => { });
                 }
             }
-            return subscriberIterable(subscriber, viewerSubscribers);
+            return {
+                ...subscriberIterable(subscriber, viewerSubscribers),
+                /**
+                 * Move the cursor this subscription resumes from after a reconnect. The daemon holds
+                 * no viewer cursor for this client, so the consumer calls this once it has applied
+                 * the event; a drop before that replays the event instead of skipping it.
+                 */
+                applied(cursor) { subscriber.resumeAfter = laterViewerCursor(subscriber.resumeAfter, cursor); },
+            };
         },
         async ackViewer(cursor) {
             return (await requestResult("ack_viewer", { cursor })).cursor;

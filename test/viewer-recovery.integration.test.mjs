@@ -92,8 +92,20 @@ it("reconstructs normalized snapshots from canonical history and durable viewer 
   const replay = second.client.subscribeViewer("session-1", firstSnapshot.cursor)[Symbol.asyncIterator]();
   const replayed = await replay.next();
   expect(replayed).toMatchObject({ value: { sessionId: "session-1", payload: { kind: "assistant_message", itemId: "assistant-1" } }, done: false });
-  await expect(second.client.ackViewer(replayed.value.cursor)).resolves.toEqual(replayed.value.cursor);
+  replay.applied(replayed.value.cursor);
   await replay.return?.();
+
+  // The resume cursor is the frontend's own and reaches no durable daemon file, so both windows it
+  // can drop in have to behave: a frontend that dropped before applying sees the event again, and
+  // one that applied it resumes past it.
+  const unapplied = second.client.subscribeViewer("session-1", firstSnapshot.cursor)[Symbol.asyncIterator]();
+  await expect(unapplied.next()).resolves.toMatchObject({ value: { eventId: replayed.value.eventId }, done: false });
+  await unapplied.return?.();
+  const resumed = second.client.subscribeViewer("session-1", replayed.value.cursor)[Symbol.asyncIterator]();
+  const pending = resumed.next();
+  await expect(Promise.race([pending, new Promise((resolve) => setTimeout(() => resolve("idle"), 50))])).resolves.toBe("idle");
+  await resumed.return?.();
+  await pending;
   const recovered = await second.client.getViewerSnapshot("session-1");
   expect(recovered.items).toEqual([
     expect.objectContaining({ kind: "user_message", itemId: "user-1" }),

@@ -11,8 +11,9 @@ import { createDashboardLayout, renderColumnHeader, } from "./dashboard-layout.m
 import { jobwatchTheme } from "./dashboard-theme.mjs";
 import { displaySessionState } from "./session-state.mjs";
 import { StopClearGesture } from "./stop-clear-gesture.mjs";
-import { destructiveAction, createChoiceOverlay, createCommandMenuOverlay, createDeliveryUnknownOverlay, createHelpOverlay, createMetadataOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, describeOverlay, filterChoiceOverlay, } from "./dashboard-overlays.mjs";
+import { destructiveAction, createChoiceOverlay, createCommandMenuOverlay, createDeliveryUnknownOverlay, createHelpOverlay, createMetadataOverlay, createPathCompletionOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, describeOverlay, filterChoiceOverlay, } from "./dashboard-overlays.mjs";
 import { draftChoices, parseListCommand } from "./list-commands.mjs";
+import { applyCwdCompletion, cwdArgument, suggestDirectories, } from "./path-completion.mjs";
 import { createLaunchDraft, prepareLaunchRequest, } from "./launch-composer.mjs";
 import { VirtualSessionList } from "./virtual-session-list.mjs";
 /** A path the operator may launch into: it must exist now and be a directory. @param {string} path */
@@ -24,6 +25,8 @@ async function existingDirectory(path) {
         return false;
     }
 }
+/** Idle time before a typed path is listed. pi-tui lists it synchronously, so no keystroke may start one. */
+const COMPLETION_DEBOUNCE_MS = 60;
 function cursorAfter(left, right) {
     if (left === undefined || left.daemonEpoch !== right.daemonEpoch)
         return true;
@@ -348,6 +351,13 @@ export class DashboardController {
     composerDraft;
     launchDefaults;
     isDirectory;
+    suggestDirectories;
+    /** The `/cwd` path the newest line types, and the last listing that completed for one. */
+    cwdCompletionArgument;
+    cwdCompletion;
+    cwdCompletionIndex = 0;
+    cwdCompletionTimer;
+    cwdCompletionAbort;
     /** Which command the slash menu highlights, and whether Escape has closed it for this text. */
     commandMenuIndex = 0;
     commandMenuClosed = false;
@@ -373,6 +383,7 @@ export class DashboardController {
         this.stopClearGesture = new StopClearGesture({ now: options.now });
         this.launchDefaults = options.launchDefaults ?? {};
         this.isDirectory = options.isDirectory ?? existingDirectory;
+        this.suggestDirectories = options.suggestDirectories ?? suggestDirectories;
         this.composerDraft = createLaunchDraft({
             ...options.launchDefaults,
             sourceSessionId: options.sourceSessionId,
@@ -510,7 +521,80 @@ export class DashboardController {
         this.commandMenuClosed = false;
         if (!prompt.trim().startsWith("/"))
             this.commandMenuIndex = 0;
+        this.scheduleCwdCompletion();
         this.scheduleUiSave();
+    }
+    /**
+     * Ask pi-tui for the directories a `/cwd` line admits. The listing is debounced and runs off the
+     * keystroke, and a listing the operator has typed past is abandoned rather than shown.
+     */
+    scheduleCwdCompletion() {
+        const argument = cwdArgument(this.composerDraft.prompt);
+        if (argument === this.cwdCompletionArgument)
+            return;
+        this.cwdCompletionArgument = argument;
+        this.cwdCompletion = undefined;
+        this.cwdCompletionIndex = 0;
+        clearTimeout(this.cwdCompletionTimer);
+        this.cwdCompletionTimer = undefined;
+        this.cwdCompletionAbort?.abort();
+        this.cwdCompletionAbort = undefined;
+        if (argument === undefined)
+            return;
+        // A relative path resolves the way a shell resolves one, against the directory the dashboard
+        // was started in, which is exactly what `/cwd` itself will do with the completed line.
+        const basePath = process.cwd();
+        const abort = new AbortController();
+        this.cwdCompletionAbort = abort;
+        this.cwdCompletionTimer = setTimeout(() => {
+            this.cwdCompletionTimer = undefined;
+            void this.readCwdCompletion(argument, basePath, abort.signal);
+        }, COMPLETION_DEBOUNCE_MS);
+        this.cwdCompletionTimer.unref?.();
+    }
+    /** @param {string} argument @param {string} basePath @param {AbortSignal} signal */
+    async readCwdCompletion(argument, basePath, signal) {
+        let suggestions;
+        try {
+            suggestions = await this.suggestDirectories(argument, basePath, signal);
+        }
+        catch {
+            // Permission denied, a path not created yet, a symbolic-link loop, a directory removed
+            // mid-read: the operator has typed a path that cannot be listed, which is not an error row.
+        }
+        // A listing the operator has typed past names directories that do not exist under the typed path.
+        if (argument !== this.cwdCompletionArgument || this.closed || suggestions === undefined)
+            return;
+        this.cwdCompletion = { argument, ...suggestions };
+        this.requestRender?.();
+    }
+    /** The directories a `/cwd` line still admits, drawn from the last completed listing and never from a new one. */
+    pathCompletionOverlay() {
+        if (this.focus !== "list" || this.commandMenuClosed)
+            return undefined;
+        const completion = this.cwdCompletion;
+        if (completion === undefined || completion.argument !== cwdArgument(this.composerDraft.prompt))
+            return undefined;
+        return createPathCompletionOverlay(completion.items, completion.prefix, this.cwdCompletionIndex);
+    }
+    movePathCompletion(delta) {
+        const overlay = this.pathCompletionOverlay();
+        if (overlay === undefined)
+            return;
+        this.cwdCompletionIndex = Math.max(0, Math.min(overlay.index + delta, overlay.items.length - 1));
+        this.requestRender?.();
+    }
+    /**
+     * Write the highlighted directory into the typed `/cwd` path. This is the one key that rewrites
+     * the operator's text, and it applies only what the last completed listing offered.
+     */
+    completeCwdPath() {
+        const overlay = this.pathCompletionOverlay();
+        const item = overlay?.items[overlay.index];
+        if (item === undefined)
+            return;
+        this.setComposerPrompt(applyCwdCompletion(this.composerDraft.prompt, item, overlay.prefix, process.cwd()));
+        this.requestRender?.();
     }
     setIsolationMode(isolationMode) {
         this.composerDraft = { ...this.composerDraft, isolationMode };
@@ -884,10 +968,18 @@ export class DashboardController {
             return;
         }
         if (matchesKey(data, Key.left)) return;
-        // Tab used to move a launch-field cursor that typing ignored and Backspace obeyed. The
-        // fields are set through their slash commands now, so a lone Tab types nothing; a tab
-        // inside a paste still arrives as text and becomes a space.
-        if (matchesKey(data, Key.tab) || matchesKey(data, "shift+tab")) return;
+        // Tab used to move a launch-field cursor that typing ignored and Backspace obeyed. It now
+        // completes a `/cwd` directory and types nothing anywhere else; a tab inside a paste still
+        // arrives as text and becomes a space.
+        if (matchesKey(data, Key.tab)) {
+            this.completeCwdPath();
+            return;
+        }
+        if (matchesKey(data, "shift+tab")) return;
+        if ((matchesKey(data, Key.up) || matchesKey(data, Key.down)) && this.pathCompletionOverlay() !== undefined) {
+            this.movePathCompletion(matchesKey(data, Key.up) ? -1 : 1);
+            return;
+        }
         if ((matchesKey(data, Key.up) || matchesKey(data, Key.down)) && this.commandMenuOverlay() !== undefined) {
             this.moveCommandMenu(matchesKey(data, Key.up) ? -1 : 1);
             return;
@@ -1215,12 +1307,13 @@ export class DashboardController {
         this.status = { kind: "error", code: outcome.error.code, message: outcome.error.message };
     }
     renderOverlay(lines) {
-        const overlay = this.overlay ?? this.commandMenuOverlay();
+        // A `/cwd` path being completed outranks the one command-menu row it would otherwise show.
+        const overlay = this.overlay ?? this.pathCompletionOverlay() ?? this.commandMenuOverlay();
         if (overlay === undefined || lines.length === 0)
             return;
         const layout = createDashboardLayout(this.width, this.height);
         // Commands and their values read like Pi's own completion list: flush above the prompt, no frame.
-        if (overlay.kind === "command_menu" || overlay.kind === "choice") {
+        if (overlay.kind === "command_menu" || overlay.kind === "choice" || overlay.kind === "path_completion") {
             this.renderInlineMenu(lines, overlay, layout);
             return;
         }
@@ -1236,7 +1329,7 @@ export class DashboardController {
     /** Draw a completion list in the rows directly above the prompt, newest entry nearest the prompt. */
     renderInlineMenu(lines, overlay, layout) {
         // Two rows short of the list area, leaving room for the count-and-filter header and the key hint.
-        const described = describeOverlay(overlay, { confirmationText: this.confirmationText, choiceRows: Math.max(1, layout.listHeight - 2) });
+        const described = describeOverlay(overlay, { confirmationText: this.confirmationText, choiceRows: Math.max(1, layout.listHeight - 2), completionRows: Math.max(1, layout.listHeight - 2) });
         // A picker over Pi's whole catalog needs its own header: the prompt that opened it is cleared,
         // so the count and the typed filter have nowhere else to appear.
         const describedRows = overlay.kind === "choice" ? [{ text: described.title, emphasis: true }, ...described.rows] : described.rows;
@@ -1382,6 +1475,10 @@ export class DashboardController {
         this.stopAnimation();
         clearTimeout(this.summaryRefreshTimer);
         this.summaryRefreshTimer = undefined;
+        clearTimeout(this.cwdCompletionTimer);
+        this.cwdCompletionTimer = undefined;
+        this.cwdCompletionAbort?.abort();
+        this.cwdCompletionAbort = undefined;
         this.closed = true;
         this.openGeneration += 1;
         this.saveAdmissionGeneration += 1;

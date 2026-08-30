@@ -7,14 +7,14 @@ import {
   ToolExecutionComponent, UserMessageComponent, getMarkdownTheme,
 } from "@earendil-works/pi-coding-agent";
 import {
-  Input, KeybindingsManager, Markdown, ScrollView, SelectList, SettingsList, TuiAltScreen, visibleWidth,
+  CombinedAutocompleteProvider, Input, KeybindingsManager, Markdown, ScrollView, SelectList, SettingsList, TuiAltScreen, visibleWidth,
 } from "@earendil-works/pi-tui";
 import { expect, it } from "vitest";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 it("resolves and instantiates approved high-level viewer components from package roots", () => {
-  for (const exported of [AssistantMessageComponent, CustomEditor, DynamicBorder, KeybindingsManager, ToolExecutionComponent, UserMessageComponent, getMarkdownTheme, Input, Markdown, ScrollView, SelectList, SettingsList, TuiAltScreen, visibleWidth]) expect(exported).toBeDefined();
+  for (const exported of [AssistantMessageComponent, CombinedAutocompleteProvider, CustomEditor, DynamicBorder, KeybindingsManager, ToolExecutionComponent, UserMessageComponent, getMarkdownTheme, Input, Markdown, ScrollView, SelectList, SettingsList, TuiAltScreen, visibleWidth]) expect(exported).toBeDefined();
   const plain = (text) => text;
   const selectTheme = { selectedPrefix: plain, selectedText: plain, description: plain, scrollInfo: plain, noMatch: plain };
   const markdownTheme = { heading: plain, link: plain, linkUrl: plain, code: plain, codeBlock: plain, codeBlockBorder: plain, quote: plain, quoteBorder: plain, hr: plain, listBullet: plain, bold: plain, italic: plain, strikethrough: plain, underline: plain };
@@ -33,6 +33,7 @@ it("ships no private Pi controller, in-process session, or deep Pi import", asyn
   const paths = [
     "app/viewer/pi-component-adapters.mjs", "app/viewer/transcript.mjs", "app/viewer/overlays.mjs",
     "app/viewer/return-gesture.mjs", "app/viewer/viewer-controller.mjs", "app/standalone.mjs",
+    "app/list/path-completion.mjs", "app/list/dashboard.mjs",
   ];
   const source = (await Promise.all(paths.map(async (path) => [path, await readFile(resolve(root, path), "utf8")])));
   for (const [path, text] of source) {

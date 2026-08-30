@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stripVTControlCharacters } from "node:util";
@@ -887,6 +887,119 @@ describe("dashboard controller", () => {
             } finally {
                 await rm(root, { recursive: true, force: true });
             }
+        });
+        function completionLines(dashboard) {
+            return dashboard.render(100, 24).map(stripVTControlCharacters).join("\n");
+        }
+        /** A directory tree to complete against, removed when the test ends. */
+        async function completionRoot() {
+            const root = await mkdtemp(join(tmpdir(), "pi-agents-complete-"));
+            await mkdir(join(root, "alpha"));
+            await mkdir(join(root, "alpha", "nested"));
+            await mkdir(join(root, "alpine"));
+            await writeFile(join(root, "alpha.txt"), "", { mode: 0o600 });
+            return root;
+        }
+        it("offers the typed directory's subdirectories, never its files, and descends into the one chosen", async () => {
+            const root = await completionRoot();
+            try {
+                const dashboard = controller(new FakeBackend([session("a")]));
+                await dashboard.open();
+                typed(dashboard, `/cwd ${root}/alp`);
+                await vi.waitFor(() => expect(completionLines(dashboard)).toContain("alpine/"));
+                expect(completionLines(dashboard)).toContain("alpha/");
+                // A file is a choice /cwd would refuse, so it is never offered.
+                expect(completionLines(dashboard)).not.toContain("alpha.txt");
+                // Down moves the completion list, not the session selection underneath it.
+                dashboard.handleInput("\x1b[B");
+                expect(dashboard.selectedSessionId).toBe("a");
+                dashboard.handleInput("\x1b[A");
+                dashboard.handleInput("\t");
+                // The trailing separator is what makes the next Tab list that directory's own children.
+                expect(dashboard.composerDraft.prompt).toBe(`/cwd ${root}/alpha/`);
+                await vi.waitFor(() => expect(completionLines(dashboard)).toContain("nested/"));
+                expect(dashboard.status).toEqual({ kind: "ready" });
+                dashboard.handleInput("\r");
+                await vi.waitFor(() => expect(dashboard.composerDraft.cwd).toBe(`${root}/alpha/`));
+            } finally {
+                await rm(root, { recursive: true, force: true });
+            }
+        });
+        it("lists the directory the dashboard was started in when no path is typed yet", async () => {
+            // Typing the path blind is the failure: with no argument yet the list still has to say what
+            // is there, and a relative path means what it would mean in the shell that started this.
+            const dashboard = controller(new FakeBackend([session("a")]), { launchDefaults: { cwd: "/nowhere" } });
+            await dashboard.open();
+            typed(dashboard, "/cwd ");
+            await vi.waitFor(() => expect(completionLines(dashboard)).toContain("app/"));
+            expect(completionLines(dashboard)).not.toContain("README.md");
+            typed(dashboard, "ap");
+            // Typing narrows the list only once its own listing lands; Tab before that rewrites nothing.
+            await vi.waitFor(() => expect(dashboard.pathCompletionOverlay()?.prefix).toBe("ap"));
+            dashboard.handleInput("\t");
+            expect(dashboard.composerDraft.prompt).toBe("/cwd app/");
+        });
+        it("lists a tilde path's real directory instead of matching a literal ~", async () => {
+            const root = await completionRoot();
+            const realHome = process.env.HOME;
+            process.env.HOME = root;
+            try {
+                const dashboard = controller(new FakeBackend([session("a")]), { launchDefaults: { cwd: "/nowhere" } });
+                await dashboard.open();
+                typed(dashboard, "/cwd ~/alp");
+                await vi.waitFor(() => expect(completionLines(dashboard)).toContain("alpha/"));
+                dashboard.handleInput("\t");
+                // The tilde survives completion, and /cwd expands it when the operator submits the line.
+                expect(dashboard.composerDraft.prompt).toBe("/cwd ~/alpha/");
+                dashboard.handleInput("\r");
+                await vi.waitFor(() => expect(dashboard.composerDraft.cwd).toBe(`${root}/alpha/`));
+            } finally {
+                process.env.HOME = realHome;
+                await rm(root, { recursive: true, force: true });
+            }
+        });
+        it("discards a directory listing that lands after the operator has typed further", async () => {
+            let releaseSlowListing = () => {};
+            const listed = [];
+            const suggestDirectories = async (argument) => {
+                listed.push(argument);
+                const item = (label) => ({ items: [{ value: `${argument}${label}/`, label: `${label}/` }], prefix: argument });
+                if (argument === "slow/") return new Promise((resolve) => { releaseSlowListing = () => resolve(item("stale-entry")); });
+                return item("fresh-entry");
+            };
+            const dashboard = controller(new FakeBackend([session("a")]), { suggestDirectories });
+            await dashboard.open();
+            typed(dashboard, "/cwd slow/");
+            await vi.waitFor(() => expect(listed).toEqual(["slow/"]));
+            typed(dashboard, "deep/");
+            await vi.waitFor(() => expect(completionLines(dashboard)).toContain("fresh-entry/"));
+            releaseSlowListing();
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            // A list that lags behind the cursor names directories that do not exist under the typed path.
+            expect(completionLines(dashboard)).not.toContain("stale-entry");
+            expect(completionLines(dashboard)).toContain("fresh-entry/");
+        });
+        it("shows no list and no error when the typed directory cannot be listed", async () => {
+            const suggestDirectories = vi.fn(async (argument) => { throw Object.assign(new Error(`EACCES: permission denied, scandir '${argument}'`), { code: "EACCES" }); });
+            const dashboard = controller(new FakeBackend([session("a")]), { suggestDirectories });
+            await dashboard.open();
+            typed(dashboard, "/cwd secret/");
+            await vi.waitFor(() => expect(suggestDirectories).toHaveBeenCalledWith("secret/", process.cwd(), expect.anything()));
+            expect(dashboard.status).toEqual({ kind: "ready" });
+            expect(completionLines(dashboard)).not.toContain("EACCES");
+            // Tab has nothing listed to apply, so it leaves the typed text exactly as it is.
+            dashboard.handleInput("\t");
+            expect(dashboard.composerDraft.prompt).toBe("/cwd secret/");
+        });
+        it("drops the completion list when the line stops being a /cwd path", async () => {
+            const suggestDirectories = async (argument) => ({ items: [{ value: "alpha/", label: "alpha/" }], prefix: argument });
+            const dashboard = controller(new FakeBackend([session("a")]), { suggestDirectories });
+            await dashboard.open();
+            typed(dashboard, "/cwd al");
+            await vi.waitFor(() => expect(completionLines(dashboard)).toContain("alpha/"));
+            typed(dashboard, "\x7f\x7f\x7f");
+            expect(dashboard.composerDraft.prompt).toBe("/cwd");
+            expect(completionLines(dashboard)).not.toContain("alpha/");
         });
         it("clears the draft name so the agent names the session itself", async () => {
             const dashboard = controller(new FakeBackend([]));

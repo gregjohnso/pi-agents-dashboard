@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createChoiceOverlay, createCommandMenuOverlay, createHelpOverlay, createSessionConfirmation, describeOverlay, filterChoiceOverlay, } from "./dashboard-overlays.mjs";
+import { createChoiceOverlay, createCommandMenuOverlay, createHelpOverlay, createPathCompletionOverlay, createSessionConfirmation, describeOverlay, filterChoiceOverlay, } from "./dashboard-overlays.mjs";
 const session = {
     schemaVersion: 1,
     revision: 2,
@@ -50,6 +50,16 @@ describe("dashboard overlays", () => {
         expect(described.rows.every((/** @type {{text:string}} */ row) => !row.text.includes("/thinking"))).toBe(true);
         expect(describeOverlay(createCommandMenuOverlay("/zz", 0)).rows[0].text).toContain("/model");
     });
+    it("draws directory completions like the command menu and bounds how many rows it takes", () => {
+        const items = [{ value: "alpha/", label: "alpha/" }, { value: "alpine/", label: "alpine/" }];
+        const described = describeOverlay(createPathCompletionOverlay(items, "al", 1), { completionRows: 8 });
+        expect(described.rows.map((row) => row.text)).toEqual(["  alpha/", "❯ alpine/"]);
+        const many = Array.from({ length: 60 }, (_, index) => ({ value: `dir-${index}/`, label: `dir-${index}/` }));
+        const windowed = describeOverlay(createPathCompletionOverlay(many, "", 40), { completionRows: 4 });
+        // A directory of sixty children may not push the session list off the screen.
+        expect(windowed.rows).toHaveLength(4);
+        expect(windowed.rows.some((row) => row.text === "❯ dir-40/")).toBe(true);
+    });
     it("windows a long picker around the selected value and counts it in the title", () => {
         const values = Array.from({ length: 20 }, (_, index) => `provider/model-${index}`);
         const described = describeOverlay(createChoiceOverlay("model", "Model", values, "provider/model-15"), { choiceRows: 5 });
@@ -84,11 +94,13 @@ describe("dashboard overlays", () => {
         expect(described.rows[0]).toMatchObject({ text: expect.stringContaining("zzz"), emphasis: true });
     });
     it("names only keys the list still answers", () => {
-        const keys = createHelpOverlay().bindings.map((binding) => binding.keys);
-        // Ctrl+J is the line-feed byte, which the list answers as Enter, and Tab no longer moves
-        // a launch-field cursor: every launch field is set through its slash command.
+        const bindings = createHelpOverlay().bindings;
+        const keys = bindings.map((binding) => binding.keys);
+        // Ctrl+J is the line-feed byte, which the list answers as Enter. Tab no longer moves a
+        // launch-field cursor: every launch field is set through its slash command, and Tab now
+        // only completes the directory typed after /cwd.
         expect(keys.join(" ")).not.toContain("Ctrl+J");
-        expect(keys.join(" ")).not.toContain("Tab");
+        expect(bindings.find((binding) => binding.keys === "Tab")?.action).toContain("/cwd");
         expect(keys.join(" ")).toContain("Ctrl+W");
         // Thinking is Pi's to set, so the help text offers no key or command for it.
         expect(createHelpOverlay().bindings.map((binding) => `${binding.keys} ${binding.action}`).join(" ")).not.toContain("thinking");

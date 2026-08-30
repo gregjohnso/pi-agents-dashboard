@@ -1,6 +1,7 @@
 import { LIST_COMMANDS, matchingListCommands } from "./list-commands.mjs";
 
 const DEFAULT_CHOICE_ROWS = 8;
+const DEFAULT_COMPLETION_ROWS = 8;
 const CHOICE_KEYS = "↑↓ choose · type to filter · Enter apply · Esc cancel";
 
 /** Describe one selected session without collapsing independent state fields. */
@@ -27,6 +28,15 @@ export function createMetadataOverlay(session) {
 export function createCommandMenuOverlay(text, index) {
     const commands = matchingListCommands(text);
     return { kind: "command_menu", commands, index: commands.length === 0 ? 0 : Math.max(0, Math.min(index, commands.length - 1)) };
+}
+
+/**
+ * Offer the directories one `/cwd` path still admits. The items come from the last completed
+ * listing, never from one this overlay starts.
+ * @param {{value:string,label:string}[]} items @param {string} prefix @param {number} index
+ */
+export function createPathCompletionOverlay(items, prefix, index) {
+    return { kind: "path_completion", items: [...items], prefix, index: items.length === 0 ? 0 : Math.max(0, Math.min(index, items.length - 1)) };
 }
 
 /** Offer one bounded list of exact values for a launch field, starting on the current one. @param {string} field @param {string} title @param {string[]} values @param {string} current */
@@ -68,6 +78,7 @@ export function createHelpOverlay() {
             { keys: "Ctrl+R / Ctrl+E", action: "refresh activity summaries; show session metadata" },
             { keys: "/model", action: "set the next session's model" },
             { keys: "/cwd /isolation /name", action: "set its directory, isolation, and name" },
+            { keys: "Tab", action: "complete the directory typed after /cwd" },
             { keys: "? / Ctrl+G", action: "this help" },
             { keys: "Ctrl+C", action: "quit" },
         ],
@@ -120,6 +131,14 @@ export function describeOverlay(overlay, options = {}) {
         return {
             title: "Commands",
             rows: overlay.commands.map((command, index) => ({ text: `${index === overlay.index ? "❯" : " "} ${signatures[index].padEnd(signatureWidth)}  ${command.summary}` })),
+        };
+    }
+    if (overlay.kind === "path_completion") {
+        const maxRows = Math.max(1, options.completionRows ?? DEFAULT_COMPLETION_ROWS);
+        const start = windowStart(overlay.index, overlay.items.length, maxRows);
+        return {
+            title: "Directories",
+            rows: overlay.items.slice(start, start + maxRows).map((/** @type {{label:string}} */ item, offset) => ({ text: `${start + offset === overlay.index ? "❯" : " "} ${item.label}` })),
         };
     }
     if (overlay.kind === "choice") {

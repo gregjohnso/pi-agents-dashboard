@@ -91,5 +91,6 @@ it("starts package-relative code from a local install, a global install, and off
   expect(localResult.stdout).toContain("Usage: pi-agents");
   expect(globalResult.stdout).toContain("With no arguments");
   expect(npxResult.stdout).toContain("pi-agents attach <full-session-id>");
+  expect(localResult.stdout).toContain("pi-agents logs [<full-session-id>]");
   await Promise.all([local, global, offlineNpx].map(({ state }) => expect(access(state)).rejects.toMatchObject({ code: "ENOENT" })));
 }, 120_000);

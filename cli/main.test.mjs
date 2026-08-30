@@ -54,10 +54,36 @@ it("prints standalone help without opening the app", async () => {
   expect(await runCli(["--help"], { openApp, io: output.io })).toBe(0);
   const help = output.stdout.join("");
   expect(help).toContain("With no arguments");
-  for (const advertised of ["pi-agents agents", "pi-agents attach", "pi-agents stop|rm", "pi-agents respawn", "session cleanup", "session resolve-delivery"]) expect(help).toContain(advertised);
-  // Commit 11 adds logs; advertising it before it answers would report a bug.
-  for (const absent of ["logs", "session status", "session stop", "session delete"]) expect(help).not.toContain(absent);
+  // Both commands now exist, so the help advertises both and hides neither.
+  for (const advertised of ["pi-agents agents", "pi-agents attach", "pi-agents logs [<full-session-id>]", "pi-agents stop|rm", "pi-agents respawn", "session cleanup", "session resolve-delivery"]) expect(help).toContain(advertised);
+  for (const absent of ["session status", "session stop", "session delete"]) expect(help).not.toContain(absent);
   expect(openApp).not.toHaveBeenCalled();
+});
+
+it("routes logs with and without one exact session ID", async () => {
+  const received = [];
+  const runLogsCommand = vi.fn(async (sessionId) => {
+    received.push(sessionId);
+    return { code: 0, result: { kind: "logs", sources: [], text: "" } };
+  });
+  expect(await runCli(["logs"], { runLogsCommand, io: capture().io })).toBe(0);
+  expect(await runCli(["logs", "exact-session-id"], { runLogsCommand, io: capture().io })).toBe(0);
+  expect(received).toEqual([undefined, "exact-session-id"]);
+  expect(await runCli(["logs", "exact-session-id", "extra"], { runLogsCommand, io: capture().io })).toBe(2);
+  expect(runLogsCommand).toHaveBeenCalledTimes(2);
+});
+
+it("writes log text unwrapped and keeps --json to one object", async () => {
+  const path = "/state/daemon/startup.log";
+  const text = `==> ${path} <==\nDashboardConfigError\n`;
+  const runLogsCommand = async () => ({ code: 0, result: { kind: "logs", sources: [{ path, bytes: 21, truncated: false }], text } });
+  const plain = capture();
+  expect(await runCli(["logs"], { runLogsCommand, io: plain.io })).toBe(0);
+  expect(plain.stdout.join("")).toBe(text);
+  const structured = capture();
+  expect(await runCli(["logs", "--json"], { runLogsCommand, io: structured.io })).toBe(0);
+  expect(structured.stdout).toHaveLength(1);
+  expect(JSON.parse(structured.stdout[0])).toMatchObject({ ok: true, kind: "logs", sources: [{ path }], text });
 });
 
 it("prints exactly one JSON object and uses syntax exit code 2", async () => {

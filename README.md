@@ -68,6 +68,7 @@ The operator-facing commands use the same verbs as Claude Code's background sess
 | `pi-agents agents` | Opens the session list. Same as `pi-agents` with no arguments. |
 | `pi-agents agents --json` | Prints every session row as one JSON object and exits. It reads only and does not start the daemon. |
 | `pi-agents attach <full-session-id>` | Opens one session's viewer directly. Returning ends the attachment, not the session. |
+| `pi-agents logs [<full-session-id>]` | Prints a combined 256 KiB tail of that session's newest Pi stderr segment and its worker stderr, newest Pi output first. With no ID it prints the daemon's startup log. Each source's full path precedes its content, so a truncated tail says where to read further. |
 | `pi-agents stop <full-session-id> --revision <n> --yes` | Stops that session's worker and its Pi process. |
 | `pi-agents rm <full-session-id> --revision <n> --yes` | Forgets the dashboard record. It does not delete Pi's session file or remove a worktree. |
 | `pi-agents respawn <full-session-id> --revision <n> --yes` | Restarts that session's worker on the installed release. It refuses while the session is working or waiting on you, rather than interrupting the turn. |
@@ -75,6 +76,8 @@ The operator-facing commands use the same verbs as Claude Code's background sess
 An upgraded daemon adopts your running sessions rather than refusing them, and restarts a worker left on older code by itself once Pi settles that session. `respawn` is how you ask for that restart at a moment you choose. A worker newer than the daemon is never downgraded.
 
 Session IDs are exact; a prefix does not match. `--revision <n>` is the `revision` in `pi-agents agents --json`, and the command refuses when the row changed underneath it.
+
+`logs` works before a session's worker is ready, which is when a launch is most likely to have failed. It resolves the run directory from the record's own root-relative run hash, so it keeps working after the state root is renamed, and it refuses any source that is not a regular file the operator owns.
 
 Two recovery commands have no Claude Code equivalent and stay under `session`:
 

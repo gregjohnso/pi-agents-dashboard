@@ -37,6 +37,10 @@ const DEFAULT_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateMs: 5_00
 /** Worst-case wait for the daemon's SIGTERM-then-SIGKILL escalation under the default policy. */
 export const DEFAULT_STOP_ESCALATION_MS = DEFAULT_STOP_POLICY.gracefulMs + DEFAULT_STOP_POLICY.terminateMs + DESTRUCTIVE_TIMEOUT_MARGIN_MS;
 const RESOLUTIONS = new Set(["retry_at_risk", "abandon"]);
+/** Combined ceiling for one `logs` answer, matching the raw-output tail Claude Code keeps for its own. */
+const LOG_TAIL_MAX_BYTES = 262_144;
+const STDERR_SEGMENT_NAME = /^stderr\.(\d+)\.jsonl$/u;
+const UNSAFE_LOG_OPEN_CODES = new Set(["ELOOP", "ENOTDIR", "EISDIR"]);
 
 /**
  * Resolve how long a destructive request may wait, from the stop policy the daemon actually escalates on.
@@ -597,6 +601,137 @@ export async function runAgentsCommand(options = {}) {
   const request = options.request ?? createDaemonRequester({ root, clientId: await loadCliClientIdentity({ root, randomId: options.randomId }), timeoutMs: options.timeoutMs });
   const state = await request("get_state", {});
   return { code: 0, result: { kind: "agents", sessions: state.sessions } };
+}
+
+/** @param {string} message @param {unknown} [cause] */
+function unsafeLogSource(message, cause) {
+  return Object.assign(new Error(message, cause === undefined ? undefined : { cause }), { code: "LOG_SOURCE_UNSAFE" });
+}
+
+/**
+ * Decode only whole characters, dropping a sequence the tail offset or a killed writer cut in half.
+ * @param {Buffer} bytes
+ */
+function completeUtf8(bytes) {
+  let start = 0;
+  while (start < bytes.length && (bytes[start] & 0b1100_0000) === 0b1000_0000) start += 1;
+  let end = bytes.length;
+  for (let back = 1; back <= 3 && end - back >= start; back += 1) {
+    const byte = bytes[end - back];
+    if ((byte & 0b1100_0000) === 0b1000_0000) continue;
+    const width = byte >= 0xf0 ? 4 : byte >= 0xe0 ? 3 : byte >= 0xc0 ? 2 : 1;
+    if (width > back) end -= back;
+    break;
+  }
+  return bytes.subarray(start, end).toString("utf8");
+}
+
+/**
+ * Read at most `maxTailBytes` from the end of one owned regular file, following no symbolic link.
+ * @param {string} path @param {number} maxTailBytes @param {(stage: string, context: any) => unknown | Promise<unknown>} [failpoint]
+ * @returns {Promise<{ path: string, text: string, bytes: number, truncated: boolean } | undefined>} absent when no such log exists
+ */
+async function readLogTail(path, maxTailBytes, failpoint = () => {}) {
+  let handle;
+  try {
+    handle = await fs.open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch (error) {
+    const code = /** @type {NodeJS.ErrnoException} */ (error)?.code ?? "";
+    if (code === "ENOENT") return undefined;
+    if (UNSAFE_LOG_OPEN_CODES.has(code)) throw unsafeLogSource(`Log source is not an owned regular file: ${path}`, error);
+    throw error;
+  }
+  try {
+    const before = await handle.stat();
+    if (!before.isFile() || before.uid !== process.getuid?.()) throw unsafeLogSource(`Log source is not an owned regular file: ${path}`);
+    const start = Math.max(0, before.size - maxTailBytes);
+    const length = before.size - start;
+    const buffer = Buffer.alloc(length);
+    const { bytesRead } = length === 0 ? { bytesRead: 0 } : await handle.read(buffer, 0, length, start);
+    await failpoint("after_read", { path });
+    // An open descriptor's device and inode cannot change, so the replacement check has to look the
+    // name up again: a rotated or swapped log leaves this descriptor readable but no longer that path.
+    const after = await fs.lstat(path).catch(() => undefined);
+    if (after?.dev !== before.dev || after.ino !== before.ino) throw unsafeLogSource(`Log source was replaced while it was read: ${path}`);
+    return { path, text: completeUtf8(buffer.subarray(0, bytesRead)), bytes: bytesRead, truncated: start > 0 };
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Newest rotating Pi stderr segment of one run, by the index its writer pads into the name. @param {string} directory */
+async function newestStderrSegment(directory) {
+  let names;
+  try { names = await fs.readdir(directory); } catch (error) {
+    if (/** @type {NodeJS.ErrnoException} */ (error)?.code === "ENOENT") return undefined;
+    throw error;
+  }
+  /** @type {{ index: number, name: string } | undefined} */
+  let newest;
+  for (const name of names) {
+    const match = STDERR_SEGMENT_NAME.exec(name);
+    if (match === null) continue;
+    const index = Number(match[1]);
+    if (newest === undefined || index > newest.index) newest = { index, name };
+  }
+  return newest === undefined ? undefined : join(directory, newest.name);
+}
+
+/** Resolve one run's directory from the record's root-relative hash, never from a stored path. @param {string} root @param {unknown} runHash */
+function resolveRunDirectory(root, runHash) {
+  if (runHash === undefined) return undefined;
+  if (typeof runHash !== "string" || runHash.length === 0 || runHash.includes("/") || runHash.startsWith(".")) throw unsafeLogSource(`Run directory is not a root-relative name: ${String(runHash)}`);
+  const runs = join(root, "runs");
+  const directory = join(runs, runHash);
+  if (!directory.startsWith(`${runs}/`)) throw unsafeLogSource(`Run directory escapes the state root: ${runHash}`);
+  return directory;
+}
+
+/** @param {{ path: string, text: string, truncated: boolean }} source */
+function renderLogSource(source) {
+  const header = `==> ${source.path}${source.truncated ? " (tail)" : ""} <==\n`;
+  return source.text.length === 0 || source.text.endsWith("\n") ? `${header}${source.text}` : `${header}${source.text}\n`;
+}
+
+/**
+ * Read the bounded log tail the operator needs after a startup failure: the daemon's startup log,
+ * or one session's newest Pi stderr segment followed by its worker stderr.
+ * @param {string} [sessionId] @param {any} [options]
+ */
+export async function runLogsCommand(sessionId, options = {}) {
+  const root = options.root ?? resolveRuntimeRoot(options.env);
+  /** @type {string[]} */
+  let candidates;
+  try {
+    if (sessionId === undefined) candidates = [join(root, "daemon", "startup.log")];
+    else {
+      if (!exactId(sessionId)) return { code: 2, error: { code: "INVALID_SYNTAX", message: "Usage: pi-agents logs [<full-session-id>]" } };
+      const request = options.request ?? createDaemonRequester({ root, clientId: await loadCliClientIdentity({ root, randomId: options.randomId }), timeoutMs: options.timeoutMs });
+      const state = await request("get_state", {});
+      const session = state?.sessions?.find((/** @type {any} */ candidate) => candidate.sessionId === sessionId);
+      if (session === undefined) return { code: 1, error: { code: "SESSION_NOT_FOUND", message: `Unknown exact session ID: ${sessionId}` } };
+      const directory = resolveRunDirectory(root, session.runHash);
+      if (directory === undefined) return { code: 1, error: { code: "LOGS_NOT_FOUND", message: `Session ${sessionId} has no run directory yet` } };
+      // Pi's own complaint takes the budget first: the worker stderr line that reports the exit
+      // rarely says why Pi refused, and that is the failure this command exists for.
+      const segment = await newestStderrSegment(join(directory, "diagnostics"));
+      candidates = [...(segment === undefined ? [] : [segment]), join(directory, "worker.stderr.log")];
+    }
+    /** @type {{ path: string, text: string, bytes: number, truncated: boolean }[]} */
+    const sources = [];
+    let remaining = options.maxTailBytes ?? LOG_TAIL_MAX_BYTES;
+    for (const path of candidates) {
+      const source = await readLogTail(path, Math.max(0, remaining), options.logFailpoint);
+      if (source === undefined) continue;
+      remaining -= source.bytes;
+      sources.push(source);
+    }
+    if (sources.length === 0) return { code: 1, error: { code: "LOGS_NOT_FOUND", message: `No readable log at: ${candidates.join(", ")}` } };
+    return { code: 0, result: { kind: "logs", sources: sources.map(({ path, bytes, truncated }) => ({ path, bytes, truncated })), text: sources.map(renderLogSource).join("") } };
+  } catch (error) {
+    if (/** @type {any} */ (error)?.code !== "LOG_SOURCE_UNSAFE") throw error;
+    return { code: 1, error: { code: "LOG_SOURCE_UNSAFE", message: /** @type {Error} */ (error).message } };
+  }
 }
 
 /** Run an exact-ID session command. */

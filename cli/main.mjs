@@ -2,11 +2,12 @@ import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { runDaemonCommand } from "./daemon-commands.mjs";
-import { runAgentsCommand, runSessionCommand } from "./session-commands.mjs";
+import { runAgentsCommand, runLogsCommand, runSessionCommand } from "./session-commands.mjs";
 
 const HELP = `Usage: pi-agents [--pi-bin /absolute/path/to/pi]
        pi-agents agents [--json]
        pi-agents attach <full-session-id>
+       pi-agents logs [<full-session-id>]
        pi-agents stop|rm <full-session-id> --revision <n> --yes
        pi-agents respawn <full-session-id> --revision <n> --yes
        pi-agents daemon start|status|restart|recover|stop [--stop-workers --yes]
@@ -19,6 +20,7 @@ const SESSION_VERBS = new Set(["stop", "rm", "respawn"]);
 /** Recovery operations Claude Code has no verb for, so they stay under the session namespace. */
 const RECOVERY_VERBS = new Set(["cleanup", "resolve-delivery"]);
 const RECOVERY_USAGE = "Usage: pi-agents session cleanup <full-id> --revision <n> --yes | session resolve-delivery <full-client-id> <full-request-id> retry_at_risk|abandon --yes";
+const LOGS_USAGE = "Usage: pi-agents logs [<full-session-id>]";
 
 async function defaultOpenApp(options) {
   const { runDashboardApp } = await import(new URL("../app/standalone.mjs", import.meta.url).href);
@@ -34,6 +36,11 @@ function writeResult(result, json, io) {
   const payload = result.code === 0
     ? { ok: true, code: "OK", ...result.result }
     : { ok: false, code: result.error?.code ?? "COMMAND_FAILED", message: result.error?.message ?? "Command failed", ...(result.result === undefined ? {} : { result: result.result }) };
+  // A log tail is the answer itself, so plain output is the bytes read and nothing around them.
+  if (!json && payload.ok && payload.kind === "logs") {
+    io.stdout.write(payload.text);
+    return;
+  }
   const target = json || result.code === 0 ? io.stdout : io.stderr;
   target.write(json ? `${JSON.stringify(payload)}\n` : `${payload.ok ? payload.kind ?? "ok" : `${payload.code}: ${payload.message}`}\n`);
 }
@@ -68,12 +75,16 @@ export async function runCli(argv = process.argv.slice(2), deps = {}) {
       result = args.length === 2
         ? await (deps.attachSession ?? defaultAttachSession)(args[1], deps.attachOptions)
         : { code: 2, error: { code: "INVALID_SYNTAX", message: "Usage: pi-agents attach <full-session-id>" } };
+    } else if (args[0] === "logs") {
+      result = args.length <= 2
+        ? await (deps.runLogsCommand ?? runLogsCommand)(args[1], deps.sessionOptions)
+        : { code: 2, error: { code: "INVALID_SYNTAX", message: LOGS_USAGE } };
     } else if (SESSION_VERBS.has(args[0])) result = await (deps.runSessionCommand ?? runSessionCommand)(args, deps.sessionOptions);
     else if (args[0] === "session") {
       result = RECOVERY_VERBS.has(args[1])
         ? await (deps.runSessionCommand ?? runSessionCommand)(args.slice(1), deps.sessionOptions)
         : { code: 2, error: { code: "INVALID_SYNTAX", message: RECOVERY_USAGE } };
-    } else result = { code: 2, error: { code: "INVALID_SYNTAX", message: "Usage: pi-agents [--pi-bin /absolute/path] | agents | attach ... | stop ... | rm ... | respawn ... | daemon ... | session ..." } };
+    } else result = { code: 2, error: { code: "INVALID_SYNTAX", message: "Usage: pi-agents [--pi-bin /absolute/path] | agents | attach ... | logs ... | stop ... | rm ... | respawn ... | daemon ... | session ..." } };
   } catch (error) {
     const conflictCodes = new Set(["OWNERSHIP_CONFLICT", "AMBIGUOUS_IDENTITY", "DAEMON_IDENTITY_CONFLICT", "PROCESS_IDENTITY_CONFLICT", "STALE_LEASE"]);
     result = { code: conflictCodes.has(error?.code) ? 5 : 1, error: { code: error?.code ?? "COMMAND_FAILED", message: error instanceof Error ? error.message : "Command failed" } };

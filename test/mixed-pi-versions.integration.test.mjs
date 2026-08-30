@@ -32,7 +32,7 @@ it("keeps version A live after the configured executable is atomically replaced 
   const fixture = await readFile(FIXTURE, "utf8");
   const executable = join(root, "pi-current");
   const replacement = join(root, "pi-next");
-  await writeFile(executable, fixture.replace('"1.0.0"', '"A"'), { mode: 0o700 });
+  await writeFile(executable, fixture.replace('"1.0.0"', '"0.84.1"'), { mode: 0o700 });
   await chmod(executable, 0o700);
   const registry = new RegistryStore(sessions);
   const now = "2026-08-25T12:00:00.000Z";
@@ -47,7 +47,7 @@ it("keeps version A live after the configured executable is atomically replaced 
   const launchSeams = { daemonConnector: CONNECTOR, daemonConnectConfig: control.connectConfig };
   const supervisor = new WorkerSupervisor({ registry, router, runsDirectory: runs, configuredPiPath: executable, env: { ...process.env, FAKE_PI_EXIT_MS: "900" }, startTimeoutMs: 2_000 });
   const first = await supervisor.launch({ sessionId: "a", canonicalSessionFile: join(root, "a.jsonl"), cwd: root, runId: "run-a", ...launchSeams });
-  await writeFile(replacement, fixture.replace('"1.0.0"', '"B"'), { mode: 0o700 });
+  await writeFile(replacement, fixture.replace('"1.0.0"', '"0.84.2"'), { mode: 0o700 });
   await chmod(replacement, 0o700);
   await rename(replacement, executable);
   const second = await supervisor.launch({ sessionId: "b", canonicalSessionFile: join(root, "b.jsonl"), cwd: root, runId: "run-b", ...launchSeams });
@@ -55,8 +55,8 @@ it("keeps version A live after the configured executable is atomically replaced 
   expect(first.piChildIdentity.pid).not.toBe(second.piChildIdentity.pid);
   const firstRecord = await registry.get("a");
   const secondRecord = await registry.get("b");
-  expect(firstRecord).toMatchObject({ runtime: { executable: { realpath: executable }, piVersion: "A", rpcAdapterVersion: 1 } });
-  expect(secondRecord).toMatchObject({ runtime: { executable: { realpath: executable }, piVersion: "B", rpcAdapterVersion: 1 } });
+  expect(firstRecord).toMatchObject({ runtime: { executable: { realpath: executable }, piVersion: "0.84.1", rpcAdapterVersion: 1 } });
+  expect(secondRecord).toMatchObject({ runtime: { executable: { realpath: executable }, piVersion: "0.84.2", rpcAdapterVersion: 1 } });
   expect(firstRecord.runtime.executable).not.toEqual(secondRecord.runtime.executable);
   await supervisor.close();
 });

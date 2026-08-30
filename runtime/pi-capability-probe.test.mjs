@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { chmod, copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +10,8 @@ import { probePiCapabilities } from "./pi-capability-probe.mjs";
 import { resolvePiExecutable } from "./pi-executable.mjs";
 
 const FIXTURE = fileURLToPath(new URL("../test/fixtures/fake-pi.mjs", import.meta.url));
+const INSTALLED_PI = fileURLToPath(new URL("../node_modules/.bin/pi", import.meta.url));
+const PACKAGE_MANIFEST = fileURLToPath(new URL("../package.json", import.meta.url));
 /** @type {string[]} */
 const cleanup = [];
 afterEach(async () => Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true }))));
@@ -30,12 +33,12 @@ it("probes recognized validation errors without a valid prompt or canonical sess
     executable,
     cache: new Map(),
     timeoutMs: 5_000,
-    env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_VERSION: "version-A" },
+    env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_VERSION: "0.84.3" },
   });
 
   expect(report).toMatchObject({
     executable,
-    reportedVersion: "version-A",
+    reportedVersion: "0.84.3",
     rpcMode: true,
     jsonl: true,
     missingRequired: [],
@@ -49,13 +52,36 @@ it("probes recognized validation errors without a valid prompt or canonical sess
   expect(entries.filter((entry) => entry.kind === "start")).toHaveLength(2);
 });
 
-it("recognizes RPC mode from the handshake, not help formatting, and accepts stock Pi's one-way extension UI response", async () => {
+it("reads the version from --version and never spawns --help", async () => {
+  const { log, executable } = await setup();
+  const report = await probePiCapabilities({ executable, cache: new Map(), timeoutMs: 5_000, env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_VERSION: "0.84.3" } });
+
+  expect(report.reportedVersion).toBe("0.84.3");
+  const starts = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line)).filter((entry) => entry.kind === "start");
+  expect(starts.filter((entry) => entry.argv.includes("--version"))).toHaveLength(1);
+  expect(starts.filter((entry) => entry.argv.includes("--help"))).toHaveLength(0);
+});
+
+it.each([
+  ["prose", { FAKE_PI_VERSION_OUTPUT: "pi - AI coding assistant with read, bash, edit, write tools\n" }],
+  ["an unrecognized flag", { FAKE_PI_VERSION_OUTPUT: "unknown option: --version\n", FAKE_PI_VERSION_EXIT: "1" }],
+  ["nothing", { FAKE_PI_VERSION_OUTPUT: "" }],
+])("records no version, and still admits the executable, when --version reports %s", async (_label, behavior) => {
+  const { log, executable } = await setup();
+  const report = await probePiCapabilities({ executable, cache: new Map(), timeoutMs: 5_000, env: { ...process.env, FAKE_PI_LOG: log, ...behavior } });
+
+  expect(report.reportedVersion).toBeNull();
+  expect(report.missingRequired).toEqual([]);
+  expect(report.commands).toEqual(["get_state", "prompt", "follow_up", "steer", "abort", "extension_ui_response"]);
+});
+
+it("recognizes RPC mode from the handshake and accepts stock Pi's one-way extension UI response", async () => {
   const { log, executable } = await setup();
   const report = await probePiCapabilities({
     executable,
     cache: new Map(),
     timeoutMs: 5_000,
-    env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_STOCK_HELP: "1", FAKE_PI_ONE_WAY_EXTENSION_UI_RESPONSE: "1" },
+    env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_ONE_WAY_EXTENSION_UI_RESPONSE: "1" },
   });
 
   expect(report.rpcMode).toBe(true);
@@ -112,6 +138,30 @@ it("caches by complete executable identity and invalidates after replacement", a
 
   await writeFile(executable.realpath, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
   await expect(probePiCapabilities(options)).rejects.toMatchObject({ code: "PI_EXECUTABLE_REPLACED" });
+});
+
+/** @param {string[]} argv */
+function installedPiOutput(argv) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [INSTALLED_PI, ...argv], { stdio: ["ignore", "pipe", "ignore"] });
+    /** @type {Buffer[]} */
+    const chunks = [];
+    child.stdout.on("data", (chunk) => chunks.push(chunk));
+    child.once("error", reject);
+    child.once("exit", (code) => (code === 0 ? resolve(Buffer.concat(chunks).toString("utf8")) : reject(new Error(`pi ${argv.join(" ")} exited ${code}`))));
+  });
+}
+
+// Canary: in Pi 0.84.3 the version lives only behind `--version`, which prints the bare `0.84.3`.
+// Its `--help` opens with the description banner "pi - AI coding assistant with read, bash, edit,
+// write tools" and carries no version anywhere, which is why probeVersion spawns `--version` and
+// nothing here parses help. When this fails, Pi moved its version and probeVersion should follow it
+// rather than the probe growing a help parser again.
+it("still keeps the installed Pi's version behind --version and out of --help", async () => {
+  const version = (await installedPiOutput(["--version"])).trim();
+  expect(version).toMatch(/^\d+\.\d+\.\d+$/u);
+  expect(version).toBe(JSON.parse(await readFile(PACKAGE_MANIFEST, "utf8")).dependencies["@earendil-works/pi-coding-agent"]);
+  expect(await installedPiOutput(["--help"])).not.toContain(version);
 });
 
 it("refuses when the selected adapter cannot normalize documented required live events without prompting Pi", async () => {

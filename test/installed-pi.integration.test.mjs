@@ -101,7 +101,8 @@ it("launches a distinct installed Pi child with exact structured argv and persis
   const childStarts = logEntries.filter((entry) => entry.kind === "start" && entry.argv.includes(sessionFile));
   expect(childStarts).toEqual([expect.objectContaining({ argv: ["--mode", "rpc", "--session", sessionFile] })]);
   expect(childStarts[0].pid).toBe(handle.piChildIdentity.pid);
-  expect(logEntries.filter((entry) => entry.kind === "start" && entry.argv.includes("--help"))).toHaveLength(1);
+  expect(logEntries.filter((entry) => entry.kind === "start" && entry.argv.includes("--version"))).toHaveLength(1);
+  expect(logEntries.filter((entry) => entry.kind === "start" && entry.argv.includes("--help"))).toHaveLength(0);
   expect(logEntries.filter((entry) => entry.kind === "command").map(({ command, providerInvocation }) => [command, providerInvocation])).toEqual(expect.arrayContaining([
     ["get_state", false], ["prompt", false], ["follow_up", false], ["steer", false], ["abort", false], ["extension_ui_response", false],
   ]));
@@ -112,6 +113,7 @@ it("launches a distinct installed Pi child with exact structured argv and persis
       executable: { realpath: executable },
       supervisor: handle.identity,
       piChild: handle.piChildIdentity,
+      piVersion: "1.0.0",
       rpcAdapterVersion: 1,
     },
   });

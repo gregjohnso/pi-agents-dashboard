@@ -59,8 +59,9 @@ def main() -> int:
     # submitit defaults timeout_min to 5 and kills the task silently; one sample is idle for 60 s of
     # its ~2 min, so 30 min is a safe explicit upper bound well inside the partition's own limit.
     parser.add_argument("--timeout-min", type=int, default=30)
-    # Concurrency, not array size: 30 samples at once made `pi --help` exceed the daemon's 5 s
-    # capability-probe timeout on a shared filesystem and failed 28 of 30 launches.
+    # Concurrency, not array size: 30 samples at once made the probe's `pi` spawn exceed the daemon's
+    # 5 s capability-probe timeout on a shared filesystem and failed 28 of 30 launches. The probe ran
+    # `pi --help` when that was measured; it runs `pi --version` now, at the same cost.
     parser.add_argument("--array-parallelism", type=int, default=6)
     # One sample runs a daemon, a worker, and a Pi child. 4 CPUs and 16 GB carried the smoke sample
     # on cw-us-e4a2-l40-202-011 at load 11.

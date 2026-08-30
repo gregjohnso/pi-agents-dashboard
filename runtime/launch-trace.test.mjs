@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { OwnershipManager } from "./ownership.mjs";
+import { RecoveredWorkerRouter } from "./reconciliation.mjs";
 import { RegistryStore } from "./registry-store.mjs";
 import { WorkerSupervisor } from "./worker-supervisor.mjs";
 
@@ -22,13 +23,13 @@ afterEach(async () => {
 /** The fake worker group: a supervisor at `pid` leads the group, and its Pi child is `pid + 100`. */
 const inspect = async (/** @type {number} */ pid) => ({ pid, startIdentity: String(pid), processGroupId: pid >= 9200 ? pid - 100 : pid });
 
-/** Spawn a worker that completes the hello, Pi bind, and readiness handshakes without a process. */
-function fakeWorkerSpawn() {
+/** Spawn a worker that completes the startup-socket handshakes without a process. @param {any} router */
+function fakeWorkerSpawn(router) {
   let nextPid = 9100;
   return (/** @type {string} */ _command, /** @type {string[]} */ argv, /** @type {any} */ options) => {
     const child = /** @type {any} */ (new EventEmitter());
     child.pid = nextPid++;
-    child.connected = true;
+    child.unref = vi.fn();
     const token = options.env.PI_AGENTS_WORKER_TOKEN;
     const identity = () => ({
       worker: { pid: child.pid, startIdentity: String(child.pid), processGroupId: child.pid },
@@ -36,15 +37,22 @@ function fakeWorkerSpawn() {
     });
     const argument = (/** @type {string} */ flag) => argv[argv.indexOf(flag) + 1];
     const handshake = { sessionId: argument("--session-id"), runId: argument("--run-id"), leaseId: argument("--lease-id"), generation: Number(argument("--generation")) };
-    child.send = vi.fn((/** @type {any} */ message, /** @type {any} */ callback) => {
-      callback?.();
-      if (message.type === "activate") queueMicrotask(() => child.emit("message", { version: 1, type: "pi_child", token, ...handshake, ...identity() }));
-      if (message.type === "child_bound") queueMicrotask(() => child.emit("message", { version: 1, type: "worker_ready", token, ...handshake, ...identity() }));
-      return true;
-    });
-    child.disconnect = vi.fn();
-    child.unref = vi.fn();
-    queueMicrotask(() => child.emit("message", { version: 1, type: "worker_hello", token, ...handshake, worker: identity().worker }));
+    /** @type {Promise<any>} */
+    let reservation;
+    /** @param {any} frame */
+    const toDaemon = async (frame) => (await reservation)?.deliver(frame);
+    /** @type {(value?: unknown) => void} */
+    let resolveClosed = () => {};
+    const connection = {
+      closed: new Promise((resolve) => { resolveClosed = resolve; }),
+      close: () => resolveClosed(undefined),
+      async send(/** @type {any} */ message) {
+        if (message.type === "activate") queueMicrotask(() => void toDaemon({ version: 1, type: "pi_child", token, ...handshake, ...identity() }));
+        if (message.type === "child_bound") queueMicrotask(() => void toDaemon({ version: 1, type: "worker_ready", token, ...handshake, ...identity() }));
+      },
+      async request() { throw new Error("Unexpected worker request"); },
+    };
+    queueMicrotask(() => { reservation = router.beginLaunchConnection({ version: 1, type: "hello", token, ...handshake, worker: identity().worker }, connection, () => {}); });
     return child;
   };
 }
@@ -64,11 +72,15 @@ async function setup() {
     taskState: "READY", processState: "EXITED", outcome: "NONE",
     activity: { kind: "saved_session", summary: "Saved", updatedAt: now }, createdAt: now, updatedAt: now,
   });
+  await mkdir(join(root, "daemon"), { mode: 0o700 });
+  const router = new RecoveredWorkerRouter({ registry, inspect, metadataPath: join(root, "daemon", "workers.json") });
+  await router.load();
   const supervisor = new WorkerSupervisor({
     registry,
+    router,
     ownership: new OwnershipManager(registry, { randomId: () => "lease-one" }),
     runsDirectory: runs,
-    spawnImpl: fakeWorkerSpawn(),
+    spawnImpl: fakeWorkerSpawn(router),
     inspect,
     randomId: () => "trace-token",
   });

@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import * as fs from "node:fs/promises";
 import { join } from "node:path";
 
@@ -12,9 +13,183 @@ import { reduceSessionState } from "./state-reducer.mjs";
 import { createViewerNormalizer } from "./viewer-normalizer.mjs";
 import { createViewerStore } from "./viewer-store.mjs";
 
+/** Frames the startup connection carries before its route is adopted. */
+const LAUNCH_CONTROL_TYPES = ["pi_child", "worker_ready"];
+/** A startup connection holds only what the launch has not consumed yet; a flood is a defect, not backpressure. */
+const MAX_RESERVATION_BUFFERED_FRAMES = 256;
+
 /** @param {any} left @param {any} right */
 function sameIdentity(left, right) {
   return left?.pid === right?.pid && left?.startIdentity === right?.startIdentity && left?.processGroupId === right?.processGroupId;
+}
+
+/** @param {unknown} value */
+function digest(value) {
+  return createHash("sha256").update(typeof value === "string" ? value : "", "utf8").digest();
+}
+
+/** @param {unknown} supplied @param {string} expected */
+function sameToken(supplied, expected) {
+  return typeof supplied === "string" && timingSafeEqual(digest(supplied), digest(expected));
+}
+
+/** @returns {any} */
+function deferred() {
+  /** @type {any} */
+  const box = { settled: false };
+  box.promise = new Promise((resolveValue, rejectValue) => {
+    box.resolve = (/** @type {any} */ value) => { if (!box.settled) { box.settled = true; resolveValue(value); } };
+    box.reject = (/** @type {unknown} */ error) => { if (!box.settled) { box.settled = true; rejectValue(error); } };
+  });
+  box.promise.catch(() => {});
+  return box;
+}
+
+/**
+ * One launch this daemon reserved before it spawned the worker, keyed by the per-run token.
+ *
+ * A worker can reach the control socket before `spawn` returns, so a startup connection whose PID is
+ * not published yet waits here instead of being refused.
+ */
+class LaunchReservation {
+  /** @param {any} options */
+  constructor({ token, sessionId, runId, leaseId, generation, inspect, release }) {
+    this.token = token;
+    this.sessionId = sessionId;
+    this.runId = runId;
+    this.leaseId = leaseId;
+    this.generation = generation;
+    this.inspect = inspect;
+    this.release = release;
+    this.spawnedPid = deferred();
+    this.connectionArrived = deferred();
+    /** @type {any} */
+    this.connection = undefined;
+    /** @type {any} */
+    this.identity = undefined;
+    /** @type {any} */
+    this.route = undefined;
+    /** @type {Map<string, any>} */
+    this.waiters = new Map();
+    /** @type {any[]} */
+    this.pending = [];
+    /** @type {any[]} */
+    this.buffered = [];
+    /** @type {((reservation: LaunchReservation) => void) | undefined} */
+    this.onAdopted = undefined;
+    this.closed = false;
+  }
+
+  /** The exact PID exists only after `spawn` returns. @param {number} pid */
+  spawned(pid) {
+    this.spawnedPid.resolve(pid);
+  }
+
+  /** The launch waits here for its own worker to arrive and be verified. @param {number} timeoutMs */
+  connected(timeoutMs) {
+    /** @type {any} */
+    let timer;
+    return Promise.race([
+      /** @type {Promise<any>} */ (this.connectionArrived.promise),
+      new Promise((_, rejectWait) => {
+        timer = setTimeout(() => rejectWait(Object.assign(new Error("Timed out waiting for the worker startup connection"), { code: "WORKER_START_TIMEOUT" })), timeoutMs);
+        timer.unref?.();
+      }),
+    ]).finally(() => clearTimeout(timer));
+  }
+
+  /** @param {any} frame @param {any} connection @param {number} timeoutMs */
+  async bind(frame, connection, timeoutMs) {
+    try {
+      return await this.#bind(frame, connection, timeoutMs);
+    } catch (error) {
+      this.connectionArrived.reject(error);
+      throw error;
+    }
+  }
+
+  /** @param {any} frame @param {any} connection @param {number} timeoutMs */
+  async #bind(frame, connection, timeoutMs) {
+    if (this.connection !== undefined) throw Object.assign(new Error("A startup connection already claimed this launch"), { code: "WORKER_ALREADY_CONNECTED" });
+    if (frame.sessionId !== this.sessionId || frame.runId !== this.runId || frame.leaseId !== this.leaseId || frame.generation !== this.generation) {
+      throw Object.assign(new Error("Startup connection did not match the reserved launch"), { code: "WORKER_HELLO_MISMATCH" });
+    }
+    /** @type {any} */
+    let timer;
+    const pid = await Promise.race([
+      this.spawnedPid.promise,
+      new Promise((_, rejectWait) => {
+        timer = setTimeout(() => rejectWait(Object.assign(new Error("Spawned PID did not arrive before the startup connection deadline"), { code: "WORKER_SPAWN_TIMEOUT" })), timeoutMs);
+        timer.unref?.();
+      }),
+    ]).finally(() => clearTimeout(timer));
+    const inspected = await this.inspect(pid);
+    if (!sameIdentity(frame.worker, inspected) || inspected.pid !== pid || inspected.processGroupId !== pid) {
+      throw Object.assign(new Error("Startup connection claimed an identity that is not the spawned process-group leader"), { code: "WORKER_IDENTITY_MISMATCH" });
+    }
+    this.connection = connection;
+    this.identity = inspected;
+    this.connectionArrived.resolve(inspected);
+    return inspected;
+  }
+
+  /** Hand one startup frame to its waiter, or hold it until the route is adopted. @param {any} frame */
+  deliver(frame) {
+    if (LAUNCH_CONTROL_TYPES.includes(frame?.type) && sameToken(frame?.token, this.token)) {
+      const waiter = this.waiters.get(frame.type);
+      if (waiter === undefined) {
+        this.pending.push(frame);
+        return;
+      }
+      this.waiters.delete(frame.type);
+      waiter.resolve(frame);
+      return;
+    }
+    if (this.buffered.length >= MAX_RESERVATION_BUFFERED_FRAMES) this.buffered.shift();
+    this.buffered.push(frame);
+  }
+
+  /** @param {string} type @param {number} timeoutMs */
+  waitFor(type, timeoutMs) {
+    const queued = this.pending.findIndex((frame) => frame.type === type);
+    if (queued >= 0) return Promise.resolve(this.pending.splice(queued, 1)[0]);
+    if (this.closed) return Promise.reject(Object.assign(new Error("Launch reservation was released"), { code: "WORKER_CHANNEL_CLOSED" }));
+    const waiter = deferred();
+    this.waiters.set(type, waiter);
+    const timer = setTimeout(() => {
+      this.waiters.delete(type);
+      waiter.reject(Object.assign(new Error(`Timed out waiting for ${type} on the control socket`), { code: "WORKER_START_TIMEOUT" }));
+    }, timeoutMs);
+    timer.unref?.();
+    /** @type {Promise<any>} */
+    const settled = waiter.promise;
+    return settled.finally(() => clearTimeout(timer));
+  }
+
+  /** @param {any} message */
+  async send(message) {
+    if (this.connection === undefined) throw Object.assign(new Error("Startup connection is not bound"), { code: "WORKER_CHANNEL_CLOSED" });
+    await this.connection.send(message);
+  }
+
+  /** Publish the adopted route so the connection's own handler takes over. @param {any} route */
+  adopt(route) {
+    this.route = route;
+    this.onAdopted?.(this);
+  }
+
+  drainBuffered() {
+    return this.buffered.splice(0);
+  }
+
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    this.connectionArrived.reject(Object.assign(new Error("Launch reservation was released"), { code: "WORKER_CHANNEL_CLOSED" }));
+    for (const waiter of this.waiters.values()) waiter.reject(Object.assign(new Error("Launch reservation was released"), { code: "WORKER_CHANNEL_CLOSED" }));
+    this.waiters.clear();
+    this.release();
+  }
 }
 
 /** @param {any} value */
@@ -22,10 +197,15 @@ function validIdentity(value) {
   return Number.isSafeInteger(value?.pid) && value.pid > 0 && typeof value.startIdentity === "string" && value.startIdentity.length > 0 && Number.isSafeInteger(value.processGroupId) && value.processGroupId > 0;
 }
 
-/** @param {any} worker */
+/**
+ * A worker entry exists from the moment its run is reserved, which is before `spawn`, so both
+ * process identities are absent until the launch binds them and present together afterwards.
+ * @param {any} worker
+ */
 function validateWorkerMetadata(worker) {
-  const allowed = ["sessionId", "runId", "leaseId", "generation", "identity", "piChildIdentity", "token"];
-  if (typeof worker !== "object" || worker === null || Array.isArray(worker) || Object.keys(worker).some((key) => !allowed.includes(key)) || [worker.sessionId, worker.runId, worker.leaseId].some((value) => typeof value !== "string" || value.length === 0) || !Number.isSafeInteger(worker.generation) || worker.generation <= 0 || !validIdentity(worker.identity) || !validIdentity(worker.piChildIdentity) || (worker.token !== undefined && (typeof worker.token !== "string" || worker.token.length === 0))) throw new TypeError("Worker recovery metadata record is invalid");
+  const allowed = ["sessionId", "runId", "leaseId", "generation", "identity", "piChildIdentity", "token", "cliVersion"];
+  const bound = worker?.identity !== undefined || worker?.piChildIdentity !== undefined;
+  if (typeof worker !== "object" || worker === null || Array.isArray(worker) || Object.keys(worker).some((key) => !allowed.includes(key)) || [worker.sessionId, worker.runId, worker.leaseId].some((value) => typeof value !== "string" || value.length === 0) || !Number.isSafeInteger(worker.generation) || worker.generation <= 0 || (bound && (!validIdentity(worker.identity) || !validIdentity(worker.piChildIdentity))) || (worker.token !== undefined && (typeof worker.token !== "string" || worker.token.length === 0)) || (worker.cliVersion !== undefined && (typeof worker.cliVersion !== "string" || worker.cliVersion.length === 0))) throw new TypeError("Worker recovery metadata record is invalid");
   return worker;
 }
 
@@ -73,12 +253,16 @@ export class RecoveredWorkerRouter {
   // against each other on their own queue instead of the lifecycle lock an attach or detach needs.
   #frames = new SessionCoordinator();
   #loaded = false;
+  /** @type {Map<string, LaunchReservation>} */
+  #reservations = new Map();
+  #bindTimeoutMs;
 
-  /** @param {{ registry: RegistryStore, inspect(pid: number): Promise<any>, metadataPath: string }} options */
-  constructor({ registry, inspect, metadataPath }) {
+  /** @param {{ registry: RegistryStore, inspect(pid: number): Promise<any>, metadataPath: string, bindTimeoutMs?: number }} options */
+  constructor({ registry, inspect, metadataPath, bindTimeoutMs = 15_000 }) {
     this.#registry = registry;
     this.#inspect = inspect;
     this.#metadataPath = metadataPath;
+    this.#bindTimeoutMs = bindTimeoutMs;
     this.#lifecycle = registryCoordinationScope(registry).lifecycle;
   }
 
@@ -92,6 +276,9 @@ export class RecoveredWorkerRouter {
       for (const candidate of value.workers) {
         const worker = validateWorkerMetadata(candidate);
         if (this.#workers.has(worker.sessionId)) throw new TypeError("Worker recovery metadata contains duplicate sessions");
+        // A reserved-but-unbound run can only be answered by the daemon that spawned it, so a
+        // replacement daemon inherits nothing from it.
+        if (worker.identity === undefined) continue;
         this.#workers.set(worker.sessionId, worker);
       }
     } catch (error) {
@@ -104,6 +291,51 @@ export class RecoveredWorkerRouter {
     await atomicWriteJson(this.#metadataPath, { schemaVersion: 1, workers: [...this.#workers.values()].sort((a, b) => a.sessionId.localeCompare(b.sessionId)) });
   }
 
+  /**
+   * Reserve one run before its worker is spawned, so a startup connection that arrives before the
+   * PID is published has something to wait on, and so a replacement daemon can authenticate the
+   * same run from durable state.
+   * @param {{ sessionId: string, runId: string, leaseId: string, generation: number, token: string, cliVersion?: string }} launch
+   */
+  async reserve(launch) {
+    return this.#lifecycle.runNested(launch.sessionId, async () => {
+      if (this.#reservations.has(launch.token)) throw Object.assign(new Error("Launch token is already reserved"), { code: "WORKER_TOKEN_REUSED" });
+      const worker = validateWorkerMetadata({
+        sessionId: launch.sessionId,
+        runId: launch.runId,
+        leaseId: launch.leaseId,
+        generation: launch.generation,
+        token: launch.token,
+        ...(launch.cliVersion === undefined ? {} : { cliVersion: launch.cliVersion }),
+      });
+      this.#workers.set(launch.sessionId, worker);
+      await this.#persist();
+      const reservation = new LaunchReservation({
+        ...launch,
+        inspect: (/** @type {number} */ pid) => this.#inspect(pid),
+        release: () => { if (this.#reservations.get(launch.token) === reservation) this.#reservations.delete(launch.token); },
+      });
+      this.#reservations.set(launch.token, reservation);
+      return reservation;
+    });
+  }
+
+  /**
+   * Claim one worker startup connection for the launch that minted its token. Returns undefined for
+   * any frame that is not a startup hello, so a reconnecting worker still adopts its route directly.
+   * @param {any} frame @param {any} connection @param {(reservation: LaunchReservation) => void} onAdopted
+   */
+  async beginLaunchConnection(frame, connection, onAdopted) {
+    if (frame?.type !== "hello") return undefined;
+    const allowed = ["version", "type", "token", "sessionId", "runId", "leaseId", "generation", "worker"];
+    if (typeof frame !== "object" || Array.isArray(frame) || frame.version !== 1 || Object.keys(frame).some((key) => !allowed.includes(key))) throw Object.assign(new Error("Invalid worker hello frame"), { code: "INVALID_WORKER_FRAME" });
+    const reservation = typeof frame.token === "string" ? this.#reservations.get(frame.token) : undefined;
+    if (reservation === undefined || !sameToken(frame.token, reservation.token)) throw Object.assign(new Error("Worker hello does not match any launch this daemon spawned"), { code: "WORKER_AUTHENTICATION_FAILED" });
+    reservation.onAdopted = onAdopted;
+    await reservation.bind(frame, connection, this.#bindTimeoutMs);
+    return reservation;
+  }
+
   /** @param {any} handle */
   async register(handle) {
     return this.#lifecycle.runNested(handle.sessionId, async () => {
@@ -111,6 +343,9 @@ export class RecoveredWorkerRouter {
       this.#routeGenerations.set(handle.sessionId, routeGeneration);
       const record = await this.#registry.get(handle.sessionId);
       if (record?.ownership === undefined || record.ownership.runId !== handle.runId || !sameIdentity(record.ownership.process, handle.identity)) throw Object.assign(new Error("Launched worker does not own the durable registry record"), { code: "OWNERSHIP_CONFLICT" });
+      const reserved = this.#workers.get(handle.sessionId);
+      // Adoption never rotates a run's token; the reservation minted it and a respawn mints a new one.
+      const carried = reserved?.runId === handle.runId && reserved.leaseId === handle.leaseId ? reserved : undefined;
       this.#workers.set(handle.sessionId, {
         sessionId: handle.sessionId,
         runId: handle.runId,
@@ -118,6 +353,8 @@ export class RecoveredWorkerRouter {
         generation: handle.generation,
         identity: handle.identity,
         piChildIdentity: handle.piChildIdentity,
+        ...(carried?.token === undefined ? {} : { token: carried.token }),
+        ...(carried?.cliVersion === undefined ? {} : { cliVersion: carried.cliVersion }),
       });
       await this.#persist();
       const previous = this.#routes.get(handle.sessionId);
@@ -125,6 +362,19 @@ export class RecoveredWorkerRouter {
         this.#routes.delete(handle.sessionId);
         previous.connection.close?.();
       }
+    });
+  }
+
+  /** Drop one run's durable worker entry, including its token. @param {string} sessionId @param {string} token */
+  async forgetRun(sessionId, token) {
+    return this.#lifecycle.runNested(sessionId, async () => {
+      const current = this.#workers.get(sessionId);
+      if (current === undefined || current.token !== token) return;
+      this.#workers.delete(sessionId);
+      const route = this.#routes.get(sessionId);
+      this.#routes.delete(sessionId);
+      await this.#persist();
+      route?.connection.close?.();
     });
   }
 
@@ -139,7 +389,9 @@ export class RecoveredWorkerRouter {
 
   /** @template T @param {string} sessionId @param {() => Promise<T>} action @param {string} label */
   #serializeRoute(sessionId, action, label) {
-    return traceSessionLock(label, sessionId, (traced) => this.#lifecycle.run(sessionId, traced), action);
+    // Startup adoption runs inside the launch, which already holds this session's lifecycle lock.
+    // Nesting is a no-op for every other caller, none of which holds it.
+    return traceSessionLock(label, sessionId, (traced) => this.#lifecycle.runNested(sessionId, traced), action);
   }
 
   /** @param {any} frame @param {any} connection */
@@ -193,7 +445,10 @@ export class RecoveredWorkerRouter {
         route,
         forget: async () => {
           if (forgotten) return;
-          if (this.#workers.get(sessionId) !== metadata || this.#routes.get(sessionId) !== route) {
+          // A graceful stop kills the worker, which closes the route this action captured. An absent
+          // route is that expected close; only a different route means the worker was replaced.
+          const current = this.#routes.get(sessionId);
+          if (this.#workers.get(sessionId) !== metadata || (current !== undefined && current !== route)) {
             throw Object.assign(new Error("Worker route changed during lifecycle action"), { code: "STALE_WORKER_CONNECTION" });
           }
           forgotten = true;
@@ -255,6 +510,7 @@ export class RecoveredWorkerRouter {
   }
 
   async close() {
+    for (const reservation of [...this.#reservations.values()]) reservation.close();
     const routes = [...this.#routes.values()];
     this.#routes.clear();
     for (const route of routes) route.connection.close?.();

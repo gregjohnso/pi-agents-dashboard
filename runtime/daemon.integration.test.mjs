@@ -488,42 +488,52 @@ it("selects sessions to summarize without republishing a durable viewer snapshot
   client.close();
 });
 
-it("reaches a freshly launched worker over its launch channel before any socket reconnect", async () => {
+it("reaches a freshly launched worker over its adopted startup route before any reconnect", async () => {
   const stateRoot = await root();
-  await mkdir(join(stateRoot, "sessions"), { mode: 0o700 });
+  for (const name of ["daemon", "sessions"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const registry = new RegistryStore(join(stateRoot, "sessions"));
   const createdAt = "2026-08-25T00:00:00.000Z";
   const identity = { pid: 501, startIdentity: "fresh-worker", processGroupId: 501 };
+  const piChild = { pid: 502, startIdentity: "fresh-pi", processGroupId: 501 };
+  const inspect = async (/** @type {number} */ pid) => pid === 501 ? identity : pid === 502 ? piChild : { pid, startIdentity: "daemon", processGroupId: pid };
   /** @type {any[]} */
-  const requested = [];
-  /** @type {any[]} */
-  const deliveries = [];
+  const delivered = [];
   const menu = { commands: [], models: [{ provider: "anthropic", id: "claude" }], model: null };
+  /** @type {(value?: unknown) => void} */
+  let closeRoute = () => {};
+  const connection = {
+    closed: new Promise((resolve) => { closeRoute = resolve; }),
+    close: () => closeRoute(undefined),
+    async send() {},
+    /** @param {any} message @param {any} expected */
+    async request(message, expected) {
+      delivered.push({ op: expected.op, token: message.token, command: message.command });
+      return { op: expected.op, stage: "RPC_ACKNOWLEDGED", result: menu };
+    },
+  };
+  /** @type {any} */
+  let router;
   const runtime = await createDaemonRuntime({
     root: stateRoot,
+    inspect,
     hostProbe: async () => ({ blockers: [] }),
     resolveLaunchRequest: async (/** @type {any} */ request) => ({
       sessionId: "fresh", canonicalSessionFile: "/sessions/fresh.jsonl", cwd: "/repo", runId: "run-fresh", initialPrompt: request.payload.prompt,
       sessionRecord: { schemaVersion: 1, revision: 0, sessionId: "fresh", sessionFile: "/sessions/fresh.jsonl", canonicalSessionFile: "/sessions/fresh.jsonl", cwd: "/repo", taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "launching", summary: "start", updatedAt: createdAt }, isolation: { mode: "shared_directory", canonicalCwd: "/repo" }, createdAt, updatedAt: createdAt },
     }),
     workerSupervisor: {
+      /** @param {any} suppliedRouter */
+      useRouter(suppliedRouter) { router = suppliedRouter; },
+      // Stand in for the real launch: reserve the run, own the record, register both identities, and
+      // adopt the startup connection before readiness, exactly as the supervisor does.
       async launch() {
+        await router.reserve({ sessionId: "fresh", runId: "run-fresh", leaseId: "lease-fresh", generation: 1, token: "fresh-run-token" });
         const current = await registry.get("fresh");
         if (current === undefined) throw new Error("fresh record missing");
         await registry.update("fresh", current.revision, { ownership: { kind: "managed", runId: "run-fresh", process: identity, acquiredAt: createdAt, heartbeatAt: createdAt }, latestRunId: "run-fresh", processState: "LIVE", updatedAt: createdAt });
-        return {
-          sessionId: "fresh", runId: "run-fresh", leaseId: "lease-fresh", generation: 1, identity, piChildIdentity: identity,
-          async request(/** @type {string} */ op) { requested.push(op); return { op, stage: "RPC_ACKNOWLEDGED", result: menu }; },
-          async deliver(/** @type {any} */ command, /** @type {any} */ journal) {
-            deliveries.push(command);
-            const accepted = await journal.accept(command);
-            if (accepted.stage !== "ACCEPTED") return accepted;
-            await journal.transition(command, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
-            await journal.transition(command, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-            return journal.transition(command, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
-          },
-          onFrame() {},
-        };
+        await router.register({ sessionId: "fresh", runId: "run-fresh", leaseId: "lease-fresh", generation: 1, identity, piChildIdentity: piChild });
+        await router.adopt({ version: 1, type: "worker_ready", token: "fresh-run-token", sessionId: "fresh", runId: "run-fresh", leaseId: "lease-fresh", generation: 1, worker: identity, piChild }, connection);
+        return { sessionId: "fresh", runId: "run-fresh", leaseId: "lease-fresh", generation: 1, identity, piChildIdentity: piChild, ready: true, terminal() {}, detach() { closeRoute(undefined); } };
       },
       async close() {},
     },
@@ -541,8 +551,9 @@ it("reaches a freshly launched worker over its launch channel before any socket 
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "session_commands", models: [{ provider: "anthropic", id: "claude" }] } });
   client.send({ version: 1, clientId: "viewer", requestId: "prompt-fresh", op: "prompt", payload: { sessionId: "fresh", text: "hello" } });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
-  expect(requested).toEqual(["get_session_commands"]);
-  expect(deliveries.map((/** @type {any} */ command) => command.op)).toEqual(["prompt", "prompt"]);
+  // Every launch and steady-state message crossed one authenticated route, including the first prompt.
+  expect(delivered.map((/** @type {any} */ entry) => entry.op)).toEqual(["prompt", "get_session_commands", "prompt"]);
+  expect(new Set(delivered.map((/** @type {any} */ entry) => entry.token))).toEqual(new Set(["fresh-run-token"]));
   client.close();
 });
 

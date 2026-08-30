@@ -1,4 +1,4 @@
-import { appendFile, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, expect, it } from "vitest";
@@ -213,4 +213,125 @@ it.each([
   expect((await registry.get("orphaned"))?.ownership).toMatchObject({ runId: "run-orphaned" });
   expect(recovered.router.metadata("orphaned")).toMatchObject({ sessionId: "orphaned" });
   await recovered.close();
+});
+
+/** @param {string} root */
+function launchRouter(root, inspect = async (/** @type {number} */ pid) => ({ pid, startIdentity: String(pid), processGroupId: pid })) {
+  const registry = new RegistryStore(join(root, "sessions"));
+  return { registry, router: new RecoveredWorkerRouter({ registry, inspect, metadataPath: join(root, "daemon", "workers.json"), bindTimeoutMs: 200 }) };
+}
+
+function fakeConnection() {
+  /** @type {(value?: unknown) => void} */
+  let resolveClosed = () => {};
+  const closed = new Promise((resolve) => { resolveClosed = resolve; });
+  return { closed, close: () => resolveClosed(undefined), async send() {}, async request() { return undefined; } };
+}
+
+it.each([
+  ["run", { runId: "other-run" }, "WORKER_HELLO_MISMATCH"],
+  ["lease", { leaseId: "other-lease" }, "WORKER_HELLO_MISMATCH"],
+  ["generation", { generation: 9 }, "WORKER_HELLO_MISMATCH"],
+  ["session", { sessionId: "other-session" }, "WORKER_HELLO_MISMATCH"],
+  ["worker PID", { worker: { pid: 9, startIdentity: "9", processGroupId: 9 } }, "WORKER_IDENTITY_MISMATCH"],
+  ["process-start identity", { worker: { pid: 401, startIdentity: "recycled", processGroupId: 401 } }, "WORKER_IDENTITY_MISMATCH"],
+  ["process group", { worker: { pid: 401, startIdentity: "401", processGroupId: 77 } }, "WORKER_IDENTITY_MISMATCH"],
+])("refuses a startup socket whose %s does not match the reserved launch", async (_name, overrides, code) => {
+  const root = await fixture();
+  const { router } = launchRouter(root);
+  await router.load();
+  const reservation = await router.reserve({ sessionId: "reserved", runId: "run-reserved", leaseId: "lease-reserved", generation: 1, token: "reserved-token" });
+  reservation.spawned(401);
+  const hello = { version: 1, type: "hello", token: "reserved-token", sessionId: "reserved", runId: "run-reserved", leaseId: "lease-reserved", generation: 1, worker: { pid: 401, startIdentity: "401", processGroupId: 401 }, ...overrides };
+
+  await expect(router.beginLaunchConnection(hello, fakeConnection(), () => {})).rejects.toMatchObject({ code });
+  await expect(reservation.connected(50)).rejects.toMatchObject({ code });
+  await router.close();
+});
+
+it("refuses a startup socket carrying a token no launch reserved", async () => {
+  const root = await fixture();
+  const { router } = launchRouter(root);
+  await router.load();
+  const reservation = await router.reserve({ sessionId: "reserved", runId: "run-reserved", leaseId: "lease-reserved", generation: 1, token: "reserved-token" });
+  reservation.spawned(401);
+
+  await expect(router.beginLaunchConnection({ version: 1, type: "hello", token: "forged-token", sessionId: "reserved", runId: "run-reserved", leaseId: "lease-reserved", generation: 1, worker: { pid: 401, startIdentity: "401", processGroupId: 401 } }, fakeConnection(), () => {}))
+    .rejects.toMatchObject({ code: "WORKER_AUTHENTICATION_FAILED" });
+  await router.close();
+});
+
+it("keeps a live worker's token in mode-0600 worker metadata across reconciliation and drops the whole entry when it is proven terminal", async () => {
+  const root = await fixture();
+  const worker = { pid: 501, startIdentity: "live-worker", processGroupId: 501 };
+  const piChild = { pid: 502, startIdentity: "live-pi", processGroupId: 501 };
+  const metadataPath = join(root, "daemon", "workers.json");
+  const registry = new RegistryStore(join(root, "sessions"));
+  await registry.create(record("live", worker));
+  await writeFile(metadataPath, `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "live", runId: "run-live", leaseId: "lease-live", generation: 1, identity: worker, piChildIdentity: piChild, token: "live-run-token" }] })}\n`, { mode: 0o600 });
+
+  const recovered = await reconcileRuntime({
+    root,
+    daemonEpoch: "epoch",
+    inspect: async (/** @type {number} */ pid) => pid === 501 ? worker : pid === 502 ? piChild : (() => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); })(),
+    waitForReconnect: async (/** @type {any[]} */ workers) => workers.map((entry) => entry.sessionId),
+  });
+  expect(recovered.conflicts).toEqual([]);
+  // A replacement daemon authenticates the surviving run with the same secret it never rotated.
+  expect(recovered.router.metadata("live")).toMatchObject({ token: "live-run-token" });
+  expect((await stat(metadataPath)).mode & 0o777).toBe(0o600);
+
+  await recovered.router.forgetRun("live", "live-run-token");
+  expect(recovered.router.metadata("live")).toBeUndefined();
+  expect(JSON.parse(await readFile(metadataPath, "utf8")).workers).toEqual([]);
+  await recovered.close();
+});
+
+it("inherits nothing from a run that was reserved but never spawned its worker", async () => {
+  const root = await fixture();
+  const metadataPath = join(root, "daemon", "workers.json");
+  await writeFile(metadataPath, `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "reserved", runId: "run-reserved", leaseId: "lease-reserved", generation: 1, token: "orphan-token" }] })}\n`, { mode: 0o600 });
+  const { router } = launchRouter(root);
+
+  await router.load();
+  expect(router.metadata("reserved")).toBeUndefined();
+  await router.close();
+});
+
+// A graceful Stop kills the worker, which closes the route the action captured. Refusing that as a
+// replacement reported STALE_WORKER_CONNECTION for a Stop that had already succeeded.
+it("lets a lifecycle action forget a worker whose own graceful exit cleared its route, and still refuses a replaced one", async () => {
+  const root = await fixture();
+  const worker = { pid: 601, startIdentity: "stopping-worker", processGroupId: 601 };
+  const piChild = { pid: 602, startIdentity: "stopping-pi", processGroupId: 601 };
+  const registry = new RegistryStore(join(root, "sessions"));
+  await registry.create(record("stopping", worker));
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "stopping", runId: "run-stopping", leaseId: "lease-stopping", generation: 1, identity: worker, piChildIdentity: piChild, token: "stopping-token" }] })}\n`, { mode: 0o600 });
+  const router = new RecoveredWorkerRouter({ registry, metadataPath: join(root, "daemon", "workers.json"), inspect: async (/** @type {number} */ pid) => pid === 601 ? worker : piChild });
+  await router.load();
+  const ready = { version: 1, type: "worker_ready", token: "stopping-token", sessionId: "stopping", runId: "run-stopping", leaseId: "lease-stopping", generation: 1, worker, piChild };
+  const first = fakeConnection();
+  await router.adopt(ready, first);
+
+  await router.runSession("stopping", async (/** @type {any} */ { forget }) => {
+    // The worker exits and its socket closes while the Stop is still inside this action.
+    first.close();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await forget();
+  });
+  expect(router.metadata("stopping")).toBeUndefined();
+
+  await registry.create(record("replaced", worker));
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "replaced", runId: "run-replaced", leaseId: "lease-replaced", generation: 1, identity: worker, piChildIdentity: piChild, token: "replaced-token" }] })}\n`, { mode: 0o600 });
+  const replacedRouter = new RecoveredWorkerRouter({ registry, metadataPath: join(root, "daemon", "workers.json"), inspect: async (/** @type {number} */ pid) => pid === 601 ? worker : piChild });
+  await replacedRouter.load();
+  const replacedReady = { ...ready, token: "replaced-token", sessionId: "replaced", runId: "run-replaced", leaseId: "lease-replaced" };
+  await replacedRouter.adopt(replacedReady, fakeConnection());
+  await expect(replacedRouter.runSession("replaced", async (/** @type {any} */ { forget }) => {
+    await replacedRouter.adopt(replacedReady, fakeConnection());
+    await forget();
+  })).rejects.toMatchObject({ code: "STALE_WORKER_CONNECTION" });
+  expect(replacedRouter.metadata("replaced")).toMatchObject({ sessionId: "replaced" });
+  await router.close();
+  await replacedRouter.close();
 });

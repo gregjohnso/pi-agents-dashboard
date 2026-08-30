@@ -40,8 +40,11 @@ export async function inspectRuntimeActivity({ stateRoot, runtimeRoot = stateRoo
   const activeSupervisors = [];
   for (const worker of value.workers) {
     const identity = worker?.identity;
-    const allowed = ["sessionId", "runId", "leaseId", "generation", "identity", "piChildIdentity", "token"];
-    if (typeof worker !== "object" || worker === null || Object.keys(worker).some((key) => !allowed.includes(key)) || [worker.sessionId, worker.runId, worker.leaseId].some((entry) => typeof entry !== "string" || entry.length === 0) || !Number.isSafeInteger(worker.generation) || worker.generation <= 0 || !validProcessIdentity(identity) || !validProcessIdentity(worker.piChildIdentity)) throw new TypeError("Worker metadata record is invalid");
+    const allowed = ["sessionId", "runId", "leaseId", "generation", "identity", "piChildIdentity", "token", "cliVersion"];
+    // A run reserved before its spawn has no identity yet, so it names no supervisor to inspect.
+    const bound = identity !== undefined || worker?.piChildIdentity !== undefined;
+    if (typeof worker !== "object" || worker === null || Object.keys(worker).some((key) => !allowed.includes(key)) || [worker.sessionId, worker.runId, worker.leaseId].some((entry) => typeof entry !== "string" || entry.length === 0) || !Number.isSafeInteger(worker.generation) || worker.generation <= 0 || (bound && (!validProcessIdentity(identity) || !validProcessIdentity(worker.piChildIdentity)))) throw new TypeError("Worker metadata record is invalid");
+    if (!bound) continue;
     try { const actual = await inspect(identity.pid); if (sameProcessIdentity(actual, identity)) activeSupervisors.push(identity); }
     catch (error) { if (!["ENOENT", "ESRCH"].includes(/** @type {NodeJS.ErrnoException} */ (error).code ?? "")) throw error; }
   }

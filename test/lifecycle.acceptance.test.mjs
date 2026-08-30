@@ -163,6 +163,7 @@ it("keeps two mixed-version fake Pi children alive across frontend close and dae
   });
   const handles = [];
   const managedSupervisor = {
+    useRouter: (router) => supervisor.useRouter(router),
     async launch(launch) {
       const handle = await supervisor.launch(launch);
       handles.push(handle);

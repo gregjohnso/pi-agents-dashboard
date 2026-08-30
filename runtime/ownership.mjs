@@ -198,8 +198,8 @@ export class OwnershipManager {
     });
   }
 
-  /** @param {string} sessionId @param {string} leaseId @param {number} generation @param {unknown} worker @param {unknown} piChild */
-  async bindProcesses(sessionId, leaseId, generation, worker, piChild) {
+  /** @param {string} sessionId @param {string} leaseId @param {number} generation @param {unknown} worker @param {unknown} piChild @param {string} [runHash] */
+  async bindProcesses(sessionId, leaseId, generation, worker, piChild, runHash) {
     validateIdentity(worker, "worker");
     validateIdentity(piChild, "piChild");
     return this.#runWithOwnershipLock(sessionId, async () => {
@@ -221,6 +221,7 @@ export class OwnershipManager {
       try {
         await this.#registry.update(sessionId, record.revision, {
           latestRunId: lease.runId,
+          ...(runHash === undefined ? {} : { runHash }),
           processState: "LIVE",
           updatedAt: lease.acquiredAt,
           ownership,

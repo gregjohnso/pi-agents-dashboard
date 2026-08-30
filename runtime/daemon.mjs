@@ -368,6 +368,8 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
     let workerMetadata;
     /** @type {number | undefined} */
     let workerRouteGeneration;
+    /** This connection is a worker's startup connection until its route is adopted. @type {any} */
+    let launchReservation;
     /** @type {Promise<void>} */
     let chain = Promise.resolve();
     const decoder = createJsonlDecoder({ maxBytes });
@@ -450,10 +452,25 @@ function createSocketServer({ socketPath, token, maxBytes, context }) {
           if (role === "worker") {
             if (workerConnection === undefined) {
               workerConnection = { closed, close, send, request: requestWorker };
+              // A startup connection announces itself with hello and is held against its launch
+              // reservation until the spawned PID and its exact identity are verified.
+              launchReservation = await context.router.beginLaunchConnection(frame, workerConnection, (/** @type {any} */ reservation) => {
+                workerMetadata = reservation.route.metadata;
+                workerRouteGeneration = reservation.route.routeGeneration;
+                chain = chain.then(() => context.recovery?.viewer?.ensure(reservation.sessionId)).catch(() => {});
+                for (const buffered of reservation.drainBuffered()) {
+                  chain = chain.then(() => context.handleWorkerFrame(buffered, workerConnection, workerMetadata, workerRouteGeneration)).catch(() => { socket.destroy(); });
+                }
+              });
+              if (launchReservation !== undefined) return;
               const route = await context.router.adopt(frame, workerConnection);
               workerMetadata = route.metadata;
               workerRouteGeneration = route.routeGeneration;
               void context.reconcileSessionActivity(route).catch(() => {});
+              return;
+            }
+            if (launchReservation !== undefined && launchReservation.route === undefined) {
+              launchReservation.deliver(frame);
               return;
             }
             await context.handleWorkerFrame(frame, workerConnection, workerMetadata, workerRouteGeneration);
@@ -607,6 +624,7 @@ export async function createDaemonRuntime({
     if (daemonEpoch !== epochCandidate) throw Object.assign(new Error("Daemon epoch changed during lifecycle claim"), { code: "DAEMON_IDENTITY_CONFLICT" });
     const registry = new RegistryStore(join(root, "sessions"));
     const router = new RecoveredWorkerRouter({ registry, inspect, metadataPath: join(daemonDirectory, "workers.json") });
+    workerSupervisor?.useRouter?.(router);
     await router.load();
     /** @type {(value?: unknown) => void} */
     let resolveStopRequested = () => {};
@@ -682,16 +700,25 @@ export async function createDaemonRuntime({
         if (handle !== undefined) sessionHandles.delete(sessionId);
         throw Object.assign(new Error("No exact recovered worker owns this session"), { code: "WORKER_UNAVAILABLE" });
       },
-      /** @param {any} handle */
+      /** The launch registered and adopted its own route; this only opens the viewer stream. @param {any} handle */
       async activateWorker(handle) {
         sessionHandles.set(handle.sessionId, handle);
-        await router.register(handle);
         await context.recovery.viewer.ensure(handle.sessionId);
-        handle.onFrame?.((/** @type {Record<string, unknown>} */ frame) => {
-          void router.runFrame(handle.sessionId, async () => {
-            await context.recovery.viewer.ingest(handle.sessionId, frame);
-          }).catch(() => {});
-        });
+      },
+      /** Deliver one durable command over this session's adopted route. @param {any} request */
+      async deliverOverRoute(request) {
+        const route = router.route(request.payload.sessionId);
+        if (route?.connection === undefined || route.metadata?.token === undefined) throw Object.assign(new Error("No adopted worker route owns this session"), { code: "WORKER_UNAVAILABLE" });
+        const accepted = await context.recovery.journal.accept(request);
+        if (accepted.stage !== "ACCEPTED") return accepted;
+        await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
+        try {
+          await context.sendWorkerCommand(route, context.nextCommandId(), request, { text: request.payload.text });
+        } catch {
+          return context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
+        }
+        await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
+        return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
       },
       /**
        * Re-derive task state from Pi after a reconnect: a turn can both finish and start while the
@@ -1096,7 +1123,7 @@ export async function createDaemonRuntime({
               const prepared = await registry.create(launch.sessionRecord);
               await context.publishSession(prepared);
             }
-            return await runSessionLifecycle(registry, launch.sessionId, async () => {
+            const launched = await runSessionLifecycle(registry, launch.sessionId, async () => {
               if (launchingSessions.has(launch.sessionId)) throw Object.assign(new Error("A launch is already in flight for this session"), { code: "LAUNCH_IN_FLIGHT" });
               launchingSessions.add(launch.sessionId);
               /** @type {any} */
@@ -1104,25 +1131,29 @@ export async function createDaemonRuntime({
               try {
                 handle = await workerSupervisor.launch({ ...launch, daemonConnector: CONNECTOR_PATH, daemonConnectConfig: { socketPath: join(daemonDirectory, "control.sock"), tokenPath, maxBytes } });
                 await context.activateWorker(handle);
-                if (typeof launch.initialPrompt === "string") {
-                  const promptRequest = {
-                    version: 1,
-                    clientId: `daemon-launch:${daemonEpoch}`,
-                    requestId: createHash("sha256").update(canonicalJson([request.clientId, request.requestId, handle.sessionId])).digest("hex"),
-                    op: "prompt",
-                    payload: { sessionId: handle.sessionId, text: launch.initialPrompt },
-                  };
-                  const promptStatus = await handle.deliver(promptRequest, context.recovery.journal);
-                  if (promptStatus?.stage !== "COMPLETED") throw Object.assign(new Error(promptStatus?.error?.message ?? `Initial prompt ended in ${promptStatus?.stage ?? "an unknown state"}`), { code: promptStatus?.error?.code ?? promptStatus?.stage ?? "INITIAL_PROMPT_FAILED" });
-                }
               } finally {
                 launchingSessions.delete(launch.sessionId);
               }
               const persisted = await context.launchResults.put(request, { sessionId: handle.sessionId });
-              await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-              await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
               return { kind: "launched", sessionId: persisted.sessionId };
             }, "launch");
+            // The first prompt's reply arrives on the worker socket and is handled through the same
+            // session lifecycle lock the launch holds, so it is delivered after that lock is released.
+            if (typeof launch.initialPrompt === "string") {
+              const promptRequest = {
+                version: 1,
+                clientId: `daemon-launch:${daemonEpoch}`,
+                requestId: createHash("sha256").update(canonicalJson([request.clientId, request.requestId, launched.sessionId])).digest("hex"),
+                op: "prompt",
+                payload: { sessionId: launched.sessionId, text: launch.initialPrompt },
+              };
+              const promptStatus = await context.deliverOverRoute(promptRequest);
+              if (promptStatus?.stage !== "COMPLETED") throw Object.assign(new Error(promptStatus?.error?.message ?? `Initial prompt ended in ${promptStatus?.stage ?? "an unknown state"}`), { code: promptStatus?.error?.code ?? promptStatus?.stage ?? "INITIAL_PROMPT_FAILED" });
+            }
+            // The launch journal stays short of COMPLETED until the first prompt is delivered.
+            await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
+            await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
+            return launched;
           } catch (error) {
             const launchError = /** @type {any} */ (error);
             const current = await context.recovery.journal.get(request);

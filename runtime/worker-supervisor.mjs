@@ -16,9 +16,6 @@ import { reduceSessionState } from "./state-reducer.mjs";
 
 const DEFAULT_WORKER_PATH = fileURLToPath(new URL("./worker.mjs", import.meta.url));
 const admissionStates = new WeakMap();
-const MAX_QUEUED_FRAME_BYTES = 1024 * 1024;
-const MAX_QUEUED_FRAMES = 256;
-const MAX_BUFFERED_STARTUP_EVENTS = 256;
 const DEFAULT_LAUNCH_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateMs: 5_000 });
 /** Stop dispositions that prove the worker process group is gone, so its lease can be released. */
 const PROVEN_TERMINAL_DISPOSITIONS = ["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "KILLED", "STALE_IDENTITY"];
@@ -28,17 +25,6 @@ const PROVEN_PI_CHILD_DISPOSITIONS = ["ALREADY_EXITED", "GRACEFUL", "TERMINATED"
 /** @typedef {(command: string, argv: string[], options: any) => any} SpawnLike */
 
 /** @typedef {import("../shared/contracts.mjs").ProcessIdentity} ProcessIdentity */
-/**
- * @typedef {object} WorkerHello
- * @property {1} version
- * @property {"worker_hello"} type
- * @property {string} token
- * @property {string} sessionId
- * @property {string} runId
- * @property {string} leaseId
- * @property {number} generation
- * @property {ProcessIdentity} worker
- */
 
 /** A stable worker admission or handshake failure. */
 export class WorkerSupervisorError extends Error {
@@ -53,30 +39,6 @@ export class WorkerSupervisorError extends Error {
 /** @param {unknown} value */
 function digest(value) {
   return createHash("sha256").update(typeof value === "string" ? value : "", "utf8").digest();
-}
-
-/** @param {any} supervision @param {number} bytes */
-function recordFrameDrop(supervision, bytes) {
-  supervision.droppedFrameCount += 1;
-  supervision.droppedFrameBytes += bytes;
-}
-
-/** @param {any} supervision @param {Record<string, unknown>} frame */
-function queueFrame(supervision, frame) {
-  let bytes;
-  try { bytes = Buffer.byteLength(JSON.stringify(frame)); } catch { return; }
-  if (bytes > MAX_QUEUED_FRAME_BYTES) {
-    recordFrameDrop(supervision, bytes);
-    return;
-  }
-  while (supervision.queuedFrames.length >= MAX_QUEUED_FRAMES || supervision.queuedFrameBytes + bytes > MAX_QUEUED_FRAME_BYTES) {
-    const removed = supervision.queuedFrames.shift();
-    if (removed === undefined) break;
-    supervision.queuedFrameBytes -= removed.bytes;
-    recordFrameDrop(supervision, removed.bytes);
-  }
-  supervision.queuedFrames.push({ frame, bytes });
-  supervision.queuedFrameBytes += bytes;
 }
 
 /** @param {unknown} error */
@@ -108,38 +70,19 @@ function observeExit(child, onTerminal) {
   return observation;
 }
 
-/** @param {any} child @param {string} type @param {number} timeoutMs @returns {Promise<any>} */
-function waitForMessage(child, type, timeoutMs) {
-  return new Promise((resolveMessage, rejectMessage) => {
-    const timer = setTimeout(() => finish(new WorkerSupervisorError("WORKER_START_TIMEOUT", `Timed out waiting for ${type}`)), timeoutMs);
-    /** @param {any} message */
-    const onMessage = (message) => {
-      if (message?.type === type) finish(undefined, message);
-    };
-    /** @param {unknown} cause */
-    const onError = (cause) => finish(new WorkerSupervisorError("WORKER_PROCESS_FAILED", "Worker process failed", { cause }));
+/** Abandon one startup wait as soon as the spawned worker dies. @param {any} child @param {Promise<any>} awaited @param {string} what @returns {Promise<any>} */
+function untilWorkerExits(child, awaited, what) {
+  return new Promise((resolveValue, rejectValue) => {
     /** @param {number | null} code @param {NodeJS.Signals | null} signal */
-    const onExit = (code, signal) => finish(new WorkerSupervisorError("WORKER_PROCESS_EXITED", `Worker exited before ${type} (${code ?? signal ?? "unknown"})`));
-    /** @param {unknown} [error] @param {any} [message] */
-    const finish = (error, message) => {
-      clearTimeout(timer);
-      child.off("message", onMessage);
-      child.off("error", onError);
-      child.off("exit", onExit);
-      if (error !== undefined) rejectMessage(error);
-      else resolveMessage(message);
-    };
-    child.on("message", onMessage);
-    child.once("error", onError);
+    const onExit = (code, signal) => rejectValue(new WorkerSupervisorError("WORKER_PROCESS_EXITED", `Worker exited before ${what} (${code ?? signal ?? "unknown"})`));
+    /** @param {unknown} cause */
+    const onError = (cause) => rejectValue(new WorkerSupervisorError("WORKER_PROCESS_FAILED", "Worker process failed", { cause }));
     child.once("exit", onExit);
-  });
-}
-
-/** @param {any} child @param {any} message */
-async function sendMessage(child, message) {
-  if (typeof child.send !== "function" || child.connected === false) throw new WorkerSupervisorError("WORKER_CHANNEL_CLOSED", "Worker IPC channel is closed");
-  await new Promise((resolveSend, rejectSend) => {
-    child.send(message, (/** @type {Error | null} */ error) => error ? rejectSend(error) : resolveSend(undefined));
+    child.once("error", onError);
+    awaited.then(resolveValue, rejectValue).finally(() => {
+      child.off("exit", onExit);
+      child.off("error", onError);
+    });
   });
 }
 
@@ -182,13 +125,15 @@ export class WorkerSupervisor {
   #signalProcessGroup;
   #sleep;
   #admission;
+  #router;
+  #cliVersion;
   #handles = new Set();
   #supervisions = new Set();
 
   /**
-   * @param {{ registry: import("./registry-store.mjs").RegistryStore, ownership?: OwnershipManager, runsDirectory: string, maxLive?: number | null, spawnImpl?: SpawnLike, inspect?: typeof inspectProcessIdentity, workerPath?: string, configuredPiPath?: string | null, env?: NodeJS.ProcessEnv, randomId?: () => string, startTimeoutMs?: number, launchStopPolicy?: { gracefulMs: number, terminateMs: number }, signalProcessGroupImpl?: typeof signalProcessGroup, sleepImpl?: typeof sleep, resolveExecutableImpl?: typeof resolvePiExecutable, probeCapabilitiesImpl?: typeof probePiCapabilities, assertExecutableImpl?: typeof assertPiExecutableIdentity, capabilityCache?: Map<string, import("../shared/contracts.mjs").PiCapabilityReport> }} options
+   * @param {{ registry: import("./registry-store.mjs").RegistryStore, ownership?: OwnershipManager, runsDirectory: string, maxLive?: number | null, spawnImpl?: SpawnLike, inspect?: typeof inspectProcessIdentity, workerPath?: string, configuredPiPath?: string | null, env?: NodeJS.ProcessEnv, randomId?: () => string, startTimeoutMs?: number, launchStopPolicy?: { gracefulMs: number, terminateMs: number }, signalProcessGroupImpl?: typeof signalProcessGroup, sleepImpl?: typeof sleep, resolveExecutableImpl?: typeof resolvePiExecutable, probeCapabilitiesImpl?: typeof probePiCapabilities, assertExecutableImpl?: typeof assertPiExecutableIdentity, capabilityCache?: Map<string, import("../shared/contracts.mjs").PiCapabilityReport>, router?: any, cliVersion?: string }} options
    */
-  constructor({ registry, ownership = new OwnershipManager(registry), runsDirectory, maxLive = null, spawnImpl = spawn, inspect = inspectProcessIdentity, workerPath = DEFAULT_WORKER_PATH, configuredPiPath = null, env = process.env, randomId = randomUUID, startTimeoutMs = 15_000, launchStopPolicy = DEFAULT_LAUNCH_STOP_POLICY, signalProcessGroupImpl = signalProcessGroup, sleepImpl = sleep, resolveExecutableImpl = resolvePiExecutable, probeCapabilitiesImpl = probePiCapabilities, assertExecutableImpl = assertPiExecutableIdentity, capabilityCache = new Map() }) {
+  constructor({ registry, ownership = new OwnershipManager(registry), runsDirectory, maxLive = null, spawnImpl = spawn, inspect = inspectProcessIdentity, workerPath = DEFAULT_WORKER_PATH, configuredPiPath = null, env = process.env, randomId = randomUUID, startTimeoutMs = 15_000, launchStopPolicy = DEFAULT_LAUNCH_STOP_POLICY, signalProcessGroupImpl = signalProcessGroup, sleepImpl = sleep, resolveExecutableImpl = resolvePiExecutable, probeCapabilitiesImpl = probePiCapabilities, assertExecutableImpl = assertPiExecutableIdentity, capabilityCache = new Map(), router = undefined, cliVersion = undefined }) {
     if (maxLive !== null && (!Number.isSafeInteger(maxLive) || maxLive <= 0)) throw new TypeError("maxLive must be null or a positive integer");
     if (!Number.isSafeInteger(startTimeoutMs) || startTimeoutMs <= 0) throw new TypeError("startTimeoutMs must be a positive integer");
     if (!Number.isSafeInteger(launchStopPolicy?.gracefulMs) || launchStopPolicy.gracefulMs <= 0 || !Number.isSafeInteger(launchStopPolicy?.terminateMs) || launchStopPolicy.terminateMs <= 0) throw new TypeError("launchStopPolicy must contain positive integer delays");
@@ -213,7 +158,15 @@ export class WorkerSupervisor {
     this.#launchStopPolicy = launchStopPolicy;
     this.#signalProcessGroup = signalProcessGroupImpl;
     this.#sleep = sleepImpl;
+    this.#router = router;
+    this.#cliVersion = cliVersion;
     this.#admission = admissionState(registryCoordinationScope(registry));
+  }
+
+  /** The daemon owns the router, so it supplies it once its runtime exists. @param {any} router */
+  useRouter(router) {
+    if (this.#router !== undefined && this.#router !== router) throw new TypeError("Worker supervisor already routes through a different router");
+    this.#router = router;
   }
 
   /** @param {string} sessionId */
@@ -305,11 +258,13 @@ export class WorkerSupervisor {
     const handle = supervision.handle;
     handle?.terminal();
     supervision.exit.detach();
-    supervision.child.off("message", supervision.messageReceiver);
+    supervision.reservation?.close();
     supervision.handle = undefined;
     if (handle !== undefined) this.#handles.delete(handle);
     if (!(await this.#piChildTerminalLocked(supervision))) return;
     await this.#ownership.release(supervision.sessionId, supervision.lease.leaseId, supervision.lease.generation);
+    // The token is private per-run state, so a proven-terminal run leaves nothing behind to authenticate.
+    await this.#router?.forgetRun(supervision.sessionId, supervision.token);
     supervision.lifecycle = "reconciled";
     this.#supervisions.delete(supervision);
   }
@@ -330,8 +285,8 @@ export class WorkerSupervisor {
       return;
     }
     if (supervision.identity === undefined) {
-      await sendMessage(supervision.child, { version: 1, type: "reject" }).catch(() => {});
-      supervision.child.disconnect?.();
+      await supervision.reservation?.send({ version: 1, type: "reject", token: supervision.token }).catch(() => {});
+      await this.#router?.forgetRun(supervision.sessionId, supervision.token).catch(() => {});
       return;
     }
     const inspect = async (/** @type {number} */ pid) => {
@@ -341,7 +296,7 @@ export class WorkerSupervisor {
     const result = await stopVerifiedProcessGroup(supervision.identity, {
       inspect,
       requestGraceful: async () => {
-        await sendMessage(supervision.child, { version: 1, type: "shutdown", token: supervision.token }).catch(() => {});
+        await supervision.reservation?.send({ version: 1, type: "shutdown", token: supervision.token }).catch(() => {});
       },
       signalProcessGroup: this.#signalProcessGroup,
       sleep: this.#sleep,
@@ -367,8 +322,8 @@ export class WorkerSupervisor {
     });
   }
 
-  /** @param {{ sessionId: string, canonicalSessionFile: string, cwd: string, runId: string, sessionRecord?: import("../shared/contracts.mjs").SessionRecord, model?: { provider: string, id: string }, name?: string, piPath?: string, daemonConnector?: string, daemonConnectConfig?: Record<string, unknown>, reconnectDelaysMs?: number[] }} request */
-  async #launch({ sessionId, canonicalSessionFile, cwd, runId, sessionRecord, model, name, piPath, daemonConnector, daemonConnectConfig = {}, reconnectDelaysMs = [100, 250, 500, 1_000, 2_000] }) {
+  /** @param {{ sessionId: string, canonicalSessionFile: string, cwd: string, runId: string, runHash?: string, sessionRecord?: import("../shared/contracts.mjs").SessionRecord, model?: { provider: string, id: string }, name?: string, piPath?: string, daemonConnector?: string, daemonConnectConfig?: Record<string, unknown>, reconnectDelaysMs?: number[] }} request */
+  async #launch({ sessionId, canonicalSessionFile, cwd, runId, runHash, sessionRecord, model, name, piPath, daemonConnector, daemonConnectConfig = {}, reconnectDelaysMs = [100, 250, 500, 1_000, 2_000] }) {
     if ([canonicalSessionFile, cwd, runId].some((value) => typeof value !== "string" || value.length === 0)) throw new TypeError("Worker launch fields must be non-empty strings");
     let record = await this.#registry.get(sessionId);
     if (record === undefined) {
@@ -396,19 +351,25 @@ export class WorkerSupervisor {
       throw error;
     }
 
-    let reservation;
+    if (this.#router === undefined) throw new WorkerSupervisorError("WORKER_ROUTER_UNAVAILABLE", "Worker launch requires the control-socket router");
+    let capacity;
     let lease;
     let child;
     /** @type {any} */
     let supervision;
+    /** @type {any} */
+    let reservation;
+    let token;
     let stdoutHandle;
     let stderrHandle;
     try {
-      reservation = await this.#reserve(sessionId);
+      capacity = await this.#reserve(sessionId);
+      const directoryName = runHash ?? createHash("sha256").update(`${runId}\0${this.#randomId()}`).digest("hex");
+      if (typeof directoryName !== "string" || directoryName.length === 0 || directoryName.includes("/")) throw new TypeError("runHash must be a root-relative directory name");
       lease = await this.#ownership.acquire(sessionId, canonicalSessionFile, runId);
-      const token = this.#randomId();
+      token = this.#randomId();
       if (typeof token !== "string" || token.length === 0) throw new TypeError("Worker token generator must return a non-empty string");
-      const runDirectory = join(this.#runsDirectory, createHash("sha256").update(`${runId}\0${token}`).digest("hex"));
+      const runDirectory = join(this.#runsDirectory, directoryName);
       await mkdir(runDirectory, { mode: 0o700 });
       stdoutHandle = await open(join(runDirectory, "worker.stdout.log"), "wx", 0o600);
       stderrHandle = await open(join(runDirectory, "worker.stderr.log"), "wx", 0o600);
@@ -441,36 +402,18 @@ export class WorkerSupervisor {
         );
       }
       if (!this.#injectedSpawn) await this.#assertExecutable(executable);
+      // The reservation exists before spawn, so a worker that reaches the control socket before
+      // `spawn` returns waits on its token instead of being refused.
+      reservation = await this.#router.reserve({ sessionId, runId, leaseId: lease.leaseId, generation: lease.generation, token, ...(this.#cliVersion === undefined ? {} : { cliVersion: this.#cliVersion }) });
       child = this.#spawn(process.execPath, argv, {
         cwd,
         env: { ...this.#env, PI_AGENTS_WORKER_TOKEN: token },
         detached: true,
         shell: false,
-        stdio: ["ignore", stdoutHandle.fd, stderrHandle.fd, "ipc"],
+        stdio: ["ignore", stdoutHandle.fd, stderrHandle.fd],
       });
-      supervision = { child, token, sessionId, lease, exit: undefined, identity: undefined, handle: undefined, lifecycle: "launching", activated: false, piChildStopped: false, queuedFrames: [], queuedFrameBytes: 0, droppedFrameCount: 0, droppedFrameBytes: 0, startupEvents: [], frameListeners: new Set(), commandResultHandler: undefined };
-      supervision.messageReceiver = (/** @type {any} */ message) => {
-        if (!authenticated(message?.token, token)) return;
-        if (message.type === "pi_frame" && message.sessionId === sessionId && typeof message.frame === "object" && message.frame !== null) {
-          if (supervision.frameListeners.size > 0) {
-            for (const listener of supervision.frameListeners) {
-              try { listener(message.frame); } catch {}
-            }
-            return;
-          }
-          queueFrame(supervision, message.frame);
-        } else if (message.type === "worker_event" && message.sessionId === sessionId) {
-          if (supervision.lifecycle === "active") {
-            void this.#applyWorkerEvent(supervision, message.event).catch(() => {});
-          } else if (supervision.lifecycle === "launching") {
-            if (supervision.startupEvents.length >= MAX_BUFFERED_STARTUP_EVENTS) supervision.startupEvents.shift();
-            supervision.startupEvents.push(message.event);
-          }
-        } else if (message.type === "command_result") {
-          supervision.commandResultHandler?.(message);
-        }
-      };
-      child.on("message", supervision.messageReceiver);
+      reservation.spawned(child.pid);
+      supervision = { child, token, sessionId, lease, reservation, exit: undefined, identity: undefined, handle: undefined, route: undefined, lifecycle: "launching", activated: false, piChildStopped: false };
       const exit = observeExit(child, () => {
         if (supervision.lifecycle === "reconciled") return;
         supervision.lifecycle = "terminal";
@@ -478,29 +421,20 @@ export class WorkerSupervisor {
       });
       supervision.exit = exit;
       this.#supervisions.add(supervision);
-      const helloPromise = waitForMessage(child, "worker_hello", this.#startTimeoutMs);
       await Promise.all([stdoutHandle.close(), stderrHandle.close()]);
       stdoutHandle = undefined;
       stderrHandle = undefined;
 
-      const hello = /** @type {WorkerHello} */ (await helloPromise);
       const childPid = child.pid;
       if (!Number.isSafeInteger(childPid) || /** @type {number} */ (childPid) <= 0) throw new WorkerSupervisorError("WORKER_IDENTITY_MISMATCH", "Spawned worker did not expose a valid PID");
-      const inspected = await this.#inspect(/** @type {number} */ (childPid));
+      const inspected = await untilWorkerExits(child, reservation.connected(this.#startTimeoutMs), "its startup connection");
       supervision.identity = inspected;
-      if (!authenticated(hello.token, token)) throw new WorkerSupervisorError("WORKER_AUTH_FAILED", "Worker hello authentication failed");
-      if (hello.version !== 1 || hello.sessionId !== sessionId || hello.runId !== runId || hello.leaseId !== lease.leaseId || hello.generation !== lease.generation) {
-        throw new WorkerSupervisorError("WORKER_HELLO_MISMATCH", "Worker hello did not match the ownership lease");
-      }
-      if (!sameIdentity(hello.worker, inspected) || inspected.pid !== childPid || inspected.processGroupId !== childPid) {
-        throw new WorkerSupervisorError("WORKER_IDENTITY_MISMATCH", "Worker PID, start identity, or process group did not match");
-      }
 
-      await this.#ownership.bindProcesses(sessionId, lease.leaseId, lease.generation, inspected, inspected);
+      await this.#ownership.bindProcesses(sessionId, lease.leaseId, lease.generation, inspected, inspected, directoryName);
       if (supervision.exit.terminal) throw new WorkerSupervisorError("WORKER_PROCESS_EXITED", "Worker exited after ownership binding");
-      const piChildPromise = waitForMessage(child, "pi_child", this.#startTimeoutMs);
+      const piChildPromise = untilWorkerExits(child, reservation.waitFor("pi_child", this.#startTimeoutMs), "pi_child");
       void piChildPromise.catch(() => {});
-      await sendMessage(child, { version: 1, type: "activate", token, leaseId: lease.leaseId, generation: lease.generation });
+      await reservation.send({ version: 1, type: "activate", token, leaseId: lease.leaseId, generation: lease.generation });
       const piMessage = await piChildPromise;
       if (!authenticated(piMessage.token, token) || piMessage.sessionId !== sessionId || piMessage.runId !== runId || piMessage.leaseId !== lease.leaseId || piMessage.generation !== lease.generation) {
         throw new WorkerSupervisorError("WORKER_CHILD_MISMATCH", "Pi child handshake did not match the authenticated launch");
@@ -520,13 +454,20 @@ export class WorkerSupervisor {
         piChild: piInspected,
       };
       await this.#ownership.bindPiChild(sessionId, lease.leaseId, lease.generation, piInspected, runtime);
-      const readyPromise = waitForMessage(child, "worker_ready", this.#startTimeoutMs);
+      // Adoption compares the ready frame against this session's recorded worker and Pi-child
+      // identities, so registration comes first.
+      await this.#router.register({ sessionId, runId, leaseId: lease.leaseId, generation: lease.generation, identity: inspected, piChildIdentity: piInspected });
+      const readyPromise = untilWorkerExits(child, reservation.waitFor("worker_ready", this.#startTimeoutMs), "worker_ready");
       void readyPromise.catch(() => {});
-      await sendMessage(child, { version: 1, type: "child_bound", token, leaseId: lease.leaseId, generation: lease.generation });
+      await reservation.send({ version: 1, type: "child_bound", token, leaseId: lease.leaseId, generation: lease.generation });
       const ready = await readyPromise;
       if (!authenticated(ready.token, token) || ready.sessionId !== sessionId || ready.runId !== runId || !sameIdentity(ready.worker, inspected) || !sameIdentity(ready.piChild, piInspected)) {
         throw new WorkerSupervisorError("WORKER_READY_MISMATCH", "Worker readiness did not match the authenticated launch");
       }
+      // Readiness never precedes adoption: the row says a session is live only once its route exists.
+      const route = await this.#router.adopt(ready, reservation.connection);
+      supervision.route = route;
+      reservation.adopt(route);
 
       await this.#writeWorkerEventLocked(supervision, { type: "WORKER_READY", at: new Date().toISOString() }, "launching");
       recordLaunchStage("ready_persisted", sessionId);
@@ -539,7 +480,6 @@ export class WorkerSupervisor {
       const handle = this.#createHandle(supervision);
       supervision.handle = handle;
       this.#handles.add(handle);
-      for (const event of supervision.startupEvents.splice(0)) void this.#applyWorkerEvent(supervision, event).catch(() => {});
       child.unref?.();
       return handle;
     } catch (error) {
@@ -551,9 +491,11 @@ export class WorkerSupervisor {
         await this.#ownership.release(sessionId, lease.leaseId, lease.generation).catch(() => {});
       }
       if (child === undefined && typeof error === "object" && error !== null) Object.assign(error, { preChild: true });
+      if (child === undefined && token !== undefined) await this.#router?.forgetRun(sessionId, token).catch(() => {});
       throw error;
     } finally {
-      await this.#unreserve(reservation);
+      reservation?.close();
+      await this.#unreserve(capacity);
     }
   }
 
@@ -596,122 +538,25 @@ export class WorkerSupervisor {
     return updated;
   }
 
-  /** @param {any} supervision @param {any} event */
-  async #applyWorkerEvent(supervision, event) {
-    return this.#admission.sessions.run(supervision.sessionId, () => this.#writeWorkerEventLocked(supervision, event, "active"));
-  }
-
   /** @param {any} supervision */
   #createHandle(supervision) {
-    const { child, token, sessionId, lease, identity } = supervision;
-    const runId = lease.runId;
-    let sequence = 0;
-    /** @type {Map<string, { resolve(value: unknown): void, reject(error: unknown): void }>} */
-    const pending = new Map();
-    /** @type {Set<(frame: Record<string, unknown>) => void>} */
-    const frameListeners = supervision.frameListeners;
-    /** @param {any} message */
-    const onCommandResult = (message) => {
-      const request = pending.get(message.id);
-      if (request === undefined) return;
-      pending.delete(message.id);
-      message.ok ? request.resolve(message.record) : request.reject(Object.assign(new Error(message.error?.message ?? "Worker command failed"), { code: message.error?.code ?? "RPC_FAILED", delivered: message.error?.deliveryUnknown !== true }));
-    };
-    supervision.commandResultHandler = onCommandResult;
-    const onDisconnect = () => {
-      for (const request of pending.values()) request.reject(Object.assign(new Error("Worker delivery became ambiguous"), { code: "DELIVERY_UNKNOWN" }));
-      pending.clear();
-    };
-    child.once("disconnect", onDisconnect);
-
-    const handle = {
+    const { sessionId, lease, identity } = supervision;
+    return {
       ready: true,
       sessionId,
-      runId,
+      runId: lease.runId,
       leaseId: lease.leaseId,
       generation: lease.generation,
       identity,
       piChildIdentity: supervision.piChildIdentity,
       pid: identity.pid,
       processGroupId: identity.processGroupId,
-      /** Send one read-only worker request over the launch channel. @param {string} op */
-      async request(op) {
-        if (supervision.lifecycle !== "active" || supervision.exit.terminal) throw Object.assign(new Error("Worker request became ambiguous"), { code: "DELIVERY_UNKNOWN" });
-        const id = `${runId}:${++sequence}`;
-        const result = new Promise((resolveResult, rejectResult) => pending.set(id, { resolve: resolveResult, reject: rejectResult }));
-        try {
-          await sendMessage(child, { version: 1, type: "command", token, id, command: { clientId: `daemon-request:${runId}`, requestId: id, op } });
-        } catch (error) {
-          pending.delete(id);
-          throw error;
-        }
-        return result;
-      },
-      /** @param {import("../shared/contracts.mjs").ClientRequest} command @param {any} journal */
-      async deliver(command, journal) {
-        if (supervision.lifecycle !== "active" || supervision.exit.terminal) {
-          throw Object.assign(new Error("Worker delivery became ambiguous"), { code: "DELIVERY_UNKNOWN" });
-        }
-        const accepted = await journal.accept(command);
-        if (accepted.stage !== "ACCEPTED") return accepted;
-        const key = { clientId: command.clientId, requestId: command.requestId };
-        const retryAtRisk = (await journal.history(key)).some((/** @type {import("../shared/contracts.mjs").CommandStatus} */ status) => status.stage === "DELIVERY_UNKNOWN");
-        await journal.transition(key, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
-        const id = `${runId}:${++sequence}`;
-        try {
-          const result = new Promise((resolveResult, rejectResult) => pending.set(id, { resolve: resolveResult, reject: rejectResult }));
-          const payload = /** @type {{ text?: string, uiRequestId?: string, response?: unknown, command?: string, model?: unknown, level?: string, name?: string, instructions?: string }} */ (command.payload);
-          const sessionCommand = command.op !== "session_command" ? undefined : sessionCommandPayload(payload);
-          await sendMessage(child, { version: 1, type: "command", token, id, command: { clientId: command.clientId, requestId: command.requestId, op: command.op, text: payload.text, response: command.op === "ui_response" ? { requestId: payload.uiRequestId, response: payload.response } : undefined, sessionCommand, retryAtRisk } });
-          await result;
-          await journal.transition(key, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-          return journal.transition(key, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
-        } catch (error) {
-          pending.delete(id);
-          const failure = /** @type {{ delivered?: boolean, code?: string }} */ (error);
-          if (failure?.delivered === true) {
-            await journal.transition(key, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-            return journal.transition(key, ["WORKER_ACKNOWLEDGED"], "FAILED", { code: failure.code ?? "RPC_FAILED", message: error instanceof Error ? error.message : "Worker command failed", retryable: false });
-          }
-          return journal.transition(key, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
-        }
-      },
-      /** @param {(frame: Record<string, unknown>) => void} listener */
-      onFrame(listener) {
-        if (typeof listener !== "function") throw new TypeError("Frame listener must be a function");
-        frameListeners.add(listener);
-        if (supervision.droppedFrameCount > 0) {
-          const overflow = {
-            type: "pi_agents_frame_queue_overflow",
-            droppedFrames: supervision.droppedFrameCount,
-            droppedBytes: supervision.droppedFrameBytes,
-            recovery: "snapshot_or_diagnostics",
-          };
-          supervision.droppedFrameCount = 0;
-          supervision.droppedFrameBytes = 0;
-          try { listener(overflow); } catch {}
-        }
-        for (const buffered of supervision.queuedFrames.splice(0)) {
-          supervision.queuedFrameBytes -= buffered.bytes;
-          try { listener(buffered.frame); } catch {}
-        }
-        return () => frameListeners.delete(listener);
-      },
-      terminal() {
-        onDisconnect();
-        frameListeners.clear();
-        supervision.commandResultHandler = undefined;
-        child.off("message", supervision.messageReceiver);
-        child.off("disconnect", onDisconnect);
-      },
+      terminal() {},
+      /** Drop the daemon's end of this worker's route; the worker reconnects on its own. */
       detach() {
-        frameListeners.clear();
-        supervision.commandResultHandler = undefined;
-        child.off("message", supervision.messageReceiver);
-        if (child.connected !== false) child.disconnect?.();
+        supervision.route?.connection.close?.();
       },
     };
-    return handle;
   }
 
   /**
@@ -739,7 +584,7 @@ export class WorkerSupervisor {
     });
   }
 
-  /** Detach daemon IPC from workers without signaling their process groups. */
+  /** Drop the daemon end of every worker route without signaling their process groups. */
   async close() {
     const handles = [...this.#handles];
     this.#handles.clear();

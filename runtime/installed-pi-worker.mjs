@@ -58,19 +58,30 @@ function parseArgs(argv) {
 export async function runInstalledPiWorker(runtimeProcess) {
   const options = parseArgs(runtimeProcess.argv.slice(2));
   const token = runtimeProcess.env.PI_AGENTS_WORKER_TOKEN;
-  if (typeof token !== "string" || token.length === 0 || typeof runtimeProcess.send !== "function") throw new Error("Worker requires an authenticated IPC launch channel");
+  if (typeof token !== "string" || token.length === 0) throw new Error("Worker requires an authenticated launch token");
+  if (options.daemonConnector === undefined) throw new Error("Worker requires the daemon control socket");
+  const reconnectController = new AbortController();
+  const connectorTarget = options.daemonConnector.startsWith("file:") ? options.daemonConnector : pathToFileURL(options.daemonConnector).href;
+  const connector = await import(connectorTarget);
+  // The startup connection is the only worker channel: a launch carries no inter-process channel.
+  const launchConnection = await connector.connectDaemon({ config: options.daemonConnectConfig, signal: reconnectController.signal });
   /** @type {((message: any) => Promise<unknown>) | undefined} */
-  let sendToDaemon;
+  let sendToDaemon = (/** @type {any} */ message) => Promise.resolve(launchConnection.send(message));
   /** @param {any} message */
-  const sendWorkerMessage = (message) => runtimeProcess.connected ? runtimeProcess.send?.(message) : void sendToDaemon?.(message).catch(() => {});
+  const sendWorkerMessage = (message) => void sendToDaemon?.(message).catch(() => {});
   /** @type {{ message: any, send: (message: any) => unknown }[]} */
   const pendingParentMessages = [];
   /** @type {((message: any, send: (message: any) => unknown) => void) | undefined} */
   let transportMessageHandler;
+  /** @type {Set<(message: any) => boolean>} */
+  const launchWaiters = new Set();
   /** @param {any} message */
-  const onParentMessage = (message) => {
+  const onDaemonMessage = (message) => {
+    for (const waiter of [...launchWaiters]) {
+      if (waiter(message)) return;
+    }
     if (!matchesToken(message?.token, token) || !["command", "shutdown"].includes(message.type)) return;
-    const send = (/** @type {any} */ response) => runtimeProcess.send?.(response);
+    const send = (/** @type {any} */ response) => sendToDaemon?.(response);
     if (transportMessageHandler !== undefined) {
       transportMessageHandler(message, send);
     } else if (pendingParentMessages.length < MAX_PENDING_PARENT_MESSAGES) {
@@ -82,23 +93,31 @@ export async function runInstalledPiWorker(runtimeProcess) {
       void send({ version: 1, type: "command_result", token, id: message.id, ok: false, error: { code: "WORKER_NOT_READY", message: "Worker parent queue is full", deliveryUnknown: false } });
     }
   };
-  runtimeProcess.on("message", onParentMessage);
-  const supervisorIdentity = await inspectProcessIdentity(runtimeProcess.pid);
-  runtimeProcess.send({ version: 1, type: "worker_hello", token, sessionId: options.sessionId, runId: options.runId, leaseId: options.leaseId, generation: options.generation, worker: supervisorIdentity });
-
-  const activation = /** @type {any} */ (await new Promise((resolveActivation, rejectActivation) => {
-    /** @param {unknown} [error] @param {any} [message] */
-    const finish = (error, message) => {
-      runtimeProcess.off("message", onMessage);
-      runtimeProcess.off("disconnect", onDisconnect);
-      if (error) rejectActivation(error); else resolveActivation(message);
-    };
+  launchConnection.onMessage(onDaemonMessage);
+  /** @param {(message: any) => boolean} matches @param {string} code @returns {Promise<any>} */
+  const awaitLaunchMessage = (matches, code) => new Promise((resolveMessage, rejectMessage) => {
     /** @param {any} message */
-    const onMessage = (message) => message?.type === "activate" ? finish(undefined, message) : message?.type === "reject" ? finish(Object.assign(new Error("Worker rejected"), { code: "WORKER_REJECTED" })) : undefined;
-    const onDisconnect = () => finish(Object.assign(new Error("Worker launch channel closed"), { code: "WORKER_DISCONNECTED" }));
-    runtimeProcess.on("message", onMessage);
-    runtimeProcess.once("disconnect", onDisconnect);
-  }));
+    const waiter = (message) => {
+      if (message?.type === "reject" && matchesToken(message?.token, token)) {
+        launchWaiters.delete(waiter);
+        rejectMessage(Object.assign(new Error("Worker rejected"), { code: "WORKER_REJECTED" }));
+        return true;
+      }
+      if (!matches(message)) return false;
+      launchWaiters.delete(waiter);
+      resolveMessage(message);
+      return true;
+    };
+    launchWaiters.add(waiter);
+    Promise.resolve(launchConnection.closed).finally(() => {
+      if (!launchWaiters.delete(waiter)) return;
+      rejectMessage(Object.assign(new Error("Worker launch connection closed"), { code }));
+    }).catch(() => {});
+  });
+  const supervisorIdentity = await inspectProcessIdentity(runtimeProcess.pid);
+  await launchConnection.send({ version: 1, type: "hello", token, sessionId: options.sessionId, runId: options.runId, leaseId: options.leaseId, generation: options.generation, worker: supervisorIdentity });
+
+  const activation = await awaitLaunchMessage((message) => message?.type === "activate", "WORKER_DISCONNECTED");
   if (!matchesToken(activation?.token, token) || activation?.leaseId !== options.leaseId || activation?.generation !== options.generation) throw Object.assign(new Error("Worker activation mismatch"), { code: "WORKER_ACTIVATION_MISMATCH" });
 
   const executableBinding = await openPiExecutableBinding(options.executable);
@@ -121,16 +140,8 @@ export async function runInstalledPiWorker(runtimeProcess) {
   const piChildPid = /** @type {number} */ (piChild.pid);
   const piChildIdentity = await inspectProcessIdentity(piChildPid);
   if (piChildIdentity.pid === supervisorIdentity.pid || piChildIdentity.processGroupId !== supervisorIdentity.processGroupId) throw Object.assign(new Error("Pi child process identity did not inherit the supervisor group"), { code: "WORKER_IDENTITY_MISMATCH" });
-  runtimeProcess.send({ version: 1, type: "pi_child", token, sessionId: options.sessionId, runId: options.runId, leaseId: options.leaseId, generation: options.generation, worker: supervisorIdentity, piChild: piChildIdentity });
-  await new Promise((resolveBound, rejectBound) => {
-    /** @param {unknown} [error] */
-    const finish = (error) => { runtimeProcess.off("message", onMessage); runtimeProcess.off("disconnect", onDisconnect); error ? rejectBound(error) : resolveBound(undefined); };
-    /** @param {any} message */
-    const onMessage = (message) => message?.type === "child_bound" && matchesToken(message.token, token) ? finish() : message?.type === "shutdown" ? finish(new Error("Worker stopped before child bind")) : undefined;
-    const onDisconnect = () => finish(new Error("Worker channel closed before child bind"));
-    runtimeProcess.on("message", onMessage);
-    runtimeProcess.once("disconnect", onDisconnect);
-  });
+  await launchConnection.send({ version: 1, type: "pi_child", token, sessionId: options.sessionId, runId: options.runId, leaseId: options.leaseId, generation: options.generation, worker: supervisorIdentity, piChild: piChildIdentity });
+  await awaitLaunchMessage((message) => message?.type === "child_bound" && matchesToken(message.token, token), "WORKER_DISCONNECTED");
 
   const initialState = await adapter.getState();
   if (initialState?.sessionFile !== options.canonicalSessionFile) {
@@ -138,7 +149,6 @@ export async function runInstalledPiWorker(runtimeProcess) {
   }
   const replay = await createWorkerReplayStore({ path: options.replayPath });
   const dispatcher = createWorkerCommandDispatcher({ replay, adapter });
-  const reconnectController = new AbortController();
   let shuttingDown = false;
   const shutdown = async () => {
     if (shuttingDown) return;
@@ -164,36 +174,30 @@ export async function runInstalledPiWorker(runtimeProcess) {
   for (const pending of pendingParentMessages.splice(0)) onTransportMessage(pending.message, pending.send);
   if (shuttingDown) return;
   const ready = { version: 1, type: "worker_ready", token, sessionId: options.sessionId, runId: options.runId, leaseId: options.leaseId, generation: options.generation, worker: supervisorIdentity, piChild: piChildIdentity };
-  runtimeProcess.send(ready);
+  await launchConnection.send(ready);
 
-  if (options.daemonConnector !== undefined) {
-    runtimeProcess.once("disconnect", () => {
-      void maintainDaemonConnection({
-        signal: reconnectController.signal, delaysMs: options.reconnectDelaysMs, sleep: (/** @type {number} */ ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms)),
-        connect: async () => {
-          const target = options.daemonConnector.startsWith("file:") ? options.daemonConnector : pathToFileURL(options.daemonConnector).href;
-          const connector = await import(target);
-          return connector.connectDaemon({ config: options.daemonConnectConfig, signal: reconnectController.signal });
-        },
-        onConnection: async (/** @type {any} */ connection) => {
-          const connectionSend = (/** @type {any} */ message) => Promise.resolve(connection.send(message));
-          sendToDaemon = connectionSend;
-          const removeMessageListener = connection.onMessage((/** @type {any} */ message) => onTransportMessage(message, connectionSend));
-          const dispose = () => { try { removeMessageListener?.(); } catch {} };
-          reconnectController.signal.addEventListener("abort", dispose, { once: true });
-          Promise.resolve(connection.closed).finally(() => { reconnectController.signal.removeEventListener("abort", dispose); dispose(); }).catch(() => {});
-          await connectionSend(ready);
-        },
-      }).catch(() => {});
-    });
-  }
+  void Promise.resolve(launchConnection.closed).finally(() => {
+    if (shuttingDown) return;
+    sendToDaemon = undefined;
+    void maintainDaemonConnection({
+      signal: reconnectController.signal, delaysMs: options.reconnectDelaysMs, sleep: (/** @type {number} */ ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms)),
+      connect: async () => connector.connectDaemon({ config: options.daemonConnectConfig, signal: reconnectController.signal }),
+      onConnection: async (/** @type {any} */ connection) => {
+        const connectionSend = (/** @type {any} */ message) => Promise.resolve(connection.send(message));
+        sendToDaemon = connectionSend;
+        const removeMessageListener = connection.onMessage((/** @type {any} */ message) => onTransportMessage(message, connectionSend));
+        const dispose = () => { try { removeMessageListener?.(); } catch {} };
+        reconnectController.signal.addEventListener("abort", dispose, { once: true });
+        Promise.resolve(connection.closed).finally(() => { reconnectController.signal.removeEventListener("abort", dispose); dispose(); }).catch(() => {});
+        await connectionSend(ready);
+      },
+    }).catch(() => {});
+  }).catch(() => {});
   /** @param {number | null} code @param {NodeJS.Signals | null} signal */
   const reportPiChildExit = async (code, signal) => {
     const event = { type: "PI_CHILD_CRASHED", at: new Date().toISOString(), summary: `Pi exited unexpectedly (${signal ?? code ?? "unknown"})` };
     const message = { version: 1, type: "worker_event", token, sessionId: options.sessionId, event };
-    const delivered = runtimeProcess.connected
-      ? new Promise((resolveSend) => { runtimeProcess.send?.(message, () => resolveSend(undefined)); })
-      : Promise.resolve(sendToDaemon?.(message));
+    const delivered = Promise.resolve(sendToDaemon?.(message));
     await Promise.race([delivered, new Promise((resolveTimeout) => setTimeout(resolveTimeout, CRASH_REPORT_TIMEOUT_MS))]);
   };
   piChild.once("exit", (code, signal) => {

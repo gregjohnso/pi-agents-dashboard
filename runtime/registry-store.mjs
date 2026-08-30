@@ -32,6 +32,7 @@ const SESSION_RECORD_KEYS = [
   "ownership",
   "isolation",
   "latestRunId",
+  "runHash",
   "runtime",
   "summary",
   "createdAt",
@@ -213,6 +214,7 @@ export function validateSessionRecord(value) {
   if (value.model !== undefined) validateModel(value.model);
   if (value.thinkingLevel !== undefined) requireString(value, "thinkingLevel");
   if (value.latestRunId !== undefined) requireString(value, "latestRunId");
+  if (value.runHash !== undefined && (requireString(value, "runHash"), value.runHash.includes("/") || value.runHash.startsWith("."))) throw new TypeError("runHash must be a root-relative directory name");
   if (value.runtime !== undefined) validateRuntime(value.runtime);
   if (value.summary !== undefined) validateSummary(value.summary);
   if (value.nameGenerated !== undefined && typeof value.nameGenerated !== "boolean") throw new TypeError("nameGenerated must be a boolean");

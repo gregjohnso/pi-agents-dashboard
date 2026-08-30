@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -118,6 +119,7 @@ it("builds an isolated canonical session launch from the daemon request", async 
   }));
   const createPiSession = vi.fn(() => ({ sessionId: "session-id", sessionFile: "/pi/agent/sessions/project/session-id.jsonl" }));
   const ids = ["session-id", "run-id"];
+  const preparedRunHash = createHash("sha256").update("run-id\0session-id").digest("hex");
   const resolveLaunch = createLaunchResolver({
     registry,
     piConfigRoot: "/pi/agent",
@@ -149,6 +151,7 @@ it("builds an isolated canonical session launch from the daemon request", async 
     canonicalSessionFile: "/pi/agent/sessions/project/session-id.jsonl",
     cwd: "/pi/agent/pi-agents/worktrees/session-id/packages/app",
     runId: "run-id",
+    runHash: preparedRunHash,
     initialPrompt: "who are you?",
     model: { provider: "openai", id: "gpt" },
     name: "identity",
@@ -167,10 +170,14 @@ it("builds an isolated canonical session launch from the daemon request", async 
       outcome: "NONE",
       activity: { kind: "launching", summary: "who are you?", updatedAt: "2026-08-25T12:00:00.000Z" },
       isolation: { mode: "worktree", worktreePath: "/pi/agent/pi-agents/worktrees/session-id", branch: "pi-agents/session-id" },
+      // The run directory is named before spawn and is relative to whatever state root holds the row.
+      latestRunId: "run-id",
+      runHash: preparedRunHash,
       createdAt: "2026-08-25T12:00:00.000Z",
       updatedAt: "2026-08-25T12:00:00.000Z",
     },
   });
+  expect(preparedRunHash).not.toContain("/");
   expect(preflight).toHaveBeenCalledWith(request.payload, { piConfigRoot: "/pi/agent", currentOwnerSessionIds: [] });
   expect(createWorktree).toHaveBeenCalledWith(expect.any(Object), { worktreeId: "session-id" });
   expect(createPiSession).toHaveBeenCalledWith("/pi/agent/pi-agents/worktrees/session-id/packages/app", "session-id");

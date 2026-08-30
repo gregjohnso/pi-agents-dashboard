@@ -1,18 +1,27 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { afterEach, expect, it } from "vitest";
 
 import { OwnershipManager } from "./ownership.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
+import { RecoveredWorkerRouter } from "./reconciliation.mjs";
 import { RegistryStore } from "./registry-store.mjs";
+import { createWorkerControlSocket } from "./test-fixtures.mjs";
 import { maintainDaemonConnection } from "./worker.mjs";
 import { WorkerSupervisor } from "./worker-supervisor.mjs";
+
+const CONNECTOR = fileURLToPath(new URL("./daemon-connector.mjs", import.meta.url));
+
+/** @type {any[]} */
+const controlSockets = [];
 
 /** @type {string[]} */
 const cleanup = [];
 afterEach(async () => {
+  await Promise.all(controlSockets.splice(0).map((control) => control.close()));
   await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
@@ -37,7 +46,7 @@ function record(root, sessionId) {
 }
 
 /** @param {number} pid @param {number} [timeoutMs] */
-async function waitForExit(pid, timeoutMs = 2_000) {
+async function waitForExit(pid, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
@@ -51,11 +60,20 @@ async function waitForExit(pid, timeoutMs = 2_000) {
   }
 }
 
-/** @param {RegistryStore} registry @param {string} sessionId */
-async function waitForOwnershipRelease(registry, sessionId) {
-  const deadline = Date.now() + 1_000;
+/** @param {RegistryStore} registry @param {string} sessionId @param {number} [timeoutMs] */
+async function waitForOwnershipRelease(registry, sessionId, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
   while ((await registry.get(sessionId))?.ownership !== undefined) {
     if (Date.now() >= deadline) throw new Error(`Ownership for ${sessionId} was not released`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+/** @param {() => Promise<boolean> | boolean} predicate */
+async function waitUntil(predicate) {
+  const deadline = Date.now() + 5_000;
+  while (!(await predicate())) {
+    if (Date.now() >= deadline) throw new Error("Condition was not reached");
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
@@ -96,14 +114,19 @@ process.stdin.on("data", (chunk) => {
   }
 });
 `, { mode: 0o700 });
-  return { root, runs, registry, fakeEntry };
+  const router = new RecoveredWorkerRouter({ registry, inspect: inspectProcessIdentity, metadataPath: join(root, "daemon", "workers.json") });
+  await router.load();
+  const control = await createWorkerControlSocket({ root, router, registry });
+  controlSockets.push(control);
+  return { root, runs, registry, fakeEntry, router, control, launchSeams: { daemonConnector: CONNECTOR, daemonConnectConfig: control.connectConfig } };
 }
 
 it("starts two bounded workers as distinct process-group leaders and opens sessions only after bind", async () => {
-  const { root, runs, registry, fakeEntry } = await setup(["one", "two"]);
+  const { root, runs, registry, fakeEntry, router, control, launchSeams } = await setup(["one", "two"]);
   const ownership = new OwnershipManager(registry);
   const supervisor = new WorkerSupervisor({
     registry,
+    router,
     ownership,
     runsDirectory: runs,
     env: { ...process.env, PI_AGENTS_TEST_EXIT_MS: "700" },
@@ -111,8 +134,8 @@ it("starts two bounded workers as distinct process-group leaders and opens sessi
   });
 
   const [one, two] = await Promise.all([
-    supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-one", piPath: fakeEntry }),
-    supervisor.launch({ sessionId: "two", canonicalSessionFile: join(root, "two.jsonl"), cwd: root, runId: "run-two", piPath: fakeEntry }),
+    supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-one", piPath: fakeEntry, ...launchSeams }),
+    supervisor.launch({ sessionId: "two", canonicalSessionFile: join(root, "two.jsonl"), cwd: root, runId: "run-two", piPath: fakeEntry, ...launchSeams }),
   ]);
 
   expect(one.identity.pid).not.toBe(two.identity.pid);
@@ -135,16 +158,17 @@ it("starts two bounded workers as distinct process-group leaders and opens sessi
 });
 
 it("fails the session with a process error when the Pi child exits unexpectedly", async () => {
-  const { root, runs, registry, fakeEntry } = await setup(["one"]);
+  const { root, runs, registry, fakeEntry, router, control, launchSeams } = await setup(["one"]);
   const supervisor = new WorkerSupervisor({
     registry,
+    router,
     ownership: new OwnershipManager(registry),
     runsDirectory: runs,
     env: { ...process.env, PI_AGENTS_TEST_EXIT_MS: "300" },
     startTimeoutMs: 2_000,
     launchStopPolicy: { gracefulMs: 100, terminateMs: 100 },
   });
-  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-pi-crash", piPath: fakeEntry });
+  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-pi-crash", piPath: fakeEntry, ...launchSeams });
 
   await waitForExit(launched.identity.pid);
   await waitForOwnershipRelease(registry, "one");
@@ -153,15 +177,16 @@ it("fails the session with a process error when the Pi child exits unexpectedly"
 });
 
 it("refuses a second writer for one canonical session", async () => {
-  const { root, runs, registry, fakeEntry } = await setup(["one"]);
+  const { root, runs, registry, fakeEntry, router, control, launchSeams } = await setup(["one"]);
   const supervisor = new WorkerSupervisor({
     registry,
+    router,
     ownership: new OwnershipManager(registry),
     runsDirectory: runs,
     env: { ...process.env, PI_AGENTS_TEST_EXIT_MS: "500" },
     startTimeoutMs: 2_000,
   });
-  const request = { sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, piPath: fakeEntry };
+  const request = { sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, piPath: fakeEntry, ...launchSeams };
 
   const results = await Promise.allSettled([
     supervisor.launch({ ...request, runId: "run-one" }),
@@ -283,114 +308,83 @@ it("closes the active daemon connection and returns on explicit shutdown", async
   await expect(reconnecting).resolves.toBeUndefined();
 });
 
-it("disposes an active reconnect channel synchronously when worker shutdown aborts", async () => {
-  const { root, runs, registry, fakeEntry } = await setup(["one"]);
-  const marker = join(root, "reconnect-cleanup.txt");
-  const connector = join(root, "stuck-daemon-connector.mjs");
-  await writeFile(connector, `
-import { appendFileSync } from "node:fs";
-export async function connectDaemon({ config }) {
-  let listener;
-  const log = (value) => appendFileSync(config.marker, value + "\\n");
-  return {
-    closed: new Promise(() => {}),
-    close() { log("close"); throw new Error("close failed"); },
-    onMessage(nextListener) {
-      listener = (message) => { log("deliver:" + message.type); nextListener(message); };
-      return () => { log("remove"); listener = undefined; };
-    },
-    async send(message) {
-      log("send:" + message.type);
-      if (message.type !== "worker_ready") return;
-      listener({ type: "shutdown", token: message.token });
-      log("after-abort:" + (listener === undefined ? "removed" : "active"));
-      listener?.({ type: "shutdown", token: message.token });
-      process.stdout.write(JSON.stringify({ type: "agent_start" }) + "\\n");
-    },
-  };
+/** @param {string} root */
+async function workerEntries(root) {
+  try { return JSON.parse(await readFile(join(root, "daemon", "workers.json"), "utf8")).workers; }
+  catch (error) { if (/** @type {NodeJS.ErrnoException} */ (error).code === "ENOENT") return []; throw error; }
 }
-`, { mode: 0o600 });
+
+it("reconnects after daemon restart from a socket-only launch and retains the run token across adoption", async () => {
+  const { root, runs, registry, fakeEntry, router, launchSeams } = await setup(["one"]);
   const supervisor = new WorkerSupervisor({
     registry,
+    router,
     ownership: new OwnershipManager(registry),
     runsDirectory: runs,
-    env: process.env,
-    startTimeoutMs: 2_000,
-    // The worker exits before its Pi child does, so the lease is released only after the child-anchored stop proves the child gone.
-    launchStopPolicy: { gracefulMs: 100, terminateMs: 100 },
+    env: { ...process.env, PI_AGENTS_TEST_EXIT_MS: "4000" },
+    startTimeoutMs: 5_000,
   });
-  const launched = await supervisor.launch({
-    sessionId: "one",
-    canonicalSessionFile: join(root, "one.jsonl"),
-    cwd: root,
-    runId: "run-reconnect-cleanup",
-    piPath: fakeEntry,
-    daemonConnector: connector,
-    daemonConnectConfig: { marker },
-    reconnectDelaysMs: [5],
-  });
+  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-reconnect", piPath: fakeEntry, ...launchSeams, reconnectDelaysMs: [5, 10] });
+  const adopted = router.route("one");
+  const [reserved] = await workerEntries(root);
+  expect(reserved).toMatchObject({ sessionId: "one", runId: "run-reconnect", identity: launched.identity });
+  expect(typeof reserved.token).toBe("string");
 
+  // Dropping the daemon's end of the route is what a daemon restart looks like to a live worker.
   await supervisor.close();
-  await waitForExit(launched.pid);
-  const calls = (await readFile(marker, "utf8")).trim().split("\n");
-  expect(calls).toContain("remove");
-  expect(calls).toContain("after-abort:removed");
-  expect(calls.filter((call) => call === "deliver:shutdown")).toHaveLength(1);
-  expect(calls).not.toContain("send:worker_event");
-  await waitForOwnershipRelease(registry, "one");
+  await waitUntil(() => router.route("one") !== undefined && router.route("one") !== adopted);
+  const reconnected = router.route("one");
+  expect(reconnected.routeGeneration).toBeGreaterThan(adopted.routeGeneration);
+  // Adoption never rotates a run's token, so the same secret still authenticates this worker.
+  expect((await workerEntries(root))[0].token).toBe(reserved.token);
+
+  await expect(reconnected.connection.request({ version: 1, type: "command", token: reconnected.metadata.token, id: "reconnected-command", command: { clientId: "reconnect-client", requestId: "reconnect-request", op: "prompt", text: "still alive" } }, {}))
+    .resolves.toMatchObject({ stage: "RPC_ACKNOWLEDGED" });
+
+  // The run token is private: it must not reach any captured worker output or rotating diagnostic.
+  const runDirectory = join(runs, (await registry.get("one"))?.runHash ?? "missing");
+  const captured = await Promise.all((await readdir(runDirectory, { recursive: true, withFileTypes: true }))
+    .filter((entry) => entry.isFile())
+    .map((entry) => readFile(join(entry.parentPath ?? runDirectory, entry.name), "utf8").catch(() => "")));
+  expect(captured.filter((text) => text.includes(reserved.token))).toEqual([]);
+  expect(captured.length).toBeGreaterThan(0);
+  await waitForExit(launched.pid, 6_000);
+  await waitForOwnershipRelease(registry, "one", 5_000);
 });
 
-it("starts the injected daemon connector after inherited IPC disconnect while Pi remains alive", async () => {
-  const { root, runs, registry, fakeEntry } = await setup(["one"]);
-  const marker = join(root, "reconnected.txt");
-  const connector = join(root, "fake-daemon-connector.mjs");
-  await writeFile(connector, `
-import { writeFile } from "node:fs/promises";
-export async function connectDaemon({ config }) {
-  let onMessage;
-  return {
-    closed: new Promise(() => {}),
-    close() {},
-    onMessage(listener) { onMessage = listener; return () => {}; },
-    async send(message) {
-      if (message.type === "worker_ready") {
-        queueMicrotask(() => onMessage({ type: "command", token: message.token, id: "reconnected-command", command: { clientId: "reconnect-client", requestId: "reconnect-request", op: "prompt", text: "still alive" } }));
-      }
-      if (message.type === "command_result") await writeFile(config.marker, JSON.stringify({ ok: message.ok, stage: message.record?.stage }), { mode: 0o600 });
-    },
-  };
-}
-`, { mode: 0o600 });
+it("issues a new token only for a new run and removes the old entry at terminal reconciliation", async () => {
+  const { root, runs, registry, fakeEntry, router, launchSeams } = await setup(["one"]);
   const supervisor = new WorkerSupervisor({
     registry,
+    router,
     ownership: new OwnershipManager(registry),
     runsDirectory: runs,
-    env: { ...process.env, PI_AGENTS_TEST_EXIT_MS: "700" },
-    startTimeoutMs: 2_000,
+    env: { ...process.env, PI_AGENTS_TEST_EXIT_MS: "150" },
+    startTimeoutMs: 5_000,
+    launchStopPolicy: { gracefulMs: 100, terminateMs: 100 },
   });
-  const launched = await supervisor.launch({
-    sessionId: "one",
-    canonicalSessionFile: join(root, "one.jsonl"),
-    cwd: root,
-    runId: "run-reconnect",
-    piPath: fakeEntry,
-    daemonConnector: connector,
-    daemonConnectConfig: { marker },
-    reconnectDelaysMs: [5, 10],
-  });
+  const first = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-first", piPath: fakeEntry, ...launchSeams });
+  const firstToken = (await workerEntries(root))[0].token;
 
+  await waitForExit(first.pid, 5_000);
+  await waitForOwnershipRelease(registry, "one", 5_000);
+  await waitUntil(async () => (await workerEntries(root)).length === 0);
+
+  await rm(join(root, "one.jsonl"), { force: true });
+  const second = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-second", piPath: fakeEntry, ...launchSeams });
+  const [respawned] = await workerEntries(root);
+  expect(respawned.runId).toBe("run-second");
+  expect(respawned.token).not.toBe(firstToken);
   await supervisor.close();
-  const deadline = Date.now() + 1_000;
-  for (;;) {
-    try {
-      expect(JSON.parse(await readFile(marker, "utf8"))).toEqual({ ok: true, stage: "RPC_ACKNOWLEDGED" });
-      break;
-    } catch (error) {
-      if (/** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT" || Date.now() >= deadline) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-  }
-  await expect(inspectProcessIdentity(launched.pid)).resolves.toEqual(launched.identity);
-  await waitForExit(launched.pid);
-  await waitForOwnershipRelease(registry, "one");
+  await waitForExit(second.pid, 5_000);
+  await waitForOwnershipRelease(registry, "one", 5_000);
+
+  // The row names its run directory relative to the state root, so a renamed root still resolves it.
+  const runHash = (await registry.get("one"))?.runHash;
+  expect(runHash).not.toContain("/");
+  const renamed = `${root}-renamed`;
+  cleanup.push(renamed);
+  await rename(root, renamed);
+  await expect(stat(join(renamed, "runs", String(runHash), "worker.stderr.log"))).resolves.toMatchObject({ size: expect.any(Number) });
+  await rename(renamed, root);
 });

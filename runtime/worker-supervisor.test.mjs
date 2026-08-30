@@ -1,12 +1,12 @@
 import { EventEmitter } from "node:events";
-import { mkdtemp, mkdir, readdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, expect, it, vi } from "vitest";
 
-import { createCommandJournal } from "./command-journal.mjs";
 import { OwnershipManager } from "./ownership.mjs";
+import { RecoveredWorkerRouter } from "./reconciliation.mjs";
 import { RegistryStore } from "./registry-store.mjs";
 import { WorkerSupervisor } from "./worker-supervisor.mjs";
 
@@ -41,29 +41,59 @@ function sessionRecord(root, sessionId) {
   };
 }
 
-/** @param {string[]} [sessionIds] @param {{ randomId?: () => string }} [options] */
+/** @param {string[]} [sessionIds] @param {{ randomId?: () => string, inspect?: (pid: number) => Promise<any> }} [options] */
 async function setup(sessionIds = ["one"], options = {}) {
   const root = await mkdtemp(join(tmpdir(), "dashboard-supervisor-"));
   cleanup.push(root);
   const sessions = join(root, "sessions");
   const runs = join(root, "runs");
+  const daemon = join(root, "daemon");
   await mkdir(sessions, { mode: 0o700 });
   await mkdir(runs, { mode: 0o700 });
+  await mkdir(daemon, { mode: 0o700 });
   const registry = new RegistryStore(sessions);
   for (const id of sessionIds) await registry.create(sessionRecord(root, id));
   const ownership = new OwnershipManager(registry, {
     randomId: options.randomId ?? (() => `lease-${Math.random()}`),
   });
-  return { root, runs, registry, ownership };
+  const metadataPath = join(daemon, "workers.json");
+  let current = options.inspect ?? inspect;
+  const router = new RecoveredWorkerRouter({ registry, inspect: (/** @type {number} */ pid) => current(pid), metadataPath, bindTimeoutMs: 1_000 });
+  await router.load();
+  return {
+    root, runs, registry, ownership, router, metadataPath,
+    /** The router must see the same process world the supervisor does. @param {(pid: number) => Promise<any>} next */
+    useInspect(next) { current = next; },
+    workers: async () => JSON.parse(await readFile(metadataPath, "utf8")).workers,
+  };
 }
 
-/** @param {{ order?: string[], helloOverrides?: Record<string, unknown>, readyOverrides?: Record<string, unknown>, holdReady?: boolean, activateSendError?: boolean, readyExitTiming?: "before" | "after", commandBehavior?: "success" | "disconnect" | "delivery_unknown" | "explicit_error", world?: any }} [configuration] */
-function fakeWorkerFactory({ order = [], helloOverrides = {}, readyOverrides = {}, holdReady = false, activateSendError = false, readyExitTiming, commandBehavior, world } = {}) {
+/** One in-process stand-in for a worker's authenticated control-socket connection. @param {(message: any) => void} onDaemonMessage */
+function fakeConnection(onDaemonMessage) {
+  /** @type {(value?: unknown) => void} */
+  let resolveClosed = () => {};
+  const closed = new Promise((resolve) => { resolveClosed = resolve; });
+  return {
+    closed,
+    close: () => resolveClosed(undefined),
+    async send(/** @type {any} */ message) { onDaemonMessage(message); },
+    async request() { throw new Error("Unexpected worker request in this fixture"); },
+  };
+}
+
+/**
+ * A fake worker that connects to the router's startup reservation instead of an inherited channel.
+ *
+ * @param {{ router?: any, order?: string[], helloOverrides?: Record<string, unknown>, readyOverrides?: Record<string, unknown>, holdReady?: boolean, holdHello?: boolean, activateSendError?: boolean, readyExitTiming?: "before" | "after", world?: any }} [configuration]
+ */
+function fakeWorkerFactory({ router, order = [], helloOverrides = {}, readyOverrides = {}, holdReady = false, holdHello = false, activateSendError = false, readyExitTiming, world } = {}) {
   let nextPid = 9100;
   /** @type {any[]} */
   const children = [];
   /** @type {any[]} */
   const calls = [];
+  /** @type {any[]} */
+  const helloFailures = [];
   /** The ordinary exit: a supervisor and its Pi child both leave the process table. @param {any} child @param {number} code */
   const exitGroup = (child, code = 1) => {
     world?.exit(child.pid);
@@ -74,103 +104,61 @@ function fakeWorkerFactory({ order = [], helloOverrides = {}, readyOverrides = {
   const spawnImpl = (command, argv, options) => {
     const child = /** @type {any} */ (new EventEmitter());
     child.pid = nextPid++;
-    child.connected = true;
     child.killed = false;
-    child.send = vi.fn((message, callback) => {
+    child.unref = vi.fn();
+    const token = options.env.PI_AGENTS_WORKER_TOKEN;
+    const sessionId = argv[argv.indexOf("--session-id") + 1];
+    const runId = argv[argv.indexOf("--run-id") + 1];
+    const leaseId = argv[argv.indexOf("--lease-id") + 1];
+    const generation = Number(argv[argv.indexOf("--generation") + 1]);
+    const worker = () => ({ pid: child.pid, startIdentity: String(child.pid), processGroupId: child.pid });
+    const piChild = () => ({ pid: piChildPid(child.pid), startIdentity: String(piChildPid(child.pid)), processGroupId: child.pid });
+    /** @type {Promise<any> | undefined} */
+    let reservation;
+    /** @param {any} frame */
+    const toDaemon = async (frame) => {
+      const entry = await reservation;
+      entry?.deliver(frame);
+    };
+    const connection = fakeConnection((/** @type {any} */ message) => {
       order.push(`parent:${message.type}`);
-      if (message.type === "activate" && activateSendError) {
-        callback?.(new Error("activation send failed"));
-        return false;
-      }
-      callback?.();
       if (message.type === "activate") {
-        queueMicrotask(() => {
-          const worker = { pid: child.pid, startIdentity: String(child.pid), processGroupId: child.pid };
-          const piChild = { pid: child.pid + 100, startIdentity: String(child.pid + 100), processGroupId: child.pid };
-          child.emit("message", {
-            version: 1,
-            type: "pi_child",
-            token: options.env.PI_AGENTS_WORKER_TOKEN,
-            sessionId: argv[argv.indexOf("--session-id") + 1],
-            runId: argv[argv.indexOf("--run-id") + 1],
-            leaseId: argv[argv.indexOf("--lease-id") + 1],
-            generation: Number(argv[argv.indexOf("--generation") + 1]),
-            worker,
-            piChild,
-          });
-        });
+        if (activateSendError) throw new Error("activation send failed");
+        queueMicrotask(() => void toDaemon({ version: 1, type: "pi_child", token, sessionId, runId, leaseId, generation, worker: worker(), piChild: piChild() }));
       }
       if (message.type === "child_bound" && !holdReady) {
         queueMicrotask(() => {
           if (readyExitTiming === "before") exitGroup(child);
-          const worker = { pid: child.pid, startIdentity: String(child.pid), processGroupId: child.pid };
-          const piChild = { pid: child.pid + 100, startIdentity: String(child.pid + 100), processGroupId: child.pid };
-          child.emit("message", {
-            version: 1,
-            type: "worker_ready",
-            token: options.env.PI_AGENTS_WORKER_TOKEN,
-            sessionId: argv[argv.indexOf("--session-id") + 1],
-            runId: argv[argv.indexOf("--run-id") + 1],
-            worker,
-            piChild,
-            ...readyOverrides,
-          });
-          if (readyExitTiming === "after") exitGroup(child);
+          void toDaemon({ version: 1, type: "worker_ready", token, sessionId, runId, leaseId, generation, worker: worker(), piChild: piChild(), ...readyOverrides });
+          if (readyExitTiming === "after") queueMicrotask(() => exitGroup(child));
         });
       }
-      if (message.type === "command" && commandBehavior === "success") {
-        queueMicrotask(() => child.emit("message", { version: 1, type: "command_result", token: options.env.PI_AGENTS_WORKER_TOKEN, id: message.id, ok: true, record: { stage: "RPC_ACKNOWLEDGED" } }));
-      }
-      if (message.type === "command" && commandBehavior === "disconnect") {
-        queueMicrotask(() => child.disconnect());
-      }
-      if (message.type === "command" && ["delivery_unknown", "explicit_error"].includes(commandBehavior ?? "")) {
-        queueMicrotask(() => child.emit("message", {
-          version: 1,
-          type: "command_result",
-          token: options.env.PI_AGENTS_WORKER_TOKEN,
-          id: message.id,
-          ok: false,
-          error: {
-            code: commandBehavior === "delivery_unknown" ? "RPC_WRITE_FAILED" : "RPC_COMMAND_FAILED",
-            message: "Pi RPC failed",
-            deliveryUnknown: commandBehavior === "delivery_unknown",
-          },
-        }));
-      }
       if (message.type === "reject" || message.type === "shutdown") {
-        child.connected = false;
         queueMicrotask(() => {
-          child.emit("disconnect");
+          connection.close();
           exitGroup(child);
         });
       }
-      return true;
     });
-    child.disconnect = vi.fn(() => {
-      child.connected = false;
-      child.emit("disconnect");
-    });
-    child.unref = vi.fn();
+    child.connection = connection;
     calls.push({ command, argv, options, child });
     children.push(child);
-    queueMicrotask(() => {
-      const identity = { pid: child.pid, startIdentity: String(child.pid), processGroupId: child.pid };
-      child.emit("message", {
-        version: 1,
-        type: "worker_hello",
-        token: options.env.PI_AGENTS_WORKER_TOKEN,
-        sessionId: argv[argv.indexOf("--session-id") + 1],
-        runId: argv[argv.indexOf("--run-id") + 1],
-        leaseId: argv[argv.indexOf("--lease-id") + 1],
-        generation: Number(argv[argv.indexOf("--generation") + 1]),
-        worker: identity,
-        ...helloOverrides,
+    if (!holdHello) {
+      queueMicrotask(() => {
+        reservation = router.beginLaunchConnection({ version: 1, type: "hello", token, sessionId, runId, leaseId, generation, worker: worker(), ...helloOverrides }, connection, () => {})
+          .catch((/** @type {any} */ error) => { helloFailures.push(error); connection.close(); return undefined; });
       });
-    });
+    }
+    /** Connect this worker's startup socket by hand, after the launch already reserved it. @param {Record<string, unknown>} [overrides] */
+    child.connect = (overrides = {}) => {
+      reservation = router.beginLaunchConnection({ version: 1, type: "hello", token, sessionId, runId, leaseId, generation, worker: worker(), ...helloOverrides, ...overrides }, connection, () => {})
+        .catch((/** @type {any} */ error) => { helloFailures.push(error); connection.close(); return undefined; });
+      return reservation;
+    };
+    child.reservation = () => reservation;
     return child;
   };
-  return { calls, children, spawnImpl, exitGroup };
+  return { calls, children, spawnImpl, exitGroup, helloFailures };
 }
 
 /** @param {number} pid */
@@ -239,7 +227,7 @@ async function waitUntil(predicate) {
 it("creates and binds the registry before activation and reports ready after authenticated hello", async () => {
   /** @type {string[]} */
   const order = [];
-  const { runs, registry, ownership } = await setup();
+  const { runs, registry, ownership, router } = await setup();
   const originalBind = ownership.bindProcesses.bind(ownership);
   ownership.bindProcesses = async (...args) => {
     order.push("bind-supervisor");
@@ -250,9 +238,10 @@ it("creates and binds the registry before activation and reports ready after aut
     order.push("bind-pi-child");
     return originalBindPiChild(...args);
   };
-  const workers = fakeWorkerFactory({ order });
+  const workers = fakeWorkerFactory({ router, order });
   const supervisor = new WorkerSupervisor({
     registry,
+    router,
     ownership,
     runsDirectory: runs,
     spawnImpl: workers.spawnImpl,
@@ -276,29 +265,89 @@ it("creates and binds the registry before activation and reports ready after aut
   });
 });
 
-it("bounds complete frames by bytes and reports an oversized dropped frame", async () => {
-  const { runs, registry, ownership } = await setup();
-  const workers = fakeWorkerFactory();
-  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "frame-bytes-token" });
-  const handle = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "frame-bytes" });
-  const oversized = { type: "oversized", payload: "x".repeat(1024 * 1024) };
-  const retained = { type: "retained", sequence: 2 };
-  workers.children[0].emit("message", { version: 1, type: "pi_frame", token: "frame-bytes-token", sessionId: "one", frame: oversized });
-  workers.children[0].emit("message", { version: 1, type: "pi_frame", token: "frame-bytes-token", sessionId: "one", frame: retained });
-  /** @type {Record<string, unknown>[]} */
-  const received = [];
-  handle.onFrame((/** @type {Record<string, unknown>} */ nextFrame) => received.push(nextFrame));
-  expect(received).toEqual([
-    { type: "pi_agents_frame_queue_overflow", droppedFrames: 1, droppedBytes: Buffer.byteLength(JSON.stringify(oversized)), recovery: "snapshot_or_diagnostics" },
-    retained,
-  ]);
+it("authenticates and adopts the startup socket before activation, and persists the run token privately", async () => {
+  const { runs, registry, ownership, router, metadataPath, workers: persisted } = await setup();
+  const workers = fakeWorkerFactory({ router, holdHello: true });
+  const supervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "startup-socket-token", cliVersion: "9.9.9" });
+  const launched = supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-startup" });
+
+  await waitUntil(async () => workers.children.length === 1);
+  // The run and its token are durable before the worker is spawned, so a replacement daemon can
+  // authenticate the same run.
+  expect(await persisted()).toEqual([{ sessionId: "one", runId: "run-startup", leaseId: expect.any(String), generation: 1, token: "startup-socket-token", cliVersion: "9.9.9" }]);
+  expect((await stat(metadataPath)).mode & 0o777).toBe(0o600);
+  expect(workers.calls[0].options.stdio).toEqual(["ignore", expect.any(Number), expect.any(Number)]);
+  expect(workers.calls[0].options.env.NODE_CHANNEL_FD).toBeUndefined();
+
+  await workers.children[0].connect();
+  const handle = await launched;
+  expect(router.route("one")).toMatchObject({ metadata: { sessionId: "one", token: "startup-socket-token" }, connection: workers.children[0].connection });
+  expect(await persisted()).toEqual([{ sessionId: "one", runId: "run-startup", leaseId: handle.leaseId, generation: 1, identity: handle.identity, piChildIdentity: handle.piChildIdentity, token: "startup-socket-token", cliVersion: "9.9.9" }]);
   await supervisor.close();
 });
 
+it("holds an early startup socket until the spawned PID is registered", async () => {
+  const { runs, registry, ownership, router } = await setup();
+  const workers = fakeWorkerFactory({ router, holdHello: true });
+  // Publish the spawned PID by hand so the worker's hello provably arrives before the daemon knows it.
+  const reserve = router.reserve.bind(router);
+  /** @type {() => void} */
+  let publishPid = () => {};
+  router.reserve = async (/** @type {any} */ launch) => {
+    const reservation = await reserve(launch);
+    const spawned = reservation.spawned.bind(reservation);
+    reservation.spawned = (/** @type {number} */ pid) => { publishPid = () => spawned(pid); };
+    return reservation;
+  };
+  const supervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "early-hello-token" });
+
+  const launched = supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-early" });
+  await waitUntil(async () => workers.children.length === 1);
+  let held = true;
+  const bound = workers.children[0].connect().then((/** @type {any} */ value) => { held = false; return value; });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(held).toBe(true);
+  publishPid();
+  await expect(bound).resolves.toBeDefined();
+  await expect(launched).resolves.toMatchObject({ sessionId: "one", ready: true });
+  await supervisor.close();
+});
+
+it("rejects a startup socket without the per-run token", async () => {
+  const { runs, registry, ownership, router } = await setup();
+  const workers = fakeWorkerFactory({ router, holdHello: true, helloOverrides: { token: "not-the-run-token" } });
+  const supervisor = new WorkerSupervisor({
+    registry, router, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect,
+    randomId: () => "expected-run-token", startTimeoutMs: 60, ...fastLaunchStop,
+  });
+
+  const launched = supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-forged" });
+  await waitUntil(async () => workers.children.length === 1);
+  await expect(workers.children[0].connect()).resolves.toBeUndefined();
+  expect(workers.helloFailures).toEqual([expect.objectContaining({ code: "WORKER_AUTHENTICATION_FAILED" })]);
+  await expect(launched).rejects.toMatchObject({ code: "WORKER_START_TIMEOUT" });
+  expect(router.route("one")).toBeUndefined();
+  expect((await getRecord(registry, "one")).ownership).toBeUndefined();
+});
+
+it("holds pre-adoption worker frames on the reservation and hands them over in arrival order", async () => {
+  const { runs, registry, ownership, router } = await setup();
+  const workers = fakeWorkerFactory({ router, holdReady: true });
+  const supervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "buffered-frames-token", startTimeoutMs: 200, ...fastLaunchStop });
+  const launched = supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-buffered" });
+
+  await waitUntil(async () => (await workers.children[0]?.reservation())?.connection !== undefined);
+  const reservation = await workers.children[0].reservation();
+  for (const sequence of [1, 2, 3]) reservation.deliver({ version: 1, type: "pi_frame", token: "buffered-frames-token", sessionId: "one", frame: { sequence } });
+  expect(reservation.drainBuffered().map((/** @type {any} */ frame) => frame.frame.sequence)).toEqual([1, 2, 3]);
+  await expect(launched).rejects.toMatchObject({ code: "WORKER_START_TIMEOUT" });
+});
+
 it("classifies missing Pi discovery as a pre-child refusal", async () => {
-  const { runs, registry, ownership } = await setup();
+  const { runs, registry, ownership, router } = await setup();
   const supervisor = new WorkerSupervisor({
     registry,
+    router,
     ownership,
     runsDirectory: runs,
     resolveExecutableImpl: async () => { throw Object.assign(new Error("missing"), { code: "PI_EXECUTABLE_NOT_FOUND" }); },
@@ -309,31 +358,14 @@ it("classifies missing Pi discovery as a pre-child refusal", async () => {
   expect(await readdir(runs)).toEqual([]);
 });
 
-it("rejects hello authentication and process identity mismatches without binding", async () => {
-  const { runs, registry, ownership } = await setup(["one", "two"]);
-  const badAuth = fakeWorkerFactory({ helloOverrides: { token: "wrong-token" } });
-  const authSupervisor = new WorkerSupervisor({
-    registry,
-    ownership,
-    runsDirectory: runs,
-    spawnImpl: badAuth.spawnImpl,
-    inspect,
-    randomId: () => "expected-token",
-    ...fastLaunchStop,
-  });
-  await expect(authSupervisor.launch({
-    sessionId: "one",
-    canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile,
-    cwd: "/repo",
-    runId: "run-auth",
-  })).rejects.toMatchObject({ code: "WORKER_AUTH_FAILED" });
-
-  const badIdentity = fakeWorkerFactory({ helloOverrides: {
+it("refuses a startup socket whose claimed identity is not the spawned process-group leader", async () => {
+  const { runs, registry, ownership, router } = await setup(["one", "two"]);
+  const badIdentity = fakeWorkerFactory({ router, helloOverrides: {
     worker: { pid: 777, startIdentity: "forged", processGroupId: 777 },
-    piChild: { pid: 777, startIdentity: "forged", processGroupId: 777 },
   } });
   const identitySupervisor = new WorkerSupervisor({
     registry,
+    router,
     ownership,
     runsDirectory: runs,
     spawnImpl: badIdentity.spawnImpl,
@@ -347,15 +379,36 @@ it("rejects hello authentication and process identity mismatches without binding
     cwd: "/repo",
     runId: "run-identity",
   })).rejects.toMatchObject({ code: "WORKER_IDENTITY_MISMATCH" });
+
+  const badRun = fakeWorkerFactory({ router, helloOverrides: { runId: "another-run" } });
+  const runSupervisor = new WorkerSupervisor({
+    registry,
+    router,
+    ownership,
+    runsDirectory: runs,
+    spawnImpl: badRun.spawnImpl,
+    inspect,
+    randomId: () => "run-mismatch-token",
+    ...fastLaunchStop,
+  });
+  await expect(runSupervisor.launch({
+    sessionId: "one",
+    canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile,
+    cwd: "/repo",
+    runId: "run-auth",
+  })).rejects.toMatchObject({ code: "WORKER_HELLO_MISMATCH" });
   expect((await getRecord(registry, "one")).ownership).toBeUndefined();
   expect((await getRecord(registry, "two")).ownership).toBeUndefined();
+  expect(router.route("one")).toBeUndefined();
+  expect(router.route("two")).toBeUndefined();
 });
 
 it("atomically enforces the live-worker cap across concurrent different-session launches", async () => {
-  const { runs, registry, ownership } = await setup(["one", "two"]);
-  const workers = fakeWorkerFactory({ holdReady: true });
+  const { runs, registry, ownership, router } = await setup(["one", "two"]);
+  const workers = fakeWorkerFactory({ router, holdReady: true });
   const supervisor = new WorkerSupervisor({
     registry,
+    router,
     ownership,
     runsDirectory: runs,
     maxLive: 1,
@@ -376,9 +429,10 @@ it("atomically enforces the live-worker cap across concurrent different-session 
 });
 
 it("releases pending ownership after spawn failure", async () => {
-  const { runs, registry, ownership } = await setup();
+  const { runs, registry, ownership, router } = await setup();
   const supervisor = new WorkerSupervisor({
     registry,
+    router,
     ownership,
     runsDirectory: runs,
     spawnImpl() {
@@ -402,11 +456,13 @@ it.each([
   ["activation send", { activateSendError: true }],
   ["readiness authentication", { readyOverrides: { token: "wrong" } }],
 ])("stops and releases durable ownership after %s failure", async (_boundary, workerOptions) => {
-  const { runs, registry, ownership } = await setup();
+  const { runs, registry, ownership, router, useInspect } = await setup();
   const world = processWorld();
-  const workers = fakeWorkerFactory({ ...workerOptions, world });
+  useInspect(world.seams.inspect);
+  const workers = fakeWorkerFactory({ router, ...workerOptions, world });
   const supervisor = new WorkerSupervisor({
     registry,
+    router,
     ownership,
     runsDirectory: runs,
     spawnImpl: workers.spawnImpl,
@@ -426,11 +482,13 @@ it.each([
 });
 
 it("releases ownership and cap capacity when a ready worker and its Pi child both exit", async () => {
-  const { runs, registry, ownership } = await setup(["one", "two"]);
-  const workers = fakeWorkerFactory();
+  const { runs, registry, ownership, router, useInspect } = await setup(["one", "two"]);
+  const workers = fakeWorkerFactory({ router });
   const world = processWorld();
+  useInspect(world.seams.inspect);
   const supervisor = new WorkerSupervisor({
     registry,
+    router,
     ownership,
     runsDirectory: runs,
     maxLive: 1,
@@ -448,11 +506,13 @@ it("releases ownership and cap capacity when a ready worker and its Pi child bot
 });
 
 it("retains ownership and refuses a second writer while the orphaned Pi child stays exact and live", async () => {
-  const { runs, registry, ownership } = await setup();
-  const workers = fakeWorkerFactory();
+  const { runs, registry, ownership, router, useInspect } = await setup();
+  const workers = fakeWorkerFactory({ router });
   const world = processWorld({ signalKills: false });
+  useInspect(world.seams.inspect);
   const supervisor = new WorkerSupervisor({
     registry,
+    router,
     ownership,
     runsDirectory: runs,
     spawnImpl: workers.spawnImpl,
@@ -479,11 +539,13 @@ it("retains ownership and refuses a second writer while the orphaned Pi child st
 });
 
 it("releases ownership once the orphaned Pi child is provably gone", async () => {
-  const { runs, registry, ownership } = await setup();
-  const workers = fakeWorkerFactory();
+  const { runs, registry, ownership, router, useInspect } = await setup();
+  const workers = fakeWorkerFactory({ router });
   const world = processWorld({ signalKills: false });
+  useInspect(world.seams.inspect);
   const supervisor = new WorkerSupervisor({
     registry,
+    router,
     ownership,
     runsDirectory: runs,
     spawnImpl: workers.spawnImpl,
@@ -505,11 +567,13 @@ it.each([
   ["ambiguous", (/** @type {any} */ world, /** @type {number} */ pid) => world.hide(pid)],
   ["a recycled process id", (/** @type {any} */ world, /** @type {number} */ pid) => world.recycle(pid, "recycled")],
 ])("retains ownership and signals nothing when the recorded Pi child inspection is %s", async (_name, confuse) => {
-  const { runs, registry, ownership } = await setup();
-  const workers = fakeWorkerFactory();
+  const { runs, registry, ownership, router, useInspect } = await setup();
+  const workers = fakeWorkerFactory({ router });
   const world = processWorld();
+  useInspect(world.seams.inspect);
   const supervisor = new WorkerSupervisor({
     registry,
+    router,
     ownership,
     runsDirectory: runs,
     spawnImpl: workers.spawnImpl,
@@ -529,11 +593,13 @@ it.each([
 });
 
 it("reconciles an exit observed before readiness persistence without restoring LIVE", async () => {
-  const { runs, registry, ownership } = await setup();
+  const { runs, registry, ownership, router, useInspect } = await setup();
   const world = processWorld();
-  const workers = fakeWorkerFactory({ readyExitTiming: "before", world });
+  useInspect(world.seams.inspect);
+  const workers = fakeWorkerFactory({ router, readyExitTiming: "before", world });
   const supervisor = new WorkerSupervisor({
     registry,
+    router,
     ownership,
     runsDirectory: runs,
     spawnImpl: workers.spawnImpl,
@@ -546,53 +612,11 @@ it("reconciles an exit observed before readiness persistence without restoring L
   expect((await getRecord(registry, "one")).ownership).toBeUndefined();
 });
 
-it("discards a queued worker event after the worker exits", async () => {
-  const { runs, registry, ownership } = await setup();
-  const world = processWorld();
-  const workers = fakeWorkerFactory({ world });
-  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, randomId: () => "queued-event-token", ...world.seams });
-  await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "queued-event" });
-  const revision = (await getRecord(registry, "one")).revision;
-
-  workers.children[0].emit("message", {
-    type: "worker_event",
-    token: "queued-event-token",
-    sessionId: "one",
-    event: { type: "TURN_STARTED", at: "2026-08-25T12:01:00.000Z" },
-  });
-  workers.exitGroup(workers.children[0]);
-
-  await waitUntil(async () => (await getRecord(registry, "one")).ownership === undefined);
-  expect(await getRecord(registry, "one")).toMatchObject({ revision: revision + 1, taskState: "READY", processState: "EXITED" });
-});
-
-it("records a Pi-child crash that races the supervisor exit it caused", async () => {
-  const { runs, registry, ownership } = await setup();
-  const world = processWorld();
-  const workers = fakeWorkerFactory({ world });
-  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, randomId: () => "pi-crash-token", ...world.seams });
-  await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-pi-crash" });
-
-  workers.children[0].emit("message", {
-    type: "worker_event",
-    token: "pi-crash-token",
-    sessionId: "one",
-    event: { type: "PI_CHILD_CRASHED", at: "2026-08-25T12:04:00.000Z", summary: "Pi exited unexpectedly (SIGSEGV)" },
-  });
-  workers.exitGroup(workers.children[0]);
-
-  await waitUntil(async () => (await getRecord(registry, "one")).ownership === undefined);
-  expect(await getRecord(registry, "one")).toMatchObject({
-    taskState: "FAILED",
-    processState: "EXITED",
-    activity: { kind: "process_error", summary: "Pi exited unexpectedly (SIGSEGV)" },
-  });
-});
-
 it("retries failed terminal release during admission and admits the next session", async () => {
-  const { runs, registry, ownership } = await setup(["one", "two"]);
+  const { runs, registry, ownership, router, useInspect } = await setup(["one", "two"]);
   const world = processWorld();
-  const workers = fakeWorkerFactory({ world });
+  useInspect(world.seams.inspect);
+  const workers = fakeWorkerFactory({ router, world });
   const originalRelease = ownership.release.bind(ownership);
   let releases = 0;
   ownership.release = async (...args) => {
@@ -600,7 +624,7 @@ it("retries failed terminal release during admission and admits the next session
     if (releases === 1) throw new Error("release persistence failed");
     return originalRelease(...args);
   };
-  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, maxLive: 1, spawnImpl: workers.spawnImpl, randomId: () => `release-retry-${workers.calls.length}`, ...world.seams });
+  const supervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, maxLive: 1, spawnImpl: workers.spawnImpl, randomId: () => `release-retry-${workers.calls.length}`, ...world.seams });
   await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "release-retry-one" });
   workers.exitGroup(workers.children[0]);
   await waitUntil(async () => releases === 1);
@@ -611,99 +635,21 @@ it("retries failed terminal release during admission and admits the next session
 });
 
 it("does not charge an ownership-free stale LIVE record against managed capacity", async () => {
-  const { runs, registry, ownership } = await setup(["one", "two"]);
+  const { runs, registry, ownership, router } = await setup(["one", "two"]);
   const one = await getRecord(registry, "one");
   await registry.update("one", one.revision, { processState: "LIVE", updatedAt: "2026-08-25T12:03:00.000Z" });
-  const workers = fakeWorkerFactory();
-  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, maxLive: 1, spawnImpl: workers.spawnImpl, inspect, randomId: () => "stale-live-cap-token" });
+  const workers = fakeWorkerFactory({ router });
+  const supervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, maxLive: 1, spawnImpl: workers.spawnImpl, inspect, randomId: () => "stale-live-cap-token" });
 
   await expect(supervisor.launch({ sessionId: "two", canonicalSessionFile: (await getRecord(registry, "two")).canonicalSessionFile, cwd: "/repo", runId: "stale-live-cap" })).resolves.toMatchObject({ sessionId: "two" });
 });
 
-// The launch channel used to rebuild the session_command payload inline, keeping only model, level,
-// name, and instructions. Every other field was dropped, so a command carrying one reached the worker
-// stripped and was refused there. One projection is the fix; this pins that the duplicate is gone.
-it("projects a session command onto the launch channel exactly as the daemon does", async () => {
-  const { root, runs, registry, ownership } = await setup();
-  const workers = fakeWorkerFactory({ commandBehavior: "success" });
-  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "projection-token" });
-  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-projection" });
-  const journal = await createCommandJournal({ path: join(root, "commands.jsonl") });
-
-  await launched.deliver(/** @type {any} */ ({ version: 1, clientId: "client", requestId: "rename", op: "session_command", payload: { sessionId: "one", command: "set_session_name", name: "Coverage loader" } }), journal);
-  await launched.deliver(/** @type {any} */ ({ version: 1, clientId: "client", requestId: "brake", op: "session_command", payload: { sessionId: "one", command: "abort_retry" } }), journal);
-
-  const child = workers.children.at(-1);
-  const projected = child.send.mock.calls.map((/** @type {any[]} */ call) => call[0]).filter((/** @type {any} */ message) => message.type === "command").map((/** @type {any} */ message) => message.command.sessionCommand);
-  expect(projected).toEqual([{ command: "set_session_name", name: "Coverage loader" }, { command: "abort_retry" }]);
-  await journal.close();
-  await supervisor.close();
-});
-
-it("journals exact command stages before delivery and preserves request identity", async () => {
-  /** @type {string[]} */
-  const order = [];
-  const { root, runs, registry, ownership } = await setup();
-  const workers = fakeWorkerFactory({ order, commandBehavior: "success" });
-  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "command-token" });
-  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-command" });
-  const journal = await createCommandJournal({
-    path: join(root, "commands.jsonl"),
-    failpoint: async (name, record) => {
-      if (name === "after_sync") order.push(`journal:${record.status.clientId}:${record.status.requestId}:${record.status.stage}`);
-    },
-  });
-  const command = /** @type {import("../shared/contracts.mjs").ClientRequest} */ ({ version: 1, clientId: "client\0exact", requestId: "request\0exact", op: "prompt", payload: { sessionId: "one", text: "hello" } });
-
-  await launched.deliver(command, journal);
-
-  expect(await journal.history(command)).toEqual([
-    expect.objectContaining({ clientId: "client\0exact", requestId: "request\0exact", stage: "ACCEPTED" }),
-    expect.objectContaining({ stage: "DELIVERY_ATTEMPTED" }),
-    expect.objectContaining({ stage: "WORKER_ACKNOWLEDGED" }),
-    expect.objectContaining({ stage: "COMPLETED" }),
-  ]);
-  expect(order.indexOf("journal:client\0exact:request\0exact:ACCEPTED")).toBeLessThan(order.indexOf("parent:command"));
-  await journal.close();
-  await supervisor.close();
-});
-
-it("marks delivery unknown when the worker channel is lost after delivery starts", async () => {
-  const { root, runs, registry, ownership } = await setup();
-  const workers = fakeWorkerFactory({ commandBehavior: "disconnect" });
-  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "disconnect-token" });
-  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-disconnect" });
-  const journal = await createCommandJournal({ path: join(root, "commands.jsonl") });
-  const command = /** @type {import("../shared/contracts.mjs").ClientRequest} */ ({ version: 1, clientId: "client", requestId: "ambiguous", op: "prompt", payload: { sessionId: "one", text: "hello" } });
-
-  await expect(launched.deliver(command, journal)).resolves.toMatchObject({ stage: "DELIVERY_UNKNOWN" });
-  expect((await journal.get(command))?.stage).toBe("DELIVERY_UNKNOWN");
-  await journal.close();
-  await supervisor.close();
-});
-
-it.each([
-  ["ambiguous Pi transport loss", "delivery_unknown", "DELIVERY_UNKNOWN"],
-  ["explicit Pi error", "explicit_error", "FAILED"],
-])("journals %s at the matching delivery boundary", async (_name, commandBehavior, expectedStage) => {
-  const { root, runs, registry, ownership } = await setup();
-  const workers = fakeWorkerFactory({ commandBehavior: /** @type {any} */ (commandBehavior) });
-  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => `result-${commandBehavior}` });
-  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: `run-${commandBehavior}` });
-  const journal = await createCommandJournal({ path: join(root, `commands-${commandBehavior}.jsonl`) });
-  const command = /** @type {import("../shared/contracts.mjs").ClientRequest} */ ({ version: 1, clientId: "client", requestId: commandBehavior, op: "prompt", payload: { sessionId: "one", text: "hello" } });
-
-  await expect(launched.deliver(command, journal)).resolves.toMatchObject({ stage: expectedStage });
-  expect((await journal.get(command))?.stage).toBe(expectedStage);
-  await journal.close();
-  await supervisor.close();
-});
-
 it("routes stop through verified Task 6 identity and releases only after observed exit", async () => {
-  const { runs, registry, ownership } = await setup();
+  const { runs, registry, ownership, router, useInspect } = await setup();
   const world = processWorld();
-  const workers = fakeWorkerFactory({ world });
-  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, randomId: () => "stop-token", ...world.seams });
+  useInspect(world.seams.inspect);
+  const workers = fakeWorkerFactory({ router, world });
+  const supervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, randomId: () => "stop-token", ...world.seams });
   const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-stop" });
   let inspections = 0;
   const requestGraceful = vi.fn(async () => { workers.exitGroup(workers.children[0]); });
@@ -726,10 +672,11 @@ it("routes stop through verified Task 6 identity and releases only after observe
 });
 
 it("releases stale exact identity without signaling a replacement process", async () => {
-  const { runs, registry, ownership } = await setup();
+  const { runs, registry, ownership, router, useInspect } = await setup();
   const world = processWorld();
-  const workers = fakeWorkerFactory({ world });
-  const supervisor = new WorkerSupervisor({ registry, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, randomId: () => "stale-token", ...world.seams });
+  useInspect(world.seams.inspect);
+  const workers = fakeWorkerFactory({ router, world });
+  const supervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, randomId: () => "stale-token", ...world.seams });
   const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-stale" });
   const requestGraceful = vi.fn();
   const signalProcessGroup = vi.fn();

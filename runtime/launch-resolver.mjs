@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { stripVTControlCharacters } from "node:util";
@@ -117,6 +117,9 @@ export function createLaunchResolver({
     const checked = await preflight(payload, { piConfigRoot, currentOwnerSessionIds: [] });
     const preparedId = requiredId(randomId(), "Prepared launch ID");
     const runId = requiredId(randomId(), "Run ID");
+    // The run directory is named before the record exists, so the prepared row already resolves its
+    // own diagnostics under whatever state root currently holds it.
+    const runHash = createHash("sha256").update(`${runId}\0${preparedId}`).digest("hex");
     /** @type {any} */
     let isolation;
     if (checked.mode === "worktree") {
@@ -151,6 +154,8 @@ export function createLaunchResolver({
         isolation: isolation.mode === "worktree"
           ? { mode: "worktree", worktreePath: isolation.worktreePath, branch: isolation.branch }
           : { mode: "shared_directory", canonicalCwd: isolation.canonicalCwd },
+        latestRunId: runId,
+        runHash,
         createdAt: timestamp,
         updatedAt: timestamp,
       };
@@ -167,6 +172,7 @@ export function createLaunchResolver({
         canonicalSessionFile: piSession.sessionFile,
         cwd: workerCwd,
         runId,
+        runHash,
         initialPrompt: payload.prompt,
         sessionRecord,
         ...(payload.model === undefined ? {} : { model: { ...payload.model } }),

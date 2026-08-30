@@ -11,7 +11,7 @@ npm install -g pi-agents
 pi-agents
 ```
 
-To install a local checkout instead, run `npm install -g /absolute/path/to/pi-agents`. The executable is `pi-agents`. With no arguments, it starts or connects to the per-user daemon and opens the session list. New sessions start from the directory where you ran the command.
+To install a local checkout instead, run `npm install -g /absolute/path/to/pi-agents`. The executable is `pi-agents`. If your shell cannot find it, the global npm prefix is not on your `PATH`; link it somewhere that is, for example `ln -s "$(npm prefix -g)/bin/pi-agents" ~/.local/bin/pi-agents`. With no arguments, it starts or connects to the per-user daemon and opens the session list. New sessions start from the directory where you ran the command.
 
 If `pi` is not on `PATH`, pass its absolute path:
 
@@ -60,10 +60,24 @@ Pi owns the slash prefix in the viewer. The viewer passes unknown slash-prefixed
 
 Press Escape while a turn is working to interrupt it. After the turn settles, press Escape again to return to the list. When Pi is idle, Escape returns immediately. Closing the dashboard does not stop Pi.
 
+## Upgrading
+
+Restart the daemon and every open dashboard after upgrading:
+
+```bash
+pi-agents daemon restart
+```
+
+A running daemon holds the code it loaded at startup while it spawns workers from the code now on disk. If the two disagree, launches fail with `WORKER_PROCESS_EXITED` until the daemon restarts. Live sessions survive a daemon restart; their workers reconnect.
+
 ## Troubleshooting
 
 - **`pi` cannot be found or executed:** put the installed executable on `PATH`, or start with `pi-agents --pi-bin /absolute/path/to/pi`. The override must be absolute.
 - **`NOT_GIT_REPOSITORY` or `UNBORN_HEAD`:** the default worktree launch needs a Git repository with at least one commit. Use `/cwd` to select one, or use `/isolation shared` and confirm the exact path.
 - **`UNSUPPORTED_PI_CAPABILITY`:** the installed Pi does not provide an RPC command or event required by this dashboard. Use a compatible Pi executable.
-- **`SESSION_IN_USE`:** another dashboard owns that session's composer role. Return from or close the other viewer, then open the session again.
+- **`SESSION_IN_USE`:** another dashboard is driving that session. One dashboard writes to a session at a time; several dashboards on different sessions work normally. Return from or close the other viewer, then open the session again.
+- **`STATE_ROOTS_SPLIT`:** two state roots both hold sessions. Stop the daemon in each, move the sessions you keep into one root, and remove the other. `pi-agents` will not merge them.
+- **A start message says a live daemon or worker still holds the state root:** the directory cannot be renamed while sessions are running. The dashboard uses the existing root and renames it on the first start after those sessions stop.
+- **`WORKER_PROCESS_EXITED` right after an upgrade:** the daemon is running older code than the workers it spawns. Run `pi-agents daemon restart`.
+- **An empty session list right after an upgrade:** the dashboard predates the current protocol. Quit it and start it again.
 - **The daemon does not start:** the error includes captured startup output when available. The same output is stored at `${PI_AGENTS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/pi-agents}/daemon/startup.log`.

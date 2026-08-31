@@ -406,7 +406,7 @@ describe("dashboard controller", () => {
     });
     // Operator-visible failure: each save fsyncs the file and its directory, about 70 ms on a
     // network home, so a burst that saved per change stalled the list while an agent streamed.
-    it("writes nothing durable while list invalidations arrive", async () => {
+    it("writes nothing durable while list invalidations arrive, and persists no cursor", async () => {
         const backend = new FakeBackend([session("a")]);
         const saves = [];
         const dashboard = controller(backend, { persistence: { async load() { return undefined; }, async save(value) { saves.push(value); } } });
@@ -417,6 +417,9 @@ describe("dashboard controller", () => {
         expect(dashboard.sessions[0].revision).toBe(5);
         await dashboard.close();
         expect(saves.length).toBeGreaterThan(before);
+        // The coverage cursor is the daemon's, held in memory for one read; nothing persists it.
+        expect(dashboard.coverageCursor).toEqual(backend.snapshot.cursor);
+        for (const state of saves) expect(state).not.toHaveProperty("cursor");
     });
     it("retires the pending row as soon as the real session appears", async () => {
         let release = () => {};

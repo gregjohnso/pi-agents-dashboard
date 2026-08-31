@@ -17,14 +17,13 @@ import { parseViewerSnapshot } from "./viewer-contracts.mjs";
 /** @typedef {{mode:"worktree"}|{mode:"shared_directory",confirmedCwd:string,ownerSessionIds:string[]}} LaunchIsolation */
 /** @typedef {{prompt:string,cwd:string,sourceSessionId:string,isolation:LaunchIsolation,model?:{provider:string,id:string},name?:string}} LaunchRequest */
 /** @typedef {{provider:string,id:string,thinking:boolean}} CatalogModel */
-/** @typedef {{daemonEpoch:string,sequence:string}} EventCursor */
+/** How far a daemon's session list had advanced when it read a snapshot. @typedef {{daemonEpoch:string,sequence:string}} ListCursor */
 /** @typedef {{daemonEpoch:string,sessionId:string,sequence:string}} ViewerCursor */
 /** @typedef {"ACCEPTED"|"DELIVERY_ATTEMPTED"|"WORKER_ACKNOWLEDGED"|"COMPLETED"|"DELIVERY_UNKNOWN"|"FAILED"} CommandStage */
 /** @typedef {{code:string,message:string,retryable:boolean}} DashboardError */
 /** @typedef {{clientId:string,requestId:string,operation:string,stage:CommandStage,acceptedAt:string,updatedAt:string,error?:DashboardError}} CommandStatus */
 /** @typedef {{version:number,clientId:string,requestId:string,op:string,payload:any}} ClientRequest */
 /** @typedef {any} DaemonResponse */
-/** @typedef {{version:1,cursor:EventCursor,occurredAt:string,kind:"session_changed"|"command_changed"|"attachment_changed",payload:any}} PersistedEvent */
 /** @typedef {{version:1,kind:"list_changed"}} ListChanged */
 
 const ENVELOPE_KEYS = ["version", "clientId", "requestId", "op", "payload"];
@@ -124,7 +123,7 @@ function validateExecutableIdentity(value, path) {
   if (!Number.isSafeInteger(executable.size) || executable.size < 0) throw new TypeError(`${path}.size is invalid`);
 }
 
-/** @param {unknown} value @param {string} path @returns {EventCursor} */
+/** @param {unknown} value @param {string} path @returns {ListCursor} */
 function readCursor(value, path) {
   const cursor = readRecord(value, path);
   rejectUnknownKeys(cursor, ["daemonEpoch", "sequence"], path);
@@ -420,23 +419,3 @@ export function parseListChanged(value) {
   return { version: 1, kind: "list_changed" };
 }
 
-/** Parse one strict version-1 persisted event broadcast to subscribers. @param {unknown} value @returns {PersistedEvent} */
-export function parsePersistedEvent(value) {
-  const event = readRecord(value, "Persisted event");
-  requireKeys(event, ["version", "cursor", "occurredAt", "kind", "payload"], [], "persisted event");
-  if (event.version !== 1) throw new TypeError("Persisted event version must be 1");
-  readCursor(event.cursor, "persisted event.cursor");
-  readIdentifier(event, "occurredAt", "persisted event.occurredAt");
-  const kind = readEnum(event, "kind", ["session_changed", "command_changed", "attachment_changed"], "persisted event.kind");
-  const payload = readRecord(event.payload, "persisted event.payload");
-  if (kind === "session_changed") { requireKeys(payload, ["session"], [], "persisted event.payload"); validateSession(payload.session, "persisted event.payload.session"); }
-  else if (kind === "command_changed") { requireKeys(payload, ["status"], [], "persisted event.payload"); validateCommandStatus(payload.status, "persisted event.payload.status"); }
-  else {
-    requireKeys(payload, ["sessionId", "clientId", "role", "attached"], [], "persisted event.payload");
-    readIdentifier(payload, "sessionId", "persisted event.payload.sessionId");
-    readIdentifier(payload, "clientId", "persisted event.payload.clientId");
-    readEnum(payload, "role", ["composer", "observer"], "persisted event.payload.role");
-    if (typeof payload.attached !== "boolean") throw new TypeError("persisted event.payload.attached must be a boolean");
-  }
-  return /** @type {PersistedEvent} */ (value);
-}

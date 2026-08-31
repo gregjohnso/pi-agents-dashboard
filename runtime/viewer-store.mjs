@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { parseViewerEvent, parseViewerSnapshot } from "../shared/viewer-contracts.mjs";
 import { openDurableAppendStore, AppendStoreError } from "./append-store.mjs";
 import { atomicWriteJson } from "./atomic-file.mjs";
-import { parseCursorSequence } from "./event-store.mjs";
 import { ensurePrivateDirectory } from "./permissions.mjs";
 
 const MAX_RECORD_BYTES = 1024 * 1024;
@@ -30,9 +29,10 @@ function canonical(value) {
   return JSON.stringify(value) ?? "null";
 }
 
-/** @param {unknown} value */
+/** Parse the canonical unsigned sequence representation a durable viewer cursor uses. @param {unknown} value */
 function sequence(value) {
-  try { return parseCursorSequence(value); } catch (cause) { throw new ViewerStoreError("INVALID_VIEWER_CURSOR", "Viewer cursor sequence must be a canonical unsigned integer string", { cause }); }
+  if (typeof value !== "string" || !/^(0|[1-9]\d*)$/u.test(value)) throw new ViewerStoreError("INVALID_VIEWER_CURSOR", "Viewer cursor sequence must be a canonical unsigned integer string");
+  return BigInt(value);
 }
 
 /** @param {string} directory @param {string} sessionId */

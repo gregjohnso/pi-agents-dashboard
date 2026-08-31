@@ -13,7 +13,7 @@ import { ViewerController } from "../viewer/viewer-controller.mjs";
 import { DashboardController, createDaemonDashboardBackend } from "./dashboard.mjs";
 import { validateFrontendState } from "./frontend-state.mjs";
 
-/** Create private fsync-backed frontend cursor persistence. @param {string} path @param {string} clientId @param {{fsOps?:any,failpoint?:(stage:string)=>unknown|Promise<unknown>}} [options] */
+/** Create private fsync-backed frontend view-state persistence. @param {string} path @param {string} clientId @param {{fsOps?:any,failpoint?:(stage:string)=>unknown|Promise<unknown>}} [options] */
 export function createFrontendPersistence(path, clientId, options = {}) {
   const fsOps = options.fsOps ?? fs;
   const failpoint = options.failpoint ?? (() => {});

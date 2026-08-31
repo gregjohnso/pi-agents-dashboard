@@ -199,20 +199,40 @@ it("holds a reattach behind the same session's in-flight detach", async () => {
   expect(order).toEqual(["detach:start", "attach:run", "detach:done", "attach:run"]);
 });
 
-it("does not replace the prior cursor when publication fails before rename", async () => {
+it("does not replace the prior view state when publication fails before rename", async () => {
   const path = await fixture();
-  const original = { schemaVersion: 1, clientId: "client", cursor: { daemonEpoch: "epoch", sequence: "1" }, viewState: { query: { view: "live" } }, launchDraft: {} };
+  const original = { schemaVersion: 1, clientId: "client", viewState: { query: { view: "live" } }, launchDraft: { prompt: "draft" } };
   await writeFile(path, `${JSON.stringify(original)}\n`, { mode: 0o600 });
   const persistence = createFrontendPersistence(path, "client", { failpoint(stage) { if (stage === "after_file_sync") throw new Error("crash"); } });
-  await expect(persistence.save({ ...original, cursor: { daemonEpoch: "epoch", sequence: "2" } })).rejects.toThrow("crash");
+  await expect(persistence.save({ ...original, viewState: { query: { view: "all" } } })).rejects.toThrow("crash");
   expect(JSON.parse(await readFile(path, "utf8"))).toEqual(original);
 });
 
-it("refuses malformed or non-private cursor state", async () => {
+it("refuses non-private frontend state and malformed view state", async () => {
   const path = await fixture();
-  await writeFile(path, JSON.stringify({ schemaVersion: 1, clientId: "client", cursor: { daemonEpoch: "epoch", sequence: "01" } }), { mode: 0o644 });
+  await writeFile(path, JSON.stringify({ schemaVersion: 1, clientId: "client", viewState: {}, launchDraft: {} }), { mode: 0o644 });
   await expect(createFrontendPersistence(path, "client").load()).rejects.toMatchObject({ code: "FRONTEND_STATE_UNSAFE" });
 
+  const malformed = await fixture();
+  await writeFile(malformed, JSON.stringify({ schemaVersion: 1, clientId: "client", viewState: null, launchDraft: {} }), { mode: 0o600 });
+  await expect(createFrontendPersistence(malformed, "client").load()).rejects.toMatchObject({ code: "FRONTEND_STATE_CORRUPT" });
+});
+
+// Operator-visible failure: his frontend-state.json carries a list cursor this release retired. A
+// key the validator refused would make the dashboard fail to open on the file it wrote yesterday.
+it("loads state that still carries the retired list cursor and never writes one back", async () => {
+  const path = await fixture();
+  // Nothing reads the retired key, so its shape is no longer checked either: a cursor a crash left
+  // half-written must not be the reason the operator's dashboard refuses to open.
+  const stored = { schemaVersion: 1, clientId: "client", cursor: { daemonEpoch: "epoch", sequence: "01" }, viewState: { query: { view: "all" } }, launchDraft: { prompt: "keep me" } };
+  await writeFile(path, `${JSON.stringify(stored)}\n`, { mode: 0o600 });
+  const persistence = createFrontendPersistence(path, "client");
+  const loaded = await persistence.load();
+  expect(loaded.viewState).toEqual({ query: { view: "all" } });
+  expect(loaded.launchDraft).toEqual({ prompt: "keep me" });
+
+  await persistence.save({ schemaVersion: 1, clientId: "client", viewState: { query: { view: "live" } }, launchDraft: { prompt: "keep me" } });
+  expect(JSON.parse(await readFile(path, "utf8"))).not.toHaveProperty("cursor");
 });
 
 describe("viewer transition failures", () => {

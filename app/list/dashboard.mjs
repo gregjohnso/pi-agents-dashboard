@@ -1370,12 +1370,11 @@ export class DashboardController {
         clearInterval(this.animationTimer);
         this.animationTimer = undefined;
     }
-    persistedState(cursor = this.coverageCursor) {
+    persistedState() {
         const { sourceSessionId: _sourceSessionId, ...launchDraft } = this.composerDraft;
         return {
             schemaVersion: 1,
             clientId: this.clientId,
-            cursor,
             viewState: {
                 query: (({ historyPolicy: _historyPolicy, ...query }) => query)(this.query),
                 selectedSessionId: this.preferredSelectionId ?? this.selectedSessionId,

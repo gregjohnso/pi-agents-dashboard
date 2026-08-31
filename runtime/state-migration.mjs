@@ -7,7 +7,6 @@ import { validateFrontendState } from "../app/list/frontend-state.mjs";
 import { convertLegacyDashboardConfig } from "../shared/config.mjs";
 import { parseClientRequest, parseDaemonResponse } from "../shared/contracts.mjs";
 import { validateAttachmentResultRecord } from "./attachment-result-store.mjs";
-import { validatePersistedEvent } from "./event-store.mjs";
 import { validateSessionRecord } from "./registry-store.mjs";
 import { validateWorkerReplayRecord } from "./worker-replay-contract.mjs";
 
@@ -42,8 +41,6 @@ function validateJsonLines(text, validate, label) {
   return values;
 }
 /** @param {any} value */
-function validCursorStore(value) { return typeof value === "object" && value !== null && !Array.isArray(value) && Object.entries(value).every(([clientId, cursor]) => clientId.length > 0 && typeof cursor === "object" && cursor !== null && !Array.isArray(cursor) && Object.keys(cursor).length === 2 && Object.keys(cursor).every((key) => ["daemonEpoch", "sequence"].includes(key)) && typeof cursor.daemonEpoch === "string" && cursor.daemonEpoch.length > 0 && /^(0|[1-9]\d*)$/u.test(cursor.sequence)); }
-/** @param {any} value */
 function validLaunchResults(value) { return value?.schemaVersion === 1 && typeof value.results === "object" && value.results !== null && !Array.isArray(value.results) && Object.keys(value).length === 2 && Object.keys(value).every((key) => ["schemaVersion", "results"].includes(key)) && Object.values(value.results).every((result) => typeof result?.sessionId === "string" && result.sessionId.length > 0 && Object.keys(result).length === 1); }
 /** @param {any} value */
 function validDeleteResults(value) {
@@ -68,19 +65,12 @@ function validateLegacyArtifact(relative, text) {
       if (publication.schemaVersion !== 1 || !validIdentity(publication) || typeof publication.daemonEpoch !== "string" || typeof publication.tokenPath !== "string" || typeof publication.startedAt !== "string" || !["STARTING", "RECONCILING", "READY", "FAILED"].includes(publication.state)) throw new TypeError("Daemon publication is invalid");
       return;
     }
-    if (relative === "daemon/event-acks.json") { if (!validCursorStore(JSON.parse(text))) throw new TypeError("Event cursor store is invalid"); return; }
     if (relative === "daemon/launch-results.json") { if (!validLaunchResults(JSON.parse(text))) throw new TypeError("Launch result store is invalid"); return; }
     if (relative === "daemon/delete-results.json") { if (!validDeleteResults(JSON.parse(text))) throw new TypeError("Delete result store is invalid"); return; }
     if (relative === "daemon/attachment-results.jsonl") {
       const records = validateJsonLines(text, validateAttachmentResultRecord, "Attachment result store");
       const latest = new Map();
       for (const record of records) { const key = `${record.request.clientId}\0${record.request.requestId}`; const previous = latest.get(key); if (previous !== undefined && !(previous.phase === "PREPARED" && record.phase === "COMPLETED" && previous.requestCanonical === record.requestCanonical)) throw new TypeError("Attachment result transition is invalid"); latest.set(key, record); }
-      return;
-    }
-    if (relative === "index/events.jsonl") {
-      const events = validateJsonLines(text, validatePersistedEvent, "Event store");
-      const epoch = events[0]?.cursor.daemonEpoch;
-      if (events.some((event, index) => event.cursor.daemonEpoch !== epoch || event.cursor.sequence !== String(index + 1))) throw new TypeError("Event store sequence is invalid");
       return;
     }
     if (relative === "queue/commands.jsonl") {

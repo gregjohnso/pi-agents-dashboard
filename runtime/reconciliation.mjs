@@ -4,7 +4,6 @@ import { join } from "node:path";
 
 import { atomicWriteJson } from "./atomic-file.mjs";
 import { createCommandJournal } from "./command-journal.mjs";
-import { createEventStore } from "./event-store.mjs";
 import { traceSessionLock } from "./lock-trace.mjs";
 import { RegistryStore, registryCoordinationScope } from "./registry-store.mjs";
 import { SessionCoordinator } from "./session-coordinator.mjs";
@@ -722,11 +721,8 @@ async function createViewerRecovery({ root, daemonEpoch, registry }) {
 export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReconnect = async () => [], onViewerReady = () => {}, router: suppliedRouter, signal }) {
   const registry = new RegistryStore(join(root, "sessions"));
   const journalPath = join(root, "queue", "commands.jsonl");
-  const eventPath = join(root, "index", "events.jsonl");
   /** @type {any} */
   let journal;
-  /** @type {any} */
-  let events;
   /** @type {any} */
   let viewer;
   const router = suppliedRouter ?? new RecoveredWorkerRouter({ registry, inspect, metadataPath: join(root, "daemon", "workers.json") });
@@ -737,12 +733,11 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReco
     cancelled();
     journal = await createCommandJournal({ path: journalPath });
     cancelled();
-    events = await createEventStore({ path: eventPath, daemonEpoch });
     await router.load();
     viewer = await createViewerRecovery({ root, daemonEpoch, registry });
     await onViewerReady(viewer);
     cancelled();
-    /** @type {any[]} */
+    /** Session records this recovery rewrote. The list is invalidated once for all of them. @type {any[]} */
     const repairedSessions = [];
     for (const record of await registry.list()) {
       cancelled();
@@ -755,7 +750,7 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReco
         activity: next.activity,
         updatedAt: next.updatedAt,
       });
-      repairedSessions.push(await events.append({ kind: "session_changed", payload: { session: updated } }));
+      repairedSessions.push(updated);
     }
     cancelled();
     /**
@@ -789,7 +784,7 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReco
         });
         // Worker metadata is what lets a later daemon find this child again, so it is forgotten only now.
         await forget();
-        repairedSessions.push(await events.append({ kind: "session_changed", payload: { session: updated } }));
+        repairedSessions.push(updated);
         return undefined;
       });
     };
@@ -857,7 +852,6 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReco
     return {
       registry,
       journal,
-      events,
       router,
       liveWorkers,
       conflicts,
@@ -865,13 +859,13 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReco
       recoveryActions,
       viewer,
       async close() {
-        const results = await Promise.allSettled([router.close(), journal.close(), events.close(), viewer.close()]);
+        const results = await Promise.allSettled([router.close(), journal.close(), viewer.close()]);
         const errors = results.filter((result) => result.status === "rejected").map((result) => result.reason);
         if (errors.length > 0) throw new AggregateError(errors, "Reconciliation stores closed with errors");
       },
     };
   } catch (error) {
-    await Promise.allSettled([journal?.close(), events?.close(), viewer?.close()]);
+    await Promise.allSettled([journal?.close(), viewer?.close()]);
     if (suppliedRouter === undefined) await router.close().catch(() => {});
     throw error;
   }

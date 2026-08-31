@@ -26,7 +26,7 @@ import { spawn as spawnProcess } from "node:child_process";
 import { createModelCatalog } from "./pi-model-catalog.mjs";
 import { WorkerSupervisor } from "./worker-supervisor.mjs";
 import { loadDashboardConfig } from "../shared/config.mjs";
-import { parseClientRequest, piConfirmedModel } from "../shared/contracts.mjs";
+import { CLIENT_PROTOCOL, parseClientRequest, piConfirmedModel } from "../shared/contracts.mjs";
 
 initializeRuntimePermissions();
 
@@ -120,42 +120,6 @@ async function privateText(path, create) {
 
 async function checkDefaultHost() {
   return { blockers: [], daemonOwnedStartup: true };
-}
-
-/** @param {string} path @param {string} daemonEpoch */
-async function createCursorStore(path, daemonEpoch) {
-  /** @type {Record<string, { daemonEpoch: string, sequence: string }>} */
-  let cursors = {};
-  try {
-    const value = JSON.parse(await fs.readFile(path, "utf8"));
-    if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("Event cursor store is invalid");
-    for (const [clientId, cursor] of Object.entries(value)) {
-      if (clientId.length === 0 || typeof cursor !== "object" || cursor === null || /** @type {any} */ (cursor).daemonEpoch !== daemonEpoch || !/^(0|[1-9]\d*)$/u.test(/** @type {any} */ (cursor).sequence) || Object.keys(cursor).some((key) => !["daemonEpoch", "sequence"].includes(key))) throw new TypeError("Event cursor store is invalid");
-    }
-    cursors = /** @type {any} */ (value);
-  } catch (error) {
-    if (!(error instanceof Error) || /** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT") throw error;
-  }
-  let tail = Promise.resolve();
-  return {
-    /** @param {string} clientId @param {{ daemonEpoch: string, sequence: string }} cursor @param {{ daemonEpoch: string, sequence: string }} maximum */
-    acknowledge(clientId, cursor, maximum) {
-      const result = tail.then(async () => {
-        if (cursor.daemonEpoch !== daemonEpoch || maximum.daemonEpoch !== daemonEpoch || !/^(0|[1-9]\d*)$/u.test(cursor.sequence)) throw Object.assign(new Error("Cursor epoch or sequence is invalid"), { code: "INVALID_CURSOR" });
-        const sequence = BigInt(cursor.sequence);
-        if (sequence > BigInt(maximum.sequence)) throw Object.assign(new Error("Cursor is ahead of the event store"), { code: "INVALID_CURSOR" });
-        const previous = cursors[clientId];
-        if (previous !== undefined && BigInt(previous.sequence) >= sequence) return previous;
-        const accepted = { daemonEpoch, sequence: String(sequence) };
-        cursors = { ...cursors, [clientId]: accepted };
-        await atomicWriteJson(path, cursors);
-        return accepted;
-      });
-      tail = result.then(() => {}, () => {});
-      return result;
-    },
-    async close() { await tail; },
-  };
 }
 
 /** @param {string} path */
@@ -373,7 +337,6 @@ export function createBoundedSocketWriter(socket, { maxPendingBytes, maxPendingR
 /** @param {{ socketPath: string, token: string, maxBytes: number, workerRequestTimeoutMs: number, context: any }} options */
 function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutMs, context }) {
   const sockets = new Set();
-  const subscribers = new Set();
   /** Sockets watching the session list. They receive payload-free invalidations and nothing else. */
   const listSubscribers = new Set();
   const viewerSubscriptions = new Map();
@@ -391,6 +354,8 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
     broadcastWriters.set(socket, createBoundedSocketWriter(socket, { maxPendingBytes: Math.min(4 * maxBytes, 4 * 1024 * 1024), maxPendingRecords: 256 }));
     let authenticated = false;
     let role = "frontend";
+    /** The client protocol a frontend connection declared, if it declared one. @type {number | undefined} */
+    let clientProtocol;
     /** @type {string | undefined} */
     let frontendClientId;
     /** @type {any} */
@@ -442,7 +407,6 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
     socket.on("close", () => {
       context.markAttachmentClosing(socket);
       sockets.delete(socket);
-      subscribers.delete(socket);
       listSubscribers.delete(socket);
       broadcastWriters.delete(socket);
       const activeViewerSubscriptions = viewerSubscriptions.get(socket) ?? [];
@@ -476,13 +440,14 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
         const operation = chain.then(async () => {
           if (!context.admissionOpen) throw Object.assign(new Error("Daemon is shutting down"), { code: "SHUTTING_DOWN", retryable: true });
           if (!authenticated) {
-            const allowed = ["version", "token", "role", "action"];
-            if (typeof frame !== "object" || frame === null || Array.isArray(frame) || Object.keys(frame).some((key) => !allowed.includes(key)) || frame.version !== 1 || !sameToken(frame.token, token) || (frame.role !== undefined && !["frontend", "worker", "control"].includes(frame.role)) || (frame.action !== undefined && (frame.role !== "control" || frame.action !== "stop"))) {
+            const allowed = ["version", "token", "role", "action", "clientProtocol"];
+            if (typeof frame !== "object" || frame === null || Array.isArray(frame) || Object.keys(frame).some((key) => !allowed.includes(key)) || frame.version !== 1 || !sameToken(frame.token, token) || (frame.role !== undefined && !["frontend", "worker", "control"].includes(frame.role)) || (frame.action !== undefined && (frame.role !== "control" || frame.action !== "stop")) || (frame.clientProtocol !== undefined && !Number.isSafeInteger(frame.clientProtocol))) {
               await send({ version: 1, ok: false, error: dashboardError(frame?.version === 1 ? "AUTHENTICATION_FAILED" : "UNSUPPORTED_VERSION", "Invalid daemon authentication") });
               socket.end();
               return;
             }
             role = frame.role ?? "frontend";
+            clientProtocol = frame.clientProtocol;
             authenticated = true;
             await send({ version: 1, kind: "authenticated", ...context.publicStatus() });
             if (role === "control") {
@@ -518,6 +483,18 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
             await context.handleWorkerFrame(frame, workerConnection, workerMetadata, workerRouteGeneration);
             return;
           }
+          // A frontend that did not declare this release's client protocol is refused at its first
+          // request, not at authentication: the daemon-liveness probe sends no request, so a new
+          // command-line client can still find and stop an older daemon during the upgrade.
+          if (clientProtocol !== CLIENT_PROTOCOL) {
+            await send({
+              version: 1,
+              requestId: typeof frame?.requestId === "string" ? frame.requestId : "invalid-request",
+              ok: false,
+              error: dashboardError("UNSUPPORTED_CLIENT_PROTOCOL", `This daemon speaks client protocol ${CLIENT_PROTOCOL}; restart every dashboard on the same release`),
+            });
+            return;
+          }
           let request;
           try {
             request = parseClientRequest(frame);
@@ -540,14 +517,11 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
           /** @type {AsyncIterableIterator<any> | undefined} */
           let viewerSubscription;
           try {
-            const result = await context.handleRequest(request, socket, subscribers, frontendClientId);
+            const result = await context.handleRequest(request, socket, frontendClientId);
             viewerSubscription = result?._viewerSubscription;
             const publicResult = viewerSubscription === undefined ? result : { kind: result.kind, cursor: result.cursor };
             await context.writeResponse({ request, value: response(request.requestId, publicResult), write: send, close });
-            if (request.op === "subscribe") {
-              const replay = await context.recovery.events.replay(request.payload.after);
-              for (const event of replay) await send(event);
-            } else if (viewerSubscription !== undefined) {
+            if (viewerSubscription !== undefined) {
               let active = viewerSubscriptions.get(socket);
               if (active === undefined) { active = new Set(); viewerSubscriptions.set(socket, active); }
               active.add(viewerSubscription);
@@ -580,7 +554,6 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
   });
   server.on("error", () => {});
   return {
-    subscribers,
     listSubscribers,
     sockets,
     async listen() {
@@ -592,11 +565,6 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
         });
       });
       await fs.chmod(socketPath, 0o600);
-    },
-    /** @param {any} event */
-    broadcast(event) {
-      const encoded = createJsonlEncoder({ maxBytes }).encode(event);
-      for (const socket of subscribers) broadcastWriters.get(socket)?.enqueue(encoded);
     },
     /** Tell every list subscriber the session list changed, without saying what changed. */
     broadcastListChanged() {
@@ -650,7 +618,6 @@ export async function createDaemonRuntime({
   signalProcessGroupImpl = signalProcessGroup,
   sleepImpl = sleep,
   trashSessionFile,
-  broadcastEvent,
   cliVersion,
 } = {}) {
   if (typeof root !== "string" || resolve(root) !== root) throw new TypeError("Daemon runtime root must be an absolute canonical path");
@@ -713,27 +680,18 @@ export async function createDaemonRuntime({
       recovery: undefined,
       viewerRecovery: undefined,
       listSubscribers: new Set(),
-      cursorStore: undefined,
       launchResults: undefined,
       attachmentResults: undefined,
       deleteResults: undefined,
       router,
       workerPending: new Map(),
       hostReport: undefined,
-      broadcast: () => {},
+      notifyListChanged: () => {},
       writeResponse: responseWriter,
       requestStop: () => resolveStopRequested(undefined),
       publicStatus() { return { state: context.state, recovering: ["STARTING", "RECONCILING"].includes(context.state), error: context.stateError, daemonEpoch, pid: identity.pid }; },
       /** @param {net.Socket} socket */
       markAttachmentClosing(socket) { closingAttachmentSockets.add(socket); },
-      /** Append and broadcast one session's new record. @param {any} session */
-      async publishSession(session) {
-        context.broadcast(await context.recovery.events.append({ kind: "session_changed", payload: { session } }));
-      },
-      /** Append and broadcast one durable command's new status. @param {any} status */
-      async publishCommand(status) {
-        context.broadcast(await context.recovery.events.append({ kind: "command_changed", payload: { status } }));
-      },
       /** Mint one worker command ID that no earlier command in this daemon has used. */
       nextCommandId() {
         const id = randomId();
@@ -835,7 +793,7 @@ export async function createDaemonRuntime({
           if (latest?.ownership?.runId === record.ownership.runId) {
             const exited = reduceSessionState(latest, { type: "WORKER_EXITED", at: new Date().toISOString() });
             const updated = await registry.update(latest.sessionId, latest.revision, { ownership: undefined, taskState: exited.taskState, processState: exited.processState, outcome: latest.outcome, activity: exited.activity, updatedAt: exited.updatedAt });
-            await context.publishSession(updated);
+            context.notifyListChanged();
           }
           // The replaced run's private metadata, including its pending replacement, goes with the run.
           await forget();
@@ -884,7 +842,7 @@ export async function createDaemonRuntime({
           if (current.taskState === derived || (current.taskState !== "WORKING" && current.taskState !== "READY")) return;
           const next = reduceSessionState(current, { type: streaming ? "TURN_STARTED" : "TURN_COMPLETED", at: new Date().toISOString() });
           const updated = await registry.update(current.sessionId, current.revision, { taskState: next.taskState, processState: next.processState, outcome: next.outcome, activity: next.activity, updatedAt: next.updatedAt });
-          await context.publishSession(updated);
+          context.notifyListChanged();
         }, "reconcile_activity");
       },
       /**
@@ -908,7 +866,7 @@ export async function createDaemonRuntime({
             ...(typeof thinkingLevel === "string" ? { thinkingLevel } : {}),
             updatedAt: new Date().toISOString(),
           });
-          await context.publishSession(updated);
+          context.notifyListChanged();
         }, "record_model");
       },
       /**
@@ -950,7 +908,7 @@ export async function createDaemonRuntime({
                 // Only a name the operator typed sets nameGenerated false; an absent flag is a legacy name of unknown provenance, which the agent may replace.
                 const namesItself = typeof writtenName === "string" && writtenName.trim().length > 0 && current.nameGenerated !== false;
                 const updated = await registry.update(current.sessionId, current.revision, { summary: { text: text.trim().slice(0, 512), generatedAt: new Date().toISOString(), model: { ...summaryModel }, sourceCursor }, ...(namesItself ? { name: writtenName.trim().slice(0, 128), nameGenerated: true } : {}), updatedAt: new Date().toISOString() });
-                await context.publishSession(updated);
+                context.notifyListChanged();
               }, "summary_write");
             } catch {
             } finally {
@@ -1007,11 +965,6 @@ export async function createDaemonRuntime({
         sessionStarts.set(sessionId, start);
         try { await start; } finally { if (sessionStarts.get(sessionId) === start) sessionStarts.delete(sessionId); }
       },
-      /** @param {string} sessionId @param {string} clientId @param {"composer" | "observer"} role @param {boolean} attached */
-      async appendAttachment(sessionId, clientId, role, attached) {
-        if (context.recovery?.events === undefined) throw Object.assign(new Error("Attachment event store is unavailable"), { code: "RECOVERING" });
-        return context.recovery.events.append({ kind: "attachment_changed", payload: { sessionId, clientId, role, attached } });
-      },
       /** @param {any} request @param {net.Socket} socket @param {string} authenticatedClientId */
       async arbitrateAttachment(request, socket, authenticatedClientId) {
         if (request.clientId !== authenticatedClientId) throw Object.assign(new Error("Attachment client identity changed"), { code: "CLIENT_IDENTITY_CONFLICT" });
@@ -1067,12 +1020,10 @@ export async function createDaemonRuntime({
               await context.attachmentResults.prepare(request, outcome);
               await checkpoint("after_prepared");
               if (prior !== undefined && prior.clientId === authenticatedClientId) {
-                const event = await context.appendAttachment(sessionId, authenticatedClientId, prior.role, false);
-                await checkpoint("after_event_append");
                 claims.delete(socket);
                 if (claims.size === 0) attachmentClaims.delete(sessionId);
                 await checkpoint("after_claim_mutation");
-                context.broadcast(event);
+                context.notifyListChanged();
                 await checkpoint("after_broadcast");
               }
             } else {
@@ -1084,12 +1035,10 @@ export async function createDaemonRuntime({
               await context.attachmentResults.prepare(request, outcome);
               await checkpoint("after_prepared");
               if (prior === undefined || prior.clientId !== authenticatedClientId || prior.role !== grantedRole) {
-                const event = await context.appendAttachment(sessionId, authenticatedClientId, grantedRole, true);
-                await checkpoint("after_event_append");
                 if (existingClaims === undefined) attachmentClaims.set(sessionId, claims);
                 claims.set(socket, { clientId: authenticatedClientId, role: grantedRole });
                 await checkpoint("after_claim_mutation");
-                context.broadcast(event);
+                context.notifyListChanged();
                 await checkpoint("after_broadcast");
               }
             }
@@ -1130,10 +1079,9 @@ export async function createDaemonRuntime({
           if (claims === undefined) return;
           const prior = claims.get(socket);
           if (prior === undefined || prior.clientId !== authenticatedClientId) return;
-          const event = await context.appendAttachment(sessionId, authenticatedClientId, prior.role, false);
           claims.delete(socket);
           if (claims.size === 0) attachmentClaims.delete(sessionId);
-          context.broadcast(event);
+          context.notifyListChanged();
         }, "release_attachments")));
         attachmentSessions.delete(socket);
       },
@@ -1184,14 +1132,14 @@ export async function createDaemonRuntime({
             return next === current ? undefined : { taskState: next.taskState, processState: next.processState, outcome: next.outcome, activity: next.activity, updatedAt: next.updatedAt };
           });
           settled = updated;
-          await context.publishSession(updated);
+          context.notifyListChanged();
         });
         // Pi settling this run is the one fact that opens an automatic replacement boundary, and it
         // opens it once per turn rather than on every event a settled session goes on to emit.
         if (previousTaskState !== "READY") context.scheduleUpgradeRespawn(metadata.sessionId, settled);
       },
-      /** @param {any} request @param {net.Socket | undefined} socket @param {Set<net.Socket>} subscribers @param {string} [authenticatedClientId] */
-      async handleRequest(request, socket, subscribers, authenticatedClientId = request.clientId, duringRecovery = false) {
+      /** @param {any} request @param {net.Socket | undefined} socket @param {string} [authenticatedClientId] */
+      async handleRequest(request, socket, authenticatedClientId = request.clientId, duringRecovery = false) {
         if (!context.admissionOpen) throw Object.assign(new Error("Daemon is shutting down"), { code: "SHUTTING_DOWN", retryable: true });
         if (request.op === "get_state") {
           // Read the coverage cursor before the registry, never after. A snapshot newer than its own
@@ -1211,7 +1159,7 @@ export async function createDaemonRuntime({
         if (request.op === "set_session_color") {
           return runSessionLifecycle(registry, request.payload.sessionId, async () => {
             const updated = await applySessionColor(registry, request.payload.sessionId, request.payload.color);
-            await context.publishSession(updated);
+            context.notifyListChanged();
             return { kind: "session_colored", sessionId: updated.sessionId, revision: updated.revision, color: updated.color ?? null };
           }, "set_session_color");
         }
@@ -1233,24 +1181,14 @@ export async function createDaemonRuntime({
           if (store === undefined) throw Object.assign(new Error("Viewer session does not exist"), { code: "SESSION_NOT_FOUND" });
           return { kind: "viewer_acknowledged", cursor: await store.acknowledge(authenticatedClientId, request.payload.cursor) };
         }
-        if (request.op === "subscribe") {
-          if (socket === undefined) throw new TypeError("Subscription requires a live socket");
-          subscribers.add(socket);
-          return { kind: "subscribed", cursor: context.recovery.events.currentCursor() };
-        }
         if (request.op === "subscribe_list_changes") {
           if (socket === undefined) throw new TypeError("List subscription requires a live socket");
           context.listSubscribers.add(socket);
           return { kind: "list_subscribed" };
         }
-        if (request.op === "ack") {
-          if (request.clientId !== authenticatedClientId) throw Object.assign(new Error("Cursor client identity changed"), { code: "CLIENT_IDENTITY_CONFLICT" });
-          const cursor = await context.cursorStore.acknowledge(authenticatedClientId, request.payload.cursor, context.recovery.events.currentCursor());
-          return { kind: "acknowledged", cursor };
-        }
         if (request.op === "resolve_delivery") {
           const status = await context.recovery.journal.resolveDelivery({ clientId: request.payload.targetClientId, requestId: request.payload.targetRequestId }, request.payload.resolution);
-          await context.publishCommand(status);
+          context.notifyListChanged();
           return { kind: "command", status };
         }
         if (request.op === "launch") {
@@ -1293,7 +1231,7 @@ export async function createDaemonRuntime({
             launch = await resolveLaunchRequest(request);
             if (launch.sessionRecord !== undefined && await registry.get(launch.sessionId) === undefined) {
               const prepared = await registry.create(launch.sessionRecord);
-              await context.publishSession(prepared);
+              context.notifyListChanged();
             }
             const launched = await runSessionLifecycle(registry, launch.sessionId, async () => {
               if (launchingSessions.has(launch.sessionId)) throw Object.assign(new Error("A launch is already in flight for this session"), { code: "LAUNCH_IN_FLIGHT" });
@@ -1342,7 +1280,7 @@ export async function createDaemonRuntime({
                   activity: { kind: "launch_failed", summary: error instanceof Error ? error.message : "Launch failed", updatedAt: new Date().toISOString() },
                   updatedAt: new Date().toISOString(),
                 });
-                await context.publishSession(updated);
+                context.notifyListChanged();
               }
               await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
               await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "FAILED", dashboardError(launchError.code ?? "LAUNCH_FAILED", error instanceof Error ? error.message : "Launch failed"));
@@ -1447,7 +1385,7 @@ export async function createDaemonRuntime({
                   // Stop is a task-state verdict; a reviewable outcome the session already earned stays intact.
                   const stopped = reduceSessionState(latest, { type: "USER_STOPPED", at: new Date().toISOString() });
                   const updated = await registry.update(latest.sessionId, latest.revision, { ownership: undefined, taskState: stopped.taskState, processState: stopped.processState, outcome: latest.outcome, activity: stopped.activity, updatedAt: stopped.updatedAt });
-                  await context.publishSession(updated);
+                  context.notifyListChanged();
                 }
                 await forget();
               }
@@ -1584,13 +1522,14 @@ export async function createDaemonRuntime({
             const current = await registry.get(request.payload.sessionId);
             if (current === undefined || current.name === request.payload.name) return;
             const updated = await registry.update(current.sessionId, current.revision, { name: request.payload.name, nameGenerated: false, updatedAt: new Date().toISOString() });
-            await context.publishSession(updated);
+            context.notifyListChanged();
           }, "set_session_name");
         }
         if (changed) {
-          const publish = () => context.publishCommand(status);
-          if (typeof request.payload?.sessionId === "string") await runSessionLifecycle(registry, request.payload.sessionId, publish, "publish_command");
-          else await publish();
+          // Notify under this session's lifecycle lock, so the invalidation cannot overtake a write
+          // the same lock is still making.
+          if (typeof request.payload?.sessionId === "string") await runSessionLifecycle(registry, request.payload.sessionId, async () => context.notifyListChanged(), "notify_list_changed");
+          else context.notifyListChanged();
         }
         return { kind: "command", status };
       },
@@ -1600,13 +1539,11 @@ export async function createDaemonRuntime({
     await socketServer.listen();
     socketOwned = true;
     context.listSubscribers = socketServer.listSubscribers;
-    context.broadcast = (/** @type {any} */ event) => {
-      const delivered = broadcastEvent !== undefined ? broadcastEvent(event, () => socketServer.broadcast(event)) : socketServer.broadcast(event);
-      // Every list change advances the coverage cursor and then tells the list, in that order, so a
-      // read that starts after the change reports a cursor that already includes it.
+    context.notifyListChanged = () => {
+      // Advance the coverage cursor and then tell the list, in that order, so a read that starts
+      // after the change reports a cursor that already includes it.
       listSequence += 1;
       socketServer.broadcastListChanged();
-      return delivered;
     };
 
     context.state = "RECONCILING";
@@ -1635,14 +1572,13 @@ export async function createDaemonRuntime({
         context.recovery = reconcile === undefined ? await defaultReconcile() : await reconcile({ root, daemonEpoch, router, defaultReconcile, signal: recoveryController.signal });
         context.viewerRecovery = context.recovery.viewer;
         if (context.recovery.conflicts.length > 0) throw Object.assign(new Error("Worker ownership conflicts block daemon recovery"), { code: "OWNERSHIP_CONFLICT", conflicts: context.recovery.conflicts });
-        context.cursorStore = await createCursorStore(join(daemonDirectory, "event-acks.json"), daemonEpoch);
         context.launchResults = await createLaunchResultStore(join(daemonDirectory, "launch-results.json"));
         context.attachmentResults = await createAttachmentResultStore({ path: join(daemonDirectory, "attachment-results.jsonl") });
         context.deleteResults = await createDeleteResultStore(join(daemonDirectory, "delete-results.json"));
-        for (const event of context.recovery.repairedSessions ?? []) context.broadcast(event);
+        if ((context.recovery.repairedSessions ?? []).length > 0) context.notifyListChanged();
         for (const entry of context.attachmentResults.entries()) await context.recovery.journal.reconcileAttachment(entry.request, entry.phase);
         for (const action of context.recovery.recoveryActions) {
-          if (action.action === "SAFE_REDELIVERY" && !["attach", "detach"].includes(action.command.op)) await context.handleRequest(action.command, undefined, new Set(), action.command.clientId, true);
+          if (action.action === "SAFE_REDELIVERY" && !["attach", "detach"].includes(action.command.op)) await context.handleRequest(action.command, undefined, action.command.clientId, true);
         }
         context.state = "READY";
         await updateDaemonLifecycleState(claim, "READY");
@@ -1703,7 +1639,6 @@ export async function createDaemonRuntime({
           await cleanup("reconciliation", async () => { await Promise.allSettled([ready]); });
           await cleanup("request_chains", () => socketServer.drainAndClose());
           await cleanup("supervisor", async () => workerSupervisor?.close?.());
-          await cleanup("cursor_store", async () => context.cursorStore?.close());
           await cleanup("launch_result_store", async () => context.launchResults?.close());
           await cleanup("attachment_result_store", async () => context.attachmentResults?.close());
           await cleanup("delete_result_store", async () => context.deleteResults?.close());

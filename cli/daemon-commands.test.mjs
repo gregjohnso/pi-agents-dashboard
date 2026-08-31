@@ -236,3 +236,22 @@ it("maps absent, unhealthy, and identity-conflict status to stable exit codes", 
     expect(result.code).toBe(code);
   }
 });
+
+// Operator-visible failure: this release changes the frontend protocol, so the daemon refuses a
+// frontend that does not declare it. The liveness probe deliberately declares nothing, because a
+// command-line client from this release must still find and stop a daemon from the previous one —
+// otherwise `pi-agents daemon restart` breaks during the one release that requires a restart.
+it("probes a daemon without declaring the client protocol", async () => {
+  const { createDaemonRuntime } = await import("../runtime/daemon.mjs");
+  const { probeDaemon } = await import("./daemon-commands.mjs");
+  const stateRoot = await mkdtemp(join(tmpdir(), "pi-agents-probe-protocol-"));
+  const runtime = await createDaemonRuntime({ root: stateRoot });
+  try {
+    await runtime.ready;
+    expect(await probeDaemon({ tokenPath: join(stateRoot, "daemon", "control.token") }, { timeoutMs: 5_000 }))
+      .toMatchObject({ reachable: true, state: "READY" });
+  } finally {
+    await runtime.close();
+    await rm(stateRoot, { recursive: true, force: true });
+  }
+});

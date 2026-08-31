@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { afterEach, expect, it } from "vitest";
 
 import { createCommandJournal } from "./command-journal.mjs";
-import { createEventStore } from "./event-store.mjs";
 import { RegistryStore } from "./registry-store.mjs";
 import { RecoveredWorkerRouter, reconcileRuntime } from "./reconciliation.mjs";
 
@@ -53,21 +52,19 @@ it("reopens truncated stores and converts unresolved delivery to DELIVERY_UNKNOW
   await writeFile(join(root, "runs", "worker-replay.jsonl"), `${JSON.stringify({ clientId: "client", requestId: "request", op: "prompt", stage: "RECEIVED", at: "2026-08-25T12:00:00.000Z" })}\n`, { mode: 0o600 });
   await appendFile(journalPath, "{\"torn\":");
 
+  // A retired list history, torn by the same crash. Recovery must neither read it nor recreate it.
   const eventPath = join(root, "index", "events.jsonl");
-  const events = await createEventStore({ path: eventPath, daemonEpoch: "epoch" });
-  const persisted = await events.append({ kind: "attachment_changed", payload: { sessionId: "one", clientId: "client", role: "observer", attached: true } });
-  await events.close();
-  await appendFile(eventPath, "{\"torn\":");
+  const retired = `${JSON.stringify({ version: 1, cursor: { daemonEpoch: "epoch", sequence: "1" }, occurredAt: "2026-08-25T12:00:00.000Z", kind: "attachment_changed", payload: { sessionId: "one", clientId: "client", role: "observer", attached: true } })}\n{"torn":`;
+  await writeFile(eventPath, retired, { mode: 0o600 });
 
   const recovered = await reconcileRuntime({ root, daemonEpoch: "epoch", inspect: async () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); }, waitForReconnect: async () => [] });
   expect(await recovered.journal.get(command)).toMatchObject({ stage: "DELIVERY_UNKNOWN" });
   expect(recovered.recoveryActions).toContainEqual(expect.objectContaining({ clientId: "client", requestId: "request", sessionId: "one", action: "DELIVERY_AMBIGUOUS" }));
-  expect(await recovered.events.replay()).toEqual([persisted]);
   await recovered.close();
   const secondRecovery = await reconcileRuntime({ root, daemonEpoch: "epoch", inspect: async () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); } });
   expect(await secondRecovery.journal.get(command)).toMatchObject({ stage: "DELIVERY_UNKNOWN" });
-  expect(await secondRecovery.events.replay()).toEqual([persisted]);
   await secondRecovery.close();
+  expect(await readFile(eventPath, "utf8")).toBe(retired);
 });
 
 it("redelivers only ACCEPTED commands and never acknowledged or worker-local RECEIVED attempts", async () => {
@@ -185,7 +182,7 @@ it("reclaims a session whose supervisor and recorded Pi child are both gone or r
     expect(repaired).toMatchObject({ processState: "EXITED", taskState: "READY" });
     expect(repaired?.ownership).toBeUndefined();
   }
-  expect(recovered.repairedSessions.map((event) => event.payload.session.sessionId).sort()).toEqual(["dead-pair", "replaced-pair"]);
+  expect(recovered.repairedSessions.map((session) => session.sessionId).sort()).toEqual(["dead-pair", "replaced-pair"]);
   await recovered.close();
 });
 

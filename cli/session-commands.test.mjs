@@ -381,7 +381,7 @@ it.each([
 it.each([
   ["unknown successful result", { version: 1, requestId: "strict-request", ok: true, result: { kind: "mystery" } }, "INVALID_DAEMON_RESPONSE"],
   ["wrong request ID", { version: 1, requestId: "other", ok: true, result: { kind: "state", sessions: [], cursor: { daemonEpoch: "epoch", sequence: "0" } } }, "UNEXPECTED_DAEMON_RESPONSE"],
-  ["event frame", { version: 1, cursor: { daemonEpoch: "epoch", sequence: "1" }, occurredAt: "now", kind: "command_changed", payload: {} }, "UNEXPECTED_DAEMON_FRAME"],
+  ["list invalidation", { version: 1, kind: "list_changed" }, "UNEXPECTED_DAEMON_FRAME"],
   ["invalid error", { version: 1, requestId: "strict-request", ok: false, error: { code: "NO", message: "bad" } }, "INVALID_DAEMON_RESPONSE"],
 ])("rejects %s as a typed protocol failure", async (_name, frame, code) => {
   const root = await stateRoot();

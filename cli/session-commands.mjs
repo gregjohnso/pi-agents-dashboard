@@ -11,7 +11,7 @@ import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
 import { acquireLifecycleLock } from "../runtime/lifecycle-lock.mjs";
 import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
 import { loadDashboardConfig } from "../shared/config.mjs";
-import { parseDaemonResponse } from "../shared/contracts.mjs";
+import { CLIENT_PROTOCOL, parseDaemonResponse } from "../shared/contracts.mjs";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
 const IDENTITY_LOCK_TIMEOUT_MS = 5_000;
@@ -293,7 +293,7 @@ export function createDaemonRequester({ root = resolveRuntimeRoot(), clientId, m
       };
       const transportClosed = (error) => finalizeTransport(submitted ? deliveryUnknown() : error ?? Object.assign(new Error("Daemon connection closed"), { code: "CONNECTION_CLOSED" }));
       timer = setTimeout(() => finalizeTransport(submitted && !READ_ONLY_OPERATIONS.has(op) ? deliveryUnknown() : Object.assign(new Error("Daemon request timed out"), { code: "DAEMON_REQUEST_TIMEOUT" })), timeoutMs);
-      socket.once("connect", () => socket.write(encoder.encode({ version: 1, token })));
+      socket.once("connect", () => socket.write(encoder.encode({ version: 1, token, clientProtocol: CLIENT_PROTOCOL })));
       socket.on("error", transportClosed);
       socket.on("data", (chunk) => {
         try {

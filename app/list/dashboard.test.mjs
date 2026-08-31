@@ -661,6 +661,24 @@ describe("dashboard controller", () => {
         expect(dashboard.status).toMatchObject({ kind: "error", code: "INVALID_RESPONSE" });
         await dashboard.close();
     });
+    // Operator-visible failure: an unrestarted dashboard against this daemon used to read rows once
+    // and then freeze on them with a ready status line, which the operator cannot tell from a list
+    // that simply has nothing new. The refusal has to reach the row he actually looks at.
+    it("shows a refused client protocol on the status line and stops", async () => {
+        const backend = new FakeBackend([session("a")]);
+        backend.subscribeFailure = Object.assign(new Error("This daemon speaks client protocol 2; restart every dashboard on the same release"), { code: "UNSUPPORTED_CLIENT_PROTOCOL" });
+        const onClose = vi.fn();
+        const dashboard = controller(backend, { onClose });
+        await dashboard.open();
+        expect(dashboard.status).toMatchObject({ kind: "error", code: "UNSUPPORTED_CLIENT_PROTOCOL" });
+        const rendered = dashboard.render(120, 24).map(stripVTControlCharacters).join("\n");
+        expect(rendered).toContain("UNSUPPORTED_CLIENT_PROTOCOL");
+        expect(rendered).toContain("restart every dashboard on the same release");
+        await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith(expect.objectContaining({ kind: "error", code: "UNSUPPORTED_CLIENT_PROTOCOL" })));
+        // It never reads rows it cannot keep current.
+        expect(backend.reads).toBe(0);
+        expect(dashboard.sessions).toEqual([]);
+    });
     it("restores safe view state but never stale composer ownership", async () => {
         const saved = persistence({
             schemaVersion: 1,

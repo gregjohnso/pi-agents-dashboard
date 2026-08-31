@@ -8,6 +8,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { createDaemonRuntime } from "../runtime/daemon.mjs";
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
 import { RegistryStore } from "../runtime/registry-store.mjs";
+import { CLIENT_PROTOCOL } from "../shared/contracts.mjs";
 
 const roots = [];
 const runtimes = [];
@@ -59,7 +60,7 @@ function connect(runtime, role = "frontend") {
       else waiter(frame);
     }
   });
-  socket.once("connect", () => socket.write(encoder.encode({ version: 1, token: runtime.token, role })));
+  socket.once("connect", () => socket.write(encoder.encode({ version: 1, token: runtime.token, role, ...(role === "frontend" ? { clientProtocol: CLIENT_PROTOCOL } : {}) })));
   const next = () => queue.length > 0 ? Promise.resolve(queue.shift()) : new Promise((resolve) => waiters.push(resolve));
   return {
     socket,

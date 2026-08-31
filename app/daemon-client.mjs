@@ -1,7 +1,7 @@
 import net from "node:net";
 import { randomUUID } from "node:crypto";
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
-import { parseDaemonResponse, parseListChanged } from "../shared/contracts.mjs";
+import { CLIENT_PROTOCOL, parseDaemonResponse, parseListChanged } from "../shared/contracts.mjs";
 import { parseViewerEvent, parseViewerSnapshot } from "../shared/viewer-contracts.mjs";
 /**
  * How much answered-request history one client keeps to deduplicate a repeated request ID.
@@ -172,7 +172,7 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
         };
         candidate.on("connect", () => {
             try {
-                candidate.write(encoder.encode({ version: 1, token }));
+                candidate.write(encoder.encode({ version: 1, token, clientProtocol: CLIENT_PROTOCOL }));
             }
             catch (error) {
                 failAttempt(error);

@@ -18,9 +18,7 @@ const acceptedRequests = [
   ["stop", { sessionId: "session", revision: 2 }],
   ["delete", { sessionId: "session", revision: 2 }],
   ["respawn", { sessionId: "session", revision: 2 }],
-  ["subscribe", {}],
   ["subscribe_list_changes", {}],
-  ["ack", { cursor: { daemonEpoch: "epoch", sequence: "2" } }],
   ["get_viewer_snapshot", { sessionId: "session" }],
   ["subscribe_viewer", { sessionId: "session", after: { daemonEpoch: "epoch", sessionId: "session", sequence: "2" } }],
   ["ack_viewer", { cursor: { daemonEpoch: "epoch", sessionId: "session", sequence: "2" } }],
@@ -60,6 +58,11 @@ const rejectedRequests = [
   ["the entry tree", "session_query", { sessionId: "session", query: "get_tree" }, /operation/iu],
   ["an HTML export", "session_query", { sessionId: "session", query: "export_html" }, /operation/iu],
   ["an HTML export to a caller-chosen path", "session_query", { sessionId: "session", query: "export_html", outputPath: "/tmp/session.html" }, /operation/iu],
+  // Ship only subscribe_list_changes. The retired operations are unknown to the strict contract;
+  // there is no fallback and no special refusal for them.
+  ["the retired list subscription", "subscribe", {}, /operation/iu],
+  ["a retired list subscription resuming from a cursor", "subscribe", { after: { daemonEpoch: "epoch", sequence: "2" } }, /operation/iu],
+  ["the retired list acknowledgement", "ack", { cursor: { daemonEpoch: "epoch", sequence: "2" } }, /operation/iu],
 ];
 
 const sessionRecord = { schemaVersion: 1, revision: 1, sessionId: "s", sessionFile: "/s.jsonl", canonicalSessionFile: "/s.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "idle", summary: "Idle", updatedAt: "2026-01-01T00:00:00.000Z" }, summary: { text: "Refactored the loader and ran tests", generatedAt: "2026-01-01T00:00:00.000Z", model: { provider: "anthropic", id: "haiku" }, sourceCursor: "42" }, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" };
@@ -108,6 +111,10 @@ const rejectedResponses = [
   ["an empty worker release string", ok({ kind: "state", sessions: [{ ...sessionRecord, workerCliVersion: "" }], cursor: coverage }), /workerCliVersion/u],
   ["a list subscription that carries a cursor", ok({ kind: "list_subscribed", cursor: coverage }), /unknown/iu],
   ["session query rows", ok({ kind: "session_query", sessionId: "session", query: "get_session_stats", rows: ["messages: 12"] }), /kind/iu],
+  // The retired list-event protocol: one subscription that replayed a persisted history, and the
+  // acknowledgement that moved a durable cursor through it.
+  ["a retired list subscription", ok({ kind: "subscribed", cursor: coverage }), /kind/iu],
+  ["a retired list acknowledgement", ok({ kind: "acknowledged", cursor: coverage }), /kind/iu],
   ["unknown model catalog field", ok({ ...modelCatalog, unknown: true }), /unknown/iu],
   ["unknown field on a catalog model", ok({ kind: "models", models: [{ provider: "anthropic", id: "claude", thinking: true, unknown: true }] }), /unknown/iu],
   ["a catalog model without a thinking flag", ok({ kind: "models", models: [{ provider: "anthropic", id: "claude" }] }), /thinking/iu],
@@ -161,7 +168,7 @@ describe("command contracts", () => {
     for (const [name, value] of [
       ["a session payload", { version: 1, kind: "list_changed", payload: { session: sessionRecord } }],
       ["a cursor", { version: 1, kind: "list_changed", cursor: coverage }],
-      ["a retired persisted event", { version: 1, cursor: coverage, occurredAt: "2026-01-01T00:00:00.000Z", kind: "session_changed", payload: { session: sessionRecord } }],
+      ["a retired persisted list event", { version: 1, cursor: coverage, occurredAt: "2026-01-01T00:00:00.000Z", kind: "session_changed", payload: { session: sessionRecord } }],
       ["a version this release does not speak", { version: 2, kind: "list_changed" }],
     ]) {
       expect(() => parseListChanged(value), /** @type {string} */ (name)).toThrow();

@@ -28,11 +28,20 @@ import { parseViewerSnapshot } from "./viewer-contracts.mjs";
 /** @typedef {{version:1,kind:"list_changed"}} ListChanged */
 
 const ENVELOPE_KEYS = ["version", "clientId", "requestId", "op", "payload"];
+/**
+ * The frontend protocol this release speaks, declared as `clientProtocol` in the socket
+ * authentication frame. Protocol 2 replaced the replayed list-event stream with payload-free
+ * invalidations, so a frontend and a daemon on different sides of that change cannot share a list.
+ * The daemon refuses a frontend that declares anything else at its first request. Worker and
+ * control connections deliberately carry no `clientProtocol`: a live worker must survive a daemon
+ * replacement, and the daemon-liveness probe must still find and stop an older daemon.
+ */
+export const CLIENT_PROTOCOL = 2;
 /** Operator-chosen row tints, named for the Jobwatch palette. Dashboard metadata; Pi never sees them. */
 export const SESSION_COLORS = ["sky", "green", "amber", "rose", "cyan", "gray"];
 /** @typedef {"sky"|"green"|"amber"|"rose"|"cyan"|"gray"} SessionColor */
 
-const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "respawn", "ui_response", "subscribe", "subscribe_list_changes", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries", "set_session_color", "get_models"];
+const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "respawn", "ui_response", "subscribe_list_changes", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries", "set_session_color", "get_models"];
 const COMMAND_STAGES = ["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED", "DELIVERY_UNKNOWN", "FAILED"];
 const SESSION_COMMANDS = ["set_model", "compact", "set_session_name", "abort_retry"];
 const MAX_MENU_ENTRIES = 1_000;
@@ -231,14 +240,6 @@ export function parseClientRequest(value) {
     if (!Object.hasOwn(payload, "response")) throw new TypeError("ui_response payload.response is required");
     return { ...base, payload: { sessionId: readIdentifier(payload, "sessionId", "ui_response payload.sessionId"), uiRequestId: readIdentifier(payload, "uiRequestId", "ui_response payload.uiRequestId"), response: readJsonValue(payload.response, "ui_response payload.response") } };
   }
-  if (op === "subscribe") {
-    const payload = readRecord(request.payload, "subscribe payload"); rejectUnknownKeys(payload, ["after"], "subscribe payload");
-    return { ...base, payload: Object.hasOwn(payload, "after") ? { after: readCursor(payload.after, "subscribe payload.after") } : {} };
-  }
-  if (op === "ack") {
-    const payload = readRecord(request.payload, "ack payload"); rejectUnknownKeys(payload, ["cursor"], "ack payload");
-    return { ...base, payload: { cursor: readCursor(payload.cursor, "ack payload.cursor") } };
-  }
   if (["get_viewer_snapshot", "get_session_commands"].includes(op)) return { ...base, payload: readSessionPayload(request.payload, op) };
   if (op === "session_command") {
     const payload = readRecord(request.payload, "session_command payload");
@@ -366,7 +367,7 @@ export function parseDaemonResponse(value) {
   if (!response.ok) { requireKeys(response, ["version", "requestId", "ok", "error"], [], "daemon response"); validateError(response.error, "daemon response.error"); return response; }
   requireKeys(response, ["version", "requestId", "ok", "result"], [], "daemon response");
   const result = readRecord(response.result, "daemon response.result");
-  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "subscribed", "list_subscribed", "acknowledged", "viewer_snapshot", "viewer_subscribed", "viewer_acknowledged", "session_commands", "settings", "models", "summaries_refreshing", "session_colored"], "daemon response.result.kind");
+  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "list_subscribed", "viewer_snapshot", "viewer_subscribed", "viewer_acknowledged", "session_commands", "settings", "models", "summaries_refreshing", "session_colored"], "daemon response.result.kind");
   // `cursor` is how far the daemon's list had advanced when it read this snapshot, and it is
   // required: it is read before the registry, never after, so the snapshot always covers at least
   // that position. That ordering is what lets a client subscribe, read, and know the read cannot
@@ -401,8 +402,7 @@ export function parseDaemonResponse(value) {
   }
   else if (kind === "summaries_refreshing") { requireKeys(result, ["kind", "sessionIds"], [], "daemon response.result"); if (!Array.isArray(result.sessionIds)) throw new TypeError("daemon response.result.sessionIds must be an array"); result.sessionIds.forEach((/** @type {unknown} */ sessionId, /** @type {number} */ index) => { if (typeof sessionId !== "string" || sessionId.length === 0) throw new TypeError(`daemon response.result.sessionIds[${index}] must be a non-empty string`); }); }
   else if (kind === "viewer_snapshot") { requireKeys(result, ["kind", "snapshot"], [], "daemon response.result"); parseViewerSnapshot(result.snapshot); }
-  else if (["viewer_subscribed", "viewer_acknowledged"].includes(kind)) { requireKeys(result, ["kind", "cursor"], [], "daemon response.result"); readViewerCursor(result.cursor, "daemon response.result.cursor"); }
-  else { requireKeys(result, ["kind", "cursor"], [], "daemon response.result"); readCursor(result.cursor, "daemon response.result.cursor"); }
+  else { requireKeys(result, ["kind", "cursor"], [], "daemon response.result"); readViewerCursor(result.cursor, "daemon response.result.cursor"); }
   return response;
 }
 

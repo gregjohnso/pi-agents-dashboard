@@ -319,16 +319,15 @@ describe("daemon client", () => {
       else if (incoming.op === "subscribe_viewer") {
         reply({ kind: "viewer_subscribed", cursor: zero });
         socket.write(encodeJsonl(event));
-      } else if (incoming.op === "ack_viewer") reply({ kind: "viewer_acknowledged", cursor: incoming.payload.cursor });
+      }
     });
     const client = startClient({ socketPath, maxBytes: 4096 });
     await expect(client.getViewerSnapshot("session-1")).resolves.toEqual(snapshot);
     const iterator = client.subscribeViewer("session-1", zero)[Symbol.asyncIterator]();
     const delivered = await within(iterator.next());
     expect(delivered).toEqual({ value: event, done: false });
-    expect(operations).not.toContain("ack_viewer");
-    await expect(client.ackViewer(one)).resolves.toEqual(one);
-    expect(operations).toEqual(["get_viewer_snapshot", "subscribe_viewer", "ack_viewer"]);
+    expect(/** @type {Record<string, unknown>} */ (client).ackViewer).toBeUndefined();
+    expect(operations).toEqual(["get_viewer_snapshot", "subscribe_viewer"]);
     await iterator.return?.();
   });
 

@@ -31,7 +31,7 @@ const ENVELOPE_KEYS = ["version", "clientId", "requestId", "op", "payload"];
 export const SESSION_COLORS = ["sky", "green", "amber", "rose", "cyan", "gray"];
 /** @typedef {"sky"|"green"|"amber"|"rose"|"cyan"|"gray"} SessionColor */
 
-const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "respawn", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries", "set_session_color", "get_models"];
+const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "respawn", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "resolve_delivery", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries", "set_session_color", "get_models"];
 const COMMAND_STAGES = ["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED", "DELIVERY_UNKNOWN", "FAILED"];
 const SESSION_COMMANDS = ["set_model", "compact", "set_session_name", "abort_retry"];
 const MAX_MENU_ENTRIES = 1_000;
@@ -268,10 +268,6 @@ export function parseClientRequest(value) {
     if (after.sessionId !== sessionId) throw new TypeError("subscribe_viewer cursor session does not match payload session");
     return { ...base, payload: { sessionId, after } };
   }
-  if (op === "ack_viewer") {
-    const payload = readRecord(request.payload, "ack_viewer payload"); rejectUnknownKeys(payload, ["cursor"], "ack_viewer payload");
-    return { ...base, payload: { cursor: readViewerCursor(payload.cursor, "ack_viewer payload.cursor") } };
-  }
   const payload = readRecord(request.payload, "resolve_delivery payload"); rejectUnknownKeys(payload, ["targetClientId", "targetRequestId", "resolution"], "resolve_delivery payload");
   return { ...base, payload: { targetClientId: readIdentifier(payload, "targetClientId", "resolve_delivery payload.targetClientId"), targetRequestId: readIdentifier(payload, "targetRequestId", "resolve_delivery payload.targetRequestId"), resolution: readEnum(payload, "resolution", ["retry_at_risk", "abandon"], "resolve_delivery payload.resolution") } };
 }
@@ -365,7 +361,7 @@ export function parseDaemonResponse(value) {
   if (!response.ok) { requireKeys(response, ["version", "requestId", "ok", "error"], [], "daemon response"); validateError(response.error, "daemon response.error"); return response; }
   requireKeys(response, ["version", "requestId", "ok", "result"], [], "daemon response");
   const result = readRecord(response.result, "daemon response.result");
-  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "subscribed", "acknowledged", "viewer_snapshot", "viewer_subscribed", "viewer_acknowledged", "session_commands", "settings", "models", "summaries_refreshing", "session_colored"], "daemon response.result.kind");
+  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "subscribed", "acknowledged", "viewer_snapshot", "viewer_subscribed", "session_commands", "settings", "models", "summaries_refreshing", "session_colored"], "daemon response.result.kind");
   // `cursor` is the daemon's event position when the snapshot was taken, and it is optional: a
   // daemon built before it existed answers with sessions alone and its clients must still work.
   if (kind === "state") { requireKeys(result, ["kind", "sessions"], ["cursor"], "daemon response.result"); if (!Array.isArray(result.sessions)) throw new TypeError("sessions must be an array"); result.sessions.forEach((session, index) => validateSession(session, `daemon response.result.sessions[${index}]`)); if (Object.hasOwn(result, "cursor")) readCursor(result.cursor, "daemon response.result.cursor"); }
@@ -397,7 +393,7 @@ export function parseDaemonResponse(value) {
   }
   else if (kind === "summaries_refreshing") { requireKeys(result, ["kind", "sessionIds"], [], "daemon response.result"); if (!Array.isArray(result.sessionIds)) throw new TypeError("daemon response.result.sessionIds must be an array"); result.sessionIds.forEach((/** @type {unknown} */ sessionId, /** @type {number} */ index) => { if (typeof sessionId !== "string" || sessionId.length === 0) throw new TypeError(`daemon response.result.sessionIds[${index}] must be a non-empty string`); }); }
   else if (kind === "viewer_snapshot") { requireKeys(result, ["kind", "snapshot"], [], "daemon response.result"); parseViewerSnapshot(result.snapshot); }
-  else if (["viewer_subscribed", "viewer_acknowledged"].includes(kind)) { requireKeys(result, ["kind", "cursor"], [], "daemon response.result"); readViewerCursor(result.cursor, "daemon response.result.cursor"); }
+  else if (kind === "viewer_subscribed") { requireKeys(result, ["kind", "cursor"], [], "daemon response.result"); readViewerCursor(result.cursor, "daemon response.result.cursor"); }
   else { requireKeys(result, ["kind", "cursor"], [], "daemon response.result"); readCursor(result.cursor, "daemon response.result.cursor"); }
   return response;
 }

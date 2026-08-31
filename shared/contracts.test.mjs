@@ -22,7 +22,6 @@ const acceptedRequests = [
   ["ack", { cursor: { daemonEpoch: "epoch", sequence: "2" } }],
   ["get_viewer_snapshot", { sessionId: "session" }],
   ["subscribe_viewer", { sessionId: "session", after: { daemonEpoch: "epoch", sessionId: "session", sequence: "2" } }],
-  ["ack_viewer", { cursor: { daemonEpoch: "epoch", sessionId: "session", sequence: "2" } }],
   ["resolve_delivery", { targetClientId: "client", targetRequestId: "request", resolution: "abandon" }],
   ["get_session_commands", { sessionId: "session" }],
   ["get_settings", {}],
@@ -38,6 +37,7 @@ const acceptedRequests = [
 
 /** Every request the wire must refuse, beyond the per-variant unknown-field matrix. @type {Array<[string, string, Record<string, any>, RegExp]>} */
 const rejectedRequests = [
+  ["the retired viewer acknowledgement operation", "ack_viewer", { cursor: { daemonEpoch: "epoch", sessionId: "session", sequence: "2" } }, /operation must be one of/u],
   ["color outside the palette", "set_session_color", { sessionId: "session", color: "chartreuse" }, /color/iu],
   ["empty color", "set_session_color", { sessionId: "session", color: "" }, /color/iu],
   ["color without a session", "set_session_color", { color: "amber" }, /sessionId/iu],

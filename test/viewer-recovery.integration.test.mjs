@@ -1,4 +1,4 @@
-import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, expect, it } from "vitest";
@@ -48,6 +48,37 @@ it("fails daemon reconciliation closed when durable viewer state is corrupt", as
   const daemon = await createDaemonRuntime({ root });
   await expect(daemon.ready).rejects.toMatchObject({ code: "VIEWER_STORE_CORRUPT" });
   await daemon.close().catch(() => {});
+});
+
+it("recovers an existing root that still holds retired viewer acknowledgement files", async () => {
+  const { root, sessionFile } = await setup();
+  const first = await open(root, "client-retired");
+  const firstSnapshot = await first.client.getViewerSnapshot("session-1");
+  await first.client.close();
+  await first.daemon.close();
+
+  const viewerDirectory = join(root, "index", "viewer");
+  const eventsFile = (await readdir(viewerDirectory)).find((name) => name.endsWith(".events.jsonl"));
+  if (eventsFile === undefined) throw new Error("Viewer event store was not created");
+  // Whatever a retired file holds cannot matter once no production code names its path, so this
+  // seeds a path that fails every read with EISDIR. It stays green only while nothing opens it.
+  const retired = join(viewerDirectory, `${eventsFile.slice(0, -".events.jsonl".length)}.acks.json`);
+  await mkdir(retired, { recursive: true });
+
+  const assistant = { type: "message", id: "assistant-1", parentId: "user-1", timestamp: at, message: { role: "assistant", content: [{ type: "text", text: "answer" }] } };
+  await appendFile(sessionFile, `${JSON.stringify(assistant)}\n`);
+  const second = await open(root, "client-retired-2");
+  const replay = second.client.subscribeViewer("session-1", firstSnapshot.cursor)[Symbol.asyncIterator]();
+  await expect(replay.next()).resolves.toMatchObject({ value: { payload: { kind: "assistant_message", itemId: "assistant-1" } }, done: false });
+  await replay.return?.();
+  const recovered = await second.client.getViewerSnapshot("session-1");
+  expect(recovered.items).toEqual([
+    expect.objectContaining({ kind: "user_message", itemId: "user-1" }),
+    expect.objectContaining({ kind: "assistant_message", itemId: "assistant-1" }),
+  ]);
+  await second.client.close();
+  await second.daemon.close();
+  expect((await stat(retired)).isDirectory()).toBe(true);
 });
 
 it("keeps a published event authoritative when re-derived history content drifts", async () => {

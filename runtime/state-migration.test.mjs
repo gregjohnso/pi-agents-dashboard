@@ -98,7 +98,6 @@ it.each([
   ["frontend-state.json", JSON.stringify({ schemaVersion: 1, clientId: "client" })],
   ["queue/commands.jsonl", "{\"command\":{}}\n"],
   ["daemon/launch-results.json", JSON.stringify({ schemaVersion: 1, results: { request: {} } })],
-  ["daemon/delete-results.json", JSON.stringify({ schemaVersion: 1, entries: { request: {} } })],
   ["daemon/attachment-results.jsonl", `${JSON.stringify({ schemaVersion: 1, phase: "PREPARED" })}\n`],
   ["frontend-state.json", JSON.stringify({ schemaVersion: 1, clientId: "client", viewState: null, launchDraft: {} })],
   ["frontend-state.json", JSON.stringify({ schemaVersion: 1, clientId: "client", viewState: {}, launchDraft: null })],

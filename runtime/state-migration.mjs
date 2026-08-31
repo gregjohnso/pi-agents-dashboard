@@ -42,11 +42,6 @@ function validateJsonLines(text, validate, label) {
 }
 /** @param {any} value */
 function validLaunchResults(value) { return value?.schemaVersion === 1 && typeof value.results === "object" && value.results !== null && !Array.isArray(value.results) && Object.keys(value).length === 2 && Object.keys(value).every((key) => ["schemaVersion", "results"].includes(key)) && Object.values(value.results).every((result) => typeof result?.sessionId === "string" && result.sessionId.length > 0 && Object.keys(result).length === 1); }
-/** @param {any} value */
-function validDeleteResults(value) {
-  if (value?.schemaVersion !== 1 || typeof value.entries !== "object" || value.entries === null || Array.isArray(value.entries) || Object.keys(value).length !== 2 || Object.keys(value).some((key) => !["schemaVersion", "entries"].includes(key))) return false;
-  return Object.values(value.entries).every((entry) => { const allowed = ["request", "sessionId", "revision", "canonicalSessionFile", "recordCanonical", "identity", "phase"]; const identityKeys = ["path", "realpath", "type", "dev", "ino", "size", "mtimeMs"]; const identity = entry?.identity; return typeof entry === "object" && entry !== null && !Array.isArray(entry) && Object.keys(entry).length === allowed.length && Object.keys(entry).every((key) => allowed.includes(key)) && typeof entry.request === "string" && typeof entry.sessionId === "string" && entry.sessionId.length > 0 && Number.isSafeInteger(entry.revision) && entry.revision >= 0 && typeof entry.canonicalSessionFile === "string" && resolve(entry.canonicalSessionFile) === entry.canonicalSessionFile && typeof entry.recordCanonical === "string" && ["PREPARED", "TRASHED"].includes(entry.phase) && typeof identity === "object" && identity !== null && !Array.isArray(identity) && Object.keys(identity).length === identityKeys.length && Object.keys(identity).every((key) => identityKeys.includes(key)) && identity.path === entry.canonicalSessionFile && identity.realpath === entry.canonicalSessionFile && identity.type === "file" && [identity.dev, identity.ino, identity.size].every((number) => Number.isSafeInteger(number) && number >= 0) && typeof identity.mtimeMs === "number" && Number.isFinite(identity.mtimeMs) && identity.mtimeMs >= 0; });
-}
 /** @param {string} relative @param {string} text */
 function validateLegacyArtifact(relative, text) {
   try {
@@ -66,7 +61,6 @@ function validateLegacyArtifact(relative, text) {
       return;
     }
     if (relative === "daemon/launch-results.json") { if (!validLaunchResults(JSON.parse(text))) throw new TypeError("Launch result store is invalid"); return; }
-    if (relative === "daemon/delete-results.json") { if (!validDeleteResults(JSON.parse(text))) throw new TypeError("Delete result store is invalid"); return; }
     if (relative === "daemon/attachment-results.jsonl") {
       const records = validateJsonLines(text, validateAttachmentResultRecord, "Attachment result store");
       const latest = new Map();

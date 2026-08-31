@@ -166,69 +166,6 @@ function canonicalJson(value) {
   return JSON.stringify(value);
 }
 
-/** @param {string} path */
-async function createDeleteResultStore(path) {
-  /** @type {Record<string, any>} */
-  let entries = {};
-  try {
-    const value = JSON.parse(await fs.readFile(path, "utf8"));
-    if (value?.schemaVersion !== 1 || typeof value.entries !== "object" || value.entries === null || Array.isArray(value.entries) || Object.keys(value).some((key) => !["schemaVersion", "entries"].includes(key))) throw new TypeError("Delete recovery store is invalid");
-    for (const entry of Object.values(value.entries)) {
-      const allowed = ["request", "sessionId", "revision", "canonicalSessionFile", "recordCanonical", "identity", "phase"];
-      const identity = /** @type {any} */ (entry)?.identity;
-      const identityKeys = ["path", "realpath", "type", "dev", "ino", "size", "mtimeMs"];
-      if (typeof entry !== "object" || entry === null || Array.isArray(entry) || Object.keys(entry).length !== allowed.length || Object.keys(entry).some((key) => !allowed.includes(key)) || typeof entry.request !== "string" || (typeof entry.sessionId !== "string" || entry.sessionId.length === 0) || !Number.isSafeInteger(entry.revision) || entry.revision < 0 || typeof entry.canonicalSessionFile !== "string" || resolve(entry.canonicalSessionFile) !== entry.canonicalSessionFile || typeof entry.recordCanonical !== "string" || !["PREPARED", "TRASHED"].includes(entry.phase) || typeof identity !== "object" || identity === null || Array.isArray(identity) || Object.keys(identity).length !== identityKeys.length || Object.keys(identity).some((key) => !identityKeys.includes(key)) || identity.path !== entry.canonicalSessionFile || identity.realpath !== entry.canonicalSessionFile || identity.type !== "file" || !Number.isSafeInteger(identity.dev) || identity.dev < 0 || !Number.isSafeInteger(identity.ino) || identity.ino < 0 || !Number.isSafeInteger(identity.size) || identity.size < 0 || typeof identity.mtimeMs !== "number" || !Number.isFinite(identity.mtimeMs) || identity.mtimeMs < 0) throw new TypeError("Delete recovery store is invalid");
-    }
-    entries = value.entries;
-  } catch (error) {
-    if (!(error instanceof Error) || /** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT") throw error;
-  }
-  let tail = Promise.resolve();
-  const key = (/** @type {any} */ request) => `${request.clientId}\0${request.requestId}`;
-  const serialized = (/** @type {any} */ request) => JSON.stringify({ op: request.op, payload: request.payload });
-  const persist = (/** @type {() => any} */ mutate) => {
-    const operation = tail.then(async () => {
-      const result = mutate();
-      await atomicWriteJson(path, { schemaVersion: 1, entries });
-      return result;
-    });
-    tail = operation.then(() => {}, () => {});
-    return operation;
-  };
-  return {
-    /** @param {any} request */
-    get(request) {
-      const entry = entries[key(request)];
-      if (entry !== undefined && entry.request !== serialized(request)) throw Object.assign(new Error("Delete request identity conflicts with recovery state"), { code: "IDEMPOTENCY_CONFLICT" });
-      return entry;
-    },
-    /** @param {any} request @param {any} record @param {any} identity */
-    prepare(request, record, identity) {
-      return persist(() => {
-        const existing = entries[key(request)];
-        const candidate = { request: serialized(request), sessionId: record.sessionId, revision: record.revision, canonicalSessionFile: record.canonicalSessionFile, recordCanonical: canonicalJson(record), identity, phase: "PREPARED" };
-        if (existing !== undefined) {
-          if (JSON.stringify({ ...existing, phase: "PREPARED" }) !== JSON.stringify(candidate)) throw Object.assign(new Error("Delete recovery identity changed"), { code: "IDEMPOTENCY_CONFLICT" });
-          return existing;
-        }
-        entries = { ...entries, [key(request)]: candidate };
-        return candidate;
-      });
-    },
-    /** @param {any} request */
-    markTrashed(request) {
-      return persist(() => {
-        const existing = entries[key(request)];
-        if (existing === undefined) throw Object.assign(new Error("Delete recovery preparation is missing"), { code: "DELETE_RECOVERY_MISSING" });
-        const updated = { ...existing, phase: "TRASHED" };
-        entries = { ...entries, [key(request)]: updated };
-        return updated;
-      });
-    },
-    async close() { await tail; },
-  };
-}
-
 /** @param {any} record @param {any} pending */
 function validateWorkerSuccess(record, pending) {
   const allowed = ["clientId", "requestId", "op", "stage", "at", "result", "stderr"];
@@ -260,15 +197,6 @@ function sameProcessIdentity(left, right) {
  */
 function idleForRespawn(record) {
   return record?.taskState === "READY" && record.processState === "LIVE" && record.activity?.kind !== "blocking_request";
-}
-
-/** Capture a regular, canonical session file identity without following a symlink replacement. @param {string} path */
-async function inspectSessionFile(path) {
-  if (typeof path !== "string" || resolve(path) !== path) throw Object.assign(new Error("Session file path is not canonical"), { code: "SESSION_PATH_UNSAFE" });
-  const metadata = await fs.lstat(path);
-  const realpath = await fs.realpath(path);
-  if (!metadata.isFile() || metadata.isSymbolicLink() || realpath !== path) throw Object.assign(new Error("Session file identity is unsafe"), { code: "SESSION_PATH_UNSAFE" });
-  return { path, realpath, type: "file", dev: metadata.dev, ino: metadata.ino, size: metadata.size, mtimeMs: metadata.mtimeMs };
 }
 
 /** @param {any} error */
@@ -617,7 +545,6 @@ export async function createDaemonRuntime({
   stopPolicy = DEFAULT_STOP_POLICY,
   signalProcessGroupImpl = signalProcessGroup,
   sleepImpl = sleep,
-  trashSessionFile,
   cliVersion,
 } = {}) {
   if (typeof root !== "string" || resolve(root) !== root) throw new TypeError("Daemon runtime root must be an absolute canonical path");
@@ -626,7 +553,6 @@ export async function createDaemonRuntime({
   if (typeof randomId !== "function") throw new TypeError("randomId must be a function");
   if (typeof responseWriter !== "function" || typeof closeFailpoint !== "function" || typeof attachmentFailpoint !== "function" || typeof destructiveFailpoint !== "function" || typeof recordDiagnostic !== "function" || typeof signalProcessGroupImpl !== "function" || typeof sleepImpl !== "function") throw new TypeError("Daemon runtime seams must be functions");
   if (!Number.isSafeInteger(stopPolicy?.gracefulMs) || stopPolicy.gracefulMs <= 0 || !Number.isSafeInteger(stopPolicy?.terminateMs) || stopPolicy.terminateMs <= 0) throw new TypeError("stopPolicy must contain approved positive integer waits");
-  if (trashSessionFile !== undefined && typeof trashSessionFile !== "function") throw new TypeError("trashSessionFile must be a function when supplied");
   await ensureLayout(root);
   const daemonDirectory = join(root, "daemon");
   const tokenPath = join(daemonDirectory, "control.token");
@@ -682,7 +608,6 @@ export async function createDaemonRuntime({
       listSubscribers: new Set(),
       launchResults: undefined,
       attachmentResults: undefined,
-      deleteResults: undefined,
       router,
       workerPending: new Map(),
       hostReport: undefined,
@@ -1309,8 +1234,7 @@ export async function createDaemonRuntime({
         const accepted = await context.recovery.journal.accept(request);
         let status = accepted;
         const changed = accepted.stage === "ACCEPTED";
-        const unresolvedDeleteRecovery = request.op === "delete" && accepted.stage === "DELIVERY_UNKNOWN" && context.deleteResults.get(request)?.phase === "PREPARED";
-        if (accepted.stage === "ACCEPTED" || unresolvedDeleteRecovery) {
+        if (accepted.stage === "ACCEPTED") {
           const route = router.route(request.payload.sessionId);
           const connection = route?.connection;
           const metadata = route?.metadata;
@@ -1411,59 +1335,12 @@ export async function createDaemonRuntime({
                 : await context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError(respawnError?.code ?? "RESPAWN_FAILED", error instanceof Error ? error.message : "Respawn failed"));
             }
           } else if (request.op === "delete") {
-            const history = await context.recovery.journal.history(request);
-            const retryAtRisk = history.some((/** @type {any} */ prior, /** @type {number} */ index) => prior.stage === "DELIVERY_UNKNOWN" && history[index + 1]?.stage === "ACCEPTED");
-            const reconciliationOnly = accepted.stage === "DELIVERY_UNKNOWN";
             status = await router.runSession(request.payload.sessionId, async (/** @type {any} */ { metadata: lockedMetadata, route: lockedRoute, forget }) => {
-              const complete = async () => {
-                await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
-                await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-                return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
-              };
               /** @param {string} code @param {string} message */
-              const refuse = (code, message) => reconciliationOnly ? accepted : context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError(code, message));
+              const refuse = (code, message) => context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError(code, message));
               const record = await registry.get(request.payload.sessionId);
-              const recovery = context.deleteResults.get(request);
-              const routeSafe = (/** @type {any} */ current) => current.ownership === undefined &&
-                !["LIVE", "SLEEPING"].includes(current.processState) &&
-                lockedMetadata === undefined && lockedRoute === undefined &&
-                !launchingSessions.has(current.sessionId) &&
-                [...(attachmentClaims.get(current.sessionId)?.keys() ?? [])].every((candidate) => candidate === socket);
-              const exactRecoveryRecord = (/** @type {any} */ current) => recovery !== undefined &&
-                recovery.sessionId === request.payload.sessionId &&
-                recovery.revision === request.payload.revision &&
-                current.revision === recovery.revision &&
-                current.canonicalSessionFile === recovery.canonicalSessionFile &&
-                canonicalJson(current) === recovery.recordCanonical;
-
-              if (recovery !== undefined) {
-                if (record === undefined) {
-                  try {
-                    await inspectSessionFile(recovery.canonicalSessionFile);
-                    return refuse("DELETE_RECONCILIATION_REFUSED", recovery.phase === "TRASHED" ? "A trashed Delete path is present again" : "Prepared Delete registry state is missing while its file remains present");
-                  } catch (error) {
-                    if (/** @type {any} */ (error)?.code !== "ENOENT") return refuse("DELETE_RECONCILIATION_REFUSED", "Recovered Delete file identity is ambiguous");
-                    return reconciliationOnly ? accepted : complete();
-                  }
-                }
-                if (!exactRecoveryRecord(record) || !routeSafe(record)) return refuse("DELETE_RECONCILIATION_REFUSED", "Delete state no longer matches the complete prepared record fingerprint and inactive safety boundary");
-                try {
-                  const currentIdentity = await inspectSessionFile(recovery.canonicalSessionFile);
-                  if (canonicalJson(currentIdentity) !== canonicalJson(recovery.identity) || recovery.phase !== "PREPARED") return refuse("DELETE_RECONCILIATION_REFUSED", "Prepared Delete file identity was replaced or restored");
-                  if (reconciliationOnly) return accepted;
-                  if (!retryAtRisk) {
-                    await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
-                    return context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
-                  }
-                } catch (error) {
-                  if (/** @type {any} */ (error)?.code !== "ENOENT") return refuse("DELETE_RECONCILIATION_REFUSED", "Prepared Delete file identity is ambiguous");
-                  await registry.remove(record.sessionId, recovery.revision);
-                  return reconciliationOnly ? accepted : complete();
-                }
-              } else {
-                if (record === undefined) return refuse("SESSION_NOT_FOUND", "The exact session does not exist");
-                if (record.revision !== request.payload.revision) return refuse("REVISION_CONFLICT", "Session revision changed before Delete");
-              }
+              if (record === undefined) return refuse("SESSION_NOT_FOUND", "The exact session does not exist");
+              if (record.revision !== request.payload.revision) return refuse("REVISION_CONFLICT", "Session revision changed before Delete");
               if (record.ownership !== undefined || ["LIVE", "SLEEPING"].includes(record.processState)) return refuse("SESSION_LIVE", "Delete refuses a live or owned session");
               // A lease whose worker process is provably gone cannot be authoritative; reclaim it instead of refusing forever.
               if (lockedMetadata !== undefined && lockedRoute === undefined && await processIsGone(lockedMetadata.identity, inspect)) {
@@ -1473,45 +1350,10 @@ export async function createDaemonRuntime({
               if (lockedMetadata !== undefined || lockedRoute !== undefined || launchingSessions.has(record.sessionId)) return refuse("OWNERSHIP_CONFLICT", "A worker lease, route, or launch is still authoritative");
               const claims = attachmentClaims.get(record.sessionId);
               if (claims !== undefined && [...claims.keys()].some((candidate) => candidate !== socket)) return refuse("SESSION_ATTACHED", "Delete refuses another attached frontend");
-              if (trashSessionFile === undefined) {
-                // Without an approved trash seam, Delete forgets the dashboard record and leaves Pi's session file and worktree untouched.
-                await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
-                await registry.remove(record.sessionId, record.revision);
-                await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-                return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
-              }
-              let original;
-              try {
-                original = recovery?.identity ?? await inspectSessionFile(record.canonicalSessionFile);
-              } catch (error) {
-                return refuse(/** @type {any} */ (error)?.code ?? "SESSION_PATH_UNSAFE", error instanceof Error ? error.message : "Session file identity is unsafe");
-              }
-              await destructiveFailpoint("delete_before_identity_recheck", request, record);
-              const currentIdentity = await inspectSessionFile(record.canonicalSessionFile);
-              if (canonicalJson(currentIdentity) !== canonicalJson(original)) return refuse("SESSION_IDENTITY_MISMATCH", "Session file was replaced before trash");
-              const prepared = recovery ?? await context.deleteResults.prepare(request, record, original);
-              if (recovery === undefined) await destructiveFailpoint("delete_after_prepare", request, record);
-              const exactRecord = await registry.get(record.sessionId);
-              if (exactRecord === undefined || canonicalJson(exactRecord) !== prepared.recordCanonical || !routeSafe(exactRecord)) return refuse("DELETE_REVALIDATION_FAILED", "Session record fingerprint or safety state changed before trash");
+              // Delete forgets the dashboard record and nothing else. Pi's canonical session file and any
+              // managed worktree belong to the operator, so no path beneath either is ever mutated here.
               await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
-              try {
-                await trashSessionFile(prepared.canonicalSessionFile, prepared.identity);
-                await fs.lstat(prepared.canonicalSessionFile).then(() => { throw Object.assign(new Error("Trash seam left the original session file in place"), { code: "TRASH_FAILED" }); }, (error) => { if (error?.code !== "ENOENT") throw error; });
-                await context.deleteResults.markTrashed(request);
-                await destructiveFailpoint("delete_after_trash", request, record);
-                const postTrashRecord = await registry.get(prepared.sessionId);
-                if (postTrashRecord !== undefined && (canonicalJson(postTrashRecord) !== prepared.recordCanonical || !routeSafe(postTrashRecord))) {
-                  await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-                  return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "FAILED", dashboardError("DELETE_RECONCILIATION_REFUSED", "Post-trash SessionRecord no longer matches the prepared safety fingerprint"));
-                }
-                if (postTrashRecord !== undefined) await registry.remove(prepared.sessionId, prepared.revision);
-                await destructiveFailpoint("delete_after_registry", request, record);
-              } catch (error) {
-                await fs.lstat(prepared.canonicalSessionFile).then(() => {}, async (missing) => { if (missing?.code === "ENOENT") await context.deleteResults.markTrashed(request).catch(() => {}); });
-                const current = await context.recovery.journal.get(request);
-                if (current?.stage === "DELIVERY_ATTEMPTED") return context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
-                throw error;
-              }
+              await registry.remove(record.sessionId, record.revision);
               await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
               return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
             });
@@ -1574,7 +1416,6 @@ export async function createDaemonRuntime({
         if (context.recovery.conflicts.length > 0) throw Object.assign(new Error("Worker ownership conflicts block daemon recovery"), { code: "OWNERSHIP_CONFLICT", conflicts: context.recovery.conflicts });
         context.launchResults = await createLaunchResultStore(join(daemonDirectory, "launch-results.json"));
         context.attachmentResults = await createAttachmentResultStore({ path: join(daemonDirectory, "attachment-results.jsonl") });
-        context.deleteResults = await createDeleteResultStore(join(daemonDirectory, "delete-results.json"));
         if ((context.recovery.repairedSessions ?? []).length > 0) context.notifyListChanged();
         for (const entry of context.attachmentResults.entries()) await context.recovery.journal.reconcileAttachment(entry.request, entry.phase);
         for (const action of context.recovery.recoveryActions) {
@@ -1641,7 +1482,6 @@ export async function createDaemonRuntime({
           await cleanup("supervisor", async () => workerSupervisor?.close?.());
           await cleanup("launch_result_store", async () => context.launchResults?.close());
           await cleanup("attachment_result_store", async () => context.attachmentResults?.close());
-          await cleanup("delete_result_store", async () => context.deleteResults?.close());
           await cleanup("recovery_stores", async () => context.recovery?.close());
           await cleanup("lifecycle", () => releaseDaemonLifecycle(claim));
           closeState = errors.length === 0 ? "CLOSED" : "FAILED_CLOSED";

@@ -99,7 +99,6 @@ it.each([
   ["queue/commands.jsonl", "{\"command\":{}}\n"],
   ["daemon/event-acks.json", JSON.stringify({ client: { daemonEpoch: "epoch", sequence: "01" } })],
   ["daemon/launch-results.json", JSON.stringify({ schemaVersion: 1, results: { request: {} } })],
-  ["daemon/delete-results.json", JSON.stringify({ schemaVersion: 1, entries: { request: {} } })],
   ["daemon/attachment-results.jsonl", `${JSON.stringify({ schemaVersion: 1, phase: "PREPARED" })}\n`],
   ["index/events.jsonl", `${JSON.stringify({ version: 1, cursor: { daemonEpoch: "epoch", sequence: "2" }, occurredAt: "now", kind: "session_changed", payload: {} })}\n`],
   ["frontend-state.json", JSON.stringify({ schemaVersion: 1, clientId: "client", viewState: null, launchDraft: {} })],

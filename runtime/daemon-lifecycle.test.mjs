@@ -133,6 +133,35 @@ it("attempts socket, PID, and lock cleanup independently before exact recovery",
   await releaseDaemonLifecycle(replacement);
 });
 
+/** @param {string} root @param {any} identity @param {string} state */
+async function publish(root, identity, state) {
+  await writeFile(join(root, "daemon", "pid.json"), JSON.stringify({
+    schemaVersion: 1, ...identity, daemonEpoch: "epoch", tokenPath: join(root, "daemon", "control.token"),
+    startedAt: "2026-08-25T12:00:00.000Z", state,
+  }), { mode: 0o600 });
+}
+
+it("gives the daemon liveness probe the timeout its caller chose", async () => {
+  // The probe's own timeout default was unreachable: `inspectDaemonEndpoint` called it with one
+  // argument, so a healthy daemon that answered slower than that default read as UNHEALTHY and
+  // refused `daemon start` and `daemon stop` on the pre-flight probe alone.
+  const root = await fixture();
+  const identity = { pid: 91, startIdentity: "910", processGroupId: 91 };
+  await publish(root, identity, "READY");
+  /** @type {(number | undefined)[]} */
+  const observed = [];
+  const probe = async (/** @type {any} */ _publication, /** @type {any} */ options) => {
+    observed.push(options?.timeoutMs);
+    return true;
+  };
+
+  await inspectDaemonEndpoint({ root, inspect: async () => identity, probe, probeTimeoutMs: 4_000 });
+  await expect(claimDaemonLifecycle({ root, identity, daemonEpoch: "other", tokenPath: join(root, "daemon", "control.token"), inspect: async () => identity, probe, probeTimeoutMs: 7_000 }))
+    .rejects.toMatchObject({ code: "DAEMON_ALREADY_RUNNING" });
+
+  expect(observed).toEqual([4_000, 7_000]);
+});
+
 it("refuses an unowned socket instead of unlinking a possibly live daemon", async () => {
   const root = await fixture();
   const socketPath = join(root, "daemon", "control.sock");

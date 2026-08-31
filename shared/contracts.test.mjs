@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { parseClientRequest, parseDaemonResponse } from "./contracts.mjs";
+import { parseClientRequest, parseDaemonResponse, parseListChanged } from "./contracts.mjs";
 
 const envelope = { version: 1, clientId: "client-1", requestId: "request-1" };
 
@@ -19,6 +19,7 @@ const acceptedRequests = [
   ["delete", { sessionId: "session", revision: 2 }],
   ["respawn", { sessionId: "session", revision: 2 }],
   ["subscribe", {}],
+  ["subscribe_list_changes", {}],
   ["ack", { cursor: { daemonEpoch: "epoch", sequence: "2" } }],
   ["get_viewer_snapshot", { sessionId: "session" }],
   ["subscribe_viewer", { sessionId: "session", after: { daemonEpoch: "epoch", sessionId: "session", sequence: "2" } }],
@@ -69,22 +70,24 @@ const menu = {
   model: { provider: "anthropic", id: "claude" },
 };
 const modelCatalog = { kind: "models", models: [{ provider: "anthropic", id: "claude-opus-4", thinking: true }, { provider: "google", id: "gemini-3-flash", thinking: false }] };
+const coverage = { daemonEpoch: "epoch", sequence: "12" };
 
 /** @param {Record<string, any>} result */
 const ok = (result) => ({ version: 1, requestId: "request", ok: true, result });
 
 /** Every daemon response shape the frozen version-1 wire accepts. @type {Array<[string, Record<string, any>]>} */
 const acceptedResponses = [
+  ["a list subscription", ok({ kind: "list_subscribed" })],
   ["session command menu", ok(menu)],
   // A running daemon that predates the thinking-control removal still answers with these two keys.
   // Refusing them made every viewer open against that daemon fail to parse and never answer.
   ["session command menu from a daemon that predates the thinking-control removal", ok({ ...menu, thinkingLevels: ["off", "high"], thinkingLevel: "off" })],
   ["summary settings", ok({ kind: "settings", summaryModel: { provider: "anthropic", id: "haiku" } })],
   ["summaries disabled", ok({ kind: "settings", summaryModel: null })],
-  ["session state carrying a bounded summary", ok({ kind: "state", sessions: [sessionRecord] })],
-  ["session state carrying the daemon's event position", ok({ kind: "state", sessions: [sessionRecord], cursor: { daemonEpoch: "epoch", sequence: "6778" } })],
-  ["session state reporting one adopted worker's release and route generation", ok({ kind: "state", sessions: [{ ...sessionRecord, workerCliVersion: "1.4.2", stale: false, routeGeneration: 3 }] })],
-  ["session state reporting an adopted worker whose release is unknown", ok({ kind: "state", sessions: [{ ...sessionRecord, stale: true, routeGeneration: 1 }] })],
+  ["session state carrying a bounded summary", ok({ kind: "state", sessions: [sessionRecord], cursor: coverage })],
+  ["session state carrying the daemon's coverage cursor", ok({ kind: "state", sessions: [sessionRecord], cursor: { daemonEpoch: "epoch", sequence: "6778" } })],
+  ["session state reporting one adopted worker's release and route generation", ok({ kind: "state", sessions: [{ ...sessionRecord, workerCliVersion: "1.4.2", stale: false, routeGeneration: 3 }], cursor: coverage })],
+  ["session state reporting an adopted worker whose release is unknown", ok({ kind: "state", sessions: [{ ...sessionRecord, stale: true, routeGeneration: 1 }], cursor: coverage })],
   ["a respawn command status", ok({ kind: "command", status: { clientId: "client", requestId: "request", operation: "respawn", stage: "COMPLETED", acceptedAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" } })],
   ["the installed Pi's model catalog", ok(modelCatalog)],
   ["an empty model catalog", ok({ kind: "models", models: [] })],
@@ -95,11 +98,15 @@ const acceptedResponses = [
 const rejectedResponses = [
   ["unknown menu field", ok({ ...menu, unknown: true }), /unknown/iu],
   ["invented menu command source", ok({ ...menu, commands: [{ name: "/x", source: "invented" }] }), /source/iu],
-  ["empty session summary text", ok({ kind: "state", sessions: [{ ...sessionRecord, summary: { ...sessionRecord.summary, text: "" } }] }), /summary\.text/u],
+  ["empty session summary text", ok({ kind: "state", sessions: [{ ...sessionRecord, summary: { ...sessionRecord.summary, text: "" } }], cursor: coverage }), /summary\.text/u],
   ["a state cursor whose sequence is not canonical", ok({ kind: "state", sessions: [], cursor: { daemonEpoch: "epoch", sequence: "01" } }), /sequence/u],
-  ["a route generation no adoption could have produced", ok({ kind: "state", sessions: [{ ...sessionRecord, routeGeneration: 0 }] }), /routeGeneration/u],
-  ["a stale flag that is not a boolean", ok({ kind: "state", sessions: [{ ...sessionRecord, stale: "yes" }] }), /stale/u],
-  ["an empty worker release string", ok({ kind: "state", sessions: [{ ...sessionRecord, workerCliVersion: "" }] }), /workerCliVersion/u],
+  // The snapshot's coverage cursor is what makes subscribe-then-read safe, so a state result
+  // without one is unusable rather than a tolerable older shape.
+  ["session state without its coverage cursor", ok({ kind: "state", sessions: [] }), /cursor is required/u],
+  ["a route generation no adoption could have produced", ok({ kind: "state", sessions: [{ ...sessionRecord, routeGeneration: 0 }], cursor: coverage }), /routeGeneration/u],
+  ["a stale flag that is not a boolean", ok({ kind: "state", sessions: [{ ...sessionRecord, stale: "yes" }], cursor: coverage }), /stale/u],
+  ["an empty worker release string", ok({ kind: "state", sessions: [{ ...sessionRecord, workerCliVersion: "" }], cursor: coverage }), /workerCliVersion/u],
+  ["a list subscription that carries a cursor", ok({ kind: "list_subscribed", cursor: coverage }), /unknown/iu],
   ["session query rows", ok({ kind: "session_query", sessionId: "session", query: "get_session_stats", rows: ["messages: 12"] }), /kind/iu],
   ["unknown model catalog field", ok({ ...modelCatalog, unknown: true }), /unknown/iu],
   ["unknown field on a catalog model", ok({ kind: "models", models: [{ provider: "anthropic", id: "claude", thinking: true, unknown: true }] }), /unknown/iu],
@@ -143,6 +150,21 @@ describe("command contracts", () => {
   it("rejects every out-of-contract daemon response", () => {
     for (const [name, response, message] of rejectedResponses) {
       expect(() => parseDaemonResponse(response), name).toThrow(message);
+    }
+  });
+
+  // Operator-visible failure: replaying a persisted list history crashed the dashboard on every
+  // start. The invalidation carries no payload at all, so nothing about it can grow with a burst.
+  it("accepts the payload-free list invalidation and refuses anything carried on it", () => {
+    const notification = { version: 1, kind: "list_changed" };
+    expect(parseListChanged(notification)).toEqual(notification);
+    for (const [name, value] of [
+      ["a session payload", { version: 1, kind: "list_changed", payload: { session: sessionRecord } }],
+      ["a cursor", { version: 1, kind: "list_changed", cursor: coverage }],
+      ["a retired persisted event", { version: 1, cursor: coverage, occurredAt: "2026-01-01T00:00:00.000Z", kind: "session_changed", payload: { session: sessionRecord } }],
+      ["a version this release does not speak", { version: 2, kind: "list_changed" }],
+    ]) {
+      expect(() => parseListChanged(value), /** @type {string} */ (name)).toThrow();
     }
   });
 });

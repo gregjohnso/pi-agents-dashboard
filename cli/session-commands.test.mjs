@@ -311,7 +311,7 @@ it("reports a read-only timeout as a timeout, never as an ambiguous delivery", a
 
 it("returns one validated response when the peer immediately ends the connection", async () => {
   const root = await stateRoot();
-  const response = { version: 1, requestId: "response-boundary", ok: true, result: { kind: "state", sessions: [] } };
+  const response = { version: 1, requestId: "response-boundary", ok: true, result: { kind: "state", sessions: [], cursor: { daemonEpoch: "epoch", sequence: "0" } } };
   const server = await daemonServer(root, (socket, encoder) => socket.end(encoder.encode(response)));
   const requester = createDaemonRequester({ root, clientId: "cli-stable", maxBytes: 4096, timeoutMs: 200 });
   await expect(requester("get_state", {}, "response-boundary")).resolves.toEqual(response.result);
@@ -324,7 +324,7 @@ it("finalizes one complete response from a peer that never closes the connection
   await mkdir(daemon, { mode: 0o700 });
   await writeFile(join(daemon, "control.token"), "secret\n", { mode: 0o600 });
   const encoder = createJsonlEncoder({ maxBytes: 4096 });
-  const response = { version: 1, requestId: "scripted-response", ok: true, result: { kind: "state", sessions: [] } };
+  const response = { version: 1, requestId: "scripted-response", ok: true, result: { kind: "state", sessions: [], cursor: { daemonEpoch: "epoch", sequence: "0" } } };
   class ScriptedSocket extends EventEmitter {
     write(_chunk, callback) {
       callback?.();
@@ -355,7 +355,7 @@ it.each([
   ["delayed partial data", (socket, encoder, response) => { socket.write(encoder.encode(response)); setTimeout(() => socket.end(Buffer.from("{\"")), 10); }, "TRAILING_DAEMON_DATA", { closeOnInputEnd: false }],
 ])("refuses the response when the daemon sends %s", async (_name, send, code, serverOptions) => {
   const root = await stateRoot();
-  const response = { version: 1, requestId: "response-boundary", ok: true, result: { kind: "state", sessions: [] } };
+  const response = { version: 1, requestId: "response-boundary", ok: true, result: { kind: "state", sessions: [], cursor: { daemonEpoch: "epoch", sequence: "0" } } };
   const server = await daemonServer(root, (socket, encoder) => send(socket, encoder, response), undefined, serverOptions);
   const requester = createDaemonRequester({ root, clientId: "cli-stable", maxBytes: 4096, timeoutMs: 200 });
   await expect(requester("get_state", {}, "response-boundary")).rejects.toMatchObject({ code });
@@ -380,7 +380,7 @@ it.each([
 
 it.each([
   ["unknown successful result", { version: 1, requestId: "strict-request", ok: true, result: { kind: "mystery" } }, "INVALID_DAEMON_RESPONSE"],
-  ["wrong request ID", { version: 1, requestId: "other", ok: true, result: { kind: "state", sessions: [] } }, "UNEXPECTED_DAEMON_RESPONSE"],
+  ["wrong request ID", { version: 1, requestId: "other", ok: true, result: { kind: "state", sessions: [], cursor: { daemonEpoch: "epoch", sequence: "0" } } }, "UNEXPECTED_DAEMON_RESPONSE"],
   ["event frame", { version: 1, cursor: { daemonEpoch: "epoch", sequence: "1" }, occurredAt: "now", kind: "command_changed", payload: {} }, "UNEXPECTED_DAEMON_FRAME"],
   ["invalid error", { version: 1, requestId: "strict-request", ok: false, error: { code: "NO", message: "bad" } }, "INVALID_DAEMON_RESPONSE"],
 ])("rejects %s as a typed protocol failure", async (_name, frame, code) => {

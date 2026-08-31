@@ -37,8 +37,8 @@ function mountedDashboard() {
   const terminal = new FakeTerminal();
   const tui = new TuiAltScreen(terminal, false, undefined, { mouse: false });
   const backend = {
-    async getSnapshot() { return { sessions: [workingSession()] }; },
-    subscribe(_after, listener, onError) { backend.listener = listener; backend.onError = onError; return () => { backend.unsubscribed = true; }; },
+    async getSnapshot() { return { sessions: [workingSession()], cursor: { daemonEpoch: "epoch", sequence: "1" } }; },
+    async subscribeListChanges(onChanged, onError) { backend.notifyListChanged = onChanged; backend.onError = onError; return () => { backend.unsubscribed = true; }; },
     async preflightLaunch(draft) { return { canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }; },
     async launch() { return { kind: "launched", sessionId: "busy" }; },
   };

@@ -27,23 +27,11 @@ async function existingDirectory(path) {
 }
 /** Idle time before a typed path is listed. pi-tui lists it synchronously, so no keystroke may start one. */
 const COMPLETION_DEBOUNCE_MS = 60;
-function cursorAfter(left, right) {
-    if (left === undefined || left.daemonEpoch !== right.daemonEpoch)
-        return true;
-    return BigInt(right.sequence) > BigInt(left.sequence);
-}
-/** The newer of two positions in one daemon's event log; a missing position loses to any real one. */
-function latestCursor(current, candidate) {
-    if (candidate === undefined)
-        return current;
-    return current === undefined || cursorAfter(current, candidate) ? candidate : current;
-}
 function daemonFailure(response) {
     return { code: response.error.code, message: response.error.message };
 }
-/** Adapt the Task 11 reconnecting client into snapshots with process-then-ack replay. */
+/** Adapt the reconnecting daemon client into current snapshots driven by list invalidations. */
 export function createDaemonDashboardBackend({ client, clientId, preflight, requestId = randomUUID, }) {
-    const sessions = new Map();
     const request = async (op, payload, exactRequestId = requestId()) => {
         return client.request({ version: 1, clientId, requestId: exactRequestId, op, payload });
     };
@@ -53,12 +41,12 @@ export function createDaemonDashboardBackend({ client, clientId, preflight, requ
             throw Object.assign(new Error(response.error.message), response.error);
         if (response.result.kind !== "state")
             throw Object.assign(new Error("Daemon returned the wrong state result"), { code: "INVALID_RESPONSE" });
-        sessions.clear();
-        for (const session of response.result.sessions)
-            sessions.set(session.sessionId, session);
-        // A daemon built before the state result carried a position answers without one; the caller
-        // then falls back to the newest cursor it has seen for itself.
-        return { sessions: [...sessions.values()], cursor: response.result.cursor };
+        // The coverage cursor states how far the daemon's list had advanced when it read these rows.
+        // Without it a snapshot cannot be told from one taken before the change that provoked the
+        // read, which is the window subscribing first exists to close.
+        if (response.result.cursor === undefined)
+            throw Object.assign(new Error("Daemon state result carries no coverage cursor"), { code: "INVALID_RESPONSE" });
+        return { sessions: response.result.sessions, cursor: response.result.cursor };
     };
     const requestAsComposer = async (operation, sessionId, revision, exactRequestId) => {
         const transaction = client.createTransactionClient?.() ?? client;
@@ -106,65 +94,30 @@ export function createDaemonDashboardBackend({ client, clientId, preflight, requ
             await client.connect();
             return refreshState();
         },
-        subscribe(after, listener, onError) {
+        /**
+         * Subscribe to payload-free list invalidations. Establishment is awaited so a daemon that
+         * does not have the operation refuses here, instead of leaving a list frozen on rows it read
+         * once. The notification carries nothing, so the caller owes exactly one refetch.
+         */
+        async subscribeListChanges(onInvalidated, onError) {
             let active = true;
-            let acknowledged = after;
             const removeFatalListener = client.onFatalError?.((error) => {
                 if (active)
                     onError({ code: error.code, message: error.message });
             });
-            const iterator = client.subscribe(after)[Symbol.asyncIterator]();
-            void (async () => {
-                try {
-                    while (active) {
-                        const next = await iterator.next();
-                        if (next.done || !active)
-                            return;
-                        const event = next.value;
-                        // Falling behind means resynchronize, not exit: the snapshot is authoritative,
-                        // so refetch it and continue from the newest position it covers.
-                        if (event.kind === "resynchronize") {
-                            const refreshed = await refreshState();
-                            const cursor = latestCursor(event.cursor, refreshed.cursor);
-                            acknowledged = latestCursor(acknowledged, cursor);
-                            await listener({ snapshot: { sessions: refreshed.sessions }, cursor, event });
-                            if (cursor !== undefined) {
-                                const acknowledgement = await request("ack", { cursor });
-                                if (!acknowledgement.ok)
-                                    throw Object.assign(new Error(acknowledgement.error.message), acknowledgement.error);
-                            }
-                            continue;
-                        }
-                        if (!cursorAfter(acknowledged, event.cursor))
-                            continue;
-                        let snapshot = { sessions: [...sessions.values()] };
-                        if (event.kind === "session_changed") {
-                            sessions.set(event.payload.session.sessionId, event.payload.session);
-                            snapshot = { sessions: [...sessions.values()] };
-                        }
-                        else if (event.kind === "command_changed" && event.payload.status.operation === "delete" && event.payload.status.stage === "COMPLETED") {
-                            snapshot = await refreshState();
-                        }
-                        await listener({ snapshot, cursor: event.cursor, event });
-                        const response = await request("ack", { cursor: event.cursor });
-                        if (!response.ok)
-                            throw Object.assign(new Error(response.error.message), response.error);
-                        if (response.result.kind !== "acknowledged")
-                            throw Object.assign(new Error("Daemon returned the wrong acknowledgement result"), { code: "INVALID_RESPONSE" });
-                        acknowledged = response.result.cursor;
-                    }
-                }
-                catch (error) {
-                    if (!active)
-                        return;
-                    const typed = error;
-                    onError({ code: typed.code ?? "MALFORMED_FRAME", message: typed.message ?? "Daemon event stream failed" });
-                }
-            })();
+            let unsubscribe;
+            try {
+                unsubscribe = await client.subscribeListChanges(() => { if (active) onInvalidated(); });
+            }
+            catch (error) {
+                active = false;
+                removeFatalListener?.();
+                throw error;
+            }
             return () => {
                 active = false;
                 removeFatalListener?.();
-                void iterator.return?.();
+                unsubscribe();
             };
         },
         preflightLaunch: preflight,
@@ -335,7 +288,9 @@ export class DashboardController {
     width = 80;
     height = 24;
     viewportOffset = 0;
-    cursor;
+    /** How far the daemon's list had advanced when it read the snapshot now on screen. In memory
+     * only: it states a snapshot's coverage and is never a position to replay from. */
+    coverageCursor;
     pendingShared;
     closed = true;
     preferredSelectionId;
@@ -343,13 +298,13 @@ export class DashboardController {
     openController;
     confirmationText = "";
     closePromise;
-    eventOperations = new Set();
-    eventTail = Promise.resolve();
+    /** One dirty flag, never a queue: any number of invalidations between reads mean the same read. */
+    listChangePending = false;
+    /** The read loop draining that flag, while one is running. */
+    listReads;
     saveTail = Promise.resolve();
     saveFailure;
     saveAdmissionGeneration = 0;
-    renderRequestGeneration = 0;
-    renderWaiters = new Map();
     stopClearGesture;
     animationTimer;
     summaryRefreshTimer;
@@ -409,7 +364,7 @@ export class DashboardController {
         this.closed = false;
         this.closePromise = undefined;
         this.saveFailure = undefined;
-        this.eventTail = Promise.resolve();
+        this.listReads = undefined;
         const generation = ++this.openGeneration;
         const controller = new AbortController();
         this.openController = controller;
@@ -419,7 +374,6 @@ export class DashboardController {
             if (!this.isCurrentOpen(generation))
                 return;
             if (persisted?.clientId === this.clientId) {
-                this.cursor = persisted.cursor;
                 this.query = safeQuery(persisted.viewState?.query);
                 this.preferredSelectionId = persisted.viewState?.selectedSessionId;
                 if (persisted.launchDraft !== undefined) {
@@ -433,21 +387,19 @@ export class DashboardController {
                     };
                 }
             }
-            const snapshot = await this.backend.getSnapshot(controller.signal);
-            if (!this.isCurrentOpen(generation))
-                return;
-            this.applySnapshot(snapshot);
-            // The snapshot already contains every event up to the position the daemon reported with
-            // it, so start there rather than replaying a persisted cursor of any age. A daemon that
-            // reports no position leaves the persisted cursor in place.
-            this.advanceCursor(snapshot.cursor);
-            const unsubscribe = await this.backend.subscribe(this.cursor, (update) => this.trackEvent(update, generation), (error) => { if (this.isCurrentOpen(generation))
+            // Subscribe before reading, never after: a change published while the read is in flight
+            // then arrives as an invalidation and provokes one refetch, rather than being lost.
+            this.listChangePending = true;
+            const unsubscribe = await this.backend.subscribeListChanges(() => this.noteListChanged(generation), (error) => { if (this.isCurrentOpen(generation))
                 this.fail(error); });
             if (!this.isCurrentOpen(generation)) {
                 unsubscribe();
                 return;
             }
             this.unsubscribe = unsubscribe;
+            await this.noteListChanged(generation);
+            if (!this.isCurrentOpen(generation))
+                return;
             this.status = { kind: "ready" };
             this.requestRender?.();
             this.scheduleSummaryRefresh(generation);
@@ -1079,7 +1031,6 @@ export class DashboardController {
             this.selectSession(row.session.sessionId);
     }
     render(width = this.width, height = this.height) {
-        const renderedGeneration = this.renderRequestGeneration;
         try {
             this.resize(width, height);
             // Rows cache their rendered line; without a fresh reading the spinner frame and age never move.
@@ -1127,13 +1078,10 @@ export class DashboardController {
             }
             this.renderOverlay(lines);
             this.syncAnimation();
-            const result = lines.map((line) => fitLine(line, this.width));
-            this.completeHostRender(renderedGeneration);
-            return result;
+            return lines.map((line) => fitLine(line, this.width));
         }
         catch (error) {
             const typed = this.typedError(error, "RENDER_FAILED");
-            this.rejectHostRenders(Object.assign(new Error(typed.message), { code: typed.code }));
             this.fail(typed);
             throw Object.assign(new Error(typed.message), { code: typed.code });
         }
@@ -1359,35 +1307,44 @@ export class DashboardController {
                 lines[start + index] = paintPlainLine(` ${text}`, this.width, selected ? jobwatchTheme.focusBorder : jobwatchTheme.muted);
         });
     }
-    trackEvent(update, generation) {
-        const operation = this.eventOperations.size === 0
-            ? this.processEvent(update, generation)
-            : this.eventTail.then(() => this.processEvent(update, generation));
-        this.eventTail = operation;
-        this.eventOperations.add(operation);
-        void operation.finally(() => this.eventOperations.delete(operation)).catch(() => { });
-        return operation;
+    /**
+     * Record that the list changed and make sure exactly one read loop is draining that fact.
+     * Returns the loop, so a caller that needs the list current can wait for it.
+     * @param {number} generation
+     */
+    noteListChanged(generation) {
+        this.listChangePending = true;
+        if (this.listReads !== undefined)
+            return this.listReads;
+        // Start the loop one microtask later so `listReads` is installed before its first read runs.
+        // Started inline, a notification raised during that read saw no loop and began a second one,
+        // and the two interleaved reads applied each other's stale rows.
+        const reads = Promise.resolve().then(() => this.readCurrentList(generation)).finally(() => { this.listReads = undefined; });
+        this.listReads = reads;
+        // The subscription's callback does not await this loop, so its failure is reported through
+        // fail() rather than left as an unhandled rejection.
+        void reads.catch(() => { });
+        return reads;
     }
-    async processEvent(update, generation) {
-        if (!this.isCurrentOpen(generation))
-            throw Object.assign(new Error("Dashboard is closed"), { code: "DASHBOARD_CLOSED" });
+    /** Read current rows until no invalidation arrived during the last read. @param {number} generation */
+    async readCurrentList(generation) {
         try {
-            this.applySnapshot(update.snapshot);
-            await this.awaitHostRender();
-            if (!this.isCurrentOpen(generation))
-                throw Object.assign(new Error("Dashboard is closed"), { code: "DASHBOARD_CLOSED" });
-            // Each save fsyncs the file and its directory, which costs ~70ms on a network home. Events
-            // arrive in bursts while an agent streams, so coalesce: a snapshot is complete state, and a
-            // cursor that lags by one burst only replays events this dashboard has already applied.
-            this.advanceCursor(update.cursor);
-            // One save per burst. Cursors advance monotonically, so a later event's save also makes this
-            // one durable; only the last event in the queue pays the fsync, and it still pays it before
-            // its acknowledgement. Saving per event costs ~70ms each on a network home.
-            if (this.eventOperations.size <= 1)
-                await this.flushCursorSave();
+            while (this.listChangePending) {
+                if (!this.isCurrentOpen(generation))
+                    throw Object.assign(new Error("Dashboard is closed"), { code: "DASHBOARD_CLOSED" });
+                this.listChangePending = false;
+                const snapshot = await this.backend.getSnapshot(this.openController?.signal);
+                if (!this.isCurrentOpen(generation))
+                    throw Object.assign(new Error("Dashboard is closed"), { code: "DASHBOARD_CLOSED" });
+                if (snapshot.cursor === undefined)
+                    throw Object.assign(new Error("List snapshot carries no coverage cursor"), { code: "INVALID_RESPONSE" });
+                this.applySnapshot(snapshot);
+                this.coverageCursor = snapshot.cursor;
+                this.requestRender?.();
+            }
         }
         catch (error) {
-            const typed = this.typedError(error, "EVENT_PROCESSING_FAILED");
+            const typed = this.typedError(error, "LIST_READ_FAILED");
             this.fail(typed);
             throw Object.assign(new Error(typed.message), { code: typed.code });
         }
@@ -1413,47 +1370,7 @@ export class DashboardController {
         clearInterval(this.animationTimer);
         this.animationTimer = undefined;
     }
-    awaitHostRender() {
-        if (this.requestRender === undefined)
-            return Promise.reject(Object.assign(new Error("Dashboard host cannot request rendering"), { code: "UNSUPPORTED_HOST" }));
-        const generation = ++this.renderRequestGeneration;
-        const rendered = new Promise((resolve, reject) => {
-            this.renderWaiters.set(generation, { resolve, reject });
-        });
-        try {
-            this.requestRender();
-        }
-        catch (error) {
-            const waiter = this.renderWaiters.get(generation);
-            this.renderWaiters.delete(generation);
-            const waiterError = Object.assign(new Error("Dashboard host render request failed"), { code: "RENDER_FAILED", cause: error });
-            waiter?.reject(waiterError);
-            return rendered;
-        }
-        return rendered;
-    }
-    completeHostRender(generation) {
-        const waiter = this.renderWaiters.get(generation);
-        if (waiter === undefined)
-            return;
-        this.renderWaiters.delete(generation);
-        waiter.resolve();
-    }
-    rejectHostRenders(error) {
-        for (const waiter of this.renderWaiters.values())
-            waiter.reject(error);
-        this.renderWaiters.clear();
-    }
-    /**
-     * Move this frontend's position forward to a cursor it is synchronized to. A cursor is never
-     * moved back: persisting a position the frontend has already passed replays those events on the
-     * next start, which is what filled the bounded queue in the first place.
-     */
-    advanceCursor(cursor) {
-        if (cursor !== undefined && cursorAfter(this.cursor, cursor))
-            this.cursor = cursor;
-    }
-    persistedState(cursor = this.cursor) {
+    persistedState(cursor = this.coverageCursor) {
         const { sourceSessionId: _sourceSessionId, ...launchDraft } = this.composerDraft;
         return {
             schemaVersion: 1,
@@ -1465,10 +1382,6 @@ export class DashboardController {
             },
             launchDraft: { ...launchDraft, model: { ...launchDraft.model } },
         };
-    }
-    /** Persist the newest applied cursor. Callers await it, so acknowledgement still follows persistence. */
-    flushCursorSave() {
-        return this.enqueueSave(this.persistedState(this.cursor));
     }
     enqueueSave(state) {
         const operation = this.saveTail.then(() => this.persistence.save(state));
@@ -1506,15 +1419,12 @@ export class DashboardController {
         this.overlay = undefined;
         this.pendingShared = undefined;
         this.confirmationText = "";
-        const closedError = initialError ?? { code: "DASHBOARD_CLOSED", message: "Dashboard closed before host render" };
-        this.rejectHostRenders(Object.assign(new Error(closedError.message), { code: closedError.code }));
         this.closePromise = this.finishClose(initialError);
         return this.closePromise;
     }
     async finishClose(initialError) {
         let error = initialError;
-        await this.flushCursorSave().catch(() => { });
-        await Promise.allSettled([...this.eventOperations]);
+        await Promise.allSettled([this.listReads]);
         await this.saveTail;
         if (error === undefined && this.saveFailure !== undefined)
             error = this.typedError(this.saveFailure, "PERSIST_FAILED");

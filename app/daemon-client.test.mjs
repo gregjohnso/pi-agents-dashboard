@@ -62,7 +62,7 @@ function startClient(options) {
   return client;
 }
 
-const emptyState = { kind: "state", sessions: [] };
+const emptyState = { kind: "state", sessions: [], cursor: { daemonEpoch: "epoch-1", sequence: "0" } };
 const request = { version: 1, clientId: "client-1", requestId: "exact-request-id", op: "get_state", payload: {} };
 
 /** @param {() => boolean} predicate */
@@ -117,32 +117,56 @@ describe("daemon client", () => {
     await expect(response).resolves.toMatchObject({ requestId: request.requestId, ok: true });
   });
 
-  it("reconnects subscriptions from the acknowledged cursor and wires successful ack responses", async () => {
-    const socketPath = await socketPathIn("client-ack-");
+  it("notifies a list subscriber for every invalidation without holding one of them", async () => {
+    const socketPath = await socketPathIn("client-invalidation-");
     /** @type {any[]} */
-    const subscriptions = [];
+    const payloads = [];
     const server = await daemonServer(socketPath, ({ request: incoming, reply }) => {
-      if (incoming.op === "subscribe") {
-        subscriptions.push(incoming.payload.after);
-        reply({ kind: "subscribed", cursor: incoming.payload.after });
-      } else if (incoming.op === "ack") reply({ kind: "acknowledged", cursor: incoming.payload.cursor });
+      if (incoming.op !== "subscribe_list_changes") return;
+      payloads.push(incoming.payload);
+      reply({ kind: "list_subscribed" });
     });
     const client = startClient({ socketPath, reconnectDelayMs: 1 });
-    const zero = { daemonEpoch: "epoch-1", sequence: "0" };
-    const one = { daemonEpoch: "epoch-1", sequence: "1" };
-    const iterator = client.subscribe(zero)[Symbol.asyncIterator]();
-    await waitFor(() => subscriptions.length === 1);
-    const pendingEvent = iterator.next();
-    server.socket?.write(encodeJsonl({ version: 1, cursor: one, occurredAt: "2026-01-01T00:00:00.000Z", kind: "attachment_changed", payload: { sessionId: "s", clientId: "client-1", role: "observer", attached: true } }));
-    await expect(pendingEvent).resolves.toMatchObject({ value: { cursor: one }, done: false });
+    let notifications = 0;
+    const unsubscribe = await client.subscribeListChanges(() => { notifications += 1; });
+    expect(payloads).toEqual([{}]);
+    const before = notifications;
+    for (let index = 0; index < 5_000; index += 1) server.socket?.write(encodeJsonl({ version: 1, kind: "list_changed" }));
+    await waitFor(() => notifications - before === 5_000);
+    unsubscribe();
+    server.socket?.write(encodeJsonl({ version: 1, kind: "list_changed" }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(notifications - before).toBe(5_000);
+  });
+
+  // A change published while the socket was down is invisible, so reconnecting is itself a change.
+  it("resubscribes and reports a change after a reconnect", async () => {
+    const socketPath = await socketPathIn("client-resubscribe-");
+    let subscriptions = 0;
+    const server = await daemonServer(socketPath, ({ request: incoming, reply }) => {
+      if (incoming.op !== "subscribe_list_changes") return;
+      subscriptions += 1;
+      reply({ kind: "list_subscribed" });
+    });
+    const client = startClient({ socketPath, reconnectDelayMs: 1 });
+    let notifications = 0;
+    await client.subscribeListChanges(() => { notifications += 1; });
+    await waitFor(() => subscriptions === 1);
+    const before = notifications;
     server.socket?.destroy();
-    await waitFor(() => subscriptions.length === 2);
-    expect(subscriptions[1]).toEqual(zero);
-    await client.request({ version: 1, clientId: "client-1", requestId: "ack-1", op: "ack", payload: { cursor: one } });
-    server.socket?.destroy();
-    await waitFor(() => subscriptions.length === 3);
-    expect(subscriptions[2]).toEqual(one);
-    await iterator.return?.();
+    await waitFor(() => subscriptions === 2);
+    await waitFor(() => notifications > before);
+  });
+
+  // Operator-visible failure: an old daemon has no list-invalidation operation, and a subscription
+  // that failed silently left the list frozen on rows it read once and never refreshed.
+  it("fails the list subscription when the daemon refuses the operation", async () => {
+    const socketPath = await socketPathIn("client-old-daemon-");
+    await daemonServer(socketPath, ({ socket, request: incoming }) => {
+      socket.write(encodeJsonl({ version: 1, requestId: incoming.requestId, ok: false, error: { code: "INVALID_REQUEST", message: "Invalid client request", retryable: false } }));
+    });
+    const client = startClient({ socketPath, reconnect: false });
+    await expect(within(client.subscribeListChanges(() => {}))).rejects.toMatchObject({ code: "INVALID_REQUEST" });
   });
 
   // Operator-visible failure: a two-field response skew froze the dashboard. The unparseable frame
@@ -193,85 +217,31 @@ describe("daemon client", () => {
     expect(fatalErrors).toEqual([expect.objectContaining({ code: "MALFORMED_FRAME" })]);
   });
 
-  it("coalesces superseded session updates instead of overflowing a slow list consumer", async () => {
-    const socketPath = await socketPathIn("client-coalesce-");
-    const session = (sessionId, sequence) => ({ schemaVersion: 1, revision: sequence, sessionId, sessionFile: `/sessions/${sessionId}.jsonl`, canonicalSessionFile: `/sessions/${sessionId}.jsonl`, cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "assistant_streaming", summary: `chunk ${sequence}`, updatedAt: "2026-01-01T00:00:00.000Z" }, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" });
-    const event = (sessionId, sequence) => ({ version: 1, cursor: { daemonEpoch: "epoch-1", sequence: String(sequence) }, occurredAt: "2026-01-01T00:00:00.000Z", kind: "session_changed", payload: { session: session(sessionId, sequence) } });
-    await daemonServer(socketPath, ({ socket, reply }) => {
-      reply({ kind: "subscribed", cursor: { daemonEpoch: "epoch-1", sequence: "0" } });
-      for (let sequence = 1; sequence <= 12; sequence += 1) socket.write(encodeJsonl(event("streaming", sequence)));
-      socket.write(encodeJsonl(event("other", 13)));
-    });
-    const client = startClient({ socketPath, maxBytes: 8192, reconnectDelayMs: 1, subscriberLimit: 4, reconnect: false });
-    const iterator = client.subscribe({ daemonEpoch: "epoch-1", sequence: "0" })[Symbol.asyncIterator]();
-    const first = await within(iterator.next());
-    expect(first.value.payload.session.sessionId).toBe("streaming");
-    const second = await within(iterator.next());
-    expect(second.value.cursor.sequence).toBe("12");
-    const third = await within(iterator.next());
-    expect(third.value.payload.session.sessionId).toBe("other");
-    await iterator.return?.();
-  });
-
-  // Operator-visible failure: the dashboard exited with "SUBSCRIBER_OVERFLOW: Client subscriber
-  // exceeded its bounded queue" whenever the daemon replayed more events than the queue holds.
-  it("asks a list subscriber that fell behind to resynchronize instead of ending it", async () => {
-    const socketPath = await socketPathIn("client-overflow-");
-    const session = (sessionId) => ({ schemaVersion: 1, revision: 1, sessionId, sessionFile: `/sessions/${sessionId}.jsonl`, canonicalSessionFile: `/sessions/${sessionId}.jsonl`, cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "assistant_final", summary: sessionId, updatedAt: "2026-01-01T00:00:00.000Z" }, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" });
-    const event = (sequence) => ({ version: 1, cursor: { daemonEpoch: "epoch-1", sequence: String(sequence) }, occurredAt: "2026-01-01T00:00:00.000Z", kind: "session_changed", payload: { session: session(`session-${sequence}`) } });
-    const server = await daemonServer(socketPath, ({ socket, reply }) => {
-      reply({ kind: "subscribed", cursor: { daemonEpoch: "epoch-1", sequence: "0" } });
-      for (let sequence = 1; sequence <= 13; sequence += 1) socket.write(encodeJsonl(event(sequence)));
-    });
-    const client = startClient({ socketPath, maxBytes: 8192, reconnectDelayMs: 1, subscriberLimit: 4, reconnect: false });
-    const iterator = client.subscribe({ daemonEpoch: "epoch-1", sequence: "0" })[Symbol.asyncIterator]();
-    /** @type {any[]} */
-    const delivered = [];
-    for (;;) {
-      const next = await within(iterator.next());
-      expect(next.done).toBe(false);
-      delivered.push(next.value);
-      if (next.value.kind === "resynchronize") break;
-    }
-    // The marker names the newest position the client saw, so the consumer can refetch a snapshot
-    // and skip everything the snapshot already contains.
-    expect(delivered.at(-1)).toEqual({ kind: "resynchronize", cursor: { daemonEpoch: "epoch-1", sequence: "13" } });
-    expect(delivered.filter((value) => value.kind === "session_changed").length).toBeLessThan(13);
-
-    server.socket?.write(encodeJsonl(event(14)));
-    await expect(within(iterator.next())).resolves.toMatchObject({ value: { cursor: { sequence: "14" } }, done: false });
-    await iterator.return?.();
-  });
-
-  // A broadcast frame belongs to no request, so dropping it would leave a gap in an ordered stream
-  // that no consumer can name or refetch. It stays fatal, and the reconnect resubscribes.
-  it("keeps a malformed event fatal, resubscribes, and retains the request it interrupted", async () => {
-    const socketPath = await socketPathIn("client-malformed-event-");
-    const executable = { realpath: "/installed/pi", device: "1", inode: "2", size: 3, modifiedTimeNs: "4" };
-    const identity = { pid: 10, startIdentity: "start", processGroupId: 10 };
-    const runtime = { executable, piVersion: "1.0.0", capabilities: { executable, reportedVersion: "1.0.0", rpcMode: true, jsonl: true, commands: ["get_state", "prompt", "follow_up", "steer", "abort", "extension_ui_response"], events: ["required_live_events"], missingRequired: [] }, rpcAdapterVersion: 1, viewerProtocolVersion: 1, supervisor: identity, piChild: identity };
-    const session = { schemaVersion: 1, revision: 1, sessionId: "s", sessionFile: "/sessions/s.jsonl", canonicalSessionFile: "/sessions/s.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "launching", summary: "Starting", updatedAt: "2026-01-01T00:00:00.000Z" }, runtime, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" };
-    const validEvent = { version: 1, cursor: { daemonEpoch: "epoch-1", sequence: "1" }, occurredAt: "2026-01-01T00:00:00.000Z", kind: "session_changed", payload: { session } };
+  // A broadcast frame belongs to no request, so a frame this release cannot read means the daemon
+  // is publishing something the list does not understand. It stays fatal, and the reconnect
+  // resubscribes; the retired persisted list event is exactly such a frame.
+  it("keeps a broadcast frame it cannot read fatal, resubscribes, and retains the request it interrupted", async () => {
+    const socketPath = await socketPathIn("client-malformed-broadcast-");
+    const retiredEvent = { version: 1, cursor: { daemonEpoch: "epoch-1", sequence: "1" }, occurredAt: "2026-01-01T00:00:00.000Z", kind: "session_changed", payload: {} };
     const server = await daemonServer(socketPath, ({ socket, request: incoming, connection, reply }) => {
-      if (incoming.op !== "subscribe") {
+      if (incoming.op !== "subscribe_list_changes") {
         if (connection === 2) reply(emptyState);
         return;
       }
-      reply({ kind: "subscribed", cursor: { daemonEpoch: "epoch-1", sequence: "0" } });
-      if (connection === 1) socket.write(encodeJsonl({ ...validEvent, cursor: { daemonEpoch: "epoch-1", sequence: 1 } }));
-      else socket.write(encodeJsonl(validEvent));
+      reply({ kind: "list_subscribed" });
+      socket.write(encodeJsonl(connection === 1 ? retiredEvent : { version: 1, kind: "list_changed" }));
     });
     const client = startClient({ socketPath, maxBytes: 4096, reconnectDelayMs: 1 });
     /** @type {any[]} */
     const fatalErrors = [];
     client.onFatalError?.((error) => fatalErrors.push(error));
+    let notifications = 0;
     const interrupted = client.request(request);
-    const iterator = client.subscribe({ daemonEpoch: "epoch-1", sequence: "0" })[Symbol.asyncIterator]();
-    await expect(within(iterator.next())).resolves.toMatchObject({ value: validEvent, done: false });
+    await client.subscribeListChanges(() => { notifications += 1; });
     await expect(within(interrupted)).resolves.toMatchObject({ ok: true, result: emptyState });
+    await waitFor(() => notifications > 0);
     expect(server.connections).toBe(2);
     expect(fatalErrors).toEqual([expect.objectContaining({ code: "MALFORMED_FRAME" })]);
-    await iterator.return?.();
   });
 
   it("resumes a viewer subscription from the applied cursor, not the delivered one", async () => {
@@ -334,18 +304,18 @@ describe("daemon client", () => {
 
   it("reports the daemon going away and coming back", async () => {
     const socketPath = await socketPathIn("client-connection-");
-    const server = await daemonServer(socketPath, ({ reply }) => reply({ kind: "subscribed", cursor: { daemonEpoch: "epoch-1", sequence: "0" } }));
+    const server = await daemonServer(socketPath, ({ reply }) => reply({ kind: "list_subscribed" }));
     const client = startClient({ socketPath, reconnectDelayMs: 1 });
     /** @type {boolean[]} */
     const connection = [];
     client.onConnectionChange((status) => connection.push(status.connected));
-    const iterator = client.subscribe()[Symbol.asyncIterator]();
+    const unsubscribe = await client.subscribeListChanges(() => {});
     await waitFor(() => connection.length === 1);
 
     server.socket?.destroy();
     await waitFor(() => connection.length === 3);
     expect(connection).toEqual([true, false, true]);
-    await iterator.return?.();
+    unsubscribe();
   });
 
   it("forgets old completed responses instead of retaining every one for the life of the dashboard", async () => {

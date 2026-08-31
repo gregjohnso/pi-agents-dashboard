@@ -51,18 +51,15 @@ Before anything is signalled, the run's private metadata gains `pendingRespawn: 
 
 See [`docs/reference/claude-code-behavior.md`](reference/claude-code-behavior.md#release-changes-adopt-workers-before-replacing-them).
 
-## Events are ordered, cursor-based, and snapshot-first
+## The list is invalidated; the viewer is replayed
 
-The daemon publishes each session or command change through [`createEventStore`](../runtime/event-store.mjs). It appends the version 1 event to `index/events.jsonl`, syncs it, assigns the next sequence in the current daemon epoch, and then broadcasts it. A cursor is the pair `daemonEpoch` and `sequence`.
+The session list carries no history. [`DashboardController.open`](../app/list/dashboard.mjs) sends `subscribe_list_changes` first, sets one dirty flag, then reads `get_state`. A change the daemon publishes while that read is in flight arrives as a payload-free `list_changed` frame, which only sets the flag again, so the read loop performs one more read and stops. Any number of invalidations between two reads mean the same single read: there is no queue, no cursor to fall behind, and nothing that grows with a burst.
 
-Both screens read a snapshot before subscribing:
+Every successful `get_state` result carries a `cursor`, the pair `daemonEpoch` and `sequence`, which is how far the daemon's list had advanced when it read those rows. The daemon reads that cursor before the registry, never after, so a snapshot never claims to cover a change it does not contain. The cursor lives only in daemon memory and in the dashboard's memory; nothing replays from it and it does not survive a daemon restart.
 
-- [`DashboardController.open`](../app/list/dashboard.mjs) calls `get_state`, adopts the cursor covered by that snapshot, then subscribes after it.
-- [`ViewerController.open`](../app/viewer/viewer-controller.mjs) calls `get_viewer_snapshot`, builds the transcript from that snapshot, then subscribes after its per-session cursor.
+The daemon still appends each session, command, and attachment change to `index/events.jsonl` through [`createEventStore`](../runtime/event-store.mjs) and broadcasts it to the older `subscribe` operation. No shipped frontend uses that path.
 
-Consumers process an event before acknowledging its cursor. The frontend persists its list cursor and launch draft. It retains viewer drafts in memory while the app runs. Viewer acknowledgements are durable in the per-session viewer store.
-
-List subscriptions are bounded. If the frontend falls behind, [`createDaemonClient`](../app/daemon-client.mjs) drops the queued backlog and emits one `resynchronize` marker. [`createDaemonDashboardBackend`](../app/list/dashboard.mjs) then fetches a new state snapshot and resumes after the newest cursor covered by that snapshot. Falling behind is a request to resynchronize, not a terminal stream error.
+Viewer data is ordered and replayed, and list invalidation does not replace it. [`ViewerController.open`](../app/viewer/viewer-controller.mjs) calls `get_viewer_snapshot`, builds the transcript from that snapshot, then subscribes after its per-session cursor. Viewer acknowledgements are durable in the per-session viewer store. The frontend persists its launch draft and keeps viewer drafts in memory while the app runs.
 
 Viewer data has a separate ordered store per session. [`createViewerNormalizer`](../runtime/viewer-normalizer.mjs) converts Pi frames into the version 1 shapes in [`shared/viewer-contracts.mjs`](../shared/viewer-contracts.mjs). Frontends never receive raw Pi RPC frames.
 

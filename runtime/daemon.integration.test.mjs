@@ -333,9 +333,47 @@ it("repairs an abandoned launch to FAILED and leaves finished sessions untouched
 
   const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 16384 });
   await client.ready;
-  client.send({ version: 1, clientId: "watcher", requestId: "replay", op: "subscribe", payload: {} });
-  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "subscribed" } });
-  expect(await client.next()).toMatchObject({ kind: "session_changed", payload: { session: { sessionId: "abandoned", taskState: "FAILED" } } });
+  // Nothing is replayed: the subscription carries no position, and the repair is in current rows.
+  client.send({ version: 1, clientId: "watcher", requestId: "subscribe", op: "subscribe_list_changes", payload: {} });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "list_subscribed" } });
+  client.send({ version: 1, clientId: "watcher", requestId: "read", op: "get_state", payload: {} });
+  const read = await client.next();
+  expect(read.result.sessions.find((/** @type {any} */ session) => session.sessionId === "abandoned")).toMatchObject({ taskState: "FAILED" });
+  expect(read.result.cursor).toMatchObject({ sequence: expect.stringMatching(/^(0|[1-9]\d*)$/u) });
+  client.close();
+});
+
+// Operator-visible failure: replaying a persisted list history crashed the dashboard on every
+// start, and 18 MB of it had accumulated on the operator's machine.
+it("invalidates a list subscription after a durable change, carrying no payload and no position", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const now = "2026-08-25T12:00:00.000Z";
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "tinted", sessionFile: "/sessions/tinted.jsonl", canonicalSessionFile: "/sessions/tinted.jsonl", cwd: "/repo", taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "saved_session", summary: "Saved", updatedAt: now }, createdAt: now, updatedAt: now });
+  const runtime = await createDaemonRuntime({ root: stateRoot });
+  runtimes.push(runtime);
+  await runtime.ready;
+
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 16384 });
+  await client.ready;
+  client.send({ version: 1, clientId: "watcher", requestId: "read-before", op: "get_state", payload: {} });
+  const before = (await client.next()).result.cursor;
+  client.send({ version: 1, clientId: "watcher", requestId: "subscribe", op: "subscribe_list_changes", payload: {} });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "list_subscribed" } });
+
+  client.send({ version: 1, clientId: "watcher", requestId: "tint", op: "set_session_color", payload: { sessionId: "tinted", color: "amber" } });
+  // The durable write comes first, then the invalidation, then this request's own answer, so a
+  // client that reads on the invalidation always sees the change it names.
+  expect(await client.next()).toEqual({ version: 1, kind: "list_changed" });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "session_colored", color: "amber" } });
+
+  client.send({ version: 1, clientId: "watcher", requestId: "read-after", op: "get_state", payload: {} });
+  const after = await client.next();
+  expect(after.result.sessions[0]).toMatchObject({ sessionId: "tinted", color: "amber" });
+  // The coverage cursor advances with the change, so a snapshot states what it covers.
+  expect(BigInt(after.result.cursor.sequence) > BigInt(before.sequence)).toBe(true);
+  expect(after.result.cursor.daemonEpoch).toBe(before.daemonEpoch);
   client.close();
 });
 

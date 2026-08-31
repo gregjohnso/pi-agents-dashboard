@@ -1,7 +1,7 @@
 import net from "node:net";
 import { randomUUID } from "node:crypto";
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
-import { parseDaemonResponse, parsePersistedEvent } from "../shared/contracts.mjs";
+import { parseDaemonResponse, parseListChanged } from "../shared/contracts.mjs";
 import { parseViewerEvent, parseViewerSnapshot } from "../shared/viewer-contracts.mjs";
 /**
  * How much answered-request history one client keeps to deduplicate a repeated request ID.
@@ -29,13 +29,6 @@ function canonical(value) {
         return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonical(record[key])}`).join(",")}}`;
     }
     return JSON.stringify(value) ?? "undefined";
-}
-function laterCursor(current, candidate) {
-    if (current === undefined || current.daemonEpoch !== candidate.daemonEpoch)
-        return candidate;
-    if (!/^(0|[1-9]\d*)$/.test(current.sequence) || !/^(0|[1-9]\d*)$/.test(candidate.sequence))
-        return candidate;
-    return BigInt(candidate.sequence) >= BigInt(current.sequence) ? candidate : current;
 }
 function laterViewerCursor(current, candidate) {
     if (current === undefined || current.daemonEpoch !== candidate.daemonEpoch || current.sessionId !== candidate.sessionId)
@@ -69,7 +62,9 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
             seenCharacters -= entry.characters ?? 0;
         }
     };
-    const subscribers = new Set();
+    /** Callers notified that the session list changed. A notification carries nothing, so this set
+     * never grows with a burst and holds no position to fall behind. */
+    const listSubscribers = new Set();
     const viewerSubscribers = new Set();
     const fatalErrorListeners = new Set();
     const connectionListeners = new Set();
@@ -88,7 +83,7 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
         for (const listener of connectionListeners)
             listener({ connected });
     };
-    const hasWork = () => pending.size > 0 || subscribers.size > 0 || viewerSubscribers.size > 0;
+    const hasWork = () => pending.size > 0 || listSubscribers.size > 0 || viewerSubscribers.size > 0;
     const reportFatalFrame = (error, fallbackCode) => {
         const typed = error;
         const reported = error instanceof DaemonClientError
@@ -103,43 +98,27 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
         socket.write(encoder.encode(value));
     };
     const sendPending = (item) => { send(item.request); item.sent = true; };
+    /**
+     * Reopen an established list subscription on a new connection. A change published while the
+     * socket was down leaves no trace, so a successful resubscription is itself a change. A daemon
+     * that refuses the operation drops the subscriber rather than resending on every reconnect,
+     * because resending is how one refusal became a reconnect storm.
+     * @param {{ onChanged: () => void }} subscriber
+     */
+    const resubscribeListChanges = (subscriber) => {
+        void requestResult("subscribe_list_changes", {}).then(() => {
+            if (listSubscribers.has(subscriber)) subscriber.onChanged();
+        }, (/** @type {unknown} */ error) => {
+            listSubscribers.delete(subscriber);
+            reportFatalFrame(error, "LIST_SUBSCRIPTION_FAILED");
+        });
+    };
     const sendSubscriptions = () => {
-        for (const subscriber of subscribers) {
-            send({ version: 1, clientId, requestId: randomUUID(), op: "subscribe", payload: subscriber.acknowledgedAfter === undefined ? {} : { after: subscriber.acknowledgedAfter } });
+        for (const subscriber of listSubscribers) {
+            if (subscriber.established) resubscribeListChanges(subscriber);
         }
         for (const subscriber of viewerSubscribers) {
             send({ version: 1, clientId, requestId: randomUUID(), op: "subscribe_viewer", payload: { sessionId: subscriber.sessionId, ...(subscriber.resumeAfter === undefined ? {} : { after: subscriber.resumeAfter }) } });
-        }
-    };
-    const dispatchEvent = (event) => {
-        const supersededSessionId = event.kind === "session_changed" ? event.payload.session.sessionId : undefined;
-        for (const subscriber of subscribers) {
-            if (subscriber.ended)
-                continue;
-            subscriber.observed = laterCursor(subscriber.observed, event.cursor);
-            // Falling behind is not fatal: the consumer owes a snapshot refetch, and every event
-            // until it takes that marker is already subsumed by the snapshot it will read.
-            if (subscriber.desynchronized)
-                continue;
-            if (subscriber.waiter !== undefined) {
-                const waiter = subscriber.waiter;
-                subscriber.waiter = undefined;
-                waiter({ value: event, done: false });
-                continue;
-            }
-            // One queued state per session: the newest record supersedes older ones and keeps cursors ascending.
-            if (supersededSessionId !== undefined) {
-                const superseded = subscriber.queue.findIndex((queued) => queued.kind === "session_changed" && queued.payload.session.sessionId === supersededSessionId);
-                if (superseded !== -1)
-                    subscriber.queue.splice(superseded, 1);
-            }
-            if (subscriber.queue.length >= subscriberLimit) {
-                subscriber.desynchronized = true;
-                subscriber.queue.length = 0;
-            }
-            else {
-                subscriber.queue.push(event);
-            }
         }
     };
     const dispatchViewerEvent = (event) => {
@@ -160,10 +139,6 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                 subscriber.queue.push(event);
             }
         }
-    };
-    const applyAcknowledgement = (cursor) => {
-        for (const subscriber of subscribers)
-            subscriber.acknowledgedAfter = laterCursor(subscriber.acknowledgedAfter, cursor);
     };
     const waitForRetry = (milliseconds) => new Promise((resolve) => {
         if (closed || milliseconds === 0) {
@@ -259,15 +234,14 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                             seenCharacters += entry.characters;
                             evictSeen();
                         }
-                        if (item.request.op === "ack" && response.ok && response.result.kind === "acknowledged")
-                            applyAcknowledgement(response.result.cursor);
                         item.resolve(response);
                     }
                     else if (typeof record === "object" && record !== null && Object.hasOwn(record, "eventId")) {
                         dispatchViewerEvent(parseViewerEvent(record));
                     }
                     else {
-                        dispatchEvent(parsePersistedEvent(record));
+                        parseListChanged(record);
+                        for (const subscriber of [...listSubscribers]) subscriber.onChanged();
                     }
                 }
             }
@@ -289,8 +263,7 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
             if (!reconnect) {
                 for (const item of pending.values()) item.reject(closedError(item.sent));
                 pending.clear();
-                for (const subscriber of subscribers) { subscriber.error = closedError(); subscriber.ended = true; subscriber.waiter?.({ value: undefined, done: true }); }
-                subscribers.clear();
+                listSubscribers.clear();
                 for (const subscriber of viewerSubscribers) { subscriber.error = closedError(); subscriber.ended = true; subscriber.waiter?.({ value: undefined, done: true }); }
                 viewerSubscribers.clear();
             }
@@ -340,12 +313,6 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
         async next() {
             if (subscriber.error !== undefined)
                 throw subscriber.error;
-            // Hand the resynchronization marker over before any later event, and resume queuing only
-            // once the consumer holds it, so nothing is dropped after the snapshot it will read.
-            if (subscriber.desynchronized === true) {
-                subscriber.desynchronized = false;
-                return { value: { kind: "resynchronize", cursor: subscriber.observed }, done: false };
-            }
             const event = subscriber.queue.shift();
             if (event !== undefined)
                 return { value: event, done: false };
@@ -393,18 +360,30 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                 void startReconnectLoop().catch(() => { });
             return promise;
         },
-        subscribe(after) {
-            const subscriber = { acknowledgedAfter: after, observed: after, desynchronized: false, queue: [], ended: closed };
-            if (!closed) {
-                subscribers.add(subscriber);
-                if (socket !== undefined && authenticated && !socket.destroyed) {
-                    send({ version: 1, clientId, requestId: randomUUID(), op: "subscribe", payload: after === undefined ? {} : { after } });
-                }
-                else {
-                    void startReconnectLoop().catch(() => { });
-                }
+        /**
+         * Subscribe to payload-free list invalidations, then read `get_state`. Subscribing first is
+         * what makes the read safe: a change published while the read is in flight arrives as a
+         * notification instead of being missed. Establishment is awaited, so a daemon without this
+         * operation refuses here rather than leaving a list that never refreshes again.
+         * @param {() => void} onChanged @returns {Promise<() => void>}
+         */
+        async subscribeListChanges(onChanged) {
+            if (typeof onChanged !== "function")
+                throw new TypeError("onChanged is required");
+            if (closed)
+                throw new DaemonClientError("CLIENT_CLOSED", "Daemon client is closed");
+            /** @type {{ onChanged: () => void, established: boolean }} */
+            const subscriber = { onChanged, established: false };
+            listSubscribers.add(subscriber);
+            try {
+                await requestResult("subscribe_list_changes", {});
             }
-            return subscriberIterable(subscriber, subscribers);
+            catch (error) {
+                listSubscribers.delete(subscriber);
+                throw error;
+            }
+            subscriber.established = true;
+            return () => { listSubscribers.delete(subscriber); };
         },
         /** @param {string} sessionId @param {string | null} color */
         async setSessionColor(sessionId, color) {
@@ -467,12 +446,12 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
             for (const item of pending.values())
                 item.reject(new DaemonClientError("CLIENT_CLOSED", "Daemon client is closed"));
             pending.clear();
-            for (const subscriber of [...subscribers, ...viewerSubscribers]) {
+            for (const subscriber of viewerSubscribers) {
                 subscriber.ended = true;
                 subscriber.waiter?.({ value: undefined, done: true });
                 subscriber.waiter = undefined;
             }
-            subscribers.clear();
+            listSubscribers.clear();
             viewerSubscribers.clear();
             fatalErrorListeners.clear();
             connectionListeners.clear();

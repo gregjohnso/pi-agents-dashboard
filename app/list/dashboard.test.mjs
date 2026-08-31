@@ -30,22 +30,40 @@ function session(id, overrides = {}) {
         ...overrides,
     };
 }
+let coverageSequence = 0;
+/** The daemon's in-memory snapshot coverage cursor, which every successful get_state must carry. */
+function nextCoverage() {
+    coverageSequence += 1;
+    return { daemonEpoch: "epoch", sequence: String(coverageSequence) };
+}
 class FakeBackend {
     snapshot;
-    listener;
+    /** The dashboard's invalidation callback; calling it returns the read it drives. */
+    notifyListChanged;
     errorListener;
     unsubscribed = 0;
+    reads = 0;
+    subscriptions = 0;
     requests = [];
     stop = vi.fn();
     delete = vi.fn();
     resolveDelivery = vi.fn(async () => { });
     constructor(sessions) {
-        this.snapshot = { sessions };
+        this.snapshot = { sessions, cursor: nextCoverage() };
     }
-    async getSnapshot() { return this.snapshot; }
-    subscribe(after, listener, onError) {
-        this.subscribedAfter = after;
-        this.listener = listener;
+    /** @param {readonly any[]} sessions */
+    setSessions(sessions) { this.snapshot = { sessions, cursor: nextCoverage() }; }
+    async getSnapshot() {
+        this.reads += 1;
+        // The daemon reads its coverage cursor and rows before it answers, so a change published
+        // while the response is in flight is not in this snapshot.
+        const snapshot = this.snapshot;
+        await this.duringRead?.(this.reads);
+        return snapshot;
+    }
+    async subscribeListChanges(onChanged, onError) {
+        this.subscriptions += 1;
+        this.notifyListChanged = onChanged;
         this.errorListener = onError;
         if (this.subscribeFailure !== undefined) throw this.subscribeFailure;
         return () => { this.unsubscribed += 1; };
@@ -99,10 +117,11 @@ function journalledDestructive(refuse) {
         },
     };
 }
-async function processRenderedEvent(dashboard, backend, update) {
-    const processing = Promise.resolve(backend.listener?.(update));
+/** Publish one list change the way the daemon does: mutate state, then invalidate. */
+async function applyListChange(dashboard, backend, sessions) {
+    if (sessions !== undefined) backend.setSessions(sessions);
+    await backend.notifyListChanged();
     dashboard.render();
-    await processing;
 }
 describe("dashboard controller", () => {
     it("keeps selection by canonical session ID through live reorder and resize", async () => {
@@ -111,7 +130,7 @@ describe("dashboard controller", () => {
         await dashboard.open();
         dashboard.handleInput("\x1b[B");
         expect(dashboard.selectedSessionId).toBe("b");
-        await processRenderedEvent(dashboard, backend, { snapshot: { sessions: [session("c"), session("a"), session("b", { revision: 2 })] }, cursor: { daemonEpoch: "epoch", sequence: "1" } });
+        await applyListChange(dashboard, backend, [session("c"), session("a"), session("b", { revision: 2 })]);
         dashboard.resize(40, 8);
         expect(dashboard.selectedSessionId).toBe("b");
     });
@@ -242,7 +261,7 @@ describe("dashboard controller", () => {
         await dashboard.open();
         dashboard.selectSession("a");
         // The retry re-reads from the daemon, so the newest revision comes from there.
-        backend.getSnapshot = vi.fn(async () => ({ sessions: [session("a", { processState: "LIVE", revision: 9 })] }));
+        backend.getSnapshot = vi.fn(async () => ({ sessions: [session("a", { processState: "LIVE", revision: 9 })], cursor: nextCoverage() }));
         dashboard.handleInput("\x18");
         await vi.waitFor(() => expect(backend.stop).toHaveBeenCalledWith("a", 9, expect.any(String)));
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
@@ -376,7 +395,7 @@ describe("dashboard controller", () => {
         const dashboard = controller(backend);
         await dashboard.open();
         // The daemon has moved on; the frontend still holds revision 4 because no event carried the change.
-        backend.getSnapshot = vi.fn(async () => ({ sessions: [session("a", { taskState: "FAILED", processState: "EXITED", revision: 25 })] }));
+        backend.getSnapshot = vi.fn(async () => ({ sessions: [session("a", { taskState: "FAILED", processState: "EXITED", revision: 25 })], cursor: nextCoverage() }));
         dashboard.setView("all");
         dashboard.selectSession("a");
         dashboard.handleInput("\x18");
@@ -385,25 +404,19 @@ describe("dashboard controller", () => {
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
         expect(new Set(journal.requestIds).size).toBe(journal.requestIds.length);
     });
-    it("coalesces cursor saves across a burst of events and flushes on close", async () => {
-        // Each save fsyncs the file and its directory, about 70ms on a network home, so one save per
-        // event stalls the list while an agent streams.
+    // Operator-visible failure: each save fsyncs the file and its directory, about 70 ms on a
+    // network home, so a burst that saved per change stalled the list while an agent streamed.
+    it("writes nothing durable while list invalidations arrive", async () => {
         const backend = new FakeBackend([session("a")]);
         const saves = [];
-        const dashboard = controller(backend, { persistence: { async load() { return undefined; }, async save(value) { saves.push(value.cursor?.sequence); } } });
+        const dashboard = controller(backend, { persistence: { async load() { return undefined; }, async save(value) { saves.push(value); } } });
         await dashboard.open();
         const before = saves.length;
-        const burst = [1, 2, 3, 4, 5].map((sequence) => Promise.resolve(backend.listener?.({
-            snapshot: { sessions: [session("a", { revision: sequence })] },
-            cursor: { daemonEpoch: "epoch", sequence: String(sequence) },
-        })));
-        // Each queued event waits for a host render, so keep rendering while the burst drains.
-        const ticker = setInterval(() => dashboard.render(), 5);
-        try { await Promise.all(burst); } finally { clearInterval(ticker); }
-        expect(saves.length - before).toBeLessThan(5);
+        for (const revision of [1, 2, 3, 4, 5]) await applyListChange(dashboard, backend, [session("a", { revision })]);
+        expect(saves.length).toBe(before);
+        expect(dashboard.sessions[0].revision).toBe(5);
         await dashboard.close();
-        // Whatever was coalesced is durable once the dashboard has closed.
-        expect(saves.at(-1)).toBe("5");
+        expect(saves.length).toBeGreaterThan(before);
     });
     it("retires the pending row as soon as the real session appears", async () => {
         let release = () => {};
@@ -479,10 +492,7 @@ describe("dashboard controller", () => {
         // Every later change the operator did not make: the summary-refresh timer, a subscription
         // update, and repeated renders. None of them may take the refusal off the screen.
         await vi.waitFor(() => expect(backend.refreshSummaries).toHaveBeenCalled(), { timeout: 5_000 });
-        const update = Promise.resolve(backend.listener?.({ snapshot: { sessions: [session("a", { revision: 2 })] }, cursor: { daemonEpoch: "epoch", sequence: "2" } }));
-        // A queued event drains on a host render, so keep rendering until it lands.
-        const ticker = setInterval(() => dashboard.render(100, 24), 5);
-        try { await update; } finally { clearInterval(ticker); }
+        await applyListChange(dashboard, backend, [session("a", { revision: 2 })]);
         expect(dashboard.status).toMatchObject({ kind: "error", code: "MODEL_UNKNOWN" });
         expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("MODEL_UNKNOWN"))).toBe(true);
 
@@ -587,45 +597,74 @@ describe("dashboard controller", () => {
         expect(backend.stop).not.toHaveBeenCalled();
     });
     // Operator-visible failure: a dashboard whose persisted cursor was thousands of events behind
-    // made the daemon replay the whole log at once, and the list died before it drew a row.
-    it("subscribes from the daemon's own position, not from a persisted cursor thousands of events behind", async () => {
-        const backend = new FakeBackend([session("a"), session("b")]);
-        backend.snapshot = { sessions: backend.snapshot.sessions, cursor: { daemonEpoch: "epoch", sequence: "6778" } };
-        const saved = persistence({ schemaVersion: 1, clientId: "stable-client", cursor: { daemonEpoch: "epoch", sequence: "2" }, viewState: {}, launchDraft: {} });
-        const dashboard = controller(backend, { persistence: saved });
+    // made the daemon replay the whole log at once, and the list died before it drew a row. Nothing
+    // is replayed now: the list subscribes to payload-free invalidations and reads current rows.
+    it("subscribes before it reads, so a change published during the read is not lost", async () => {
+        const backend = new FakeBackend([session("a")]);
+        /** @type {string[]} */
+        const order = [];
+        backend.duringRead = async (read) => {
+            order.push(`read-${read}`);
+            // The daemon published this between the subscription and the response, the window that
+            // used to lose a change entirely.
+            if (read === 1) {
+                backend.setSessions([session("a"), session("b", { taskState: "WORKING" })]);
+                void backend.notifyListChanged();
+            }
+        };
+        const subscribeListChanges = backend.subscribeListChanges.bind(backend);
+        backend.subscribeListChanges = async (...args) => { order.push("subscribe"); return subscribeListChanges(...args); };
+        const dashboard = controller(backend);
         await dashboard.open();
+        expect(order).toEqual(["subscribe", "read-1", "read-2"]);
         expect(dashboard.status).toEqual({ kind: "ready" });
-        expect(backend.subscribedAfter).toEqual({ daemonEpoch: "epoch", sequence: "6778" });
+        expect(dashboard.sessions.map((record) => record.sessionId)).toEqual(["a", "b"]);
+        expect(dashboard.coverageCursor).toEqual(backend.snapshot.cursor);
+        await dashboard.close();
+    });
+    // Operator-visible failure: replaying a persisted list history crashed the dashboard on every
+    // start, and the queue that held the replay grew with the burst.
+    it("collapses ten thousand invalidations into one dirty flag and at most three reads", async () => {
+        const backend = new FakeBackend([session("a")]);
+        backend.duringRead = async (read) => {
+            if (read === 1) for (let index = 0; index < 10_000; index += 1) void backend.notifyListChanged();
+            // One further change lands during the refetch the burst provoked.
+            if (read === 2) { backend.setSessions([session("a", { revision: 3 })]); void backend.notifyListChanged(); }
+        };
+        const dashboard = controller(backend);
+        await dashboard.open();
+        expect(backend.reads).toBe(3);
+        expect(dashboard.listChangePending).toBe(false);
+        expect(dashboard.sessions[0].revision).toBe(3);
+        await dashboard.close();
+        expect(backend.reads).toBe(3);
+    });
+    // A change published while the socket was down leaves no trace, so the client reports the
+    // reconnection itself as a change and the list reads current rows again.
+    it("reads again when the subscription reports a reconnect", async () => {
+        const backend = new FakeBackend([session("a")]);
+        const dashboard = controller(backend);
+        await dashboard.open();
+        const reads = backend.reads;
+        await applyListChange(dashboard, backend, [session("a"), session("b")]);
+        expect(backend.reads).toBe(reads + 1);
         expect(dashboard.sessions.map((record) => record.sessionId)).toEqual(["a", "b"]);
         await dashboard.close();
-        expect(saved.saved.at(-1)?.cursor).toEqual({ daemonEpoch: "epoch", sequence: "6778" });
     });
-    it("keeps the persisted cursor against a daemon that does not report its position", async () => {
+    // Operator-visible failure: a snapshot whose coverage was unknown could not be told from one
+    // taken before a change, which is what made the subscribe-then-read window unsafe.
+    it("refuses a snapshot that does not carry its coverage cursor", async () => {
         const backend = new FakeBackend([session("a")]);
-        const saved = persistence({ schemaVersion: 1, clientId: "stable-client", cursor: { daemonEpoch: "epoch", sequence: "2" }, viewState: {}, launchDraft: {} });
-        const dashboard = controller(backend, { persistence: saved });
+        backend.getSnapshot = async () => ({ sessions: [session("a")] });
+        const dashboard = controller(backend);
         await dashboard.open();
-        expect(backend.subscribedAfter).toEqual({ daemonEpoch: "epoch", sequence: "2" });
+        expect(dashboard.status).toMatchObject({ kind: "error", code: "INVALID_RESPONSE" });
         await dashboard.close();
     });
-    // Operator-visible failure: every crash rewrote frontend-state.json with a cursor at the start of
-    // the log, or with no cursor at all, so the next start replayed the same flood.
-    it("never persists a cursor behind the position it reached, even when open fails", async () => {
-        const backend = new FakeBackend([session("a")]);
-        backend.snapshot = { sessions: backend.snapshot.sessions, cursor: { daemonEpoch: "epoch", sequence: "6778" } };
-        backend.subscribeFailure = Object.assign(new Error("Client subscriber exceeded its bounded queue"), { code: "SUBSCRIBER_OVERFLOW" });
-        const saved = persistence({ schemaVersion: 1, clientId: "stable-client", cursor: { daemonEpoch: "epoch", sequence: "2" }, viewState: {}, launchDraft: {} });
-        const dashboard = controller(backend, { persistence: saved });
-        await dashboard.open();
-        await dashboard.close();
-        expect(saved.saved.length).toBeGreaterThan(0);
-        for (const state of saved.saved) expect(state.cursor).toEqual({ daemonEpoch: "epoch", sequence: "6778" });
-    });
-    it("restores safe view state and cursor but never stale composer ownership", async () => {
+    it("restores safe view state but never stale composer ownership", async () => {
         const saved = persistence({
             schemaVersion: 1,
             clientId: "stable-client",
-            cursor: { daemonEpoch: "epoch", sequence: "4" },
             viewState: { query: { view: "all", search: "b" }, selectedSessionId: "b" },
         });
         const dashboard = controller(new FakeBackend([session("a"), session("b")]), { persistence: saved });
@@ -636,77 +675,86 @@ describe("dashboard controller", () => {
         await dashboard.close();
         expect(saved.saved.length).toBeGreaterThan(0);
     });
-    it("serializes concurrent events through distinct rendered states and acknowledgements", async () => {
+    it("draws every snapshot it reads, newest last", async () => {
         const backend = new FakeBackend([session("initial")]);
-        const saved = persistence();
         const renders = [];
-        const acknowledgements = [];
         let dashboard;
-        dashboard = controller(backend, {
-            persistence: {
-                load: saved.load,
-                async save(state) {
-                    await saved.save(state);
-                    if (state.cursor !== undefined)
-                        acknowledgements.push(state.cursor.sequence);
-                },
-            },
-            requestRender: () => { renders.push(dashboard.render(80, 12)); },
-        });
+        dashboard = controller(backend, { requestRender: () => { renders.push(dashboard.render(80, 12)); } });
         await dashboard.open();
         renders.length = 0;
-        const first = Promise.resolve(backend.listener?.({ snapshot: { sessions: [session("state-1")] }, cursor: { daemonEpoch: "epoch", sequence: "1" } }));
-        const second = Promise.resolve(backend.listener?.({ snapshot: { sessions: [session("state-2")] }, cursor: { daemonEpoch: "epoch", sequence: "2" } }));
-        await first;
-        expect(renders).toHaveLength(2);
-        expect(renders[0]?.join("\n")).toContain("state-1");
-        expect(renders[0]?.join("\n")).not.toContain("state-2");
-        await second;
-        expect(renders[1]?.join("\n")).toContain("state-2");
-        // Cursors advance monotonically, so a burst persists once and the newest cursor covers the rest.
-        expect(acknowledgements).toEqual(["2"]);
+        backend.setSessions([session("state-1")]);
+        backend.duringRead = async () => {
+            backend.duringRead = undefined;
+            backend.setSessions([session("state-2")]);
+            void backend.notifyListChanged();
+        };
+        await backend.notifyListChanged();
+        expect(renders.map((lines) => lines.join("\n")).filter((text) => text.includes("state-1"))).toHaveLength(1);
+        expect(renders.at(-1)?.join("\n")).toContain("state-2");
+        await dashboard.close();
     });
-    it.each(["render", "request", "persistence", "disposed"])("closes on %s failure so the backend sends no acknowledgement", async (failure) => {
+    it("closes when the host cannot repaint the list it just read", async () => {
         const backend = new FakeBackend([session("a")]);
         const onClose = vi.fn();
-        const saved = persistence();
         let renderRequests = 0;
-        if (failure === "persistence")
-            saved.save = vi.fn(async () => { throw Object.assign(new Error("disk failed"), { code: "PERSIST_FAILED" }); });
         const dashboard = controller(backend, {
-            persistence: saved,
             onClose,
             requestRender: () => {
                 renderRequests += 1;
-                if (failure === "request" && renderRequests > 1)
-                    throw new Error("request render failed");
+                if (renderRequests > 1) throw new Error("request render failed");
             },
         });
         await dashboard.open();
-        if (failure === "render") {
-            const internals = dashboard;
-            internals.list.renderViewport = () => { throw new Error("render failed"); };
-        }
-        const processing = Promise.resolve(backend.listener?.({ snapshot: { sessions: [session("a", { revision: 2 })] }, cursor: { daemonEpoch: "epoch", sequence: "1" } }));
-        if (failure === "disposed")
-            await dashboard.close();
-        else if (failure === "render")
-            expect(() => dashboard.render()).toThrowError("render failed");
-        else if (failure !== "request")
-            dashboard.render();
-        await expect(processing).rejects.toThrow();
-        await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith(expect.objectContaining({ kind: failure === "disposed" ? "closed" : "error" })));
+        await expect(applyListChange(dashboard, backend, [session("a", { revision: 2 })])).rejects.toThrow();
+        await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith(expect.objectContaining({ kind: "error" })));
         expect(backend.unsubscribed).toBe(1);
-        expect(saved.saved.some((state) => state.cursor?.sequence === "1")).toBe(false);
+    });
+    it("closes when rendering the list throws", async () => {
+        const backend = new FakeBackend([session("a")]);
+        const onClose = vi.fn();
+        const dashboard = controller(backend, { onClose });
+        await dashboard.open();
+        /** @type {any} */ (dashboard).list.renderViewport = () => { throw new Error("render failed"); };
+        expect(() => dashboard.render()).toThrowError("render failed");
+        await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith(expect.objectContaining({ kind: "error" })));
+        expect(backend.unsubscribed).toBe(1);
+    });
+    it("closes when persisting local view state fails", async () => {
+        const backend = new FakeBackend([session("a"), session("b")]);
+        const onClose = vi.fn();
+        const saved = persistence();
+        saved.save = vi.fn(async () => { throw Object.assign(new Error("disk failed"), { code: "PERSIST_FAILED" }); });
+        const dashboard = controller(backend, { persistence: saved, onClose });
+        await dashboard.open();
+        dashboard.selectSession("b");
+        await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith(expect.objectContaining({ kind: "error", code: "PERSIST_FAILED" })));
+        expect(backend.unsubscribed).toBe(1);
+    });
+    it("abandons a read in flight when the dashboard closes and never applies it", async () => {
+        const backend = new FakeBackend([session("a")]);
+        const onClose = vi.fn();
+        const dashboard = controller(backend, { onClose });
+        await dashboard.open();
+        let releaseRead = () => {};
+        backend.duringRead = () => new Promise((resolve) => { releaseRead = () => resolve(undefined); });
+        backend.setSessions([session("a"), session("b")]);
+        const reading = backend.notifyListChanged();
+        const closing = dashboard.close();
+        releaseRead();
+        await expect(reading).rejects.toMatchObject({ code: "DASHBOARD_CLOSED" });
+        await closing;
+        expect(onClose).toHaveBeenCalledWith({ kind: "closed" });
+        expect(dashboard.sessions.map((record) => record.sessionId)).toEqual(["a"]);
+        expect(backend.unsubscribed).toBe(1);
     });
     it("disposes a subscription that resolves after close and installs nothing", async () => {
         let resolveSubscribe;
         const backend = new FakeBackend([session("a")]);
         const unsubscribe = vi.fn();
-        backend.subscribe = vi.fn(() => new Promise((resolve) => { resolveSubscribe = resolve; }));
+        backend.subscribeListChanges = vi.fn(() => new Promise((resolve) => { resolveSubscribe = resolve; }));
         const dashboard = controller(backend);
         const opening = dashboard.open();
-        await vi.waitFor(() => expect(backend.subscribe).toHaveBeenCalled());
+        await vi.waitFor(() => expect(backend.subscribeListChanges).toHaveBeenCalled());
         await dashboard.close();
         resolveSubscribe?.(unsubscribe);
         await opening;
@@ -769,7 +817,6 @@ describe("dashboard controller", () => {
         const stored = {
             schemaVersion: 1,
             clientId: "stable-client",
-            cursor: { daemonEpoch: "epoch", sequence: "1" },
             viewState: { query: { view: "live" } },
             launchDraft: { prompt: "", cwd: "/repo", isolationMode: "worktree", model: { provider: "provider", id: "id" }, name: "" },
         };
@@ -1224,93 +1271,53 @@ describe("daemon dashboard backend", () => {
         const backend = createDaemonDashboardBackend({ client: client, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
         await expect(backend[operation]("exact-session", 3, `${operation}-request`)).rejects.toMatchObject({ code: "SESSION_REFUSED", message: `${operation} refused` });
     });
-    it("refreshes state after completed Delete command_changed and removes the absent row", async () => {
-        const cursor = { daemonEpoch: "epoch", sequence: "1" };
+    it("reads current rows for every invalidation, so a completed Delete removes the absent row", async () => {
         const deleted = session("deleted", { processState: "EXITED" });
-        const event = { version: 1, cursor, occurredAt: timestamp, kind: "command_changed", payload: { status: { clientId: "stable-client", requestId: "delete-request", operation: "delete", stage: "COMPLETED", acceptedAt: timestamp, updatedAt: timestamp } } };
         let stateReads = 0;
+        /** @type {(() => void) | undefined} */
+        let invalidate;
         const client = {
             async connect() { },
             async request(request) {
-                if (request.op === "get_state") {
-                    stateReads += 1;
-                    return { version: 1, requestId: request.requestId, ok: true, result: { kind: "state", sessions: stateReads === 1 ? [deleted] : [] } };
-                }
-                return { version: 1, requestId: request.requestId, ok: true, result: { kind: "acknowledged", cursor: request.payload.cursor } };
+                stateReads += 1;
+                return { version: 1, requestId: request.requestId, ok: true, result: { kind: "state", sessions: stateReads === 1 ? [deleted] : [], cursor: nextCoverage() } };
             },
-            subscribe() { return { async *[Symbol.asyncIterator]() { yield event; } }; },
+            async subscribeListChanges(onChanged) { invalidate = onChanged; return () => { invalidate = undefined; }; },
             async close() { },
         };
-        const backend = createDaemonDashboardBackend({ client: client, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
+        const backend = createDaemonDashboardBackend({ client, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
+        const invalidations = [];
+        const unsubscribe = await backend.subscribeListChanges(() => { invalidations.push(1); }, () => { });
         expect((await backend.getSnapshot()).sessions).toHaveLength(1);
-        const updates = [];
-        const unsubscribe = await backend.subscribe(undefined, (update) => { updates.push(update); }, () => { });
-        await vi.waitFor(() => expect(updates).toHaveLength(1));
-        expect(updates[0]?.snapshot.sessions).toEqual([]);
+        invalidate?.();
+        expect(invalidations).toHaveLength(1);
+        expect((await backend.getSnapshot()).sessions).toEqual([]);
         expect(stateReads).toBe(2);
         unsubscribe();
     });
-    // Operator-visible failure: a session that changed while the client was behind kept its old row
-    // forever, because the dropped session_changed was never replaced by an authoritative read.
-    it("resynchronizes from the snapshot on overflow and shows the session that changed during the gap", async () => {
-        const resynchronize = { kind: "resynchronize", cursor: { daemonEpoch: "epoch", sequence: "9" } };
-        // A late event from before the snapshot must not put the stale row back.
-        const stale = { version: 1, cursor: { daemonEpoch: "epoch", sequence: "4" }, occurredAt: timestamp, kind: "session_changed", payload: { session: session("a", { revision: 2 }) } };
-        const requests = [];
-        let stateReads = 0;
+    // Operator-visible failure: a snapshot with no stated coverage cannot be told from one taken
+    // before the change that provoked the read, so the list could sit on a row that never updated.
+    it("refuses a get_state result that carries no coverage cursor", async () => {
         const client = {
             async connect() { },
             async request(request) {
-                requests.push(request);
-                if (request.op === "get_state") {
-                    stateReads += 1;
-                    return { version: 1, requestId: request.requestId, ok: true, result: { kind: "state", sessions: [session("a", { revision: stateReads === 1 ? 1 : 7, taskState: stateReads === 1 ? "READY" : "WORKING" })], cursor: { daemonEpoch: "epoch", sequence: stateReads === 1 ? "1" : "9" } } };
-                }
-                return { version: 1, requestId: request.requestId, ok: true, result: { kind: "acknowledged", cursor: request.payload.cursor } };
+                return { version: 1, requestId: request.requestId, ok: true, result: { kind: "state", sessions: [] } };
             },
-            subscribe() { return { async *[Symbol.asyncIterator]() { yield resynchronize; yield stale; } }; },
+            async subscribeListChanges() { return () => { }; },
             async close() { },
         };
         const backend = createDaemonDashboardBackend({ client, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
-        expect((await backend.getSnapshot()).cursor).toEqual({ daemonEpoch: "epoch", sequence: "1" });
-        const updates = [];
-        const unsubscribe = await backend.subscribe({ daemonEpoch: "epoch", sequence: "1" }, (update) => { updates.push(update); }, () => { });
-        await vi.waitFor(() => expect(updates).toHaveLength(1));
-        await new Promise((resolve) => setTimeout(resolve, 0));
-        unsubscribe();
-        expect(updates[0].snapshot.sessions).toEqual([expect.objectContaining({ sessionId: "a", taskState: "WORKING", revision: 7 })]);
-        expect(updates[0].cursor).toEqual({ daemonEpoch: "epoch", sequence: "9" });
-        // The snapshot already contains the dropped events, so the client acknowledges where it now stands.
-        expect(requests.filter((request) => request.op === "ack").map((request) => request.payload.cursor)).toEqual([{ daemonEpoch: "epoch", sequence: "9" }]);
-        expect(stateReads).toBe(2);
+        await expect(backend.getSnapshot()).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
     });
-    it("resynchronizes against a daemon that does not report its position", async () => {
-        const resynchronize = { kind: "resynchronize", cursor: { daemonEpoch: "epoch", sequence: "9" } };
-        let stateReads = 0;
+    it("reports a refused list subscription instead of returning a list that never refreshes", async () => {
         const client = {
             async connect() { },
-            async request(request) {
-                if (request.op === "get_state") {
-                    stateReads += 1;
-                    return { version: 1, requestId: request.requestId, ok: true, result: { kind: "state", sessions: [session("a", { revision: 7, taskState: "WORKING" })] } };
-                }
-                return { version: 1, requestId: request.requestId, ok: true, result: { kind: "acknowledged", cursor: request.payload.cursor } };
-            },
-            subscribe() { return { async *[Symbol.asyncIterator]() { yield resynchronize; } }; },
+            async request(request) { return { version: 1, requestId: request.requestId, ok: true, result: { kind: "state", sessions: [], cursor: nextCoverage() } }; },
+            async subscribeListChanges() { throw Object.assign(new Error("Invalid client request"), { code: "INVALID_REQUEST" }); },
             async close() { },
         };
         const backend = createDaemonDashboardBackend({ client, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
-        expect((await backend.getSnapshot()).cursor).toBeUndefined();
-        const updates = [];
-        const unsubscribe = await backend.subscribe(undefined, (update) => { updates.push(update); }, () => { });
-        await vi.waitFor(() => expect(updates).toHaveLength(1));
-        unsubscribe();
-        // Without a daemon-reported position the newest cursor the client saw is the one it reached.
-        expect(updates[0].cursor).toEqual({ daemonEpoch: "epoch", sequence: "9" });
-        expect(updates[0].snapshot.sessions).toEqual([expect.objectContaining({ taskState: "WORKING" })]);
-        // The snapshot is refetched, not reused: a row that changed during the gap is only correct
-        // because the daemon was asked again.
-        expect(stateReads).toBe(2);
+        await expect(backend.subscribeListChanges(() => { }, () => { })).rejects.toMatchObject({ code: "INVALID_REQUEST" });
     });
     it("reads the model catalog through get_models and names a daemon that cannot list one", async () => {
         const models = [{ provider: "anthropic", id: "claude-opus-4", thinking: true }];
@@ -1331,35 +1338,29 @@ describe("daemon dashboard backend", () => {
         await expect(backend.getModels()).rejects.toMatchObject({ code: "MODEL_CATALOG_TIMEOUT", message: "Listing Pi models timed out" });
         expect(operations).toEqual(["get_models", "get_models"]);
     });
-    it("processes replay once, acknowledges only successful events, and resumes from the acknowledged cursor", async () => {
-        const zero = { daemonEpoch: "epoch", sequence: "0" };
-        const one = { daemonEpoch: "epoch", sequence: "1" };
+    it("sends nothing on the wire for an invalidation and stops notifying once unsubscribed", async () => {
         const requests = [];
-        const event = { version: 1, cursor: one, occurredAt: timestamp, kind: "session_changed", payload: { session: session("a") } };
+        /** @type {(() => void) | undefined} */
+        let invalidate;
         const client = {
             async connect() { },
             async request(request) {
-                requests.push(request);
-                const typed = request;
-                if (typed.op === "get_state")
-                    return { version: 1, requestId: typed.requestId, ok: true, result: { kind: "state", sessions: [] } };
-                return { version: 1, requestId: typed.requestId, ok: true, result: { kind: "acknowledged", cursor: typed.payload.cursor } };
+                requests.push(request.op);
+                return { version: 1, requestId: request.requestId, ok: true, result: { kind: "state", sessions: [], cursor: nextCoverage() } };
             },
-            subscribe(after) {
-                expect(after).toEqual(zero);
-                return {
-                    async *[Symbol.asyncIterator]() { yield event; yield event; },
-                };
-            },
+            async subscribeListChanges(onChanged) { invalidate = onChanged; return () => { invalidate = undefined; }; },
             async close() { },
         };
         const backend = createDaemonDashboardBackend({ client, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
-        const updates = [];
-        const unsubscribe = await backend.subscribe(zero, (update) => { updates.push(update); }, () => { });
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        const invalidations = [];
+        const unsubscribe = await backend.subscribeListChanges(() => { invalidations.push(1); }, () => { });
+        invalidate?.();
+        invalidate?.();
+        expect(invalidations).toHaveLength(2);
+        // An invalidation costs no request: no acknowledgement, no cursor, no replay.
+        expect(requests).toEqual([]);
         unsubscribe();
-        expect(updates).toHaveLength(1);
-        expect(requests).toEqual(expect.arrayContaining([expect.objectContaining({ op: "ack", payload: { cursor: one } })]));
+        expect(invalidate).toBeUndefined();
     });
 });
 

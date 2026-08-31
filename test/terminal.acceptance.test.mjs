@@ -30,13 +30,21 @@ function session(sessionId, overrides = {}) {
   };
 }
 
+let coverageSequence = 0;
+/** The daemon's in-memory snapshot coverage cursor, required in every successful get_state. */
+function nextCoverage() {
+  coverageSequence += 1;
+  return { daemonEpoch: "epoch", sequence: String(coverageSequence) };
+}
+
 class DashboardBackend {
-  constructor(sessions) { this.snapshot = { sessions }; }
+  constructor(sessions) { this.snapshot = { sessions, cursor: nextCoverage() }; }
   stop = vi.fn(async () => {});
   delete = vi.fn(async () => {});
   resolveDelivery = vi.fn(async () => {});
+  setSessions(sessions) { this.snapshot = { sessions, cursor: nextCoverage() }; }
   async getSnapshot() { return this.snapshot; }
-  subscribe(_cursor, listener, onError) { this.listener = listener; this.onError = onError; return () => { this.unsubscribed = true; }; }
+  async subscribeListChanges(onChanged, onError) { this.notifyListChanged = onChanged; this.onError = onError; return () => { this.unsubscribed = true; }; }
   async preflightLaunch(draft) { return { canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }; }
   async launch() { return { kind: "launched", sessionId: "new" }; }
 }
@@ -190,9 +198,9 @@ it("drives list navigation, search/filter/sort/group, metadata/help, composer, c
   f.dashboard.handleInput("\x18");
   await vi.waitFor(() => expect(f.backend.stop).toHaveBeenCalledWith("live", 4, "terminal-request"));
   await vi.waitFor(() => expect(f.dashboard.stopClearArmed).toBe(true));
-  const processing = Promise.resolve(f.backend.listener({ snapshot: { sessions: [session("live", { revision: 5, processState: "EXITED" }), session("saved", { revision: 7, processState: "EXITED" })] }, cursor: { daemonEpoch: "epoch", sequence: "1" } }));
+  f.backend.setSessions([session("live", { revision: 5, processState: "EXITED" }), session("saved", { revision: 7, processState: "EXITED" })]);
+  await f.backend.notifyListChanged();
   f.dashboard.render(80, 24);
-  await processing;
   f.dashboard.handleInput("\x18");
   await vi.waitFor(() => expect(f.backend.delete).toHaveBeenCalledWith("live", 5, "terminal-request"));
 

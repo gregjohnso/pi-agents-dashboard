@@ -374,6 +374,8 @@ export function createBoundedSocketWriter(socket, { maxPendingBytes, maxPendingR
 function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutMs, context }) {
   const sockets = new Set();
   const subscribers = new Set();
+  /** Sockets watching the session list. They receive payload-free invalidations and nothing else. */
+  const listSubscribers = new Set();
   const viewerSubscriptions = new Map();
   const broadcastWriters = new Map();
   const chains = new Set();
@@ -441,6 +443,7 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
       context.markAttachmentClosing(socket);
       sockets.delete(socket);
       subscribers.delete(socket);
+      listSubscribers.delete(socket);
       broadcastWriters.delete(socket);
       const activeViewerSubscriptions = viewerSubscriptions.get(socket) ?? [];
       viewerSubscriptions.delete(socket);
@@ -578,6 +581,7 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
   server.on("error", () => {});
   return {
     subscribers,
+    listSubscribers,
     sockets,
     async listen() {
       await new Promise((resolveListen, rejectListen) => {
@@ -593,6 +597,11 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
     broadcast(event) {
       const encoded = createJsonlEncoder({ maxBytes }).encode(event);
       for (const socket of subscribers) broadcastWriters.get(socket)?.enqueue(encoded);
+    },
+    /** Tell every list subscriber the session list changed, without saying what changed. */
+    broadcastListChanged() {
+      const encoded = createJsonlEncoder({ maxBytes }).encode({ version: 1, kind: "list_changed" });
+      for (const socket of listSubscribers) broadcastWriters.get(socket)?.enqueue(encoded);
     },
 
     beginShutdown() {
@@ -675,6 +684,12 @@ export async function createDaemonRuntime({
     const stopRequested = new Promise((resolveStop) => { resolveStopRequested = resolveStop; });
     const recoveryController = new AbortController();
     const usedCommandIds = new Set();
+    /**
+     * How far this daemon's session list has advanced, in memory only. It states what a `get_state`
+     * snapshot covers; it is not a position anything replays from, and it does not survive a restart.
+     */
+    let listSequence = 0;
+    const listCoverageCursor = () => ({ daemonEpoch, sequence: String(listSequence) });
     const settingsStore = await openSettingsStore({ directory: daemonDirectory });
     /** @type {Set<string>} */
     const summarizing = new Set();
@@ -697,6 +712,7 @@ export async function createDaemonRuntime({
       admissionOpen: true,
       recovery: undefined,
       viewerRecovery: undefined,
+      listSubscribers: new Set(),
       cursorStore: undefined,
       launchResults: undefined,
       attachmentResults: undefined,
@@ -1178,13 +1194,12 @@ export async function createDaemonRuntime({
       async handleRequest(request, socket, subscribers, authenticatedClientId = request.clientId, duringRecovery = false) {
         if (!context.admissionOpen) throw Object.assign(new Error("Daemon is shutting down"), { code: "SHUTTING_DOWN", retryable: true });
         if (request.op === "get_state") {
-          // Read the event position before the registry, never after: a snapshot newer than its own
-          // cursor only replays events it already contains, while a cursor newer than the snapshot
-          // would let a subscriber skip a change it never saw. Recovery has no event store yet, and
-          // a client that gets no cursor falls back to its own.
-          const cursor = context.recovery?.events?.currentCursor();
+          // Read the coverage cursor before the registry, never after. A snapshot newer than its own
+          // cursor understates what it covers, which costs one extra read; a cursor newer than the
+          // snapshot would let a client believe a change it never saw was already included.
+          const cursor = listCoverageCursor();
           const sessions = (await registry.list()).map((session) => context.withWorkerAdoption(session));
-          return cursor === undefined ? { kind: "state", sessions } : { kind: "state", sessions, cursor };
+          return { kind: "state", sessions, cursor };
         }
         if (request.op === "get_settings") return { kind: "settings", ...settingsStore.current() };
         if (request.op === "get_models") {
@@ -1222,6 +1237,11 @@ export async function createDaemonRuntime({
           if (socket === undefined) throw new TypeError("Subscription requires a live socket");
           subscribers.add(socket);
           return { kind: "subscribed", cursor: context.recovery.events.currentCursor() };
+        }
+        if (request.op === "subscribe_list_changes") {
+          if (socket === undefined) throw new TypeError("List subscription requires a live socket");
+          context.listSubscribers.add(socket);
+          return { kind: "list_subscribed" };
         }
         if (request.op === "ack") {
           if (request.clientId !== authenticatedClientId) throw Object.assign(new Error("Cursor client identity changed"), { code: "CLIENT_IDENTITY_CONFLICT" });
@@ -1579,9 +1599,14 @@ export async function createDaemonRuntime({
     socketServer = createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutMs, context });
     await socketServer.listen();
     socketOwned = true;
+    context.listSubscribers = socketServer.listSubscribers;
     context.broadcast = (/** @type {any} */ event) => {
-      if (broadcastEvent !== undefined) return broadcastEvent(event, () => socketServer.broadcast(event));
-      return socketServer.broadcast(event);
+      const delivered = broadcastEvent !== undefined ? broadcastEvent(event, () => socketServer.broadcast(event)) : socketServer.broadcast(event);
+      // Every list change advances the coverage cursor and then tells the list, in that order, so a
+      // read that starts after the change reports a cursor that already includes it.
+      listSequence += 1;
+      socketServer.broadcastListChanged();
+      return delivered;
     };
 
     context.state = "RECONCILING";

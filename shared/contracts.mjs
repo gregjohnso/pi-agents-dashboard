@@ -25,13 +25,14 @@ import { parseViewerSnapshot } from "./viewer-contracts.mjs";
 /** @typedef {{version:number,clientId:string,requestId:string,op:string,payload:any}} ClientRequest */
 /** @typedef {any} DaemonResponse */
 /** @typedef {{version:1,cursor:EventCursor,occurredAt:string,kind:"session_changed"|"command_changed"|"attachment_changed",payload:any}} PersistedEvent */
+/** @typedef {{version:1,kind:"list_changed"}} ListChanged */
 
 const ENVELOPE_KEYS = ["version", "clientId", "requestId", "op", "payload"];
 /** Operator-chosen row tints, named for the Jobwatch palette. Dashboard metadata; Pi never sees them. */
 export const SESSION_COLORS = ["sky", "green", "amber", "rose", "cyan", "gray"];
 /** @typedef {"sky"|"green"|"amber"|"rose"|"cyan"|"gray"} SessionColor */
 
-const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "respawn", "ui_response", "subscribe", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries", "set_session_color", "get_models"];
+const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "respawn", "ui_response", "subscribe", "subscribe_list_changes", "ack", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries", "set_session_color", "get_models"];
 const COMMAND_STAGES = ["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED", "DELIVERY_UNKNOWN", "FAILED"];
 const SESSION_COMMANDS = ["set_model", "compact", "set_session_name", "abort_retry"];
 const MAX_MENU_ENTRIES = 1_000;
@@ -191,7 +192,7 @@ export function parseClientRequest(value) {
   const requestId = readIdentifier(request, "requestId");
   const op = readEnum(request, "op", OPERATIONS, "operation");
   const base = { version: 1, clientId, requestId, op };
-  if (["get_state", "get_settings", "refresh_summaries", "get_models"].includes(op)) {
+  if (["get_state", "get_settings", "refresh_summaries", "get_models", "subscribe_list_changes"].includes(op)) {
     const payload = readRecord(request.payload, `${op} payload`); rejectUnknownKeys(payload, [], `${op} payload`); return { ...base, payload: {} };
   }
   if (op === "set_settings") {
@@ -365,10 +366,13 @@ export function parseDaemonResponse(value) {
   if (!response.ok) { requireKeys(response, ["version", "requestId", "ok", "error"], [], "daemon response"); validateError(response.error, "daemon response.error"); return response; }
   requireKeys(response, ["version", "requestId", "ok", "result"], [], "daemon response");
   const result = readRecord(response.result, "daemon response.result");
-  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "subscribed", "acknowledged", "viewer_snapshot", "viewer_subscribed", "viewer_acknowledged", "session_commands", "settings", "models", "summaries_refreshing", "session_colored"], "daemon response.result.kind");
-  // `cursor` is the daemon's event position when the snapshot was taken, and it is optional: a
-  // daemon built before it existed answers with sessions alone and its clients must still work.
-  if (kind === "state") { requireKeys(result, ["kind", "sessions"], ["cursor"], "daemon response.result"); if (!Array.isArray(result.sessions)) throw new TypeError("sessions must be an array"); result.sessions.forEach((session, index) => validateSession(session, `daemon response.result.sessions[${index}]`)); if (Object.hasOwn(result, "cursor")) readCursor(result.cursor, "daemon response.result.cursor"); }
+  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "subscribed", "list_subscribed", "acknowledged", "viewer_snapshot", "viewer_subscribed", "viewer_acknowledged", "session_commands", "settings", "models", "summaries_refreshing", "session_colored"], "daemon response.result.kind");
+  // `cursor` is how far the daemon's list had advanced when it read this snapshot, and it is
+  // required: it is read before the registry, never after, so the snapshot always covers at least
+  // that position. That ordering is what lets a client subscribe, read, and know the read cannot
+  // have silently skipped a change.
+  if (kind === "state") { requireKeys(result, ["kind", "sessions", "cursor"], [], "daemon response.result"); if (!Array.isArray(result.sessions)) throw new TypeError("sessions must be an array"); result.sessions.forEach((session, index) => validateSession(session, `daemon response.result.sessions[${index}]`)); readCursor(result.cursor, "daemon response.result.cursor"); }
+  else if (kind === "list_subscribed") requireKeys(result, ["kind"], [], "daemon response.result");
   else if (["launched", "detached"].includes(kind)) { requireKeys(result, ["kind", "sessionId"], [], "daemon response.result"); readIdentifier(result, "sessionId"); }
   else if (kind === "attached") { requireKeys(result, ["kind", "sessionId", "role"], [], "daemon response.result"); readIdentifier(result, "sessionId"); readEnum(result, "role", ["composer", "observer"]); }
   else if (kind === "command") { requireKeys(result, ["kind", "status"], [], "daemon response.result"); validateCommandStatus(result.status, "status"); }
@@ -400,6 +404,20 @@ export function parseDaemonResponse(value) {
   else if (["viewer_subscribed", "viewer_acknowledged"].includes(kind)) { requireKeys(result, ["kind", "cursor"], [], "daemon response.result"); readViewerCursor(result.cursor, "daemon response.result.cursor"); }
   else { requireKeys(result, ["kind", "cursor"], [], "daemon response.result"); readCursor(result.cursor, "daemon response.result.cursor"); }
   return response;
+}
+
+/**
+ * Parse one strict version-1 list invalidation. It carries no payload and no position, so a burst
+ * of them cannot grow anything a consumer has to hold; the consumer answers with one dirty flag and
+ * refetches `get_state`.
+ * @param {unknown} value @returns {ListChanged}
+ */
+export function parseListChanged(value) {
+  const notification = readRecord(value, "List invalidation");
+  requireKeys(notification, ["version", "kind"], [], "list invalidation");
+  if (notification.version !== 1) throw new TypeError("List invalidation version must be 1");
+  if (notification.kind !== "list_changed") throw new TypeError("List invalidation kind must be list_changed");
+  return { version: 1, kind: "list_changed" };
 }
 
 /** Parse one strict version-1 persisted event broadcast to subscribers. @param {unknown} value @returns {PersistedEvent} */

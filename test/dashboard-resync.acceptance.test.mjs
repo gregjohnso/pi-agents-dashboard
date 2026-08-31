@@ -11,9 +11,9 @@ import { createFrontendPersistence } from "../app/list/standalone-list.mjs";
 import { createDaemonRuntime } from "../runtime/daemon.mjs";
 import { RegistryStore } from "../runtime/registry-store.mjs";
 
-// The operator's own numbers: a frontend cursor at sequence 2 against an event log at 6778.
-const LOG_LENGTH = 6_778;
-const STALE_SEQUENCE = "2";
+// The operator's own numbers: a list history of 6778 records, 18 MB of it on his machine, which the
+// dashboard used to replay on every start.
+const RETIRED_LOG_LENGTH = 6_778;
 const EPOCH = "resync-acceptance-epoch";
 const AT = "2026-08-25T12:00:00.000Z";
 
@@ -49,13 +49,11 @@ function sessionRecord(root, sessionId, overrides = {}) {
 }
 
 /**
- * One state root holding two sessions, an event log of `LOG_LENGTH` events, and one frontend state
- * file carrying `cursor` (a cursor near the start of the log, or none at all, which replays from
- * zero). `beta` reaches WORKING only in the last event, which is the change a client that falls
- * behind must not miss.
- * @param {string} clientId @param {{ daemonEpoch: string, sequence: string } | undefined} cursor
+ * One state root holding two sessions and a retired list history of `RETIRED_LOG_LENGTH` records.
+ * The history is left exactly where it lies: nothing may parse, replay, migrate, or delete it.
+ * @param {string} clientId
  */
-async function seedRoot(clientId, cursor) {
+async function seedRoot(clientId) {
   const root = await mkdtemp(join(tmpdir(), "pi-agents-resync-acceptance-"));
   roots.push(root);
   for (const directory of ["canonical", "daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(root, directory), { recursive: true, mode: 0o700 });
@@ -65,54 +63,42 @@ async function seedRoot(clientId, cursor) {
   await registry.create(sessionRecord(root, "alpha"));
   await registry.create(sessionRecord(root, "beta", { taskState: "WORKING", processState: "LIVE" }));
 
-  // Attachment events are the honest filler: one composer claim and its release per viewer visit,
-  // and unlike session_changed they never supersede each other in a client's queue.
   const lines = [];
-  for (let sequence = 1; sequence < LOG_LENGTH; sequence += 1) {
+  for (let sequence = 1; sequence <= RETIRED_LOG_LENGTH; sequence += 1) {
     lines.push(JSON.stringify({ version: 1, cursor: { daemonEpoch: EPOCH, sequence: String(sequence) }, occurredAt: AT, kind: "attachment_changed", payload: { sessionId: "alpha", clientId, role: "composer", attached: sequence % 2 === 1 } }));
   }
-  lines.push(JSON.stringify({ version: 1, cursor: { daemonEpoch: EPOCH, sequence: String(LOG_LENGTH) }, occurredAt: AT, kind: "session_changed", payload: { session: sessionRecord(root, "beta", { taskState: "WORKING", processState: "LIVE" }) } }));
   await writeFile(join(root, "index", "events.jsonl"), `${lines.join("\n")}\n`, { mode: 0o600 });
 
   const launchDraft = { prompt: "", cwd: root, isolationMode: "worktree", model: { provider: "", id: "" }, name: "" };
-  await writeFile(join(root, "frontend-state.json"), `${JSON.stringify({ schemaVersion: 1, clientId, ...(cursor === undefined ? {} : { cursor }), viewState: {}, launchDraft })}\n`, { mode: 0o600 });
+  // The crashing shape: a persisted cursor near the start of that history.
+  await writeFile(join(root, "frontend-state.json"), `${JSON.stringify({ schemaVersion: 1, clientId, cursor: { daemonEpoch: EPOCH, sequence: "2" }, viewState: {}, launchDraft })}\n`, { mode: 0o600 });
   return root;
 }
 
-/** Present a daemon that answers get_state with only {kind, sessions}, the build the operator is running. @param {any} client @param {{ count: number }} stateReads */
-function withoutStateCursor(client, stateReads) {
+/** Count the requests the list actually puts on the wire. @param {any} client @param {string[]} operations */
+function recordingRequests(client, operations) {
   return {
     ...client,
-    async request(/** @type {any} */ request) {
-      const response = await client.request(request);
-      if (request.op === "get_state") stateReads.count += 1;
-      if (request.op !== "get_state" || !response.ok) return response;
-      const { cursor: _cursor, ...result } = response.result;
-      return { ...response, result };
+    request(/** @type {any} */ request) {
+      operations.push(request.op);
+      return client.request(request);
+    },
+    subscribeListChanges(/** @type {any} */ onChanged) {
+      operations.push("subscribe_list_changes");
+      return client.subscribeListChanges(onChanged);
     },
   };
 }
 
-/** Record the position the list actually asks the daemon to replay from. @param {any} client @param {{ after?: any }} seen */
-function recordingSubscribe(client, seen) {
-  return {
-    ...client,
-    subscribe(/** @type {any} */ after) {
-      seen.after = after;
-      return client.subscribe(after);
-    },
-  };
-}
-
-/** Open one real dashboard against one real daemon and return what the operator would see. @param {{ root: string, clientId: string, adaptClient?: (client: any) => any }} options */
-async function openDashboard({ root, clientId, adaptClient = (client) => client }) {
+/** Open one real dashboard against one real daemon and return what the operator would see. @param {{ root: string, clientId: string }} options */
+async function openDashboard({ root, clientId }) {
   const runtime = await createDaemonRuntime({ root, hostProbe: async () => ({ blockers: [] }), reconnectTimeoutMs: 2_000 });
   runtimes.push(runtime);
   await runtime.ready;
   const client = createDaemonClient({ socketPath: runtime.socketPath, token: runtime.token, clientId, maxBytes: 256 * 1024, reconnect: false });
-  /** @type {{ after?: any }} */
-  const subscribed = {};
-  const backend = createDaemonDashboardBackend({ client: recordingSubscribe(adaptClient(client), subscribed), clientId, preflight: async (/** @type {any} */ draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
+  /** @type {string[]} */
+  const operations = [];
+  const backend = createDaemonDashboardBackend({ client: recordingRequests(client, operations), clientId, preflight: async (/** @type {any} */ draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
   /** @type {any} */
   let dashboard;
   dashboard = new DashboardController({
@@ -127,7 +113,8 @@ async function openDashboard({ root, clientId, adaptClient = (client) => client 
   await dashboard.open();
   return {
     dashboard,
-    subscribed,
+    operations,
+    runtime,
     async close() {
       await dashboard.close();
       await client.close();
@@ -135,66 +122,87 @@ async function openDashboard({ root, clientId, adaptClient = (client) => client 
     rows() {
       return dashboard.render(120, 24).map((/** @type {string} */ line) => stripVTControlCharacters(line));
     },
-    async persistedCursor() {
-      return JSON.parse(await readFile(join(root, "frontend-state.json"), "utf8")).cursor;
-    },
   };
 }
 
-/** Wait until the list stands at the head of the log, or until it dies trying. @param {any} opened */
-async function settle(opened) {
-  const deadline = Date.now() + 20_000;
-  while (Date.now() < deadline) {
-    if (opened.dashboard.status.kind === "error" || opened.dashboard.closed) return;
-    if (opened.dashboard.cursor?.sequence === String(LOG_LENGTH)) return;
-    await new Promise((resolve) => setTimeout(resolve, 25));
+/** @param {any} runtime @param {string} clientId */
+async function readState(runtime, clientId) {
+  const client = createDaemonClient({ socketPath: runtime.socketPath, token: runtime.token, clientId, maxBytes: 256 * 1024, reconnect: false });
+  try {
+    const response = await client.request({ version: 1, clientId, requestId: `read-${Date.now()}`, op: "get_state", payload: {} });
+    if (!response.ok) throw new Error(response.error.message);
+    return response.result;
+  } finally {
+    await client.close();
   }
 }
 
 // Operator-visible failure: the dashboard crashed on every start with
 // "SUBSCRIBER_OVERFLOW: Client subscriber exceeded its bounded queue" and rewrote the same stale cursor.
-it("starts and lists its sessions with a persisted cursor thousands of events behind", async () => {
+it("starts from current rows beside a retired list history it never opens", async () => {
   const clientId = "resync-acceptance-current";
-  const root = await seedRoot(clientId, { daemonEpoch: EPOCH, sequence: STALE_SEQUENCE });
+  const root = await seedRoot(clientId);
+  const historyBefore = await readFile(join(root, "index", "events.jsonl"), "utf8");
   const opened = await openDashboard({ root, clientId });
   try {
-    await settle(opened);
     expect(opened.dashboard.status).toEqual({ kind: "ready" });
     expect(opened.dashboard.sessions.map((/** @type {any} */ record) => record.sessionId)).toEqual(["alpha", "beta"]);
     opened.dashboard.setView("all");
     expect(opened.rows().join("\n")).toContain("alpha");
     expect(opened.rows().join("\n")).toContain("beta");
-    // The snapshot is authoritative up to the daemon's own position, so the list subscribes there
-    // and never asks for a replay of the 6776 events the snapshot already contains.
-    expect(opened.subscribed.after).toEqual({ daemonEpoch: EPOCH, sequence: String(LOG_LENGTH) });
+    // Subscribe first, then read: that order is what makes the read safe, and it costs one read.
+    expect(opened.operations).toEqual(["subscribe_list_changes", "get_state"]);
+    expect(opened.dashboard.coverageCursor).toMatchObject({ sequence: expect.stringMatching(/^(0|[1-9]\d*)$/u) });
   } finally {
     await opened.close();
   }
-  expect(await opened.persistedCursor()).toEqual({ daemonEpoch: EPOCH, sequence: String(LOG_LENGTH) });
+  // The retired history stays exactly as it was: no parser, no migration, no deletion.
+  expect(await readFile(join(root, "index", "events.jsonl"), "utf8")).toBe(historyBefore);
 }, 60_000);
 
-// Operator-visible failure: against the daemon he is running, which does not report its position,
-// the whole log replays at once and every dropped session_changed left a permanently wrong row.
-// A crash also once wrote state with no cursor key, which replays from zero on the next start.
-it.each([
-  ["a cursor thousands of events behind", { daemonEpoch: EPOCH, sequence: STALE_SEQUENCE }],
-  ["no cursor at all", undefined],
-])("survives a full-log replay from an older daemon with %s and shows the session that changed during the gap", async (_label, persistedCursor) => {
-  const clientId = `resync-acceptance-older-daemon-${persistedCursor === undefined ? "no-cursor" : "stale-cursor"}`;
-  const root = await seedRoot(clientId, persistedCursor);
-  const stateReads = { count: 0 };
-  const opened = await openDashboard({ root, clientId, adaptClient: (client) => withoutStateCursor(client, stateReads) });
+// Operator-visible failure: a burst of changes filled the bounded replay queue, and every dropped
+// record left a row permanently wrong. The read-per-change bound is pinned by the focused
+// ten-thousand-notification test; what this proves against a real daemon is convergence.
+it("converges on the daemon's own rows after a burst of changes", async () => {
+  const clientId = "resync-acceptance-burst";
+  const root = await seedRoot(clientId);
+  const opened = await openDashboard({ root, clientId });
   try {
-    await settle(opened);
-    expect(opened.subscribed.after).toEqual(persistedCursor);
+    const readsBefore = opened.operations.filter((operation) => operation === "get_state").length;
+    const colors = ["sky", "green", "amber", "rose", "cyan", "gray"];
+    const mutator = createDaemonClient({ socketPath: opened.runtime.socketPath, token: opened.runtime.token, clientId: "burst-mutator", maxBytes: 256 * 1024, reconnect: false });
+    try {
+      // Concurrent, because a burst is what filled the old replay queue; one change per read is not.
+      await Promise.all(Array.from({ length: 120 }, (_unused, index) => mutator.setSessionColor(index % 2 === 0 ? "alpha" : "beta", colors[index % colors.length])));
+    } finally {
+      await mutator.close();
+    }
+    const expected = await readState(opened.runtime, "reader");
+    await vi_waitFor(() => {
+      const rows = opened.dashboard.sessions.map((/** @type {any} */ record) => ({ sessionId: record.sessionId, color: record.color, revision: record.revision }));
+      expect(rows).toEqual(expected.sessions.map((/** @type {any} */ record) => ({ sessionId: record.sessionId, color: record.color, revision: record.revision })));
+    });
     expect(opened.dashboard.status).toEqual({ kind: "ready" });
-    // The list is only correct because it read the daemon again after falling behind.
-    expect(stateReads.count).toBeGreaterThan(1);
-    expect(opened.dashboard.sessions.find((/** @type {any} */ record) => record.sessionId === "beta")?.taskState).toBe("WORKING");
-    expect(opened.dashboard.sessions.map((/** @type {any} */ record) => record.sessionId)).toEqual(["alpha", "beta"]);
-    // The replay is absorbed by a resynchronization, so the frontend ends up at the head of the log.
-    expect((await opened.persistedCursor())?.sequence).toBe(String(LOG_LENGTH));
+    // A change never costs more than one read, so the reads cannot amplify with the burst.
+    const reads = opened.operations.filter((operation) => operation === "get_state").length - readsBefore;
+    expect(reads).toBeGreaterThan(0);
+    expect(reads).toBeLessThanOrEqual(121);
+    expect(opened.dashboard.listChangePending).toBe(false);
   } finally {
     await opened.close();
   }
 }, 60_000);
+
+/** @param {() => void} assertion */
+async function vi_waitFor(assertion) {
+  const deadline = Date.now() + 20_000;
+  for (;;) {
+    try {
+      assertion();
+      return;
+    } catch (error) {
+      if (Date.now() >= deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+}

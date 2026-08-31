@@ -211,11 +211,10 @@ export async function runDaemonCommand(command, options = {}) {
     const current = await inspectEndpoint(common);
     if (current.status === "ABSENT") return { code: 3, error: { code: "DAEMON_ABSENT", message: "Daemon is not running" } };
     if (current.status !== "HEALTHY") return { code: current.status === "CONFLICT" ? 5 : 1, error: { code: "STOP_REFUSED", message: "Daemon identity is not healthy and exact" } };
-    const clientId = options.request === undefined && options.composerRequest === undefined ? await loadCliClientIdentity({ root, randomId: options.randomId }) : undefined;
+    const clientId = options.request === undefined && options.heldConnectionRequest === undefined ? await loadCliClientIdentity({ root, randomId: options.randomId }) : undefined;
     // A worker Stop only answers after the daemon's own SIGTERM-then-SIGKILL escalation, so a shorter deadline reports a false ambiguous delivery.
     const persistent = clientId === undefined ? undefined : await (options.createPersistentRequester ?? createPersistentDaemonRequester)({ root, clientId, timeoutMs: await destructiveRequestTimeoutMs(root, undefined, options.timeoutMs) });
-    const request = options.composerRequest ?? persistent?.request ?? options.request ?? createDaemonRequester({ root, clientId, timeoutMs: options.timeoutMs });
-    const claimsComposer = options.composerRequest !== undefined || persistent !== undefined;
+    const request = options.heldConnectionRequest ?? persistent?.request ?? options.request ?? createDaemonRequester({ root, clientId, timeoutMs: options.timeoutMs });
     /** @type {string[]} */
     let stoppedSessionIds = [];
     try {
@@ -226,15 +225,7 @@ export async function runDaemonCommand(command, options = {}) {
       }
       if (liveSessions.length > 0 && options.stopWorkers === true) {
         let outcomes;
-        try { outcomes = await Promise.all(liveSessions.map(async (record) => {
-          if (claimsComposer) {
-            const attached = await request("attach", { sessionId: record.sessionId, role: "composer" });
-            if (attached?.kind !== "attached" || attached.role !== "composer") return attached;
-          }
-          let outcome;
-          try { outcome = await request("stop", { sessionId: record.sessionId, revision: record.revision }); return outcome; }
-          finally { if (claimsComposer && outcome !== undefined) await request("detach", { sessionId: record.sessionId }).catch(() => {}); }
-        })); }
+        try { outcomes = await Promise.all(liveSessions.map((record) => request("stop", { sessionId: record.sessionId, revision: record.revision }))); }
         catch (error) { if (error?.code === "DELIVERY_UNKNOWN" || (error?.code === "CONNECTION_CLOSED" && error?.submitted === true)) return { code: 1, error: { code: "DELIVERY_UNKNOWN", message: "A worker Stop delivery is ambiguous; daemon remains running" } }; throw error; }
         const refused = outcomes.find((outcome) => outcome?.kind !== "command" || outcome.status?.stage !== "COMPLETED");
         if (refused !== undefined) return { code: 1, error: { code: refused?.status?.stage === "DELIVERY_UNKNOWN" ? "DELIVERY_UNKNOWN" : "WORKER_STOP_REFUSED", message: "A worker stop did not complete; daemon remains running" }, result: refused };

@@ -48,29 +48,22 @@ export function createDaemonDashboardBackend({ client, clientId, preflight, requ
             throw Object.assign(new Error("Daemon state result carries no coverage cursor"), { code: "INVALID_RESPONSE" });
         return { sessions: response.result.sessions, cursor: response.result.cursor };
     };
-    const requestAsComposer = async (operation, sessionId, revision, exactRequestId) => {
+    /**
+     * Send one destructive command on its own connection, so a socket that dies mid-command is this
+     * command's own ambiguity rather than the list connection's.
+     */
+    const requestDestructive = async (operation, sessionId, revision, exactRequestId) => {
         const transaction = client.createTransactionClient?.() ?? client;
         const ownsTransaction = transaction !== client;
-        const transactionRequest = async (op, payload, transactionRequestId = requestId()) => transaction.request({ version: 1, clientId, requestId: transactionRequestId, op, payload });
-        let attached = false;
-        let response;
         try {
             if (ownsTransaction) await transaction.connect();
-            const attachment = await transactionRequest("attach", { sessionId, role: "composer" });
-            if (!attachment.ok || attachment.result.kind !== "attached" || attachment.result.role !== "composer") {
-                if (!attachment.ok) throw Object.assign(new Error(attachment.error.message), attachment.error);
-                throw Object.assign(new Error("Daemon refused the composer role"), { code: "ATTACHMENT_REQUIRED" });
-            }
-            attached = true;
-            try { response = await transactionRequest(operation, { sessionId, revision }, exactRequestId); }
+            try { return await transaction.request({ version: 1, clientId, requestId: exactRequestId, op: operation, payload: { sessionId, revision } }); }
             catch (error) {
                 if (["CONNECTION_CLOSED", "MALFORMED_FRAME", "MALFORMED_RESPONSE", "INVALID_DAEMON_RESPONSE", "UNEXPECTED_DAEMON_RESPONSE"].includes(error?.code)) throw Object.assign(new Error(`${operation === "stop" ? "Stop" : "Delete"} delivery is ambiguous`), { code: "DELIVERY_UNKNOWN", clientId, requestId: exactRequestId });
                 throw error;
             }
-            return response;
         }
         finally {
-            if (attached && response !== undefined) await transactionRequest("detach", { sessionId }).catch(() => {});
             if (ownsTransaction) await transaction.close();
         }
     };
@@ -161,20 +154,15 @@ export function createDaemonDashboardBackend({ client, clientId, preflight, requ
                 throw Object.assign(new Error(response.error.message), response.error);
         },
         async stop(sessionId, revision, exactRequestId) {
-            requireCompletedDestructive("stop", await requestAsComposer("stop", sessionId, revision, exactRequestId));
+            requireCompletedDestructive("stop", await requestDestructive("stop", sessionId, revision, exactRequestId));
         },
         async delete(sessionId, revision, exactRequestId) {
-            requireCompletedDestructive("delete", await requestAsComposer("delete", sessionId, revision, exactRequestId));
+            requireCompletedDestructive("delete", await requestDestructive("delete", sessionId, revision, exactRequestId));
         },
     };
 }
 function defaultQuery() {
     return { view: "live" };
-}
-function safeQuery(value) {
-    if (value === undefined || !["live", "done", "all"].includes(value.view))
-        return defaultQuery();
-    return { ...value };
 }
 const TASK_STATES = ["WORKING", "WAITING", "READY", "FAILED", "STOPPED"];
 const PROCESS_STATES = ["LIVE", "SLEEPING", "EXITED", "STALE"];
@@ -273,7 +261,6 @@ function renderOverlayPanel(described, width, areaHeight) {
 /** Own dashboard subscription, focus, selection, launch, rendering, and disposal. */
 export class DashboardController {
     backend;
-    persistence;
     openViewer;
     clientId;
     sourceSessionId;
@@ -302,9 +289,6 @@ export class DashboardController {
     listChangePending = false;
     /** The read loop draining that flag, while one is running. */
     listReads;
-    saveTail = Promise.resolve();
-    saveFailure;
-    saveAdmissionGeneration = 0;
     stopClearGesture;
     animationTimer;
     summaryRefreshTimer;
@@ -334,7 +318,6 @@ export class DashboardController {
     status = { kind: "loading" };
     constructor(options) {
         this.backend = options.backend;
-        this.persistence = options.persistence;
         if (typeof options.openViewer !== "function")
             throw new TypeError("openViewer is required");
         this.openViewer = options.openViewer;
@@ -363,30 +346,12 @@ export class DashboardController {
             return;
         this.closed = false;
         this.closePromise = undefined;
-        this.saveFailure = undefined;
         this.listReads = undefined;
         const generation = ++this.openGeneration;
         const controller = new AbortController();
         this.openController = controller;
         this.status = { kind: "loading" };
         try {
-            const persisted = await this.persistence.load();
-            if (!this.isCurrentOpen(generation))
-                return;
-            if (persisted?.clientId === this.clientId) {
-                this.query = safeQuery(persisted.viewState?.query);
-                this.preferredSelectionId = persisted.viewState?.selectedSessionId;
-                if (persisted.launchDraft !== undefined) {
-                    this.composerDraft = {
-                        ...persisted.launchDraft,
-                        // Where the operator started this dashboard outranks where the last one ran:
-                        // a saved cwd would silently launch work into yesterday's directory.
-                        cwd: this.launchDefaults.cwd ?? persisted.launchDraft.cwd,
-                        sourceSessionId: this.sourceSessionId,
-                        model: { ...persisted.launchDraft.model },
-                    };
-                }
-            }
             // Subscribe before reading, never after: a change published while the read is in flight
             // then arrives as an invalidation and provokes one refetch, rather than being lost.
             this.listChangePending = true;
@@ -431,7 +396,6 @@ export class DashboardController {
         if (selected) {
             // Selecting elsewhere abandons an armed clear, so Ctrl+X can never remove the wrong session.
             this.stopClearGesture.cancel();
-            this.scheduleUiSave();
         }
         return selected;
     }
@@ -485,7 +449,6 @@ export class DashboardController {
         if (!prompt.trim().startsWith("/"))
             this.commandMenuIndex = 0;
         this.scheduleCwdCompletion();
-        this.scheduleUiSave();
     }
     /**
      * Ask pi-tui for the directories a `/cwd` line admits. The listing is debounced and runs off the
@@ -561,7 +524,6 @@ export class DashboardController {
     }
     setIsolationMode(isolationMode) {
         this.composerDraft = { ...this.composerDraft, isolationMode };
-        this.scheduleUiSave();
     }
     /** The commands a slash prompt still admits, or undefined when the operator is not typing one. */
     commandMenuOverlay() {
@@ -673,7 +635,6 @@ export class DashboardController {
         else
             this.composerDraft = { ...this.composerDraft, isolationMode: value };
         this.closeChoice();
-        this.scheduleUiSave();
     }
     moveChoice(delta) {
         const overlay = this.overlay;
@@ -1089,7 +1050,6 @@ export class DashboardController {
     setQuery(query) {
         this.query = query;
         this.rebuildList();
-        this.scheduleUiSave();
     }
     applySnapshot(snapshot) {
         this.sessions = snapshot.sessions;
@@ -1128,7 +1088,6 @@ export class DashboardController {
         this.list.moveSelection(delta);
         this.preferredSelectionId = this.list.selectedSessionId;
         this.ensureSelectionVisible();
-        this.scheduleUiSave();
     }
     selectBoundary(last) {
         const rows = last ? [...this.list.rows].reverse() : this.list.rows;
@@ -1255,7 +1214,6 @@ export class DashboardController {
             this.requestRender?.();
         }
         if (outcome.kind === "launched") {
-            this.scheduleUiSave();
             this.requestRender?.();
             return;
         }
@@ -1370,33 +1328,6 @@ export class DashboardController {
         clearInterval(this.animationTimer);
         this.animationTimer = undefined;
     }
-    persistedState() {
-        const { sourceSessionId: _sourceSessionId, ...launchDraft } = this.composerDraft;
-        return {
-            schemaVersion: 1,
-            clientId: this.clientId,
-            viewState: {
-                query: (({ historyPolicy: _historyPolicy, ...query }) => query)(this.query),
-                selectedSessionId: this.preferredSelectionId ?? this.selectedSessionId,
-            },
-            launchDraft: { ...launchDraft, model: { ...launchDraft.model } },
-        };
-    }
-    enqueueSave(state) {
-        const operation = this.saveTail.then(() => this.persistence.save(state));
-        this.saveTail = operation.then(() => { }, (error) => { this.saveFailure ??= error; });
-        return operation;
-    }
-    scheduleUiSave() {
-        if (this.closed)
-            return;
-        const admission = this.saveAdmissionGeneration;
-        const state = this.persistedState();
-        if (this.closed || admission !== this.saveAdmissionGeneration)
-            return;
-        const operation = this.enqueueSave(state);
-        void operation.catch((error) => this.fail(this.typedError(error, "PERSIST_FAILED")));
-    }
     beginClose(initialError) {
         if (this.closePromise !== undefined)
             return this.closePromise;
@@ -1409,7 +1340,6 @@ export class DashboardController {
         this.cwdCompletionAbort = undefined;
         this.closed = true;
         this.openGeneration += 1;
-        this.saveAdmissionGeneration += 1;
         this.openController?.abort();
         this.openController = undefined;
         const unsubscribe = this.unsubscribe;
@@ -1424,16 +1354,6 @@ export class DashboardController {
     async finishClose(initialError) {
         let error = initialError;
         await Promise.allSettled([this.listReads]);
-        await this.saveTail;
-        if (error === undefined && this.saveFailure !== undefined)
-            error = this.typedError(this.saveFailure, "PERSIST_FAILED");
-        try {
-            await this.enqueueSave(this.persistedState());
-        }
-        catch (saveError) {
-            error ??= this.typedError(saveError, "DASHBOARD_CLOSE_FAILED");
-        }
-        await this.saveTail;
         const result = error === undefined
             ? { kind: "closed" }
             : { kind: "error", code: error.code, message: error.message };

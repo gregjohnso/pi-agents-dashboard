@@ -7,7 +7,7 @@ const timestamp = "2026-08-25T00:00:00Z";
 function snapshot(overrides = {}) {
   return {
     version: 1, sessionId: "s", registryRevision: 1, cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "0" }, runtime: null,
-    role: "composer", taskState: "READY", processState: "LIVE", outcome: "NONE",
+    taskState: "READY", processState: "LIVE", outcome: "NONE",
     activity: { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "snapshot", startedAt: timestamp }, model: null, thinkingLevel: null,
     items: [{ kind: "user_message", itemId: "u", content: [{ type: "text", text: "hello" }] }], tools: [], pendingUi: [], errors: [], ...overrides,
   };
@@ -42,7 +42,7 @@ function fixture(overrides = {}) {
   return { instance, client, commands, order, saved, dashboard, attached, subscribed, emit: (event) => listener(event), connection: (status) => connectionListener(status) };
 }
 
-describe("viewer commands and role restrictions", () => {
+describe("viewer commands", () => {
   it("sends prompt while idle, follow_up while working, explicit steer, interrupt, and one UI response", async () => {
     const f = fixture();
     await f.instance.open();
@@ -267,15 +267,16 @@ describe("viewer commands and role restrictions", () => {
     expect(rendered[promptRow]).not.toContain("\x1b[38;2;252;211;77m");
   });
 
-  it("observer mode disables every mutation but preserves scroll and tool inspection", async () => {
+  // Operator-visible failure: a second dashboard on a session was read-only, so the keys that answer
+  // the agent did nothing. Every viewer writes now, and tool inspection still works alongside it.
+  it("submits from a second viewer on the same session while tool inspection still works", async () => {
     const tool = (/** @type {string} */ id) => ({ id, name: "future_tool", state: "completed", arguments: { id }, result: [{ type: "text", text: `result ${id}` }], startedAt: timestamp, finishedAt: timestamp });
-    const f = fixture({ snapshot: { role: "observer", tools: [tool("tool-a"), tool("tool-b")] } });
+    const f = fixture({ snapshot: { tools: [tool("tool-a"), tool("tool-b")] } });
     await f.instance.open();
-    f.instance.editor.setText("blocked");
-    for (const input of ["\r", "\x03", "\x1b[5~", "\x1b", "\x14", "/", "x"]) f.instance.handleInput(input);
-    f.instance.submitSteer("blocked");
-    expect(f.commands).toEqual([]);
-    expect(f.instance.render(55, 16).join("\n")).toContain("OBSERVER");
+    f.instance.editor.setText("answer from the second viewer");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "prompt", payload: { sessionId: "s", text: "answer from the second viewer" } }]));
+    expect(stripVTControlCharacters(f.instance.render(55, 16).join("\n"))).not.toMatch(/OBSERVER|COMPOSER|Read-only/u);
 
     f.instance.handleInput("\x0f");
     expect(f.instance.transcript.selectedToolId).toBe("tool-a");
@@ -287,7 +288,6 @@ describe("viewer commands and role restrictions", () => {
     expect(f.instance.render(80, 24).join("\n")).toContain("tool:future_tool completed collapsed");
     f.instance.handleInput("\x0f");
     expect(f.instance.render(80, 24).join("\n")).toContain("tool:future_tool completed expanded");
-    expect(f.commands).toEqual([]);
   });
 
   it("opens steer input over the draft and toggles thinking visibility", async () => {
@@ -351,7 +351,6 @@ describe("viewer rendering and navigation", () => {
       ["placeholders", { items: [{ kind: "image_placeholder", attachment: { id: "image", path: "safe.png", mediaType: "image/png", width: 10, height: 5 } }, { kind: "file_placeholder", attachment: { id: "file", path: "safe.txt", size: 12 } }] }],
       ["active", { taskState: "WORKING", activity: { kind: "activity", phase: "tool_running", label: "Running bash", detail: "pytest", sourceEventId: "active", startedAt: timestamp } }],
       ["pending-ui", { taskState: "WAITING", pendingUi: [{ id: "ui-editor", method: "editor", title: "Edit response", initialValue: "line one\nline two" }] }],
-      ["observer", { role: "observer" }],
       ["model-thinking", { model: { provider: "anthropic", id: "opus" }, thinkingLevel: "high" }],
     ];
     const matrix = {};
@@ -472,7 +471,7 @@ describe("frontend resume across a reconnect", () => {
   const republished = (asSnapshot, payload) => (call) => (call === 0 ? empty : { ...asSnapshot(payload), cursor: at });
 
   it.each(kinds)("keeps one %s item when the socket drops before the event is processed", async (_name, payload, asSnapshot, identity) => {
-    const f = fixture({ snapshot: republished(asSnapshot, payload), attach: async () => ({ role: "composer" }) });
+    const f = fixture({ snapshot: republished(asSnapshot, payload), attach: async () => ({ kind: "attached", sessionId: "s" }) });
     await f.instance.open();
     await f.connection({ connected: false });
     await f.connection({ connected: true });
@@ -483,7 +482,7 @@ describe("frontend resume across a reconnect", () => {
   });
 
   it.each(kinds)("keeps one %s item when the socket drops after the event is drawn but before the cursor advances", async (_name, payload, asSnapshot, identity) => {
-    const f = fixture({ snapshot: republished(asSnapshot, payload), attach: async () => ({ role: "composer" }) });
+    const f = fixture({ snapshot: republished(asSnapshot, payload), attach: async () => ({ kind: "attached", sessionId: "s" }) });
     await f.instance.open();
     await f.emit(boundary(payload));
     expect(identities(f.instance)).toEqual([identity]);
@@ -498,7 +497,7 @@ describe("frontend resume across a reconnect", () => {
 
   it("continues without a gap when the socket drops after the resume cursor advanced", async () => {
     const [, payload, asSnapshot, identity] = kinds[0];
-    const f = fixture({ snapshot: republished(asSnapshot, payload), attach: async () => ({ role: "composer" }) });
+    const f = fixture({ snapshot: republished(asSnapshot, payload), attach: async () => ({ kind: "attached", sessionId: "s" }) });
     await f.instance.open();
     await f.emit(boundary(payload));
     await f.connection({ connected: false });
@@ -536,7 +535,7 @@ describe("Pi interactive-mode parity", () => {
 
 describe("daemon outage", () => {
   it("says the daemon is unreachable and rebuilds the session when it comes back", async () => {
-    const f = fixture({ attach: async () => ({ role: "composer" }) });
+    const f = fixture({ attach: async () => ({ kind: "attached", sessionId: "s" }) });
     await f.instance.open();
     const view = () => stripVTControlCharacters(f.instance.render(80, 24).join("\n"));
     expect(view()).not.toContain("Daemon unreachable");
@@ -556,14 +555,14 @@ describe("daemon outage", () => {
     expect(view()).toContain("daemon is back");
   });
 
-  it("keeps the viewer open and says why when the returning daemon refuses the composer claim", async () => {
-    const f = fixture({ attach: async () => { throw Object.assign(new Error("Another frontend owns this session"), { code: "SESSION_IN_USE" }); } });
+  it("keeps the viewer open and says why when the returning daemon refuses to reopen the session", async () => {
+    const f = fixture({ attach: async () => { throw Object.assign(new Error("Unknown viewer session"), { code: "SESSION_NOT_FOUND" }); } });
     await f.instance.open();
     await f.connection({ connected: false });
     await f.connection({ connected: true });
 
     expect(f.instance.closedState).toBe(false);
-    expect(stripVTControlCharacters(f.instance.render(80, 24).join("\n"))).toContain("SESSION_IN_USE");
+    expect(stripVTControlCharacters(f.instance.render(80, 24).join("\n"))).toContain("SESSION_NOT_FOUND");
   });
 });
 

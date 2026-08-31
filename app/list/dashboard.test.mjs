@@ -76,19 +76,10 @@ class FakeBackend {
         return { kind: "launched", sessionId: "launched" };
     }
 }
-function persistence(initial = undefined) {
-    const saved = [];
-    return {
-        saved,
-        async load() { return initial; },
-        async save(value) { saved.push(value); },
-    };
-}
 const openViewer = vi.fn(async () => {});
 function controller(backend, overrides = {}) {
     return new DashboardController({
         backend,
-        persistence: persistence(),
         openViewer,
         clientId: "stable-client",
         sourceSessionId: "source",
@@ -404,22 +395,19 @@ describe("dashboard controller", () => {
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
         expect(new Set(journal.requestIds).size).toBe(journal.requestIds.length);
     });
-    // Operator-visible failure: each save fsyncs the file and its directory, about 70 ms on a
-    // network home, so a burst that saved per change stalled the list while an agent streamed.
-    it("writes nothing durable while list invalidations arrive, and persists no cursor", async () => {
+    // Operator-visible failure: each save fsynced the file and its directory, about 70 ms on a
+    // network home, so a burst that saved per change stalled the list while an agent streamed. The
+    // dashboard keeps its view state in memory now and writes nothing at all.
+    it("writes nothing durable while list invalidations arrive, or when it closes", async () => {
         const backend = new FakeBackend([session("a")]);
-        const saves = [];
-        const dashboard = controller(backend, { persistence: { async load() { return undefined; }, async save(value) { saves.push(value); } } });
+        const dashboard = controller(backend);
         await dashboard.open();
-        const before = saves.length;
         for (const revision of [1, 2, 3, 4, 5]) await applyListChange(dashboard, backend, [session("a", { revision })]);
-        expect(saves.length).toBe(before);
         expect(dashboard.sessions[0].revision).toBe(5);
-        await dashboard.close();
-        expect(saves.length).toBeGreaterThan(before);
         // The coverage cursor is the daemon's, held in memory for one read; nothing persists it.
         expect(dashboard.coverageCursor).toEqual(backend.snapshot.cursor);
-        for (const state of saves) expect(state).not.toHaveProperty("cursor");
+        expect(/** @type {any} */ (dashboard).persistence).toBeUndefined();
+        await dashboard.close();
     });
     it("retires the pending row as soon as the real session appears", async () => {
         let release = () => {};
@@ -682,19 +670,23 @@ describe("dashboard controller", () => {
         expect(backend.reads).toBe(0);
         expect(dashboard.sessions).toEqual([]);
     });
-    it("restores safe view state but never stale composer ownership", async () => {
-        const saved = persistence({
-            schemaVersion: 1,
-            clientId: "stable-client",
-            viewState: { query: { view: "all", search: "b" }, selectedSessionId: "b" },
-        });
-        const dashboard = controller(new FakeBackend([session("a"), session("b")]), { persistence: saved });
+    it("keeps its own view state across a viewer transition, and starts a new process at the default", async () => {
+        const backend = new FakeBackend([session("a"), session("b")]);
+        const dashboard = controller(backend);
+        await dashboard.open();
+        dashboard.setView("all");
+        dashboard.setSearch("b");
+        dashboard.selectSession("b");
+        // Opening a viewer closes the list and reopens it; that must not move the operator's place.
+        await dashboard.close();
         await dashboard.open();
         expect(dashboard.query).toMatchObject({ view: "all", search: "b" });
         expect(dashboard.selectedSessionId).toBe("b");
-        expect(dashboard.attachmentRole).toBeUndefined();
-        await dashboard.close();
-        expect(saved.saved.length).toBeGreaterThan(0);
+
+        const fresh = controller(new FakeBackend([session("a"), session("b")]));
+        await fresh.open();
+        expect(fresh.query).toMatchObject({ view: "live" });
+        await fresh.close();
     });
     it("draws every snapshot it reads, newest last", async () => {
         const backend = new FakeBackend([session("initial")]);
@@ -738,17 +730,6 @@ describe("dashboard controller", () => {
         /** @type {any} */ (dashboard).list.renderViewport = () => { throw new Error("render failed"); };
         expect(() => dashboard.render()).toThrowError("render failed");
         await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith(expect.objectContaining({ kind: "error" })));
-        expect(backend.unsubscribed).toBe(1);
-    });
-    it("closes when persisting local view state fails", async () => {
-        const backend = new FakeBackend([session("a"), session("b")]);
-        const onClose = vi.fn();
-        const saved = persistence();
-        saved.save = vi.fn(async () => { throw Object.assign(new Error("disk failed"), { code: "PERSIST_FAILED" }); });
-        const dashboard = controller(backend, { persistence: saved, onClose });
-        await dashboard.open();
-        dashboard.selectSession("b");
-        await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith(expect.objectContaining({ kind: "error", code: "PERSIST_FAILED" })));
         expect(backend.unsubscribed).toBe(1);
     });
     it("abandons a read in flight when the dashboard closes and never applies it", async () => {
@@ -832,16 +813,10 @@ describe("dashboard controller", () => {
         expect(dashboard.composerDraft.name).toBe("new task");
         expect(dashboard.composerDraft.isolationMode).toBe("worktree");
     });
-    it("shows a persisted launch model, so a draft the operator cannot fix cannot poison a launch unseen", async () => {
-        // The menu hint reads /model [provider/id]; typing it literally persisted this draft, and
+    it("shows the draft launch model, so a draft the operator cannot fix cannot poison a launch unseen", async () => {
+        // The menu hint reads /model [provider/id]; typing it literally left this in the draft, and
         // /model now refuses the value that is still sitting in it.
-        const stored = {
-            schemaVersion: 1,
-            clientId: "stable-client",
-            viewState: { query: { view: "live" } },
-            launchDraft: { prompt: "", cwd: "/repo", isolationMode: "worktree", model: { provider: "provider", id: "id" }, name: "" },
-        };
-        const dashboard = controller(new FakeBackend([session("a")]), { persistence: persistence(stored) });
+        const dashboard = controller(new FakeBackend([session("a")]), { launchDefaults: { cwd: "/repo", model: { provider: "provider", id: "id" } } });
         await dashboard.open();
         expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("model:provider/id"))).toBe(true);
 
@@ -1220,46 +1195,68 @@ describe("dashboard controller", () => {
             expect(dashboard.render(width, 10).every((line) => visibleWidth(line) <= width)).toBe(true);
         });
     });
-    it("never persists source ownership and derives it from each current Pi session", async () => {
-        let current;
-        const shared = {
-            async load() { return current; },
-            async save(state) { current = structuredClone(state); },
+    // Operator-visible failure: three dashboards shared one frontend-state.json, so whichever one
+    // saved last handed its draft and selection to whichever one next reopened its list after a
+    // viewer transition. Each dashboard now keeps that state in its own process and writes nothing.
+    it("keeps three dashboards' drafts and selections apart, whatever order they close in", async () => {
+        const sharedFrontendStore = {
+            loads: 0,
+            saves: [],
+            async load() { this.loads += 1; const last = this.saves.at(-1); return last === undefined ? undefined : structuredClone(last); },
+            async save(state) { this.saves.push(state); },
         };
+        const dashboards = ["alpha", "beta", "gamma"].map((name) => controller(new FakeBackend([session("a"), session("b"), session("c")]), { persistence: sharedFrontendStore, sourceSessionId: `source-${name}` }));
+        for (const dashboard of dashboards) await dashboard.open();
+        const drafts = ["alpha draft", "beta draft", "gamma draft"];
+        const selections = ["a", "b", "c"];
+        dashboards.forEach((dashboard, index) => {
+            dashboard.setComposerPrompt(drafts[index]);
+            dashboard.selectSession(selections[index]);
+        });
+        // Closing order is the operator's, not ours: one dashboard leaving must not move another's state.
+        for (const index of [1, 2, 0]) await dashboards[index].close();
+        for (const index of [2, 0, 1]) await dashboards[index].open();
+        expect(dashboards.map((dashboard) => dashboard.composerDraft.prompt)).toEqual(drafts);
+        expect(dashboards.map((dashboard) => dashboard.selectedSessionId)).toEqual(selections);
+        expect([sharedFrontendStore.loads, sharedFrontendStore.saves.length]).toEqual([0, 0]);
+        for (const dashboard of dashboards) await dashboard.close();
+    });
+    it("derives source ownership from each dashboard's own Pi session, never from another's draft", async () => {
         const firstBackend = new FakeBackend([]);
-        const first = controller(firstBackend, { persistence: shared, sourceSessionId: "session-a" });
+        const first = controller(firstBackend, { sourceSessionId: "session-a" });
         await first.open();
         first.setComposerPrompt("from A");
         await first.close();
-        expect(current?.launchDraft).not.toHaveProperty("sourceSessionId");
         const secondBackend = new FakeBackend([]);
-        const second = controller(secondBackend, { persistence: shared, sourceSessionId: "session-b" });
+        const second = controller(secondBackend, { sourceSessionId: "session-b" });
         await second.open();
+        second.setComposerPrompt("from B");
         await second.submitComposer();
-        expect(secondBackend.requests[0]).toMatchObject({ sourceSessionId: "session-b", prompt: "from A" });
+        expect(secondBackend.requests[0]).toMatchObject({ sourceSessionId: "session-b", prompt: "from B" });
+        expect(first.composerDraft.prompt).toBe("from A");
     });
 });
 describe("daemon dashboard backend", () => {
-    it.each(["stop", "delete"])("claims composer on the same client for %s and detaches afterward", async (operation) => {
-        const operations = [];
+    // A destructive command claims nothing: it carries the installation clientId, its own request ID,
+    // and an exact revision, and that is the whole authorization the daemon needs.
+    it.each(["stop", "delete"])("sends %s alone, with no attachment around it", async (operation) => {
+        const requests = [];
         const client = {
             async connect() {},
             async request(request) {
-                operations.push(request.op);
-                if (request.op === "attach") return { version: 1, requestId: request.requestId, ok: true, result: { kind: "attached", sessionId: "exact-session", role: "composer" } };
-                if (request.op === "detach") return { version: 1, requestId: request.requestId, ok: true, result: { kind: "detached", sessionId: "exact-session" } };
+                requests.push(request);
                 return { version: 1, requestId: request.requestId, ok: true, result: { kind: "command", status: { clientId: "stable-client", requestId: request.requestId, operation, stage: "COMPLETED", acceptedAt: timestamp, updatedAt: timestamp } } };
             },
             subscribe() { return { async *[Symbol.asyncIterator]() {} }; },
         };
         const backend = createDaemonDashboardBackend({ client, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
         await backend[operation]("exact-session", 3, `${operation}-request`);
-        expect(operations).toEqual(["attach", operation, "detach"]);
+        expect(requests).toEqual([{ version: 1, clientId: "stable-client", requestId: `${operation}-request`, op: operation, payload: { sessionId: "exact-session", revision: 3 } }]);
     });
     // An ambiguous transport failure after submission is never replayed silently: it becomes
     // DELIVERY_UNKNOWN, carrying the identity the operator needs to resolve it explicitly.
     it.each([
-        ["stop", "a disconnected composer socket", Object.assign(new Error("socket closed"), { code: "CONNECTION_CLOSED", submitted: true })],
+        ["stop", "a disconnected socket", Object.assign(new Error("socket closed"), { code: "CONNECTION_CLOSED", submitted: true })],
         ["delete", "a malformed daemon frame", Object.assign(new Error("malformed daemon frame"), { code: "MALFORMED_FRAME" })],
         ["stop", "an unparseable response for this request", Object.assign(new Error("unparseable response"), { code: "MALFORMED_RESPONSE", submitted: true })],
     ])("classifies %s interrupted by %s as delivery unknown", async (operation, _label, failure) => {
@@ -1268,22 +1265,19 @@ describe("daemon dashboard backend", () => {
             async connect() {},
             async request(request) {
                 requests.push(request.op);
-                if (request.op === "attach") return { version: 1, requestId: request.requestId, ok: true, result: { kind: "attached", sessionId: "exact-session", role: "composer" } };
                 throw failure;
             },
             async close() {},
         };
         const backend = createDaemonDashboardBackend({ client: { createTransactionClient: () => transaction }, clientId: "stable-client", preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
         await expect(backend[operation]("exact-session", 3, `${operation}-request`)).rejects.toMatchObject({ code: "DELIVERY_UNKNOWN", clientId: "stable-client", requestId: `${operation}-request` });
-        expect(requests).toEqual(["attach", operation]);
+        expect(requests).toEqual([operation]);
     });
     it.each(["stop", "delete"])("treats durable %s FAILED as a structured refusal", async (operation) => {
         const status = { clientId: "stable-client", requestId: `${operation}-request`, operation, stage: "FAILED", acceptedAt: timestamp, updatedAt: timestamp, error: { code: "SESSION_REFUSED", message: `${operation} refused`, retryable: false } };
         const client = {
             async connect() { },
             async request(request) {
-                if (request.op === "attach") return { version: 1, requestId: request.requestId, ok: true, result: { kind: "attached", sessionId: "exact-session", role: "composer" } };
-                if (request.op === "detach") return { version: 1, requestId: request.requestId, ok: true, result: { kind: "detached", sessionId: "exact-session" } };
                 return { version: 1, requestId: request.requestId, ok: true, result: { kind: "command", status } };
             },
             subscribe() { return { async *[Symbol.asyncIterator]() { } }; },

@@ -36,7 +36,7 @@ function laterViewerCursor(current, candidate) {
     return BigInt(candidate.sequence) >= BigInt(current.sequence) ? candidate : current;
 }
 /** Create a bounded JSONL daemon client with optional reconnect-and-replay behavior. */
-export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelayMs = 50, maxReconnectDelayMs = 1_000, clientId, subscriberLimit = 100, reconnect = true, }) {
+export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelayMs = 50, maxReconnectDelayMs = 1_000, clientId, attachId = undefined, subscriberLimit = 100, reconnect = true, }) {
     if (!Number.isSafeInteger(reconnectDelayMs) || reconnectDelayMs < 0)
         throw new TypeError("reconnectDelayMs must be a non-negative safe integer");
     if (!Number.isSafeInteger(maxReconnectDelayMs) || maxReconnectDelayMs < reconnectDelayMs)
@@ -45,6 +45,8 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
         throw new TypeError("subscriberLimit must be a positive safe integer");
     if (typeof clientId !== "string" || clientId.length === 0)
         throw new TypeError("clientId is required");
+    if (attachId !== undefined && (typeof attachId !== "string" || attachId.length === 0))
+        throw new TypeError("attachId must be a non-empty string when it is given");
     if (typeof reconnect !== "boolean")
         throw new TypeError("reconnect must be boolean");
     const encoder = createJsonlEncoder({ maxBytes });
@@ -172,7 +174,9 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
         };
         candidate.on("connect", () => {
             try {
-                candidate.write(encoder.encode({ version: 1, token, clientProtocol: CLIENT_PROTOCOL }));
+                // `clientId` is this installation and outlives every process; `attachId` is this
+                // dashboard process, and the daemon binds connection-scoped state to it and the socket.
+                candidate.write(encoder.encode({ version: 1, token, clientProtocol: CLIENT_PROTOCOL, ...(attachId === undefined ? {} : { attachId }) }));
             }
             catch (error) {
                 failAttempt(error);
@@ -330,7 +334,7 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
     });
     const client = {
         connect: startReconnectLoop,
-        createTransactionClient() { return createDaemonClient({ socketPath, token, maxBytes, reconnectDelayMs, maxReconnectDelayMs, clientId, subscriberLimit, reconnect: false }); },
+        createTransactionClient() { return createDaemonClient({ socketPath, token, maxBytes, reconnectDelayMs, maxReconnectDelayMs, clientId, attachId, subscriberLimit, reconnect: false }); },
         request(request) {
             if (closed)
                 return Promise.reject(new DaemonClientError("CLIENT_CLOSED", "Daemon client is closed"));

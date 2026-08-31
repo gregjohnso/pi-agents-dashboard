@@ -51,11 +51,10 @@ class DashboardBackend {
 
 function dashboardFixture(sessions, overrides = {}) {
   const backend = new DashboardBackend(sessions);
-  const persistence = { async load() {}, async save() {} };
   const openViewer = overrides.openViewer ?? vi.fn(async () => {});
   const onClose = overrides.onClose ?? vi.fn();
   const dashboard = new DashboardController({
-    backend, persistence, openViewer, onClose,
+    backend, openViewer, onClose,
     clientId: "terminal-client",
     requestId: () => "terminal-request",
     launchDefaults: { cwd: "/repo", model: { provider: "", id: "" }, name: "" },
@@ -81,7 +80,6 @@ function viewerSnapshot(overrides = {}) {
     registryRevision: 3,
     cursor: { daemonEpoch: "epoch", sessionId: "viewer-session", sequence: "0" },
     runtime: null,
-    role: "composer",
     taskState: "WAITING",
     processState: "LIVE",
     outcome: "NONE",
@@ -243,12 +241,12 @@ it("drives viewer prompt/follow-up/steer/interrupt, tools, pending UI, and read-
   expect(f.controller.transcript.expandedTools.has("tool")).toBe(true);
   await f.controller.close();
 
-  const observer = viewerFixture({ role: "observer", pendingUi: [{ id: "blocked", method: "confirm", title: "Blocked" }] });
-  await observer.controller.open();
-  for (const input of ["x", "\r", "\x03", "\x13", "y", "\x1b[5~", "/", "x"]) observer.controller.handleInput(input);
-  expect(observer.commands).toEqual([]);
-  expect(observer.controller.render(55, 16).join("\n")).toContain("OBSERVER");
-  await observer.controller.close();
+  // A second viewer on the same session answers its pending request instead of watching it.
+  const second = viewerFixture({ pendingUi: [{ id: "blocked", method: "confirm", title: "Blocked" }] });
+  await second.controller.open();
+  second.controller.handleInput("y");
+  await vi.waitFor(() => expect(second.commands.at(-1)).toMatchObject({ operation: "ui_response", payload: { uiRequestId: "blocked", response: true } }));
+  await second.controller.close();
 });
 
 it("uses context-sensitive Ctrl+C, immediate Escape, and the exact clean and 500 ms dirty/history Left table", async () => {

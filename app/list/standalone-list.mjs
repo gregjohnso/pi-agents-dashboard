@@ -1,8 +1,7 @@
 import { appendFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
 import { ProcessTerminal, TuiAltScreen } from "@earendil-works/pi-tui";
 
@@ -11,43 +10,6 @@ import { createWheelInputTap } from "../mouse-input.mjs";
 import { createPiEditor } from "../viewer/pi-component-adapters.mjs";
 import { ViewerController } from "../viewer/viewer-controller.mjs";
 import { DashboardController, createDaemonDashboardBackend } from "./dashboard.mjs";
-import { validateFrontendState } from "./frontend-state.mjs";
-
-/** Create private fsync-backed frontend view-state persistence. @param {string} path @param {string} clientId @param {{fsOps?:any,failpoint?:(stage:string)=>unknown|Promise<unknown>}} [options] */
-export function createFrontendPersistence(path, clientId, options = {}) {
-  const fsOps = options.fsOps ?? fs;
-  const failpoint = options.failpoint ?? (() => {});
-  return {
-    async load() {
-      let handle;
-      try { handle = await fsOps.open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW); }
-      catch (error) { if (/** @type {NodeJS.ErrnoException} */ (error).code === "ENOENT") return undefined; throw Object.assign(new Error("Frontend state is unsafe", { cause: error }), { code: "FRONTEND_STATE_UNSAFE" }); }
-      try {
-        const metadata = await handle.stat();
-        if (!metadata.isFile() || metadata.isSymbolicLink?.() || metadata.uid !== process.getuid?.() || (metadata.mode & 0o777) !== 0o600) throw Object.assign(new Error("Frontend state is unsafe"), { code: "FRONTEND_STATE_UNSAFE" });
-        const state = validateFrontendState(JSON.parse(await handle.readFile("utf8")));
-        return state;
-      } catch (error) {
-        if (error?.code === "FRONTEND_STATE_UNSAFE" || error?.code === "FRONTEND_STATE_CORRUPT") throw error;
-        throw Object.assign(new Error("Frontend state is corrupt", { cause: error }), { code: "FRONTEND_STATE_CORRUPT" });
-      } finally { await handle.close(); }
-    },
-    async save(state) {
-      validateFrontendState(state);
-      if (state.clientId !== clientId) throw Object.assign(new Error("Frontend client identity changed"), { code: "FRONTEND_STATE_IDENTITY_MISMATCH" });
-      const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-      try {
-        const handle = await fsOps.open(temporary, "wx", 0o600);
-        try { await handle.chmod(0o600); await handle.writeFile(`${JSON.stringify(state)}\n`); await handle.sync(); } finally { await handle.close(); }
-        await failpoint("after_file_sync");
-        await fsOps.rename(temporary, path);
-        await failpoint("after_rename");
-        const directory = await fsOps.open(dirname(path), "r"); try { await directory.sync(); } finally { await directory.close(); }
-        await failpoint("after_directory_sync");
-      } finally { await fsOps.rm(temporary, { force: true }); }
-    },
-  };
-}
 
 /** Adapt one daemon client to the viewer controller's ordered public-v1 seam. */
 export function createDaemonViewerClient({ client, clientId }) {
@@ -62,12 +24,11 @@ export function createDaemonViewerClient({ client, clientId }) {
   return {
     replayFromOrigin: false,
     async attach(sessionId) {
-      // Leaving no longer waits for the daemon to release this session's composer claim, so a fast
-      // reopen can outrun its own detach. Ordering per session is what the one-composer rule needs;
-      // a different session never queues behind it.
+      // A fast reopen can outrun its own detach, and the two would then race on this connection's
+      // record of the session. Ordering them per session is enough; another session never waits here.
       await detaching.get(sessionId)?.catch(() => {});
-      const attached = await request("attach", { sessionId, role: "composer", activate: true });
-      if (attached?.kind !== "attached" || attached.role !== "composer") throw Object.assign(new Error("Another frontend owns this session"), { code: "SESSION_IN_USE", retryable: false });
+      const attached = await request("attach", { sessionId, activate: true });
+      if (attached?.kind !== "attached") throw Object.assign(new Error("Daemon returned the wrong attachment result"), { code: "INVALID_RESPONSE", retryable: false });
       return attached;
     },
     detach(sessionId) {
@@ -157,9 +118,8 @@ export async function runViewerTransition({ sessionId, viewerClient, controller,
     failure = error;
   } finally {
     await viewer?.close().catch(() => {});
-    // Releasing the composer claim is cleanup, not a precondition for drawing the list, and on a
-    // network home one detach measured 4.3 to 6.4 s of durable daemon writes. The client keeps the
-    // promise so a later attach for this session still waits behind it; the operator does not.
+    // Detaching is cleanup, not a precondition for drawing the list. The client keeps the promise so
+    // a later attach for this session still waits behind it; the operator does not.
     if (attached) void viewerClient.detach(sessionId).catch(() => {});
     if (restoreList && shouldRestore()) { await controller.open(); markTransition("list-reopened", startedAt); }
     if (shouldRestore()) {
@@ -217,7 +177,7 @@ export function mountStandaloneHost({ tui, getActive, getHeight, terminal }) {
 /** Open the relocated list and real viewer in one package-root TUI. @param {any} options */
 export async function createStandaloneList({ cwd, frontend }) {
   const token = (await fs.readFile(join(frontend.root, "daemon", "control.token"), "utf8")).trim();
-  const client = createDaemonClient({ socketPath: join(frontend.root, "daemon", "control.sock"), token, maxBytes: 1024 * 1024, clientId: frontend.clientId });
+  const client = createDaemonClient({ socketPath: join(frontend.root, "daemon", "control.sock"), token, maxBytes: 1024 * 1024, clientId: frontend.clientId, attachId: frontend.attachId });
   const backend = createDaemonDashboardBackend({
     client, clientId: frontend.clientId,
     preflight: async (draft) => {
@@ -277,7 +237,7 @@ export async function createStandaloneList({ cwd, frontend }) {
     switching = false;
   };
   const controller = new DashboardController({
-    backend, persistence: createFrontendPersistence(join(frontend.root, "frontend-state.json"), frontend.clientId), openViewer: openRealViewer,
+    backend, openViewer: openRealViewer,
     clientId: frontend.clientId, sourceSessionId: `dashboard-${frontend.clientId}`,
     launchDefaults: { cwd }, requestRender: () => tui.requestRender(),
     onClose: () => { if (!switching && activeViewer === undefined) { tui.stop(); resolveClosed(); } },

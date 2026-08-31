@@ -202,22 +202,6 @@ export async function createCommandJournal({ path, now = () => new Date().toISOS
         return append({ commandCanonical: previous.commandCanonical, command: previous.command, status });
       });
     },
-    /** Reconcile a strict attachment-result phase after both durable stores recover. @param {DurableCommand} command @param {"PREPARED" | "COMPLETED"} phase @returns {Promise<CommandStatus>} */
-    reconcileAttachment(command, phase) {
-      return serialize(async () => {
-        assertKey(command);
-        if (!["attach", "detach"].includes(command.op) || !["PREPARED", "COMPLETED"].includes(phase)) throw new TypeError("Attachment reconciliation requires a strict attachment command and phase");
-        const previous = current(command);
-        if (previous === undefined) throw new CommandJournalError("COMMAND_NOT_FOUND", "Attachment command was not accepted");
-        if (previous.commandCanonical !== canonical(command)) throw new CommandJournalError("IDEMPOTENCY_CONFLICT", "Request IDs were already used with a different command");
-        if (previous.status.stage === "FAILED") return previous.status;
-        const next = phase === "COMPLETED" ? "COMPLETED" : "DELIVERY_UNKNOWN";
-        if (previous.status.stage === next) return previous.status;
-        const status = /** @type {CommandStatus} */ ({ ...previous.status, stage: next, updatedAt: now() });
-        delete status.error;
-        return append({ commandCanonical: previous.commandCanonical, command: previous.command, status });
-      });
-    },
     /** @param {RequestKey} key @returns {Promise<CommandStatus | undefined>} */
     async get(key) {
       await tail;

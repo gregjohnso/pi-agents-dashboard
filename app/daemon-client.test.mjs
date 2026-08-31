@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import { createJsonlDecoder, encodeJsonl } from "../runtime/jsonl.mjs";
+import { CLIENT_PROTOCOL } from "../shared/contracts.mjs";
 import { createDaemonClient } from "./daemon-client.mjs";
 
 /** @type {Array<() => Promise<unknown> | unknown>} */
@@ -25,7 +26,7 @@ async function socketPathIn(prefix) {
  * @param {(exchange: { socket: net.Socket, request: any, connection: number, requests: number, reply: (result: any) => void }) => void} respond
  */
 async function daemonServer(socketPath, respond) {
-  const state = { requests: 0, connections: 0, /** @type {net.Socket | undefined} */ socket: undefined, /** @type {net.Socket[]} */ sockets: [] };
+  const state = { requests: 0, connections: 0, /** @type {any[]} */ authentications: [], /** @type {net.Socket | undefined} */ socket: undefined, /** @type {net.Socket[]} */ sockets: [] };
   const server = net.createServer((socket) => {
     state.connections += 1;
     state.socket = socket;
@@ -38,6 +39,7 @@ async function daemonServer(socketPath, respond) {
       for (const request of decoder.push(chunk)) {
         if (!authenticated) {
           authenticated = true;
+          state.authentications.push(request);
           socket.write(encodeJsonl({ version: 1, kind: "authenticated" }));
           continue;
         }
@@ -89,6 +91,24 @@ describe("daemon client", () => {
     const client = startClient({ socketPath });
     await client.connect();
     expect(await client.request(request)).toMatchObject({ requestId: "exact-request-id", ok: true });
+  });
+
+  // The daemon binds this connection's open sessions to the attachId, so three dashboards of one
+  // installation are three peers rather than one identity racing itself.
+  it("declares this dashboard process in the authentication frame, and omits it when there is none", async () => {
+    const socketPath = await socketPathIn("client-");
+    const server = await daemonServer(socketPath, ({ reply }) => reply(emptyState));
+    const withAttachId = startClient({ socketPath, attachId: "attach-one" });
+    await withAttachId.connect();
+    const withoutAttachId = startClient({ socketPath, clientId: "client-1" });
+    await withoutAttachId.connect();
+    expect(server.authentications).toEqual([
+      { version: 1, token: "secret", clientProtocol: CLIENT_PROTOCOL, attachId: "attach-one" },
+      { version: 1, token: "secret", clientProtocol: CLIENT_PROTOCOL },
+    ]);
+    // A transaction client is another connection of the same dashboard process, not another process.
+    expect(withAttachId.createTransactionClient).toBeTypeOf("function");
+    expect(() => startClient({ socketPath, attachId: "" })).toThrow(/attachId/u);
   });
 
   it("reconnects and resends the same request after disconnect without worker-side cancellation", async () => {
@@ -281,7 +301,7 @@ describe("daemon client", () => {
     const zero = { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "0" };
     const one = { ...zero, sequence: "1" };
     const activity = { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "source", startedAt: "2026-08-25T00:00:00.000Z" };
-    const snapshot = { version: 1, sessionId: "session-1", registryRevision: 1, cursor: zero, runtime: null, role: "observer", taskState: "READY", processState: "SLEEPING", outcome: "NONE", activity, model: null, thinkingLevel: null, items: [], tools: [], pendingUi: [], errors: [] };
+    const snapshot = { version: 1, sessionId: "session-1", registryRevision: 1, cursor: zero, runtime: null, taskState: "READY", processState: "SLEEPING", outcome: "NONE", activity, model: null, thinkingLevel: null, items: [], tools: [], pendingUi: [], errors: [] };
     const event = { version: 1, sessionId: "session-1", eventId: "event-1", cursor: one, timestamp: "2026-08-25T00:00:00.000Z", payload: { kind: "user_message", itemId: "user-1", content: [{ type: "text", text: "hello" }] } };
     await daemonServer(socketPath, ({ socket, request: incoming, reply }) => {
       operations.push(incoming.op);
@@ -335,7 +355,7 @@ describe("daemon client", () => {
     const socketPath = await socketPathIn("client-seen-bytes-");
     const cursor = { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "0" };
     const activity = { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "source", startedAt: "2026-08-25T00:00:00.000Z" };
-    const snapshot = { version: 1, sessionId: "session-1", registryRevision: 1, cursor, runtime: null, role: "observer", taskState: "READY", processState: "SLEEPING", outcome: "NONE", activity, model: null, thinkingLevel: null, items: [{ kind: "assistant_message", itemId: "answer", content: Array.from({ length: 10 }, () => ({ type: "text", text: "x".repeat(60_000) })) }], tools: [], pendingUi: [], errors: [] };
+    const snapshot = { version: 1, sessionId: "session-1", registryRevision: 1, cursor, runtime: null, taskState: "READY", processState: "SLEEPING", outcome: "NONE", activity, model: null, thinkingLevel: null, items: [{ kind: "assistant_message", itemId: "answer", content: Array.from({ length: 10 }, () => ({ type: "text", text: "x".repeat(60_000) })) }], tools: [], pendingUi: [], errors: [] };
     const server = await daemonServer(socketPath, ({ reply }) => reply({ kind: "viewer_snapshot", snapshot }));
     const client = startClient({ socketPath, maxBytes: 1024 * 1024 });
     const read = (/** @type {string} */ requestId) => client.request({ version: 1, clientId: "client-1", requestId, op: "get_viewer_snapshot", payload: { sessionId: "session-1" } });

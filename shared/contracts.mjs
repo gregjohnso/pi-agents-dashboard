@@ -3,7 +3,6 @@ import { parseViewerSnapshot } from "./viewer-contracts.mjs";
 /** @typedef {"WORKING" | "WAITING" | "READY" | "FAILED" | "STOPPED"} TaskState */
 /** @typedef {"LIVE" | "SLEEPING" | "EXITED" | "STALE"} ProcessState */
 /** @typedef {"NONE" | "COMPLETED" | "READY_FOR_REVIEW"} Outcome */
-/** @typedef {"composer" | "observer"} AttachmentRole */
 /** @typedef {"retry_at_risk" | "abandon"} DeliveryResolution */
 /** @typedef {null | boolean | number | string | any[] | {[key: string]: any}} JsonValue */
 /** @typedef {{pid:number,startIdentity:string,processGroupId:number}} ProcessIdentity */
@@ -30,12 +29,14 @@ const ENVELOPE_KEYS = ["version", "clientId", "requestId", "op", "payload"];
 /**
  * The frontend protocol this release speaks, declared as `clientProtocol` in the socket
  * authentication frame. Protocol 2 replaced the replayed list-event stream with payload-free
- * invalidations, so a frontend and a daemon on different sides of that change cannot share a list.
- * The daemon refuses a frontend that declares anything else at its first request. Worker and
- * control connections deliberately carry no `clientProtocol`: a live worker must survive a daemon
- * replacement, and the daemon-liveness probe must still find and stop an older daemon.
+ * invalidations; protocol 3 removed the access role from the attach request and its reply, so a
+ * protocol-2 client reads that reply as a refusal of the role it asked for. A frontend and
+ * a daemon on different sides of either change cannot share a session, so the daemon refuses a
+ * frontend that declares anything else at its first request. Worker and control connections
+ * deliberately carry no `clientProtocol`: a live worker must survive a daemon replacement, and the
+ * daemon-liveness probe must still find and stop an older daemon.
  */
-export const CLIENT_PROTOCOL = 2;
+export const CLIENT_PROTOCOL = 3;
 /** Operator-chosen row tints, named for the Jobwatch palette. Dashboard metadata; Pi never sees them. */
 export const SESSION_COLORS = ["sky", "green", "amber", "rose", "cyan", "gray"];
 /** @typedef {"sky"|"green"|"amber"|"rose"|"cyan"|"gray"} SessionColor */
@@ -222,9 +223,11 @@ export function parseClientRequest(value) {
   }
   if (op === "launch") return { ...base, payload: readLaunchRequest(request.payload) };
   if (op === "attach") {
+    // `role` is a retired key. The operator's queue/commands.jsonl holds attach records that carry
+    // one and state-migration reparses them, so it is accepted here and dropped; nothing reads it.
     const payload = readRecord(request.payload, "attach payload"); rejectUnknownKeys(payload, ["sessionId", "role", "activate"], "attach payload");
     if (Object.hasOwn(payload, "activate") && typeof payload.activate !== "boolean") throw new TypeError("attach payload.activate must be a boolean");
-    const parsed = { sessionId: readIdentifier(payload, "sessionId", "attach payload.sessionId"), role: readEnum(payload, "role", ["composer", "observer"], "attach payload.role") };
+    const parsed = { sessionId: readIdentifier(payload, "sessionId", "attach payload.sessionId") };
     return { ...base, payload: payload.activate === true ? { ...parsed, activate: true } : parsed };
   }
   if (["detach", "interrupt"].includes(op)) return { ...base, payload: readSessionPayload(request.payload, op) };
@@ -369,8 +372,7 @@ export function parseDaemonResponse(value) {
   // have silently skipped a change.
   if (kind === "state") { requireKeys(result, ["kind", "sessions", "cursor"], [], "daemon response.result"); if (!Array.isArray(result.sessions)) throw new TypeError("sessions must be an array"); result.sessions.forEach((session, index) => validateSession(session, `daemon response.result.sessions[${index}]`)); readCursor(result.cursor, "daemon response.result.cursor"); }
   else if (kind === "list_subscribed") requireKeys(result, ["kind"], [], "daemon response.result");
-  else if (["launched", "detached"].includes(kind)) { requireKeys(result, ["kind", "sessionId"], [], "daemon response.result"); readIdentifier(result, "sessionId"); }
-  else if (kind === "attached") { requireKeys(result, ["kind", "sessionId", "role"], [], "daemon response.result"); readIdentifier(result, "sessionId"); readEnum(result, "role", ["composer", "observer"]); }
+  else if (["launched", "attached", "detached"].includes(kind)) { requireKeys(result, ["kind", "sessionId"], [], "daemon response.result"); readIdentifier(result, "sessionId"); }
   else if (kind === "command") { requireKeys(result, ["kind", "status"], [], "daemon response.result"); validateCommandStatus(result.status, "status"); }
   else if (kind === "session_commands") validateSessionCommands(result);
   else if (kind === "settings") {

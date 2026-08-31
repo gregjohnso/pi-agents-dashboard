@@ -105,22 +105,22 @@ it("stops only through the verified daemon process-group boundary", async () => 
   ]);
 });
 
-it("claims composer on each exact worker before --stop-workers mutation", async () => {
+// Operator-visible failure: this claimed an access role per worker and read the reply to decide
+// whether it might stop that worker. The daemon grants no roles, so the claim could only refuse.
+it("stops each exact live worker on one held connection, claiming nothing", async () => {
   const publication = { pid: 321, startIdentity: "987654321", processGroupId: 654, tokenPath: "/state/daemon/control.token" };
   const operations = [];
-  const request = async (op) => {
-    operations.push(op);
+  const request = async (/** @type {string} */ op, /** @type {any} */ payload) => {
+    operations.push([op, payload]);
     if (op === "get_state") return { kind: "state", sessions: [{ sessionId: "live", revision: 4, processState: "LIVE", ownership: { runId: "run" } }] };
-    if (op === "attach") return { kind: "attached", sessionId: "live", role: "composer" };
-    if (op === "detach") return { kind: "detached", sessionId: "live" };
     return { kind: "command", status: { stage: "COMPLETED" } };
   };
   const endpoints = [{ status: "HEALTHY", daemonState: "READY", publication }, { status: "ABSENT" }];
-  await runDaemonCommand("stop", {
-    root: "/state", inspectEndpoint: async () => endpoints.shift() ?? { status: "ABSENT" }, composerRequest: request,
+  await expect(runDaemonCommand("stop", {
+    root: "/state", inspectEndpoint: async () => endpoints.shift() ?? { status: "ABSENT" }, heldConnectionRequest: request,
     stopWorkers: true, yes: true, stopProcessGroup: async () => ({ disposition: "GRACEFUL" }),
-  });
-  expect(operations).toEqual(["get_state", "attach", "stop", "detach"]);
+  })).resolves.toMatchObject({ code: 0, result: { kind: "daemon_stopped", stoppedSessionIds: ["live"] } });
+  expect(operations).toEqual([["get_state", {}], ["stop", { sessionId: "live", revision: 4 }]]);
 });
 
 it("gives every worker stop the daemon's full escalation window and reports the sessions it stopped", async () => {
@@ -137,8 +137,6 @@ it("gives every worker stop the daemon's full escalation window and reports the 
       return {
         request: async (op) => {
           if (op === "get_state") return { kind: "state", sessions: [{ sessionId: "live", revision: 4, processState: "LIVE", ownership: { runId: "run" } }] };
-          if (op === "attach") return { kind: "attached", sessionId: "live", role: "composer" };
-          if (op === "detach") return { kind: "detached", sessionId: "live" };
           return { kind: "command", status: { stage: "COMPLETED" } };
         },
         close: async () => {},
@@ -153,7 +151,6 @@ it("gives every worker stop the daemon's full escalation window and reports the 
 it("keeps the daemon running when the stop socket disconnects after submission", async () => {
   const respond = async (/** @type {string} */ op) => {
     if (op === "get_state") return { kind: "state", sessions: [{ sessionId: "live", revision: 4, processState: "LIVE", ownership: { runId: "run" } }] };
-    if (op === "attach") return { kind: "attached", sessionId: "live", role: "composer" };
     throw Object.assign(new Error("socket closed"), { code: "DELIVERY_UNKNOWN", submitted: true });
   };
   const publication = { pid: 321, startIdentity: "987654321", processGroupId: 654, tokenPath: "/state/daemon/control.token" };
@@ -161,10 +158,10 @@ it("keeps the daemon running when the stop socket disconnects after submission",
   const stopProcessGroup = vi.fn();
   await expect(runDaemonCommand("stop", {
     root: "/state", inspectEndpoint: async () => ({ status: "HEALTHY", daemonState: "READY", publication }),
-    composerRequest: async (op, ...rest) => { operations.push(op); return respond(op, ...rest); },
+    heldConnectionRequest: async (op, ...rest) => { operations.push(op); return respond(op, ...rest); },
     stopWorkers: true, yes: true, stopProcessGroup,
   })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN" } });
-  expect(operations.slice(0, 3)).toEqual(["get_state", "attach", "stop"]);
+  expect(operations.slice(0, 2)).toEqual(["get_state", "stop"]);
   expect(stopProcessGroup).not.toHaveBeenCalled();
 });
 

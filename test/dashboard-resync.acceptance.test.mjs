@@ -7,7 +7,6 @@ import { afterEach, expect, it } from "vitest";
 
 import { createDaemonClient } from "../app/daemon-client.mjs";
 import { DashboardController, createDaemonDashboardBackend } from "../app/list/dashboard.mjs";
-import { createFrontendPersistence } from "../app/list/standalone-list.mjs";
 import { createDaemonRuntime } from "../runtime/daemon.mjs";
 import { RegistryStore } from "../runtime/registry-store.mjs";
 
@@ -70,7 +69,8 @@ async function seedRoot(clientId) {
   await writeFile(join(root, "index", "events.jsonl"), `${lines.join("\n")}\n`, { mode: 0o600 });
 
   const launchDraft = { prompt: "", cwd: root, isolationMode: "worktree", model: { provider: "", id: "" }, name: "" };
-  // The crashing shape: a persisted cursor near the start of that history.
+  // The retired shared frontend state, left where it lies with the cursor that used to crash a start.
+  // No dashboard reads or writes it any more; each one keeps its view state in its own process.
   await writeFile(join(root, "frontend-state.json"), `${JSON.stringify({ schemaVersion: 1, clientId, cursor: { daemonEpoch: EPOCH, sequence: "2" }, viewState: {}, launchDraft })}\n`, { mode: 0o600 });
   return root;
 }
@@ -90,12 +90,12 @@ function recordingRequests(client, operations) {
   };
 }
 
-/** Open one real dashboard against one real daemon and return what the operator would see. @param {{ root: string, clientId: string }} options */
-async function openDashboard({ root, clientId }) {
+/** Open one real dashboard against one real daemon and return what the operator would see. @param {{ root: string, clientId: string, attachId?: string }} options */
+async function openDashboard({ root, clientId, attachId = "resync-acceptance-process" }) {
   const runtime = await createDaemonRuntime({ root, hostProbe: async () => ({ blockers: [] }), reconnectTimeoutMs: 2_000 });
   runtimes.push(runtime);
   await runtime.ready;
-  const client = createDaemonClient({ socketPath: runtime.socketPath, token: runtime.token, clientId, maxBytes: 256 * 1024, reconnect: false });
+  const client = createDaemonClient({ socketPath: runtime.socketPath, token: runtime.token, clientId, attachId, maxBytes: 256 * 1024, reconnect: false });
   /** @type {string[]} */
   const operations = [];
   const backend = createDaemonDashboardBackend({ client: recordingRequests(client, operations), clientId, preflight: async (/** @type {any} */ draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
@@ -103,7 +103,6 @@ async function openDashboard({ root, clientId }) {
   let dashboard;
   dashboard = new DashboardController({
     backend,
-    persistence: createFrontendPersistence(join(root, "frontend-state.json"), clientId),
     openViewer: async () => {},
     clientId,
     sourceSessionId: `dashboard-${clientId}`,
@@ -143,6 +142,7 @@ it("starts from current rows beside a retired list history it never opens", asyn
   const clientId = "resync-acceptance-current";
   const root = await seedRoot(clientId);
   const historyBefore = await readFile(join(root, "index", "events.jsonl"), "utf8");
+  const frontendStateBefore = await readFile(join(root, "frontend-state.json"), "utf8");
   const opened = await openDashboard({ root, clientId });
   try {
     expect(opened.dashboard.status).toEqual({ kind: "ready" });
@@ -156,8 +156,10 @@ it("starts from current rows beside a retired list history it never opens", asyn
   } finally {
     await opened.close();
   }
-  // The retired history stays exactly as it was: no parser, no migration, no deletion.
+  // The retired history and the retired shared frontend state both stay exactly as they were: no
+  // parser, no migration, no deletion, and above all no writer.
   expect(await readFile(join(root, "index", "events.jsonl"), "utf8")).toBe(historyBefore);
+  expect(await readFile(join(root, "frontend-state.json"), "utf8")).toBe(frontendStateBefore);
 }, 60_000);
 
 // Operator-visible failure: a burst of changes filled the bounded replay queue, and every dropped

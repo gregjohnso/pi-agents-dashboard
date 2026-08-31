@@ -46,14 +46,25 @@ it("rejects every invalid viewer event shape", () => {
   }
 });
 
+const snapshot = {
+  version: 1, sessionId: "session-1", registryRevision: 4, cursor: base.cursor, runtime: null,
+  taskState: "READY", processState: "SLEEPING", outcome: "COMPLETED",
+  activity: { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "snapshot-source", startedAt: "2026-08-25T00:00:00Z" },
+  model: null, thinkingLevel: null, items: [payloads[0]], tools: [tool], pendingUi: [request], errors: [{ code: "WARN", message: "bounded", retryable: false }],
+};
+
 it("strictly parses the frozen version-1 viewer snapshot", () => {
-  const snapshot = {
-    version: 1, sessionId: "session-1", registryRevision: 4, cursor: base.cursor, runtime: null, role: "observer",
-    taskState: "READY", processState: "SLEEPING", outcome: "COMPLETED",
-    activity: { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "snapshot-source", startedAt: "2026-08-25T00:00:00Z" },
-    model: null, thinkingLevel: null, items: [payloads[0]], tools: [tool], pendingUi: [request], errors: [{ code: "WARN", message: "bounded", retryable: false }],
-  };
   expect(parseViewerSnapshot(snapshot)).toEqual(snapshot);
   expect(() => parseViewerSnapshot({ ...snapshot, unknown: true })).toThrow(/unknown/iu);
   expect(() => parseViewerSnapshot({ ...snapshot, activeAssistant: { itemId: "a1", blocks: [{ contentIndex: 0, type: "text", text: "hel" }] } }), "internal assistant checkpoint state").toThrow(/unknown/iu);
+});
+
+// The operator's index/viewer/*.snapshot.json files were written when a snapshot carried an access
+// role. The key is accepted so daemon recovery still reads them, and dropped so no viewer can
+// render it, gate an editor on it, or publish it forward.
+it("tolerates a retired role on a persisted snapshot and drops it", () => {
+  const stored = { ...snapshot, role: "composer" };
+  const parsed = parseViewerSnapshot(stored);
+  expect(parsed).toEqual(snapshot);
+  expect(parsed).not.toHaveProperty("role");
 });

@@ -1,19 +1,6 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { describe, expect, it, vi } from "vitest";
 
-import { afterEach, describe, expect, it, vi } from "vitest";
-
-import { createDaemonViewerClient, createFrontendPersistence, runViewerTransition } from "./standalone-list.mjs";
-
-const roots = [];
-afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
-
-async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), "pi-agents-frontend-state-"));
-  roots.push(root);
-  return join(root, "frontend-state.json");
-}
+import { createDaemonViewerClient, runViewerTransition } from "./standalone-list.mjs";
 
 it("adapts the installed daemon client to origin replay, mutation, applied cursors, and detach", async () => {
   const requests = [];
@@ -31,7 +18,7 @@ it("adapts the installed daemon client to origin replay, mutation, applied curso
   const client = {
     async request(value) {
       requests.push(value);
-      const result = value.op === "attach" ? { kind: "attached", role: "composer" }
+      const result = value.op === "attach" ? { kind: "attached", sessionId: value.payload.sessionId }
         : value.op === "detach" ? { kind: "detached" }
           : { kind: "command", status: { stage: "COMPLETED" } };
       return { ok: true, result };
@@ -61,12 +48,22 @@ it("adapts the installed daemon client to origin replay, mutation, applied curso
   expect(requests.map(({ op }) => op)).toEqual(["attach", "interrupt", "detach"]);
 });
 
-it("refuses observer fallback instead of opening a read-only viewer", async () => {
+// Operator-visible failure: a session already open elsewhere used to hand this viewer a read-only
+// role. It opens for every dashboard now, and asks the daemon to start a worker that has exited.
+it("opens a session another dashboard already has open, and asks for its worker", async () => {
+  const requests = [];
   const client = {
-    async request() { return { ok: true, result: { kind: "attached", sessionId: "session", role: "observer" } }; },
+    async request(value) { requests.push(value); return { ok: true, result: { kind: "attached", sessionId: "session" } }; },
   };
   const viewer = createDaemonViewerClient({ client, clientId: "client" });
-  await expect(viewer.attach("session")).rejects.toMatchObject({ code: "SESSION_IN_USE" });
+  await expect(viewer.attach("session")).resolves.toEqual({ kind: "attached", sessionId: "session" });
+  expect(requests).toEqual([expect.objectContaining({ op: "attach", payload: { sessionId: "session", activate: true } })]);
+});
+
+it("refuses an attachment result that is not one", async () => {
+  const client = { async request() { return { ok: true, result: { kind: "detached", sessionId: "session" } }; } };
+  const viewer = createDaemonViewerClient({ client, clientId: "client" });
+  await expect(viewer.attach("session")).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
 });
 
 it("detaches and reopens the same list when viewer construction fails", async () => {
@@ -184,7 +181,7 @@ it("holds a reattach behind the same session's in-flight detach", async () => {
         return { ok: true, result: { kind: "detached" } };
       }
       order.push(`${value.op}:run`);
-      return { ok: true, result: { kind: "attached", sessionId: value.payload.sessionId, role: "composer" } };
+      return { ok: true, result: { kind: "attached", sessionId: value.payload.sessionId } };
     },
   };
   const viewer = createDaemonViewerClient({ client, clientId: "client" });
@@ -195,44 +192,8 @@ it("holds a reattach behind the same session's in-flight detach", async () => {
   await viewer.attach("other");
   expect(order).toEqual(["detach:start", "attach:run"]);
   resolveDetach();
-  await expect(reattach).resolves.toMatchObject({ role: "composer" });
+  await expect(reattach).resolves.toMatchObject({ kind: "attached", sessionId: "session" });
   expect(order).toEqual(["detach:start", "attach:run", "detach:done", "attach:run"]);
-});
-
-it("does not replace the prior view state when publication fails before rename", async () => {
-  const path = await fixture();
-  const original = { schemaVersion: 1, clientId: "client", viewState: { query: { view: "live" } }, launchDraft: { prompt: "draft" } };
-  await writeFile(path, `${JSON.stringify(original)}\n`, { mode: 0o600 });
-  const persistence = createFrontendPersistence(path, "client", { failpoint(stage) { if (stage === "after_file_sync") throw new Error("crash"); } });
-  await expect(persistence.save({ ...original, viewState: { query: { view: "all" } } })).rejects.toThrow("crash");
-  expect(JSON.parse(await readFile(path, "utf8"))).toEqual(original);
-});
-
-it("refuses non-private frontend state and malformed view state", async () => {
-  const path = await fixture();
-  await writeFile(path, JSON.stringify({ schemaVersion: 1, clientId: "client", viewState: {}, launchDraft: {} }), { mode: 0o644 });
-  await expect(createFrontendPersistence(path, "client").load()).rejects.toMatchObject({ code: "FRONTEND_STATE_UNSAFE" });
-
-  const malformed = await fixture();
-  await writeFile(malformed, JSON.stringify({ schemaVersion: 1, clientId: "client", viewState: null, launchDraft: {} }), { mode: 0o600 });
-  await expect(createFrontendPersistence(malformed, "client").load()).rejects.toMatchObject({ code: "FRONTEND_STATE_CORRUPT" });
-});
-
-// Operator-visible failure: his frontend-state.json carries a list cursor this release retired. A
-// key the validator refused would make the dashboard fail to open on the file it wrote yesterday.
-it("loads state that still carries the retired list cursor and never writes one back", async () => {
-  const path = await fixture();
-  // Nothing reads the retired key, so its shape is no longer checked either: a cursor a crash left
-  // half-written must not be the reason the operator's dashboard refuses to open.
-  const stored = { schemaVersion: 1, clientId: "client", cursor: { daemonEpoch: "epoch", sequence: "01" }, viewState: { query: { view: "all" } }, launchDraft: { prompt: "keep me" } };
-  await writeFile(path, `${JSON.stringify(stored)}\n`, { mode: 0o600 });
-  const persistence = createFrontendPersistence(path, "client");
-  const loaded = await persistence.load();
-  expect(loaded.viewState).toEqual({ query: { view: "all" } });
-  expect(loaded.launchDraft).toEqual({ prompt: "keep me" });
-
-  await persistence.save({ schemaVersion: 1, clientId: "client", viewState: { query: { view: "live" } }, launchDraft: { prompt: "keep me" } });
-  expect(JSON.parse(await readFile(path, "utf8"))).not.toHaveProperty("cursor");
 });
 
 describe("viewer transition failures", () => {

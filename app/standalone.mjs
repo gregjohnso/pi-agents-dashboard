@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { access } from "node:fs/promises";
 
 import { ProcessTerminal, TuiAltScreen } from "@earendil-works/pi-tui";
@@ -71,5 +72,8 @@ async function defaultConnectOrStart(options) {
   const started = await runDaemonCommand("start", { root: options.root, piBin: options.piBin, env: options.env });
   if (started.code !== 0) throw Object.assign(new Error(started.error?.message ?? "Daemon did not start"), { code: started.error?.code ?? "DAEMON_START_FAILED" });
   const clientId = await loadCliClientIdentity({ root: options.root });
-  return { root: options.root, clientId, piBin: options.piBin, async close() {} };
+  // `clientId` is this installation and survives every restart, because the command journal and
+  // delivery resolution key off it. `attachId` is this dashboard process and dies with it, which is
+  // what lets three dashboards of one installation hold their own connection state.
+  return { root: options.root, clientId, attachId: randomUUID(), piBin: options.piBin, async close() {} };
 }

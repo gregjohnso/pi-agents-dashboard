@@ -3,10 +3,8 @@ import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
-import { validateFrontendState } from "../app/list/frontend-state.mjs";
 import { convertLegacyDashboardConfig } from "../shared/config.mjs";
 import { parseClientRequest, parseDaemonResponse } from "../shared/contracts.mjs";
-import { validateAttachmentResultRecord } from "./attachment-result-store.mjs";
 import { validateSessionRecord } from "./registry-store.mjs";
 import { validateWorkerReplayRecord } from "./worker-replay-contract.mjs";
 
@@ -48,7 +46,6 @@ function validateLegacyArtifact(relative, text) {
     if (relative === "dashboard.json") { convertLegacyDashboardConfig(JSON.parse(text)); return; }
     if (/^sessions\/[^/]+\.json$/u.test(relative)) { const record = validateSessionRecord(JSON.parse(text)); if (`sessions/${record.sessionId}.json` !== relative) throw new TypeError("Registry filename and session ID differ"); return; }
     if (relative === "daemon/control.token") { const token = text.trim(); if (token.length === 0 || token.length > 4096 || /\s/u.test(token)) throw new TypeError("Control token is invalid"); return; }
-    if (relative === "frontend-state.json") { validateFrontendState(JSON.parse(text)); return; }
     if (relative === "daemon/workers.json") {
       const metadata = JSON.parse(text); exactObject(metadata, ["schemaVersion", "workers"], "Worker metadata"); if (metadata.schemaVersion !== 1 || !Array.isArray(metadata.workers)) throw new TypeError("Worker metadata is invalid");
       // A run is reserved before its worker is spawned, so both identities are absent together until the launch binds them.
@@ -61,12 +58,6 @@ function validateLegacyArtifact(relative, text) {
       return;
     }
     if (relative === "daemon/launch-results.json") { if (!validLaunchResults(JSON.parse(text))) throw new TypeError("Launch result store is invalid"); return; }
-    if (relative === "daemon/attachment-results.jsonl") {
-      const records = validateJsonLines(text, validateAttachmentResultRecord, "Attachment result store");
-      const latest = new Map();
-      for (const record of records) { const key = `${record.request.clientId}\0${record.request.requestId}`; const previous = latest.get(key); if (previous !== undefined && !(previous.phase === "PREPARED" && record.phase === "COMPLETED" && previous.requestCanonical === record.requestCanonical)) throw new TypeError("Attachment result transition is invalid"); latest.set(key, record); }
-      return;
-    }
     if (relative === "queue/commands.jsonl") {
       validateJsonLines(text, (journal) => { try { exactObject(journal, ["commandCanonical", "command", "status"], "Journal record"); const command = parseClientRequest(journal.command); parseDaemonResponse({ version: 1, requestId: command.requestId, ok: true, result: { kind: "command", status: journal.status } }); return journal.status.clientId === command.clientId && journal.status.requestId === command.requestId && journal.status.operation === command.op && typeof journal.commandCanonical === "string"; } catch { return false; } }, "Command journal");
       return;
@@ -131,6 +122,8 @@ async function validatePublishedDestination(root, files, expectedUserId, fsOps) 
 }
 /** @param {string} root @param {Array<{relative:string,sha256:string}>} files @param {any} fsOps */
 async function validateReconciledDestination(root, files, fsOps) {
+  // `frontend-state.json` is retired: nothing reads or writes it. A destination root an earlier
+  // release wrote still holds one, and refusing to migrate into that root would be a false collision.
   const allowed = new Set([LOCK, MANIFEST, CANONICAL_MARKER, RECONCILIATION_MARKER, "daemon", "sessions", "queue", "runs", "index", "cli", "frontend-state.json", "dashboard.json", ...files.map((file) => file.relative.split("/")[0])]);
   const collision = (await fsOps.readdir(root)).find((/** @type {string} */ name) => !allowed.has(name));
   if (collision !== undefined) throw migrationError("DESTINATION_COLLISION", `Destination contains unexpected artifact: ${collision}`);

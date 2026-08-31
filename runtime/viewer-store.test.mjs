@@ -13,7 +13,7 @@ async function location() { const directory = await mkdtemp(join(tmpdir(), "view
 const draft = { eventId: "event-1", timestamp: "2026-08-25T00:00:00.000Z", payload: { kind: "user_message", itemId: "user-1", content: [{ type: "text", text: "hello" }] } };
 const cursor = (/** @type {number} */ sequence, /** @type {string} */ epoch = "epoch-1", /** @type {string} */ sessionId = "session-1") => ({ daemonEpoch: epoch, sessionId, sequence: String(sequence) });
 const snapshot = (/** @type {number} */ sequence, /** @type {string} */ text = "hello") => ({
-  version: 1, sessionId: "session-1", registryRevision: 1, cursor: cursor(sequence), runtime: null, role: "observer",
+  version: 1, sessionId: "session-1", registryRevision: 1, cursor: cursor(sequence), runtime: null,
   taskState: "READY", processState: "SLEEPING", outcome: "NONE",
   activity: { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "source", startedAt: "2026-08-25T00:00:00.000Z" },
   model: null, thinkingLevel: null, items: [{ kind: "user_message", itemId: "user-1", content: [{ type: "text", text }] }], tools: [], pendingUi: [], errors: [],

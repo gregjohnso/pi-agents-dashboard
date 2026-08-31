@@ -610,7 +610,6 @@ async function createViewerRecovery({ root, daemonEpoch, registry }) {
       runtime: current.runtime ?? null,
       model: current.model ?? null,
       thinkingLevel: current.thinkingLevel ?? null,
-      role: state.role ?? "observer",
       taskState: current.taskState,
       processState: current.processState,
       outcome: current.outcome,
@@ -651,7 +650,7 @@ async function createViewerRecovery({ root, daemonEpoch, registry }) {
       normalizer.consumeError({ code: missing ? "SESSION_HISTORY_MISSING" : historyError.code, message: missing ? "Canonical session history is unavailable" : historyError.message, retryable: missing });
       reader = { async read() { return { entries: [], errors: [], position: { byteOffset: 0, line: 0 } }; }, async close() {} };
     }
-    const state = { sessionId: record.sessionId, store, normalizer, reader, role: "observer" };
+    const state = { sessionId: record.sessionId, store, normalizer, reader };
     sessions.set(record.sessionId, state);
     const snapshot = await store.getSnapshot();
     if (snapshot !== undefined) normalizer.restore(snapshot);
@@ -699,11 +698,10 @@ async function createViewerRecovery({ root, daemonEpoch, registry }) {
       if (state === undefined) return undefined;
       return { sequence: state.store.currentCursor().sequence, items: state.normalizer.transcriptItems() };
     },
-    /** @param {string} sessionId @param {"composer" | "observer"} [role] */
-    async snapshot(sessionId, role = "observer") {
+    /** @param {string} sessionId */
+    async snapshot(sessionId) {
       const state = sessions.get(sessionId);
       if (state === undefined) throw Object.assign(new Error(`Unknown viewer session: ${sessionId}`), { code: "SESSION_NOT_FOUND" });
-      state.role = role;
       await readHistory(state);
       return publish(state);
     },

@@ -32,7 +32,7 @@ async function root() {
 }
 
 /** @param {any} options @returns {any} */
-function connect({ socketPath, token, role, maxBytes = 1024, declaredClientProtocol = CLIENT_PROTOCOL }) {
+function connect({ socketPath, token, role, attachId, maxBytes = 1024, declaredClientProtocol = CLIENT_PROTOCOL }) {
   const decoder = createJsonlDecoder({ maxBytes });
   const encoder = createJsonlEncoder({ maxBytes });
   /** @type {any[]} */
@@ -56,6 +56,7 @@ function connect({ socketPath, token, role, maxBytes = 1024, declaredClientProto
       const authentication = { version: 1, token };
       if (role !== undefined) Object.assign(authentication, { role });
       else if (declaredClientProtocol !== null) Object.assign(authentication, { clientProtocol: declaredClientProtocol });
+      if (attachId !== undefined) Object.assign(authentication, { attachId });
       socket.write(encoder.encode(authentication));
       resolve(undefined);
     });
@@ -149,18 +150,18 @@ it("closes a subscriber whose output queue outgrows its bound", () => {
   expect(blocked.destroy).toHaveBeenCalledWith(expect.objectContaining({ code: "SUBSCRIBER_BACKPRESSURE_LIMIT" }));
 });
 
-it("rejects every composer-only command before journaling for observers and unattached sockets", async () => {
+// Operator-visible failure: a second dashboard on a session could read it and not answer it, because
+// the first one held the only writable attachment. Every authenticated client writes now, and the
+// journal is where a command becomes durable, whether or not that client ever opened the session.
+it("journals every mutation from an authenticated client that never attached", async () => {
   const runtime = await createDaemonRuntime({ root: await root() });
   runtimes.push(runtime);
   await runtime.ready;
-  const owner = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  const observer = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  const unattached = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await Promise.all([owner.ready, observer.ready, unattached.ready]);
-  owner.send({ version: 1, clientId: "owner", requestId: "attach-owner", op: "attach", payload: { sessionId: "session", role: "composer" } });
-  expect(await owner.next()).toMatchObject({ ok: true, result: { role: "composer" } });
-  observer.send({ version: 1, clientId: "observer", requestId: "attach-observer", op: "attach", payload: { sessionId: "session", role: "composer" } });
-  expect(await observer.next()).toMatchObject({ ok: true, result: { role: "observer" } });
+  const attached = connect({ socketPath: runtime.socketPath, token: runtime.token, attachId: "attach-one" });
+  const unattached = connect({ socketPath: runtime.socketPath, token: runtime.token, attachId: "attach-two" });
+  await Promise.all([attached.ready, unattached.ready]);
+  attached.send({ version: 1, clientId: "attached", requestId: "attach", op: "attach", payload: { sessionId: "session" } });
+  expect(await attached.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
 
   const variants = [
     ["prompt", { sessionId: "session", text: "next" }],
@@ -172,18 +173,15 @@ it("rejects every composer-only command before journaling for observers and unat
     ["delete", { sessionId: "session", revision: 1 }],
   ];
   for (const [op, payload] of variants) {
-    const observerRequest = { version: 1, clientId: "observer", requestId: `observer-${op}`, op, payload };
-    observer.send(observerRequest);
-    expect(await observer.next()).toMatchObject({ ok: false, error: { code: "OBSERVER_READ_ONLY" } });
-    expect(await runtime.commandStatus(observerRequest)).toBeUndefined();
-
-    const unattachedRequest = { version: 1, clientId: "unattached", requestId: `unattached-${op}`, op, payload };
-    unattached.send(unattachedRequest);
-    expect(await unattached.next()).toMatchObject({ ok: false, error: { code: "ATTACHMENT_REQUIRED" } });
-    expect(await runtime.commandStatus(unattachedRequest)).toBeUndefined();
+    for (const [clientId, client] of /** @type {Array<[string, any]>} */ ([["attached", attached], ["unattached", unattached]])) {
+      const request = { version: 1, clientId, requestId: `${clientId}-${op}`, op, payload };
+      client.send(request);
+      // This session does not exist, so each command fails on its own merits after acceptance.
+      expect(await client.next(), `${clientId} ${op}`).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "FAILED" } } });
+      expect(await runtime.commandStatus(request), `${clientId} ${op}`).toMatchObject({ clientId, requestId: request.requestId });
+    }
   }
-  owner.close();
-  observer.close();
+  attached.close();
   unattached.close();
 });
 
@@ -239,8 +237,8 @@ it("forgets a session whose worker lease points at a dead process", async () => 
   const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
   await client.ready;
 
-  client.send({ version: 1, clientId: "viewer", requestId: "attach-leased", op: "attach", payload: { sessionId: "leased", role: "composer" } });
-  expect(await client.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+  client.send({ version: 1, clientId: "viewer", requestId: "attach-leased", op: "attach", payload: { sessionId: "leased" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
   client.send({ version: 1, clientId: "viewer", requestId: "forget-leased", op: "delete", payload: { sessionId: "leased", revision: 0 } });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
   expect(await registry.get("leased")).toBeUndefined();
@@ -262,8 +260,8 @@ it("forgets a dead session without touching its Pi session file, and never resur
   const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
   await client.ready;
 
-  client.send({ version: 1, clientId: "viewer", requestId: "attach-forget", op: "attach", payload: { sessionId: "forgotten", role: "composer" } });
-  expect(await client.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+  client.send({ version: 1, clientId: "viewer", requestId: "attach-forget", op: "attach", payload: { sessionId: "forgotten" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
   expect(launch).not.toHaveBeenCalled();
 
   client.send({ version: 1, clientId: "viewer", requestId: "forget", op: "delete", payload: { sessionId: "forgotten", revision: 0 } });
@@ -298,8 +296,8 @@ it("marks a stopped session STOPPED rather than leaving it ready", async () => {
   await runtime.ready;
   const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
   await client.ready;
-  client.send({ version: 1, clientId: "viewer", requestId: "attach-stop", op: "attach", payload: { sessionId: "stopping", role: "composer" } });
-  expect(await client.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+  client.send({ version: 1, clientId: "viewer", requestId: "attach-stop", op: "attach", payload: { sessionId: "stopping" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
   const current = await registry.get("stopping");
   if (current === undefined) throw new Error("stopping record missing");
   setTimeout(() => { workerAlive = false; }, 20);
@@ -581,8 +579,8 @@ it("reaches a freshly launched worker over its adopted startup route before any 
   await client.ready;
   client.send({ version: 1, clientId: "viewer", requestId: "launch-fresh", op: "launch", payload: { prompt: "start", cwd: "/repo", sourceSessionId: "source", isolation: { mode: "shared_directory", confirmedCwd: "/repo", ownerSessionIds: [] } } });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "launched", sessionId: "fresh" } });
-  client.send({ version: 1, clientId: "viewer", requestId: "attach-fresh", op: "attach", payload: { sessionId: "fresh", role: "composer" } });
-  expect(await client.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+  client.send({ version: 1, clientId: "viewer", requestId: "attach-fresh", op: "attach", payload: { sessionId: "fresh" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
 
   client.send({ version: 1, clientId: "viewer", requestId: "menu-fresh", op: "get_session_commands", payload: { sessionId: "fresh" } });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "session_commands", models: [{ provider: "anthropic", id: "claude" }] } });
@@ -610,8 +608,8 @@ it("refuses a session query and serves session toggles from the owning worker", 
   await runtime.ready;
   const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
   await client.ready;
-  client.send({ version: 1, clientId: "viewer", requestId: "attach-query", op: "attach", payload: { sessionId: "query", role: "composer" } });
-  expect(await client.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+  client.send({ version: 1, clientId: "viewer", requestId: "attach-query", op: "attach", payload: { sessionId: "query" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
 
   client.send({ version: 1, clientId: "viewer", requestId: "stats-request", op: "session_query", payload: { sessionId: "query", query: "get_session_stats" } });
   expect(await client.next()).toMatchObject({ ok: false, error: { code: "INVALID_REQUEST" } });
@@ -652,8 +650,8 @@ it("bounds a worker request that is never answered and records it as ambiguous",
   await runtime.ready;
   const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
   await client.ready;
-  client.send({ version: 1, clientId: "viewer", requestId: "attach-silent", op: "attach", payload: { sessionId: "silent", role: "composer" } });
-  expect(await client.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+  client.send({ version: 1, clientId: "viewer", requestId: "attach-silent", op: "attach", payload: { sessionId: "silent" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
 
   client.send({ version: 1, clientId: "viewer", requestId: "prompt-silent", op: "prompt", payload: { sessionId: "silent", text: "hello" } });
   const settled = await Promise.race([client.next(), new Promise((resolve) => setTimeout(() => resolve("stalled"), 3_000))]);
@@ -680,8 +678,8 @@ it("discovers slash commands and delivers one session command to the owning work
   await runtime.ready;
   const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
   await client.ready;
-  client.send({ version: 1, clientId: "viewer", requestId: "attach-menu", op: "attach", payload: { sessionId: "menu", role: "composer" } });
-  expect(await client.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+  client.send({ version: 1, clientId: "viewer", requestId: "attach-menu", op: "attach", payload: { sessionId: "menu" } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
   client.send({ version: 1, clientId: "viewer", requestId: "menu-request", op: "get_session_commands", payload: { sessionId: "menu" } });
   const served = /** @type {any} */ (await client.next());
   // A worker may still report Pi's thinking values; the daemon serves the menu without them.
@@ -698,195 +696,38 @@ it("discovers slash commands and delivers one session command to the owning work
   expect(delivered[2].sessionCommand).toEqual({ command: "set_session_name", name: "Coverage loader" });
   client.close();
 });
-
-it("arbitrates one composer per session and persists release before observer takeover", async () => {
-  const workerSupervisor = { close: vi.fn(), stop: vi.fn(), delete: vi.fn() };
-  const runtime = await createDaemonRuntime({ root: await root(), workerSupervisor });
-  runtimes.push(runtime);
-  await runtime.ready;
-  const first = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  const second = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  const observer = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await Promise.all([first.ready, second.ready, observer.ready]);
-  /** @param {string} clientId @param {string} requestId @param {string} op @param {any} payload */
-  const request = (clientId, requestId, op, payload) => ({ version: 1, clientId, requestId, op, payload });
-
-  observer.send(request("watcher", "subscribe", "subscribe_list_changes", {}));
-  expect(await observer.next()).toMatchObject({ ok: true, result: { kind: "list_subscribed" } });
-  first.send(request("client-a", "attach-a", "attach", { sessionId: "session", role: "composer" }));
-  second.send(request("client-b", "attach-b", "attach", { sessionId: "session", role: "composer" }));
-  const [firstResponse, secondResponse] = await Promise.all([first.next(), second.next()]);
-  expect([firstResponse.result.role, secondResponse.result.role].sort()).toEqual(["composer", "observer"]);
-  // An invalidation names nothing, so a watcher learns only that the list changed.
-  expect(await observer.next()).toEqual({ version: 1, kind: "list_changed" });
-  expect(await observer.next()).toEqual({ version: 1, kind: "list_changed" });
-
-  const winner = firstResponse.result.role === "composer" ? first : second;
-  const loser = winner === first ? second : first;
-  const loserClient = winner === first ? "client-b" : "client-a";
-  winner.close();
-  expect(await observer.next()).toEqual({ version: 1, kind: "list_changed" });
-
-  loser.send(request(loserClient, "attach-retry", "attach", { sessionId: "session", role: "composer" }));
-  expect(await loser.next()).toMatchObject({ ok: true, result: { kind: "attached", role: "composer" } });
-  expect(await observer.next()).toEqual({ version: 1, kind: "list_changed" });
-  expect(workerSupervisor.stop).not.toHaveBeenCalled();
-  expect(workerSupervisor.delete).not.toHaveBeenCalled();
-  loser.close();
-  observer.close();
-});
-
-it("serializes disconnect behind an attach whose durable record is in flight", async () => {
-  /** @type {((value?: unknown) => void) | undefined} */
-  let releaseRecord;
-  /** @type {((value?: unknown) => void) | undefined} */
-  let recordReached;
-  const recordGate = new Promise((resolve) => { releaseRecord = resolve; });
-  const reached = new Promise((resolve) => { recordReached = resolve; });
-  const runtime = await createDaemonRuntime({
-    root: await root(),
-    async attachmentFailpoint(/** @type {string} */ phase, /** @type {any} */ request) {
-      if (phase === "after_prepared" && request.clientId === "closing" && request.op === "attach") {
-        recordReached?.();
-        await recordGate;
-      }
-    },
-  });
-  runtimes.push(runtime);
-  await runtime.ready;
-  const client = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  const observer = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await Promise.all([client.ready, observer.ready]);
-  observer.send({ version: 1, clientId: "watcher", requestId: "subscribe", op: "subscribe_list_changes", payload: {} });
-  await observer.next();
-  client.send({ version: 1, clientId: "closing", requestId: "attach", op: "attach", payload: { sessionId: "session", role: "composer" } });
-  await reached;
-  client.close();
-  /** @type {(value?: unknown) => void} */ (releaseRecord)();
-  expect(await observer.next()).toEqual({ version: 1, kind: "list_changed" });
-  expect(await observer.next()).toEqual({ version: 1, kind: "list_changed" });
-
-  const next = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await next.ready;
-  next.send({ version: 1, clientId: "next", requestId: "attach", op: "attach", payload: { sessionId: "session", role: "composer" } });
-  expect(await next.next()).toMatchObject({ ok: true, result: { role: "composer" } });
-  next.close();
-  observer.close();
-});
-
-it.each([
-  ["after_prepared", "abandon"],
-  ["after_claim_mutation", "retry_at_risk"],
-])("recovers attachment crash phase %s as durable ambiguity until %s", async (crashPhase, resolution) => {
+// Operator-visible failure: an attachment used to be a durable claim, journaled and stored, so one
+// dashboard opening a session both excluded the others and left 697 KB of attachment records behind.
+// It is connection state now: no journal entry, no artifact, no list invalidation, and no exclusion.
+it("opens one session on three connections at once, durably recording nothing", async () => {
   const stateRoot = await root();
-  let crash = true;
-  const original = { version: 1, clientId: "crash-client", requestId: `attach-${crashPhase}`, op: "attach", payload: { sessionId: `session-${crashPhase}`, role: "composer" } };
-  const firstRuntime = await createDaemonRuntime({
-    root: stateRoot,
-    async attachmentFailpoint(/** @type {string} */ phase) {
-      if (crash && phase === crashPhase) {
-        crash = false;
-        throw new Error(`crash at ${phase}`);
-      }
-    },
-  });
-  runtimes.push(firstRuntime);
-  await firstRuntime.ready;
-  const first = connect({ socketPath: firstRuntime.socketPath, token: firstRuntime.token });
-  await first.ready;
-  first.send(original);
-  expect(await first.next()).toMatchObject({ ok: false });
-  expect(await firstRuntime.commandStatus(original)).toMatchObject({ stage: "DELIVERY_ATTEMPTED" });
-  first.close();
-  await first.closed;
-  await firstRuntime.close();
-  runtimes.splice(runtimes.indexOf(firstRuntime), 1);
-
-  const attachmentsBefore = await readFile(join(stateRoot, "daemon", "attachment-results.jsonl"), "utf8");
-  const secondRuntime = await createDaemonRuntime({ root: stateRoot });
-  runtimes.push(secondRuntime);
-  await secondRuntime.ready;
-  expect(await secondRuntime.commandStatus(original)).toMatchObject({ stage: "DELIVERY_UNKNOWN" });
-  expect(await readFile(join(stateRoot, "daemon", "attachment-results.jsonl"), "utf8")).toBe(attachmentsBefore);
-
-  const second = connect({ socketPath: secondRuntime.socketPath, token: secondRuntime.token });
-  await second.ready;
-  second.send(original);
-  expect(await second.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "DELIVERY_UNKNOWN" } } });
-  second.send({ ...original, payload: { ...original.payload, role: "observer" } });
-  expect(await second.next()).toMatchObject({ ok: false, error: { code: "IDEMPOTENCY_CONFLICT" } });
-  expect(await readFile(join(stateRoot, "daemon", "attachment-results.jsonl"), "utf8")).toBe(attachmentsBefore);
-
-  second.send({ version: 1, clientId: original.clientId, requestId: `resolve-${crashPhase}`, op: "resolve_delivery", payload: { targetClientId: original.clientId, targetRequestId: original.requestId, resolution } });
-  expect(await second.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: resolution === "abandon" ? "FAILED" : "ACCEPTED" } } });
-  second.send(original);
-  if (resolution === "abandon") {
-    expect(await second.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "FAILED", error: { code: "DELIVERY_ABANDONED" } } } });
-  } else {
-    expect(await second.next()).toMatchObject({ ok: true, result: { kind: "attached", sessionId: original.payload.sessionId } });
-    expect(await secondRuntime.commandStatus(original)).toMatchObject({ stage: "COMPLETED" });
-  }
-  // A retired list history is never created, whichever way the ambiguity resolves.
-  await expect(access(join(stateRoot, "index", "events.jsonl"))).rejects.toMatchObject({ code: "ENOENT" });
-  second.close();
-});
-
-it("replays strict completion after a post-completion crash without attachment side effects", async () => {
-  const stateRoot = await root();
-  const original = { version: 1, clientId: "completed-client", requestId: "completed-attach", op: "attach", payload: { sessionId: "completed-session", role: "composer" } };
-  const firstRuntime = await createDaemonRuntime({
-    root: stateRoot,
-    attachmentFailpoint(/** @type {string} */ phase) {
-      if (phase === "after_result_completion") throw new Error("post-completion crash");
-    },
-  });
-  runtimes.push(firstRuntime);
-  await firstRuntime.ready;
-  const first = connect({ socketPath: firstRuntime.socketPath, token: firstRuntime.token });
-  await first.ready;
-  first.send(original);
-  expect(await first.next()).toMatchObject({ ok: false });
-  expect(await firstRuntime.commandStatus(original)).toMatchObject({ stage: "COMPLETED" });
-  first.close();
-  await first.closed;
-  await firstRuntime.close();
-  runtimes.splice(runtimes.indexOf(firstRuntime), 1);
-  const attachmentsBefore = await readFile(join(stateRoot, "daemon", "attachment-results.jsonl"), "utf8");
-
-  const restarted = await createDaemonRuntime({ root: stateRoot });
-  runtimes.push(restarted);
-  await restarted.ready;
-  const replay = connect({ socketPath: restarted.socketPath, token: restarted.token });
-  await replay.ready;
-  replay.send(original);
-  expect(await replay.next()).toMatchObject({ ok: true, result: { kind: "attached", sessionId: original.payload.sessionId, role: "composer" } });
-  expect(await restarted.commandStatus(original)).toMatchObject({ stage: "COMPLETED" });
-  expect(await readFile(join(stateRoot, "daemon", "attachment-results.jsonl"), "utf8")).toBe(attachmentsBefore);
-  replay.close();
-});
-
-it("does not install a claim when the durable attachment record fails", async () => {
-  let rejectNextAttachment = true;
-  const runtime = await createDaemonRuntime({
-    root: await root(),
-    attachmentFailpoint(/** @type {string} */ phase) {
-      if (rejectNextAttachment && phase === "after_prepared") {
-        rejectNextAttachment = false;
-        throw Object.assign(new Error("injected durable failure"), { code: "PERSIST_FAILED" });
-      }
-    },
-  });
+  const runtime = await createDaemonRuntime({ root: stateRoot });
   runtimes.push(runtime);
   await runtime.ready;
-  const first = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  const second = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await Promise.all([first.ready, second.ready]);
-  first.send({ version: 1, clientId: "first", requestId: "attach-fails", op: "attach", payload: { sessionId: "session", role: "composer" } });
-  expect(await first.next()).toMatchObject({ ok: false, error: { code: "PERSIST_FAILED" } });
-  second.send({ version: 1, clientId: "second", requestId: "attach-succeeds", op: "attach", payload: { sessionId: "session", role: "composer" } });
-  expect(await second.next()).toMatchObject({ ok: true, result: { role: "composer" } });
-  first.close();
-  second.close();
+  const watcher = connect({ socketPath: runtime.socketPath, token: runtime.token, attachId: "attach-watcher" });
+  const dashboards = ["attach-one", "attach-two", "attach-three"].map((attachId) => connect({ socketPath: runtime.socketPath, token: runtime.token, attachId }));
+  await Promise.all([watcher.ready, ...dashboards.map((dashboard) => dashboard.ready)]);
+  watcher.send({ version: 1, clientId: "watcher", requestId: "subscribe", op: "subscribe_list_changes", payload: {} });
+  expect(await watcher.next()).toMatchObject({ ok: true, result: { kind: "list_subscribed" } });
+
+  dashboards.forEach((dashboard, index) => dashboard.send({ version: 1, clientId: "installation-1", requestId: `attach-${index}`, op: "attach", payload: { sessionId: "session" } }));
+  for (const dashboard of dashboards) expect(await dashboard.next()).toMatchObject({ ok: true, result: { kind: "attached", sessionId: "session" } });
+  // A reopen on a connection that already has it open is the same attachment, not a conflict.
+  dashboards[0].send({ version: 1, clientId: "installation-1", requestId: "attach-again", op: "attach", payload: { sessionId: "session" } });
+  expect(await dashboards[0].next()).toMatchObject({ ok: true, result: { kind: "attached" } });
+  dashboards[1].send({ version: 1, clientId: "installation-1", requestId: "detach-1", op: "detach", payload: { sessionId: "session" } });
+  expect(await dashboards[1].next()).toMatchObject({ ok: true, result: { kind: "detached", sessionId: "session" } });
+  dashboards[2].close();
+  await dashboards[2].closed;
+
+  // Nothing about opening or leaving a session changed the list, and nothing was written down.
+  watcher.send({ version: 1, clientId: "watcher", requestId: "read", op: "get_state", payload: {} });
+  expect(await watcher.next()).toMatchObject({ ok: true, requestId: "read", result: { kind: "state" } });
+  await expect(access(join(stateRoot, "daemon", "attachment-results.jsonl"))).rejects.toMatchObject({ code: "ENOENT" });
+  const journal = await readFile(join(stateRoot, "queue", "commands.jsonl"), "utf8").catch(() => "");
+  expect(journal).toBe("");
+  watcher.close();
+  for (const dashboard of dashboards) dashboard.close();
 });
 
 it("authenticates every connection and applies strict framing limits", async () => {
@@ -1226,8 +1067,8 @@ it("reconnects two surviving fake workers through the concrete connector after d
   await firstRuntime.ready;
   const frontend = connect({ socketPath: firstRuntime.socketPath, token: firstRuntime.token });
   await frontend.ready;
-  frontend.send({ version: 1, clientId: "client", requestId: "attach-before-restart", op: "attach", payload: { sessionId: "one", role: "composer" } });
-  expect(await frontend.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+  frontend.send({ version: 1, clientId: "client", requestId: "attach-before-restart", op: "attach", payload: { sessionId: "one" } });
+  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
   frontend.send({ version: 1, clientId: "client", requestId: "before-restart", op: "prompt", payload: { sessionId: "one", text: "hello" } });
   expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
   frontend.close();
@@ -1242,26 +1083,28 @@ it("reconnects two surviving fake workers through the concrete connector after d
   expect(loops.every((loop) => loop.connectionCount >= 2)).toBe(true);
   const malformed = connect({ socketPath: secondRuntime.socketPath, token: secondRuntime.token });
   await malformed.ready;
-  malformed.send({ version: 1, clientId: "client", requestId: "attach-malformed", op: "attach", payload: { sessionId: "one", role: "composer" } });
-  expect(await malformed.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+  malformed.send({ version: 1, clientId: "client", requestId: "attach-malformed", op: "attach", payload: { sessionId: "one" } });
+  expect(await malformed.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
   malformed.send({ version: 1, clientId: "client", requestId: "invalid-worker-result", op: "prompt", payload: { sessionId: "one", text: "invalid result" } });
   expect(await malformed.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "DELIVERY_UNKNOWN" } } });
   malformed.close();
   const resumed = connect({ socketPath: secondRuntime.socketPath, token: secondRuntime.token });
   await resumed.ready;
-  resumed.send({ version: 1, clientId: "client", requestId: "attach-resumed", op: "attach", payload: { sessionId: "two", role: "composer" } });
-  expect(await resumed.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+  resumed.send({ version: 1, clientId: "client", requestId: "attach-resumed", op: "attach", payload: { sessionId: "two" } });
+  expect(await resumed.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
   resumed.send({ version: 1, clientId: "client", requestId: "after-restart", op: "steer", payload: { sessionId: "two", text: "next" } });
   expect(await resumed.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
   const beforeLostResponse = loops[1].commandCount;
   const lostResponse = { version: 1, clientId: "client", requestId: "lost-response", op: "prompt", payload: { sessionId: "two", text: "persist first" } };
   resumed.send(lostResponse);
   resumed.close();
-  await new Promise((resolve) => setTimeout(resolve, 30));
+  // The socket died before the response, not before the work. Wait for the command the daemon is
+  // still finishing, so the retry below is a retry of a completed command rather than a race with it.
+  await vi.waitFor(async () => expect(await secondRuntime.commandStatus(lostResponse)).toMatchObject({ stage: "COMPLETED" }));
   const retry = connect({ socketPath: secondRuntime.socketPath, token: secondRuntime.token });
   await retry.ready;
-  retry.send({ version: 1, clientId: "client", requestId: "attach-retry", op: "attach", payload: { sessionId: "two", role: "composer" } });
-  expect(await retry.next()).toMatchObject({ ok: true, result: { role: "composer" } });
+  retry.send({ version: 1, clientId: "client", requestId: "attach-retry", op: "attach", payload: { sessionId: "two" } });
+  expect(await retry.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
   retry.send(lostResponse);
   expect(await retry.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
   expect(loops[1].commandCount).toBe(beforeLostResponse + 1);
@@ -1379,12 +1222,12 @@ async function replaceableWorker({ sessionId, cliVersion, taskState, activityKin
   return { stateRoot, registry, runtime, loop, identity, signals, launches, diagnostics, now };
 }
 
-/** Attach one composer frontend, which every durable command still requires. @param {any} runtime @param {string} sessionId */
-async function composer(runtime, sessionId) {
-  const frontend = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 64 * 1024 });
+/** Open one dashboard connection on a session, the way a viewer does. @param {any} runtime @param {string} sessionId */
+async function openSession(runtime, sessionId) {
+  const frontend = connect({ socketPath: runtime.socketPath, token: runtime.token, attachId: `attach-${sessionId}`, maxBytes: 64 * 1024 });
   await frontend.ready;
-  frontend.send({ version: 1, clientId: "client", requestId: "attach", op: "attach", payload: { sessionId, role: "composer" } });
-  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "attached", role: "composer" } });
+  frontend.send({ version: 1, clientId: "client", requestId: "attach", op: "attach", payload: { sessionId } });
+  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
   return frontend;
 }
 
@@ -1428,7 +1271,7 @@ it.each(/** @type {Array<[string, import("../shared/contracts.mjs").TaskState, s
   ["waiting on a person", "WAITING", "blocking_request"],
 ]))("refuses an explicit respawn while the session is %s and never signals it", async (_name, taskState, activityKind) => {
   const live = await replaceableWorker({ sessionId: "guarded", cliVersion: "1.9.0", taskState, activityKind });
-  const frontend = await composer(live.runtime, "guarded");
+  const frontend = await openSession(live.runtime, "guarded");
 
   frontend.send({ version: 1, clientId: "client", requestId: "respawn-busy", op: "respawn", payload: { sessionId: "guarded", revision: 0 } });
 
@@ -1444,7 +1287,7 @@ it.each(/** @type {Array<[string, import("../shared/contracts.mjs").TaskState, s
 // operator's running session, and a worker with no recorded release is unknown rather than newer.
 it("replaces an idle worker of unknown release on request and refuses to downgrade a newer one", async () => {
   const newer = await replaceableWorker({ sessionId: "guarded", cliVersion: "2.1.0", taskState: "READY" });
-  const newerFrontend = await composer(newer.runtime, "guarded");
+  const newerFrontend = await openSession(newer.runtime, "guarded");
   newerFrontend.send({ version: 1, clientId: "client", requestId: "respawn-newer", op: "respawn", payload: { sessionId: "guarded", revision: 0 } });
   expect(await newerFrontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "FAILED", error: { code: "WORKER_NEWER_THAN_DAEMON" } } } });
   expect(newer.signals).toEqual([]);
@@ -1459,7 +1302,7 @@ it("replaces an idle worker of unknown release on request and refuses to downgra
   const unknown = await replaceableWorker({ sessionId: "nameless", taskState: "READY" });
   // Idle and replaceable, but with no promise on disk and no settled turn, nothing replaces it alone.
   expect(unknown.launches).toEqual([]);
-  const frontend = await composer(unknown.runtime, "nameless");
+  const frontend = await openSession(unknown.runtime, "nameless");
   frontend.send({ version: 1, clientId: "client", requestId: "respawn-unknown", op: "respawn", payload: { sessionId: "nameless", revision: 0 } });
 
   expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { operation: "respawn", stage: "COMPLETED" } } });
@@ -1590,8 +1433,8 @@ it("relaunches a stopped session whose recorded worker processes are both gone",
   const client = connect({ socketPath: runtime.socketPath, token: runtime.token });
   await client.ready;
 
-  client.send({ version: 1, clientId: "client", requestId: "reopen", op: "attach", payload: { sessionId: "stopped", role: "composer", activate: true } });
-  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "attached", sessionId: "stopped", role: "composer" } });
+  client.send({ version: 1, clientId: "client", requestId: "reopen", op: "attach", payload: { sessionId: "stopped", activate: true } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "attached", sessionId: "stopped" } });
   expect(launch).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "stopped" }));
   client.close();
 });
@@ -1665,7 +1508,7 @@ it("refuses an activating attach while the recorded Pi child of a gone superviso
   const client = connect({ socketPath: runtime.socketPath, token: runtime.token });
   await client.ready;
 
-  client.send({ version: 1, clientId: "client", requestId: "reopen-orphan", op: "attach", payload: { sessionId: "orphan-writer", role: "composer", activate: true } });
+  client.send({ version: 1, clientId: "client", requestId: "reopen-orphan", op: "attach", payload: { sessionId: "orphan-writer", activate: true } });
   expect(await client.next()).toMatchObject({ ok: false, error: { code: "WORKER_STILL_LIVE", retryable: false } });
   expect(launch).not.toHaveBeenCalled();
   expect(JSON.parse(await readFile(join(stateRoot, "daemon", "workers.json"), "utf8")).workers).toHaveLength(1);
@@ -1739,7 +1582,7 @@ it("relaunches a session whose launched worker died during this daemon's lifetim
   await registry.update("relaunch", live.revision, { ownership: undefined, taskState: "STOPPED", processState: "EXITED", updatedAt: createdAt });
   await vi.waitFor(() => expect(router.route("relaunch")).toBeUndefined());
 
-  client.send({ version: 1, clientId: "viewer", requestId: "reopen-relaunch", op: "attach", payload: { sessionId: "relaunch", role: "composer", activate: true } });
+  client.send({ version: 1, clientId: "viewer", requestId: "reopen-relaunch", op: "attach", payload: { sessionId: "relaunch", activate: true } });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "attached", sessionId: "relaunch" } });
   expect(launch).toHaveBeenCalledTimes(2);
   client.close();
@@ -1869,6 +1712,137 @@ it("refuses a frontend that did not declare this release's client protocol, once
   current.send({ version: 1, clientId: "current-dashboard", requestId: "read", op: "get_state", payload: {} });
   expect(await current.next()).toMatchObject({ ok: true, result: { kind: "state" } });
   current.close();
+});
+
+/**
+ * One live session owned by one connected fake worker, which is what a concurrent-writer test and a
+ * restart test both need. Returns the fixture the caller starts its own daemon runtimes against.
+ * @param {string} stateRoot @param {string} sessionId
+ */
+async function liveSessionRoot(stateRoot, sessionId) {
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const now = "2026-08-25T12:00:00.000Z";
+  const identity = { pid: 811, startIdentity: "worker-shared", processGroupId: 811 };
+  const piChildIdentity = { pid: 812, startIdentity: "pi-shared", processGroupId: 811 };
+  /** @param {number} pid */
+  const inspect = async (pid) => {
+    if (pid === process.pid) return { pid, startIdentity: "daemon", processGroupId: process.pid };
+    if (pid === 811) return identity;
+    if (pid === 812) return piChildIdentity;
+    throw Object.assign(new Error("gone"), { code: "ESRCH" });
+  };
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId, sessionFile: `/sessions/${sessionId}.jsonl`, canonicalSessionFile: `/sessions/${sessionId}.jsonl`, cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-shared", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-shared", createdAt: now, updatedAt: now });
+  const worker = { sessionId, runId: "run-shared", leaseId: "lease-shared", generation: 1, identity, piChildIdentity, token: "shared-worker-token" };
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId, runId: worker.runId, leaseId: worker.leaseId, generation: 1, identity, piChildIdentity, token: worker.token }] })}\n`, { mode: 0o600 });
+  return { inspect, registry, worker };
+}
+
+// Operator-visible failure: one dashboard held the session's composer claim and every other one was
+// refused, so the second terminal could read the session and not answer it.
+it("orders and journals concurrent commands from three dashboard processes on one session", async () => {
+  const stateRoot = await root();
+  const { inspect, worker } = await liveSessionRoot(stateRoot, "shared");
+  const runtime = await createDaemonRuntime({ root: stateRoot, inspect, reconnectTimeoutMs: 1_000 });
+  runtimes.push(runtime);
+  const loop = startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, worker);
+  await runtime.ready;
+
+  // Three dashboard processes of one installation: three process-scoped attachIds, one stable clientId.
+  const attachIds = ["attach-one", "attach-two", "attach-three"];
+  const dashboards = attachIds.map((attachId) => connect({ socketPath: runtime.socketPath, token: runtime.token, attachId, maxBytes: 8192 }));
+  for (const dashboard of dashboards) expect(await dashboard.ready).toMatchObject({ version: 1, kind: "authenticated" });
+
+  const requests = dashboards.map((_dashboard, index) => ({ version: 1, clientId: "installation-1", requestId: `prompt-${index}`, op: "prompt", payload: { sessionId: "shared", text: `from dashboard ${index}` } }));
+  // No attachment, claim, or grant precedes a mutation: every authenticated client may write.
+  requests.forEach((request, index) => dashboards[index].send(request));
+  const responses = await Promise.all(dashboards.map((dashboard) => dashboard.next()));
+  for (const response of responses) expect(response).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED", clientId: "installation-1" } } });
+
+  const journal = (await readFile(join(stateRoot, "queue", "commands.jsonl"), "utf8")).split("\n").filter((line) => line.length > 0).map((line) => JSON.parse(line));
+  expect(new Set(journal.map((record) => record.status.clientId))).toEqual(new Set(["installation-1"]));
+  const journalOrder = [...new Set(journal.map((record) => record.status.requestId))];
+  expect(journalOrder.sort()).toEqual(["prompt-0", "prompt-1", "prompt-2"]);
+  // The per-session coordinator delivered them in exactly the order the journal accepted them. The
+  // worker also answers this daemon's own adoption probe, which is not a journaled client command.
+  const accepted = journal.filter((record) => record.status.stage === "ACCEPTED").map((record) => record.status.requestId);
+  expect(loop.commands.map((command) => command.requestId).filter((requestId) => requestId.startsWith("prompt-"))).toEqual(accepted);
+  for (const dashboard of dashboards) dashboard.close();
+});
+
+// Operator-visible failure: a restart that rewrote worker identity would orphan the operator's live
+// Pi child, which is the one thing a dashboard change may never do.
+it("leaves worker identity exactly as it was when the daemon restarts mid-session", async () => {
+  const stateRoot = await root();
+  const { inspect, registry, worker } = await liveSessionRoot(stateRoot, "resident");
+  const firstRuntime = await createDaemonRuntime({ root: stateRoot, inspect, reconnectTimeoutMs: 1_000 });
+  const loop = startPersistentFakeWorker({ socketPath: firstRuntime.socketPath, tokenPath: firstRuntime.tokenPath }, worker);
+  await firstRuntime.ready;
+  const before = connect({ socketPath: firstRuntime.socketPath, token: firstRuntime.token, attachId: "attach-before", maxBytes: 8192 });
+  expect(await before.ready).toMatchObject({ version: 1, kind: "authenticated" });
+  before.send({ version: 1, clientId: "installation-1", requestId: "before-restart", op: "prompt", payload: { sessionId: "resident", text: "before" } });
+  expect(await before.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  before.close();
+
+  // routeGeneration is the one field adoption is allowed to move; everything identifying the process is not.
+  /** @param {string} text */
+  const workerIdentity = (text) => JSON.parse(text).workers.map((/** @type {any} */ { routeGeneration: _routeGeneration, ...rest }) => rest);
+  const identityBefore = workerIdentity(await readFile(join(stateRoot, "daemon", "workers.json"), "utf8"));
+  const ownershipBefore = (await registry.get("resident"))?.ownership;
+  await firstRuntime.close();
+  expect(loop.alive).toBe(true);
+
+  const secondRuntime = await createDaemonRuntime({ root: stateRoot, inspect, reconnectTimeoutMs: 1_000 });
+  runtimes.push(secondRuntime);
+  await secondRuntime.ready;
+  await vi.waitFor(() => expect(secondRuntime.status().connectedWorkers).toEqual(["resident"]));
+  expect(workerIdentity(await readFile(join(stateRoot, "daemon", "workers.json"), "utf8"))).toEqual(identityBefore);
+  expect((await registry.get("resident"))?.ownership).toEqual(ownershipBefore);
+  expect(loop.alive).toBe(true);
+
+  const after = connect({ socketPath: secondRuntime.socketPath, token: secondRuntime.token, attachId: "attach-after", maxBytes: 8192 });
+  await after.ready;
+  after.send({ version: 1, clientId: "installation-1", requestId: "after-restart", op: "prompt", payload: { sessionId: "resident", text: "after" } });
+  expect(await after.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  after.close();
+  await secondRuntime.close();
+  runtimes.splice(runtimes.indexOf(secondRuntime), 1);
+  expect(loop.alive).toBe(true);
+});
+
+// The operator's index/viewer/*.snapshot.json files were written by the release that still had
+// access roles. Recovery must read one and publish it forward without its retired `role`.
+it("recovers a viewer snapshot written with a retired role and republishes it without one", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  await mkdir(join(stateRoot, "index", "viewer"), { mode: 0o700 });
+  const now = "2026-08-25T12:00:00.000Z";
+  const sessionFile = join(stateRoot, "legacy.jsonl");
+  await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "legacy", timestamp: now, cwd: stateRoot })}\n`, { mode: 0o600 });
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "legacy", sessionFile, canonicalSessionFile: sessionFile, cwd: stateRoot, taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "assistant_final", summary: "done", updatedAt: now }, createdAt: now, updatedAt: now });
+  const daemonEpoch = randomUUID();
+  await writeFile(join(stateRoot, "daemon", "epoch"), daemonEpoch, { mode: 0o600 });
+  const stem = createHash("sha256").update("legacy").digest("hex");
+  const snapshotPath = join(stateRoot, "index", "viewer", `${stem}.snapshot.json`);
+  await writeFile(snapshotPath, `${JSON.stringify({
+    version: 1, sessionId: "legacy", registryRevision: 0, cursor: { daemonEpoch, sessionId: "legacy", sequence: "0" }, runtime: null,
+    role: "composer", taskState: "READY", processState: "EXITED", outcome: "NONE",
+    activity: { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "seed", startedAt: now },
+    model: null, thinkingLevel: null, items: [], tools: [], pendingUi: [], errors: [],
+  })}\n`, { mode: 0o600 });
+
+  const runtime = await createDaemonRuntime({ root: stateRoot });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, attachId: "attach-legacy", maxBytes: 16384 });
+  await client.ready;
+  client.send({ version: 1, clientId: "installation-1", requestId: "snapshot", op: "get_viewer_snapshot", payload: { sessionId: "legacy" } });
+  const response = await client.next();
+  expect(response).toMatchObject({ ok: true, result: { kind: "viewer_snapshot" } });
+  expect(response.result.snapshot).not.toHaveProperty("role");
+  expect(JSON.parse(await readFile(snapshotPath, "utf8"))).not.toHaveProperty("role");
+  client.close();
 });
 
 it("authenticates a control stop that carries no client protocol", async () => {

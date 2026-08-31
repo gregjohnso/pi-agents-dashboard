@@ -52,37 +52,27 @@ function record(root, sessionId, overrides = {}) {
   };
 }
 
-let automaticAttachment = 0;
+let connections = 0;
 
-function connect(runtime, role = "frontend") {
+function connect(runtime, role = "frontend", attachId = `attach-${connections++}`) {
   const encoder = createJsonlEncoder({ maxBytes: 1024 * 1024 });
   const decoder = createJsonlDecoder({ maxBytes: 1024 * 1024 });
   const socket = net.createConnection(runtime.socketPath);
   const queue = [];
   const waiters = [];
-  const attachmentRoles = new Map();
   socket.on("data", (chunk) => {
     for (const frame of decoder.push(chunk)) {
-      if (typeof frame?.requestId === "string" && frame.requestId.startsWith("automatic-composer-")) continue;
       const waiter = waiters.shift();
       if (waiter === undefined) queue.push(frame);
       else waiter(frame);
     }
   });
-  socket.once("connect", () => socket.write(encoder.encode({ version: 1, token: runtime.token, role, ...(role === "frontend" ? { clientProtocol: CLIENT_PROTOCOL } : {}) })));
+  socket.once("connect", () => socket.write(encoder.encode({ version: 1, token: runtime.token, role, ...(role === "frontend" ? { clientProtocol: CLIENT_PROTOCOL, attachId } : {}) })));
   const next = () => queue.length > 0 ? Promise.resolve(queue.shift()) : new Promise((resolve) => waiters.push(resolve));
   return {
     socket,
     next,
-    send(value) {
-      if (value.op === "attach") attachmentRoles.set(value.payload.sessionId, value.payload.role);
-      else if (value.op === "detach") attachmentRoles.delete(value.payload.sessionId);
-      else if (["prompt", "follow_up", "steer", "interrupt", "ui_response", "stop", "delete", "respawn"].includes(value.op) && (!["stop", "delete", "respawn"].includes(value.op) || Number.isSafeInteger(value.payload.revision)) && !attachmentRoles.has(value.payload.sessionId)) {
-        attachmentRoles.set(value.payload.sessionId, "composer");
-        socket.write(encoder.encode({ version: 1, clientId: value.clientId, requestId: `automatic-composer-${automaticAttachment++}`, op: "attach", payload: { sessionId: value.payload.sessionId, role: "composer" } }));
-      }
-      socket.write(encoder.encode(value));
-    },
+    send(value) { socket.write(encoder.encode(value)); },
     close() { socket.destroy(); },
   };
 }
@@ -273,7 +263,7 @@ it("gains no delete path from a supplied trash callback", async () => {
   frontend.close();
 });
 
-it("refuses a revision-free, live, or observer Delete and mutates neither session path", async () => {
+it("refuses a revision-free Delete, a live one, and one another dashboard has open, mutating neither session path", async () => {
   const root = await fixtureRoot();
   const registry = new RegistryStore(join(root, "sessions"));
   const live = record(root, "live-delete", { processState: "LIVE" });
@@ -293,10 +283,15 @@ it("refuses a revision-free, live, or observer Delete and mutates neither sessio
   expect(await frontend.next()).toMatchObject({ ok: false, error: { code: "REVISION_REQUIRED" } });
   frontend.send(request("client", "live-delete-request", "delete", { sessionId: live.sessionId, revision: 0 }));
   expect(await frontend.next()).toMatchObject({ result: { status: { stage: "FAILED", error: { code: "SESSION_LIVE" } } } });
-  frontend.send(request("client", "attach-observer", "attach", { sessionId: observed.sessionId, role: "observer" }));
-  expect(await frontend.next()).toMatchObject({ result: { role: "observer" } });
-  frontend.send(request("client", "observer-delete", "delete", { sessionId: observed.sessionId, revision: 0 }));
-  expect(await frontend.next()).toMatchObject({ ok: false, error: { code: "OBSERVER_READ_ONLY" } });
+  // Another dashboard has this row on screen. Every client may write, but Delete still refuses to
+  // remove a session out from under one, because the row would vanish while it was being read.
+  const other = connect(runtime, "frontend", "another-dashboard-process");
+  await other.next();
+  other.send(request("client", "attach-observed", "attach", { sessionId: observed.sessionId }));
+  expect(await other.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
+  frontend.send(request("client", "attached-delete", "delete", { sessionId: observed.sessionId, revision: 0 }));
+  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "FAILED", error: { code: "SESSION_ATTACHED" } } } });
+  other.close();
 
   expect(mutationAttempts()).toEqual([]);
   await expect(readFile(live.canonicalSessionFile, "utf8")).resolves.toBe("live\n");
@@ -304,6 +299,31 @@ it("refuses a revision-free, live, or observer Delete and mutates neither sessio
   expect(await registry.get(live.sessionId)).toBeDefined();
   expect(await registry.get(observed.sessionId)).toBeDefined();
   frontend.close();
+});
+
+// One dashboard's destructive command travels on its own connection while its list connection may
+// still hold the session, so a Delete that refused every other socket refused the dashboard itself.
+it("forgets a session the deleting dashboard still holds open on its own other connection", async () => {
+  const root = await fixtureRoot();
+  const registry = new RegistryStore(join(root, "sessions"));
+  const session = record(root, "same-process-delete");
+  await writeFile(session.canonicalSessionFile, "session\n");
+  await registry.create(session);
+  const runtime = await createDaemonRuntime({ root });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const list = connect(runtime, "frontend", "one-dashboard-process");
+  await list.next();
+  list.send(request("client", "attach-list", "attach", { sessionId: session.sessionId }));
+  expect(await list.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
+
+  const transaction = connect(runtime, "frontend", "one-dashboard-process");
+  await transaction.next();
+  transaction.send(request("client", "same-process-delete", "delete", { sessionId: session.sessionId, revision: 0 }));
+  expect(await transaction.next()).toMatchObject({ result: { status: { stage: "COMPLETED" } } });
+  expect(await registry.get(session.sessionId)).toBeUndefined();
+  list.close();
+  transaction.close();
 });
 
 it("forgets an inactive row and preserves the canonical Pi file and the worktree", async () => {
@@ -450,7 +470,7 @@ it("refuses Delete while a relaunch of the same session is in flight", async () 
   await deleting.next();
   forbidMutationBeneath(session.canonicalSessionFile);
 
-  activating.send(request("activating-client", "activate-attach", "attach", { sessionId: session.sessionId, role: "composer", activate: true }));
+  activating.send(request("activating-client", "activate-attach", "attach", { sessionId: session.sessionId, activate: true }));
   await started;
   deleting.send(request("deleting-client", "relaunching-delete-request", "delete", { sessionId: session.sessionId, revision: 0 }));
   expect(await deleting.next()).toMatchObject({ result: { status: { stage: "FAILED", error: { code: "OWNERSHIP_CONFLICT" } } } });

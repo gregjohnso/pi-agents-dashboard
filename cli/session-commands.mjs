@@ -216,7 +216,7 @@ function validateExpectedResult(op, payload, clientId, requestId, result) {
   }
 }
 
-/** Create one persistent authenticated request session for composer-scoped operations.
+/** Create one persistent authenticated request session, held open across a destructive command.
  * @param {{ root?: string, clientId?: string, maxBytes?: number, timeoutMs?: number }} [options]
  */
 export async function createPersistentDaemonRequester({ root = resolveRuntimeRoot(), clientId, maxBytes = 1024 * 1024, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {}) {
@@ -757,29 +757,21 @@ export async function runSessionCommand(argv, options = {}) {
       : existing;
     if (pending.entry.clientId !== clientId) throw Object.assign(new Error("Persistent CLI identity changed while a destructive request remains pending"), { code: "CLI_CLIENT_IDENTITY_CHANGED", pendingClientId: pending.entry.clientId, currentClientId: clientId, requestId: pending.entry.requestId });
     const destructiveTimeoutMs = await destructiveRequestTimeoutMs(root, options.stopPolicy, options.timeoutMs);
-    const persistent = options.request === undefined && options.composerRequest === undefined
+    const persistent = options.request === undefined && options.heldConnectionRequest === undefined
       ? await createPersistentDaemonRequester({ root, clientId: pending.entry.clientId, timeoutMs: destructiveTimeoutMs })
       : undefined;
-    const request = options.composerRequest ?? persistent?.request ?? options.request;
-    const claimsComposer = options.composerRequest !== undefined || persistent !== undefined;
-    let attached = false;
-    let canDetach = false;
+    const request = options.heldConnectionRequest ?? persistent?.request ?? options.request;
+    // One connection is held open across this command, so its loss is this command's own ambiguity.
+    const heldConnection = options.heldConnectionRequest !== undefined || persistent !== undefined;
     try {
-      if (claimsComposer) {
-        const attachment = await request("attach", { sessionId: parsed.sessionId, role: "composer" });
-        if (attachment?.kind !== "attached" || attachment.role !== "composer") throw Object.assign(new Error("Daemon refused the composer role"), { code: "ATTACHMENT_REQUIRED" });
-        attached = true;
-      }
       const result = await request(parsed.operation, { sessionId: parsed.sessionId, revision: parsed.revision }, pending.entry.requestId);
-      canDetach = true;
       if (result?.kind === "command" && ["COMPLETED", "FAILED"].includes(result.status?.stage)) await clearPending(root, pending.path, pending, options.pendingFailpoint);
       return classifyCommandResult(result);
     } catch (error) {
       if (error?.code === "DELIVERY_UNKNOWN") return { code: 1, error: { code: "DELIVERY_UNKNOWN", message: error.message, clientId: pending.entry.clientId, requestId: pending.entry.requestId } };
-      if (attached && error?.code === "CONNECTION_CLOSED") return { code: 1, error: { code: "DELIVERY_UNKNOWN", message: "Composer connection was lost before delivery could be confirmed", clientId: pending.entry.clientId, requestId: pending.entry.requestId } };
+      if (heldConnection && error?.code === "CONNECTION_CLOSED") return { code: 1, error: { code: "DELIVERY_UNKNOWN", message: "The daemon connection was lost before delivery could be confirmed", clientId: pending.entry.clientId, requestId: pending.entry.requestId } };
       throw error;
     } finally {
-      if (attached && canDetach) await request("detach", { sessionId: parsed.sessionId }).catch(() => {});
       await persistent?.close();
     }
   }

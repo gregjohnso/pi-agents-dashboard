@@ -43,7 +43,7 @@ function mountedDashboard() {
     async launch() { return { kind: "launched", sessionId: "busy" }; },
   };
   const controller = new DashboardController({
-    backend, persistence: { async load() {}, async save() {} }, openViewer: async () => {},
+    backend, openViewer: async () => {},
     clientId: "host-client", launchDefaults: { cwd: "/repo", model: { provider: "anthropic", id: "claude" }, name: "task" },
     requestRender: () => tui.requestRender(),
   });

@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { TranscriptModel, applyViewerEvent, createTranscriptState } from "./transcript.mjs";
 
 const activity = { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "snapshot", startedAt: "2026-08-25T00:00:00Z" };
-const snapshot = { items: [{ kind: "user_message", itemId: "u", content: [{ type: "text", text: "hello" }] }], tools: [], activity, pendingUi: [], errors: [], role: "composer", taskState: "READY", processState: "LIVE", outcome: "NONE", model: null, thinkingLevel: null };
+const snapshot = { items: [{ kind: "user_message", itemId: "u", content: [{ type: "text", text: "hello" }] }], tools: [], activity, pendingUi: [], errors: [], taskState: "READY", processState: "LIVE", outcome: "NONE", model: null, thinkingLevel: null };
 const event = (payload, sequence = "1") => ({ eventId: `e-${sequence}`, cursor: { daemonEpoch: "epoch", sessionId: "s", sequence }, timestamp: "2026-08-25T00:00:01Z", payload });
 
 describe("normalized transcript state", () => {

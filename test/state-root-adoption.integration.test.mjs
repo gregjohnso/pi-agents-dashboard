@@ -86,7 +86,7 @@ it("lists every session from the previous state root after startup under the new
 
   const started = await runDaemonCommand("start", { root });
   startedRoots.push(root);
-  expect(started).toMatchObject({ code: 0, result: { kind: "daemon_started" } });
+  expect(started, JSON.stringify(started)).toMatchObject({ code: 0, result: { kind: "daemon_started" } });
 
   expect(await listSessionsThroughDaemon(root)).toEqual(["alpha", "beta", "delta", "gamma"]);
 });

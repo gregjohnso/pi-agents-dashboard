@@ -235,11 +235,11 @@ it("keeps two mixed-version fake Pi children alive across frontend close and dae
     ["two", join(root, "canonical", "two.jsonl"), "0.84.2", "run-two"],
   ]);
 
-  const second = createDaemonClient({ socketPath: secondRuntime.socketPath, token: secondRuntime.token, clientId: "frontend-after", reconnect: false, maxBytes: 256 * 1024 });
+  const second = createDaemonClient({ socketPath: secondRuntime.socketPath, token: secondRuntime.token, clientId: "frontend-after", attachId: "attach-after-restart", reconnect: false, maxBytes: 256 * 1024 });
   await second.connect();
   for (const sessionId of ["one", "two"]) {
-    const attachment = await second.request(request("frontend-after", `attach-${sessionId}`, "attach", { sessionId, role: "composer" }));
-    expect(attachment).toMatchObject({ ok: true, result: { role: "composer" } });
+    const attachment = await second.request(request("frontend-after", `attach-${sessionId}`, "attach", { sessionId }));
+    expect(attachment).toMatchObject({ ok: true, result: { kind: "attached", sessionId } });
     const response = await second.request(request("frontend-after", `prompt-${sessionId}`, "prompt", { sessionId, text: `later ${sessionId}` }));
     expect(response).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
   }

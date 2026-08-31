@@ -587,7 +587,6 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       registryRevision: runtimeState.registryRevision,
       cursor,
       runtime: runtimeState.runtime ?? null,
-      role: runtimeState.role ?? "observer",
       taskState: runtimeState.taskState,
       processState: runtimeState.processState,
       outcome: runtimeState.outcome,

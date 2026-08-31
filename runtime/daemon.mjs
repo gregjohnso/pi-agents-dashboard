@@ -7,7 +7,6 @@ import { fileURLToPath } from "node:url";
 
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
-import { createAttachmentResultStore } from "./attachment-result-store.mjs";
 import { atomicWriteJson } from "./atomic-file.mjs";
 import { claimDaemonLifecycle, releaseDaemonLifecycle, updateDaemonLifecycleState } from "./daemon-lifecycle.mjs";
 import { createJsonlDecoder, createJsonlEncoder, JsonlFramingError } from "./jsonl.mjs";
@@ -31,7 +30,6 @@ import { CLIENT_PROTOCOL, parseClientRequest, piConfirmedModel } from "../shared
 initializeRuntimePermissions();
 
 const DEFAULT_MAX_BYTES = 1024 * 1024;
-const MAX_ATTACHMENT_REQUESTS = 4096;
 const WORKER_DELIVERED_COMMANDS = ["prompt", "steer", "follow_up", "interrupt", "ui_response", "session_command"];
 const DURABLE_COMMANDS = new Set([...WORKER_DELIVERED_COMMANDS, "stop", "delete", "respawn"]);
 /** Stop dispositions that prove the signalled process group is gone. */
@@ -284,6 +282,8 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
     let role = "frontend";
     /** The client protocol a frontend connection declared, if it declared one. @type {number | undefined} */
     let clientProtocol;
+    /** The dashboard process this connection belongs to, which lives and dies with that process. @type {string | undefined} */
+    let attachId;
     /** @type {string | undefined} */
     let frontendClientId;
     /** @type {any} */
@@ -333,16 +333,13 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
       });
     });
     socket.on("close", () => {
-      context.markAttachmentClosing(socket);
       sockets.delete(socket);
       listSubscribers.delete(socket);
       broadcastWriters.delete(socket);
       const activeViewerSubscriptions = viewerSubscriptions.get(socket) ?? [];
       viewerSubscriptions.delete(socket);
       for (const subscription of activeViewerSubscriptions) void subscription.return?.();
-      const attachmentRelease = context.releaseAttachments(socket, frontendClientId);
-      chains.add(attachmentRelease);
-      void attachmentRelease.finally(() => chains.delete(attachmentRelease)).catch(() => {});
+      context.releaseAttachments(socket);
       resolveClosed(undefined);
       for (const [id, pending] of context.workerPending) {
         if (pending.connection === workerConnection && context.workerPending.get(id) === pending) {
@@ -368,14 +365,15 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
         const operation = chain.then(async () => {
           if (!context.admissionOpen) throw Object.assign(new Error("Daemon is shutting down"), { code: "SHUTTING_DOWN", retryable: true });
           if (!authenticated) {
-            const allowed = ["version", "token", "role", "action", "clientProtocol"];
-            if (typeof frame !== "object" || frame === null || Array.isArray(frame) || Object.keys(frame).some((key) => !allowed.includes(key)) || frame.version !== 1 || !sameToken(frame.token, token) || (frame.role !== undefined && !["frontend", "worker", "control"].includes(frame.role)) || (frame.action !== undefined && (frame.role !== "control" || frame.action !== "stop")) || (frame.clientProtocol !== undefined && !Number.isSafeInteger(frame.clientProtocol))) {
+            const allowed = ["version", "token", "role", "action", "clientProtocol", "attachId"];
+            if (typeof frame !== "object" || frame === null || Array.isArray(frame) || Object.keys(frame).some((key) => !allowed.includes(key)) || frame.version !== 1 || !sameToken(frame.token, token) || (frame.role !== undefined && !["frontend", "worker", "control"].includes(frame.role)) || (frame.action !== undefined && (frame.role !== "control" || frame.action !== "stop")) || (frame.clientProtocol !== undefined && !Number.isSafeInteger(frame.clientProtocol)) || (frame.attachId !== undefined && (typeof frame.attachId !== "string" || frame.attachId.length === 0 || frame.attachId.trim() !== frame.attachId))) {
               await send({ version: 1, ok: false, error: dashboardError(frame?.version === 1 ? "AUTHENTICATION_FAILED" : "UNSUPPORTED_VERSION", "Invalid daemon authentication") });
               socket.end();
               return;
             }
             role = frame.role ?? "frontend";
             clientProtocol = frame.clientProtocol;
+            attachId = frame.attachId;
             authenticated = true;
             await send({ version: 1, kind: "authenticated", ...context.publicStatus() });
             if (role === "control") {
@@ -445,7 +443,7 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
           /** @type {AsyncIterableIterator<any> | undefined} */
           let viewerSubscription;
           try {
-            const result = await context.handleRequest(request, socket, frontendClientId);
+            const result = await context.handleRequest(request, { socket, attachId }, frontendClientId);
             viewerSubscription = result?._viewerSubscription;
             const publicResult = viewerSubscription === undefined ? result : { kind: result.kind, cursor: result.cursor };
             await context.writeResponse({ request, value: response(request.requestId, publicResult), write: send, close });
@@ -466,7 +464,6 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
       }
     });
     socket.on("end", () => {
-      context.markAttachmentClosing(socket);
       /** @type {{ code?: string, message?: string } | undefined} */
       let framingError;
       try {
@@ -539,7 +536,6 @@ export async function createDaemonRuntime({
   randomId = randomUUID,
   responseWriter = async (/** @type {any} */ { value, write }) => write(value),
   closeFailpoint = async () => {},
-  attachmentFailpoint = () => {},
   destructiveFailpoint = async () => {},
   recordDiagnostic = (/** @type {any} */ entry) => { process.stderr.write(`${JSON.stringify(entry)}\n`); },
   stopPolicy = DEFAULT_STOP_POLICY,
@@ -551,7 +547,7 @@ export async function createDaemonRuntime({
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 128) throw new TypeError("maxBytes must be at least 128");
   if (!Number.isSafeInteger(workerRequestTimeoutMs) || workerRequestTimeoutMs <= 0) throw new TypeError("workerRequestTimeoutMs must be a positive integer");
   if (typeof randomId !== "function") throw new TypeError("randomId must be a function");
-  if (typeof responseWriter !== "function" || typeof closeFailpoint !== "function" || typeof attachmentFailpoint !== "function" || typeof destructiveFailpoint !== "function" || typeof recordDiagnostic !== "function" || typeof signalProcessGroupImpl !== "function" || typeof sleepImpl !== "function") throw new TypeError("Daemon runtime seams must be functions");
+  if (typeof responseWriter !== "function" || typeof closeFailpoint !== "function" || typeof destructiveFailpoint !== "function" || typeof recordDiagnostic !== "function" || typeof signalProcessGroupImpl !== "function" || typeof sleepImpl !== "function") throw new TypeError("Daemon runtime seams must be functions");
   if (!Number.isSafeInteger(stopPolicy?.gracefulMs) || stopPolicy.gracefulMs <= 0 || !Number.isSafeInteger(stopPolicy?.terminateMs) || stopPolicy.terminateMs <= 0) throw new TypeError("stopPolicy must contain approved positive integer waits");
   await ensureLayout(root);
   const daemonDirectory = join(root, "daemon");
@@ -590,14 +586,15 @@ export async function createDaemonRuntime({
     const sessionStarts = new Map();
     /** Sessions whose automatic upgrade respawn is in flight, which bounds the burst after an upgrade. @type {Set<string>} */
     const upgradeRespawns = new Set();
-    /** @type {Map<string, Map<net.Socket, { clientId: string, role: "composer" | "observer" }>>} */
-    const attachmentClaims = new Map();
-    /** @type {Map<string, { serialized: string, promise: Promise<any> }>} */
-    const attachmentRequests = new Map();
+    /**
+     * Which dashboard connections currently have each session open. An attachment grants nothing:
+     * every authenticated client may write. It records that a session is on someone's screen, which
+     * is what Delete refuses to remove out from under, and it dies with its connection.
+     * @type {Map<string, Map<net.Socket, { attachId: string | undefined }>>}
+     */
+    const attachedConnections = new Map();
     /** @type {WeakMap<net.Socket, Set<string>>} */
-    const attachmentSessions = new WeakMap();
-    /** @type {WeakSet<net.Socket>} */
-    const closingAttachmentSockets = new WeakSet();
+    const attachedSessions = new WeakMap();
     /** @type {any} */
     const context = {
       state: "STARTING",
@@ -607,7 +604,6 @@ export async function createDaemonRuntime({
       viewerRecovery: undefined,
       listSubscribers: new Set(),
       launchResults: undefined,
-      attachmentResults: undefined,
       router,
       workerPending: new Map(),
       hostReport: undefined,
@@ -615,8 +611,6 @@ export async function createDaemonRuntime({
       writeResponse: responseWriter,
       requestStop: () => resolveStopRequested(undefined),
       publicStatus() { return { state: context.state, recovering: ["STARTING", "RECONCILING"].includes(context.state), error: context.stateError, daemonEpoch, pid: identity.pid }; },
-      /** @param {net.Socket} socket */
-      markAttachmentClosing(socket) { closingAttachmentSockets.add(socket); },
       /** Mint one worker command ID that no earlier command in this daemon has used. */
       nextCommandId() {
         const id = randomId();
@@ -890,125 +884,49 @@ export async function createDaemonRuntime({
         sessionStarts.set(sessionId, start);
         try { await start; } finally { if (sessionStarts.get(sessionId) === start) sessionStarts.delete(sessionId); }
       },
-      /** @param {any} request @param {net.Socket} socket @param {string} authenticatedClientId */
-      async arbitrateAttachment(request, socket, authenticatedClientId) {
+      /**
+       * Record or forget one session on one dashboard connection. It authorizes nothing: the socket
+       * token already authenticated this client, and every authenticated client may write.
+       * @param {any} request @param {{ socket: net.Socket, attachId: string | undefined }} connection @param {string} authenticatedClientId
+       */
+      async attachConnection(request, connection, authenticatedClientId) {
         if (request.clientId !== authenticatedClientId) throw Object.assign(new Error("Attachment client identity changed"), { code: "CLIENT_IDENTITY_CONFLICT" });
         const sessionId = request.payload.sessionId;
-        if (request.op === "attach" && request.payload.role === "composer" && request.payload.activate === true) await context.ensureSessionWorker(sessionId);
-        let touched = attachmentSessions.get(socket);
-        if (touched === undefined) {
-          touched = new Set();
-          attachmentSessions.set(socket, touched);
+        const { socket, attachId } = connection;
+        if (request.op === "detach") {
+          attachedSessions.get(socket)?.delete(sessionId);
+          const attached = attachedConnections.get(sessionId);
+          attached?.delete(socket);
+          if (attached?.size === 0) attachedConnections.delete(sessionId);
+          return { kind: "detached", sessionId };
         }
-        touched.add(sessionId);
-        attachmentFailpoint("registered", request);
-        const cacheKey = JSON.stringify([authenticatedClientId, request.requestId]);
-        const serialized = JSON.stringify({ op: request.op, payload: request.payload });
-        const cached = attachmentRequests.get(cacheKey);
-        if (cached !== undefined) {
-          if (cached.serialized !== serialized) throw Object.assign(new Error("Attachment request ID was reused with changed content"), { code: "IDEMPOTENCY_CONFLICT" });
-          return cached.promise;
+        // Opening a session whose worker has exited starts one, which is the only side effect an
+        // attachment has. It runs before the connection is recorded so a refused start records nothing.
+        if (request.payload.activate === true) await context.ensureSessionWorker(sessionId);
+        let sessions = attachedSessions.get(socket);
+        if (sessions === undefined) {
+          sessions = new Set();
+          attachedSessions.set(socket, sessions);
         }
-        if (attachmentRequests.size >= MAX_ATTACHMENT_REQUESTS) throw Object.assign(new Error("Too many attachment requests are in flight"), { code: "ATTACHMENT_REQUEST_LIMIT", retryable: true });
-        const operation = runSessionLifecycle(registry, sessionId, async () => {
-          let accepted = await context.recovery.journal.accept(request);
-          const phase = context.attachmentResults.phase(request);
-          const stored = context.attachmentResults.get(request);
-          if (stored !== undefined) {
-            if (stored.ok) return stored.result;
-            throw Object.assign(new Error(stored.error.message), stored.error);
-          }
-          if (phase === "PREPARED" && accepted.stage !== "ACCEPTED") accepted = await context.recovery.journal.reconcileAttachment(request, phase);
-          if (accepted.stage !== "ACCEPTED") return { kind: "command", status: accepted };
-          await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
-          /** @type {unknown} */
-          let failpointFailure;
-          /** @param {string} phase */
-          const checkpoint = async (phase) => {
-            try {
-              await attachmentFailpoint(phase, request);
-            } catch (error) {
-              failpointFailure = error;
-              throw error;
-            }
-          };
-          /** @type {{ ok: true, result: any } | { ok: false, error: { code: string, message: string, retryable: boolean } }} */
-          let outcome;
-          try {
-            if (closingAttachmentSockets.has(socket)) throw Object.assign(new Error("Attachment connection is closing"), { code: "SOCKET_CLOSING" });
-            const existingClaims = attachmentClaims.get(sessionId);
-            const claims = existingClaims ?? new Map();
-            const prior = claims.get(socket);
-            if (prior !== undefined && prior.clientId !== authenticatedClientId) throw Object.assign(new Error("Attachment claim identity changed"), { code: "CLIENT_IDENTITY_CONFLICT" });
-            if (request.op === "detach") {
-              outcome = { ok: true, result: { kind: "detached", sessionId } };
-              await context.attachmentResults.prepare(request, outcome);
-              await checkpoint("after_prepared");
-              if (prior !== undefined && prior.clientId === authenticatedClientId) {
-                claims.delete(socket);
-                if (claims.size === 0) attachmentClaims.delete(sessionId);
-                await checkpoint("after_claim_mutation");
-                context.notifyListChanged();
-                await checkpoint("after_broadcast");
-              }
-            } else {
-              const composerClaim = [...claims.values()].find((claim) => claim.role === "composer");
-              const grantedRole = request.payload.role === "composer" && (composerClaim === undefined || (prior?.clientId === authenticatedClientId && prior.role === "composer"))
-                ? "composer"
-                : "observer";
-              outcome = { ok: true, result: { kind: "attached", sessionId, role: grantedRole } };
-              await context.attachmentResults.prepare(request, outcome);
-              await checkpoint("after_prepared");
-              if (prior === undefined || prior.clientId !== authenticatedClientId || prior.role !== grantedRole) {
-                if (existingClaims === undefined) attachmentClaims.set(sessionId, claims);
-                claims.set(socket, { clientId: authenticatedClientId, role: grantedRole });
-                await checkpoint("after_claim_mutation");
-                context.notifyListChanged();
-                await checkpoint("after_broadcast");
-              }
-            }
-          } catch (error) {
-            if (error === failpointFailure) throw error;
-            const attachmentError = /** @type {any} */ (error);
-            outcome = { ok: false, error: dashboardError(attachmentError?.code ?? "REQUEST_FAILED", error instanceof Error ? error.message : "Request failed", attachmentError?.retryable === true) };
-          }
-          await checkpoint("before_result_completion");
-          let durable;
-          try {
-            durable = await context.attachmentResults.put(request, outcome);
-          } catch (error) {
-            const current = await context.recovery.journal.get(request);
-            if (current?.stage === "DELIVERY_ATTEMPTED") await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
-            throw error;
-          }
-          await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-          await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
-          await checkpoint("after_result_completion");
-          if (durable.ok) return durable.result;
-          throw Object.assign(new Error(durable.error.message), durable.error);
-        }, request.op);
-        const reservation = { serialized, promise: operation };
-        attachmentRequests.set(cacheKey, reservation);
-        void operation.finally(() => {
-          if (attachmentRequests.get(cacheKey) === reservation) attachmentRequests.delete(cacheKey);
-        }).catch(() => {});
-        return operation;
+        sessions.add(sessionId);
+        let attached = attachedConnections.get(sessionId);
+        if (attached === undefined) {
+          attached = new Map();
+          attachedConnections.set(sessionId, attached);
+        }
+        attached.set(socket, { attachId });
+        return { kind: "attached", sessionId };
       },
-      /** @param {net.Socket} socket @param {string | undefined} authenticatedClientId */
-      async releaseAttachments(socket, authenticatedClientId) {
-        if (authenticatedClientId === undefined) return;
-        const sessionIds = attachmentSessions.get(socket);
-        if (sessionIds === undefined) return;
-        await Promise.all([...sessionIds].map((sessionId) => runSessionLifecycle(registry, sessionId, async () => {
-          const claims = attachmentClaims.get(sessionId);
-          if (claims === undefined) return;
-          const prior = claims.get(socket);
-          if (prior === undefined || prior.clientId !== authenticatedClientId) return;
-          claims.delete(socket);
-          if (claims.size === 0) attachmentClaims.delete(sessionId);
-          context.notifyListChanged();
-        }, "release_attachments")));
-        attachmentSessions.delete(socket);
+      /** @param {net.Socket} socket */
+      releaseAttachments(socket) {
+        const sessions = attachedSessions.get(socket);
+        if (sessions === undefined) return;
+        for (const sessionId of sessions) {
+          const attached = attachedConnections.get(sessionId);
+          attached?.delete(socket);
+          if (attached?.size === 0) attachedConnections.delete(sessionId);
+        }
+        attachedSessions.delete(socket);
       },
       /** @param {any} frame @param {any} connection @param {any} metadata @param {number} routeGeneration */
       async handleWorkerFrame(frame, connection, metadata, routeGeneration) {
@@ -1063,8 +981,10 @@ export async function createDaemonRuntime({
         // opens it once per turn rather than on every event a settled session goes on to emit.
         if (previousTaskState !== "READY") context.scheduleUpgradeRespawn(metadata.sessionId, settled);
       },
-      /** @param {any} request @param {net.Socket | undefined} socket @param {string} [authenticatedClientId] */
-      async handleRequest(request, socket, authenticatedClientId = request.clientId, duringRecovery = false) {
+      /** @param {any} request @param {{ socket: net.Socket, attachId: string | undefined } | undefined} connection @param {string} [authenticatedClientId] */
+      async handleRequest(request, connection, authenticatedClientId = request.clientId, duringRecovery = false) {
+        const socket = connection?.socket;
+        const attachId = connection?.attachId;
         if (!context.admissionOpen) throw Object.assign(new Error("Daemon is shutting down"), { code: "SHUTTING_DOWN", retryable: true });
         if (request.op === "get_state") {
           // Read the coverage cursor before the registry, never after. A snapshot newer than its own
@@ -1089,10 +1009,7 @@ export async function createDaemonRuntime({
           }, "set_session_color");
         }
         if (context.state !== "READY" && !duringRecovery) throw Object.assign(new Error(context.state === "FAILED" ? context.stateError?.message ?? "Daemon recovery failed" : "Daemon recovery is still in progress"), { code: context.state === "FAILED" ? context.stateError?.code ?? "RECOVERY_FAILED" : "RECOVERING", retryable: context.state !== "FAILED" });
-        if (request.op === "get_viewer_snapshot") {
-          const role = socket === undefined ? "observer" : attachmentClaims.get(request.payload.sessionId)?.get(socket)?.role ?? "observer";
-          return { kind: "viewer_snapshot", snapshot: await context.recovery.viewer.snapshot(request.payload.sessionId, role) };
-        }
+        if (request.op === "get_viewer_snapshot") return { kind: "viewer_snapshot", snapshot: await context.recovery.viewer.snapshot(request.payload.sessionId) };
         if (request.op === "subscribe_viewer") {
           if (socket === undefined) throw new TypeError("Viewer subscription requires a live socket");
           const store = context.recovery.viewer.store(request.payload.sessionId);
@@ -1209,8 +1126,8 @@ export async function createDaemonRuntime({
         }
         if (request.op === "refresh_summaries") return { kind: "summaries_refreshing", sessionIds: await context.refreshSummaries() };
         if (request.op === "attach" || request.op === "detach") {
-          if (socket === undefined) throw new TypeError("Attachment requires a live socket");
-          return context.arbitrateAttachment(request, socket, authenticatedClientId);
+          if (connection === undefined) throw new TypeError("Attachment requires a live socket");
+          return context.attachConnection(request, connection, authenticatedClientId);
         }
         if (request.op === "get_session_commands") {
           const menu = (await context.askWorker(request))?.result ?? {};
@@ -1220,11 +1137,6 @@ export async function createDaemonRuntime({
           };
         }
         if (!DURABLE_COMMANDS.has(request.op)) throw Object.assign(new Error(`Unsupported daemon operation: ${request.op}`), { code: "UNSUPPORTED_OPERATION" });
-        if (!duringRecovery) {
-          const claim = socket === undefined ? undefined : attachmentClaims.get(request.payload.sessionId)?.get(socket);
-          if (claim === undefined) throw Object.assign(new Error("A composer attachment is required"), { code: "ATTACHMENT_REQUIRED" });
-          if (claim.role !== "composer") throw Object.assign(new Error("Observers cannot mutate sessions"), { code: "OBSERVER_READ_ONLY" });
-        }
         const accepted = await context.recovery.journal.accept(request);
         let status = accepted;
         const changed = accepted.stage === "ACCEPTED";
@@ -1342,8 +1254,12 @@ export async function createDaemonRuntime({
                 lockedMetadata = undefined;
               }
               if (lockedMetadata !== undefined || lockedRoute !== undefined || launchingSessions.has(record.sessionId)) return refuse("OWNERSHIP_CONFLICT", "A worker lease, route, or launch is still authoritative");
-              const claims = attachmentClaims.get(record.sessionId);
-              if (claims !== undefined && [...claims.keys()].some((candidate) => candidate !== socket)) return refuse("SESSION_ATTACHED", "Delete refuses another attached frontend");
+              // Another dashboard has this row open, so removing it would empty a screen someone is
+              // reading. One dashboard's own second connection is not another dashboard: a destructive
+              // command travels on its own socket, and its list connection may still hold the session.
+              const attached = attachedConnections.get(record.sessionId);
+              const heldElsewhere = [...(attached ?? []).entries()].some(([candidate, held]) => candidate !== socket && (attachId === undefined || held.attachId !== attachId));
+              if (heldElsewhere) return refuse("SESSION_ATTACHED", "Delete refuses a session another dashboard has open");
               // Delete forgets the dashboard record and nothing else. Pi's canonical session file and any
               // managed worktree belong to the operator, so no path beneath either is ever mutated here.
               await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
@@ -1409,10 +1325,10 @@ export async function createDaemonRuntime({
         context.viewerRecovery = context.recovery.viewer;
         if (context.recovery.conflicts.length > 0) throw Object.assign(new Error("Worker ownership conflicts block daemon recovery"), { code: "OWNERSHIP_CONFLICT", conflicts: context.recovery.conflicts });
         context.launchResults = await createLaunchResultStore(join(daemonDirectory, "launch-results.json"));
-        context.attachmentResults = await createAttachmentResultStore({ path: join(daemonDirectory, "attachment-results.jsonl") });
         if ((context.recovery.repairedSessions ?? []).length > 0) context.notifyListChanged();
-        for (const entry of context.attachmentResults.entries()) await context.recovery.journal.reconcileAttachment(entry.request, entry.phase);
         for (const action of context.recovery.recoveryActions) {
+          // An attachment is connection-scoped state now, so a journal entry an earlier release wrote
+          // for one names a connection that no longer exists and is never redelivered.
           if (action.action === "SAFE_REDELIVERY" && !["attach", "detach"].includes(action.command.op)) await context.handleRequest(action.command, undefined, action.command.clientId, true);
         }
         context.state = "READY";
@@ -1475,7 +1391,6 @@ export async function createDaemonRuntime({
           await cleanup("request_chains", () => socketServer.drainAndClose());
           await cleanup("supervisor", async () => workerSupervisor?.close?.());
           await cleanup("launch_result_store", async () => context.launchResults?.close());
-          await cleanup("attachment_result_store", async () => context.attachmentResults?.close());
           await cleanup("recovery_stores", async () => context.recovery?.close());
           await cleanup("lifecycle", () => releaseDaemonLifecycle(claim));
           closeState = errors.length === 0 ? "CLOSED" : "FAILED_CLOSED";

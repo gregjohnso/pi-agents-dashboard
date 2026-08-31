@@ -82,38 +82,29 @@ async function closeServer(server) {
 }
 
 /** @param {net.Socket} socket @param {any} encoder @param {any} frame @param {() => void} [afterWrite] */
-function grantComposer(socket, encoder, frame, afterWrite) {
-  socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "attached", sessionId: "exact-session-id", role: "composer" } }), afterWrite);
-}
-
-it("claims composer, sends the exact revision-bound stop, and releases", async () => {
+// The command carries the installation clientId, its own request ID, and an exact revision. It
+// claims nothing first: the daemon authorized this client when it authenticated the socket.
+it("sends the exact revision-bound stop alone", async () => {
   const root = await stateRoot();
   const operations = [];
   const request = vi.fn(async (op, payload) => {
     operations.push([op, payload]);
-    if (op === "attach") return { kind: "attached", sessionId: "exact-session-id", role: "composer" };
-    if (op === "detach") return { kind: "detached", sessionId: "exact-session-id" };
     return { kind: "command", status: { stage: "COMPLETED" } };
   });
-  await expect(runSessionCommand(stopArgv, { composerRequest: request, root })).resolves.toMatchObject({ code: 0 });
-  expect(operations).toEqual([
-    ["attach", { sessionId: "exact-session-id", role: "composer" }],
-    ["stop", { sessionId: "exact-session-id", revision: 4 }],
-    ["detach", { sessionId: "exact-session-id" }],
-  ]);
+  await expect(runSessionCommand(stopArgv, { heldConnectionRequest: request, root })).resolves.toMatchObject({ code: 0 });
+  expect(operations).toEqual([["stop", { sessionId: "exact-session-id", revision: 4 }]]);
 });
 
-it("never replays a destructive request when the composer socket is lost after the stop is submitted", async () => {
+it("never replays a destructive request when the socket is lost after the stop is submitted", async () => {
   const root = await stateRoot();
   const operations = [];
   const server = await daemonServer(root, (socket, encoder, frame) => {
     operations.push(frame.op);
-    if (frame.op === "attach") grantComposer(socket, encoder, frame);
-    else if (frame.op === "stop") socket.destroy();
+    if (frame.op === "stop") socket.destroy();
   });
   await expect(runSessionCommand(stopArgv, { root, randomId: () => "lost-socket", timeoutMs: 200 })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN" } });
   await new Promise((resolve) => setTimeout(resolve, 20));
-  expect(operations).toEqual(["attach", "stop"]);
+  expect(operations).toEqual(["stop"]);
   await closeServer(server);
 });
 
@@ -152,21 +143,15 @@ it("sends rm as the delete operation and records delete as the pending action", 
 
 // respawn ends a worker's process group, so it takes the same convention as stop and rm: a full
 // identifier, an exact revision, and explicit confirmation, with its own durable pending action.
-it("claims composer, sends the exact revision-bound respawn, and records respawn as the pending action", async () => {
+it("sends the exact revision-bound respawn and records respawn as the pending action", async () => {
   const root = await stateRoot();
   const operations = [];
   const request = vi.fn(async (op, payload, requestId) => {
     operations.push([op, payload]);
-    if (op === "attach") return { kind: "attached", sessionId: "exact-session-id", role: "composer" };
-    if (op === "detach") return { kind: "detached", sessionId: "exact-session-id" };
     return { kind: "command", status: { stage: "DELIVERY_UNKNOWN", clientId: "cli-stable", requestId } };
   });
-  await expect(runSessionCommand(respawnArgv, { root, randomId: () => "stable", composerRequest: request })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN" } });
-  expect(operations).toEqual([
-    ["attach", { sessionId: "exact-session-id", role: "composer" }],
-    ["respawn", { sessionId: "exact-session-id", revision: 4 }],
-    ["detach", { sessionId: "exact-session-id" }],
-  ]);
+  await expect(runSessionCommand(respawnArgv, { root, randomId: () => "stable", heldConnectionRequest: request })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN" } });
+  expect(operations).toEqual([["respawn", { sessionId: "exact-session-id", revision: 4 }]]);
   const [name] = (await readdir(join(root, "cli", "pending"))).filter((candidate) => candidate.endsWith(".json"));
   expect(JSON.parse(await readFile(join(root, "cli", "pending", name), "utf8"))).toMatchObject({ action: "respawn", sessionId: "exact-session-id", revision: 4 });
 });
@@ -403,11 +388,7 @@ it("classifies a destructive response that cannot be parsed as delivery unknown"
 
 it("classifies an unvalidated delete response as delivery unknown and retains pending identity", async () => {
   const root = await stateRoot();
-  const server = await daemonServer(root, (socket, encoder, frame) => {
-    if (frame.op === "attach") grantComposer(socket, encoder, frame);
-    else if (frame.op === "detach") socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "detached", sessionId: "exact-session-id" } }));
-    else socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "mystery" } }));
-  });
+  const server = await daemonServer(root, (socket, encoder, frame) => socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "mystery" } })));
   await expect(runSessionCommand(rmArgv, { root, randomId: () => "stable", timeoutMs: 200 })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN", clientId: "cli-stable", requestId: expect.any(String) } });
   expect(await readdir(join(root, "cli", "pending"))).toHaveLength(1);
   await closeServer(server);

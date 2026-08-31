@@ -95,12 +95,8 @@ it.each([
 it.each([
   ["sessions/one.json", JSON.stringify({ schemaVersion: 1, sessionId: "one" })],
   ["daemon/control.token", ""],
-  ["frontend-state.json", JSON.stringify({ schemaVersion: 1, clientId: "client" })],
   ["queue/commands.jsonl", "{\"command\":{}}\n"],
   ["daemon/launch-results.json", JSON.stringify({ schemaVersion: 1, results: { request: {} } })],
-  ["daemon/attachment-results.jsonl", `${JSON.stringify({ schemaVersion: 1, phase: "PREPARED" })}\n`],
-  ["frontend-state.json", JSON.stringify({ schemaVersion: 1, clientId: "client", viewState: null, launchDraft: {} })],
-  ["frontend-state.json", JSON.stringify({ schemaVersion: 1, clientId: "client", viewState: {}, launchDraft: null })],
   ["runs/one/worker-replay.jsonl", `${JSON.stringify({ clientId: "client", requestId: "request", op: "stop", stage: "UNKNOWN", at: "now" })}\n`],
   ["runs/one/worker-replay.jsonl", `${JSON.stringify({ clientId: "", requestId: "request", op: "stop", stage: "RECEIVED", at: "now" })}\n`],
   ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, proto: 0 }] })],
@@ -108,6 +104,10 @@ it.each([
   ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, pendingRespawn: "later" }] })],
   ["cli/pending/one.json", JSON.stringify({ schemaVersion: 1, action: "restart", sessionId: "one", revision: 3, clientId: "client", requestId: "request" })],
   ["unknown-state.json", JSON.stringify({ value: true })],
+  // Retired artifacts. No production code names either one, so neither has a validator and both are
+  // simply unknown to a migration: nothing parses, migrates, or deletes the copies already on disk.
+  ["frontend-state.json", JSON.stringify({ schemaVersion: 1, clientId: "client", viewState: {}, launchDraft: {} })],
+  ["daemon/attachment-results.jsonl", `${JSON.stringify({ schemaVersion: 1, phase: "COMPLETED" })}\n`],
 ])("refuses malformed legacy artifact %s", async (relative, text) => {
   const paths = await fixture();
   const directory = join(paths.legacyRoot, relative.split("/").slice(0, -1).join("/"));

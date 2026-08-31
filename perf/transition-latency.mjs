@@ -24,7 +24,9 @@ const PHASE_LOG = option("phase-log", "");
 // Frames every STREAM_MS from every fake Pi, so the transition competes with its own session's ingest.
 const STREAM_MS = option("stream-ms", "");
 
-const VIEWER_MARK = Buffer.from("COMPOSER");
+// The viewer's own key hints; the list draws no such line. The header used to end in the access
+// role, which is what this watched for before roles were removed.
+const VIEWER_MARK = Buffer.from("Ctrl+S steer");
 const LIST_MARK = Buffer.from("pi-agents");
 const QUIET_MS = 400;
 
@@ -63,7 +65,7 @@ async function main() {
   }
   // One deep transcript, so the session the measurement opens carries a realistic item count.
   const deep = sessionIds[0];
-  const attached = await request("attach", { sessionId: deep, role: "composer", activate: true });
+  const attached = await request("attach", { sessionId: deep, activate: true });
   if (!attached.ok) throw new Error(`attach failed: ${JSON.stringify(attached.error)}`);
   for (let index = 0; index < ITEMS; index += 1) {
     const sent = await request("follow_up", { sessionId: deep, text: `perf item ${index}` });

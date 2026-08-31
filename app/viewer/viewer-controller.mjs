@@ -72,12 +72,10 @@ function renderModelFooter({ model, thinkingLevel }, hideThinking, width) {
 }
 
 /** Render the widest prefix of Pi's key hints plus the dashboard's own return keys that fits. */
-function renderKeyHints({ role, working }, width) {
-  const segments = role !== "composer"
-    ? ["Esc/← list", "↑↓ scroll", "Ctrl+T thinking", "Ctrl+O tools"]
-    : working
-      ? ["Esc interrupt", "← list", "↑↓ scroll", "Ctrl+S steer", "Ctrl+T thinking", "Ctrl+O tools", "/ commands"]
-      : ["Esc/← list", "↑↓ scroll", "Ctrl+S steer", "Ctrl+T thinking", "Ctrl+O tools", "/ commands"];
+function renderKeyHints({ working }, width) {
+  const segments = working
+    ? ["Esc interrupt", "← list", "↑↓ scroll", "Ctrl+S steer", "Ctrl+T thinking", "Ctrl+O tools", "/ commands"]
+    : ["Esc/← list", "↑↓ scroll", "Ctrl+S steer", "Ctrl+T thinking", "Ctrl+O tools", "/ commands"];
   for (let count = segments.length; count > 0; count -= 1) {
     const line = ` ${segments.slice(0, count).join(" · ")}`;
     if (visibleWidth(line) <= width) return line;
@@ -100,7 +98,7 @@ const SELECTION_PICKERS = {
   SESSION_COLOR_REQUIRED: { command: "/color", title: () => "Select a session color", items: () => [{ value: "default", label: "default · no tint" }, ...SESSION_COLORS.map((color) => ({ value: color, label: color }))] },
 };
 
-/** Own one standalone normalized Pi chat subscription and its composer role. */
+/** Own one standalone normalized Pi chat subscription and the input that writes to it. */
 export class ViewerController {
   constructor({ sessionId, client, editor, persistence, requestRender, onReturn, onDashboardAction = undefined, now = Date.now, adapters = undefined, cwd = process.cwd() }) {
     if (!sessionId || client === undefined || editor === undefined || persistence === undefined) throw new TypeError("sessionId, client, editor, and persistence are required");
@@ -151,8 +149,7 @@ export class ViewerController {
       this.replaySnapshot = replayFromOrigin ? snapshot : undefined;
       const initial = replayFromOrigin ? { ...snapshot, cursor: { ...snapshot.cursor, sequence: "0" }, items: [], tools: [], pendingUi: [], errors: [] } : snapshot;
       this.state = createTranscriptState(initial);
-      this.editor.disableSubmit = snapshot.role !== "composer";
-      this.editor.focused = snapshot.role === "composer";
+      this.editor.focused = true;
       this.transcript = new TranscriptModel({ state: this.state, adapters: this.adapters });
       this.installOverlay();
       const unsubscribe = await this.client.subscribe(this.sessionId, initial.cursor, (event) => this.processEvent(event), (error) => this.fail(error));
@@ -174,14 +171,13 @@ export class ViewerController {
     width = Math.max(0, Math.floor(width)); height = Math.max(0, Math.floor(height));
     if (height === 0) return [];
     if (this.state === undefined) return Array.from({ length: height }, () => fit("Loading viewer…", width));
-    const role = this.state.role.toUpperCase();
     const header = width >= 70
-      ? ` pi-agents · ${this.sessionId} · ${this.state.taskState}/${this.state.processState} · ${role}`
+      ? ` pi-agents · ${this.sessionId} · ${this.state.taskState}/${this.state.processState}`
       : width >= 50
-        ? ` ${this.sessionId} · ${this.state.taskState}/${this.state.processState} · ${role}`
-        : ` ${this.state.taskState}/${this.state.processState} · ${role}`;
+        ? ` ${this.sessionId} · ${this.state.taskState}/${this.state.processState}`
+        : ` ${this.state.taskState}/${this.state.processState}`;
     let status = renderStatusIndicator(this.state.activity, width, this.now(), { working: this.state.working });
-    const promptLines = this.state.role === "composer" ? this.editor.render(width) : [" Read-only session · scroll and tool inspection only"];
+    const promptLines = this.editor.render(width);
     let editorLines = framePromptBox(promptLines, this.sessionColor, width, this.menu?.name);
     const inputLabel = this.inputMode === "steer" ? [" Steer at next supported boundary"] : this.steerStatus === undefined ? [] : [` Steer ${this.steerStatus}`];
     const selectedTool = this.transcript.selectedToolId === undefined ? undefined : this.state.tools.get(this.transcript.selectedToolId);
@@ -222,7 +218,7 @@ export class ViewerController {
     }
     if (this.overlay !== undefined) {
       this.returnGesture.cancel();
-      if (matchesKey(data, Key.ctrl("c")) && this.state.role === "composer" && this.state.working) {
+      if (matchesKey(data, Key.ctrl("c")) && this.state.working) {
         void this.sendCommand("interrupt", {});
         return;
       }
@@ -257,8 +253,8 @@ export class ViewerController {
     if (matchesKey(data, Key.ctrl("o"))) { this.transcript.selectNextTool(1); this.returnGesture.cancel(); this.requestRender(); return; }
     if (matchesKey(data, Key.home)) { this.transcript.scrollToStart(); this.returnGesture.cancel(); this.requestRender(); return; }
     if (matchesKey(data, Key.end)) { this.transcript.scrollToEnd(); this.returnGesture.cancel(); this.requestRender(); return; }
-    if (matchesKey(data, Key.pageUp) || (this.state.role === "observer" && matchesKey(data, Key.up))) { this.transcript.scrollBy(-1); this.requestRender(); return; }
-    if (matchesKey(data, Key.pageDown) || (this.state.role === "observer" && matchesKey(data, Key.down))) { this.transcript.scrollBy(1); this.requestRender(); return; }
+    if (matchesKey(data, Key.pageUp)) { this.transcript.scrollBy(-1); this.requestRender(); return; }
+    if (matchesKey(data, Key.pageDown)) { this.transcript.scrollBy(1); this.requestRender(); return; }
     // Arrows scroll only when the editor has nothing to offer: no draft to move within and no prompt
     // history to recall. Either one hands them back to Pi's editor, which keeps history reachable and
     // keeps the Left double-press gesture honest about a dirty prompt.
@@ -271,11 +267,11 @@ export class ViewerController {
     if (matchesKey(data, Key.up) || matchesKey(data, Key.down)) {
       this.historyUsed ||= this.history.length > 0;
       this.returnGesture.cancel();
-      if (this.state.role === "composer") this.editor.handleInput(data);
+      this.editor.handleInput(data);
       this.requestRender();
       return;
     }
-    if (matchesKey(data, Key.escape) && this.state.role === "composer" && this.state.working) {
+    if (matchesKey(data, Key.escape) && this.state.working) {
       // Escape stops the running agent first; leaving the session needs a second Escape once it settles.
       this.returnGesture.cancel();
       void this.sendCommand("interrupt", {});
@@ -298,10 +294,9 @@ export class ViewerController {
     }
     this.returnGesture.cancelForInput("other");
     if (matchesKey(data, Key.ctrl("c"))) {
-      if (this.state.role === "composer") void this.sendCommand("interrupt", {});
+      void this.sendCommand("interrupt", {});
       return;
     }
-    if (this.state.role !== "composer") return;
     this.editor.handleInput(data);
     this.requestRender();
   }
@@ -340,7 +335,7 @@ export class ViewerController {
   }
 
   beginSteer() {
-    if (this.state?.role !== "composer") return;
+    if (this.state === undefined) return;
     this.steerRestore = this.editor.getText();
     this.steerStatus = "composing";
     this.inputMode = "steer";
@@ -378,7 +373,7 @@ export class ViewerController {
 
   async submitText(text) {
     const prompt = text.trim();
-    if (this.state?.role !== "composer" || prompt.length === 0) return;
+    if (this.state === undefined || prompt.length === 0) return;
     const submission = parseSlashSubmission(prompt, this.menu);
     if (submission.kind === "rejected") {
       const bare = /^\/\S+$/u.test(prompt) ? prompt : undefined;
@@ -421,7 +416,7 @@ export class ViewerController {
 
   async submitSteer(text) {
     const steer = text.trim();
-    if (this.state?.role !== "composer" || steer.length === 0) return false;
+    if (this.state === undefined || steer.length === 0) return false;
     const sent = await this.sendCommand("steer", { text: steer });
     if (sent) this.queued.push({ mode: "steer", text: steer });
     return sent;
@@ -548,9 +543,9 @@ export class ViewerController {
   }
 
   /**
-   * Rebuild against a daemon that just came back. A restarted daemon holds no attachment claims and
-   * issues a new epoch, so this viewer's composer role and cursor both died with the old process:
-   * reclaim the role if it is free, then resubscribe from a fresh snapshot.
+   * Rebuild against a daemon that just came back. A restarted daemon knows nothing of this
+   * connection and issues a new epoch, so this viewer's attachment and cursor both died with the old
+   * process: attach again, then resubscribe from a fresh snapshot.
    *
    * The applied event IDs cross into the rebuilt state. Their effects are already in the snapshot,
    * and the resumed subscription can hand the last event over again, which only a stable event ID
@@ -568,7 +563,6 @@ export class ViewerController {
       const applied = this.state?.eventIds ?? [];
       this.state = createTranscriptState(snapshot);
       for (const eventId of applied) this.state.eventIds.add(eventId);
-      this.editor.disableSubmit = snapshot.role !== "composer";
       this.transcript.update(this.state);
       this.installOverlay();
       const unsubscribe = await this.client.subscribe(this.sessionId, snapshot.cursor, (event) => this.processEvent(event), (error) => this.fail(error));
@@ -579,7 +573,7 @@ export class ViewerController {
     }
     if (attachError !== undefined) {
       const typed = /** @type {any} */ (attachError);
-      await this.recordError({ code: typed?.code ?? "SESSION_REATTACH_FAILED", message: attachError instanceof Error ? attachError.message : "This session could not be reclaimed after the daemon restarted", retryable: false });
+      await this.recordError({ code: typed?.code ?? "SESSION_REATTACH_FAILED", message: attachError instanceof Error ? attachError.message : "This session could not be reopened after the daemon restarted", retryable: false });
     }
     await this.requestRender();
   }
@@ -596,11 +590,10 @@ export class ViewerController {
         const seenItems = new Set(this.state.items.map((item) => item.itemId ?? item.attachment?.id));
         for (const item of authoritative.items) if (!seenItems.has(item.itemId ?? item.attachment?.id)) this.state.items.push(structuredClone(item));
         for (const tool of authoritative.tools) if (!this.state.tools.has(tool.id)) this.state.tools.set(tool.id, structuredClone(tool));
-        this.state = { ...this.state, role: authoritative.role, taskState: authoritative.taskState, processState: authoritative.processState, outcome: authoritative.outcome, model: authoritative.model, thinkingLevel: authoritative.thinkingLevel, activity: authoritative.activity, pendingUi: structuredClone(authoritative.pendingUi), errors: structuredClone(authoritative.errors) };
+        this.state = { ...this.state, taskState: authoritative.taskState, processState: authoritative.processState, outcome: authoritative.outcome, model: authoritative.model, thinkingLevel: authoritative.thinkingLevel, activity: authoritative.activity, pendingUi: structuredClone(authoritative.pendingUi), errors: structuredClone(authoritative.errors) };
       }
       this.syncQueued();
       this.transcript.update(this.state);
-      this.editor.disableSubmit = this.state.role !== "composer";
       this.installOverlay();
       await this.requestRender();
       await this.persistence.save(this.persisted(event.cursor));
@@ -638,7 +631,7 @@ export class ViewerController {
 
   installOverlay() {
     const request = this.state?.pendingUi.find((candidate) => !this.respondedUi.has(candidate.id));
-    if (request === undefined || this.state.role !== "composer") { this.overlay?.dispose(); this.overlay = undefined; return; }
+    if (request === undefined) { this.overlay?.dispose(); this.overlay = undefined; return; }
     if (this.overlay?.request.id === request.id) return;
     this.overlay?.dispose();
     this.overlay = new PendingUiOverlay({
@@ -646,7 +639,6 @@ export class ViewerController {
       tui: this.editor.tui ?? { requestRender: () => this.requestRender(), setFocus() {} },
       returnFocus: this.editor,
       respond: (response) => {
-        if (this.state?.role !== "composer") return;
         this.respondedUi.add(response.requestId);
         const resolved = this.overlay;
         this.overlay = undefined;

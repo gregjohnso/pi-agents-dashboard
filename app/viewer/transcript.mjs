@@ -10,7 +10,7 @@ export function createTranscriptState(snapshot) {
   for (const tool of tools.values()) if (!items.some((item) => item.toolId === tool.id)) items.push(toolItem(tool));
   return {
     items, tools, pendingUi: cloneItems(snapshot.pendingUi ?? []), errors: cloneItems(snapshot.errors ?? []),
-    activity: structuredClone(snapshot.activity), role: snapshot.role, taskState: snapshot.taskState,
+    activity: structuredClone(snapshot.activity), taskState: snapshot.taskState,
     processState: snapshot.processState, outcome: snapshot.outcome, model: snapshot.model === null ? null : structuredClone(snapshot.model),
     thinkingLevel: snapshot.thinkingLevel, working: snapshot.taskState === "WORKING", eventIds: new Set(), cursor: snapshot.cursor,
   };

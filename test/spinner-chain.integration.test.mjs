@@ -102,7 +102,6 @@ async function mountDashboard(runtime, clientId) {
   let controller;
   controller = new DashboardController({
     backend,
-    persistence: { async load() { return undefined; }, async save() {} },
     openViewer: async () => {},
     clientId, sourceSessionId: `dashboard-${clientId}`,
     launchDefaults: { cwd: "/repo", model: { provider: "anthropic", id: "claude" }, name: "task" },

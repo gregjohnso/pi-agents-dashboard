@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -16,7 +17,7 @@ async function defaultConnect({ root, clientId, sessionId }) {
   const { createDaemonViewerClient } = await import(new URL("../app/list/standalone-list.mjs", import.meta.url).href);
   const { createStandaloneViewer } = await import(new URL("../app/standalone.mjs", import.meta.url).href);
   const token = (await readFile(join(root, "daemon", "control.token"), "utf8")).trim();
-  const client = createDaemonClient({ socketPath: join(root, "daemon", "control.sock"), token, maxBytes: MAX_FRAME_BYTES, clientId });
+  const client = createDaemonClient({ socketPath: join(root, "daemon", "control.sock"), token, maxBytes: MAX_FRAME_BYTES, clientId, attachId: randomUUID() });
   await client.connect();
   const viewerClient = createDaemonViewerClient({ client, clientId });
   /** @type {any} */
@@ -53,7 +54,7 @@ export async function attachSession(sessionId, options = {}) {
     await viewer.open();
     await viewer.closed;
   } catch (error) {
-    return { code: error?.code === "SESSION_IN_USE" ? 5 : 1, error: { code: error?.code ?? "ATTACH_FAILED", message: error instanceof Error ? error.message : "Attach failed" } };
+    return { code: 1, error: { code: error?.code ?? "ATTACH_FAILED", message: error instanceof Error ? error.message : "Attach failed" } };
   } finally {
     await viewer?.close().catch(() => {});
     if (attached) await connection.viewerClient.detach(sessionId).catch(() => {});

@@ -101,7 +101,6 @@ A running daemon holds the code it loaded at startup while it spawns workers fro
 - **`pi` cannot be found or executed:** put the installed executable on `PATH`, or start with `pi-agents --pi-bin /absolute/path/to/pi`. The override must be absolute.
 - **`NOT_GIT_REPOSITORY` or `UNBORN_HEAD`:** the default worktree launch needs a Git repository with at least one commit. Use `/cwd` to select one, or use `/isolation shared` and confirm the exact path.
 - **`UNSUPPORTED_PI_CAPABILITY`:** the installed Pi does not provide an RPC command or event required by this dashboard. Use a compatible Pi executable.
-- **`SESSION_IN_USE`:** another dashboard is driving that session. One dashboard writes to a session at a time; several dashboards on different sessions work normally. Return from or close the other viewer, then open the session again.
 - **`STATE_ROOTS_SPLIT`:** two state roots both hold sessions. Stop the daemon in each, move the sessions you keep into one root, and remove the other. `pi-agents` will not merge them.
 - **A start message says a live daemon or worker still holds the state root:** the directory cannot be renamed while sessions are running. The dashboard uses the existing root and renames it on the first start after those sessions stop.
 - **`DAEMON_STILL_RUNNING`:** the daemon released its endpoint but its process still matches the identity that was published, so `stop` and `restart` refuse instead of leaving a second daemon on the same state root. Find that process by the PID in the message and end it, then run `pi-agents daemon start`.

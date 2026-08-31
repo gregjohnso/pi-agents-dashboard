@@ -3,7 +3,7 @@
 exports[`viewer rendering and navigation > snapshots the complete chat-state matrix at 80x24 1`] = `
 {
   "active": [
-    " pi-agents · s · WORKING/LIVE · COMPOSER",
+    " pi-agents · s · WORKING/LIVE",
     "",
     "",
     "",
@@ -29,7 +29,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Esc interrupt · ← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking",
   ],
   "assistant": [
-    " pi-agents · s · READY/LIVE · COMPOSER",
+    " pi-agents · s · READY/LIVE",
     "",
     "",
     "",
@@ -55,7 +55,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "compaction": [
-    " pi-agents · s · READY/LIVE · COMPOSER",
+    " pi-agents · s · READY/LIVE",
     "",
     "",
     "",
@@ -81,7 +81,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "error": [
-    " pi-agents · s · READY/LIVE · COMPOSER",
+    " pi-agents · s · READY/LIVE",
     "",
     "",
     "",
@@ -107,7 +107,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "model-thinking": [
-    " pi-agents · s · READY/LIVE · COMPOSER",
+    " pi-agents · s · READY/LIVE",
     "",
     "",
     "",
@@ -132,34 +132,8 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "                                                         (anthropic) opus • high",
     " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
-  "observer": [
-    " pi-agents · s · READY/LIVE · OBSERVER",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "                                                                                ",
-    " hello                                                                          ",
-    "                                                                                ",
-    "────────────────────────────────────────────────────────────────────────────────",
-    " Read-only session · scroll and tool inspection only",
-    "────────────────────────────────────────────────────────────────────────────────",
-    "                                                                        no-model",
-    " Esc/← list · ↑↓ scroll · Ctrl+T thinking · Ctrl+O tools",
-  ],
   "paused-follow": [
-    " pi-agents · s · READY/LIVE · COMPOSER",
+    " pi-agents · s · READY/LIVE",
     " history 3",
     "",
     " history 4",
@@ -185,7 +159,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "pending-ui": [
-    " pi-agents · s · WAITING/LIVE · COMPOSER",
+    " pi-agents · s · WAITING/LIVE",
     "",
     "",
     "",
@@ -211,7 +185,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "placeholders": [
-    " pi-agents · s · READY/LIVE · COMPOSER",
+    " pi-agents · s · READY/LIVE",
     "",
     "",
     "",
@@ -237,7 +211,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "reconnect": [
-    " pi-agents · s · READY/LIVE · COMPOSER",
+    " pi-agents · s · READY/LIVE",
     "",
     "",
     "",
@@ -263,7 +237,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "retry": [
-    " pi-agents · s · READY/LIVE · COMPOSER",
+    " pi-agents · s · READY/LIVE",
     "",
     "",
     "",
@@ -289,7 +263,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "streaming": [
-    " pi-agents · s · READY/LIVE · COMPOSER",
+    " pi-agents · s · READY/LIVE",
     "",
     "",
     "",
@@ -315,7 +289,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "thinking-hidden": [
-    " pi-agents · s · READY/LIVE · COMPOSER",
+    " pi-agents · s · READY/LIVE",
     "",
     "",
     "",
@@ -341,7 +315,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "thinking-visible": [
-    " pi-agents · s · READY/LIVE · COMPOSER",
+    " pi-agents · s · READY/LIVE",
     "",
     "",
     "",
@@ -367,7 +341,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "tool-completed": [
-    " pi-agents · s · READY/LIVE · COMPOSER",
+    " pi-agents · s · READY/LIVE",
     "",
     "",
     "",
@@ -393,7 +367,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "tool-failed": [
-    " pi-agents · s · READY/LIVE · COMPOSER",
+    " pi-agents · s · READY/LIVE",
     "",
     "",
     "",
@@ -419,7 +393,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "tool-pending": [
-    " pi-agents · s · READY/LIVE · COMPOSER",
+    " pi-agents · s · READY/LIVE",
     "",
     "",
     "",
@@ -445,7 +419,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "tool-running": [
-    " pi-agents · s · READY/LIVE · COMPOSER",
+    " pi-agents · s · READY/LIVE",
     "",
     "",
     "",
@@ -471,7 +445,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "tool-streaming": [
-    " pi-agents · s · READY/LIVE · COMPOSER",
+    " pi-agents · s · READY/LIVE",
     "",
     "",
     "",
@@ -497,7 +471,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "unknown": [
-    " pi-agents · s · READY/LIVE · COMPOSER",
+    " pi-agents · s · READY/LIVE",
     "",
     "",
     "",
@@ -523,7 +497,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
   ],
   "user": [
-    " pi-agents · s · READY/LIVE · COMPOSER",
+    " pi-agents · s · READY/LIVE",
     "",
     "",
     "",

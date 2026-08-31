@@ -77,7 +77,7 @@ Prefer small additive edits. The daemon's failpoint seams, journal stage transit
 
 **Summaries are opt-in and cost tokens.** `settings.summaryModel` defaults to `null` ([runtime/summaries.mjs](../runtime/summaries.mjs)). Setting it makes the daemon spawn real `pi --print --no-session --no-tools` inference to write names and one-line summaries. Never enable it in a test or a default.
 
-**A frontend that falls behind resynchronizes; it does not fail.** Overflow drops the backlog and yields one `resynchronize` marker; the list refetches `get_state` and continues from the position that snapshot covers. Do not raise the queue bound instead. Correctness lives in the resync path, not in the constant.
+**A frontend that falls behind resynchronizes; it does not fail.** The list keeps one dirty flag and refetches `get_state`, whatever the size of the burst. A viewer that fell further behind than the daemon's subscriber bound is refused when it resumes, and [`ViewerController.streamFailed`](../app/viewer/viewer-controller.mjs) answers that refusal with one reload from a fresh snapshot. Do not raise either bound instead. Correctness lives in the reload path, not in the constant. The reload is spent once per refusal and restored by the next event that arrives, because retrying a refusal that keeps coming back is a request loop, not a recovery: that second refusal becomes a visible transcript error instead.
 
 **Anything that signals a process must revalidate identity immediately before the signal.** Use `stopVerifiedProcessGroup` ([runtime/process-signaler.mjs](../runtime/process-signaler.mjs)). Never call `process.kill` directly.
 

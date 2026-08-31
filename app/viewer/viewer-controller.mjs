@@ -119,6 +119,8 @@ export class ViewerController {
     this.inputMode = "prompt";
     this.hideThinking = false;
     this.daemonUnreachable = false;
+    this.streamStopped = false;
+    this.streamReloaded = false;
     this.edited = false;
     this.historyUsed = false;
     this.closedState = true;
@@ -152,7 +154,7 @@ export class ViewerController {
       this.editor.focused = true;
       this.transcript = new TranscriptModel({ state: this.state, adapters: this.adapters });
       this.installOverlay();
-      const unsubscribe = await this.client.subscribe(this.sessionId, initial.cursor, (event) => this.processEvent(event), (error) => this.fail(error));
+      const unsubscribe = await this.client.subscribe(this.sessionId, initial.cursor, (event) => this.processEvent(event), (error) => this.streamFailed(error));
       if (this.closedState) unsubscribe?.(); else this.unsubscribe = unsubscribe;
       this.watchConnection = this.client.onConnectionChange?.((status) => this.onConnection(status));
       await this.requestRender();
@@ -176,7 +178,10 @@ export class ViewerController {
       : width >= 50
         ? ` ${this.sessionId} · ${this.state.taskState}/${this.state.processState}`
         : ` ${this.state.taskState}/${this.state.processState}`;
-    let status = renderStatusIndicator(this.state.activity, width, this.now(), { working: this.state.working });
+    // A stopped stream cannot report a running turn: the spinner would be drawn from the last state
+    // this viewer received, which is exactly the frozen-but-live-looking transcript this dock exists
+    // to prevent.
+    let status = renderStatusIndicator(this.state.activity, width, this.now(), { working: this.state.working && !this.streamStopped });
     const promptLines = this.editor.render(width);
     let editorLines = framePromptBox(promptLines, this.sessionColor, width, this.menu?.name);
     const inputLabel = this.inputMode === "steer" ? [" Steer at next supported boundary"] : this.steerStatus === undefined ? [] : [` Steer ${this.steerStatus}`];
@@ -184,7 +189,7 @@ export class ViewerController {
     const toolLine = selectedTool === undefined ? [] : [` tool:${selectedTool.name} ${selectedTool.state} ${this.transcript.expandedTools.has(selectedTool.id) ? "expanded" : "collapsed"}`];
     let errorLines = this.state.errors.slice(-1).flatMap((error) => renderSystemCard({ text: `${error.code}: ${error.message}`, level: "error" }, width));
     let queuedLines = this.renderQueued();
-    const connectionLines = this.daemonUnreachable ? [" Daemon unreachable · reconnecting…"] : [];
+    const connectionLines = this.daemonUnreachable ? [" Daemon unreachable · reconnecting…"] : this.streamStopped ? [" Transcript stopped · Esc to the list, then reopen this session"] : [];
     let hints = renderKeyHints(this.state, width);
     const dockRows = () => 2 + (hints === "" ? 0 : 1) + status.length + editorLines.length + inputLabel.length + toolLine.length + errorLines.length + queuedLines.length + connectionLines.length;
     if (height - dockRows() < MIN_TRANSCRIPT_ROWS) {
@@ -552,6 +557,14 @@ export class ViewerController {
    * absorbs: a placeholder or an unrecognized Pi event has no other identity to replace on.
    */
   async resynchronize() {
+    // One rebuild at a time: a refused subscription and a returning daemon can each ask for one, and
+    // two in flight would leave two live subscriptions with only the newer one owned here.
+    this.rebuilding ??= this.rebuild().finally(() => { this.rebuilding = undefined; });
+    return this.rebuilding;
+  }
+
+  /** Rebuild this transcript from a fresh snapshot and resubscribe from that snapshot's cursor. */
+  async rebuild() {
     this.unsubscribe?.();
     this.unsubscribe = undefined;
     let attachError;
@@ -565,9 +578,12 @@ export class ViewerController {
       for (const eventId of applied) this.state.eventIds.add(eventId);
       this.transcript.update(this.state);
       this.installOverlay();
-      const unsubscribe = await this.client.subscribe(this.sessionId, snapshot.cursor, (event) => this.processEvent(event), (error) => this.fail(error));
+      const unsubscribe = await this.client.subscribe(this.sessionId, snapshot.cursor, (event) => this.processEvent(event), (error) => this.streamFailed(error));
       if (this.closedState) unsubscribe?.(); else this.unsubscribe = unsubscribe;
+      this.streamStopped = false;
     } catch (error) {
+      // No subscription survived the rebuild, so this transcript is not being updated any more.
+      this.streamStopped = true;
       const typed = /** @type {any} */ (error);
       await this.recordError({ code: typed?.code ?? "VIEWER_RESYNC_FAILED", message: error instanceof Error ? error.message : "This session could not be reloaded after the daemon restarted", retryable: true });
     }
@@ -592,6 +608,10 @@ export class ViewerController {
         for (const tool of authoritative.tools) if (!this.state.tools.has(tool.id)) this.state.tools.set(tool.id, structuredClone(tool));
         this.state = { ...this.state, taskState: authoritative.taskState, processState: authoritative.processState, outcome: authoritative.outcome, model: authoritative.model, thinkingLevel: authoritative.thinkingLevel, activity: authoritative.activity, pendingUi: structuredClone(authoritative.pendingUi), errors: structuredClone(authoritative.errors) };
       }
+      // An event is the only proof this viewer has that its subscription is live, so it is also what
+      // restores the one reload a later refusal may spend.
+      this.streamStopped = false;
+      this.streamReloaded = false;
       this.syncQueued();
       this.transcript.update(this.state);
       this.installOverlay();
@@ -664,6 +684,28 @@ export class ViewerController {
       this.selection = undefined;
       this.resolveClosed?.();
     }
+  }
+
+  /**
+   * The event stream this viewer reads stopped: the daemon refused the subscription, or refused to
+   * resume it from this viewer's cursor. A refusal used to reach nothing at all, so the transcript
+   * stopped while the dock kept drawing the last state this viewer had received.
+   *
+   * Falling further behind than the daemon's subscriber bound is the ordinary way to get here, and a
+   * cursor it will not resume from is recoverable: the answer to that bound is one reload from a
+   * fresh snapshot, the way the list refetches. A second refusal with no event in between is not
+   * reloaded again, because retrying a refusal is a request loop rather than a recovery.
+   */
+  async streamFailed(error) {
+    if (this.closedState) return;
+    if (!this.streamReloaded) {
+      this.streamReloaded = true;
+      await this.resynchronize();
+      return;
+    }
+    this.streamStopped = true;
+    const typed = /** @type {any} */ (error);
+    await this.recordError({ code: typed?.code ?? "VIEWER_STREAM_FAILED", message: error instanceof Error ? error.message : "This session stopped receiving updates", retryable: false });
   }
 
   async fail(error) { this.error = error; await this.close({ persist: false }); }

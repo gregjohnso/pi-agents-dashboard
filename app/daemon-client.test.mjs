@@ -22,8 +22,11 @@ async function socketPathIn(prefix) {
 
 /**
  * Authenticate every connection, then hand each request frame to `respond`.
+ *
+ * `refuse` is not decoration: a double that can only accept cannot reproduce a daemon that turns an
+ * operation down, and that is how a refused viewer subscription reached production unnoticed.
  * @param {string} socketPath
- * @param {(exchange: { socket: net.Socket, request: any, connection: number, requests: number, reply: (result: any) => void }) => void} respond
+ * @param {(exchange: { socket: net.Socket, request: any, connection: number, requests: number, reply: (result: any) => void, refuse: (error: { code: string, message: string, retryable?: boolean }) => void }) => void} respond
  */
 async function daemonServer(socketPath, respond) {
   const state = { requests: 0, connections: 0, /** @type {any[]} */ authentications: [], /** @type {net.Socket | undefined} */ socket: undefined, /** @type {net.Socket[]} */ sockets: [] };
@@ -44,7 +47,11 @@ async function daemonServer(socketPath, respond) {
           continue;
         }
         state.requests += 1;
-        respond({ socket, request, connection, requests: state.requests, reply: (result) => socket.write(encodeJsonl({ version: 1, requestId: request.requestId, ok: true, result })) });
+        respond({
+          socket, request, connection, requests: state.requests,
+          reply: (result) => socket.write(encodeJsonl({ version: 1, requestId: request.requestId, ok: true, result })),
+          refuse: (error) => socket.write(encodeJsonl({ version: 1, requestId: request.requestId, ok: false, error: { retryable: false, ...error } })),
+        });
       }
     });
   });
@@ -292,6 +299,38 @@ describe("daemon client", () => {
     await waitFor(() => subscriptions.length === 3);
     expect(subscriptions[2]).toEqual(one);
     await subscription.return?.();
+  });
+
+  // Operator-visible failure: a viewer whose socket broke while more events than the subscriber
+  // bound accumulated reconnected, was refused, and then sat on a frozen transcript while this
+  // client still reported the connection healthy. The list stopped doing this when it started
+  // awaiting its own subscription; the viewer kept sending one and reading nothing back.
+  it.each([
+    ["resumed subscription refused on reconnect", 2, "SUBSCRIBER_OVERFLOW", "Initial viewer replay exceeds the subscriber bound"],
+    ["first subscription refused outright", 1, "SESSION_NOT_FOUND", "Viewer session does not exist"],
+  ])("ends a viewer subscription with the daemon's refusal: %s", async (_name, refusedConnection, code, message) => {
+    const socketPath = await socketPathIn("viewer-refused-");
+    const zero = { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "0" };
+    /** @type {number[]} */
+    const subscriptions = [];
+    const server = await daemonServer(socketPath, ({ request: incoming, connection, reply, refuse }) => {
+      if (incoming.op !== "subscribe_viewer") return;
+      subscriptions.push(connection);
+      if (connection === refusedConnection) refuse({ code, message });
+      else reply({ kind: "viewer_subscribed", cursor: zero });
+    });
+    const client = startClient({ socketPath, reconnectDelayMs: 1, maxBytes: 4096 });
+    const subscription = client.subscribeViewer("session-1", zero)[Symbol.asyncIterator]();
+    const reading = subscription.next().then(() => "the refused subscription delivered an event", (/** @type {unknown} */ error) => error);
+    await waitFor(() => subscriptions.length === 1);
+    if (refusedConnection === 2) {
+      server.socket?.destroy();
+      await waitFor(() => subscriptions.length === 2);
+    }
+
+    // The reader was already waiting, so a refusal that only records itself still hangs it forever.
+    await expect(within(reading)).resolves.toMatchObject({ code, message });
+    await expect(within(subscription.next())).rejects.toMatchObject({ code });
   });
 
   it("gets viewer snapshots and subscribes by session cursor", async () => {

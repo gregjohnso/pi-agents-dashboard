@@ -81,6 +81,29 @@ it("recovers an existing root that still holds retired viewer acknowledgement fi
   expect((await stat(retired)).isDirectory()).toBe(true);
 });
 
+// The two halves of this were each already tested and never together: the store refuses a replay
+// larger than its subscriber bound, and the client subscribes over a socket. A viewer that fell that
+// far behind used to receive the refusal as nothing at all.
+it("tells a viewer that its resumed subscription replays more than the daemon's subscriber bound", async () => {
+  const { root, sessionFile } = await setup();
+  const answers = Array.from({ length: 120 }, (_, index) => ({
+    type: "message", id: `assistant-${index}`, parentId: index === 0 ? "user-1" : `assistant-${index - 1}`, timestamp: at,
+    message: { role: "assistant", content: [{ type: "text", text: `answer ${index}` }] },
+  }));
+  await appendFile(sessionFile, answers.map((answer) => `${JSON.stringify(answer)}\n`).join(""));
+  const { daemon, client } = await open(root, "client-overflow");
+  const snapshot = await client.getViewerSnapshot("session-1");
+  expect(BigInt(snapshot.cursor.sequence)).toBeGreaterThan(100n);
+
+  const behind = client.subscribeViewer("session-1", { ...snapshot.cursor, sequence: "0" })[Symbol.asyncIterator]();
+  const refused = behind.next().then(() => "delivered", (/** @type {unknown} */ error) => error);
+  await expect(Promise.race([refused, new Promise((resolve) => setTimeout(() => resolve("waited for a refusal that reached nobody"), 2_000))]))
+    .resolves.toMatchObject({ code: "SUBSCRIBER_OVERFLOW" });
+  await behind.return?.();
+  await client.close();
+  await daemon.close();
+});
+
 it("keeps a published event authoritative when re-derived history content drifts", async () => {
   const { root } = await setup();
   const first = await open(root, "client-drift");

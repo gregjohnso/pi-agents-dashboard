@@ -18,6 +18,7 @@ function editor() {
 }
 function fixture(overrides = {}) {
   let listener;
+  let streamError;
   let connectionListener;
   const commands = [];
   const order = [];
@@ -27,7 +28,7 @@ function fixture(overrides = {}) {
   let snapshots = 0;
   const client = {
     async getSnapshot() { order.push("snapshot"); return snapshot(typeof overrides.snapshot === "function" ? overrides.snapshot(snapshots++) : overrides.snapshot); },
-    subscribe(_sessionId, cursor, next) { subscribed.push(cursor); listener = next; return () => order.push("unsubscribe"); },
+    subscribe(_sessionId, cursor, next, onError) { subscribed.push(cursor); listener = next; streamError = onError; return () => order.push("unsubscribe"); },
     onConnectionChange(next) { connectionListener = next; return () => { connectionListener = undefined; }; },
     ...(overrides.attach === undefined ? {} : { attach: async (sessionId) => { attached.push(sessionId); return overrides.attach(sessionId); } }),
     async command(operation, payload) { commands.push({ operation, payload }); return overrides.command?.(operation, payload); },
@@ -39,7 +40,7 @@ function fixture(overrides = {}) {
   const persistence = { async load() { return overrides.persisted; }, async save(value) { await overrides.save?.(value); saved.push(structuredClone(value)); order.push(`persist:${value.cursor?.sequence ?? "draft"}`); } };
   const dashboard = [];
   const instance = new ViewerController({ sessionId: "s", client, editor: overrides.editor ?? editor(), persistence, requestRender: async () => { order.push("render"); }, onReturn: vi.fn(), now: () => 0, onDashboardAction: (action) => dashboard.push(action) });
-  return { instance, client, commands, order, saved, dashboard, attached, subscribed, emit: (event) => listener(event), connection: (status) => connectionListener(status) };
+  return { instance, client, commands, order, saved, dashboard, attached, subscribed, emit: (event) => listener(event), refuseStream: (error) => streamError(error), connection: (status) => connectionListener(status) };
 }
 
 describe("viewer commands", () => {
@@ -563,6 +564,46 @@ describe("daemon outage", () => {
 
     expect(f.instance.closedState).toBe(false);
     expect(stripVTControlCharacters(f.instance.render(80, 24).join("\n"))).toContain("SESSION_NOT_FOUND");
+  });
+});
+
+describe("refused viewer subscription", () => {
+  const overflow = () => Object.assign(new Error("Initial viewer replay exceeds the subscriber bound"), { code: "SUBSCRIBER_OVERFLOW" });
+
+  // Operator-visible failure: the daemon refuses to resume a subscription whose cursor is further
+  // behind than the subscriber bound, and the refusal used to reach nothing. The transcript stopped
+  // updating while the dock still drew a running turn.
+  it("reloads from a fresh snapshot once, then reports the refusal instead of freezing the transcript", async () => {
+    const f = fixture({ snapshot: { taskState: "WORKING" } });
+    await f.instance.open();
+    const view = () => stripVTControlCharacters(f.instance.render(80, 24).join("\n"));
+    expect(view()).toContain("Working");
+
+    await f.refuseStream(overflow());
+    expect(f.subscribed).toHaveLength(2);
+    expect(f.order.filter((entry) => entry === "snapshot")).toHaveLength(2);
+
+    // A refusal answered by another reload is a request loop, so the second one is the operator's.
+    await f.refuseStream(overflow());
+    expect(f.subscribed).toHaveLength(2);
+    expect(view()).toContain("SUBSCRIBER_OVERFLOW");
+    expect(view()).toContain("Transcript stopped");
+    expect(view()).not.toContain("Working");
+    expect(f.instance.closedState).toBe(false);
+  });
+
+  it("reports a session the daemon no longer holds, which no reload can recover", async () => {
+    const f = fixture();
+    await f.instance.open();
+    const gone = Object.assign(new Error("Viewer session does not exist"), { code: "SESSION_NOT_FOUND" });
+    f.client.getSnapshot = async () => { throw gone; };
+
+    await f.refuseStream(gone);
+
+    const view = stripVTControlCharacters(f.instance.render(80, 24).join("\n"));
+    expect(view).toContain("SESSION_NOT_FOUND");
+    expect(view).toContain("Transcript stopped");
+    expect(f.instance.closedState).toBe(false);
   });
 });
 

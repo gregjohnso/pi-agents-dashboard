@@ -3,8 +3,11 @@ import { join } from "node:path";
 
 import { atomicWriteJson } from "./atomic-file.mjs";
 import { acquireLifecycleLock, LifecycleLockError } from "./lifecycle-lock.mjs";
+import { signalProcessGroup as signalProcessGroupImpl, sleep as sleepImpl, stopVerifiedProcessGroup } from "./process-signaler.mjs";
 
 const DAEMON_STATES = new Set(["STARTING", "RECONCILING", "READY", "FAILED"]);
+/** Dispositions that prove the abandoned child is gone, rather than merely signalled. */
+const PROVEN_GONE_DISPOSITIONS = ["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "KILLED"];
 const PUBLICATION_KEYS = ["schemaVersion", "pid", "startIdentity", "processGroupId", "daemonEpoch", "tokenPath", "startedAt", "state", "error"];
 
 export class DaemonLifecycleError extends Error {
@@ -92,6 +95,81 @@ export async function inspectDaemonEndpoint({ root, inspect, probe = async () =>
     daemonState: reported.state ?? publication.state,
     error: reported.error ?? publication.error,
   };
+}
+
+/**
+ * Read back the exact identity of a just-spawned detached daemon child.
+ *
+ * `detached: true` makes the child a session and process-group leader, so a record whose group is
+ * led by anything else is not this child: its PID was reused and that group belongs to someone
+ * else. Reading the identity here rather than at the deadline is what makes it usable: the child is
+ * still an unreaped child of this process, so its PID cannot yet name a different process.
+ *
+ * @param {{ pid?: number }} child @param {(pid: number) => Promise<any>} inspect
+ * @returns {Promise<{ status: "NONE" } | { status: "EXITED" | "UNVERIFIED", pid: number } | { status: "IDENTIFIED", pid: number, identity: { pid: number, startIdentity: string, processGroupId: number } }>}
+ */
+export async function identifyDaemonChild(child, inspect) {
+  const pid = Number(child?.pid);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return { status: "NONE" };
+  /** @type {any} */
+  let actual;
+  try {
+    actual = await inspect(pid);
+  } catch (error) {
+    if (error instanceof Error && ["ENOENT", "ESRCH"].includes(/** @type {NodeJS.ErrnoException} */ (error).code ?? "")) return { status: "EXITED", pid };
+    return { status: "UNVERIFIED", pid };
+  }
+  if (actual?.pid !== pid || actual?.processGroupId !== pid || typeof actual?.startIdentity !== "string" || actual.startIdentity.length === 0) return { status: "UNVERIFIED", pid };
+  return { status: "IDENTIFIED", pid, identity: { pid, startIdentity: actual.startIdentity, processGroupId: pid } };
+}
+
+/** @param {number} pid @param {boolean} proven @param {string} disposition */
+function describeAbandonedChild(pid, proven, disposition) {
+  return `its daemon child ${pid} ${proven ? "is gone" : "may still be running"} (${disposition})`;
+}
+
+/**
+ * Give up on a daemon child this command spawned: prove it is gone, or stop it by verified identity.
+ *
+ * A start that returns without doing this leaves a detached child that publishes itself seconds
+ * later and then owns the state root indefinitely. Only the identity read back from the spawned PID
+ * authorizes a signal, and `stopVerifiedProcessGroup` re-reads that identity immediately before
+ * each one, so an unverifiable child is reported rather than signalled.
+ *
+ * The child may already have published before it was stopped. Removing that publication is limited
+ * to one naming this exact child, so giving up never cleans up an endpoint it did not create, and
+ * the operator's next start is not refused with `STALE_ENDPOINT_REQUIRES_RECOVER`.
+ *
+ * @param {any} spawned the result of `identifyDaemonChild`
+ * @param {{ root: string, inspect(pid: number): Promise<any>, probe?(publication: any, options: { timeoutMs?: number }): Promise<boolean | Record<string, unknown>>, probeTimeoutMs?: number, signalProcessGroup?: typeof signalProcessGroupImpl, sleep?: (ms: number) => Promise<void>, stopPolicy: { gracefulMs: number, terminateMs: number }, cleanupStale?: typeof cleanupStaleDaemon, fsOps?: any }} deps
+ * @returns {Promise<{ disposition: string, proven: boolean, pid?: number, summary?: string, cleanedPublication?: boolean }>}
+ */
+export async function abandonDaemonStartChild(spawned, { root, inspect, probe, probeTimeoutMs, signalProcessGroup = signalProcessGroupImpl, sleep = sleepImpl, stopPolicy, cleanupStale = cleanupStaleDaemon, fsOps = fs }) {
+  if (!Number.isSafeInteger(stopPolicy?.gracefulMs) || stopPolicy.gracefulMs <= 0 || !Number.isSafeInteger(stopPolicy?.terminateMs) || stopPolicy.terminateMs <= 0) throw new TypeError("Abandoning a daemon child requires a reviewed stop timing policy");
+  if (spawned?.status === "NONE") return { disposition: "NO_CHILD", proven: true };
+  const pid = /** @type {number} */ (spawned.pid);
+  if (spawned.status !== "IDENTIFIED") {
+    const proven = spawned.status === "EXITED";
+    const disposition = proven ? "ALREADY_EXITED" : "UNVERIFIED";
+    return { disposition, proven, pid, summary: describeAbandonedChild(pid, proven, disposition), cleanedPublication: false };
+  }
+  const stopped = await stopVerifiedProcessGroup(spawned.identity, {
+    inspect,
+    // A child that has not published an endpoint has no socket to ask politely through, so the
+    // SIGTERM this escalation sends next is the only graceful channel a starting daemon has.
+    requestGraceful: async () => {},
+    signalProcessGroup,
+    sleep,
+  }, stopPolicy).catch(() => ({ disposition: "AMBIGUOUS_IDENTITY" }));
+  const proven = PROVEN_GONE_DISPOSITIONS.includes(stopped.disposition);
+  let cleanedPublication = false;
+  if (proven) {
+    const endpoint = await inspectDaemonEndpoint({ root, inspect, probe, probeTimeoutMs, fsOps }).catch(() => undefined);
+    if (endpoint?.status === "STALE" && endpoint.canCleanup === true && sameIdentity(endpoint.publication, spawned.identity)) {
+      cleanedPublication = await cleanupStale({ root, inspect, probe, probeTimeoutMs, fsOps }).then(() => true, () => false);
+    }
+  }
+  return { disposition: stopped.disposition, proven, pid, summary: describeAbandonedChild(pid, proven, stopped.disposition), cleanedPublication };
 }
 
 /** @param {string} path @param {(pid: number) => Promise<any>} inspect @param {any} fsOps */

@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { afterEach, expect, it } from "vitest";
 
 import {
+  abandonDaemonStartChild,
   claimDaemonLifecycle,
+  identifyDaemonChild,
   inspectDaemonEndpoint,
   releaseDaemonLifecycle,
 } from "./daemon-lifecycle.mjs";
@@ -141,6 +143,14 @@ async function publish(root, identity, state) {
   }), { mode: 0o600 });
 }
 
+/** A cleanup caller has to identify itself, so every fake inspector answers for this process too. */
+const selfIdentity = { pid: process.pid, startIdentity: "1", processGroupId: process.pid };
+
+/** @param {number} pid */
+function noSuchProcess(pid) {
+  return Object.assign(new Error(`no such process ${pid}`), { code: "ESRCH" });
+}
+
 it("gives the daemon liveness probe the timeout its caller chose", async () => {
   // The probe's own timeout default was unreachable: `inspectDaemonEndpoint` called it with one
   // argument, so a healthy daemon that answered slower than that default read as UNHEALTHY and
@@ -160,6 +170,108 @@ it("gives the daemon liveness probe the timeout its caller chose", async () => {
     .rejects.toMatchObject({ code: "DAEMON_ALREADY_RUNNING" });
 
   expect(observed).toEqual([4_000, 7_000]);
+});
+
+it.each([
+  ["leads its own process group, so it can be signalled", { pid: 4242, startIdentity: "111222333", processGroupId: 4242 }, { status: "IDENTIFIED", pid: 4242 }],
+  ["belongs to a group another process leads, so its PID was reused", { pid: 4242, startIdentity: "111222333", processGroupId: 17 }, { status: "UNVERIFIED", pid: 4242 }],
+  ["reports no start identity at all", { pid: 4242, processGroupId: 4242 }, { status: "UNVERIFIED", pid: 4242 }],
+])("identifies a spawned daemon child that %s", async (_label, observed, expected) => {
+  await expect(identifyDaemonChild({ pid: 4242 }, async () => observed)).resolves.toMatchObject(expected);
+});
+
+it.each([
+  ["exited before it could be identified", { pid: 4242 }, async () => { throw noSuchProcess(4242); }, { status: "EXITED", pid: 4242 }],
+  ["never produced a PID", {}, async () => selfIdentity, { status: "NONE" }],
+])("identifies a spawned daemon child that %s", async (_label, child, inspect, expected) => {
+  await expect(identifyDaemonChild(child, inspect)).resolves.toEqual(expected);
+});
+
+it("stops an abandoned daemon child through its verified process group", async () => {
+  // A start that gave up left its detached child running, and the child published itself seconds
+  // later and lived forever: 47 test daemons leaked in one night, the oldest up 38 hours.
+  const root = await fixture();
+  const identity = { pid: 4242, startIdentity: "111222333", processGroupId: 4242 };
+  await publish(root, identity, "STARTING");
+  let alive = true;
+  /** @type {any[][]} */
+  const signals = [];
+  const spawned = await identifyDaemonChild({ pid: identity.pid }, async () => identity);
+
+  const abandoned = await abandonDaemonStartChild(spawned, {
+    root,
+    inspect: async (/** @type {number} */ pid) => {
+      if (pid === process.pid) return selfIdentity;
+      if (pid === identity.pid && alive) return identity;
+      throw noSuchProcess(pid);
+    },
+    signalProcessGroup: (/** @type {number} */ pgid, /** @type {string} */ signal) => { signals.push([pgid, signal]); alive = false; },
+    stopPolicy: { gracefulMs: 1, terminateMs: 1 },
+  });
+
+  expect(signals).toEqual([[4242, "SIGTERM"]]);
+  expect(abandoned).toMatchObject({ pid: 4242, proven: true, disposition: "TERMINATED", cleanedPublication: true });
+  // The child published before it was stopped, so leaving that endpoint behind would refuse the
+  // operator's next start with STALE_ENDPOINT_REQUIRES_RECOVER.
+  await expect(access(join(root, "daemon", "pid.json"))).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+it("never signals an abandoned daemon child whose identity it could not verify", async () => {
+  const root = await fixture();
+  /** @type {any[][]} */
+  const signals = [];
+  const spawned = await identifyDaemonChild({ pid: 4242 }, async () => ({ pid: 4242, startIdentity: "111222333", processGroupId: 17 }));
+
+  const abandoned = await abandonDaemonStartChild(spawned, {
+    root,
+    inspect: async () => selfIdentity,
+    signalProcessGroup: (/** @type {number} */ pgid, /** @type {string} */ signal) => { signals.push([pgid, signal]); },
+    stopPolicy: { gracefulMs: 1, terminateMs: 1 },
+  });
+
+  expect(signals).toEqual([]);
+  expect(abandoned).toMatchObject({ pid: 4242, proven: false, disposition: "UNVERIFIED" });
+  expect(abandoned.summary).toContain("4242");
+});
+
+it("leaves an endpoint another daemon published where it is", async () => {
+  const root = await fixture();
+  const other = { pid: 77, startIdentity: "770", processGroupId: 77 };
+  await publish(root, other, "READY");
+  const child = { pid: 4242, startIdentity: "111222333", processGroupId: 4242 };
+  const spawned = await identifyDaemonChild({ pid: child.pid }, async () => child);
+
+  const abandoned = await abandonDaemonStartChild(spawned, {
+    root,
+    inspect: async (/** @type {number} */ pid) => {
+      if (pid === process.pid) return selfIdentity;
+      if (pid === other.pid) throw noSuchProcess(pid);
+      throw noSuchProcess(pid);
+    },
+    signalProcessGroup: () => { throw new Error("an exited child must not be signalled"); },
+    stopPolicy: { gracefulMs: 1, terminateMs: 1 },
+  });
+
+  expect(abandoned).toMatchObject({ proven: true, disposition: "ALREADY_EXITED", cleanedPublication: false });
+  expect(JSON.parse(await readFile(join(root, "daemon", "pid.json"), "utf8"))).toMatchObject({ pid: 77 });
+});
+
+it("reports an abandoned daemon child that survived every signal instead of claiming it is gone", async () => {
+  const root = await fixture();
+  const identity = { pid: 4242, startIdentity: "111222333", processGroupId: 4242 };
+  /** @type {any[][]} */
+  const signals = [];
+  const spawned = await identifyDaemonChild({ pid: identity.pid }, async () => identity);
+
+  const abandoned = await abandonDaemonStartChild(spawned, {
+    root,
+    inspect: async (/** @type {number} */ pid) => (pid === process.pid ? selfIdentity : identity),
+    signalProcessGroup: (/** @type {number} */ pgid, /** @type {string} */ signal) => { signals.push([pgid, signal]); },
+    stopPolicy: { gracefulMs: 1, terminateMs: 1 },
+  });
+
+  expect(signals).toEqual([[4242, "SIGTERM"], [4242, "SIGKILL"]]);
+  expect(abandoned).toMatchObject({ pid: 4242, proven: false, disposition: "KILL_REQUESTED" });
 });
 
 it("refuses an unowned socket instead of unlinking a possibly live daemon", async () => {

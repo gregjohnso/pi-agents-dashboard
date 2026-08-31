@@ -15,7 +15,9 @@ async function main() {
     process.stderr.write(`${/** @type {any} */ (error)?.code ?? "STATE_ROOT_UNUSABLE"}: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
   }
-  if (adoption.message !== undefined) process.stderr.write(`${adoption.message}\n`);
+  // Marked as a notice because it is one: adoption succeeded and this run continues on the root it
+  // names. Unmarked, it stood alone on stderr above a real error and was read as the failure.
+  if (adoption.message !== undefined) process.stderr.write(`notice: ${adoption.message}\n`);
   process.env.PI_AGENTS_STATE_DIR = adoption.root;
 
   const { runCli } = await import(new URL("../cli/main.mjs", import.meta.url).href);

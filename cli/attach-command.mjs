@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { exactId, loadCliClientIdentity, resolveRuntimeRoot } from "./session-commands.mjs";
+import { describeAuthenticationRefusal, exactId, loadCliClientIdentity, resolveRuntimeRoot } from "./session-commands.mjs";
 
 const MAX_FRAME_BYTES = 1024 * 1024;
 
@@ -43,7 +43,14 @@ export async function attachSession(sessionId, options = {}) {
   if (!exactId(sessionId)) return { code: 2, error: { code: "INVALID_SYNTAX", message: "Usage: pi-agents attach <full-session-id>" } };
   const root = options.root ?? resolveRuntimeRoot(options.env);
   const clientId = await loadCliClientIdentity({ root, randomId: options.randomId });
-  const connection = await (options.connect ?? defaultConnect)({ root, clientId, sessionId });
+  /** @type {any} */
+  let connection;
+  try {
+    connection = await (options.connect ?? defaultConnect)({ root, clientId, sessionId });
+  } catch (error) {
+    const described = await describeAuthenticationRefusal(root, error);
+    return { code: 1, error: { code: described?.code ?? "ATTACH_FAILED", message: described instanceof Error ? described.message : "Attach failed" } };
+  }
   /** @type {any} */
   let viewer;
   let attached = false;

@@ -6,6 +6,8 @@ import { join } from "node:path";
 
 import { afterEach, expect, it, vi } from "vitest";
 
+import { CLIENT_PROTOCOL } from "../shared/contracts.mjs";
+import { startPreviousReleaseDaemon } from "../test/previous-release-daemon.mjs";
 import { resolveRuntimeRoot, runDaemonCommand } from "./daemon-commands.mjs";
 
 const roots = [];
@@ -15,6 +17,50 @@ async function stateRoot() {
   const root = await mkdtemp(join(tmpdir(), "dashboard-daemon-cli-"));
   roots.push(root);
   return root;
+}
+
+const liveSession = { sessionId: "live-session", revision: 4, processState: "LIVE", ownership: { runId: "run" } };
+
+/**
+ * Run one daemon command against a real socket served by the previous release, with this file's
+ * usual process-identity seams: only the protocol behaviour is real, as it is in every other case here.
+ * @param {string} command @param {{ expectStop?: boolean } & Record<string, any>} [options]
+ */
+async function againstPreviousRelease(command, { expectStop = true, ...options } = {}) {
+  const root = await stateRoot();
+  const daemon = await startPreviousReleaseDaemon(root, { sessions: [liveSession] });
+  const publication = { pid: daemon.pid, startIdentity: "111222333", processGroupId: daemon.pid, tokenPath: daemon.tokenPath };
+  /** @type {any[]} */
+  const signalled = [];
+  /** @type {string[][]} */
+  const spawned = [];
+  let stopped = false;
+  try {
+    const result = await runDaemonCommand(command, {
+      root,
+      inspect: async () => {
+        if (stopped) throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+        return publication;
+      },
+      inspectEndpoint: async () => stopped
+        ? (spawned.length === 0 ? { status: "ABSENT" } : { status: "HEALTHY", daemonState: "READY", publication: { ...publication, pid: 5000 } })
+        : { status: "HEALTHY", daemonState: "READY", publication },
+      stopProcessGroup: async (/** @type {any} */ ownership, /** @type {any} */ deps) => {
+        signalled.push(ownership);
+        await deps.requestGraceful(ownership);
+        stopped = true;
+        return { disposition: "GRACEFUL" };
+      },
+      spawnDaemon: (/** @type {string} */ _file, /** @type {string[]} */ argv) => { spawned.push(argv); return { once() {} }; },
+      ...options,
+    });
+    // The control stop frame is written and its socket destroyed before the command returns, so the
+    // daemon side of it lands after that. Bounded so a lost frame fails as an assertion, not a hang.
+    if (expectStop) await Promise.race([daemon.stopped, new Promise((settle) => setTimeout(settle, 10_000))]);
+    return { result, daemon, signalled, spawned, publication };
+  } finally {
+    await daemon.close();
+  }
 }
 
 it("uses one per-user state root regardless of effective Pi config root", () => {
@@ -311,5 +357,81 @@ it("probes a daemon without declaring the client protocol", async () => {
   } finally {
     await runtime.close();
     await rm(stateRoot, { recursive: true, force: true });
+  }
+});
+
+// The refusal an operator meets on a current daemon, and the one an earlier release could not
+// reach far enough to raise. It moved into stopLiveWorkers with this commit and was untested before.
+it("still refuses a daemon stop while workers are live and --stop-workers is absent", async () => {
+  const publication = { pid: 321, startIdentity: "987654321", processGroupId: 654, tokenPath: "/state/daemon/control.token" };
+  const stopProcessGroup = vi.fn();
+  const result = await runDaemonCommand("stop", {
+    root: "/state",
+    inspectEndpoint: async () => ({ status: "HEALTHY", daemonState: "READY", publication }),
+    heldConnectionRequest: async () => ({ kind: "state", sessions: [liveSession] }),
+    stopProcessGroup,
+  });
+
+  expect(result).toMatchObject({ code: 1, error: { code: "WORKERS_LIVE" }, result: { kind: "live_workers", sessionIds: ["live-session"] } });
+  expect(stopProcessGroup).not.toHaveBeenCalled();
+});
+
+// Operator-visible failure, 2026-08-31: probing an older daemon is not restarting one. The stop the
+// restart runs first opened a frontend connection only to read `get_state` for its live-worker
+// check, and the previous release refused that connection's authentication frame, so
+// `pi-agents daemon restart` failed with AUTHENTICATION_FAILED during the one release that
+// requires a restart. The restart never needed those rows: it stops the daemon whatever they say.
+it("restarts a daemon from the previous release without opening a frontend connection", async () => {
+  const { result, daemon, signalled, spawned } = await againstPreviousRelease("restart");
+
+  expect(result).toMatchObject({ code: 0, result: { kind: "daemon_started", alreadyRunning: false } });
+  expect(daemon.refusals).toEqual([]);
+  expect(daemon.requests).toEqual([]);
+  expect(daemon.stopRequests).toHaveLength(1);
+  expect(signalled).toEqual([{ pid: daemon.pid, startIdentity: "111222333", processGroupId: daemon.pid }]);
+  expect(spawned).toHaveLength(1);
+});
+
+// Operator-visible failure, 2026-08-31: with four live workers, this daemon's only accepted escape
+// was --stop-workers, which would have stopped all four sessions.
+it("stops a daemon from the previous release without --stop-workers and without stopping a worker", async () => {
+  const { result, daemon, signalled } = await againstPreviousRelease("stop");
+
+  expect(result).toMatchObject({ code: 0, result: { kind: "daemon_stopped", stoppedSessionIds: [] } });
+  // The one frame in this path the previous release cannot answer: the frontend authentication
+  // frame the live-worker read needs, refused for its unknown `clientProtocol` key.
+  expect(daemon.refusals).toEqual([{ version: 1, token: daemon.token, clientProtocol: CLIENT_PROTOCOL }]);
+  expect(daemon.requests).toEqual([]);
+  expect(daemon.stopRequests).toHaveLength(1);
+  expect(signalled).toEqual([{ pid: daemon.pid, startIdentity: "111222333", processGroupId: daemon.pid }]);
+});
+
+it("refuses --stop-workers against a daemon from the previous release, naming the release and the restart", async () => {
+  const { result, daemon, signalled } = await againstPreviousRelease("stop", { stopWorkers: true, yes: true, expectStop: false });
+
+  expect(result).toMatchObject({ code: 1, error: { code: "DAEMON_FROM_EARLIER_RELEASE", message: expect.stringContaining("pi-agents daemon restart") } });
+  expect(daemon.requests).toEqual([]);
+  expect(daemon.stopRequests).toEqual([]);
+  expect(signalled).toEqual([]);
+});
+
+// The spike proved a forged or malformed frame is refused. Naming an older release must not become
+// a way to read a refused token as a version problem.
+it("keeps a refused token a refused token rather than an earlier release", async () => {
+  const root = await stateRoot();
+  const daemon = await startPreviousReleaseDaemon(root, { token: "server-token" });
+  await writeFile(join(root, "daemon", "control.token"), "wrong-token\n", { mode: 0o600 });
+  const publication = { pid: daemon.pid, startIdentity: "111222333", processGroupId: daemon.pid, tokenPath: daemon.tokenPath };
+  const stopProcessGroup = vi.fn();
+  try {
+    await expect(runDaemonCommand("stop", {
+      root,
+      inspect: async () => publication,
+      inspectEndpoint: async () => ({ status: "HEALTHY", daemonState: "READY", publication }),
+      stopProcessGroup,
+    })).rejects.toMatchObject({ code: "AUTHENTICATION_FAILED" });
+    expect(stopProcessGroup).not.toHaveBeenCalled();
+  } finally {
+    await daemon.close();
   }
 });

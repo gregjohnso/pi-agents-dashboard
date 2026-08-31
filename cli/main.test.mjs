@@ -1,5 +1,11 @@
-import { expect, it, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
+import { afterEach, expect, it, vi } from "vitest";
+
+import { CLIENT_PROTOCOL } from "../shared/contracts.mjs";
+import { startPreviousReleaseDaemon } from "../test/previous-release-daemon.mjs";
 import { runCli } from "./main.mjs";
 
 function capture() {
@@ -7,6 +13,17 @@ function capture() {
   const stderr = [];
   return { stdout, stderr, io: { stdout: { write: (value) => { stdout.push(String(value)); } }, stderr: { write: (value) => { stderr.push(String(value)); } } } };
 }
+
+const roots = [];
+afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
+
+async function stateRoot() {
+  const root = await mkdtemp(join(tmpdir(), "pi-agents-cli-main-"));
+  roots.push(root);
+  return root;
+}
+
+const EARLIER_RELEASE_LINE = `DAEMON_FROM_EARLIER_RELEASE: This daemon is from an earlier release and refused this client's protocol ${CLIENT_PROTOCOL} authentication. Run \`pi-agents daemon restart\` to restart it on this release; the restart stops no running session.`;
 
 it("opens the list from empty argv and preserves startup cwd", async () => {
   const openApp = vi.fn(async () => {});
@@ -127,4 +144,35 @@ it.each([
   const runSessionCommand = vi.fn(async () => ({ code: 0, result: { kind: "command", status: { stage: "COMPLETED" } } }));
   expect(await runCli(["session", ...argv], { io: capture().io, runSessionCommand })).toBe(0);
   expect(runSessionCommand).toHaveBeenCalledWith(argv, undefined);
+});
+
+// Operator-visible failure, 2026-08-31: against a daemon from the previous release these printed
+// INVALID_DAEMON_AUTHENTICATION and AUTHENTICATION_FAILED, which name no cause and no action, one
+// line under a state-root adoption notice the operator reasonably read as the error.
+it.each([
+  ["logs", ["logs", "exact-session-id"]],
+  ["stop", ["stop", "exact-session-id", "--revision", "4", "--yes"]],
+])("tells the operator that an earlier release refused %s, and names the command that fixes it", async (_name, argv) => {
+  const root = await stateRoot();
+  const daemon = await startPreviousReleaseDaemon(root);
+  const output = capture();
+  try {
+    expect(await runCli(argv, { io: output.io, sessionOptions: { root } })).toBe(1);
+  } finally {
+    await daemon.close();
+  }
+  expect(output.stdout).toEqual([]);
+  expect(output.stderr.join("")).toBe(`${EARLIER_RELEASE_LINE}\n`);
+});
+
+it("names the earlier release in the agents JSON the operator ran", async () => {
+  const root = await stateRoot();
+  const daemon = await startPreviousReleaseDaemon(root);
+  const output = capture();
+  try {
+    expect(await runCli(["agents", "--json"], { io: output.io, sessionOptions: { root } })).toBe(1);
+  } finally {
+    await daemon.close();
+  }
+  expect(JSON.parse(output.stdout[0])).toEqual({ ok: false, code: "DAEMON_FROM_EARLIER_RELEASE", message: EARLIER_RELEASE_LINE.slice("DAEMON_FROM_EARLIER_RELEASE: ".length) });
 });

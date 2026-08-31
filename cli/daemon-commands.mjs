@@ -144,6 +144,52 @@ async function waitForProcessExit(publication, inspect) {
   }
 }
 
+/**
+ * Read the live workers a daemon stop must account for, and stop them when the operator asked to.
+ *
+ * The read needs a frontend connection, and a daemon from an earlier release refuses this release's
+ * authentication frame on one. Stopping the daemon signals the daemon's own process group and no
+ * other, so the stop continues without those rows rather than leaving the operator a refusal whose
+ * only escape stops every live session. `--stop-workers` cannot continue: it exists to signal those
+ * workers, so it names the release that refused instead.
+ *
+ * @param {string} root @param {any} options
+ * @returns {Promise<{ refusal?: any, stoppedSessionIds: string[] }>}
+ */
+async function stopLiveWorkers(root, options) {
+  const clientId = options.request === undefined && options.heldConnectionRequest === undefined ? await loadCliClientIdentity({ root, randomId: options.randomId }) : undefined;
+  /** @type {any} */
+  let persistent;
+  /** @type {any} */
+  let request;
+  /** @type {any} */
+  let state;
+  try {
+    // A worker Stop only answers after the daemon's own SIGTERM-then-SIGKILL escalation, so a shorter deadline reports a false ambiguous delivery.
+    persistent = clientId === undefined ? undefined : await (options.createPersistentRequester ?? createPersistentDaemonRequester)({ root, clientId, timeoutMs: await destructiveRequestTimeoutMs(root, undefined, options.timeoutMs) });
+    request = options.heldConnectionRequest ?? persistent?.request ?? options.request ?? createDaemonRequester({ root, clientId, timeoutMs: options.timeoutMs });
+    state = await request("get_state", {});
+  } catch (error) {
+    await persistent?.close();
+    if (/** @type {any} */ (error)?.code !== "DAEMON_FROM_EARLIER_RELEASE") throw error;
+    if (options.stopWorkers !== true) return { stoppedSessionIds: [] };
+    return { refusal: { code: 1, error: { code: "DAEMON_FROM_EARLIER_RELEASE", message: /** @type {Error} */ (error).message } }, stoppedSessionIds: [] };
+  }
+  try {
+    const liveSessions = state.sessions.filter((/** @type {any} */ record) => record.ownership !== undefined || ["LIVE", "SLEEPING"].includes(record.processState));
+    if (liveSessions.length > 0 && options.allowLiveWorkers !== true && (options.stopWorkers !== true || options.yes !== true)) {
+      return { refusal: { code: 1, error: { code: "WORKERS_LIVE", message: "Daemon stop requires --stop-workers --yes while workers are live" }, result: { kind: "live_workers", sessionIds: liveSessions.map((/** @type {any} */ record) => record.sessionId) } }, stoppedSessionIds: [] };
+    }
+    if (liveSessions.length === 0 || options.stopWorkers !== true) return { stoppedSessionIds: [] };
+    let outcomes;
+    try { outcomes = await Promise.all(liveSessions.map((/** @type {any} */ record) => request("stop", { sessionId: record.sessionId, revision: record.revision }))); }
+    catch (error) { if (/** @type {any} */ (error)?.code === "DELIVERY_UNKNOWN" || (/** @type {any} */ (error)?.code === "CONNECTION_CLOSED" && /** @type {any} */ (error)?.submitted === true)) return { refusal: { code: 1, error: { code: "DELIVERY_UNKNOWN", message: "A worker Stop delivery is ambiguous; daemon remains running" } }, stoppedSessionIds: [] }; throw error; }
+    const refused = outcomes.find((outcome) => outcome?.kind !== "command" || outcome.status?.stage !== "COMPLETED");
+    if (refused !== undefined) return { refusal: { code: 1, error: { code: refused?.status?.stage === "DELIVERY_UNKNOWN" ? "DELIVERY_UNKNOWN" : "WORKER_STOP_REFUSED", message: "A worker stop did not complete; daemon remains running" }, result: refused }, stoppedSessionIds: [] };
+    return { stoppedSessionIds: liveSessions.map((/** @type {any} */ record) => record.sessionId) };
+  } finally { await persistent?.close(); }
+}
+
 async function waitForStatus(root, desired, options, defaultTimeoutMs) {
   const deadline = Date.now() + (options.timeoutMs ?? defaultTimeoutMs);
   let endpoint;
@@ -222,27 +268,13 @@ export async function runDaemonCommand(command, options = {}) {
     const current = await inspectEndpoint(common);
     if (current.status === "ABSENT") return { code: 3, error: { code: "DAEMON_ABSENT", message: "Daemon is not running" } };
     if (current.status !== "HEALTHY") return { code: current.status === "CONFLICT" ? 5 : 1, error: { code: "STOP_REFUSED", message: "Daemon identity is not healthy and exact" } };
-    const clientId = options.request === undefined && options.heldConnectionRequest === undefined ? await loadCliClientIdentity({ root, randomId: options.randomId }) : undefined;
-    // A worker Stop only answers after the daemon's own SIGTERM-then-SIGKILL escalation, so a shorter deadline reports a false ambiguous delivery.
-    const persistent = clientId === undefined ? undefined : await (options.createPersistentRequester ?? createPersistentDaemonRequester)({ root, clientId, timeoutMs: await destructiveRequestTimeoutMs(root, undefined, options.timeoutMs) });
-    const request = options.heldConnectionRequest ?? persistent?.request ?? options.request ?? createDaemonRequester({ root, clientId, timeoutMs: options.timeoutMs });
-    /** @type {string[]} */
-    let stoppedSessionIds = [];
-    try {
-      const state = await request("get_state", {});
-      const liveSessions = state.sessions.filter((record) => record.ownership !== undefined || ["LIVE", "SLEEPING"].includes(record.processState));
-      if (liveSessions.length > 0 && options.allowLiveWorkers !== true && (options.stopWorkers !== true || options.yes !== true)) {
-        return { code: 1, error: { code: "WORKERS_LIVE", message: "Daemon stop requires --stop-workers --yes while workers are live" }, result: { kind: "live_workers", sessionIds: liveSessions.map((record) => record.sessionId) } };
-      }
-      if (liveSessions.length > 0 && options.stopWorkers === true) {
-        let outcomes;
-        try { outcomes = await Promise.all(liveSessions.map((record) => request("stop", { sessionId: record.sessionId, revision: record.revision }))); }
-        catch (error) { if (error?.code === "DELIVERY_UNKNOWN" || (error?.code === "CONNECTION_CLOSED" && error?.submitted === true)) return { code: 1, error: { code: "DELIVERY_UNKNOWN", message: "A worker Stop delivery is ambiguous; daemon remains running" } }; throw error; }
-        const refused = outcomes.find((outcome) => outcome?.kind !== "command" || outcome.status?.stage !== "COMPLETED");
-        if (refused !== undefined) return { code: 1, error: { code: refused?.status?.stage === "DELIVERY_UNKNOWN" ? "DELIVERY_UNKNOWN" : "WORKER_STOP_REFUSED", message: "A worker stop did not complete; daemon remains running" }, result: refused };
-        stoppedSessionIds = liveSessions.map((record) => record.sessionId);
-      }
-    } finally { await persistent?.close(); }
+    // A restart's own stop accounts for no worker: it stops the daemon whatever the rows say, and
+    // opening a frontend connection to read them is what an earlier release refuses.
+    const workers = options.allowLiveWorkers === true && options.stopWorkers !== true
+      ? { stoppedSessionIds: [] }
+      : await stopLiveWorkers(root, options);
+    if (workers.refusal !== undefined) return workers.refusal;
+    const stoppedSessionIds = workers.stoppedSessionIds;
     const ownership = { pid: current.publication.pid, startIdentity: current.publication.startIdentity, processGroupId: current.publication.processGroupId };
     const stop = options.stopProcessGroup ?? stopVerifiedProcessGroup;
     const disposition = await stop(ownership, {

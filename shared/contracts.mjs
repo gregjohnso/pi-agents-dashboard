@@ -34,7 +34,10 @@ const ENVELOPE_KEYS = ["version", "clientId", "requestId", "op", "payload"];
  * a daemon on different sides of either change cannot share a session, so the daemon refuses a
  * frontend that declares anything else at its first request. Worker and control connections
  * deliberately carry no `clientProtocol`: a live worker must survive a daemon replacement, and the
- * daemon-liveness probe must still find and stop an older daemon.
+ * liveness probe and the control stop frame must still reach a daemon from the previous release,
+ * which refuses this key outright. That is why no command-line path opens a frontend connection it
+ * does not need, and why a refused handshake is reported as an earlier release rather than as a
+ * failed authentication.
  */
 export const CLIENT_PROTOCOL = 3;
 /** Operator-chosen row tints, named for the Jobwatch palette. Dashboard metadata; Pi never sees them. */

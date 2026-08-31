@@ -112,7 +112,10 @@ it("adopts from the executable itself, before any command resolves a state root"
   const status = await execFileAsync(process.execPath, [executable, "daemon", "status", "--json"], { env: { PATH: process.env.PATH ?? "", ...env }, encoding: "utf8" }).catch((/** @type {any} */ error) => error);
 
   expect(status.code).toBe(3);
-  expect(status.stderr).toContain(`Adopted ${previousRoot} as ${root}`);
+  // The operator read this line as the failure, because it stood alone on stderr above a real
+  // error and looked exactly like one. Adoption succeeded and the command continued past it.
+  expect(status.stderr.split("\n").find((/** @type {string} */ line) => line.includes("Adopted ")))
+    .toBe(`notice: Adopted ${previousRoot} as ${root}: the directory was renamed in place, keeping every session.`);
   expect(JSON.parse(status.stdout)).toMatchObject({ result: { kind: "daemon_status", root, status: "ABSENT" } });
   expect(await readdir(parent)).toEqual(["pi-agents"]);
   expect((await readdir(join(root, "sessions"))).sort()).toEqual(["alpha.json", "beta.json", "delta.json", "gamma.json"]);

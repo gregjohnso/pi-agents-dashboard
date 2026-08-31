@@ -177,6 +177,9 @@ export async function loadCliClientIdentity({
   }, { timeoutMs: lockTimeoutMs, operation: "client_identity", busyMessage: "CLI client identity lock remained held", fsOps, inspect });
 }
 
+/** Codes a daemon's refusal of this client's authentication frame arrives as, on either requester. */
+const AUTHENTICATION_REFUSAL_CODES = new Set(["AUTHENTICATION_FAILED", "INVALID_DAEMON_AUTHENTICATION"]);
+
 /** @param {unknown} value */
 function validateAuthentication(value) {
   const invalid = () => Object.assign(new Error("Daemon authentication frame is invalid"), { code: "INVALID_DAEMON_AUTHENTICATION" });
@@ -216,6 +219,63 @@ function validateExpectedResult(op, payload, clientId, requestId, result) {
   }
 }
 
+/**
+ * Offer the authentication frame every release has accepted, version and token alone, and report
+ * whether this daemon authenticates it. That is the frame the liveness probe sends.
+ * @param {{ root: string, createConnection?: typeof net.createConnection, maxBytes?: number, timeoutMs?: number }} options
+ */
+async function daemonAuthenticatesTokenAlone({ root, createConnection = net.createConnection, maxBytes = 1024 * 1024, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS }) {
+  /** @type {string} */
+  let token;
+  try { token = (await fs.readFile(join(root, "daemon", "control.token"), "utf8")).trim(); } catch { return false; }
+  const encoder = createJsonlEncoder({ maxBytes });
+  const decoder = createJsonlDecoder({ maxBytes });
+  return new Promise((resolveProbe) => {
+    const socket = createConnection(join(root, "daemon", "control.sock"));
+    let settled = false;
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    /** @param {boolean} value */
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolveProbe(value);
+    };
+    socket.once("connect", () => socket.write(encoder.encode({ version: 1, token })));
+    socket.on("data", (chunk) => {
+      try {
+        const frames = decoder.push(chunk);
+        if (frames.length === 0) return;
+        validateAuthentication(frames[0]);
+        finish(true);
+      } catch { finish(false); }
+    });
+    socket.once("error", () => finish(false));
+    socket.once("close", () => finish(false));
+  });
+}
+
+/**
+ * Name a refused handshake the operator can act on, or return the error exactly as it arrived.
+ *
+ * A daemon that refuses this release's authentication frame but authenticates the token alone
+ * refused that frame's `clientProtocol` key, which is what a daemon from before that key does. One
+ * that refuses both was handed a token it does not hold, and that stays the refusal it is today: a
+ * forged or malformed frame must read as forged, never as a version to upgrade past.
+ *
+ * @param {string} root @param {any} error
+ * @param {{ createConnection?: typeof net.createConnection, maxBytes?: number, timeoutMs?: number }} [options]
+ */
+export async function describeAuthenticationRefusal(root, error, options = {}) {
+  if (!AUTHENTICATION_REFUSAL_CODES.has(error?.code)) return error;
+  if (!await daemonAuthenticatesTokenAlone({ root, ...options })) return error;
+  return Object.assign(
+    new Error(`This daemon is from an earlier release and refused this client's protocol ${CLIENT_PROTOCOL} authentication. Run \`pi-agents daemon restart\` to restart it on this release; the restart stops no running session.`),
+    { code: "DAEMON_FROM_EARLIER_RELEASE" },
+  );
+}
+
 /** Create one persistent authenticated request session, held open across a destructive command.
  * @param {{ root?: string, clientId?: string, maxBytes?: number, timeoutMs?: number }} [options]
  */
@@ -223,7 +283,12 @@ export async function createPersistentDaemonRequester({ root = resolveRuntimeRoo
   if (!exactId(clientId)) throw new TypeError("A stable CLI clientId is required");
   const token = (await fs.readFile(join(root, "daemon", "control.token"), "utf8")).trim();
   const client = createDaemonClient({ socketPath: join(root, "daemon", "control.sock"), token, maxBytes, clientId, reconnect: false });
-  await client.connect();
+  try {
+    await client.connect();
+  } catch (error) {
+    await client.close();
+    throw await describeAuthenticationRefusal(root, error, { maxBytes, timeoutMs });
+  }
   return {
     async request(op, payload, requestId = randomUUID()) {
       let timer;
@@ -256,7 +321,7 @@ export async function createPersistentDaemonRequester({ root = resolveRuntimeRoo
 export function createDaemonRequester({ root = resolveRuntimeRoot(), clientId, maxBytes = 1024 * 1024, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, createConnection = net.createConnection } = {}) {
   if (!exactId(clientId)) throw new TypeError("A stable CLI clientId is required");
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new TypeError("timeoutMs must be a positive safe integer");
-  return async (op, payload, requestId = randomUUID()) => {
+  const send = async (/** @type {string} */ op, /** @type {any} */ payload, /** @type {string} */ requestId) => {
     const token = (await fs.readFile(join(root, "daemon", "control.token"), "utf8")).trim();
     const encoder = createJsonlEncoder({ maxBytes });
     const decoder = createJsonlDecoder({ maxBytes });
@@ -332,6 +397,13 @@ export function createDaemonRequester({ root = resolveRuntimeRoot(), clientId, m
       socket.once("end", () => transportClosed());
       socket.once("close", () => transportClosed());
     });
+  };
+  return async (op, payload, requestId = randomUUID()) => {
+    try {
+      return await send(op, payload, requestId);
+    } catch (error) {
+      throw await describeAuthenticationRefusal(root, error, { createConnection, maxBytes, timeoutMs });
+    }
   };
 }
 

@@ -5,7 +5,7 @@ import { mkdir, open, readFile, realpath } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { cleanupStaleDaemon, inspectDaemonEndpoint } from "../runtime/daemon-lifecycle.mjs";
+import { abandonDaemonStartChild, cleanupStaleDaemon, identifyDaemonChild, inspectDaemonEndpoint } from "../runtime/daemon-lifecycle.mjs";
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
 import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "../runtime/process-signaler.mjs";
@@ -204,14 +204,20 @@ export async function runDaemonCommand(command, options = {}) {
     try {
       const child = (options.spawnDaemon ?? spawnDaemon)(entry, argv, options.env ?? process.env, capture?.handle.fd ?? "ignore");
       child.once?.("error", () => {});
+      // Read before the wait, not after it: at the deadline this PID may already name someone else.
+      const spawned = await identifyDaemonChild(child, inspect);
       const endpoint = await waitForStatus(root, ["HEALTHY", "CONFLICT"], { ...options, inspect, probe, probeTimeoutMs, inspectEndpoint, requireReady: true, child }, DAEMON_START_DEADLINE_MS);
       if (endpoint?.status === "HEALTHY") return { code: 0, result: { kind: "daemon_started", alreadyRunning: false, root, publication: endpoint.publication } };
+      // Every remaining path gives up on this child, and a child nobody stops publishes itself
+      // seconds later and owns the root forever.
+      const abandoned = await abandonDaemonStartChild(spawned, { ...common, signalProcessGroup: options.signalProcessGroup, sleep: options.sleep, cleanupStale: options.cleanupStale, stopPolicy: options.stopPolicy ?? DEFAULT_STOP_POLICY });
       if (endpoint?.status === "CONFLICT" || (endpoint?.status === "PROCESS_EXITED" && endpoint.exitCode === 5)) return { code: 5, error: { code: "DAEMON_RECOVERY_CONFLICT", message: "Daemon recovery found an ownership conflict" } };
-      const summary = endpoint?.status === "PROCESS_EXITED"
+      const reason = endpoint?.status === "PROCESS_EXITED"
         ? `Daemon exited with code ${endpoint.exitCode} before becoming healthy`
         : endpoint?.status === "PROCESS_FAILED"
           ? `Daemon could not be spawned: ${endpoint.error instanceof Error ? endpoint.error.message : String(endpoint.error)}`
           : "Daemon did not become healthy before the startup deadline";
+      const summary = abandoned.summary === undefined ? reason : `${reason}; ${abandoned.summary}`;
       const output = await readStartupOutput(capture);
       return { code: 1, error: { code: "DAEMON_START_FAILED", message: output !== "" ? `${summary}:\n${output}` : capture === undefined ? summary : `${summary}; ${capture.path} is empty` } };
     } finally {

@@ -1,6 +1,8 @@
+import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { afterEach, expect, it } from "vitest";
 
@@ -64,6 +66,23 @@ async function listSessionsThroughDaemon(root) {
   }
 }
 
+/**
+ * List the daemon processes started against exactly one state root.
+ *
+ * The root is a `mkdtemp` path this test owns, so an exact `--root <root>` argument match cannot
+ * name a daemon belonging to the operator or to a concurrently running suite.
+ *
+ * @param {string} root
+ * @returns {number[]}
+ */
+function daemonsRootedAt(root) {
+  const listing = execFileSync("ps", ["-eo", "pid=,args="], { encoding: "utf8" });
+  return listing.split("\n")
+    .filter((line) => line.includes("runtime/daemon.mjs") && line.includes(`--root ${root}`))
+    .map((line) => Number(line.trim().split(/\s+/u)[0]))
+    .filter((pid) => Number.isSafeInteger(pid));
+}
+
 /** @param {any} identity */
 async function stillRunning(identity) {
   try {
@@ -83,6 +102,27 @@ it("starts against the sessions the operator already has when no root is given",
   startedRoots.push(started.result.root);
 
   expect(await listSessionsThroughDaemon(started.result.root)).toEqual([...sessionIds].sort());
+}, 120_000);
+
+it("stops the daemon child a start gave up on instead of leaving it to publish itself", async () => {
+  // A start that reached its deadline returned DAEMON_START_FAILED and left its detached child
+  // running; the child published itself seconds later and lived forever. 47 such daemons leaked in
+  // one night, the oldest up 38 hours. A deadline far below a real cold start forces that window.
+  const { previousRoot, env } = await stateParent(["alpha"]);
+
+  // Registered before the assertions: a regression leaves a live daemon that teardown must reap.
+  startedRoots.push(previousRoot);
+  const started = await runDaemonCommand("start", { root: previousRoot, env, timeoutMs: 200 });
+  expect(started).toMatchObject({ code: 1, error: { code: "DAEMON_START_FAILED" } });
+
+  // The leak was visible only after the abandoned child finished starting, so absence has to be
+  // observed past the point where it would have published itself.
+  await delay(5_000);
+  expect(daemonsRootedAt(previousRoot)).toEqual([]);
+  // A stopped child that had already published must not leave the endpoint that refuses the
+  // operator's next start with STALE_ENDPOINT_REQUIRES_RECOVER.
+  const restarted = await runDaemonCommand("start", { root: previousRoot, env, timeoutMs: STARTUP_DEADLINE_MS });
+  expectDaemonCommand("start", restarted, { code: 0, result: { kind: "daemon_started", alreadyRunning: false } });
 }, 120_000);
 
 it("replaces the daemon on restart, leaving one process and a publication that names it", async () => {

@@ -640,7 +640,6 @@ export async function createDaemonRuntime({
   stopPolicy = DEFAULT_STOP_POLICY,
   signalProcessGroupImpl = signalProcessGroup,
   sleepImpl = sleep,
-  trashSessionFile,
   broadcastEvent,
   cliVersion,
 } = {}) {
@@ -650,7 +649,6 @@ export async function createDaemonRuntime({
   if (typeof randomId !== "function") throw new TypeError("randomId must be a function");
   if (typeof responseWriter !== "function" || typeof closeFailpoint !== "function" || typeof attachmentFailpoint !== "function" || typeof destructiveFailpoint !== "function" || typeof recordDiagnostic !== "function" || typeof signalProcessGroupImpl !== "function" || typeof sleepImpl !== "function") throw new TypeError("Daemon runtime seams must be functions");
   if (!Number.isSafeInteger(stopPolicy?.gracefulMs) || stopPolicy.gracefulMs <= 0 || !Number.isSafeInteger(stopPolicy?.terminateMs) || stopPolicy.terminateMs <= 0) throw new TypeError("stopPolicy must contain approved positive integer waits");
-  if (trashSessionFile !== undefined && typeof trashSessionFile !== "function") throw new TypeError("trashSessionFile must be a function when supplied");
   await ensureLayout(root);
   const daemonDirectory = join(root, "daemon");
   const tokenPath = join(daemonDirectory, "control.token");
@@ -1515,45 +1513,10 @@ export async function createDaemonRuntime({
               if (lockedMetadata !== undefined || lockedRoute !== undefined || launchingSessions.has(record.sessionId)) return refuse("OWNERSHIP_CONFLICT", "A worker lease, route, or launch is still authoritative");
               const claims = attachmentClaims.get(record.sessionId);
               if (claims !== undefined && [...claims.keys()].some((candidate) => candidate !== socket)) return refuse("SESSION_ATTACHED", "Delete refuses another attached frontend");
-              if (trashSessionFile === undefined) {
-                // Without an approved trash seam, Delete forgets the dashboard record and leaves Pi's session file and worktree untouched.
-                await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
-                await registry.remove(record.sessionId, record.revision);
-                await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-                return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
-              }
-              let original;
-              try {
-                original = recovery?.identity ?? await inspectSessionFile(record.canonicalSessionFile);
-              } catch (error) {
-                return refuse(/** @type {any} */ (error)?.code ?? "SESSION_PATH_UNSAFE", error instanceof Error ? error.message : "Session file identity is unsafe");
-              }
-              await destructiveFailpoint("delete_before_identity_recheck", request, record);
-              const currentIdentity = await inspectSessionFile(record.canonicalSessionFile);
-              if (canonicalJson(currentIdentity) !== canonicalJson(original)) return refuse("SESSION_IDENTITY_MISMATCH", "Session file was replaced before trash");
-              const prepared = recovery ?? await context.deleteResults.prepare(request, record, original);
-              if (recovery === undefined) await destructiveFailpoint("delete_after_prepare", request, record);
-              const exactRecord = await registry.get(record.sessionId);
-              if (exactRecord === undefined || canonicalJson(exactRecord) !== prepared.recordCanonical || !routeSafe(exactRecord)) return refuse("DELETE_REVALIDATION_FAILED", "Session record fingerprint or safety state changed before trash");
+              // Delete forgets the dashboard record and nothing else. Pi's canonical session file and any
+              // managed worktree belong to the operator, so no path beneath either is ever mutated here.
               await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
-              try {
-                await trashSessionFile(prepared.canonicalSessionFile, prepared.identity);
-                await fs.lstat(prepared.canonicalSessionFile).then(() => { throw Object.assign(new Error("Trash seam left the original session file in place"), { code: "TRASH_FAILED" }); }, (error) => { if (error?.code !== "ENOENT") throw error; });
-                await context.deleteResults.markTrashed(request);
-                await destructiveFailpoint("delete_after_trash", request, record);
-                const postTrashRecord = await registry.get(prepared.sessionId);
-                if (postTrashRecord !== undefined && (canonicalJson(postTrashRecord) !== prepared.recordCanonical || !routeSafe(postTrashRecord))) {
-                  await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-                  return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "FAILED", dashboardError("DELETE_RECONCILIATION_REFUSED", "Post-trash SessionRecord no longer matches the prepared safety fingerprint"));
-                }
-                if (postTrashRecord !== undefined) await registry.remove(prepared.sessionId, prepared.revision);
-                await destructiveFailpoint("delete_after_registry", request, record);
-              } catch (error) {
-                await fs.lstat(prepared.canonicalSessionFile).then(() => {}, async (missing) => { if (missing?.code === "ENOENT") await context.deleteResults.markTrashed(request).catch(() => {}); });
-                const current = await context.recovery.journal.get(request);
-                if (current?.stage === "DELIVERY_ATTEMPTED") return context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
-                throw error;
-              }
+              await registry.remove(record.sessionId, record.revision);
               await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
               return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
             });

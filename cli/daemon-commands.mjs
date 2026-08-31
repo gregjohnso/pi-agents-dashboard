@@ -37,7 +37,18 @@ export async function daemonEntryPoint() {
   return realpath(resolve(dirname(fileURLToPath(import.meta.url)), "../runtime/daemon.mjs"));
 }
 
-export async function probeDaemon(publication, { timeoutMs = 500 } = {}) {
+// The liveness probe is a socket round trip with no request in it, but it still waits behind
+// whatever the daemon's event loop is already doing. Measured on this box at 1-minute load 7.04:
+// one daemon holding 400 session rows, with 48 concurrent clients reading `get_state`, answered 31
+// probes with a median of 380 ms, a worst of 557 ms, and 7 of them over 500 ms. The former 500 ms
+// default therefore read a healthy daemon as UNHEALTHY under ordinary client load, which refused
+// `daemon start` with DAEMON_UNHEALTHY and `daemon stop` with STOP_REFUSED on the single pre-flight
+// probe. 5 s is nine times that worst case and still bounded: a daemon that never answers has to be
+// named rather than hang the command line. Callers on a tighter budget pass `probeTimeoutMs`.
+export const DAEMON_PROBE_TIMEOUT_MS = 5_000;
+
+export async function probeDaemon(publication, { timeoutMs = DAEMON_PROBE_TIMEOUT_MS } = {}) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new TypeError("probe timeoutMs must be a positive safe integer");
   const token = (await readFile(publication.tokenPath, "utf8")).trim();
   const socketPath = join(dirname(publication.tokenPath), "control.sock");
   const encoder = createJsonlEncoder({ maxBytes: 64 * 1024 });
@@ -199,7 +210,7 @@ async function waitForStatus(root, desired, options, defaultTimeoutMs) {
   options.child?.once?.("error", (/** @type {unknown} */ error) => { childFailure ??= { status: "PROCESS_FAILED", error }; });
   while (Date.now() < deadline) {
     if (childFailure !== undefined) return childFailure;
-    endpoint = await options.inspectEndpoint({ root, inspect: options.inspect, probe: options.probe });
+    endpoint = await options.inspectEndpoint({ root, inspect: options.inspect, probe: options.probe, probeTimeoutMs: options.probeTimeoutMs });
     if (desired.includes(endpoint.status) && (!options.requireReady || endpoint.status !== "HEALTHY" || endpoint.daemonState === "READY" || endpoint.daemonState === undefined)) return endpoint;
     await new Promise((resolveWait) => setTimeout(resolveWait, 25));
   }
@@ -221,7 +232,8 @@ export async function runDaemonCommand(command, options = {}) {
   const inspect = options.inspect ?? inspectProcessIdentity;
   const probe = options.probe ?? probeDaemon;
   const inspectEndpoint = options.inspectEndpoint ?? inspectDaemonEndpoint;
-  const common = { root, inspect, probe };
+  const probeTimeoutMs = options.probeTimeoutMs ?? DAEMON_PROBE_TIMEOUT_MS;
+  const common = { root, inspect, probe, probeTimeoutMs };
   if (command === "status") {
     const endpoint = await inspectEndpoint(common);
     const code = endpoint.status === "HEALTHY" && endpoint.daemonState !== undefined && endpoint.daemonState !== "READY" ? 1 : STATUS_CODES[endpoint.status] ?? 1;
@@ -238,7 +250,7 @@ export async function runDaemonCommand(command, options = {}) {
     try {
       const child = (options.spawnDaemon ?? spawnDaemon)(entry, argv, options.env ?? process.env, capture?.handle.fd ?? "ignore");
       child.once?.("error", () => {});
-      const endpoint = await waitForStatus(root, ["HEALTHY", "CONFLICT"], { ...options, inspect, probe, inspectEndpoint, requireReady: true, child }, DAEMON_START_DEADLINE_MS);
+      const endpoint = await waitForStatus(root, ["HEALTHY", "CONFLICT"], { ...options, inspect, probe, probeTimeoutMs, inspectEndpoint, requireReady: true, child }, DAEMON_START_DEADLINE_MS);
       if (endpoint?.status === "HEALTHY") return { code: 0, result: { kind: "daemon_started", alreadyRunning: false, root, publication: endpoint.publication } };
       if (endpoint?.status === "CONFLICT" || (endpoint?.status === "PROCESS_EXITED" && endpoint.exitCode === 5)) return { code: 5, error: { code: "DAEMON_RECOVERY_CONFLICT", message: "Daemon recovery found an ownership conflict" } };
       const summary = endpoint?.status === "PROCESS_EXITED"
@@ -284,7 +296,7 @@ export async function runDaemonCommand(command, options = {}) {
       sleep: options.sleep ?? sleep,
     }, options.stopPolicy ?? DEFAULT_STOP_POLICY);
     if (["STALE_IDENTITY", "AMBIGUOUS_IDENTITY", "CANCELLED"].includes(disposition.disposition)) return { code: 5, error: { code: "DAEMON_IDENTITY_CONFLICT", message: `Daemon stop refused at exact identity boundary: ${disposition.disposition}` } };
-    let endpoint = await waitForStatus(root, ["ABSENT", "STALE"], { ...options, inspect, probe, inspectEndpoint }, DAEMON_STOP_DEADLINE_MS);
+    let endpoint = await waitForStatus(root, ["ABSENT", "STALE"], { ...options, inspect, probe, probeTimeoutMs, inspectEndpoint }, DAEMON_STOP_DEADLINE_MS);
     if (endpoint?.status === "STALE") {
       try {
         await (options.cleanupStale ?? cleanupStaleDaemon)(common);

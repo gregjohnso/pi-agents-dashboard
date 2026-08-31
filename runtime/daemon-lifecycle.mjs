@@ -64,8 +64,8 @@ function probeState(probeResult) {
   return { reachable: false };
 }
 
-/** @param {{ root: string, inspect(pid: number): Promise<any>, probe?(publication: any): Promise<boolean | Record<string, unknown>>, fsOps?: any }} options */
-export async function inspectDaemonEndpoint({ root, inspect, probe = async () => false, fsOps = fs }) {
+/** @param {{ root: string, inspect(pid: number): Promise<any>, probe?(publication: any, options: { timeoutMs?: number }): Promise<boolean | Record<string, unknown>>, probeTimeoutMs?: number, fsOps?: any }} options */
+export async function inspectDaemonEndpoint({ root, inspect, probe = async () => false, probeTimeoutMs, fsOps = fs }) {
   const publication = await readPublication(root, fsOps);
   if (publication === undefined) return { status: "ABSENT", canCleanup: false };
   let actual;
@@ -79,7 +79,7 @@ export async function inspectDaemonEndpoint({ root, inspect, probe = async () =>
   /** @type {any} */
   let reported = { reachable: false };
   try {
-    reported = probeState(await probe?.(publication));
+    reported = probeState(await probe?.(publication, { timeoutMs: probeTimeoutMs }));
   } catch {
   }
   if (reported.reachable && (reported.state === "FAILED" || reported.state === "CONFLICT")) {
@@ -154,8 +154,8 @@ async function acquireRecoverableLock(path, owner, inspect, fsOps) {
   }
 }
 
-/** @param {{ root: string, inspect(pid: number): Promise<any>, probe?: (publication: any) => Promise<boolean | Record<string, unknown>>, fsOps?: any }} options */
-export async function cleanupStaleDaemon({ root, inspect, probe, fsOps = fs }) {
+/** @param {{ root: string, inspect(pid: number): Promise<any>, probe?: (publication: any, options: { timeoutMs?: number }) => Promise<boolean | Record<string, unknown>>, probeTimeoutMs?: number, fsOps?: any }} options */
+export async function cleanupStaleDaemon({ root, inspect, probe, probeTimeoutMs, fsOps = fs }) {
   const daemon = join(root, "daemon");
   let cleanupIdentity;
   try {
@@ -165,9 +165,9 @@ export async function cleanupStaleDaemon({ root, inspect, probe, fsOps = fs }) {
   }
   const transaction = await acquireRecoverableLock(join(daemon, "lifecycle.transaction.lock"), { pid: cleanupIdentity.pid, startIdentity: cleanupIdentity.startIdentity, processGroupId: cleanupIdentity.processGroupId }, inspect, fsOps);
   try {
-    const endpoint = await inspectDaemonEndpoint({ root, inspect, probe, fsOps });
+    const endpoint = await inspectDaemonEndpoint({ root, inspect, probe, probeTimeoutMs, fsOps });
     if (endpoint.status !== "STALE" || endpoint.canCleanup !== true) throw new DaemonLifecycleError("UNSAFE_STALE_CLEANUP", "Exact daemon identity does not authorize endpoint cleanup");
-    const revalidated = await inspectDaemonEndpoint({ root, inspect, probe, fsOps });
+    const revalidated = await inspectDaemonEndpoint({ root, inspect, probe, probeTimeoutMs, fsOps });
     if (revalidated.status !== "STALE" || !samePublication(revalidated.publication, endpoint.publication)) throw new DaemonLifecycleError("DAEMON_IDENTITY_CONFLICT", "Daemon identity changed during stale cleanup");
     await removeLegacyLockIfStale(join(daemon, "lifecycle.lock"), inspect, fsOps);
     await fsOps.rm(join(daemon, "control.sock"), { force: true });
@@ -178,8 +178,8 @@ export async function cleanupStaleDaemon({ root, inspect, probe, fsOps = fs }) {
   }
 }
 
-/** @param {{ root: string, identity: any, daemonEpoch: string, tokenPath: string, inspect(pid: number): Promise<any>, probe?: (publication: any) => Promise<boolean | Record<string, unknown>>, now?: () => string, fsOps?: any }} options */
-export async function claimDaemonLifecycle({ root, identity, daemonEpoch, tokenPath, inspect, probe = async () => false, now = () => new Date().toISOString(), fsOps = fs }) {
+/** @param {{ root: string, identity: any, daemonEpoch: string, tokenPath: string, inspect(pid: number): Promise<any>, probe?: (publication: any, options: { timeoutMs?: number }) => Promise<boolean | Record<string, unknown>>, probeTimeoutMs?: number, now?: () => string, fsOps?: any }} options */
+export async function claimDaemonLifecycle({ root, identity, daemonEpoch, tokenPath, inspect, probe = async () => false, probeTimeoutMs, now = () => new Date().toISOString(), fsOps = fs }) {
   validateIdentity(identity);
   const daemon = join(root, "daemon");
   let transaction;
@@ -187,7 +187,7 @@ export async function claimDaemonLifecycle({ root, identity, daemonEpoch, tokenP
     transaction = await acquireRecoverableLock(join(daemon, "lifecycle.transaction.lock"), identity, inspect, fsOps);
   } catch (error) {
     if (error instanceof DaemonLifecycleError && error.code === "DAEMON_ALREADY_RUNNING") {
-      const endpoint = await inspectDaemonEndpoint({ root, inspect, probe, fsOps });
+      const endpoint = await inspectDaemonEndpoint({ root, inspect, probe, probeTimeoutMs, fsOps });
       if (endpoint.status === "HEALTHY" || endpoint.status === "UNHEALTHY") throw new DaemonLifecycleError("DAEMON_ALREADY_RUNNING", "A verified daemon already owns the per-user endpoint");
       throw new DaemonLifecycleError("DAEMON_BUSY", "A live daemon lifecycle transaction has not published a stable endpoint", { cause: error });
     }
@@ -196,11 +196,11 @@ export async function claimDaemonLifecycle({ root, identity, daemonEpoch, tokenP
 
   let lock;
   try {
-    const endpoint = await inspectDaemonEndpoint({ root, inspect, probe, fsOps });
+    const endpoint = await inspectDaemonEndpoint({ root, inspect, probe, probeTimeoutMs, fsOps });
     if (endpoint.status === "HEALTHY" || endpoint.status === "UNHEALTHY") throw new DaemonLifecycleError("DAEMON_ALREADY_RUNNING", "A verified daemon already owns the per-user endpoint");
     if (endpoint.status === "CONFLICT") throw new DaemonLifecycleError("DAEMON_IDENTITY_CONFLICT", "Daemon publication ownership cannot be verified");
     if (endpoint.status === "STALE") {
-      const revalidated = await inspectDaemonEndpoint({ root, inspect, probe, fsOps });
+      const revalidated = await inspectDaemonEndpoint({ root, inspect, probe, probeTimeoutMs, fsOps });
       if (revalidated.status !== "STALE" || !samePublication(revalidated.publication, endpoint.publication)) throw new DaemonLifecycleError("DAEMON_IDENTITY_CONFLICT", "Daemon identity changed during stale recovery");
       await removeLegacyLockIfStale(join(daemon, "lifecycle.lock"), inspect, fsOps);
       await fsOps.rm(join(daemon, "control.sock"), { force: true });

@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { writeSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,7 +9,7 @@ import { afterEach, expect, it, vi } from "vitest";
 
 import { CLIENT_PROTOCOL } from "../shared/contracts.mjs";
 import { startPreviousReleaseDaemon } from "../test/previous-release-daemon.mjs";
-import { resolveRuntimeRoot, runDaemonCommand } from "./daemon-commands.mjs";
+import { DAEMON_PROBE_TIMEOUT_MS, probeDaemon, resolveRuntimeRoot, runDaemonCommand } from "./daemon-commands.mjs";
 
 const roots = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
@@ -339,6 +340,77 @@ it("maps absent, unhealthy, and identity-conflict status to stable exit codes", 
     const result = await runDaemonCommand("status", { root: "/state", inspectEndpoint: async () => ({ status }) });
     expect(result.code).toBe(code);
   }
+});
+
+/**
+ * Serve one control socket that answers the liveness probe only after `delayMs`.
+ *
+ * @param {string} directory @param {number} delayMs
+ * @returns {Promise<{ tokenPath: string, close(): Promise<void> }>}
+ */
+async function slowControlSocket(directory, delayMs) {
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const tokenPath = join(directory, "control.token");
+  await writeFile(tokenPath, "probe-token\n", { mode: 0o600 });
+  /** @type {NodeJS.Timeout[]} */
+  const timers = [];
+  const server = net.createServer((socket) => {
+    socket.once("data", () => {
+      timers.push(setTimeout(() => socket.write(`${JSON.stringify({ version: 1, kind: "authenticated", state: "READY" })}\n`), delayMs));
+    });
+    socket.on("error", () => {});
+  });
+  await new Promise((ready) => server.listen(join(directory, "control.sock"), () => ready(undefined)));
+  return {
+    tokenPath,
+    async close() {
+      for (const timer of timers) clearTimeout(timer);
+      await new Promise((closed) => server.close(() => closed(undefined)));
+    },
+  };
+}
+
+it("reads a healthy daemon that answers slower than half a second as healthy", async () => {
+  // Measured on this box at 1-minute load 7.04: one daemon holding 400 session rows with 48
+  // dashboards reading get_state answered the liveness probe in a median of 380 ms and a worst of
+  // 557 ms, and 7 of 31 probes exceeded 500 ms. Under the old default those reads refused
+  // `daemon start` with DAEMON_UNHEALTHY and `daemon stop` with STOP_REFUSED.
+  const root = await stateRoot();
+  const server = await slowControlSocket(join(root, "daemon"), 900);
+  try {
+    expect(DAEMON_PROBE_TIMEOUT_MS).toBeGreaterThan(900);
+    await expect(probeDaemon({ tokenPath: server.tokenPath })).resolves.toMatchObject({ reachable: true, state: "READY" });
+  } finally {
+    await server.close();
+  }
+}, 20_000);
+
+it("still bounds a probe the caller shortened, so a wedged daemon cannot hang the command", async () => {
+  const root = await stateRoot();
+  const server = await slowControlSocket(join(root, "daemon"), 5_000);
+  try {
+    await expect(probeDaemon({ tokenPath: server.tokenPath }, { timeoutMs: 100 })).resolves.toEqual({ reachable: false });
+  } finally {
+    await server.close();
+  }
+}, 20_000);
+
+it("gives every daemon command's endpoint probe a timeout the caller can choose", async () => {
+  const root = await stateRoot();
+  await mkdir(join(root, "daemon"), { recursive: true, mode: 0o700 });
+  const identity = { pid: 4_310, startIdentity: "430", processGroupId: 4_310 };
+  await writeFile(join(root, "daemon", "pid.json"), JSON.stringify({
+    schemaVersion: 1, ...identity, daemonEpoch: "epoch", tokenPath: join(root, "daemon", "control.token"),
+    startedAt: "2026-08-25T12:00:00.000Z", state: "READY",
+  }), { mode: 0o600 });
+  /** @type {(number | undefined)[]} */
+  const observed = [];
+  const probe = async (/** @type {any} */ _publication, /** @type {any} */ options) => { observed.push(options?.timeoutMs); return true; };
+
+  await runDaemonCommand("status", { root, inspect: async () => identity, probe });
+  await runDaemonCommand("status", { root, inspect: async () => identity, probe, probeTimeoutMs: 12_000 });
+
+  expect(observed).toEqual([DAEMON_PROBE_TIMEOUT_MS, 12_000]);
 });
 
 // Operator-visible failure: this release changes the frontend protocol, so the daemon refuses a

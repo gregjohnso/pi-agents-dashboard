@@ -4,7 +4,6 @@ import * as fs from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
 import { convertLegacyDashboardConfig } from "../shared/config.mjs";
-import { parseClientRequest, parseDaemonResponse } from "../shared/contracts.mjs";
 import { validateSessionRecord } from "./registry-store.mjs";
 import { validateWorkerReplayRecord } from "./worker-replay-contract.mjs";
 
@@ -15,6 +14,9 @@ const CANONICAL_MARKER = "CANONICAL";
 const LEGACY_MARKER = "MIGRATED";
 const LOCK = ".migration.lock";
 const RECONCILIATION_MARKER = ".reconciliation-started";
+const COMMAND_ENVELOPE_KEYS = ["version", "clientId", "requestId", "op", "payload"];
+const COMMAND_STATUS_KEYS = ["clientId", "requestId", "operation", "stage", "acceptedAt", "updatedAt", "error"];
+const COMMAND_STAGES = ["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED", "DELIVERY_UNKNOWN", "FAILED"];
 
 /** @param {string} code @param {string} message @param {Record<string, unknown>} [details] */
 function migrationError(code, message, details = {}) { return Object.assign(new Error(message), { code, ...details }); }
@@ -29,6 +31,42 @@ async function durableFile(path, value, fsOps) {
 function digest(value) { return createHash("sha256").update(value).digest("hex"); }
 /** @param {any} value @param {readonly string[]} keys @param {string} label */
 function exactObject(value, keys, label) { if (typeof value !== "object" || value === null || Array.isArray(value) || Object.keys(value).some((key) => !keys.includes(key))) throw new TypeError(`${label} is invalid`); }
+/** @param {any} value */
+function nonEmptyString(value) { return typeof value === "string" && value.length > 0; }
+/**
+ * Validate one durable journal envelope written by any release.
+ *
+ * Migration reads history, so it cannot judge a record against the operations this release can still
+ * run: an operation was legitimate when its record was written, and deleting the feature does not
+ * corrupt the journal. What must still hold is what makes the record readable and internally
+ * consistent, because a daemon recovering this journal indexes it by client and request and resumes
+ * it from its stage. So the version-1 envelope shape, agreement between command and status on
+ * client, request and operation, a canonical fingerprint, and a stage this release can still
+ * recover are all required; the operation name and the payload shape are not.
+ *
+ * The fingerprint is checked for presence, never recomputed. It covers the command as the writing
+ * release normalized it, and this release's parser drops retired payload keys, so a recomputed
+ * digest would differ for records that are old rather than corrupt.
+ * @param {any} journal
+ */
+function validJournalRecord(journal) {
+  try {
+    exactObject(journal, ["commandCanonical", "command", "status"], "Journal record");
+    const { commandCanonical, command, status } = journal;
+    exactObject(command, COMMAND_ENVELOPE_KEYS, "Journal command");
+    exactObject(status, COMMAND_STATUS_KEYS, "Journal command status");
+    if (command.version !== 1 || !Object.hasOwn(command, "payload")) return false;
+    if (![commandCanonical, command.clientId, command.requestId, command.op].every(nonEmptyString)) return false;
+    if (![status.clientId, status.requestId, status.operation, status.acceptedAt, status.updatedAt].every(nonEmptyString)) return false;
+    if (!COMMAND_STAGES.includes(status.stage)) return false;
+    if (status.clientId !== command.clientId || status.requestId !== command.requestId || status.operation !== command.op) return false;
+    if (Object.hasOwn(status, "error")) {
+      exactObject(status.error, ["code", "message", "retryable"], "Journal command error");
+      if (!nonEmptyString(status.error.code) || typeof status.error.message !== "string" || typeof status.error.retryable !== "boolean") return false;
+    }
+    return true;
+  } catch { return false; }
+}
 /** @param {any} value */
 function validIdentity(value) { return Number.isSafeInteger(value?.pid) && value.pid > 0 && typeof value.startIdentity === "string" && value.startIdentity.length > 0 && Number.isSafeInteger(value.processGroupId) && value.processGroupId > 0; }
 /** @param {string} text @param {(value:any)=>boolean} validate @param {string} label */
@@ -59,7 +97,7 @@ function validateLegacyArtifact(relative, text) {
     }
     if (relative === "daemon/launch-results.json") { if (!validLaunchResults(JSON.parse(text))) throw new TypeError("Launch result store is invalid"); return; }
     if (relative === "queue/commands.jsonl") {
-      validateJsonLines(text, (journal) => { try { exactObject(journal, ["commandCanonical", "command", "status"], "Journal record"); const command = parseClientRequest(journal.command); parseDaemonResponse({ version: 1, requestId: command.requestId, ok: true, result: { kind: "command", status: journal.status } }); return journal.status.clientId === command.clientId && journal.status.requestId === command.requestId && journal.status.operation === command.op && typeof journal.commandCanonical === "string"; } catch { return false; } }, "Command journal");
+      validateJsonLines(text, validJournalRecord, "Command journal");
       return;
     }
     if (relative === "daemon/reconciliation.json") { const value = JSON.parse(text); exactObject(value, ["schemaVersion", "daemonEpoch", "completedAt", "conflicts", "recoveryActions"], "Reconciliation record"); if (value.schemaVersion !== 1 || typeof value.daemonEpoch !== "string" || typeof value.completedAt !== "string" || !Array.isArray(value.conflicts) || !Array.isArray(value.recoveryActions)) throw new TypeError("Reconciliation record is invalid"); return; }

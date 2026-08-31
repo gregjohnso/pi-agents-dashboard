@@ -160,6 +160,51 @@ it("migrates a worker awaiting replacement and a pending respawn request", async
   expect(JSON.parse(await readFile(join(paths.destinationRoot, "cli", "pending", "one.json"), "utf8"))).toEqual(pending);
 });
 
+/**
+ * One durable journal record as a release that still had `session_query` wrote it. The fingerprint
+ * is that release's canonical form of the command: sorted keys, no whitespace.
+ */
+function retiredOperationRecord() {
+  return {
+    commandCanonical: '{"clientId":"client","op":"session_query","payload":{"query":"stats","sessionId":"one"},"requestId":"request","version":1}',
+    command: { version: 1, clientId: "client", requestId: "request", op: "session_query", payload: { sessionId: "one", query: "stats" } },
+    status: { clientId: "client", requestId: "request", operation: "session_query", stage: "COMPLETED", acceptedAt: "2026-08-25T00:00:00.000Z", updatedAt: "2026-08-25T00:00:01.000Z" },
+  };
+}
+
+/** @param {{legacyRoot:string}} paths @param {unknown} record */
+async function writeLegacyJournal(paths, record) {
+  await mkdir(join(paths.legacyRoot, "queue"), { recursive: true, mode: 0o700 });
+  await writeFile(join(paths.legacyRoot, "queue", "commands.jsonl"), `${JSON.stringify(record)}\n`, { mode: 0o600 });
+}
+
+// Operator-visible failure: the journal records what a command was, not what the daemon can still
+// run. Judging a historical record against the current operation allowlist refuses a whole root
+// because it once used a feature this release deleted.
+it("migrates a journal record for an operation this release removed", async () => {
+  const paths = await fixture();
+  const record = retiredOperationRecord();
+  await writeLegacyJournal(paths, record);
+
+  await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {} })).resolves.toMatchObject({ status: "MIGRATED" });
+  expect(JSON.parse(await readFile(join(paths.destinationRoot, "queue", "commands.jsonl"), "utf8"))).toEqual(record);
+});
+
+it.each([
+  ["a client identity its command contradicts", (/** @type {any} */ record) => { record.status.clientId = "other"; }],
+  ["a request identity its command contradicts", (/** @type {any} */ record) => { record.status.requestId = "other"; }],
+  ["an operation its command contradicts", (/** @type {any} */ record) => { record.status.operation = "stop"; }],
+  ["no canonical fingerprint", (/** @type {any} */ record) => { delete record.commandCanonical; }],
+  ["a stage this release cannot recover", (/** @type {any} */ record) => { record.status.stage = "DISPATCHED"; }],
+])("refuses a legacy journal record with %s", async (_label, corrupt) => {
+  const paths = await fixture();
+  const record = retiredOperationRecord();
+  corrupt(record);
+  await writeLegacyJournal(paths, record);
+
+  await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: vi.fn() })).rejects.toMatchObject({ code: "MALFORMED_LEGACY_STATE" });
+});
+
 it("recovers mutable PUBLISHED output only after the reconciliation marker is durable", async () => {
   const paths = await fixture();
   const recordPath = join(paths.destinationRoot, "sessions", "one.json");

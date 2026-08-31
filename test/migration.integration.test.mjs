@@ -7,6 +7,7 @@ import { expect, it } from "vitest";
 import { runDashboardApp } from "../app/standalone.mjs";
 import { runDaemonCommand } from "../cli/daemon-commands.mjs";
 import { migrateLegacyState } from "../runtime/state-migration.mjs";
+import { expectDaemonCommand } from "./daemon-command-assertions.mjs";
 
 async function attempt(mutator, expectedCode) {
   const parent = await mkdtemp(join(tmpdir(), "migration-unsafe-"));
@@ -45,9 +46,9 @@ it("publishes and reconciles exactly one real destination daemon", async () => {
       openList: async () => ({ closed: Promise.resolve(), async close() {} }),
     });
     const status = await runDaemonCommand("status", { root: destinationRoot });
-    expect(status).toMatchObject({ code: 0, result: { publication: { pid: expect.any(Number) } } });
+    expectDaemonCommand("status", status, { code: 0, result: { publication: { pid: expect.any(Number) } } });
     const secondStart = await runDaemonCommand("start", { root: destinationRoot });
-    expect(secondStart).toMatchObject({ code: 0, result: { alreadyRunning: true, publication: { pid: status.result.publication.pid } } });
+    expectDaemonCommand("start", secondStart, { code: 0, result: { alreadyRunning: true, publication: { pid: status.result.publication.pid } } });
   } finally {
     await runDaemonCommand("stop", { root: destinationRoot }).catch(() => {});
     await rm(parent, { recursive: true, force: true });

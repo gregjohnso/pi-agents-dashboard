@@ -7,6 +7,7 @@ import { afterEach, expect, it } from "vitest";
 import { createDaemonClient } from "../app/daemon-client.mjs";
 import { runDaemonCommand } from "../cli/daemon-commands.mjs";
 import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
+import { expectDaemonCommand } from "./daemon-command-assertions.mjs";
 
 /** @type {string[]} */
 const parents = [];
@@ -78,7 +79,7 @@ it("starts against the sessions the operator already has when no root is given",
   const { env } = await stateParent(sessionIds);
 
   const started = await runDaemonCommand("start", { env, timeoutMs: STARTUP_DEADLINE_MS });
-  expect(started).toMatchObject({ code: 0, result: { kind: "daemon_started" } });
+  expectDaemonCommand("start", started, { code: 0, result: { kind: "daemon_started" } });
   startedRoots.push(started.result.root);
 
   expect(await listSessionsThroughDaemon(started.result.root)).toEqual([...sessionIds].sort());
@@ -88,12 +89,12 @@ it("replaces the daemon on restart, leaving one process and a publication that n
   const { previousRoot, env } = await stateParent(["alpha"]);
 
   const started = await runDaemonCommand("start", { root: previousRoot, env, timeoutMs: STARTUP_DEADLINE_MS });
-  expect(started).toMatchObject({ code: 0, result: { kind: "daemon_started" } });
+  expectDaemonCommand("start", started, { code: 0, result: { kind: "daemon_started" } });
   startedRoots.push(previousRoot);
   const before = started.result.publication;
 
   const restarted = await runDaemonCommand("restart", { root: previousRoot, env, timeoutMs: STARTUP_DEADLINE_MS });
-  expect(restarted).toMatchObject({ code: 0, result: { kind: "daemon_started" } });
+  expectDaemonCommand("restart", restarted, { code: 0, result: { kind: "daemon_started" } });
   const after = restarted.result.publication;
 
   expect(after.pid).not.toBe(before.pid);

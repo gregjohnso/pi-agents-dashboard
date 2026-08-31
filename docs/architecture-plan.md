@@ -1,8 +1,10 @@
 # Architecture implementation plan
 
-**Status on 2026-08-31: all 19 planned commits are merged and pushed on `standalone-dashboard`, plus 5 commits this plan did not anticipate. The suite is 957 tests across 89 files, green under `pixi run test` with no flags, typecheck clean. What remains is Gates 2, 3 and 4, two packaging decisions, and the defect list at the end of this file. Every change below is done unless the section says otherwise.**
+**Status on 2026-08-31: all 19 planned commits are merged and pushed on `standalone-dashboard`, plus 7 commits this plan did not anticipate. The suite is 968 tests across 89 files, green under `pixi run test` with no flags, typecheck clean. What remains is Gates 2, 3 and 4, two packaging decisions, and the defect list at the end of this file. Every change below is done unless the section says otherwise.**
 
-The five unplanned commits each fixed something a planned commit broke or exposed, and they are the reason the count is 24 rather than 19: the launch refusal that ate the operator's typed prompt, Pi's version stored as its help banner, real timeouts so `pixi run test` is a gate again, reaching a daemon from the previous release, and the daemon child a timed-out start used to orphan.
+The seven unplanned commits each fixed something a planned commit broke or exposed, and they are the reason the count is 26 rather than 19: the launch refusal that ate the operator's typed prompt, Pi's version stored as its help banner, real timeouts so `pixi run test` is a gate again, an unreachable liveness-probe timeout, the daemon child a timed-out start used to orphan, reaching a daemon from the previous release, and a refused viewer resubscription that froze the transcript in silence.
+
+Two of those came from failures the operator hit himself, and two more from an external review that read the files rather than the diff. The pattern worth carrying forward: **every fire-and-forget send across a process boundary eventually becomes a silent freeze.** It happened in the list path, was fixed there by Change 7, and survived twenty lines away in the viewer path until someone read the file.
 
 After these 19 commits:
 
@@ -76,7 +78,7 @@ The first implementation day starts with Gate 0 and a collision check against th
 
 Nothing in the commit sequence. Three gates, two decisions, and a defect list.
 
-**Gates.** Gate 2 (confirmed model), Gate 3 (three dashboards and list convergence) and Gate 4 (viewer, logs, commands, `rm`) are specified below and unrun. Gates 0 and 1 passed. All three remaining gates run on temporary roots; none may touch the operator's live sessions.
+**Gates.** Gate 2 (confirmed model), Gate 3 (three dashboards and list convergence) and Gate 4 (viewer, logs, commands, `rm`) are specified below and unrun. Gate 4's viewer section is written against the wrong failure: an external review on 2026-08-31 found a refused viewer resubscription froze the transcript silently, and Gate 4 as specified would not have caught it, because it never breaks a live viewer's socket nor lets events accumulate past the daemon's subscriber bound. Widen it before running it. Gates 0 and 1 passed. All three remaining gates run on temporary roots; none may touch the operator's live sessions.
 
 **Two packaging decisions, one line each.** `package.json` carries no `"private": true` although this tool is not published, and `README.md` still says `npm install -g pi-agents`, which names a package nobody can install. Both have been flagged repeatedly and left alone, because publishing intent is the operator's call.
 

@@ -119,7 +119,7 @@ it("starts the production daemon with launch resolution and delivers the compose
   const env = { ...process.env, FAKE_PI_LOG: log, FAKE_PI_EVENT_AFTER_COMMAND: "prompt", FAKE_PI_ONE_WAY_EXTENSION_UI_RESPONSE: "1" };
   let client;
   try {
-    const started = await runDaemonCommand("start", { root, piBin: executable, env });
+    const started = await runDaemonCommand("start", { root, piBin: executable, env, timeoutMs: 20_000 });
     expect(started).toMatchObject({ code: 0, result: { kind: "daemon_started" } });
     client = createDaemonClient({ socketPath: join(root, "daemon", "control.sock"), token: (await readFile(join(root, "daemon", "control.token"), "utf8")).trim(), clientId: "production-launch", reconnect: false, maxBytes: 256 * 1024 });
     await client.connect();

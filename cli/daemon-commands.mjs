@@ -21,6 +21,17 @@ const STARTUP_REPORT_BYTES = 4 * 1024;
 // How long a stopped daemon may keep matching its published identity after the endpoint is gone.
 const PROCESS_EXIT_PROOF_MS = 2_000;
 const PROCESS_EXIT_POLL_MS = 25;
+// How long a daemon child may take to publish a healthy endpoint. 24 concurrent cold starts on this
+// box at load 6 took 4.7 s to 5.5 s each, and this suite has read a 15 s cap as a product failure
+// three times under real load. The bound stays because a daemon that never publishes has to be
+// named rather than hang the command line; 90 s keeps it under the 120 s test timeout, so the
+// command's own DAEMON_START_FAILED and its captured startup log still win over a bare harness
+// timeout. Callers on a tighter budget pass `timeoutMs`.
+const DAEMON_START_DEADLINE_MS = 90_000;
+// The stop wait begins after the process group has already been signalled, so it measures only how
+// long the kernel takes to reap it. It stays short on purpose: an unkillable daemon is the failure
+// worth reporting quickly, and lengthening it would only delay DAEMON_STOP_TIMEOUT.
+const DAEMON_STOP_DEADLINE_MS = 15_000;
 
 export async function daemonEntryPoint() {
   return realpath(resolve(dirname(fileURLToPath(import.meta.url)), "../runtime/daemon.mjs"));
@@ -133,8 +144,8 @@ async function waitForProcessExit(publication, inspect) {
   }
 }
 
-async function waitForStatus(root, desired, options) {
-  const deadline = Date.now() + (options.timeoutMs ?? 15_000);
+async function waitForStatus(root, desired, options, defaultTimeoutMs) {
+  const deadline = Date.now() + (options.timeoutMs ?? defaultTimeoutMs);
   let endpoint;
   /** @type {any} */
   let childFailure;
@@ -181,7 +192,7 @@ export async function runDaemonCommand(command, options = {}) {
     try {
       const child = (options.spawnDaemon ?? spawnDaemon)(entry, argv, options.env ?? process.env, capture?.handle.fd ?? "ignore");
       child.once?.("error", () => {});
-      const endpoint = await waitForStatus(root, ["HEALTHY", "CONFLICT"], { ...options, inspect, probe, inspectEndpoint, requireReady: true, child });
+      const endpoint = await waitForStatus(root, ["HEALTHY", "CONFLICT"], { ...options, inspect, probe, inspectEndpoint, requireReady: true, child }, DAEMON_START_DEADLINE_MS);
       if (endpoint?.status === "HEALTHY") return { code: 0, result: { kind: "daemon_started", alreadyRunning: false, root, publication: endpoint.publication } };
       if (endpoint?.status === "CONFLICT" || (endpoint?.status === "PROCESS_EXITED" && endpoint.exitCode === 5)) return { code: 5, error: { code: "DAEMON_RECOVERY_CONFLICT", message: "Daemon recovery found an ownership conflict" } };
       const summary = endpoint?.status === "PROCESS_EXITED"
@@ -250,7 +261,7 @@ export async function runDaemonCommand(command, options = {}) {
       sleep: options.sleep ?? sleep,
     }, options.stopPolicy ?? DEFAULT_STOP_POLICY);
     if (["STALE_IDENTITY", "AMBIGUOUS_IDENTITY", "CANCELLED"].includes(disposition.disposition)) return { code: 5, error: { code: "DAEMON_IDENTITY_CONFLICT", message: `Daemon stop refused at exact identity boundary: ${disposition.disposition}` } };
-    let endpoint = await waitForStatus(root, ["ABSENT", "STALE"], { ...options, inspect, probe, inspectEndpoint });
+    let endpoint = await waitForStatus(root, ["ABSENT", "STALE"], { ...options, inspect, probe, inspectEndpoint }, DAEMON_STOP_DEADLINE_MS);
     if (endpoint?.status === "STALE") {
       try {
         await (options.cleanupStale ?? cleanupStaleDaemon)(common);

@@ -13,7 +13,8 @@ const parents = [];
 /** @type {string[]} */
 const startedRoots = [];
 // Every case here spawns a real detached daemon, and this box runs at load 30 while the suite does
-// the same in parallel; the default 15 s startup deadline reports that contention as a failure.
+// the same in parallel. The command's own default is 90 s; 45 s is this suite's tighter budget,
+// chosen so a daemon that never publishes is named well inside the 120 s test timeout.
 const STARTUP_DEADLINE_MS = 45_000;
 
 afterEach(async () => {

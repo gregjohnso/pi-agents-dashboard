@@ -7,6 +7,7 @@ import { expect, it } from "vitest";
 import { runDashboardApp } from "../app/standalone.mjs";
 import { runDaemonCommand } from "../cli/daemon-commands.mjs";
 import { migrateLegacyState } from "../runtime/state-migration.mjs";
+import { expectDaemonCommand } from "./daemon-command-assertions.mjs";
 
 async function attempt(mutator, expectedCode) {
   const parent = await mkdtemp(join(tmpdir(), "migration-unsafe-"));
@@ -26,6 +27,10 @@ async function attempt(mutator, expectedCode) {
   }
 }
 
+// The real daemon start here is the one `migrateLegacyState` makes through `reconcileDestination`,
+// so this test's own budget, not a `timeoutMs` argument, is the only thing that can cut it short. It
+// has to exceed the command's 90 s startup deadline, or a hung daemon reads as a bare test timeout
+// with no cause instead of DAEMON_START_FAILED and the daemon's own captured stderr.
 it("publishes and reconciles exactly one real destination daemon", async () => {
   const parent = await mkdtemp(join(tmpdir(), "migration-real-daemon-"));
   const legacyRoot = join(parent, "pi-agents-dashboard");
@@ -41,14 +46,14 @@ it("publishes and reconciles exactly one real destination daemon", async () => {
       openList: async () => ({ closed: Promise.resolve(), async close() {} }),
     });
     const status = await runDaemonCommand("status", { root: destinationRoot });
-    expect(status).toMatchObject({ code: 0, result: { publication: { pid: expect.any(Number) } } });
+    expectDaemonCommand("status", status, { code: 0, result: { publication: { pid: expect.any(Number) } } });
     const secondStart = await runDaemonCommand("start", { root: destinationRoot });
-    expect(secondStart).toMatchObject({ code: 0, result: { alreadyRunning: true, publication: { pid: status.result.publication.pid } } });
+    expectDaemonCommand("start", secondStart, { code: 0, result: { alreadyRunning: true, publication: { pid: status.result.publication.pid } } });
   } finally {
     await runDaemonCommand("stop", { root: destinationRoot }).catch(() => {});
     await rm(parent, { recursive: true, force: true });
   }
-}, 20_000);
+}, 120_000);
 
 it.each([
   ["a group-readable legacy root", async ({ legacyRoot }) => chmod(legacyRoot, 0o755), "UNSAFE_LEGACY_STATE"],

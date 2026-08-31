@@ -10,6 +10,7 @@ import { afterEach, expect, it } from "vitest";
 import { createDaemonClient } from "../app/daemon-client.mjs";
 import { runDaemonCommand } from "../cli/daemon-commands.mjs";
 import { adoptRenamedStateRoot } from "../runtime/state-root-adoption.mjs";
+import { expectDaemonCommand } from "./daemon-command-assertions.mjs";
 
 const execFileAsync = promisify(execFile);
 const executable = resolve(dirname(fileURLToPath(import.meta.url)), "..", "bin", "pi-agents.mjs");
@@ -86,7 +87,7 @@ it("lists every session from the previous state root after startup under the new
 
   const started = await runDaemonCommand("start", { root });
   startedRoots.push(root);
-  expect(started, JSON.stringify(started)).toMatchObject({ code: 0, result: { kind: "daemon_started" } });
+  expectDaemonCommand("start", started, { code: 0, result: { kind: "daemon_started" } });
 
   expect(await listSessionsThroughDaemon(root)).toEqual(["alpha", "beta", "delta", "gamma"]);
 });
@@ -97,10 +98,10 @@ it("recovers a crashed previous daemon whose publication still names the previou
 
   expect(await adoptRenamedStateRoot({ env })).toMatchObject({ status: "ADOPTED", root });
 
-  expect(await runDaemonCommand("start", { root })).toMatchObject({ code: 1, error: { code: "STALE_ENDPOINT_REQUIRES_RECOVER" } });
+  expectDaemonCommand("start", await runDaemonCommand("start", { root }), { code: 1, error: { code: "STALE_ENDPOINT_REQUIRES_RECOVER" } });
   const recovered = await runDaemonCommand("recover", { root });
   startedRoots.push(root);
-  expect(recovered).toMatchObject({ code: 0, result: { publication: { tokenPath: join(root, "daemon", "control.token") } } });
+  expectDaemonCommand("recover", recovered, { code: 0, result: { publication: { tokenPath: join(root, "daemon", "control.token") } } });
 
   expect(await listSessionsThroughDaemon(root)).toEqual(["alpha", "beta"]);
 });

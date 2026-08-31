@@ -61,6 +61,67 @@ it.each([
   expect(await readFile(join(root, "daemon", "startup.log"), "utf8")).toContain("DashboardConfigError");
 });
 
+/**
+ * Run one daemon command against a clock only the test moves.
+ *
+ * Faking `Date` alone leaves `setTimeout` and the file system real, so the polling wait still runs
+ * its own 25 ms steps while each poll costs the caller `stepMs` of apparent time. Faking the timers
+ * too deadlocks: an `fs/promises` call never settles while `vi.advanceTimersByTimeAsync` is running.
+ *
+ * @param {string} command @param {any} options @param {number} stepMs
+ * @returns {Promise<{ result: any, elapsedMs: number[] }>} the command's result and the apparent time of each poll
+ */
+async function underSlowClock(command, options, stepMs) {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    const startedAt = Date.now();
+    let apparentMs = 0;
+    /** @type {number[]} */
+    const elapsedMs = [];
+    const inspectEndpoint = async (/** @type {any} */ request) => {
+      elapsedMs.push(apparentMs);
+      apparentMs += stepMs;
+      vi.setSystemTime(startedAt + apparentMs);
+      return options.inspectEndpoint(request);
+    };
+    return { result: await runDaemonCommand(command, { ...options, inspectEndpoint }), elapsedMs };
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
+it("waits far past fifteen seconds for a slow daemon start, and still gives up bounded", async () => {
+  // A daemon start on this shared file system reaches READY well after 15 s at load 30, and no
+  // vitest timeout can extend a deadline the command hard-codes; the suite read that as a product
+  // failure three times. The bound must stay: a daemon that never publishes has to surface as
+  // DAEMON_START_FAILED rather than hang the operator's command line forever.
+  const root = await stateRoot();
+  const { result, elapsedMs } = await underSlowClock("start", {
+    root,
+    inspectEndpoint: async () => ({ status: "ABSENT" }),
+    spawnDaemon: () => new EventEmitter(),
+  }, 5_000);
+
+  expect(elapsedMs.at(-1)).toBeGreaterThanOrEqual(60_000);
+  expect(result).toMatchObject({ code: 1, error: { code: "DAEMON_START_FAILED", message: expect.stringContaining("startup deadline") } });
+});
+
+it("still reports a daemon that will not release its endpoint within seconds of the stop", async () => {
+  // The stop wait begins after the process group has already been signalled, so it must not inherit
+  // the start deadline: an unkillable daemon has to be named quickly, not a minute and a half later.
+  const publication = { pid: 321, startIdentity: "987654321", processGroupId: 654, tokenPath: "/state/daemon/control.token" };
+  const { result, elapsedMs } = await underSlowClock("stop", {
+    root: "/state",
+    inspect: async () => publication,
+    inspectEndpoint: async () => ({ status: "HEALTHY", daemonState: "READY", publication }),
+    request: async () => ({ kind: "state", sessions: [] }),
+    stopProcessGroup: async () => ({ disposition: "GRACEFUL" }),
+  }, 5_000);
+
+  expect(elapsedMs.at(-1)).toBeLessThanOrEqual(20_000);
+  expect(result).toMatchObject({ code: 1, error: { code: "DAEMON_STOP_TIMEOUT" } });
+});
+
 it("reports a daemon child that could not be spawned at all", async () => {
   const root = await stateRoot();
   const result = await runDaemonCommand("start", {

@@ -7,13 +7,15 @@ import { afterEach, expect, it } from "vitest";
 import { createDaemonClient } from "../app/daemon-client.mjs";
 import { runDaemonCommand } from "../cli/daemon-commands.mjs";
 import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
+import { expectDaemonCommand } from "./daemon-command-assertions.mjs";
 
 /** @type {string[]} */
 const parents = [];
 /** @type {string[]} */
 const startedRoots = [];
 // Every case here spawns a real detached daemon, and this box runs at load 30 while the suite does
-// the same in parallel; the default 15 s startup deadline reports that contention as a failure.
+// the same in parallel. The command's own default is 90 s; 45 s is this suite's tighter budget,
+// chosen so a daemon that never publishes is named well inside the 120 s test timeout.
 const STARTUP_DEADLINE_MS = 45_000;
 
 afterEach(async () => {
@@ -77,7 +79,7 @@ it("starts against the sessions the operator already has when no root is given",
   const { env } = await stateParent(sessionIds);
 
   const started = await runDaemonCommand("start", { env, timeoutMs: STARTUP_DEADLINE_MS });
-  expect(started).toMatchObject({ code: 0, result: { kind: "daemon_started" } });
+  expectDaemonCommand("start", started, { code: 0, result: { kind: "daemon_started" } });
   startedRoots.push(started.result.root);
 
   expect(await listSessionsThroughDaemon(started.result.root)).toEqual([...sessionIds].sort());
@@ -87,12 +89,12 @@ it("replaces the daemon on restart, leaving one process and a publication that n
   const { previousRoot, env } = await stateParent(["alpha"]);
 
   const started = await runDaemonCommand("start", { root: previousRoot, env, timeoutMs: STARTUP_DEADLINE_MS });
-  expect(started).toMatchObject({ code: 0, result: { kind: "daemon_started" } });
+  expectDaemonCommand("start", started, { code: 0, result: { kind: "daemon_started" } });
   startedRoots.push(previousRoot);
   const before = started.result.publication;
 
   const restarted = await runDaemonCommand("restart", { root: previousRoot, env, timeoutMs: STARTUP_DEADLINE_MS });
-  expect(restarted).toMatchObject({ code: 0, result: { kind: "daemon_started" } });
+  expectDaemonCommand("restart", restarted, { code: 0, result: { kind: "daemon_started" } });
   const after = restarted.result.publication;
 
   expect(after.pid).not.toBe(before.pid);

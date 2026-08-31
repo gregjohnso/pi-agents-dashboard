@@ -98,6 +98,7 @@ describe("authenticated control server", () => {
 
   it.each([
     ["unknown operation", { version: 1, clientId: "c", requestId: "exact-id", op: "shell", payload: {} }],
+    ["the retired viewer acknowledgement", { version: 1, clientId: "c", requestId: "exact-id", op: "ack_viewer", payload: { cursor: { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "1" } } }],
     ["wrong request version", { version: 2, clientId: "c", requestId: "exact-id", op: "get_state", payload: {} }],
   ])("rejects %s after authentication", async (_name, bad) => {
     const { socketPath, received } = await fixture();
@@ -106,15 +107,14 @@ describe("authenticated control server", () => {
     expect(received).toHaveLength(0);
   });
 
-  it("dispatches strict viewer snapshot, subscribe, and acknowledgement operations", async () => {
+  it("dispatches strict viewer snapshot and subscribe operations", async () => {
     const { socketPath, received } = await fixture();
     const viewerRequests = [
       { version: 1, clientId: "client-1", requestId: "viewer-1", op: "get_viewer_snapshot", payload: { sessionId: "session-1" } },
       { version: 1, clientId: "client-1", requestId: "viewer-2", op: "subscribe_viewer", payload: { sessionId: "session-1", after: { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "0" } } },
-      { version: 1, clientId: "client-1", requestId: "viewer-3", op: "ack_viewer", payload: { cursor: { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "1" } } },
     ];
     const responses = await exchange(socketPath, [auth, ...viewerRequests.map((value) => `${JSON.stringify(value)}\n`)]);
-    expect(responses.slice(1)).toHaveLength(3);
+    expect(responses.slice(1)).toHaveLength(2);
     expect(received).toEqual(viewerRequests);
   });
 });

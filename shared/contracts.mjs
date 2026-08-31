@@ -40,7 +40,7 @@ export const CLIENT_PROTOCOL = 2;
 export const SESSION_COLORS = ["sky", "green", "amber", "rose", "cyan", "gray"];
 /** @typedef {"sky"|"green"|"amber"|"rose"|"cyan"|"gray"} SessionColor */
 
-const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "respawn", "ui_response", "subscribe_list_changes", "get_viewer_snapshot", "subscribe_viewer", "ack_viewer", "resolve_delivery", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries", "set_session_color", "get_models"];
+const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "respawn", "ui_response", "subscribe_list_changes", "get_viewer_snapshot", "subscribe_viewer", "resolve_delivery", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries", "set_session_color", "get_models"];
 const COMMAND_STAGES = ["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED", "DELIVERY_UNKNOWN", "FAILED"];
 const SESSION_COMMANDS = ["set_model", "compact", "set_session_name", "abort_retry"];
 const MAX_MENU_ENTRIES = 1_000;
@@ -269,10 +269,6 @@ export function parseClientRequest(value) {
     if (after.sessionId !== sessionId) throw new TypeError("subscribe_viewer cursor session does not match payload session");
     return { ...base, payload: { sessionId, after } };
   }
-  if (op === "ack_viewer") {
-    const payload = readRecord(request.payload, "ack_viewer payload"); rejectUnknownKeys(payload, ["cursor"], "ack_viewer payload");
-    return { ...base, payload: { cursor: readViewerCursor(payload.cursor, "ack_viewer payload.cursor") } };
-  }
   const payload = readRecord(request.payload, "resolve_delivery payload"); rejectUnknownKeys(payload, ["targetClientId", "targetRequestId", "resolution"], "resolve_delivery payload");
   return { ...base, payload: { targetClientId: readIdentifier(payload, "targetClientId", "resolve_delivery payload.targetClientId"), targetRequestId: readIdentifier(payload, "targetRequestId", "resolve_delivery payload.targetRequestId"), resolution: readEnum(payload, "resolution", ["retry_at_risk", "abandon"], "resolve_delivery payload.resolution") } };
 }
@@ -366,7 +362,7 @@ export function parseDaemonResponse(value) {
   if (!response.ok) { requireKeys(response, ["version", "requestId", "ok", "error"], [], "daemon response"); validateError(response.error, "daemon response.error"); return response; }
   requireKeys(response, ["version", "requestId", "ok", "result"], [], "daemon response");
   const result = readRecord(response.result, "daemon response.result");
-  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "list_subscribed", "viewer_snapshot", "viewer_subscribed", "viewer_acknowledged", "session_commands", "settings", "models", "summaries_refreshing", "session_colored"], "daemon response.result.kind");
+  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "list_subscribed", "viewer_snapshot", "viewer_subscribed", "session_commands", "settings", "models", "summaries_refreshing", "session_colored"], "daemon response.result.kind");
   // `cursor` is how far the daemon's list had advanced when it read this snapshot, and it is
   // required: it is read before the registry, never after, so the snapshot always covers at least
   // that position. That ordering is what lets a client subscribe, read, and know the read cannot

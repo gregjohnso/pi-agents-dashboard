@@ -1100,12 +1100,6 @@ export async function createDaemonRuntime({
           const subscription = store.subscribe(request.payload.after);
           return { kind: "viewer_subscribed", cursor: store.currentCursor(), _viewerSubscription: subscription };
         }
-        if (request.op === "ack_viewer") {
-          if (request.clientId !== authenticatedClientId) throw Object.assign(new Error("Viewer cursor client identity changed"), { code: "CLIENT_IDENTITY_CONFLICT" });
-          const store = context.recovery.viewer.store(request.payload.cursor.sessionId);
-          if (store === undefined) throw Object.assign(new Error("Viewer session does not exist"), { code: "SESSION_NOT_FOUND" });
-          return { kind: "viewer_acknowledged", cursor: await store.acknowledge(authenticatedClientId, request.payload.cursor) };
-        }
         if (request.op === "subscribe_list_changes") {
           if (socket === undefined) throw new TypeError("List subscription requires a live socket");
           context.listSubscribers.add(socket);

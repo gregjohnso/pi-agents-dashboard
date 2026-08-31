@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
@@ -113,15 +113,13 @@ describe("durable per-session viewer store", () => {
     await store.close();
   });
 
-  it("durably acknowledges one client's cursor without advancing other clients", async () => {
+  it("exposes no acknowledgement method and writes no retired acknowledgement file", async () => {
     const directory = await location();
     const store = await createViewerStore({ directory, sessionId: "session-1", daemonEpoch: "epoch-1" });
     await store.append(draft);
-    expect(await store.acknowledge("client-1", cursor(1))).toEqual(cursor(1));
-    expect(store.acknowledged("client-2")).toBeUndefined();
+    await store.publishSnapshot(snapshot(1));
+    expect(Object.keys(store).filter((name) => /ack/iu.test(name))).toEqual([]);
     await store.close();
-    const recovered = await createViewerStore({ directory, sessionId: "session-1", daemonEpoch: "epoch-1" });
-    expect(recovered.acknowledged("client-1")).toEqual(cursor(1));
-    await recovered.close();
+    expect((await readdir(directory)).filter((name) => name.endsWith(".acks.json"))).toEqual([]);
   });
 });

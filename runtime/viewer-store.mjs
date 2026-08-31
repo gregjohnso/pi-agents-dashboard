@@ -38,7 +38,7 @@ function sequence(value) {
 /** @param {string} directory @param {string} sessionId */
 function paths(directory, sessionId) {
   const stem = createHash("sha256").update(sessionId).digest("hex");
-  return { events: join(directory, `${stem}.events.jsonl`), checkpoints: join(directory, `${stem}.checkpoints.jsonl`), snapshot: join(directory, `${stem}.snapshot.json`), acks: join(directory, `${stem}.acks.json`) };
+  return { events: join(directory, `${stem}.events.jsonl`), checkpoints: join(directory, `${stem}.checkpoints.jsonl`), snapshot: join(directory, `${stem}.snapshot.json`) };
 }
 
 /** @param {unknown} value */
@@ -72,7 +72,7 @@ function applyLegacyCheckpoint(checkpoint, payload) {
 }
 
 /**
- * Open one append-only normalized viewer stream and its crash-safe snapshot/ACK state.
+ * Open one append-only normalized viewer stream and its crash-safe snapshot state.
  *
  * @param {{ directory: string, sessionId: string, daemonEpoch: string, protocolVersion?: number, subscriberLimit?: number, failpoint?: (phase: string, value?: unknown) => void | Promise<void> }} options
  */
@@ -155,20 +155,6 @@ export async function createViewerStore({ directory, sessionId, daemonEpoch, pro
     if (candidateSequence <= events.length && candidateSequence >= checkpointSequence) { checkpointSequence = candidateSequence; recoveredCheckpoint = storedCheckpoint; }
   }
   for (let index = checkpointSequence; index < recoveryPayloads.length; index += 1) recoveredCheckpoint = applyLegacyCheckpoint(recoveredCheckpoint, recoveryPayloads[index]);
-
-  /** @type {Record<string, { daemonEpoch: string, sessionId: string, sequence: string }>} */
-  let acknowledgements = {};
-  try {
-    const parsed = JSON.parse(await readFile(location.acks, "utf8"));
-    if (parsed?.version !== 1 || parsed.sessionId !== sessionId || parsed.daemonEpoch !== daemonEpoch || typeof parsed.clients !== "object" || parsed.clients === null || Array.isArray(parsed.clients) || Object.keys(parsed).some((key) => !["version", "sessionId", "daemonEpoch", "clients"].includes(key))) throw new TypeError("invalid ACK store");
-    for (const [clientId, cursor] of Object.entries(parsed.clients)) {
-      if (clientId.length === 0) throw new TypeError("invalid ACK client");
-      validateCursor(cursor);
-    }
-    acknowledgements = parsed.clients;
-  } catch (error) {
-    if (!(error instanceof Error) || /** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT") { await Promise.allSettled([durable.close(), checkpointDurable.close()]); throw new ViewerStoreError("VIEWER_STORE_CORRUPT", "Persisted viewer acknowledgements are invalid", { cause: error }); }
-  }
 
   /** @type {Set<any>} */
   const subscribers = new Set();
@@ -289,19 +275,6 @@ export async function createViewerStore({ directory, sessionId, daemonEpoch, pro
     },
     async getSnapshot() { await tail; return publishedSnapshot; },
     async getCheckpoint() { await tail; return structuredClone(recoveredCheckpoint); },
-    acknowledge(/** @type {string} */ clientId, /** @type {any} */ cursor) {
-      return serialize(async () => {
-        if (typeof clientId !== "string" || clientId.length === 0) throw new TypeError("clientId is required");
-        const next = validateCursor(cursor);
-        const prior = acknowledgements[clientId];
-        if (prior !== undefined && sequence(prior.sequence) >= next) return prior;
-        const accepted = { daemonEpoch, sessionId, sequence: String(next) };
-        acknowledgements = { ...acknowledgements, [clientId]: accepted };
-        await atomicWriteJson(location.acks, { version: 1, sessionId, daemonEpoch, clients: acknowledgements });
-        return accepted;
-      });
-    },
-    acknowledged(/** @type {string} */ clientId) { return acknowledgements[clientId]; },
     async close() {
       await tail;
       if (closed) return;

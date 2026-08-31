@@ -425,9 +425,6 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                 applied(cursor) { subscriber.resumeAfter = laterViewerCursor(subscriber.resumeAfter, cursor); },
             };
         },
-        async ackViewer(cursor) {
-            return (await requestResult("ack_viewer", { cursor })).cursor;
-        },
         onFatalError(listener) {
             fatalErrorListeners.add(listener);
             return () => fatalErrorListeners.delete(listener);

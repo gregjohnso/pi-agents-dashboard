@@ -112,6 +112,23 @@ it("prints exactly one JSON object and uses syntax exit code 2", async () => {
   expect(output.stderr).toEqual([]);
 });
 
+// Operator-visible failure: the wait for a healthy endpoint runs inside runDaemonCommand and writes
+// nowhere, so a start that hung left the operator's terminal blank until the command returned.
+it("gives daemon start the operator's own error stream to report a slow wait on", async () => {
+  const output = capture();
+  const runDaemonCommand = async (/** @type {string} */ command, /** @type {any} */ options) => {
+    expect(command).toBe("start");
+    options.stderr.write("daemon start: waiting for a healthy endpoint (5s of 90s)\n");
+    return { code: 0, result: { kind: "daemon_started", alreadyRunning: false } };
+  };
+  expect(await runCli(["daemon", "start", "--json"], { io: output.io, runDaemonCommand })).toBe(0);
+
+  expect(output.stderr.join("")).toContain("waiting for a healthy endpoint");
+  // The progress report is for a person and never joins the machine-readable answer.
+  expect(output.stdout).toHaveLength(1);
+  expect(JSON.parse(output.stdout[0])).toMatchObject({ ok: true, kind: "daemon_started" });
+});
+
 it.each([
   ["stop", ["stop", "full-session-id", "--revision", "3", "--yes"]],
   ["rm", ["rm", "full-session-id", "--revision", "3", "--yes"]],

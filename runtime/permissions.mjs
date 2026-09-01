@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, open, rm, rmdir } from "node:fs/promises";
+import { chmod, lstat, mkdir, rmdir } from "node:fs/promises";
 
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
@@ -80,28 +80,6 @@ export async function ensurePrivateDirectory(
     if (created && typeof fsOps.rmdir === "function") {
       await fsOps.rmdir(path).catch(() => {});
     }
-    throw error;
-  }
-}
-
-/**
- * Exclusively create a mode-0600 file without following an existing symlink.
- *
- * @param {string} path
- * @param {{ open(path: string, flags: string, mode: number): Promise<any>, rm(path: string, options: { force: boolean }): Promise<void> }} [fsOps]
- */
-export async function createPrivateFile(path, fsOps = { open, rm }) {
-  const handle = await fsOps.open(path, "wx", PRIVATE_FILE_MODE);
-  try {
-    await handle.chmod(PRIVATE_FILE_MODE);
-    const metadata = await handle.stat();
-    if (!metadata.isFile() || (metadata.mode & 0o777) !== PRIVATE_FILE_MODE) {
-      throw new Error("Private file creation did not produce a regular mode-0600 file");
-    }
-    return handle;
-  } catch (error) {
-    await handle.close();
-    await fsOps.rm(path, { force: true }).catch(() => {});
     throw error;
   }
 }

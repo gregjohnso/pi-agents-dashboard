@@ -100,8 +100,15 @@ async function requestDaemonStop(publication, { timeoutMs = 500 } = {}) {
   });
 }
 
-/** @param {string} file @param {string[]} argv @param {NodeJS.ProcessEnv} env @param {number | "ignore"} stderr */
-function spawnDaemon(file, argv, env, stderr) {
+/**
+ * Start one detached daemon child.
+ *
+ * Exported so a caller that wraps the `spawnDaemon` option spawns by this exact call rather than a
+ * copy of it: the real-process test harness records the child's identity around this seam.
+ *
+ * @param {string} file @param {string[]} argv @param {NodeJS.ProcessEnv} env @param {number | "ignore"} stderr
+ */
+export function spawnDaemon(file, argv, env, stderr) {
   const child = spawn(process.execPath, [file, ...argv], { detached: true, shell: false, stdio: ["ignore", "ignore", stderr], env });
   child.unref();
   return child;

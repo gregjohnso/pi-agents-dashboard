@@ -174,12 +174,26 @@ export async function reapLedgerDirectory({ directory = process.env[LEDGER_DIREC
     results.push(...await reapProcessLedger(path, { inspect, signal, nap, stopPolicy, warn }));
     await rm(path, { force: true });
   }
+  reportReapResults(results, warn);
+  return results;
+}
+
+/**
+ * Say what a sweep did, for everything except the two dispositions that mean it did nothing.
+ *
+ * An entry naming a process that already exited, or one whose PID a different process now owns, is
+ * what a run that cleaned up after itself looks like. Everything else is either a leak this sweep
+ * had to end or a process it could not end, and both have to reach the run's output.
+ *
+ * @param {{ label: string, identity: { pid: number }, disposition: string }[]} results
+ * @param {(message: string) => void} warn
+ */
+export function reportReapResults(results, warn) {
   for (const result of results) {
     if (NOTHING_TO_DO_DISPOSITIONS.includes(result.disposition)) continue;
     const what = REAPED_DISPOSITIONS.includes(result.disposition) ? "reaped a leaked process" : "could not stop a recorded process";
     warn(`process ledger: ${what} ${result.identity.pid} (${result.label}) — ${result.disposition}`);
   }
-  return results;
 }
 
 /** @param {{ pid: number, startIdentity: string, processGroupId: number }} expected @param {typeof inspectProcessIdentity} inspect */

@@ -216,6 +216,8 @@ export class OwnershipManager {
         runId: lease.runId,
         process: worker,
         acquiredAt: lease.acquiredAt,
+        // No caller refreshes this. It is written once so a daemon from the previous release, whose
+        // validator requires the key, still accepts a record this release wrote.
         heartbeatAt: lease.acquiredAt,
       };
       try {
@@ -254,27 +256,6 @@ export class OwnershipManager {
       const updated = await this.#registry.update(sessionId, record.revision, { runtime });
       lease.piChild = /** @type {ProcessIdentity} */ (piChild);
       return updated;
-    });
-  }
-
-  /** @param {string} sessionId @param {string} leaseId @param {number} generation */
-  async heartbeat(sessionId, leaseId, generation) {
-    return this.#runWithOwnershipLock(sessionId, async () => {
-      const lease = this.#currentLease(sessionId, leaseId, generation);
-      if (lease.worker === undefined) throw new StaleLeaseError(sessionId, leaseId, generation);
-      const record = await this.#registry.get(sessionId);
-      if (
-        record === undefined ||
-        record.ownership === undefined ||
-        record.ownership.runId !== lease.runId
-      ) {
-        throw new StaleLeaseError(sessionId, leaseId, generation);
-      }
-      const heartbeatAt = this.#now();
-      return this.#registry.update(sessionId, record.revision, {
-        updatedAt: heartbeatAt,
-        ownership: { ...record.ownership, heartbeatAt },
-      });
     });
   }
 

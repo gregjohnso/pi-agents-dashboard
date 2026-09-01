@@ -20,7 +20,7 @@ import { openSettingsStore, summarizePromptInput, summarizeWithPi } from "./summ
 import { RegistryStore, applySessionColor, applySessionUpdate, runSessionLifecycle } from "./registry-store.mjs";
 import { sessionCommandPayload } from "./session-command-projection.mjs";
 import { reduceSessionState } from "./state-reducer.mjs";
-import { createIdleExit } from "./idle-exit.mjs";
+import { createIdleExit, resolveIdleExitMs } from "./idle-exit.mjs";
 import { spawn as spawnProcess } from "node:child_process";
 import { createModelCatalog } from "./pi-model-catalog.mjs";
 import { WorkerSupervisor } from "./worker-supervisor.mjs";
@@ -271,6 +271,8 @@ export function createBoundedSocketWriter(socket, { maxPendingBytes, maxPendingR
 /** @param {{ socketPath: string, token: string, maxBytes: number, workerRequestTimeoutMs: number, context: any }} options */
 function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutMs, context }) {
   const sockets = new Set();
+  /** Dashboard connections. A worker holds a connection too, and idle exit must not read it as a client. */
+  const frontendSockets = new Set();
   /** Sockets watching the session list. They receive payload-free invalidations and nothing else. */
   const listSubscribers = new Set();
   const viewerSubscriptions = new Map();
@@ -285,6 +287,9 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
       return;
     }
     sockets.add(socket);
+    // Every connection re-arms the idle window here, before it authenticates, so a liveness probe
+    // keeps the daemon up for the client it precedes rather than racing that client's connect.
+    context.touchIdle();
     broadcastWriters.set(socket, createBoundedSocketWriter(socket, { maxPendingBytes: Math.min(4 * maxBytes, 4 * 1024 * 1024), maxPendingRecords: 256 }));
     let authenticated = false;
     let role = "frontend";
@@ -342,6 +347,7 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
     });
     socket.on("close", () => {
       sockets.delete(socket);
+      frontendSockets.delete(socket);
       listSubscribers.delete(socket);
       broadcastWriters.delete(socket);
       const activeViewerSubscriptions = viewerSubscriptions.get(socket) ?? [];
@@ -380,6 +386,7 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
               return;
             }
             role = frame.role ?? "frontend";
+            if (role === "frontend") frontendSockets.add(socket);
             clientProtocol = frame.clientProtocol;
             attachId = frame.attachId;
             authenticated = true;
@@ -496,6 +503,7 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
   return {
     listSubscribers,
     sockets,
+    frontendSockets,
     async listen() {
       await new Promise((resolveListen, rejectListen) => {
         server.once("error", rejectListen);
@@ -625,6 +633,8 @@ export async function createDaemonRuntime({
       notifyListChanged: () => {},
       writeResponse: responseWriter,
       requestStop: () => resolveStopRequested(undefined),
+      /** Re-armed by every accepted connection; replaced by the idle window this daemon runs on. */
+      touchIdle: () => {},
       publicStatus() { return { state: context.state, recovering: ["STARTING", "RECONCILING"].includes(context.state), error: context.stateError, daemonEpoch, pid: identity.pid }; },
       /** Mint one worker command ID that no earlier command in this daemon has used. */
       nextCommandId() {
@@ -1453,10 +1463,23 @@ export async function createDaemonRuntime({
       ready,
       stopRequested,
       status() { return { ...context.publicStatus(), connectedWorkers: router.connectedSessionIds(), closeState }; },
-      /** Frontend sockets currently attached, which is what idle exit must never interrupt. */
-      attachedFrontends() { return socketServer.sockets.size; },
-      /** Workers whose supervisor and Pi child are still recorded as live. */
-      liveWorkers() { return router.connectedSessionIds().length; },
+      /**
+       * Why this daemon must not exit now, or undefined when nothing holds it.
+       *
+       * Live workers are absent on purpose: a worker is Pi's parent, outlives the daemon, and keeps
+       * recording, so a session with no dashboard open is not work this process has to stay up for.
+       */
+      idleHold() {
+        // Work this daemon owes first, watchers last: when several stand at once the reason names
+        // what has to finish rather than who happens to be looking.
+        if (upgradeRespawns.size > 0 || deferredUpgradeRespawns.size > 0) return "replacements";
+        if (launchingSessions.size > 0) return "launches";
+        if (context.workerPending.size > 0) return "commands";
+        if (socketServer.frontendSockets.size > 0) return "clients";
+        return undefined;
+      },
+      /** Re-arm the idle window from every accepted connection. @param {() => void} touch */
+      onClientActivity(touch) { context.touchIdle = touch; },
       /** @param {any} key */
       async commandStatus(key) { await ready; return context.recovery.journal.get(key); },
       close() {
@@ -1553,8 +1576,7 @@ async function runMain() {
   const piBinFlag = argv.indexOf("--pi-bin");
   const root = rootFlag >= 0 ? argv[rootFlag + 1] : defaultRuntimeRoot();
   const piBin = piBinFlag >= 0 ? argv[piBinFlag + 1] : undefined;
-  const idleFlag = argv.indexOf("--idle-exit-ms");
-  const idleMs = idleFlag >= 0 ? Number(argv[idleFlag + 1]) : Number(process.env.PI_AGENTS_IDLE_EXIT_MS ?? 0);
+  const idleMs = resolveIdleExitMs({ argv, env: process.env });
   const runtime = await createDefaultDaemonRuntime({ root, piBin });
   try {
     await runtime.ready;
@@ -1563,8 +1585,9 @@ async function runMain() {
       new Promise((resolveStop) => {
         process.once("SIGTERM", resolveStop);
         process.once("SIGINT", resolveStop);
-        if (!Number.isFinite(idleMs) || idleMs <= 0) return;
-        const idle = createIdleExit({ idleMs, now: () => Date.now(), onIdle: () => resolveStop(undefined), frontends: () => runtime.attachedFrontends(), workers: () => runtime.liveWorkers() });
+        if (idleMs <= 0) return;
+        const idle = createIdleExit({ idleMs, now: () => Date.now(), onIdle: () => resolveStop(undefined), hold: () => runtime.idleHold() });
+        runtime.onClientActivity(idle.touch);
         const timer = setInterval(() => idle.check(), Math.max(250, Math.min(idleMs, 5_000)));
         timer.unref?.();
       }),

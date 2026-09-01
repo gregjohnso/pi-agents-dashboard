@@ -1,5 +1,4 @@
-import { chmod, mkdtemp, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -10,25 +9,29 @@ import { RecoveredWorkerRouter } from "../runtime/reconciliation.mjs";
 import { RegistryStore } from "../runtime/registry-store.mjs";
 import { createWorkerControlSocket } from "../runtime/test-fixtures.mjs";
 import { WorkerSupervisor } from "../runtime/worker-supervisor.mjs";
+import { createRealProcessHarness } from "./real-process-harness.mjs";
 
 const FIXTURE = fileURLToPath(new URL("./fixtures/fake-pi.mjs", import.meta.url));
 const CONNECTOR = fileURLToPath(new URL("../runtime/daemon-connector.mjs", import.meta.url));
-/** @type {string[]} */
-const cleanup = [];
+const harness = createRealProcessHarness("mixed-pi-versions");
 /** @type {any[]} */
 const controlSockets = [];
 afterEach(async () => {
   await Promise.all(controlSockets.splice(0).map((control) => control.close()));
-  await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  await harness.cleanup();
 });
 
+/** Launch one real worker and record it, so a timeout around this test cannot leave it running. */
+async function launch(supervisor, request) {
+  const handle = await supervisor.launch(request);
+  await harness.record(`worker ${request.runId}`, handle.identity);
+  return handle;
+}
+
 it("keeps version A live after the configured executable is atomically replaced by version B", async () => {
-  const root = await mkdtemp(join(tmpdir(), "mixed-pi-"));
-  cleanup.push(root);
+  const root = await harness.stateRoot("mixed-pi-", ["sessions", "runs"]);
   const sessions = join(root, "sessions");
   const runs = join(root, "runs");
-  await mkdir(sessions, { mode: 0o700 });
-  await mkdir(runs, { mode: 0o700 });
   const fixture = await readFile(FIXTURE, "utf8");
   const executable = join(root, "pi-current");
   const replacement = join(root, "pi-next");
@@ -46,11 +49,11 @@ it("keeps version A live after the configured executable is atomically replaced 
   controlSockets.push(control);
   const launchSeams = { daemonConnector: CONNECTOR, daemonConnectConfig: control.connectConfig };
   const supervisor = new WorkerSupervisor({ registry, router, runsDirectory: runs, configuredPiPath: executable, env: { ...process.env, FAKE_PI_EXIT_MS: "900" }, startTimeoutMs: 2_000 });
-  const first = await supervisor.launch({ sessionId: "a", canonicalSessionFile: join(root, "a.jsonl"), cwd: root, runId: "run-a", ...launchSeams });
+  const first = await launch(supervisor, { sessionId: "a", canonicalSessionFile: join(root, "a.jsonl"), cwd: root, runId: "run-a", ...launchSeams });
   await writeFile(replacement, fixture.replace('"1.0.0"', '"0.84.2"'), { mode: 0o700 });
   await chmod(replacement, 0o700);
   await rename(replacement, executable);
-  const second = await supervisor.launch({ sessionId: "b", canonicalSessionFile: join(root, "b.jsonl"), cwd: root, runId: "run-b", ...launchSeams });
+  const second = await launch(supervisor, { sessionId: "b", canonicalSessionFile: join(root, "b.jsonl"), cwd: root, runId: "run-b", ...launchSeams });
 
   expect(first.piChildIdentity.pid).not.toBe(second.piChildIdentity.pid);
   const firstRecord = await registry.get("a");

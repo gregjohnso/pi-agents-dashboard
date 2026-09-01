@@ -1,6 +1,5 @@
 import { execFile } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { lstat, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -8,20 +7,16 @@ import { promisify } from "node:util";
 import { afterEach, expect, it } from "vitest";
 
 import { createDaemonClient } from "../app/daemon-client.mjs";
-import { runDaemonCommand } from "../cli/daemon-commands.mjs";
 import { adoptRenamedStateRoot } from "../runtime/state-root-adoption.mjs";
 import { expectDaemonCommand } from "./daemon-command-assertions.mjs";
+import { createRealProcessHarness } from "./real-process-harness.mjs";
 
 const execFileAsync = promisify(execFile);
 const executable = resolve(dirname(fileURLToPath(import.meta.url)), "..", "bin", "pi-agents.mjs");
 const DEAD_PID = 0x7ffffffe;
-const parents = [];
-const startedRoots = [];
+const harness = createRealProcessHarness("state-root-adoption");
 
-afterEach(async () => {
-  for (const root of startedRoots.splice(0)) await runDaemonCommand("stop", { root, allowLiveWorkers: true }).catch(() => {});
-  await Promise.all(parents.splice(0).map((parent) => rm(parent, { recursive: true, force: true })));
-});
+afterEach(() => harness.cleanup());
 
 /** @param {string} root @param {string} sessionId */
 function record(root, sessionId) {
@@ -45,8 +40,7 @@ function record(root, sessionId) {
 
 /** Build a state root under the name the product shipped before the pi-agents rename. @param {string[]} sessionIds */
 async function previousStateRoot(sessionIds) {
-  const parent = await mkdtemp(join(tmpdir(), "pi-agents-adoption-integration-"));
-  parents.push(parent);
+  const parent = await harness.stateRoot("pi-agents-adoption-integration-");
   const previousRoot = join(parent, "pi-dashboard");
   for (const directory of ["canonical", "daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(previousRoot, directory), { recursive: true, mode: 0o700 });
   for (const sessionId of sessionIds) {
@@ -85,8 +79,7 @@ it("lists every session from the previous state root after startup under the new
 
   expect(await adoptRenamedStateRoot({ env })).toMatchObject({ status: "ADOPTED", root });
 
-  const started = await runDaemonCommand("start", { root });
-  startedRoots.push(root);
+  const started = await harness.daemon("start", { root });
   expectDaemonCommand("start", started, { code: 0, result: { kind: "daemon_started" } });
 
   expect(await listSessionsThroughDaemon(root)).toEqual(["alpha", "beta", "delta", "gamma"]);
@@ -98,9 +91,8 @@ it("recovers a crashed previous daemon whose publication still names the previou
 
   expect(await adoptRenamedStateRoot({ env })).toMatchObject({ status: "ADOPTED", root });
 
-  expectDaemonCommand("start", await runDaemonCommand("start", { root }), { code: 1, error: { code: "STALE_ENDPOINT_REQUIRES_RECOVER" } });
-  const recovered = await runDaemonCommand("recover", { root });
-  startedRoots.push(root);
+  expectDaemonCommand("start", await harness.daemon("start", { root }), { code: 1, error: { code: "STALE_ENDPOINT_REQUIRES_RECOVER" } });
+  const recovered = await harness.daemon("recover", { root });
   expectDaemonCommand("recover", recovered, { code: 0, result: { publication: { tokenPath: join(root, "daemon", "control.token") } } });
 
   expect(await listSessionsThroughDaemon(root)).toEqual(["alpha", "beta"]);

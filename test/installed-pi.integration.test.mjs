@@ -1,5 +1,4 @@
-import { chmod, copyFile, mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, copyFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -11,25 +10,29 @@ import { RecoveredWorkerRouter } from "../runtime/reconciliation.mjs";
 import { RegistryStore } from "../runtime/registry-store.mjs";
 import { createWorkerControlSocket } from "../runtime/test-fixtures.mjs";
 import { WorkerSupervisor } from "../runtime/worker-supervisor.mjs";
+import { createRealProcessHarness } from "./real-process-harness.mjs";
 
 const FIXTURE = fileURLToPath(new URL("./fixtures/fake-pi.mjs", import.meta.url));
 const CONNECTOR = fileURLToPath(new URL("../runtime/daemon-connector.mjs", import.meta.url));
-/** @type {string[]} */
-const cleanup = [];
+const harness = createRealProcessHarness("installed-pi");
 /** @type {any[]} */
 const controlSockets = [];
 afterEach(async () => {
   await Promise.all(controlSockets.splice(0).map((control) => control.close()));
-  await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  await harness.cleanup();
 });
 
+/** Launch one real worker and record it, so a timeout around this test cannot leave it running. */
+async function launch(supervisor, request) {
+  const handle = await supervisor.launch(request);
+  await harness.record(`worker ${request.runId}`, handle.identity);
+  return handle;
+}
+
 async function setup() {
-  const root = await mkdtemp(join(tmpdir(), "installed-pi-"));
-  cleanup.push(root);
+  const root = await harness.stateRoot("installed-pi-", ["sessions", "runs"]);
   const sessions = join(root, "sessions");
   const runs = join(root, "runs");
-  await mkdir(sessions, { mode: 0o700 });
-  await mkdir(runs, { mode: 0o700 });
   const executable = join(root, "pi");
   await copyFile(FIXTURE, executable);
   await chmod(executable, 0o700);
@@ -47,7 +50,7 @@ async function setup() {
 it("omits optional launch flags by default and includes only selected model and name flags", async () => {
   const { root, runs, registry, executable, sessionFile, log, router, control, launchSeams } = await setup();
   const supervisor = new WorkerSupervisor({ registry, router, runsDirectory: runs, configuredPiPath: executable, env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_EXIT_MS: "700" }, startTimeoutMs: 2_000 });
-  await supervisor.launch({ sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-options", model: { provider: "fake provider", id: "model;id" }, thinkingLevel: "high", name: "name with spaces", ...launchSeams });
+  await launch(supervisor, { sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-options", model: { provider: "fake provider", id: "model;id" }, thinkingLevel: "high", name: "name with spaces", ...launchSeams });
   const childStart = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line)).find((entry) => entry.kind === "start" && entry.argv.includes(sessionFile));
   // Pi restores its own thinking level from the session file, so no launch selects one.
   expect(childStart.argv).toEqual(["--mode", "rpc", "--session", sessionFile, "--provider", "fake provider", "--model", "model;id", "--name", "name with spaces"]);
@@ -73,7 +76,7 @@ it("rejects readiness when get_state reports a different canonical session file"
 it("holds a startup frame on the reservation and delivers it over the adopted route", async () => {
   const { root, runs, registry, executable, sessionFile, router, control, launchSeams } = await setup();
   const supervisor = new WorkerSupervisor({ registry, router, runsDirectory: runs, configuredPiPath: executable, env: { ...process.env, FAKE_PI_EVENT: "startup_notice", FAKE_PI_EXIT_MS: "700" }, startTimeoutMs: 2_000 });
-  await supervisor.launch({ sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-startup-frame", ...launchSeams });
+  await launch(supervisor, { sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-startup-frame", ...launchSeams });
   // A frame Pi emitted before the route existed is held on the reservation and arrives after adoption.
   const deadline = Date.now() + 5_000;
   while (!control.frames.some((/** @type {any} */ frame) => frame.type === "pi_frame" && frame.frame?.type === "startup_notice")) {
@@ -93,7 +96,7 @@ it("launches a distinct installed Pi child with exact structured argv and persis
     env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_EXIT_MS: "700" },
     startTimeoutMs: 2_000,
   });
-  const handle = await supervisor.launch({ sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-one", piPath: executable, ...launchSeams });
+  const handle = await launch(supervisor, { sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-one", piPath: executable, ...launchSeams });
 
   expect(handle.piChildIdentity.pid).not.toBe(handle.identity.pid);
   expect(handle.identity.processGroupId).toBe(handle.identity.pid);
@@ -141,7 +144,7 @@ async function stopWorker(supervisor, handle, route) {
 it("delivers the operator's text once while Pi is already running a turn, with no refusal reaching him", async () => {
   const { root, runs, registry, executable, sessionFile, log, router, launchSeams } = await setup();
   const supervisor = new WorkerSupervisor({ registry, router, runsDirectory: runs, configuredPiPath: executable, env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_STREAMING: "active" }, startTimeoutMs: 5_000 });
-  const handle = await supervisor.launch({ sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-busy-prompt", ...launchSeams });
+  const handle = await launch(supervisor, { sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-busy-prompt", ...launchSeams });
   const route = router.route("one");
 
   try {
@@ -161,7 +164,7 @@ it("delivers the operator's text once while Pi is already running a turn, with n
 it("keeps both dashboards' text when each submits believing the same session is idle", async () => {
   const { root, runs, registry, executable, sessionFile, log, router, launchSeams } = await setup();
   const supervisor = new WorkerSupervisor({ registry, router, runsDirectory: runs, configuredPiPath: executable, env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_STREAMING: "on_prompt" }, startTimeoutMs: 5_000 });
-  const handle = await supervisor.launch({ sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-two-dashboards", ...launchSeams });
+  const handle = await launch(supervisor, { sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-two-dashboards", ...launchSeams });
   const route = router.route("one");
   const command = (clientId, text) => route.connection.request({ version: 1, type: "command", token: route.metadata.token, id: `submit-${clientId}`, command: { clientId, requestId: `submit-${clientId}`, op: "prompt", text } }, {});
 

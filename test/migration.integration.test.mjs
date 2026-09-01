@@ -2,12 +2,16 @@ import { chmod, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { expect, it } from "vitest";
+import { afterEach, expect, it } from "vitest";
 
 import { runDashboardApp } from "../app/standalone.mjs";
-import { runDaemonCommand } from "../cli/daemon-commands.mjs";
 import { migrateLegacyState } from "../runtime/state-migration.mjs";
 import { expectDaemonCommand } from "./daemon-command-assertions.mjs";
+import { createRealProcessHarness } from "./real-process-harness.mjs";
+
+const harness = createRealProcessHarness("migration");
+
+afterEach(() => harness.cleanup());
 
 async function attempt(mutator, expectedCode) {
   const parent = await mkdtemp(join(tmpdir(), "migration-unsafe-"));
@@ -32,27 +36,26 @@ async function attempt(mutator, expectedCode) {
 // has to exceed the command's 90 s startup deadline, or a hung daemon reads as a bare test timeout
 // with no cause instead of DAEMON_START_FAILED and the daemon's own captured stderr.
 it("publishes and reconciles exactly one real destination daemon", async () => {
-  const parent = await mkdtemp(join(tmpdir(), "migration-real-daemon-"));
+  const parent = await harness.stateRoot("migration-real-daemon-");
   const legacyRoot = join(parent, "pi-agents-dashboard");
-  const destinationRoot = join(parent, "pi-agents");
+  const destinationRoot = harness.daemonRoot(join(parent, "pi-agents"));
   await mkdir(legacyRoot, { mode: 0o700 });
   await writeFile(join(legacyRoot, "dashboard.json"), JSON.stringify({ schemaVersion: 1 }), { mode: 0o600 });
-  try {
-    await runDashboardApp({
-      cwd: parent,
-      env: { HOME: parent, XDG_STATE_HOME: parent, XDG_RUNTIME_DIR: join(parent, "runtime") },
-      initialize: async () => {},
-      connectOrStart: async ({ root }) => ({ root, clientId: "migration-acceptance", async close() {} }),
-      openList: async () => ({ closed: Promise.resolve(), async close() {} }),
-    });
-    const status = await runDaemonCommand("status", { root: destinationRoot });
-    expectDaemonCommand("status", status, { code: 0, result: { publication: { pid: expect.any(Number) } } });
-    const secondStart = await runDaemonCommand("start", { root: destinationRoot });
-    expectDaemonCommand("start", secondStart, { code: 0, result: { alreadyRunning: true, publication: { pid: status.result.publication.pid } } });
-  } finally {
-    await runDaemonCommand("stop", { root: destinationRoot }).catch(() => {});
-    await rm(parent, { recursive: true, force: true });
-  }
+  await runDashboardApp({
+    cwd: parent,
+    env: { HOME: parent, XDG_STATE_HOME: parent, XDG_RUNTIME_DIR: join(parent, "runtime") },
+    initialize: async () => {},
+    connectOrStart: async ({ root }) => ({ root, clientId: "migration-acceptance", async close() {} }),
+    openList: async () => ({ closed: Promise.resolve(), async close() {} }),
+  });
+  const status = await harness.daemon("status", { root: destinationRoot });
+  expectDaemonCommand("status", status, { code: 0, result: { publication: { pid: expect.any(Number) } } });
+  // `migrateLegacyState` starts this daemon through `reconcileDestination`, deep enough that the
+  // harness never sees its spawn. Recording the published identity here is the earliest point a
+  // later timeout can still be reaped from; a timeout inside `runDashboardApp` above still leaks.
+  await harness.record("reconciled destination daemon", status.result.publication);
+  const secondStart = await harness.daemon("start", { root: destinationRoot });
+  expectDaemonCommand("start", secondStart, { code: 0, result: { alreadyRunning: true, publication: { pid: status.result.publication.pid } } });
 }, 120_000);
 
 it.each([

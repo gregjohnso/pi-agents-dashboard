@@ -1,56 +1,27 @@
-import { chmod, mkdtemp, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { afterEach, expect, it } from "vitest";
 
 import { createDaemonClient } from "../app/daemon-client.mjs";
-import { runDaemonCommand } from "../cli/daemon-commands.mjs";
 import { createDaemonRuntime } from "../runtime/daemon.mjs";
 import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
 import { RegistryStore } from "../runtime/registry-store.mjs";
 import { WorkerSupervisor } from "../runtime/worker-supervisor.mjs";
+import { createRealProcessHarness } from "./real-process-harness.mjs";
 
 const fakePiSource = await readFile(fileURLToPath(new URL("./fixtures/fake-pi.mjs", import.meta.url)), "utf8");
-const roots = [];
-const processGroups = new Map();
+const harness = createRealProcessHarness("lifecycle-acceptance");
 const runtimes = [];
 
 afterEach(async () => {
   await Promise.allSettled(runtimes.splice(0).map((runtime) => runtime.close()));
-  for (const identity of processGroups.values()) {
-    try {
-      const actual = await inspectProcessIdentity(identity.pid);
-      if (actual.pid === identity.pid && actual.startIdentity === identity.startIdentity && actual.processGroupId === identity.processGroupId) process.kill(-identity.processGroupId, "SIGTERM");
-    } catch {
-    }
-  }
-  processGroups.clear();
-  await new Promise((resolve) => setTimeout(resolve, 30));
-  // Stop detached daemons before their roots disappear: a daemon whose publication is deleted can no longer be stopped by identity.
-  for (const root of roots) await stopDetachedDaemon(root);
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  // The harness stops each detached daemon before its root disappears, because a daemon whose
+  // publication is deleted can no longer be stopped by identity, then reaps every worker and Pi
+  // child recorded below by that same exact identity.
+  await harness.cleanup();
 });
-
-/** Stop one root's detached daemon, then verify its exact published process group is gone. @param {string} root */
-async function stopDetachedDaemon(root) {
-  /** @type {any} */
-  let publication;
-  try {
-    publication = JSON.parse(await readFile(join(root, "daemon", "pid.json"), "utf8"));
-  } catch {
-    return;
-  }
-  await runDaemonCommand("stop", { root, allowLiveWorkers: true, stopWorkers: true, yes: true }).catch(() => {});
-  try {
-    const actual = await inspectProcessIdentity(publication.pid);
-    if (actual.pid === publication.pid && actual.startIdentity === publication.startIdentity && actual.processGroupId === publication.processGroupId) {
-      process.kill(-publication.processGroupId, "SIGTERM");
-    }
-  } catch {
-  }
-}
 
 function sourceFor(version) {
   return fakePiSource.replace('process.env.FAKE_PI_VERSION ?? "1.0.0"', JSON.stringify(version));
@@ -76,10 +47,7 @@ function record(root, sessionId) {
 }
 
 async function setupRoot(prefix) {
-  const root = await mkdtemp(join(tmpdir(), prefix));
-  roots.push(root);
-  for (const directory of ["canonical", "daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(root, directory), { recursive: true, mode: 0o700 });
-  return root;
+  return harness.stateRoot(prefix, ["canonical", "daemon", "sessions", "queue", "runs", "index"]);
 }
 
 function request(clientId, requestId, op, payload) {
@@ -119,7 +87,7 @@ it("starts the production daemon with launch resolution and delivers the compose
   const env = { ...process.env, FAKE_PI_LOG: log, FAKE_PI_EVENT_AFTER_COMMAND: "prompt", FAKE_PI_ONE_WAY_EXTENSION_UI_RESPONSE: "1" };
   let client;
   try {
-    const started = await runDaemonCommand("start", { root, piBin: executable, env, timeoutMs: 20_000 });
+    const started = await harness.daemon("start", { root, piBin: executable, env, timeoutMs: 20_000 });
     expect(started).toMatchObject({ code: 0, result: { kind: "daemon_started" } });
     client = createDaemonClient({ socketPath: join(root, "daemon", "control.sock"), token: (await readFile(join(root, "daemon", "control.token"), "utf8")).trim(), clientId: "production-launch", reconnect: false, maxBytes: 256 * 1024 });
     await client.connect();
@@ -134,13 +102,13 @@ it("starts the production daemon with launch resolution and delivers the compose
     const state = await client.request(request("production-launch", "state-after-launch", "get_state", {}));
     expect(state).toMatchObject({ ok: true, result: { kind: "state", sessions: [expect.objectContaining({ sessionId: launched.result.sessionId })] } });
     const records = await new RegistryStore(join(root, "sessions")).list();
-    if (records[0]?.ownership?.process !== undefined) processGroups.set(records[0].ownership.process.pid, records[0].ownership.process);
+    if (records[0]?.ownership?.process !== undefined) await harness.record("launched worker", records[0].ownership.process);
     expect(records).toEqual([expect.objectContaining({ sessionId: launched.result.sessionId, cwd: root, isolation: { mode: "shared_directory", canonicalCwd: root }, processState: "LIVE" })]);
     const commands = (await readFile(log, "utf8")).trim().split("\n").map(JSON.parse).filter((entry) => entry.kind === "command");
     expect(commands.some((entry) => entry.command === "prompt" && entry.message === "who are you?" && entry.valid === true)).toBe(true);
   } finally {
     await client?.close();
-    const stopped = await runDaemonCommand("stop", { root, allowLiveWorkers: true, env });
+    const stopped = await harness.daemon("stop", { root, allowLiveWorkers: true, env });
     if (![0, 3].includes(stopped.code)) throw new Error(`Production daemon cleanup failed: ${JSON.stringify(stopped)}`);
   }
 }, 30_000);
@@ -167,7 +135,7 @@ it("keeps two mixed-version fake Pi children alive across frontend close and dae
     async launch(launch) {
       const handle = await supervisor.launch(launch);
       handles.push(handle);
-      processGroups.set(handle.identity.pid, handle.identity);
+      await harness.record(`worker for ${launch.sessionId}`, handle.identity);
       return handle;
     },
     close: () => supervisor.close(),

@@ -51,6 +51,8 @@ At the boundary the operation re-reads every fact it rests on: the revision, the
 
 Before anything is signalled, the run's private metadata gains `pendingRespawn: "upgrade"`, so a daemon that dies mid-replacement resumes the guarded operation after it has adopted that worker again. The replacement then stops the worker through the same exact-identity boundary Stop uses, forgets the run, and launches a new one. Automatic replacements are bounded to three in flight across sessions, so one upgrade does not restart every idle session at once.
 
+The replacement is visible while it runs, because it takes as long as a cold start on a session the operator was using. The same operation reduces `WORKER_REPLACING` onto the row before it signals, and the `replacing` activity that writes reads as `STARTING` in the list for as long as the restart takes, exactly as a launch does; a replacement that stops short of proof restores the activity it found. Once the old worker is provably gone it appends one notice to the session's normalized viewer stream, so an open viewer says what the pause is. Both surfaces come from that one structured transition, never from terminal bytes or from how long a reply is taking.
+
 See [`docs/reference/claude-code-behavior.md`](reference/claude-code-behavior.md#release-changes-adopt-workers-before-replacing-them).
 
 ## The list is invalidated; the viewer is replayed

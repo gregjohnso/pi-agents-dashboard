@@ -26,6 +26,12 @@ const DIALOG_METHODS = new Set(["confirm", "select", "input", "editor"]);
  * `runtime/session-event-mapping.mjs` keeps the same split.
  */
 const ONE_WAY_UI_METHODS = new Set(["notify", "setStatus", "setWidget", "setTitle", "set_editor_text"]);
+/**
+ * What an open viewer reads while its worker is replaced across a release boundary. The supervisor
+ * frames this itself; Pi neither knows nor reports it, and the restart takes long enough that
+ * silence reads as a hung session rather than as work in progress.
+ */
+export const WORKER_REPLACING_NOTICE = "Restarting this session's worker for the current release. Pi resumes this session when it is back.";
 
 /** A typed, session-scoped Pi compatibility failure. */
 export class ViewerNormalizerError extends Error {
@@ -477,6 +483,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       thinkingLevel = frame.level;
       return publish({ kind: "thinking_state", level: thinkingLevel }, `${sourceId}:thinking`, at);
     }
+    if (frame.type === "worker_replacing") return publish(noteSystemMessage(sourceId, WORKER_REPLACING_NOTICE), sourceId, at);
     if (frame.type === "agent_start") return [...publish({ kind: "turn_state", working: true }, `${sourceId}:turn`, at), ...replaceActivity("thinking", "Thinking", sourceId)];
     if (frame.type === "agent_settled") return [...publish({ kind: "turn_state", working: false }, `${sourceId}:turn`, at), ...replaceActivity("idle", "Idle", sourceId)];
     if (frame.type === "compaction_start") return replaceActivity("compacting", "Compacting context", sourceId);

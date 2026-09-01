@@ -3,7 +3,11 @@ import { mkdir, mkdtemp, readFile, readlink, rename, rm, symlink, writeFile } fr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { stripVTControlCharacters } from "node:util";
+
 import { afterEach, expect, it, vi } from "vitest";
+
+import { createDashboardLayout, renderSessionRow } from "../app/list/dashboard-layout.mjs";
 
 import { createDaemonRuntime } from "../runtime/daemon.mjs";
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
@@ -205,6 +209,67 @@ it("respawns a stale worker through the guarded destructive path and preserves t
   expect(await readFile(session.canonicalSessionFile, "utf8")).toBe("session\n");
   const journal = await readFile(join(root, "queue", "commands.jsonl"), "utf8");
   expect(journal.indexOf('"stage":"DELIVERY_ATTEMPTED"')).toBeLessThan(journal.lastIndexOf('"stage":"WORKER_ACKNOWLEDGED"'));
+  frontend.close();
+  workerSocket.close();
+});
+
+// Operator-visible failure: the daemon replaced a stale worker at a safe boundary and left the row on
+// its last state while Pi restarted and resumed. The operator waited two minutes with nothing on the
+// row or in the transcript to say why, read the session as broken, and said so.
+it("shows a replacement as work in progress on the row and in the transcript", async () => {
+  const root = await fixtureRoot();
+  const worker = { pid: 9411, startIdentity: "941100", processGroupId: 9411 };
+  let alive = true;
+  const registry = new RegistryStore(join(root, "sessions"));
+  const session = record(root, "visible-respawn", {
+    processState: "LIVE",
+    ownership: { kind: "managed", runId: "run-visible", process: worker, acquiredAt: "2026-08-25T12:00:00.000Z", heartbeatAt: "2026-08-25T12:00:00.000Z" },
+    latestRunId: "run-visible",
+  });
+  await writeFile(session.canonicalSessionFile, "");
+  await registry.create(session);
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: session.sessionId, runId: "run-visible", leaseId: "lease-visible", generation: 1, identity: worker, piChildIdentity: worker, cliVersion: "1.9.0" }] })}\n`, { mode: 0o600 });
+  // The row the operator stares at is the one the daemon holds while the replacement worker starts,
+  // so it is read at the launch the replacement asks for, not after that launch has finished.
+  const rowsWhileStarting = [];
+  const runtime = await createDaemonRuntime({
+    root,
+    cliVersion: "2.0.0",
+    reconnectTimeoutMs: 1_000,
+    stopPolicy: { gracefulMs: 1, terminateMs: 1 },
+    sleepImpl: async () => {},
+    inspect: async (pid) => {
+      if (pid === process.pid) return { pid, startIdentity: "1", processGroupId: process.pid };
+      if (pid === worker.pid && alive) return worker;
+      throw Object.assign(new Error("gone"), { code: "ESRCH" });
+    },
+    signalProcessGroupImpl(_pgid, signal) { if (signal === "SIGTERM") alive = false; },
+    workerSupervisor: {
+      useRouter() {},
+      async launch(request) { rowsWhileStarting.push(await registry.get(request.sessionId)); return { sessionId: request.sessionId }; },
+      async close() {},
+    },
+  });
+  runtimes.push(runtime);
+  const workerSocket = connect(runtime, "worker");
+  await workerSocket.next();
+  workerSocket.send({ version: 1, type: "worker_ready", token: "visible-token", sessionId: session.sessionId, runId: "run-visible", leaseId: "lease-visible", generation: 1, worker, piChild: worker });
+  await runtime.ready;
+  const frontend = connect(runtime);
+  await frontend.next();
+
+  frontend.send(request("client", "visible-respawn-request", "respawn", { sessionId: session.sessionId, revision: 0 }));
+  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { operation: "respawn", stage: "COMPLETED" } } });
+
+  expect(rowsWhileStarting).toHaveLength(1);
+  const row = stripVTControlCharacters(renderSessionRow(rowsWhileStarting[0], createDashboardLayout(160, 40), { now: Date.parse("2026-08-25T12:00:10.000Z") }));
+  expect(row).toContain("STARTING");
+  expect(row).not.toContain("EXITED");
+  expect(row).toContain("Replacing this session's worker");
+
+  frontend.send(request("client", "visible-snapshot", "get_viewer_snapshot", { sessionId: session.sessionId }));
+  const snapshot = await frontend.next();
+  expect(snapshot.result.snapshot.items.map((item) => item.text ?? "").join("\n")).toContain("Restarting this session's worker");
   frontend.close();
   workerSocket.close();
 });

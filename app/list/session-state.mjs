@@ -4,6 +4,9 @@
  * Task state alone is misleading: a finished session still reports READY, which reads as
  * "ready to work" for a session whose process is gone.
  *
+ * A worker being replaced across a release boundary is starting, not finished: the row would
+ * otherwise read as a dead session for the whole time Pi takes to restart and resume.
+ *
  * @param {import("../../shared/contracts.mjs").SessionRecord} session
  * @returns {"WORKING"|"WAITING"|"READY"|"SLEEPING"|"STARTING"|"EXITED"|"STOPPED"|"FAILED"|"STALE"}
  */
@@ -12,6 +15,6 @@ export function displaySessionState(session) {
   if (session.taskState === "STOPPED") return "STOPPED";
   if (session.processState === "STALE") return "STALE";
   if (session.processState === "SLEEPING") return "SLEEPING";
-  if (session.processState === "EXITED") return session.activity.kind === "launching" ? "STARTING" : "EXITED";
+  if (session.processState === "EXITED") return ["launching", "replacing"].includes(session.activity.kind) ? "STARTING" : "EXITED";
   return session.taskState === "WORKING" || session.taskState === "WAITING" ? session.taskState : "READY";
 }

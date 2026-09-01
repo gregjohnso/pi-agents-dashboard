@@ -21,7 +21,7 @@ function isInView(session, view) {
     if (view === "all")
         return true;
     if (view === "live")
-        return session.processState === "LIVE" || session.activity.kind === "launching";
+        return session.processState === "LIVE" || ["launching", "replacing"].includes(session.activity.kind);
     return ((session.outcome === "COMPLETED" || session.outcome === "READY_FOR_REVIEW")
         && (session.processState === "SLEEPING" || session.processState === "EXITED"));
 }

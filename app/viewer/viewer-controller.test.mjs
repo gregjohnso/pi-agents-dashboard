@@ -1,6 +1,7 @@
 import { stripVTControlCharacters } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 
+import { createViewerNormalizer } from "../../runtime/viewer-normalizer.mjs";
 import { ViewerController } from "./viewer-controller.mjs";
 
 const timestamp = "2026-08-25T00:00:00Z";
@@ -252,6 +253,23 @@ describe("viewer commands", () => {
     const plain = f.instance.render(80, 20).map(stripVTControlCharacters);
     const promptRow = plain.findLastIndex((line) => line.startsWith("> "));
     expect(plain[promptRow - 1]).toMatch(/^─+$/u);
+  });
+
+  // Operator-visible failure: the supervisor replaced this session's worker at a release boundary and
+  // the transcript said nothing for the two minutes Pi took to restart and resume, so the operator
+  // read a live restart as a hung session. The notice is the normalizer's own, not a string this test
+  // invents: it comes from the same frame the daemon ingests when it replaces a worker.
+  it("shows the supervisor's worker replacement in the transcript it renders", async () => {
+    const f = fixture();
+    await f.instance.open();
+    const [draft] = createViewerNormalizer({ sessionId: "s", protocolVersion: 1, now: () => timestamp })
+      .consumeFrame({ type: "worker_replacing", id: "respawn:run-1" });
+
+    await f.emit({ version: 1, sessionId: "s", eventId: draft.eventId, cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: draft.payload });
+
+    const rendered = stripVTControlCharacters(f.instance.render(100, 24).join("\n"));
+    expect(rendered).toContain("Restarting this session's worker");
+    expect(rendered).not.toContain("Unsupported");
   });
 
   it("colors the border Pi's editor already draws instead of adding rules", async () => {

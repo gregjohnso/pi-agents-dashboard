@@ -4,7 +4,7 @@
 
 /**
  * @typedef {object} SessionStateEvent
- * @property {"WORKER_READY" | "TURN_STARTED" | "TURN_COMPLETED" | "TURN_READY_FOR_REVIEW" | "WORKER_SLEEPING" | "WORKER_EXITED" | "USER_STOPPED" | "PI_CHILD_CRASHED" | "WORKER_CRASHED" | "IDENTITY_STALE" | "UI_REQUESTED" | "UI_RESPONDED" | "ACTIVITY_SNAPSHOT" | "LAUNCH_ABANDONED" | "FRONTEND_DETACHED"} type
+ * @property {"WORKER_READY" | "TURN_STARTED" | "TURN_COMPLETED" | "TURN_READY_FOR_REVIEW" | "WORKER_SLEEPING" | "WORKER_EXITED" | "WORKER_REPLACING" | "USER_STOPPED" | "PI_CHILD_CRASHED" | "WORKER_CRASHED" | "IDENTITY_STALE" | "UI_REQUESTED" | "UI_RESPONDED" | "ACTIVITY_SNAPSHOT" | "LAUNCH_ABANDONED" | "FRONTEND_DETACHED"} type
  * @property {string} at
  * @property {string} [summary]
  * @property {ActivitySignal} [blockingRequest]
@@ -96,6 +96,17 @@ export function reduceSessionState(record, event) {
         taskState: "READY",
         processState: "EXITED",
         outcome: record.outcome,
+      });
+    case "WORKER_REPLACING":
+      // Task and process state stay where they are: the worker is still running here, and the exit
+      // this activity outlives is the replacement's own. It reads as a start in progress until the
+      // replacement worker reports ready, exactly as a launch does.
+      return transition(record, event.at, {
+        activity: {
+          kind: "replacing",
+          summary: event.summary ?? "Replacing this session's worker for the current release",
+          updatedAt: event.at,
+        },
       });
     case "USER_STOPPED":
       return transition(record, event.at, {

@@ -669,6 +669,32 @@ export async function createDaemonRuntime({
           routeGeneration: route.routeGeneration,
         };
       },
+      /**
+       * Say on the row and in the transcript that this session's worker is being replaced.
+       *
+       * The replacement takes as long as a cold start, and it is the supervisor's own decision: the
+       * operator's session was READY and stays READY through it, so without this the wait reads as a
+       * hung prompt. Both surfaces come from this one structured transition; neither infers it from
+       * terminal bytes or from how long a reply is taking.
+       * @param {any} record
+       */
+      async announceWorkerReplacement(record) {
+        const replacing = reduceSessionState(record, { type: "WORKER_REPLACING", at: new Date().toISOString() });
+        await registry.update(record.sessionId, record.revision, { activity: replacing.activity, updatedAt: replacing.updatedAt });
+        context.notifyListChanged();
+      },
+      /**
+       * Restore the activity a refused or failed replacement announced, so a row that is not being
+       * replaced stops saying that it is. The compare is on the announcement itself: a worker that
+       * went on to report something newer keeps what it reported.
+       * @param {string} sessionId @param {any} activity
+       */
+      async withdrawWorkerReplacement(sessionId, activity) {
+        await applySessionUpdate(registry, sessionId, (current) => current.activity.kind === "replacing"
+          ? { activity, updatedAt: new Date().toISOString() }
+          : undefined).catch(() => {});
+        context.notifyListChanged();
+      },
       /** Record one refusal or failure to replace a worker; the worker itself keeps running. @param {string} sessionId @param {unknown} error */
       recordRespawnRefusal(sessionId, error) {
         const refusal = /** @type {any} */ (error);
@@ -700,6 +726,8 @@ export async function createDaemonRuntime({
           // The intent is durable before anything is signalled, so a daemon that dies mid-replacement
           // resumes the guarded operation after it has adopted the worker again.
           await router.markPendingRespawn(sessionId, metadata.runId);
+          const announced = record.activity;
+          await context.announceWorkerReplacement(record);
           await beforeSignal();
           const disposition = await stopVerifiedProcessGroup(record.ownership.process, {
             inspect,
@@ -707,7 +735,10 @@ export async function createDaemonRuntime({
             signalProcessGroup: signalProcessGroupImpl,
             sleep: sleepImpl,
           }, stopPolicy);
-          if (!TERMINAL_STOP_DISPOSITIONS.includes(disposition.disposition)) throw refusal(disposition.disposition, `Respawn stopped short of proof at the exact identity boundary: ${disposition.disposition}`);
+          if (!TERMINAL_STOP_DISPOSITIONS.includes(disposition.disposition)) {
+            await context.withdrawWorkerReplacement(sessionId, announced);
+            throw refusal(disposition.disposition, `Respawn stopped short of proof at the exact identity boundary: ${disposition.disposition}`);
+          }
           const latest = await registry.get(sessionId);
           if (latest?.ownership?.runId === record.ownership.runId) {
             const exited = reduceSessionState(latest, { type: "WORKER_EXITED", at: new Date().toISOString() });
@@ -716,6 +747,12 @@ export async function createDaemonRuntime({
           }
           // The replaced run's private metadata, including its pending replacement, goes with the run.
           await forget();
+          // The transcript says it once the worker is provably gone, so an open viewer never reads a
+          // restart notice for a worker that is still running. A notice that cannot be written must
+          // not cost the operator the replacement itself.
+          const viewer = context.recovery?.viewer ?? context.viewerRecovery;
+          await viewer?.ingest(sessionId, { type: "worker_replacing", id: `respawn:${record.ownership.runId}` })
+            .catch((/** @type {unknown} */ error) => { recordDiagnostic({ event: "respawn_notice_failed", sessionId, code: /** @type {any} */ (error)?.code ?? "VIEWER_NOTICE_FAILED", message: error instanceof Error ? error.message : "Replacement notice failed", at: new Date().toISOString() }); });
           await context.ensureSessionWorker(sessionId);
         });
       },

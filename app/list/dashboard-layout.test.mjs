@@ -167,3 +167,19 @@ it("spins an unlabelled column left of STATE so the state text never shifts", ()
     // The header labels nothing above the spinner.
     expect(stripVTControlCharacters(renderColumnHeader(layout))).toMatch(/NAME\s+STATE\s+ACTIVITY/u);
 });
+
+it("reads a worker replacement as a start in progress, with the reason in the activity column", () => {
+    // Operator-visible failure: a worker replaced at a release boundary left the row on its last
+    // state for the two minutes the restart took, and the operator read his own prompt as hung.
+    const layout = createDashboardLayout(160, 40);
+    const replacing = session("replacing-1234", {
+        processState: "EXITED",
+        activity: { kind: "replacing", summary: "Replacing this session's worker for the current release", updatedAt: "2026-08-25T11:59:00.000Z" },
+    });
+    const row = stripVTControlCharacters(renderSessionRow(replacing, layout, { now }));
+    expect(row).toContain("STARTING");
+    expect(row).not.toContain("EXITED");
+    expect(row).toContain("Replacing this session's worker");
+    // A restarting session is live work, so the default view must not drop it.
+    expect(renderSessionRow(replacing, layout, { now })).toContain(JOBWATCH_ANSI.cyan);
+});

@@ -1,7 +1,9 @@
 import { stripVTControlCharacters } from "node:util";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 
 import { createViewerNormalizer } from "../../runtime/viewer-normalizer.mjs";
+import { createPiEditor } from "./pi-component-adapters.mjs";
 import { ViewerController } from "./viewer-controller.mjs";
 
 const timestamp = "2026-08-25T00:00:00Z";
@@ -678,4 +680,23 @@ describe("transcript scrolling keys and wheel", () => {
     expect(tail).toContain("fresh");
   });
 
+});
+
+describe("viewer prompt", () => {
+  // The dashboard's prompt clipped an over-wide draft; this pins that the viewer's does not, because
+  // it is Pi's own editor rather than a hand-painted line.
+  it("wraps a draft wider than the terminal instead of clipping it", async () => {
+    const draft = "Add the Notion and Slack MCP servers to this session so the agent can read the release checklist";
+    const f = fixture({ editor: createPiEditor({ tui: { requestRender() {} } }) });
+    await f.instance.open();
+    f.instance.editor.setText(draft);
+
+    const lines = f.instance.render(60, 24).map(stripTerminalSequences);
+    const rules = lines.flatMap((line, index) => /^─+$/u.test(line.trim()) ? [index] : []);
+    const promptRows = lines.slice(rules.at(-2) + 1, rules.at(-1));
+
+    expect(promptRows.length).toBeGreaterThan(1);
+    expect(promptRows.join("").replace(/\s+/gu, "")).toBe(draft.replace(/\s+/gu, ""));
+    expect(lines.every((line) => visibleWidth(line) <= 60)).toBe(true);
+  });
 });

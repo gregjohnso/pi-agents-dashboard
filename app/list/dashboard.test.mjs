@@ -1475,3 +1475,99 @@ it("rests a dimmed cursor on the placeholder's first character until the operato
   expect(typed).not.toContain("describe a task for a new session");
   expect(typed).toContain("hello");
 });
+
+/** The dock's prompt block: the rows between the rule that opens the prompt box and the one that closes it. */
+function promptRows(lines) {
+  const plain = lines.map(stripVTControlCharacters);
+  const rules = plain.flatMap((line, index) => /^─+$/u.test(line.trim()) ? [index] : []);
+  const [open, close] = rules.slice(-2);
+  return plain.slice(open + 1, close);
+}
+
+function listRowCount(lines) {
+  return lines.filter((line) => stripVTControlCharacters(line).includes("READY")).length;
+}
+
+const CAPPED_DRAFT = Array.from({ length: 200 }, (_, index) => `word${index}`).join(" ");
+
+describe("prompt wrapping", () => {
+  // Operator-visible failure: a prompt longer than the terminal was clipped at the right edge, so the
+  // operator's own sentence disappeared as he typed it and he could not read what he was about to send.
+  it("keeps every character of an over-wide draft visible and takes the rows from the list", async () => {
+    const draft = "Add the Notion and Slack MCP servers to this session so the agent can read the release checklist and post a summary";
+    const dashboard = controller(new FakeBackend(Array.from({ length: 40 }, (_, index) => session(`s-${index}`))));
+    await dashboard.open();
+
+    const empty = dashboard.render(60, 24);
+    expect(promptRows(empty)).toHaveLength(1);
+
+    dashboard.setComposerPrompt(draft);
+    const wrapped = dashboard.render(60, 24);
+    const rows = promptRows(wrapped);
+    expect(rows.length).toBeGreaterThan(1);
+    expect(rows.join("").replace(/\s+/gu, "")).toBe(`❯${draft}`.replace(/\s+/gu, ""));
+    expect(wrapped.every((line) => visibleWidth(line) <= 60)).toBe(true);
+    // No word is broken across rows while a whole word still fits.
+    for (const row of rows.slice(0, -1)) expect(row.trimEnd()).toMatch(/[\s❯]\S+$/u);
+    expect(listRowCount(empty) - listRowCount(wrapped)).toBe(rows.length - 1);
+  });
+
+  it("caps the prompt box at Pi's editor height and keeps the tail of a longer draft visible", async () => {
+    const dashboard = controller(new FakeBackend([session("a")]));
+    await dashboard.open();
+    dashboard.setComposerPrompt(CAPPED_DRAFT);
+    const lines = dashboard.render(60, 24);
+    const rows = promptRows(lines);
+
+    // pi-tui's Editor shows max(5, 30% of the terminal): 7 rows at height 24.
+    expect(rows).toHaveLength(7);
+    expect(rows.at(-1)).toContain("word199");
+    expect(rows.join(" ")).not.toMatch(/word0\b/u);
+    expect(lines.every((line) => visibleWidth(line) <= 60)).toBe(true);
+  });
+
+  it("never takes the last list row, however long the draft and however short the terminal", async () => {
+    const dashboard = controller(new FakeBackend([session("a")]));
+    await dashboard.open();
+    dashboard.setComposerPrompt(CAPPED_DRAFT);
+    for (const height of [24, 12, 11, 9]) {
+      const lines = dashboard.render(60, height);
+      expect(lines, `height ${height}`).toHaveLength(height);
+      expect(listRowCount(lines), `height ${height}`).toBeGreaterThanOrEqual(1);
+      expect(lines.every((line) => visibleWidth(line) <= 60), `height ${height}`).toBe(true);
+    }
+  });
+
+  it("wraps a wide-character draft without splitting a cell", async () => {
+    const draft = "検証中🚀のセッションをNotionとSlackのMCPサーバーに接続して結果を要約してください";
+    const dashboard = controller(new FakeBackend([session("a")]));
+    await dashboard.open();
+    dashboard.setComposerPrompt(draft);
+    const lines = dashboard.render(40, 24);
+    const rows = promptRows(lines);
+
+    expect(rows.length).toBeGreaterThan(1);
+    expect(rows.join("").replace(/\s+/gu, "")).toBe(`❯${draft}`.replace(/\s+/gu, ""));
+    for (const row of rows) expect(visibleWidth(row)).toBeLessThanOrEqual(40);
+  });
+
+  it("keeps the /cwd completion list flush above a prompt several rows tall", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-agents-tall-prompt-"));
+    await mkdir(join(root, "a-directory-name-long-enough-to-wrap-the-prompt", "nested"), { recursive: true });
+    try {
+      const dashboard = controller(new FakeBackend([session("a")]));
+      await dashboard.open();
+      for (const character of `/cwd ${root}/a-directory-name-long-enough-to-wrap-the-prompt/`) dashboard.handleInput(character);
+      await vi.waitFor(() => expect(dashboard.pathCompletionOverlay()).toBeDefined());
+
+      const lines = dashboard.render(60, 24);
+      const plain = lines.map(stripVTControlCharacters);
+      expect(promptRows(lines).length).toBeGreaterThan(2);
+      const openRule = plain.flatMap((line, index) => /^─+$/u.test(line.trim()) ? [index] : []).at(-2);
+      // The completion list ends on the row directly above the rule, wherever the taller prompt put it.
+      expect(plain[openRule - 1].trim()).not.toBe("");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});

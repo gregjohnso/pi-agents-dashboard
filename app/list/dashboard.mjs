@@ -7,7 +7,7 @@ import { pastedText } from "./dashboard-input.mjs";
 import { sessionNameFromPrompt } from "../../runtime/launch-resolver.mjs";
 import { SPINNER_INTERVAL_MS } from "../spinner.mjs";
 import { countDashboardSessions, selectDashboardSessions, } from "./dashboard-state.mjs";
-import { createDashboardLayout, renderColumnHeader, } from "./dashboard-layout.mjs";
+import { createDashboardLayout, renderColumnHeader, wrapPromptDraft, } from "./dashboard-layout.mjs";
 import { jobwatchTheme } from "./dashboard-theme.mjs";
 import { displaySessionState } from "./session-state.mjs";
 import { StopClearGesture } from "./stop-clear-gesture.mjs";
@@ -971,11 +971,12 @@ export class DashboardController {
             this.moveSelection(1);
             return;
         }
-        const layout = createDashboardLayout(this.width, this.height);
+        const layout = this.layout();
         const clicked = Math.floor(event.row);
-        // The prompt is the row under the dock's opening rule; everything else above the list
+        // The prompt is the block under the dock's opening rule; everything else above the list
         // (title, context, launch settings, border, column header) and below it is read-only.
-        if (this.height >= 4 && clicked === this.height - layout.dockRows + 1) {
+        const dockTop = this.height - layout.dockRows;
+        if (this.height >= 4 && clicked > dockTop && clicked <= dockTop + layout.promptRows) {
             this.focusComposer();
             return;
         }
@@ -996,7 +997,7 @@ export class DashboardController {
             this.resize(width, height);
             // Rows cache their rendered line; without a fresh reading the spinner frame and age never move.
             this.list.setNow(this.now());
-            const layout = createDashboardLayout(this.width, this.height);
+            const layout = this.layout();
             // The dock takes the focus border only while it waits for the typed shared-directory path.
             const confirmingSharedLaunch = this.focus === "confirmation";
             const lines = Array.from({ length: this.height }, () => "");
@@ -1023,11 +1024,20 @@ export class DashboardController {
                 const draftPrompt = this.composerDraft.prompt;
                 // Flat rules above and below the prompt: a rounded top with a flat bottom read as a broken box.
                 lines[dockTop] = sectionFooter(this.width, confirmingSharedLaunch);
-                lines[dockTop + 1] = draftPrompt === "" ? promptPlaceholderLine(this.width) : paintPlainLine(` ❯ ${draftPrompt}`, this.width, (text) => jobwatchTheme.text(text, false));
+                if (draftPrompt === "")
+                    lines[dockTop + 1] = promptPlaceholderLine(this.width);
+                else {
+                    // Past the cap the box scrolls: typing lands at the end, so the tail is what must stay visible.
+                    const wrapped = wrapPromptDraft(draftPrompt, this.width);
+                    wrapped.slice(Math.max(0, wrapped.length - layout.promptRows)).forEach((row, index) => {
+                        lines[dockTop + 1 + index] = paintPlainLine(row, this.width, (text) => jobwatchTheme.text(text, false));
+                    });
+                }
+                const promptBottom = dockTop + layout.promptRows;
                 const form = layout.listTop >= 4 ? this.draftModelSummary() : ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} name:${this.composerDraft.name}`;
                 // The rule closes the prompt box; launch settings and the selected path are context below it.
-                const formRow = layout.dockRows >= 4 ? dockTop + 3 : dockTop + 2;
-                if (layout.dockRows >= 4) lines[dockTop + 2] = sectionFooter(this.width, confirmingSharedLaunch);
+                const formRow = layout.dockRows >= 4 ? promptBottom + 2 : promptBottom + 1;
+                if (layout.dockRows >= 4) lines[promptBottom + 1] = sectionFooter(this.width, confirmingSharedLaunch);
                 // An armed clear is the one thing on this row worth interrupting for, and it expires on its own.
                 lines[formRow] = this.stopClearArmed
                     ? paintPlainLine(" ctrl+x to confirm", this.width, jobwatchTheme.error)
@@ -1095,8 +1105,12 @@ export class DashboardController {
         if (row?.kind === "session")
             this.selectSession(row.session.sessionId);
     }
+    /** The current layout, with the dock sized to the rows the draft wraps into. */
+    layout() {
+        return createDashboardLayout(this.width, this.height, { promptRows: wrapPromptDraft(this.composerDraft.prompt, this.width).length });
+    }
     listHeight() {
-        return createDashboardLayout(this.width, this.height).listHeight;
+        return this.layout().listHeight;
     }
     ensureSelectionVisible() {
         const row = this.list.selectedRowIndex;
@@ -1233,7 +1247,7 @@ export class DashboardController {
         const overlay = this.overlay ?? this.pathCompletionOverlay() ?? this.commandMenuOverlay();
         if (overlay === undefined || lines.length === 0)
             return;
-        const layout = createDashboardLayout(this.width, this.height);
+        const layout = this.layout();
         // Commands and their values read like Pi's own completion list: flush above the prompt, no frame.
         if (overlay.kind === "command_menu" || overlay.kind === "choice" || overlay.kind === "path_completion") {
             this.renderInlineMenu(lines, overlay, layout);

@@ -517,6 +517,23 @@ describe("dashboard controller", () => {
         await vi.waitFor(() => expect(backend.requests).toHaveLength(2));
         expect(backend.requests[1]).toMatchObject({ isolation: { mode: "shared_directory", confirmedCwd: "/repo" } });
     });
+    // A launch has two failure channels today: a refusal on the response envelope, and a thrown
+    // transport failure the client cannot attribute to an answer. The confirmation path let the
+    // second one escape, and the operator's text went with it: the composer was already cleared.
+    it("hands the prompt back when a confirmed shared-directory launch fails on the transport", async () => {
+        const backend = new FakeBackend([]);
+        backend.launch = vi.fn(async () => { throw Object.assign(new Error("Daemon response could not be parsed"), { code: "MALFORMED_RESPONSE" }); });
+        const dashboard = controller(backend);
+        await dashboard.open();
+        dashboard.setComposerPrompt("Shared change");
+        dashboard.setIsolationMode("shared_directory");
+        await dashboard.submitComposer();
+        expect(dashboard.focus).toBe("confirmation");
+        await dashboard.confirmSharedLaunch("/repo");
+        expect(backend.launch).toHaveBeenCalledTimes(1);
+        expect(dashboard.composerDraft.prompt).toBe("Shared change");
+        expect(dashboard.status).toMatchObject({ kind: "error", code: "MALFORMED_RESPONSE" });
+    });
 // Nothing durable records an ambiguous launch and nothing may retry it, so the operator gets his
 // prompt back and one error line naming the code.
     it("hands back the prompt and never retries a launch whose delivery is ambiguous", async () => {

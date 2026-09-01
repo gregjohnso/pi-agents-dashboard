@@ -1188,6 +1188,12 @@ export class DashboardController {
         try {
             outcome = await this.backend.launch(request, this.requestId());
         }
+        catch (error) {
+            // A launch that throws costs the operator exactly what a refusal costs him: his text and
+            // the session it was for. One refusal path handles both, because the second caller below
+            // is invoked from a keystroke with `void` and a thrown one vanished with the draft.
+            outcome = { kind: "rejected", error: this.typedError(error, "LAUNCH_FAILED") };
+        }
         finally {
             // Always retire the placeholder: a throw used to leave a STARTING row that never resolved.
             this.pendingLaunches = this.pendingLaunches.filter((entry) => entry !== pending);
@@ -1198,10 +1204,9 @@ export class DashboardController {
             this.requestRender?.();
             return;
         }
-        // A refused launch must hand the typed prompt back. The backend answers a refusal with
-        // `rejected`, never `error`, so matching only `error` silently ate the draft on every refusal.
-        if (outcome.kind === "error" || outcome.kind === "rejected")
-            this.restoreDraft(request.prompt);
+        // Every launch that is not `launched` hands the typed prompt back. Matching one refusal shape
+        // out of two silently ate the draft on the other.
+        this.restoreDraft(request.prompt);
         this.status = { kind: "error", code: outcome.error.code, message: outcome.error.message };
     }
     renderOverlay(lines) {

@@ -60,7 +60,7 @@ Not adopted, deliberately: their PTY hosting and terminal-byte rendering. `docs/
 
 Ordered by concepts removed, not lines. Every item was verified against the code by the review that proposed it; where a review argued against a change, that verdict is recorded too.
 
-**Delete `runtime/control-server.mjs`, 148 lines.** A second socket-server implementation whose only consumer is its own test; production uses the private one inside `daemon.mjs`. Port its malformed-frame and socket-mode coverage to the surviving server first, then delete. Verified by search.
+**Delete `runtime/control-server.mjs`, 148 lines. Done.** A second socket-server implementation whose only consumer is its own test; production uses the private one inside `daemon.mjs`. Port its malformed-frame and socket-mode coverage to the surviving server first, then delete. Verified by search.
 
 **Split transport out of `runtime/daemon.mjs` into `runtime/daemon-server.mjs`.** Socket lifecycle, authentication, role selection, the frontend protocol gate, JSONL framing, per-socket ordering, worker reply correlation, subscription lifetimes, bounded queues, shutdown draining. About 250 lines move out of a 1,549-line file that every commit in this release had to touch, which made it the serialization point for all parallel work. Do not split the rest of the request handler into one file per operation: its first half is a dispatch table, but its second half is a transaction coordinator and distributing that would add imports without removing concepts.
 

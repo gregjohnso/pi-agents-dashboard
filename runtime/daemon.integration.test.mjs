@@ -1,7 +1,7 @@
 import net from "node:net";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { access, mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, lstat, mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, expect, it, vi } from "vitest";
@@ -65,6 +65,28 @@ function connect({ socketPath, token, role, attachId, maxBytes = 1024, declaredC
   /** @param {any} value */
   const send = (value) => { socket.write(encoder.encode(value)); };
   return { socket, ready, closed, next, send, close() { socket.destroy(); } };
+}
+
+/**
+ * Write raw bytes to the daemon's control socket and read every frame it answered with before the
+ * connection closed. `halfClose` sends FIN, which is what makes the daemon run its end-of-stream
+ * framing check on whatever partial record is still buffered.
+ *
+ * @param {string} socketPath @param {string[]} chunks @param {{ halfClose?: boolean }} [options]
+ * @returns {Promise<any[]>}
+ */
+function rawExchange(socketPath, chunks, { halfClose = false } = {}) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(socketPath);
+    let text = "";
+    socket.on("data", (chunk) => { text += chunk; });
+    socket.on("error", reject);
+    socket.on("close", () => resolve(text.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))));
+    socket.on("connect", () => {
+      for (const chunk of chunks) socket.write(chunk);
+      if (halfClose) socket.end();
+    });
+  });
 }
 
 /** @param {{ socketPath: string, tokenPath: string }} config @param {any} worker */
@@ -738,14 +760,57 @@ it("authenticates every connection and applies strict framing limits", async () 
   expect(await wrong.ready).toMatchObject({ ok: false, error: { code: "AUTHENTICATION_FAILED" } });
   wrong.close();
 
-  const oversized = await new Promise((resolve) => {
-    const socket = net.createConnection(runtime.socketPath);
-    let text = "";
-    socket.on("connect", () => socket.write(`${JSON.stringify({ version: 1, token: "x".repeat(400) })}\n`));
-    socket.on("data", (chunk) => { text += chunk; });
-    socket.on("close", () => resolve(JSON.parse(text.trim())));
-  });
+  const [oversized] = await rawExchange(runtime.socketPath, [`${JSON.stringify({ version: 1, token: "x".repeat(400) })}\n`]);
   expect(oversized).toMatchObject({ error: { code: "FRAME_TOO_LARGE" } });
+});
+
+// A frame the daemon cannot even parse is refused by code and the connection is closed, so a
+// client never mistakes silence for acceptance. Ported from the deleted runtime/control-server,
+// a second socket server that promised these refusals and that nothing but its own test reached.
+it.each([
+  ["malformed JSON", "{oops\n", "MALFORMED_JSON"],
+  ["an authentication frame from an unknown protocol version", `${JSON.stringify({ version: 2, token: "secret" })}\n`, "UNSUPPORTED_VERSION"],
+])("refuses %s before authentication and closes the connection", async (_name, frame, code) => {
+  const runtime = await createDaemonRuntime({ root: await root(), hostProbe: async () => ({ blockers: [] }), maxBytes: 256 });
+  runtimes.push(runtime);
+  await runtime.ready;
+  expect(await rawExchange(runtime.socketPath, [frame])).toEqual([{ version: 1, ok: false, error: { code, message: expect.any(String), retryable: false } }]);
+});
+
+it("refuses a stream that ends before its line-feed delimiter", async () => {
+  const runtime = await createDaemonRuntime({ root: await root(), hostProbe: async () => ({ blockers: [] }), maxBytes: 256 });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const authentication = `${JSON.stringify({ version: 1, token: runtime.token, clientProtocol: CLIENT_PROTOCOL })}\n`;
+  const frames = await rawExchange(runtime.socketPath, [authentication, '{"version":1'], { halfClose: true });
+  expect(frames[0]).toMatchObject({ kind: "authenticated" });
+  expect(frames.at(-1)).toMatchObject({ ok: false, error: { code: "INCOMPLETE_FRAME" } });
+});
+
+it.each([
+  ["an unknown operation", { version: 1, clientId: "c", requestId: "exact-id", op: "shell", payload: {} }],
+  ["the retired viewer acknowledgement", { version: 1, clientId: "c", requestId: "exact-id", op: "ack_viewer", payload: { cursor: { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "1" } } }],
+  ["a request from an unknown protocol version", { version: 2, clientId: "c", requestId: "exact-id", op: "get_state", payload: {} }],
+])("refuses %s after authentication and names the request it refused", async (_name, bad) => {
+  const runtime = await createDaemonRuntime({ root: await root(), hostProbe: async () => ({ blockers: [] }) });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token });
+  await client.ready;
+  client.send(bad);
+  expect(await client.next()).toMatchObject({ version: 1, requestId: "exact-id", ok: false, error: { code: "INVALID_REQUEST" } });
+  client.close();
+});
+
+it("binds the control socket as a user-owned mode-0600 socket", async () => {
+  const runtime = await createDaemonRuntime({ root: await root(), hostProbe: async () => ({ blockers: [] }) });
+  runtimes.push(runtime);
+  await runtime.ready;
+  const metadata = await lstat(runtime.socketPath);
+  expect(metadata.isSocket()).toBe(true);
+  expect(metadata.isSymbolicLink()).toBe(false);
+  expect(metadata.uid).toBe(process.getuid?.());
+  expect(metadata.mode & 0o777).toBe(0o600);
 });
 
 it("publishes failed recovery status and removes lifecycle artifacts on close", async () => {

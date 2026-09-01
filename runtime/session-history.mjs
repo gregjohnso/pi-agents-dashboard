@@ -146,13 +146,3 @@ export async function createSessionHistoryReader({ path, maxRecordBytes = DEFAUL
     },
   };
 }
-
-/** Read all currently complete lines from a canonical Pi JSONL session. @param {Parameters<typeof createSessionHistoryReader>[0]} options */
-export async function readSessionHistory(options) {
-  const reader = await createSessionHistoryReader(options);
-  try {
-    return await reader.read();
-  } finally {
-    await reader.close();
-  }
-}

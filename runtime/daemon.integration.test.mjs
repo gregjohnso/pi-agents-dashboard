@@ -1264,6 +1264,107 @@ it("resumes a replacement its predecessor promised, after it has adopted that wo
   expect(JSON.parse(await readFile(join(live.stateRoot, "daemon", "workers.json"), "utf8")).workers).toEqual([]);
 }, 20_000);
 
+/**
+ * Build one live adopted worker per session, all of one stale release, whose replacement launches wait
+ * for this test to release them. Holding the launches keeps a known number of replacements in flight,
+ * so the burst bound is observed without depending on how fast a replacement runs.
+ * @param {string[]} sessionIds
+ */
+async function burstReplaceableWorkers(sessionIds) {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const now = "2026-08-25T12:00:00.000Z";
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const workers = sessionIds.map((sessionId, index) => {
+    const pid = 4101 + index * 2;
+    return {
+      sessionId, runId: `run-${sessionId}`, leaseId: `lease-${sessionId}`, generation: 1, cliVersion: "1.9.0",
+      // stopVerifiedProcessGroup requires a positive integer start time, so these read like /proc.
+      identity: { pid, startIdentity: `${pid}00`, processGroupId: pid },
+      piChildIdentity: { pid: pid + 1, startIdentity: `${pid + 1}00`, processGroupId: pid },
+      token: `${sessionId}-token`,
+    };
+  });
+  for (const worker of workers) {
+    await registry.create({ schemaVersion: 1, revision: 0, sessionId: worker.sessionId, sessionFile: join(stateRoot, `${worker.sessionId}.jsonl`), canonicalSessionFile: join(stateRoot, `${worker.sessionId}.jsonl`), cwd: stateRoot, taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "tool", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: worker.runId, process: worker.identity, acquiredAt: now, heartbeatAt: now }, latestRunId: worker.runId, createdAt: now, updatedAt: now });
+  }
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: workers.map(({ token: _token, ...worker }) => worker) })}\n`, { mode: 0o600 });
+  const identities = new Map(workers.flatMap((worker) => [[worker.identity.pid, worker.identity], [worker.piChildIdentity.pid, worker.piChildIdentity]]));
+  const groups = new Map(workers.map((worker) => [worker.identity.processGroupId, [worker.identity.pid, worker.piChildIdentity.pid]]));
+  const livePids = new Set(identities.keys());
+  /** @type {string[]} */
+  const launches = [];
+  /** @type {any[]} */
+  const diagnostics = [];
+  /** @type {Record<string, () => void>} */
+  const releases = {};
+  /** @type {Record<string, Promise<unknown>>} */
+  const launchGates = Object.fromEntries(sessionIds.map((sessionId) => [sessionId, new Promise((resolveGate) => { releases[sessionId] = () => resolveGate(undefined); })]));
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    cliVersion: "2.0.0",
+    reconnectTimeoutMs: 2_000,
+    stopPolicy: { gracefulMs: 20, terminateMs: 20 },
+    sleepImpl: async () => {},
+    inspect: async (/** @type {number} */ pid) => {
+      if (pid === process.pid) return { pid, startIdentity: "1", processGroupId: process.pid };
+      if (!livePids.has(pid)) throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      return identities.get(pid);
+    },
+    signalProcessGroupImpl: (/** @type {number} */ pgid, /** @type {string} */ signal) => {
+      if (signal !== "SIGTERM") return;
+      for (const pid of groups.get(pgid) ?? []) livePids.delete(pid);
+    },
+    recordDiagnostic: (/** @type {any} */ entry) => { diagnostics.push(entry); },
+    workerSupervisor: {
+      useRouter() {},
+      async launch(/** @type {any} */ request) {
+        launches.push(request.sessionId);
+        await launchGates[request.sessionId];
+        return { sessionId: request.sessionId };
+      },
+      async close() {},
+    },
+  });
+  runtimes.push(runtime);
+  const loops = Object.fromEntries(workers.map((worker) => [worker.sessionId, startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, worker)]));
+  await runtime.ready;
+  await vi.waitFor(() => expect(runtime.status().connectedWorkers).toHaveLength(workers.length), { timeout: 5_000, interval: 25 });
+  /** Let one held replacement launch finish. Releasing an already released launch does nothing. @param {string} sessionId */
+  const release = (sessionId) => { releases[sessionId](); };
+  return { stateRoot, registry, runtime, loops, launches, diagnostics, now, release };
+}
+
+// Operator-visible failure: four stale sessions settling close together replaced three and stranded the
+// fourth on old code, with nothing said about it, until another turn settled, someone ran respawn by
+// hand, or the daemon restarted.
+it("replaces every settled stale session when more settle at once than the burst bound admits", async () => {
+  const live = await burstReplaceableWorkers(["one", "two", "three", "four"]);
+
+  // A held launch outlives a failed assertion, so every gate is released before this test returns.
+  try {
+    // Three replacements are held at their launch, which is what fills the bound.
+    for (const sessionId of ["one", "two", "three"]) {
+      await live.loops[sessionId].sendEvent({ type: "TURN_COMPLETED", at: live.now });
+      await vi.waitFor(() => expect(live.launches).toContain(sessionId), { timeout: 8_000, interval: 25 });
+    }
+    await live.loops.four.sendEvent({ type: "TURN_COMPLETED", at: live.now });
+    await vi.waitFor(async () => expect(await live.registry.get("four")).toMatchObject({ taskState: "READY" }), { timeout: 8_000, interval: 25 });
+    expect(live.launches).toEqual(["one", "two", "three"]);
+
+    live.release("one");
+
+    await vi.waitFor(() => expect(live.launches).toEqual(["one", "two", "three", "four"]), { timeout: 8_000, interval: 25 });
+    // The bound says what it does at the limit rather than dropping the work in silence.
+    expect(live.diagnostics).toContainEqual(expect.objectContaining({ event: "respawn_deferred", sessionId: "four" }));
+    for (const sessionId of ["two", "three", "four"]) live.release(sessionId);
+    await vi.waitFor(async () => expect(JSON.parse(await readFile(join(live.stateRoot, "daemon", "workers.json"), "utf8")).workers).toEqual([]), { timeout: 8_000, interval: 25 });
+  } finally {
+    for (const sessionId of Object.keys(live.loops)) live.release(sessionId);
+    await Promise.all(Object.values(live.loops).map((loop) => loop.stop()));
+  }
+}, 30_000);
+
 // Operator-visible failure: an explicit respawn that interrupted a running turn would destroy work the
 // operator could not get back, and WAITING blocks on the operator rather than being idle.
 it.each(/** @type {Array<[string, import("../shared/contracts.mjs").TaskState, string]>} */ ([

@@ -39,6 +39,8 @@ const REPLACEABLE_RELEASES = new Set(["STALE", "UNKNOWN"]);
 /**
  * Automatic upgrade respawns in flight across sessions. An idle boundary is never urgent, and an
  * unbounded burst would restart every session at once the first time an upgraded daemon starts.
+ * A session that settles while the bound is full is deferred, not dropped: the next replacement to
+ * finish frees a slot and re-decides it.
  */
 const MAX_UPGRADE_RESPAWNS = 3;
 const CONNECTOR_PATH = fileURLToPath(new URL("./daemon-connector.mjs", import.meta.url));
@@ -586,6 +588,8 @@ export async function createDaemonRuntime({
     const sessionStarts = new Map();
     /** Sessions whose automatic upgrade respawn is in flight, which bounds the burst after an upgrade. @type {Set<string>} */
     const upgradeRespawns = new Set();
+    /** Sessions the burst bound turned away, waiting for a slot. Insertion order is the order they settled. @type {Set<string>} */
+    const deferredUpgradeRespawns = new Set();
     /**
      * Which dashboard connections currently have each session open. An attachment grants nothing:
      * every authenticated client may write. It records that a session is on someone's screen, which
@@ -765,12 +769,39 @@ export async function createDaemonRuntime({
       scheduleUpgradeRespawn(sessionId, record) {
         // A daemon that does not know its own release cannot judge a worker's, and replaces nothing.
         if (cliVersion === undefined || !idleForRespawn(record)) return;
-        if (upgradeRespawns.size >= MAX_UPGRADE_RESPAWNS || upgradeRespawns.has(sessionId)) return;
+        if (upgradeRespawns.has(sessionId)) return;
         if (router.route(sessionId) === undefined || !REPLACEABLE_RELEASES.has(router.releaseStatus(sessionId))) return;
+        if (upgradeRespawns.size >= MAX_UPGRADE_RESPAWNS) {
+          // The bound delays this replacement; it never cancels it. Saying so is the difference between
+          // a queued upgrade and a session stranded on old code with nothing recorded about it.
+          if (!deferredUpgradeRespawns.has(sessionId)) {
+            deferredUpgradeRespawns.add(sessionId);
+            recordDiagnostic({ event: "respawn_deferred", sessionId, inFlight: upgradeRespawns.size, deferred: deferredUpgradeRespawns.size, at: new Date().toISOString() });
+          }
+          return;
+        }
+        deferredUpgradeRespawns.delete(sessionId);
         upgradeRespawns.add(sessionId);
         void context.replaceStaleWorker(sessionId)
           .catch((/** @type {unknown} */ error) => context.recordRespawnRefusal(sessionId, error))
-          .finally(() => upgradeRespawns.delete(sessionId));
+          .finally(() => {
+            upgradeRespawns.delete(sessionId);
+            void context.resumeDeferredUpgradeRespawns();
+          });
+      },
+      /**
+       * Take up the replacements the burst bound turned away, now that a slot is free. Each one is
+       * re-decided from a freshly read record rather than the one that settled: a session that went
+       * busy again, or was already replaced, waits for its own next idle boundary instead.
+       */
+      async resumeDeferredUpgradeRespawns() {
+        while (deferredUpgradeRespawns.size > 0 && upgradeRespawns.size < MAX_UPGRADE_RESPAWNS) {
+          const [sessionId] = deferredUpgradeRespawns;
+          // Removed before the read, so two replacements finishing together cannot both take this one.
+          deferredUpgradeRespawns.delete(sessionId);
+          const record = await registry.get(sessionId).catch(() => undefined);
+          context.scheduleUpgradeRespawn(sessionId, record);
+        }
       },
       /**
        * Re-derive task state from Pi after a reconnect: a turn can both finish and start while the

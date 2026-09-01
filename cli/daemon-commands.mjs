@@ -28,6 +28,12 @@ const PROCESS_EXIT_POLL_MS = 25;
 // command's own DAEMON_START_FAILED and its captured startup log still win over a bare harness
 // timeout. Callers on a tighter budget pass `timeoutMs`.
 const DAEMON_START_DEADLINE_MS = 90_000;
+// How long a start may say nothing at all. A start that finishes inside this reads as an ordinary
+// start and gets no progress report; past it the operator is waiting on something, and silence to
+// the deadline reads as a hung tool worth killing, which destroys the diagnosis the deadline exists
+// to produce. The repeat is far apart because the report carries no news, only proof of life.
+const START_REPORT_AFTER_MS = 3_000;
+const START_REPORT_INTERVAL_MS = 10_000;
 // The stop wait begins after the process group has already been signalled, so it measures only how
 // long the kernel takes to reap it. It stays short on purpose: an unkillable daemon is the failure
 // worth reporting quickly, and lengthening it would only delay DAEMON_STOP_TIMEOUT.
@@ -201,8 +207,27 @@ async function stopLiveWorkers(root, options) {
   } finally { await persistent?.close(); }
 }
 
+/**
+ * Report a wait the operator is sitting in front of, on his own error stream.
+ *
+ * Nothing crosses a process boundary here and nothing enters the command's result: `--json` keeps
+ * one object on standard output either way.
+ * @param {{ write: (text: string) => unknown } | undefined} stderr @param {number} deadlineMs
+ */
+function startWaitReporter(stderr, deadlineMs) {
+  if (typeof stderr?.write !== "function") return undefined;
+  let nextReportMs = START_REPORT_AFTER_MS;
+  const seconds = (/** @type {number} */ milliseconds) => Math.round(milliseconds / 1_000);
+  return (/** @type {{ elapsedMs: number }} */ { elapsedMs }) => {
+    if (elapsedMs < nextReportMs) return;
+    nextReportMs = elapsedMs + START_REPORT_INTERVAL_MS;
+    stderr.write(`pi-agents daemon start: waiting for a healthy endpoint (${seconds(elapsedMs)}s of ${seconds(deadlineMs)}s)\n`);
+  };
+}
+
 async function waitForStatus(root, desired, options, defaultTimeoutMs) {
-  const deadline = Date.now() + (options.timeoutMs ?? defaultTimeoutMs);
+  const startedAt = Date.now();
+  const deadline = startedAt + (options.timeoutMs ?? defaultTimeoutMs);
   let endpoint;
   /** @type {any} */
   let childFailure;
@@ -212,6 +237,7 @@ async function waitForStatus(root, desired, options, defaultTimeoutMs) {
     if (childFailure !== undefined) return childFailure;
     endpoint = await options.inspectEndpoint({ root, inspect: options.inspect, probe: options.probe, probeTimeoutMs: options.probeTimeoutMs });
     if (desired.includes(endpoint.status) && (!options.requireReady || endpoint.status !== "HEALTHY" || endpoint.daemonState === "READY" || endpoint.daemonState === undefined)) return endpoint;
+    options.onWaiting?.({ elapsedMs: Date.now() - startedAt, status: endpoint?.status });
     await new Promise((resolveWait) => setTimeout(resolveWait, 25));
   }
   return endpoint;
@@ -252,7 +278,8 @@ export async function runDaemonCommand(command, options = {}) {
       child.once?.("error", () => {});
       // Read before the wait, not after it: at the deadline this PID may already name someone else.
       const spawned = await identifyDaemonChild(child, inspect);
-      const endpoint = await waitForStatus(root, ["HEALTHY", "CONFLICT"], { ...options, inspect, probe, probeTimeoutMs, inspectEndpoint, requireReady: true, child }, DAEMON_START_DEADLINE_MS);
+      const deadlineMs = options.timeoutMs ?? DAEMON_START_DEADLINE_MS;
+      const endpoint = await waitForStatus(root, ["HEALTHY", "CONFLICT"], { ...options, inspect, probe, probeTimeoutMs, inspectEndpoint, requireReady: true, child, onWaiting: startWaitReporter(options.stderr, deadlineMs) }, DAEMON_START_DEADLINE_MS);
       if (endpoint?.status === "HEALTHY") return { code: 0, result: { kind: "daemon_started", alreadyRunning: false, root, publication: endpoint.publication } };
       // Every remaining path gives up on this child, and a child nobody stops publishes itself
       // seconds later and owns the root forever.

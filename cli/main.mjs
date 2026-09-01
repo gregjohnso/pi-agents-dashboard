@@ -70,7 +70,9 @@ export async function runCli(argv = process.argv.slice(2), deps = {}) {
     else if (args[0] === "daemon") {
       const stopWorkers = args[1] === "stop" && args.length === 4 && args.includes("--stop-workers") && args.includes("--yes");
       if (args.length !== 2 && !stopWorkers) result = { code: 2, error: { code: "INVALID_SYNTAX", message: "Usage: pi-agents daemon start|status|restart|recover|stop [--stop-workers --yes]" } };
-      else result = await (deps.runDaemonCommand ?? runDaemonCommand)(args[1], stopWorkers ? { ...deps.daemonOptions, stopWorkers: true, yes: true } : deps.daemonOptions);
+      // The daemon commands wait on a process this one does not own, and only they can say so while
+      // the wait is still running: writeResult below runs after the answer already exists.
+      else result = await (deps.runDaemonCommand ?? runDaemonCommand)(args[1], { ...deps.daemonOptions, stderr: io.stderr, ...(stopWorkers ? { stopWorkers: true, yes: true } : {}) });
     } else if (args[0] === "attach") {
       result = args.length === 2
         ? await (deps.attachSession ?? defaultAttachSession)(args[1], deps.attachOptions)

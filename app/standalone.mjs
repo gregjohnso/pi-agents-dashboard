@@ -57,9 +57,11 @@ export async function runDashboardApp({
       },
     });
   }
+  // The daemon start runs before the interface exists, so its own slow-start reporting needs this
+  // terminal's error stream: a hung start would otherwise leave the operator a blank screen.
   const frontend = connectOrStart === undefined
-    ? await defaultConnectOrStart({ root: roots.destinationStateRoot, piBin, env })
-    : await connectOrStart({ root: roots.destinationStateRoot, piBin, env });
+    ? await defaultConnectOrStart({ root: roots.destinationStateRoot, piBin, env, stderr })
+    : await connectOrStart({ root: roots.destinationStateRoot, piBin, env, stderr });
   const listOptions = { cwd, piBin, env, stdin, stdout, stderr, frontend };
   const list = openList === undefined
     ? await createStandaloneList(listOptions)
@@ -67,9 +69,9 @@ export async function runDashboardApp({
   try { await list.closed; } finally { await list.close(); await frontend.close(); }
 }
 
-/** @param {{root:string,piBin?:string,env:NodeJS.ProcessEnv}} options */
+/** @param {{root:string,piBin?:string,env:NodeJS.ProcessEnv,stderr?:NodeJS.WritableStream}} options */
 async function defaultConnectOrStart(options) {
-  const started = await runDaemonCommand("start", { root: options.root, piBin: options.piBin, env: options.env });
+  const started = await runDaemonCommand("start", { root: options.root, piBin: options.piBin, env: options.env, stderr: options.stderr });
   if (started.code !== 0) throw Object.assign(new Error(started.error?.message ?? "Daemon did not start"), { code: started.error?.code ?? "DAEMON_START_FAILED" });
   const clientId = await loadCliClientIdentity({ root: options.root });
   // `clientId` is this installation and survives every restart, because the command journal and

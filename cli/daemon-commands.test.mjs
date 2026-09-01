@@ -153,6 +153,46 @@ it("waits far past fifteen seconds for a slow daemon start, and still gives up b
   expect(result).toMatchObject({ code: 1, error: { code: "DAEMON_START_FAILED", message: expect.stringContaining("startup deadline") } });
 });
 
+// Operator-visible failure: `daemon start` builds its result and prints it only after the command
+// returns, and the standalone dashboard starts the daemon before it opens the interface. A start that
+// hung gave the operator a dead terminal for ninety seconds, which is long enough to conclude the tool
+// is broken and kill it, destroying the diagnosis the deadline exists to produce.
+it("reports a slow daemon start while it waits, and stays quiet when the start is fast", async () => {
+  const root = await stateRoot();
+  /** @type {string[]} */
+  const slow = [];
+  const slowStart = await underSlowClock("start", {
+    root,
+    stderr: { write: (/** @type {string} */ text) => { slow.push(text); return true; } },
+    inspectEndpoint: async () => ({ status: "ABSENT" }),
+    spawnDaemon: () => new EventEmitter(),
+  }, 5_000);
+
+  expect(slowStart.result).toMatchObject({ code: 1, error: { code: "DAEMON_START_FAILED" } });
+  expect(slow[0]).toContain("daemon start");
+  expect(slow[0]).toMatch(/\b5s of 90s\b/u);
+  expect(slow.at(-1)).toMatch(/\b\d+s of 90s\b/u);
+  // The wait says so more than once, and it does not repeat every poll.
+  expect(slow.length).toBeGreaterThan(1);
+  expect(slow.length).toBeLessThan(slowStart.elapsedMs.length);
+  for (const line of slow) expect(line.endsWith("\n")).toBe(true);
+
+  /** @type {string[]} */
+  const fast = [];
+  const publication = { pid: 4_242, startIdentity: "424200", processGroupId: 4_242, tokenPath: join(root, "daemon", "control.token") };
+  const endpoints = [{ status: "ABSENT" }, { status: "HEALTHY", daemonState: "READY", publication }];
+  const fastStart = await underSlowClock("start", {
+    root,
+    stderr: { write: (/** @type {string} */ text) => { fast.push(text); return true; } },
+    inspectEndpoint: async () => endpoints.shift() ?? { status: "HEALTHY", daemonState: "READY", publication },
+    spawnDaemon: () => new EventEmitter(),
+  }, 1_700);
+
+  // A 1.7 s start is an ordinary start: the operator reads its result, not a progress report.
+  expect(fastStart.result).toMatchObject({ code: 0, result: { kind: "daemon_started", alreadyRunning: false } });
+  expect(fast).toEqual([]);
+});
+
 it("still reports a daemon that will not release its endpoint within seconds of the stop", async () => {
   // The stop wait begins after the process group has already been signalled, so it must not inherit
   // the start deadline: an unkillable daemon has to be named quickly, not a minute and a half later.

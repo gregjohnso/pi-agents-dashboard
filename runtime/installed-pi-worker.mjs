@@ -8,6 +8,7 @@ import { PiRpcAdapter, piRpcArgv } from "./pi-rpc-adapter.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { openRotatingDiagnostics } from "./rotating-diagnostics.mjs";
 import { sessionEventForPiEvent } from "./session-event-mapping.mjs";
+import { MAX_LIVE_TAIL_BYTES, createLiveTail } from "./worker-live-tail.mjs";
 import { createWorkerCommandDispatcher, createWorkerReplayStore, maintainDaemonConnection, replayDeliveryIsAmbiguous } from "./worker.mjs";
 
 const MAX_PENDING_PARENT_MESSAGES = 256;
@@ -133,7 +134,15 @@ export async function runInstalledPiWorker(runtimeProcess) {
   if (piChild.stdin === null || piChild.stdout === null || piChild.stderr === null || !Number.isSafeInteger(piChild.pid)) throw Object.assign(new Error("Pi child did not expose owned pipes"), { code: "RPC_PROCESS_FAILED" });
   piChild.stderr.on("data", (chunk) => { void diagnostics.stderr.append(chunk).catch(() => {}); });
   const adapter = PiRpcAdapter.connect({ input: piChild.stdin, output: piChild.stdout, diagnostics: diagnostics.rpc, process: piChild, maxRecordBytes: 16 * 1024 * 1024 });
-  adapter.onFrame((frame) => sendWorkerMessage({ version: 1, type: "pi_frame", token, sessionId: options.sessionId, frame }));
+  // This worker holds the session's live tail. A daemon that restarts has none of these frames and
+  // Pi has not written the newest of them to its own session file yet, so the process that produced
+  // them is the one that keeps them. The whole tail travels in one frame, so it stays under half of
+  // the control socket's own bound.
+  const liveTail = createLiveTail({ maxBytes: Math.min(MAX_LIVE_TAIL_BYTES, Math.floor((options.daemonConnectConfig?.maxBytes ?? MAX_LIVE_TAIL_BYTES * 2) / 2)) });
+  adapter.onFrame((frame) => {
+    liveTail.record(frame);
+    sendWorkerMessage({ version: 1, type: "pi_frame", token, sessionId: options.sessionId, frame });
+  });
   adapter.onEvent((event) => {
     const stateEvent = sessionEventForPiEvent(event);
     if (stateEvent !== undefined) sendWorkerMessage({ version: 1, type: "worker_event", token, sessionId: options.sessionId, event: stateEvent });
@@ -193,7 +202,14 @@ export async function runInstalledPiWorker(runtimeProcess) {
         const dispose = () => { try { removeMessageListener?.(); } catch {} };
         reconnectController.signal.addEventListener("abort", dispose, { once: true });
         Promise.resolve(connection.closed).finally(() => { reconnectController.signal.removeEventListener("abort", dispose); dispose(); }).catch(() => {});
-        await connectionSend(ready);
+        // Readiness and the tail are written in one step, before this function awaits anything: a
+        // frame Pi produces during the awaits is written after both, so the daemon reads the tail and
+        // then that frame, with nothing repeated and nothing missing between them. The launch
+        // connection sends no tail, because the daemon that spawned this worker has every frame.
+        const readied = connectionSend(ready);
+        const replayed = connectionSend({ version: 1, type: "pi_tail", token, sessionId: options.sessionId, frames: liveTail.frames(), dropped: liveTail.dropped });
+        await readied;
+        await replayed;
       },
     }).catch(() => {});
   }).catch(() => {});

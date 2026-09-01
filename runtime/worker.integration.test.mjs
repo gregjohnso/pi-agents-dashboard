@@ -337,7 +337,7 @@ async function workerEntries(root) {
 }
 
 it("reconnects after daemon restart from a socket-only launch and retains the run token across adoption", async () => {
-  const { root, runs, registry, fakeEntry, router, launchSeams } = await setup(["one"]);
+  const { root, runs, registry, fakeEntry, router, control, launchSeams } = await setup(["one"]);
   const supervisor = new WorkerSupervisor({
     registry,
     router,
@@ -356,6 +356,13 @@ it("reconnects after daemon restart from a socket-only launch and retains the ru
   await waitUntil(() => router.route("one") !== undefined && router.route("one") !== adopted);
   const reconnected = router.route("one");
   expect(reconnected.routeGeneration).toBeGreaterThan(adopted.routeGeneration);
+  // A replacement daemon holds none of this session's frames, and Pi has not written the newest of
+  // them to its own file yet, so the worker replays its live tail before anything new on this
+  // connection. The launch connection sent none, because that daemon had every frame already.
+  const replayed = control.frames.filter((/** @type {any} */ frame) => frame.type === "pi_tail");
+  expect(replayed).toHaveLength(1);
+  expect(replayed[0]).toMatchObject({ version: 1, sessionId: "one", dropped: 0 });
+  expect(replayed[0].frames.map((/** @type {any} */ frame) => frame.type)).toContain("response");
   // Adoption never rotates a run's token, so the same secret still authenticates this worker.
   expect((await workerEntries(root))[0].token).toBe(reserved.token);
 

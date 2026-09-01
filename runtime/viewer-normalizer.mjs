@@ -17,7 +17,12 @@ const MAX_SNAPSHOT_ERRORS = 20;
 
 /** The synthetic head item that tells a viewer its snapshot starts mid-transcript. */
 export const SNAPSHOT_TRUNCATED_ITEM_ID = "viewer-snapshot-truncated";
-const DIALOG_METHODS = new Set(["confirm", "select", "input", "editor"]);
+/**
+ * The `extension_ui_request` methods that block Pi on a person's answer. They are the only UI methods
+ * that become a transcript dialog, and the only frames a worker's live tail refuses to drop while
+ * they are unresolved.
+ */
+export const DIALOG_UI_METHODS = new Set(["confirm", "select", "input", "editor"]);
 /**
  * The `extension_ui_request` methods Pi 0.84.3's RPC mode fires without waiting for a response
  * (`dist/modes/rpc/rpc-mode.js`). They are display updates for Pi's own terminal interface, which
@@ -431,7 +436,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
       return [...publish({ kind, tool }, `${sourceId}:tool:${tool.id}:${kind}`, at), ...replaceActivity(phase, frame.isError === true ? `${tool.name} failed` : frame.type === "tool_execution_update" ? `Streaming ${tool.name}` : `${tool.name} completed`, sourceId, { toolCallId: tool.id })];
     }
     if (frame.type === "extension_ui_request") {
-      if (!DIALOG_METHODS.has(frame.method)) {
+      if (!DIALOG_UI_METHODS.has(frame.method)) {
         if (ONE_WAY_UI_METHODS.has(frame.method)) {
           if (frame.method !== "notify") return [];
           const message = singleLine(frame.message);

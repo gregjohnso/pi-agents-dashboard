@@ -706,6 +706,44 @@ async function createViewerRecovery({ daemonEpoch, registry }) {
       return state.normalizer.consumeFrame(frame).map((/** @type {any} */ draft) => state.stream.append(draft));
     },
     /**
+     * Rebuild one session's normalized state from Pi's canonical file plus the tail its worker just
+     * replayed, and tell every subscriber to start again from the result.
+     *
+     * This is the only path that reaches a mid-turn transcript after this daemon started, and it runs
+     * on every worker connection after the launch: the tail carries frames this daemon never saw, and
+     * frames it did see before the connection dropped. Rebuilding from scratch is what makes it
+     * idempotent, since a fingerprint in the normalizer collapses a message that appears in both
+     * sources but nothing collapses a frame ingested twice into the same normalizer.
+     *
+     * Subscribers are ended before the rebuild, not after, so none of them receives the rebuilt
+     * events as though they were new; each answers with one fresh snapshot of the result.
+     * @param {string} sessionId @param {any[]} frames
+     */
+    async rebuild(sessionId, frames) {
+      const state = sessions.get(sessionId);
+      if (state === undefined) throw Object.assign(new Error(`Unknown viewer session: ${sessionId}`), { code: "SESSION_NOT_FOUND" });
+      const record = await registry.get(sessionId);
+      if (record === undefined) throw Object.assign(new Error(`Unknown viewer session: ${sessionId}`), { code: "SESSION_NOT_FOUND" });
+      state.stream.resynchronize("VIEWER_RESYNCHRONIZED", "This session was rebuilt from Pi's session file and its worker's live tail");
+      const normalizer = createViewerNormalizer({ sessionId, protocolVersion: 1, now: () => new Date().toISOString() });
+      const reader = await openHistoryReader(record, normalizer);
+      const previous = state.reader;
+      state.normalizer = normalizer;
+      state.reader = reader;
+      await previous.close().catch(() => {});
+      await readHistory(state);
+      for (const frame of frames) {
+        try {
+          for (const draft of normalizer.consumeFrame(frame)) state.stream.append(draft);
+        } catch (error) {
+          // One replayed frame this normalizer refuses costs that frame, not the rebuild: refusing the
+          // whole tail would leave the worker resending it on every reconnect and never recovering.
+          const failure = /** @type {any} */ (error);
+          normalizer.consumeError({ code: failure?.code ?? "VIEWER_TAIL_FRAME_REFUSED", message: error instanceof Error ? error.message : "Replayed Pi frame was refused", retryable: false });
+        }
+      }
+    },
+    /**
      * One session's normalized transcript, read from memory. Unlike snapshot it reads no canonical
      * history, so background work never puts file IO on a request the operator is waiting behind.
      * @param {string} sessionId

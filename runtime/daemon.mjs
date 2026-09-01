@@ -53,6 +53,12 @@ const DEFAULT_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateMs: 5_00
  * expiring behind another before the daemon stops waiting on a worker that answers nothing.
  */
 const WORKER_REQUEST_TIMEOUT_MS = 300_000;
+/**
+ * Frames one worker may replay in its live tail. The worker bounds that tail by bytes
+ * (`MAX_LIVE_TAIL_BYTES`), and this bounds the count a daemon will parse from a frame it did not
+ * write, so a malformed tail is refused rather than walked.
+ */
+const MAX_LIVE_TAIL_FRAMES = 8_192;
 const WORKTREE_ROOT_DIRECTORIES = ["pi-agents", "pi-dashboard", "pi-agents-dashboard"];
 
 /** @param {unknown} value */
@@ -1028,6 +1034,23 @@ export async function createDaemonRuntime({
           await router.runCurrentFrame(metadata, connection, routeGeneration, async () => {
             await viewer.ingest(frame.sessionId, frame.frame);
           });
+          return;
+        }
+        // A reconnecting worker replays its bounded live tail before it forwards anything new on that
+        // connection. It is the only source for frames Pi produced while this daemon was absent, and
+        // for the newest frames Pi has not written to its own session file yet.
+        if (frame.type === "pi_tail") {
+          const allowed = ["version", "type", "token", "sessionId", "frames", "dropped"];
+          if (frame.version !== 1 || frame.sessionId !== metadata.sessionId || Object.keys(frame).some((key) => !allowed.includes(key)) || !Array.isArray(frame.frames) || frame.frames.length > MAX_LIVE_TAIL_FRAMES || frame.frames.some((/** @type {any} */ value) => typeof value !== "object" || value === null || Array.isArray(value)) || !Number.isSafeInteger(frame.dropped) || frame.dropped < 0) throw Object.assign(new Error("Invalid Pi tail frame"), { code: "INVALID_WORKER_FRAME" });
+          const viewer = context.recovery?.viewer ?? context.viewerRecovery;
+          if (viewer === undefined) throw Object.assign(new Error("Viewer recovery is still initializing"), { code: "RECOVERING", retryable: true });
+          await router.runCurrentFrame(metadata, connection, routeGeneration, async () => {
+            await viewer.rebuild(frame.sessionId, frame.frames);
+          });
+          // The bound was reached, so the rebuilt transcript holds Pi's completed history and only the
+          // newest live frames. Nothing freezes and nothing fails; the operator loses partial text
+          // older than the tail, which is what this records.
+          if (frame.dropped > 0) recordDiagnostic({ event: "viewer_tail_truncated", sessionId: frame.sessionId, droppedFrames: frame.dropped, retainedFrames: frame.frames.length, at: new Date().toISOString() });
           return;
         }
         if (context.state !== "READY") throw Object.assign(new Error("Daemon recovery is still in progress"), { code: "RECOVERING", retryable: true });

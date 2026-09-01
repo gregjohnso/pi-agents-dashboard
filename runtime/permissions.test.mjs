@@ -1,4 +1,4 @@
-import { lstat, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -6,7 +6,6 @@ import { afterEach, expect, it, vi } from "vitest";
 
 import {
   chmodPrivateSocket,
-  createPrivateFile,
   ensurePrivateDirectory,
   initializeRuntimePermissions,
   setPrivateUmask,
@@ -16,6 +15,14 @@ import {
 const cleanup = [];
 afterEach(async () => {
   await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+});
+
+// Every private file this package creates is opened by the module that owns it, so the permissions
+// module hands out the umask, the directory guarantee, and the socket guarantee only.
+it("exposes the umask, directory, and socket guarantees and no file opener", async () => {
+  expect(Object.keys(await import("./permissions.mjs")).sort()).toEqual([
+    "chmodPrivateSocket", "ensurePrivateDirectory", "initializeRuntimePermissions", "setPrivateUmask",
+  ]);
 });
 
 it("exposes startup initialization that sets the process file-creation mask to user-only", () => {
@@ -28,24 +35,19 @@ it("exposes startup initialization that sets the process file-creation mask to u
   expect(setUmask).toHaveBeenCalledWith(0o077);
 });
 
-it("creates private directories and files with exact modes under a restrictive umask", async () => {
+it("creates a private directory with an exact mode under a restrictive umask", async () => {
   const parent = await mkdtemp(join(tmpdir(), "dashboard-permissions-"));
   cleanup.push(parent);
   const directory = join(parent, "private");
-  const file = join(directory, "artifact.json");
   const previousUmask = process.umask(0o777);
 
   try {
     await ensurePrivateDirectory(directory);
-    const handle = await createPrivateFile(file);
-    await handle.writeFile("private");
-    await handle.close();
   } finally {
     process.umask(previousUmask);
   }
 
   expect((await lstat(directory)).mode & 0o777).toBe(0o700);
-  expect((await lstat(file)).mode & 0o777).toBe(0o600);
 });
 
 it.each([
@@ -58,36 +60,6 @@ it.each([
   };
 
   await expect(ensurePrivateDirectory("/runtime", fsOps, 1000)).rejects.toThrow(message);
-});
-
-it("removes a newly created file when exact-mode establishment fails", async () => {
-  const close = vi.fn(async () => {});
-  const rm = vi.fn(async () => {});
-  const fsOps = {
-    open: vi.fn(async () => ({
-      chmod: async () => {
-        throw new Error("chmod failed");
-      },
-      close,
-    })),
-    rm,
-  };
-
-  await expect(createPrivateFile("/runtime/artifact", fsOps)).rejects.toThrow("chmod failed");
-  expect(close).toHaveBeenCalledOnce();
-  expect(rm).toHaveBeenCalledWith("/runtime/artifact", { force: true });
-});
-
-it("does not follow a symlink when creating a private file", async () => {
-  const parent = await mkdtemp(join(tmpdir(), "dashboard-permissions-link-"));
-  cleanup.push(parent);
-  const target = join(parent, "target");
-  const link = join(parent, "artifact");
-  await writeFile(target, "sentinel");
-  await symlink(target, link);
-
-  await expect(createPrivateFile(link)).rejects.toMatchObject({ code: "EEXIST" });
-  expect(await readFile(target, "utf8")).toBe("sentinel");
 });
 
 it("chmods only a verified user-owned socket and revalidates it", async () => {

@@ -4,14 +4,16 @@
 
 ## Install and open the session list
 
-You need Node.js 22, version 22.19 or newer, and an installed `pi` executable.
+You need Node.js 22.19 or newer and below 23, and an installed `pi` executable. That upper bound is the range the suite runs against; nothing above it is tested.
+
+This package is not published. Install it from a checkout:
 
 ```bash
-npm install -g pi-agents
+npm install -g /absolute/path/to/pi-agents
 pi-agents
 ```
 
-To install a local checkout instead, run `npm install -g /absolute/path/to/pi-agents`. The executable is `pi-agents`. If your shell cannot find it, the global npm prefix is not on your `PATH`; link it somewhere that is, for example `ln -s "$(npm prefix -g)/bin/pi-agents" ~/.local/bin/pi-agents`. With no arguments, it starts or connects to the per-user daemon and opens the session list. New sessions start from the directory where you ran the command.
+The executable is `pi-agents`. If your shell cannot find it, the global npm prefix is not on your `PATH`; link it somewhere that is, for example `ln -s "$(npm prefix -g)/bin/pi-agents" ~/.local/bin/pi-agents`. With no arguments, it starts or connects to the per-user daemon and opens the session list. New sessions start from the directory where you ran the command.
 
 If `pi` is not on `PATH`, pass its absolute path:
 
@@ -26,10 +28,10 @@ The list uses these columns. Narrow terminals hide columns from right to left.
 - **Name** is the chosen session name, a name derived from the first prompt, or the first 8 characters of the session ID.
 - **State** is the dashboard state, such as `WORKING`, `WAITING`, `READY`, `FAILED`, or `STOPPED`.
 - **Activity** is the latest summary or current Pi activity.
-- **Model** is Pi's current model ID.
+- **Model** is the model Pi reported for that session. It is empty until Pi says which model it is running, and never shows what a launch asked for.
 - **Age** is the time since the session was created.
 
-Type anywhere to compose a prompt in the box at the bottom. Press Enter with prompt text to launch a session. Worktree isolation is the default, so the current directory must be inside a Git repository with a commit. Press Enter with an empty prompt to open the selected session.
+Type anywhere to compose a prompt in the box at the bottom. The box wraps and grows as you type, and the list shrinks to make room. Press Enter with prompt text to launch a session. Worktree isolation is the default, so the current directory must be inside a Git repository with a commit. Press Enter with an empty prompt to open the selected session.
 
 Use Up and Down to select a row. Page Up, Page Down, Home, and End move farther. The mouse wheel moves the selection. One click selects a row, and a second click opens it.
 

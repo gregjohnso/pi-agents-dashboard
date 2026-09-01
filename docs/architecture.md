@@ -121,5 +121,5 @@ Two owned paths are outside the state root. Canonical Pi session files remain in
 - `runtime/` contains the daemon, registry, journals, recovery, worker supervision, Pi RPC adapter, normalization, and durable stores. Start with [`runtime/daemon.mjs`](../runtime/daemon.mjs).
 - `shared/` contains strict contracts shared across process boundaries.
 - `isolation/` contains launch preflight, managed worktrees, ownership locks, and explicit cleanup.
-- `cli/` contains the operator verbs `agents`, `attach`, `stop`, `rm`, and `respawn`, plus administrative daemon and session-recovery commands. `bin/` contains the installed executable entry point.
+- `cli/` contains the operator verbs `agents`, `attach`, `logs`, `stop`, `rm`, and `respawn`, plus administrative daemon and session-recovery commands. `bin/` contains the installed executable entry point.
 - `test/` contains cross-module integration and terminal acceptance tests. Unit tests sit beside their source as `*.test.mjs`.

@@ -1,6 +1,6 @@
 # Development
 
-How to build, test, and change `pi-agents`. For what the tool does, read [README.md](../README.md). For how it is put together, read [architecture.md](architecture.md).
+How to build, test, and change `pi-agents`. For what the tool does, read [README.md](../README.md). For how it is put together, read [architecture.md](architecture.md). For what is left to do and what is known broken, read [status.md](status.md).
 
 ## Commands
 
@@ -23,7 +23,7 @@ Focused runs use the raw vitest task:
 pixi run vitest -- run app/mouse-input.test.mjs --testTimeout=20000
 ```
 
-The suite is 992 tests across 89 files. A full run takes about 3 minutes on an unloaded machine and can take twice that under load.
+A full run takes about 3 minutes on an unloaded machine and can take twice that under load. `pixi run test` is the gate: it carries a 120 s per-test budget because the real-process suites spawn daemons, workers and Pi children, and it must pass with no extra flags. A timeout there is a per-test cap, a hard-coded wait no budget can extend, or a real hang — never a reason to raise a flag.
 
 ## Tests
 

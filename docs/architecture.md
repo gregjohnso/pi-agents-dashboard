@@ -140,9 +140,9 @@ Two owned paths are outside the state root. Canonical Pi session files remain in
 
 - `app/list/` contains list state, input, layout, overlays, launch composition, and daemon adaptation. Start with [`app/list/dashboard.mjs`](../app/list/dashboard.mjs).
 - `app/viewer/` contains the Pi-style transcript, editor control, overlays, and viewer slash handling. Start with [`app/viewer/viewer-controller.mjs`](../app/viewer/viewer-controller.mjs).
-- `app/daemon-client.mjs` owns reconnecting socket transport and subscription queues. `app/standalone.mjs` and `app/list/standalone-list.mjs` assemble the terminal application.
+- `app/daemon-client.mjs` owns reconnecting socket transport and subscription queues. It is the only client of the daemon socket: the dashboard runs it reconnecting, and both its own transaction client and every command in `cli/` run it with `reconnect: false`, held open for exactly one operation. `app/standalone.mjs` and `app/list/standalone-list.mjs` assemble the terminal application.
 - `runtime/` contains the daemon, registry, recovery, worker supervision, Pi RPC adapter, normalization, and durable stores. Start with [`runtime/daemon.mjs`](../runtime/daemon.mjs).
 - `shared/` contains strict contracts shared across process boundaries.
 - `isolation/` contains launch preflight, managed worktrees, ownership locks, and explicit cleanup.
-- `cli/` contains the operator verbs `agents`, `attach`, `logs`, `stop`, `rm`, and `respawn`, plus administrative daemon and session-recovery commands. `bin/` contains the installed executable entry point.
+- `cli/` contains the operator verbs `agents`, `attach`, `logs`, `stop`, `rm`, and `respawn`, plus administrative daemon and session-recovery commands. What it owns beyond argument parsing, exit codes and its JSON output is the private client identity file, a bounded per-command deadline, and the classification that decides whether a lost answer to a destructive command may already have run. `bin/` contains the installed executable entry point.
 - `test/` contains cross-module integration and terminal acceptance tests. Unit tests sit beside their source as `*.test.mjs`.

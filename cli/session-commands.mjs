@@ -11,7 +11,7 @@ import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
 import { acquireLifecycleLock } from "../runtime/lifecycle-lock.mjs";
 import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
 import { loadDashboardConfig } from "../shared/config.mjs";
-import { CLIENT_PROTOCOL, parseDaemonResponse } from "../shared/contracts.mjs";
+import { CLIENT_PROTOCOL } from "../shared/contracts.mjs";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
 const IDENTITY_LOCK_TIMEOUT_MS = 5_000;
@@ -30,8 +30,6 @@ const AUTHENTICATION_STATES = new Set(["STARTING", "RECONCILING", "READY", "FAIL
 const SESSION_OPERATIONS = new Map([["stop", "stop"], ["rm", "delete"], ["respawn", "respawn"], ["cleanup", "cleanup"]]);
 /** Operations that end a worker's process group, so a lost answer leaves delivery ambiguous. */
 const DESTRUCTIVE_OPERATIONS = new Set(["stop", "delete", "respawn"]);
-/** Daemon operations the CLI sends that mutate nothing, so a lost answer is only a lost answer. */
-const READ_ONLY_OPERATIONS = new Set(["get_state"]);
 const DESTRUCTIVE_TIMEOUT_MARGIN_MS = 1_000;
 const DEFAULT_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateMs: 5_000 });
 /** Worst-case wait for the daemon's SIGTERM-then-SIGKILL escalation under the default policy. */
@@ -176,7 +174,7 @@ export async function loadCliClientIdentity({
   }, { timeoutMs: lockTimeoutMs, operation: "client_identity", busyMessage: "CLI client identity lock remained held", fsOps, inspect });
 }
 
-/** Codes a daemon's refusal of this client's authentication frame arrives as, on either requester. */
+/** Codes a daemon's refusal of this client's authentication frame arrives as. */
 const AUTHENTICATION_REFUSAL_CODES = new Set(["AUTHENTICATION_FAILED", "INVALID_DAEMON_AUTHENTICATION"]);
 
 /** @param {unknown} value */
@@ -208,39 +206,42 @@ function validateExpectedResult(op, payload, result) {
 }
 
 /**
- * Offer the authentication frame every release has accepted, version and token alone, and report
- * whether this daemon authenticates it. That is the frame the liveness probe sends.
- * @param {{ root: string, createConnection?: typeof net.createConnection, maxBytes?: number, timeoutMs?: number }} options
+ * Offer the authentication frame every release has accepted — version and token, nothing else — and
+ * return the frame the daemon answers with.
+ *
+ * No request follows it, and that is the point: a daemon from an earlier release refuses any
+ * authentication key it does not know, so this is the one conversation a client from this release
+ * can still hold with one. Its two callers read the answer their own way, because a liveness probe
+ * and a refusal diagnosis disagree about how strict an authenticated frame has to be.
+ *
+ * @param {string} socketPath @param {string} token
+ * @param {{ timeoutMs?: number, maxBytes?: number }} [options]
+ * @returns {Promise<any>} the daemon's first frame, or undefined when none arrived
  */
-async function daemonAuthenticatesTokenAlone({ root, createConnection = net.createConnection, maxBytes = 1024 * 1024, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS }) {
-  /** @type {string} */
-  let token;
-  try { token = (await fs.readFile(join(root, "daemon", "control.token"), "utf8")).trim(); } catch { return false; }
+export function offerTokenAuthentication(socketPath, token, { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, maxBytes = 64 * 1024 } = {}) {
   const encoder = createJsonlEncoder({ maxBytes });
   const decoder = createJsonlDecoder({ maxBytes });
-  return new Promise((resolveProbe) => {
-    const socket = createConnection(join(root, "daemon", "control.sock"));
+  return new Promise((resolveFrame) => {
+    const socket = net.createConnection(socketPath);
     let settled = false;
-    const timer = setTimeout(() => finish(false), timeoutMs);
-    /** @param {boolean} value */
-    const finish = (value) => {
+    const timer = setTimeout(() => finish(undefined), timeoutMs);
+    /** @param {any} frame */
+    const finish = (frame) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       socket.destroy();
-      resolveProbe(value);
+      resolveFrame(frame);
     };
     socket.once("connect", () => socket.write(encoder.encode({ version: 1, token })));
     socket.on("data", (chunk) => {
       try {
-        const frames = decoder.push(chunk);
-        if (frames.length === 0) return;
-        validateAuthentication(frames[0]);
-        finish(true);
-      } catch { finish(false); }
+        const [frame] = decoder.push(chunk);
+        if (frame !== undefined) finish(frame);
+      } catch { finish(undefined); }
     });
-    socket.once("error", () => finish(false));
-    socket.once("close", () => finish(false));
+    socket.once("error", () => finish(undefined));
+    socket.once("close", () => finish(undefined));
   });
 }
 
@@ -253,21 +254,32 @@ async function daemonAuthenticatesTokenAlone({ root, createConnection = net.crea
  * forged or malformed frame must read as forged, never as a version to upgrade past.
  *
  * @param {string} root @param {any} error
- * @param {{ createConnection?: typeof net.createConnection, maxBytes?: number, timeoutMs?: number }} [options]
+ * @param {{ maxBytes?: number, timeoutMs?: number }} [options]
  */
 export async function describeAuthenticationRefusal(root, error, options = {}) {
   if (!AUTHENTICATION_REFUSAL_CODES.has(error?.code)) return error;
-  if (!await daemonAuthenticatesTokenAlone({ root, ...options })) return error;
+  /** @type {string} */
+  let token;
+  try { token = (await fs.readFile(join(root, "daemon", "control.token"), "utf8")).trim(); } catch { return error; }
+  try { validateAuthentication(await offerTokenAuthentication(join(root, "daemon", "control.sock"), token, options)); } catch { return error; }
   return Object.assign(
     new Error(`This daemon is from an earlier release and refused this client's protocol ${CLIENT_PROTOCOL} authentication. Run \`pi-agents daemon restart\` to restart it on this release; the restart stops no running session.`),
     { code: "DAEMON_FROM_EARLIER_RELEASE" },
   );
 }
 
-/** Create one persistent authenticated request session, held open across a destructive command.
+/**
+ * Create the CLI's one authenticated request session, held open for the whole command.
+ *
+ * Everything below the CLI's own surface is the shared daemon client: connection, authentication,
+ * request and reply correlation, and the transport failures those produce. What is added here is
+ * the part a command-line invocation needs and a dashboard does not — a bounded deadline it reports
+ * rather than reconnecting past, and the ambiguity classification that decides whether a lost
+ * answer to a destructive request may already have run.
+ *
  * @param {{ root?: string, clientId?: string, maxBytes?: number, timeoutMs?: number }} [options]
  */
-export async function createPersistentDaemonRequester({ root = resolveRuntimeRoot(), clientId, maxBytes = 1024 * 1024, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {}) {
+export async function createDaemonRequester({ root = resolveRuntimeRoot(), clientId, maxBytes = 1024 * 1024, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {}) {
   if (!exactId(clientId)) throw new TypeError("A stable CLI clientId is required");
   const token = (await fs.readFile(join(root, "daemon", "control.token"), "utf8")).trim();
   const client = createDaemonClient({ socketPath: join(root, "daemon", "control.sock"), token, maxBytes, clientId, reconnect: false });
@@ -303,96 +315,27 @@ export async function createPersistentDaemonRequester({ root = resolveRuntimeRoo
   };
 }
 
-/** Create one bounded authenticated requester; transport closure never signals workers.
- * @param {{ root?: string, clientId?: string, maxBytes?: number, timeoutMs?: number, createConnection?: typeof net.createConnection }} [options]
+/**
+ * Run one command's daemon requests on one authenticated connection, closed however the command ends.
+ *
+ * A command runs once and exits, so its connection lives exactly as long as it does: one handshake,
+ * however many requests, and no reconnect. `options.request` replaces that connection for a caller
+ * that supplies its own request function.
+ *
+ * @template T
+ * @param {any} options @param {string} root @param {number | undefined} timeoutMs
+ * @param {(request: (op: string, payload: any, requestId?: string) => Promise<any>) => Promise<T>} run
+ * @returns {Promise<T>}
  */
-export function createDaemonRequester({ root = resolveRuntimeRoot(), clientId, maxBytes = 1024 * 1024, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, createConnection = net.createConnection } = {}) {
-  if (!exactId(clientId)) throw new TypeError("A stable CLI clientId is required");
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new TypeError("timeoutMs must be a positive safe integer");
-  const send = async (/** @type {string} */ op, /** @type {any} */ payload, /** @type {string} */ requestId) => {
-    const token = (await fs.readFile(join(root, "daemon", "control.token"), "utf8")).trim();
-    const encoder = createJsonlEncoder({ maxBytes });
-    const decoder = createJsonlDecoder({ maxBytes });
-    return new Promise((resolveRequest, rejectRequest) => {
-      const socket = createConnection(join(root, "daemon", "control.sock"));
-      let settled = false;
-      let submitted = false;
-      /** @type {any} */
-      let validatedResponse;
-      const deliveryUnknown = () => Object.assign(new Error("Daemon response was lost after submission"), { code: "DELIVERY_UNKNOWN", clientId, requestId });
-      const protocolError = (code, message, cause) => Object.assign(new Error(message, cause === undefined ? undefined : { cause }), { code });
-      /** @type {NodeJS.Timeout} */
-      let timer;
-      /** @param {unknown} error @param {unknown} [value] */
-      const finish = (error, value) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        socket.destroy();
-        if (error !== undefined) rejectRequest(error);
-        else resolveRequest(value);
-      };
-      const settleValidated = () => {
-        if (validatedResponse === undefined) return false;
-        if (!validatedResponse.ok) finish(Object.assign(new Error(validatedResponse.error.message || "Daemon request failed"), validatedResponse.error));
-        else finish(undefined, validatedResponse.result);
-        return true;
-      };
-      /** Finalize buffered UTF-8/JSONL before classifying a transport boundary. @param {unknown} fallback */
-      const finalizeTransport = (fallback) => {
-        if (settled) return;
-        try { decoder.end(); } catch (error) { finish(error); return; }
-        if (!settleValidated()) finish(fallback);
-      };
-      const transportClosed = (error) => finalizeTransport(submitted ? deliveryUnknown() : error ?? Object.assign(new Error("Daemon connection closed"), { code: "CONNECTION_CLOSED" }));
-      timer = setTimeout(() => finalizeTransport(submitted && !READ_ONLY_OPERATIONS.has(op) ? deliveryUnknown() : Object.assign(new Error("Daemon request timed out"), { code: "DAEMON_REQUEST_TIMEOUT" })), timeoutMs);
-      socket.once("connect", () => socket.write(encoder.encode({ version: 1, token, clientProtocol: CLIENT_PROTOCOL })));
-      socket.on("error", transportClosed);
-      socket.on("data", (chunk) => {
-        try {
-          const frames = decoder.push(chunk);
-          if (!submitted) {
-            if (frames.length === 0) return;
-            validateAuthentication(frames[0]);
-            if (frames.length !== 1) throw protocolError("UNEXPECTED_DAEMON_FRAME", "Daemon sent trailing data with authentication");
-            submitted = true;
-            socket.end(encoder.encode({ version: 1, clientId, requestId, op, payload }));
-            return;
-          }
-          if (validatedResponse !== undefined) {
-            if (frames.length === 0) throw protocolError("TRAILING_DAEMON_DATA", "Daemon sent partial data after its validated response");
-            if (frames.every((frame) => typeof frame === "object" && frame !== null && Object.hasOwn(frame, "requestId"))) throw protocolError("DUPLICATE_DAEMON_RESPONSE", "Daemon sent data after its validated response");
-            throw protocolError("UNEXPECTED_DAEMON_FRAME", "Daemon sent trailing data after its validated response");
-          }
-          if (frames.length === 0) return;
-          if (frames.some((frame) => typeof frame !== "object" || frame === null || !Object.hasOwn(frame, "requestId"))) throw protocolError("UNEXPECTED_DAEMON_FRAME", "Daemon sent an event or trailing frame where a response was required");
-          /** @type {any[]} */
-          const responses = [];
-          for (const frame of frames) {
-            let parsed;
-            try { parsed = parseDaemonResponse(frame); } catch (error) { throw protocolError("INVALID_DAEMON_RESPONSE", "Daemon response failed strict validation", error); }
-            if (parsed.requestId !== requestId) throw protocolError("UNEXPECTED_DAEMON_RESPONSE", "Daemon response requestId does not match the submitted request");
-            responses.push(parsed);
-          }
-          if (responses.length !== 1) throw protocolError("DUPLICATE_DAEMON_RESPONSE", "Daemon sent more than one response for one request");
-          const parsed = responses[0];
-          if (parsed.ok) validateExpectedResult(op, payload, parsed.result);
-          validatedResponse = parsed;
-        } catch (error) {
-          finish(error);
-        }
-      });
-      socket.once("end", () => transportClosed());
-      socket.once("close", () => transportClosed());
-    });
-  };
-  return async (op, payload, requestId = randomUUID()) => {
-    try {
-      return await send(op, payload, requestId);
-    } catch (error) {
-      throw await describeAuthenticationRefusal(root, error, { createConnection, maxBytes, timeoutMs });
-    }
-  };
+export async function onDaemonConnection(options, root, timeoutMs, run) {
+  if (options.request !== undefined) return run(options.request);
+  const clientId = await loadCliClientIdentity({ root, randomId: options.randomId });
+  const requester = await (options.createRequester ?? createDaemonRequester)({ root, clientId, timeoutMs });
+  try {
+    return await run(requester.request);
+  } finally {
+    await requester.close();
+  }
 }
 
 /** @param {string[]} argv */
@@ -489,9 +432,10 @@ function sameFileIdentity(left, right) {
 /** Read every machine-local session row without opening the list. */
 export async function runAgentsCommand(options = {}) {
   const root = options.root ?? resolveRuntimeRoot(options.env);
-  const request = options.request ?? createDaemonRequester({ root, clientId: await loadCliClientIdentity({ root, randomId: options.randomId }), timeoutMs: options.timeoutMs });
-  const state = await request("get_state", {});
-  return { code: 0, result: { kind: "agents", sessions: state.sessions } };
+  return onDaemonConnection(options, root, options.timeoutMs, async (request) => {
+    const state = await request("get_state", {});
+    return { code: 0, result: { kind: "agents", sessions: state.sessions } };
+  });
 }
 
 /** @param {string} message @param {unknown} [cause] */
@@ -597,9 +541,10 @@ export async function runLogsCommand(sessionId, options = {}) {
     if (sessionId === undefined) candidates = [join(root, "daemon", "startup.log")];
     else {
       if (!exactId(sessionId)) return { code: 2, error: { code: "INVALID_SYNTAX", message: "Usage: pi-agents logs [<full-session-id>]" } };
-      const request = options.request ?? createDaemonRequester({ root, clientId: await loadCliClientIdentity({ root, randomId: options.randomId }), timeoutMs: options.timeoutMs });
-      const state = await request("get_state", {});
-      const session = state?.sessions?.find((/** @type {any} */ candidate) => candidate.sessionId === sessionId);
+      const session = await onDaemonConnection(options, root, options.timeoutMs, async (request) => {
+        const state = await request("get_state", {});
+        return state?.sessions?.find((/** @type {any} */ candidate) => candidate.sessionId === sessionId);
+      });
       if (session === undefined) return { code: 1, error: { code: "SESSION_NOT_FOUND", message: `Unknown exact session ID: ${sessionId}` } };
       const directory = resolveRunDirectory(root, session.runHash);
       if (directory === undefined) return { code: 1, error: { code: "LOGS_NOT_FOUND", message: `Session ${sessionId} has no run directory yet` } };
@@ -635,50 +580,45 @@ export async function runSessionCommand(argv, options = {}) {
     // No durable request identity: the exact revision is the guard. A command the daemon refuses to
     // answer leaves the row it was aimed at as the record of whether it happened, and reissuing
     // against a revision that already moved is refused rather than applied twice.
-    const clientId = await loadCliClientIdentity({ root, randomId: options.randomId });
     const requestId = randomUUID();
     const destructiveTimeoutMs = await destructiveRequestTimeoutMs(root, options.stopPolicy, options.timeoutMs);
-    const persistent = options.request === undefined && options.heldConnectionRequest === undefined
-      ? await createPersistentDaemonRequester({ root, clientId, timeoutMs: destructiveTimeoutMs })
-      : undefined;
-    const request = options.heldConnectionRequest ?? persistent?.request ?? options.request;
     // One connection is held open across this command, so its loss is this command's own ambiguity.
-    const heldConnection = options.heldConnectionRequest !== undefined || persistent !== undefined;
+    return onDaemonConnection(options, root, destructiveTimeoutMs, async (request) => {
+      try {
+        const result = await request(parsed.operation, { sessionId: parsed.sessionId, revision: parsed.revision }, requestId);
+        if (result?.kind !== "command") return { code: 1, error: { code: "INVALID_RESPONSE", message: "Daemon returned an unexpected command result" } };
+        return { code: 0, result };
+      } catch (error) {
+        if (error?.code === "DELIVERY_UNKNOWN") return { code: 1, error: { code: "DELIVERY_UNKNOWN", message: error.message, sessionId: parsed.sessionId, revision: parsed.revision } };
+        if (error?.code === "CONNECTION_CLOSED") return { code: 1, error: { code: "DELIVERY_UNKNOWN", message: "The daemon connection was lost before delivery could be confirmed", sessionId: parsed.sessionId, revision: parsed.revision } };
+        if (error?.code !== undefined && error?.message !== undefined) return { code: 1, error: { code: error.code, message: error.message } };
+        throw error;
+      }
+    });
+  }
+
+  return onDaemonConnection(options, root, options.timeoutMs, async (request) => {
+    const readSession = async () => {
+      const state = await request("get_state", {});
+      return state?.sessions?.find((/** @type {any} */ candidate) => candidate.sessionId === parsed.sessionId);
+    };
+    const session = await readSession();
+    if (session === undefined) return { code: 1, error: { code: "SESSION_NOT_FOUND", message: `Unknown exact session ID: ${parsed.sessionId}` } };
+    if (session.revision !== parsed.revision) return { code: 1, error: { code: "REVISION_CONFLICT", message: "Session revision changed before cleanup" } };
+    if (session.isolation?.mode !== "worktree") return { code: 1, error: { code: "NOT_MANAGED_WORKTREE", message: "Shared-directory sessions have no managed worktree to remove" } };
+
     try {
-      const result = await request(parsed.operation, { sessionId: parsed.sessionId, revision: parsed.revision }, requestId);
-      if (result?.kind !== "command") return { code: 1, error: { code: "INVALID_RESPONSE", message: "Daemon returned an unexpected command result" } };
+      const cleanupManagedWorktree = options.cleanupManagedWorktree ?? defaultCleanupManagedWorktree;
+      const result = await cleanupManagedWorktree(session.isolation, {
+        readLiveOwnership: async () => {
+          const current = await readSession();
+          if (current === undefined || current.revision !== parsed.revision || current.ownership !== undefined || ["LIVE", "SLEEPING"].includes(current.processState)) return { conflict: true };
+          return null;
+        },
+      });
       return { code: 0, result };
     } catch (error) {
-      if (error?.code === "DELIVERY_UNKNOWN") return { code: 1, error: { code: "DELIVERY_UNKNOWN", message: error.message, sessionId: parsed.sessionId, revision: parsed.revision } };
-      if (heldConnection && error?.code === "CONNECTION_CLOSED") return { code: 1, error: { code: "DELIVERY_UNKNOWN", message: "The daemon connection was lost before delivery could be confirmed", sessionId: parsed.sessionId, revision: parsed.revision } };
-      if (error?.code !== undefined && error?.message !== undefined) return { code: 1, error: { code: error.code, message: error.message } };
-      throw error;
-    } finally {
-      await persistent?.close();
+      return { code: ["OWNERSHIP_CONFLICT", "IDENTITY_MISMATCH"].includes(/** @type {any} */ (error)?.code) ? 5 : 1, error: { code: /** @type {any} */ (error)?.code ?? "CLEANUP_FAILED", message: error instanceof Error ? error.message : "Cleanup failed" } };
     }
-  }
-
-  const request = options.request ?? createDaemonRequester({ root, clientId: await loadCliClientIdentity({ root, randomId: options.randomId }), timeoutMs: options.timeoutMs });
-  const readSession = async () => {
-    const state = await request("get_state", {});
-    return state?.sessions?.find((candidate) => candidate.sessionId === parsed.sessionId);
-  };
-  const session = await readSession();
-  if (session === undefined) return { code: 1, error: { code: "SESSION_NOT_FOUND", message: `Unknown exact session ID: ${parsed.sessionId}` } };
-  if (session.revision !== parsed.revision) return { code: 1, error: { code: "REVISION_CONFLICT", message: "Session revision changed before cleanup" } };
-  if (session.isolation?.mode !== "worktree") return { code: 1, error: { code: "NOT_MANAGED_WORKTREE", message: "Shared-directory sessions have no managed worktree to remove" } };
-
-  try {
-    const cleanupManagedWorktree = options.cleanupManagedWorktree ?? defaultCleanupManagedWorktree;
-    const result = await cleanupManagedWorktree(session.isolation, {
-      readLiveOwnership: async () => {
-        const current = await readSession();
-        if (current === undefined || current.revision !== parsed.revision || current.ownership !== undefined || ["LIVE", "SLEEPING"].includes(current.processState)) return { conflict: true };
-        return null;
-      },
-    });
-    return { code: 0, result };
-  } catch (error) {
-    return { code: ["OWNERSHIP_CONFLICT", "IDENTITY_MISMATCH"].includes(error?.code) ? 5 : 1, error: { code: error?.code ?? "CLEANUP_FAILED", message: error instanceof Error ? error.message : "Cleanup failed" } };
-  }
+  });
 }

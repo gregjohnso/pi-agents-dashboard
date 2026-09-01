@@ -1,4 +1,3 @@
-import { EventEmitter } from "node:events";
 import net from "node:net";
 import * as fs from "node:fs/promises";
 import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
@@ -8,7 +7,7 @@ import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
-import { DEFAULT_STOP_ESCALATION_MS, createDaemonRequester, createPersistentDaemonRequester, destructiveRequestTimeoutMs, loadCliClientIdentity, runAgentsCommand, runLogsCommand, runSessionCommand } from "./session-commands.mjs";
+import { DEFAULT_STOP_ESCALATION_MS, createDaemonRequester, destructiveRequestTimeoutMs, loadCliClientIdentity, runAgentsCommand, runLogsCommand, runSessionCommand } from "./session-commands.mjs";
 
 const roots = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
@@ -76,7 +75,7 @@ it("sends the exact revision-bound stop alone", async () => {
     operations.push([op, payload]);
     return { kind: "command", sessionId: "exact-session-id" };
   });
-  await expect(runSessionCommand(stopArgv, { heldConnectionRequest: request, root })).resolves.toMatchObject({ code: 0 });
+  await expect(runSessionCommand(stopArgv, { request: request, root })).resolves.toMatchObject({ code: 0 });
   expect(operations).toEqual([["stop", { sessionId: "exact-session-id", revision: 4 }]]);
 });
 
@@ -135,7 +134,7 @@ it("sends the exact revision-bound respawn alone", async () => {
     operations.push([op, payload]);
     throw Object.assign(new Error("Daemon response was lost after submission"), { code: "DELIVERY_UNKNOWN" });
   });
-  await expect(runSessionCommand(respawnArgv, { root, randomId: () => "stable", heldConnectionRequest: request })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN" } });
+  await expect(runSessionCommand(respawnArgv, { root, randomId: () => "stable", request: request })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN" } });
   expect(operations).toEqual([["respawn", { sessionId: "exact-session-id", revision: 4 }]]);
 });
 
@@ -228,22 +227,30 @@ it("refuses cleanup when revision changes or live ownership appears", async () =
   expect(cleanupManagedWorktree).not.toHaveBeenCalled();
 });
 
+/** One CLI requester on one held connection, closed however the test ends. */
+async function withRequester(root, options, run) {
+  const requester = await createDaemonRequester({ root, clientId: "cli-stable", maxBytes: 4096, ...options });
+  try { return await run(requester.request); } finally { await requester.close(); }
+}
+
 it.each([
   ["ends without answering", (socket) => socket.end(), {}, 200],
   ["holds the connection open past the deadline", () => {}, { closeOnInputEnd: false }, 100],
 ])("settles a submitted request as DELIVERY_UNKNOWN when the peer %s", async (_name, respond, serverOptions, timeoutMs) => {
   const root = await stateRoot();
   const server = await daemonServer(root, respond, undefined, serverOptions);
-  const requester = createDaemonRequester({ root, clientId: "cli-stable", maxBytes: 4096, timeoutMs });
-  await expect(requester("delete", { sessionId: "exact", revision: 1 }, "request-full")).rejects.toMatchObject({ code: "DELIVERY_UNKNOWN", clientId: "cli-stable", requestId: "request-full" });
+  await withRequester(root, { timeoutMs }, async (request) => {
+    await expect(request("delete", { sessionId: "exact", revision: 1 }, "request-full")).rejects.toMatchObject({ code: "DELIVERY_UNKNOWN", clientId: "cli-stable", requestId: "request-full" });
+  });
   await closeServer(server);
 });
 
 it("reports a read-only timeout as a timeout, never as an ambiguous delivery", async () => {
   const root = await stateRoot();
   const server = await daemonServer(root, () => {}, undefined, { closeOnInputEnd: false });
-  const requester = createDaemonRequester({ root, clientId: "cli-stable", maxBytes: 4096, timeoutMs: 100 });
-  await expect(requester("get_state", {}, "read-only-request")).rejects.toMatchObject({ code: "DAEMON_REQUEST_TIMEOUT" });
+  await withRequester(root, { timeoutMs: 100 }, async (request) => {
+    await expect(request("get_state", {}, "read-only-request")).rejects.toMatchObject({ code: "DAEMON_REQUEST_TIMEOUT" });
+  });
   await closeServer(server);
 });
 
@@ -251,81 +258,25 @@ it("returns one validated response when the peer immediately ends the connection
   const root = await stateRoot();
   const response = { version: 1, requestId: "response-boundary", ok: true, result: { kind: "state", sessions: [], cursor: { daemonEpoch: "epoch", sequence: "0" } } };
   const server = await daemonServer(root, (socket, encoder) => socket.end(encoder.encode(response)));
-  const requester = createDaemonRequester({ root, clientId: "cli-stable", maxBytes: 4096, timeoutMs: 200 });
-  await expect(requester("get_state", {}, "response-boundary")).resolves.toEqual(response.result);
+  await withRequester(root, { timeoutMs: 200 }, async (request) => {
+    await expect(request("get_state", {}, "response-boundary")).resolves.toEqual(response.result);
+  });
   await closeServer(server);
 });
 
-it("finalizes one complete response from a peer that never closes the connection", async () => {
-  const root = await stateRoot();
-  const daemon = join(root, "daemon");
-  await mkdir(daemon, { mode: 0o700 });
-  await writeFile(join(daemon, "control.token"), "secret\n", { mode: 0o600 });
-  const encoder = createJsonlEncoder({ maxBytes: 4096 });
-  const response = { version: 1, requestId: "scripted-response", ok: true, result: { kind: "state", sessions: [], cursor: { daemonEpoch: "epoch", sequence: "0" } } };
-  class ScriptedSocket extends EventEmitter {
-    write(_chunk, callback) {
-      callback?.();
-      queueMicrotask(() => this.emit("data", encoder.encode(authenticated)));
-      return true;
-    }
-    end(_chunk, callback) {
-      callback?.();
-      queueMicrotask(() => this.emit("data", encoder.encode(response)));
-      return this;
-    }
-    destroy() {}
-  }
-  const socket = new ScriptedSocket();
-  const requester = createDaemonRequester({ root, clientId: "cli-stable", maxBytes: 4096, timeoutMs: 20, createConnection: () => {
-    queueMicrotask(() => socket.emit("connect"));
-    return socket;
-  } });
-  await expect(requester("get_state", {}, "scripted-response")).resolves.toEqual(response.result);
-});
-
+// The shared client's rule, which the CLI now inherits: an answer that fails strict validation
+// rejects the one request that owns it and keeps the connection. A destructive request whose answer
+// cannot be read may already have run, so it is ambiguous rather than a clean failure.
 it.each([
-  ["a duplicate response in one flush", (socket, encoder, response) => socket.write(Buffer.concat([encoder.encode(response), encoder.encode(response)])), "DUPLICATE_DAEMON_RESPONSE", {}],
-  ["a trailing frame in one flush", (socket, encoder, response) => socket.write(Buffer.concat([encoder.encode(response), encoder.encode({ nonsense: true })])), "UNEXPECTED_DAEMON_FRAME", {}],
-  ["a partial frame in one flush", (socket, encoder, response) => socket.end(Buffer.concat([encoder.encode(response), Buffer.from("{\"")])), "INCOMPLETE_FRAME", {}],
-  ["a delayed duplicate response", (socket, encoder, response) => { socket.write(encoder.encode(response)); setTimeout(() => socket.end(encoder.encode(response)), 10); }, "DUPLICATE_DAEMON_RESPONSE", { closeOnInputEnd: false }],
-  ["a delayed trailing frame", (socket, encoder, response) => { socket.write(encoder.encode(response)); setTimeout(() => socket.end(encoder.encode({ nonsense: true })), 10); }, "UNEXPECTED_DAEMON_FRAME", { closeOnInputEnd: false }],
-  ["delayed partial data", (socket, encoder, response) => { socket.write(encoder.encode(response)); setTimeout(() => socket.end(Buffer.from("{\"")), 10); }, "TRAILING_DAEMON_DATA", { closeOnInputEnd: false }],
-])("refuses the response when the daemon sends %s", async (_name, send, code, serverOptions) => {
+  ["an unparseable successful result", { ok: true, result: { kind: "mystery" } }],
+  ["an unparseable error", { ok: false, error: { code: "NO", message: "bad" } }],
+])("rejects only the request that owns %s", async (_name, answer) => {
   const root = await stateRoot();
-  const response = { version: 1, requestId: "response-boundary", ok: true, result: { kind: "state", sessions: [], cursor: { daemonEpoch: "epoch", sequence: "0" } } };
-  const server = await daemonServer(root, (socket, encoder) => send(socket, encoder, response), undefined, serverOptions);
-  const requester = createDaemonRequester({ root, clientId: "cli-stable", maxBytes: 4096, timeoutMs: 200 });
-  await expect(requester("get_state", {}, "response-boundary")).rejects.toMatchObject({ code });
-  await closeServer(server);
-});
-
-it.each([
-  ["unknown state", { ...authenticated, state: "MYSTERY" }],
-  ["unknown field", { ...authenticated, extra: true }],
-  ["truthy error in READY", { ...authenticated, error: "bad" }],
-  ["malformed FAILED error", { ...authenticated, state: "FAILED", error: { code: "FAILED", message: "bad" } }],
-  ["wrong recovery marker", { ...authenticated, state: "RECONCILING" }],
-])("rejects invalid authentication: %s", async (_name, authentication) => {
-  const root = await stateRoot();
-  const submitted = vi.fn();
-  const server = await daemonServer(root, submitted, authentication);
-  const requester = createDaemonRequester({ root, clientId: "cli-stable", maxBytes: 4096, timeoutMs: 200 });
-  await expect(requester("delete", { sessionId: "exact", revision: 1 }, "auth-request")).rejects.toMatchObject({ code: "INVALID_DAEMON_AUTHENTICATION" });
-  expect(submitted).not.toHaveBeenCalled();
-  await closeServer(server);
-});
-
-it.each([
-  ["unknown successful result", { version: 1, requestId: "strict-request", ok: true, result: { kind: "mystery" } }, "INVALID_DAEMON_RESPONSE"],
-  ["wrong request ID", { version: 1, requestId: "other", ok: true, result: { kind: "state", sessions: [], cursor: { daemonEpoch: "epoch", sequence: "0" } } }, "UNEXPECTED_DAEMON_RESPONSE"],
-  ["list invalidation", { version: 1, kind: "list_changed" }, "UNEXPECTED_DAEMON_FRAME"],
-  ["invalid error", { version: 1, requestId: "strict-request", ok: false, error: { code: "NO", message: "bad" } }, "INVALID_DAEMON_RESPONSE"],
-])("rejects %s as a typed protocol failure", async (_name, frame, code) => {
-  const root = await stateRoot();
-  const server = await daemonServer(root, (socket, encoder) => socket.write(encoder.encode(frame)));
-  const requester = createDaemonRequester({ root, clientId: "cli-stable", maxBytes: 4096, timeoutMs: 200 });
-  await expect(requester("get_state", {}, "strict-request")).rejects.toMatchObject({ code });
+  const server = await daemonServer(root, (socket, encoder, frame) => socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ...answer })), undefined, { closeOnInputEnd: false });
+  await withRequester(root, { timeoutMs: 200 }, async (request) => {
+    await expect(request("get_state", {}, "read-request")).rejects.toMatchObject({ code: "MALFORMED_RESPONSE" });
+    await expect(request("delete", { sessionId: "exact", revision: 1 }, "delete-request")).rejects.toMatchObject({ code: "DELIVERY_UNKNOWN", clientId: "cli-stable", requestId: "delete-request", submitted: true });
+  });
   await closeServer(server);
 });
 
@@ -333,19 +284,20 @@ it.each([
 it("classifies a destructive response that cannot be parsed as delivery unknown", async () => {
   const root = await stateRoot();
   const server = await daemonServer(root, (socket, encoder, frame) => socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "command" } })));
-  const requester = await createPersistentDaemonRequester({ root, clientId: "cli-stable", maxBytes: 4096, timeoutMs: 2_000 });
-  await expect(requester.request("delete", { sessionId: "exact", revision: 1 }, "unparseable-request")).rejects.toMatchObject({ code: "DELIVERY_UNKNOWN", clientId: "cli-stable", requestId: "unparseable-request", submitted: true });
-  await requester.close();
+  await withRequester(root, { timeoutMs: 2_000 }, async (request) => {
+    await expect(request("delete", { sessionId: "exact", revision: 1 }, "unparseable-request")).rejects.toMatchObject({ code: "DELIVERY_UNKNOWN", clientId: "cli-stable", requestId: "unparseable-request", submitted: true });
+  });
   await closeServer(server);
 });
 
-// A command answer for another session is not this command's answer.
+// A command answer for another session is not this command's answer, and the stop it answers may
+// still have run, so the operator is told it is ambiguous rather than that nothing happened.
 it("refuses a command answer that names a different session", async () => {
   const root = await stateRoot();
-  const frame = { version: 1, requestId: "strict-request", ok: true, result: { kind: "command", sessionId: "another-session" } };
-  const server = await daemonServer(root, (socket, encoder) => socket.write(encoder.encode(frame)));
-  const requester = createDaemonRequester({ root, clientId: "cli-stable", maxBytes: 4096, timeoutMs: 200 });
-  await expect(requester("stop", { sessionId: "exact", revision: 1 }, "strict-request")).rejects.toMatchObject({ code: "UNEXPECTED_DAEMON_RESPONSE" });
+  const server = await daemonServer(root, (socket, encoder) => socket.write(encoder.encode({ version: 1, requestId: "strict-request", ok: true, result: { kind: "command", sessionId: "another-session" } })));
+  await withRequester(root, { timeoutMs: 200 }, async (request) => {
+    await expect(request("stop", { sessionId: "exact", revision: 1 }, "strict-request")).rejects.toMatchObject({ code: "DELIVERY_UNKNOWN", requestId: "strict-request" });
+  });
   await closeServer(server);
 });
 
@@ -353,6 +305,49 @@ it("classifies an unvalidated delete response as delivery unknown", async () => 
   const root = await stateRoot();
   const server = await daemonServer(root, (socket, encoder, frame) => socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "mystery" } })));
   await expect(runSessionCommand(rmArgv, { root, randomId: () => "stable", timeoutMs: 200 })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN", sessionId: "exact-session-id" } });
+  await closeServer(server);
+});
+
+/** One session row shaped the way the daemon publishes it, so strict response validation accepts it. */
+const wireSession = {
+  schemaVersion: 1,
+  revision: 4,
+  sessionId: "exact-session-id",
+  sessionFile: "/pi/sessions/exact.json",
+  canonicalSessionFile: "/pi/sessions/exact.json",
+  cwd: "/repo",
+  taskState: "STOPPED",
+  processState: "EXITED",
+  outcome: "NONE",
+  activity: { kind: "idle", summary: "", updatedAt: "2026-01-01T00:00:00.000Z" },
+  createdAt: "2026-01-01T00:00:00.000Z",
+  updatedAt: "2026-01-01T00:00:00.000Z",
+  isolation: { mode: "worktree", worktreePath: "/managed/worktree", branch: "agent/exact" },
+};
+
+// A read has nothing to be ambiguous about: nothing was mutated, so a lost answer is a lost answer.
+// The one-shot CLI socket reported every submitted request as DELIVERY_UNKNOWN when the peer went
+// away, which read as "your rm may have run" for a command that only asked for rows.
+it("reports a lost read as a lost connection, never as an ambiguous delivery", async () => {
+  const root = await stateRoot();
+  const server = await daemonServer(root, (socket) => socket.destroy());
+  await expect(runAgentsCommand({ root, randomId: () => "stable", timeoutMs: 2_000 })).rejects.toMatchObject({ code: "CONNECTION_CLOSED" });
+  await closeServer(server);
+});
+
+// One command is one authenticated conversation. Cleanup reads the row, then re-reads it at the
+// ownership boundary; on the retired per-request socket that was two connections and two handshakes.
+it("runs every request of one command on one authenticated connection", async () => {
+  const root = await stateRoot();
+  const server = await daemonServer(root, (socket, encoder, frame) =>
+    socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "state", sessions: [wireSession], cursor: { daemonEpoch: "epoch", sequence: "0" } } })));
+  const cleanupManagedWorktree = vi.fn(async (_isolation, cleanupOptions) => {
+    expect(await cleanupOptions.readLiveOwnership()).toBeNull();
+    return { disposition: "REMOVED" };
+  });
+  await expect(runSessionCommand(["cleanup", "exact-session-id", "--revision", "4", "--yes"], { root, randomId: () => "stable", timeoutMs: 2_000, cleanupManagedWorktree }))
+    .resolves.toMatchObject({ code: 0, result: { disposition: "REMOVED" } });
+  expect(server.sockets).toHaveLength(1);
   await closeServer(server);
 });
 

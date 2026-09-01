@@ -6,11 +6,11 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { abandonDaemonStartChild, cleanupStaleDaemon, identifyDaemonChild, inspectDaemonEndpoint } from "../runtime/daemon-lifecycle.mjs";
-import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
+import { createJsonlEncoder } from "../runtime/jsonl.mjs";
 import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "../runtime/process-signaler.mjs";
 import { adoptRenamedStateRoot } from "../runtime/state-root-adoption.mjs";
-import { createDaemonRequester, createPersistentDaemonRequester, destructiveRequestTimeoutMs, loadCliClientIdentity, resolveRuntimeRoot } from "./session-commands.mjs";
+import { destructiveRequestTimeoutMs, offerTokenAuthentication, onDaemonConnection, resolveRuntimeRoot } from "./session-commands.mjs";
 
 export { resolveRuntimeRoot };
 
@@ -56,30 +56,10 @@ export const DAEMON_PROBE_TIMEOUT_MS = 5_000;
 export async function probeDaemon(publication, { timeoutMs = DAEMON_PROBE_TIMEOUT_MS } = {}) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new TypeError("probe timeoutMs must be a positive safe integer");
   const token = (await readFile(publication.tokenPath, "utf8")).trim();
-  const socketPath = join(dirname(publication.tokenPath), "control.sock");
-  const encoder = createJsonlEncoder({ maxBytes: 64 * 1024 });
-  const decoder = createJsonlDecoder({ maxBytes: 64 * 1024 });
-  return new Promise((resolveProbe) => {
-    const socket = net.createConnection(socketPath);
-    const timer = setTimeout(() => finish({ reachable: false }), timeoutMs);
-    let settled = false;
-    const finish = (value) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      socket.destroy();
-      resolveProbe(value);
-    };
-    socket.once("connect", () => socket.write(encoder.encode({ version: 1, token })));
-    socket.on("data", (chunk) => {
-      try {
-        const frame = /** @type {any} */ (decoder.push(chunk)[0]);
-        if (frame !== undefined) finish(frame?.version === 1 && frame?.kind === "authenticated" ? { reachable: true, state: frame.state, error: frame.error } : { reachable: false });
-      } catch { finish({ reachable: false }); }
-    });
-    socket.once("error", () => finish({ reachable: false }));
-    socket.once("close", () => finish({ reachable: false }));
-  });
+  const frame = await offerTokenAuthentication(join(dirname(publication.tokenPath), "control.sock"), token, { timeoutMs });
+  // Deliberately looser than the refusal diagnosis: this only asks whether a daemon is there to talk
+  // to, and a version of it this build has never seen still counts as reachable.
+  return frame?.version === 1 && frame?.kind === "authenticated" ? { reachable: true, state: frame.state, error: frame.error } : { reachable: false };
 }
 
 async function requestDaemonStop(publication, { timeoutMs = 500 } = {}) {
@@ -181,37 +161,29 @@ async function waitForProcessExit(publication, inspect) {
  * @returns {Promise<{ refusal?: any, stoppedSessionIds: string[] }>}
  */
 async function stopLiveWorkers(root, options) {
-  const clientId = options.request === undefined && options.heldConnectionRequest === undefined ? await loadCliClientIdentity({ root, randomId: options.randomId }) : undefined;
-  /** @type {any} */
-  let persistent;
-  /** @type {any} */
-  let request;
-  /** @type {any} */
-  let state;
   try {
     // A worker Stop only answers after the daemon's own SIGTERM-then-SIGKILL escalation, so a shorter deadline reports a false ambiguous delivery.
-    persistent = clientId === undefined ? undefined : await (options.createPersistentRequester ?? createPersistentDaemonRequester)({ root, clientId, timeoutMs: await destructiveRequestTimeoutMs(root, undefined, options.timeoutMs) });
-    request = options.heldConnectionRequest ?? persistent?.request ?? options.request ?? createDaemonRequester({ root, clientId, timeoutMs: options.timeoutMs });
-    state = await request("get_state", {});
+    const timeoutMs = await destructiveRequestTimeoutMs(root, undefined, options.timeoutMs);
+    return await onDaemonConnection(options, root, timeoutMs, async (request) => {
+      const state = await request("get_state", {});
+      const liveSessions = state.sessions.filter((/** @type {any} */ record) => record.ownership !== undefined || ["LIVE", "SLEEPING"].includes(record.processState));
+      if (liveSessions.length > 0 && options.allowLiveWorkers !== true && (options.stopWorkers !== true || options.yes !== true)) {
+        return { refusal: { code: 1, error: { code: "WORKERS_LIVE", message: "Daemon stop requires --stop-workers --yes while workers are live" }, result: { kind: "live_workers", sessionIds: liveSessions.map((/** @type {any} */ record) => record.sessionId) } }, stoppedSessionIds: [] };
+      }
+      if (liveSessions.length === 0 || options.stopWorkers !== true) return { stoppedSessionIds: [] };
+      let outcomes;
+      try { outcomes = await Promise.all(liveSessions.map((/** @type {any} */ record) => request("stop", { sessionId: record.sessionId, revision: record.revision }))); }
+      catch (error) { if (/** @type {any} */ (error)?.code === "DELIVERY_UNKNOWN" || (/** @type {any} */ (error)?.code === "CONNECTION_CLOSED" && /** @type {any} */ (error)?.submitted === true)) return { refusal: { code: 1, error: { code: "DELIVERY_UNKNOWN", message: "A worker Stop delivery is ambiguous; daemon remains running" } }, stoppedSessionIds: [] }; throw error; }
+      const refused = outcomes.find((outcome) => outcome?.kind !== "command" || outcome.status?.stage !== "COMPLETED");
+      if (refused !== undefined) return { refusal: { code: 1, error: { code: refused?.status?.stage === "DELIVERY_UNKNOWN" ? "DELIVERY_UNKNOWN" : "WORKER_STOP_REFUSED", message: "A worker stop did not complete; daemon remains running" }, result: refused }, stoppedSessionIds: [] };
+      return { stoppedSessionIds: liveSessions.map((/** @type {any} */ record) => record.sessionId) };
+    });
   } catch (error) {
-    await persistent?.close();
+    // Only the handshake reaches this code: it is minted where the connection is authenticated.
     if (/** @type {any} */ (error)?.code !== "DAEMON_FROM_EARLIER_RELEASE") throw error;
     if (options.stopWorkers !== true) return { stoppedSessionIds: [] };
     return { refusal: { code: 1, error: { code: "DAEMON_FROM_EARLIER_RELEASE", message: /** @type {Error} */ (error).message } }, stoppedSessionIds: [] };
   }
-  try {
-    const liveSessions = state.sessions.filter((/** @type {any} */ record) => record.ownership !== undefined || ["LIVE", "SLEEPING"].includes(record.processState));
-    if (liveSessions.length > 0 && options.allowLiveWorkers !== true && (options.stopWorkers !== true || options.yes !== true)) {
-      return { refusal: { code: 1, error: { code: "WORKERS_LIVE", message: "Daemon stop requires --stop-workers --yes while workers are live" }, result: { kind: "live_workers", sessionIds: liveSessions.map((/** @type {any} */ record) => record.sessionId) } }, stoppedSessionIds: [] };
-    }
-    if (liveSessions.length === 0 || options.stopWorkers !== true) return { stoppedSessionIds: [] };
-    let outcomes;
-    try { outcomes = await Promise.all(liveSessions.map((/** @type {any} */ record) => request("stop", { sessionId: record.sessionId, revision: record.revision }))); }
-    catch (error) { if (/** @type {any} */ (error)?.code === "DELIVERY_UNKNOWN" || (/** @type {any} */ (error)?.code === "CONNECTION_CLOSED" && /** @type {any} */ (error)?.submitted === true)) return { refusal: { code: 1, error: { code: "DELIVERY_UNKNOWN", message: "A worker Stop delivery is ambiguous; daemon remains running" } }, stoppedSessionIds: [] }; throw error; }
-    const refused = outcomes.find((outcome) => outcome?.kind !== "command" || outcome.status?.stage !== "COMPLETED");
-    if (refused !== undefined) return { refusal: { code: 1, error: { code: refused?.status?.stage === "DELIVERY_UNKNOWN" ? "DELIVERY_UNKNOWN" : "WORKER_STOP_REFUSED", message: "A worker stop did not complete; daemon remains running" }, result: refused }, stoppedSessionIds: [] };
-    return { stoppedSessionIds: liveSessions.map((/** @type {any} */ record) => record.sessionId) };
-  } finally { await persistent?.close(); }
 }
 
 /**

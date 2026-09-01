@@ -1,12 +1,19 @@
 # Architecture implementation plan
 
-**Status on 2026-08-31: all 19 planned commits are merged and pushed on `standalone-dashboard`, plus 7 commits this plan did not anticipate. The suite is 968 tests across 89 files, green under `pixi run test` with no flags, typecheck clean. What remains is Gates 2, 3 and 4, two packaging decisions, and the defect list at the end of this file. Every change below is done unless the section says otherwise.**
+**This plan is finished and kept as history. Live state lives in [docs/status.md](status.md); the design it produced is [docs/architecture.md](architecture.md).**
 
-The seven unplanned commits each fixed something a planned commit broke or exposed, and they are the reason the count is 26 rather than 19: the launch refusal that ate the operator's typed prompt, Pi's version stored as its help banner, real timeouts so `pixi run test` is a gate again, an unreachable liveness-probe timeout, the daemon child a timed-out start used to orphan, reaching a daemon from the previous release, and a refused viewer resubscription that froze the transcript in silence.
+It shipped as 26 commits rather than the 19 planned. The seven unplanned ones each fixed something a planned commit broke or exposed: the launch refusal that ate the operator's typed prompt, Pi's version stored as its help banner, real test timeouts so `pixi run test` is a gate again, an unreachable liveness-probe timeout, the daemon child a timed-out start used to orphan, reaching a daemon from the previous release, and a refused viewer resubscription that froze the transcript in silence. Two came from failures the operator hit himself; two more from a review that read the files rather than the diff.
 
-Two of those came from failures the operator hit himself, and two more from an external review that read the files rather than the diff. The pattern worth carrying forward: **every fire-and-forget send across a process boundary eventually becomes a silent freeze.** It happened in the list path, was fixed there by Change 7, and survived twenty lines away in the viewer path until someone read the file.
+Three lessons are worth more than the sequence below.
+
+**Every fire-and-forget send across a process boundary eventually becomes a silent freeze.** It happened in the list path, was fixed there by Change 7, and survived twenty lines away in the viewer path until someone read the file rather than the diff.
+
+**A cached copy of another process's state cannot decide what to send it.** The viewer chose `prompt` or `follow_up` from a flag one event behind Pi and lost the operator's text; `openSession` checked a map, awaited, then wrote it, and leaked file handles fatally on Node 24 and later. Both are the same shape.
+
+**A test double that only models success is worse than no test.** Three separate defects shipped behind a fully green suite because the fake could not refuse.
 
 After these 19 commits:
+
 
 - Commands work the same on a newly launched session and after a daemon restart. Graceful Stop no longer waits through its timeout solely because a route is absent.
 - Every attached client may read and write the same session. The daemon serializes and journals accepted commands.
@@ -16,7 +23,7 @@ After these 19 commits:
 - `rm` forgets only the dashboard row. It preserves the canonical Pi file and worktree.
 - The daemon and workers continue running when terminal clients exit or the daemon is absent.
 
-Approve the work as 19 green commits in one release, with five operator-machine gates protecting the live daemon and two live sessions. The estimate is 7.5 to 12.5 engineer-days. This is not measured work. It includes tests, gates, and documentation but excludes review time and maintenance-window waits.
+The work shipped as one release, with five operator-machine gates protecting the live daemon and its sessions. All five passed. The pre-work estimate was 7.5 to 12.5 engineer-days and was never measured against the actual spend.
 
 The resulting process model is one daemon per state root, many read-write terminal clients, and one worker per live Pi session. The daemon orders commands per session and records their delivery stages.
 
@@ -73,30 +80,6 @@ The Stop line is an assertion, not a summary. Check source-removal assertions wi
 If a focused test fails for a different reason, repair the fixture or narrow the test before implementation. If the full suite or typecheck fails, do not commit. If an operator gate fails, stop the release, save public-client output and daemon diagnostics, leave the two original workers untouched, and diagnose on a copied or temporary root. Do not roll back the daemon, replace a worker, edit production state, or signal a process as an improvised recovery step. Repeat the failed gate only after a new green commit explains the failure.
 
 The first implementation day starts with Gate 0 and a collision check against the file table at the end of this plan. Create one branch for the serial path. Parallel preparation may produce patches, but the serial branch owner rebases and reruns the full checks after each merge.
-
-## What remains
-
-Nothing in the commit sequence. Three gates, two decisions, and a defect list.
-
-**Gates.** Gate 2 (confirmed model), Gate 3 (three dashboards and list convergence) and Gate 4 (viewer, logs, commands, `rm`) are specified below and unrun. Gate 4's viewer section is written against the wrong failure: an external review on 2026-08-31 found a refused viewer resubscription froze the transcript silently, and Gate 4 as specified would not have caught it, because it never breaks a live viewer's socket nor lets events accumulate past the daemon's subscriber bound. Widen it before running it. Gates 0 and 1 passed. All three remaining gates run on temporary roots; none may touch the operator's live sessions.
-
-**Two packaging decisions, one line each.** `package.json` carries no `"private": true` although this tool is not published, and `README.md` still says `npm install -g pi-agents`, which names a package nobody can install. Both have been flagged repeatedly and left alone, because publishing intent is the operator's call.
-
-**Defects found and not fixed.** None blocks the release; all were found by the commit that reported them.
-
-| Defect | Where | Cost |
-|---|---|---|
-| A worker replaced across a release change is invisible | list UI | The row stays READY and a prompt appears to hang for about two minutes. The operator hit this on 2026-08-31 and read it as the session being broken. |
-| `daemon start` prints nothing for up to 90 s | `cli/main.mjs` writes its result only after the command returns | On a real hang the terminal is dead long enough to Ctrl-C and destroy the diagnosis the 90 s deadline exists to produce. |
-| `PROCESS_EXIT_PROOF_MS` is 2 s with no option | `cli/daemon-commands.mjs:22` | A daemon the kernel takes longer to reap turns a correct stop into exit code 5. |
-| `CRASH_REPORT_TIMEOUT_MS` is 1 s | `runtime/installed-pi-worker.mjs:15` | Under load a crashing worker loses its own explanation. |
-| `PENDING_LOCK_TIMEOUT_MS` unreachable at two call sites | `cli/session-commands.mjs:481,528` | Same class as the probe timeout that was fixed. |
-| `runViewerTransition` fires `detach` without awaiting it | viewer | A fast reopen-then-delete still races its own detach. |
-| `migrateLegacyState` refuses any root that ever opened a viewer | `runtime/state-migration.mjs` | Pre-existing; it means that path cannot succeed on the operator's machine today. |
-| Test doubles that cannot fail the way production fails | `cli/daemon-commands.test.mjs`, `app/list/dashboard.test.mjs`, `cli/session-commands.test.mjs` | This class hid a `daemon stop --stop-workers` regression behind a fully green suite. |
-| `docs/development.md` states 901 tests | documentation | The tree has 957. |
-
-**Inert files on the operator's root**, named by no code and removed by nothing: `index/events.jsonl` (18 MB), `daemon/attachment-results.jsonl` (697 KB), `daemon/event-acks.json`, 15 `index/viewer/*.acks.json`, and `frontend-state.json`. They also block the deferred `pi-dashboard` to `pi-agents` rename, which needs a moment with no live daemon or worker.
 
 ## Sequence and concurrent work
 

@@ -4,7 +4,7 @@
 
 ## Install and open the session list
 
-You need Node.js 22.19 or newer and an installed `pi` executable.
+You need Node.js 22, version 22.19 or newer, and an installed `pi` executable.
 
 ```bash
 npm install -g pi-agents

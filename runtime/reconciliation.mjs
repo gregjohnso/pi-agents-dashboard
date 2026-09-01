@@ -598,6 +598,8 @@ async function createViewerRecovery({ root, daemonEpoch, registry }) {
   const directory = join(root, "index", "viewer");
   /** @type {Map<string, any>} */
   const sessions = new Map();
+  /** One in-flight open per session, so a second caller joins the first instead of building its own store. @type {Map<string, Promise<any>>} */
+  const opening = new Map();
 
   /** @param {any} state */
   async function publish(state) {
@@ -634,10 +636,25 @@ async function createViewerRecovery({ root, daemonEpoch, registry }) {
     }
   }
 
-  /** @param {any} record */
+  /**
+   * Join whichever attempt is already opening this session, or start the only one. The in-flight
+   * promise is recorded before this function's first await, so two concurrent callers cannot both
+   * reach openNewSession and drop the loser's event, checkpoint and history handles unclosed. A
+   * rejected attempt is forgotten rather than cached, so the next caller opens the session again.
+   * @param {any} record
+   */
   async function openSession(record) {
+    const inFlight = opening.get(record.sessionId);
+    if (inFlight !== undefined) return inFlight;
     const existing = sessions.get(record.sessionId);
     if (existing !== undefined) return existing;
+    const attempt = openNewSession(record);
+    opening.set(record.sessionId, attempt);
+    try { return await attempt; } finally { opening.delete(record.sessionId); }
+  }
+
+  /** @param {any} record */
+  async function openNewSession(record) {
     const store = await createViewerStore({ directory, sessionId: record.sessionId, daemonEpoch });
     const normalizer = createViewerNormalizer({ sessionId: record.sessionId, protocolVersion: 1, now: () => new Date().toISOString() });
     let reader;

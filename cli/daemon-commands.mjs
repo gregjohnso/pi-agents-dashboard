@@ -6,11 +6,11 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { abandonDaemonStartChild, cleanupStaleDaemon, identifyDaemonChild, inspectDaemonEndpoint } from "../runtime/daemon-lifecycle.mjs";
-import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
+import { createJsonlEncoder } from "../runtime/jsonl.mjs";
 import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "../runtime/process-signaler.mjs";
 import { adoptRenamedStateRoot } from "../runtime/state-root-adoption.mjs";
-import { destructiveRequestTimeoutMs, onDaemonConnection, resolveRuntimeRoot } from "./session-commands.mjs";
+import { destructiveRequestTimeoutMs, offerTokenAuthentication, onDaemonConnection, resolveRuntimeRoot } from "./session-commands.mjs";
 
 export { resolveRuntimeRoot };
 
@@ -56,30 +56,10 @@ export const DAEMON_PROBE_TIMEOUT_MS = 5_000;
 export async function probeDaemon(publication, { timeoutMs = DAEMON_PROBE_TIMEOUT_MS } = {}) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new TypeError("probe timeoutMs must be a positive safe integer");
   const token = (await readFile(publication.tokenPath, "utf8")).trim();
-  const socketPath = join(dirname(publication.tokenPath), "control.sock");
-  const encoder = createJsonlEncoder({ maxBytes: 64 * 1024 });
-  const decoder = createJsonlDecoder({ maxBytes: 64 * 1024 });
-  return new Promise((resolveProbe) => {
-    const socket = net.createConnection(socketPath);
-    const timer = setTimeout(() => finish({ reachable: false }), timeoutMs);
-    let settled = false;
-    const finish = (value) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      socket.destroy();
-      resolveProbe(value);
-    };
-    socket.once("connect", () => socket.write(encoder.encode({ version: 1, token })));
-    socket.on("data", (chunk) => {
-      try {
-        const frame = /** @type {any} */ (decoder.push(chunk)[0]);
-        if (frame !== undefined) finish(frame?.version === 1 && frame?.kind === "authenticated" ? { reachable: true, state: frame.state, error: frame.error } : { reachable: false });
-      } catch { finish({ reachable: false }); }
-    });
-    socket.once("error", () => finish({ reachable: false }));
-    socket.once("close", () => finish({ reachable: false }));
-  });
+  const frame = await offerTokenAuthentication(join(dirname(publication.tokenPath), "control.sock"), token, { timeoutMs });
+  // Deliberately looser than the refusal diagnosis: this only asks whether a daemon is there to talk
+  // to, and a version of it this build has never seen still counts as reachable.
+  return frame?.version === 1 && frame?.kind === "authenticated" ? { reachable: true, state: frame.state, error: frame.error } : { reachable: false };
 }
 
 async function requestDaemonStop(publication, { timeoutMs = 500 } = {}) {

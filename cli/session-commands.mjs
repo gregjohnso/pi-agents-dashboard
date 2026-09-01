@@ -206,39 +206,42 @@ function validateExpectedResult(op, payload, result) {
 }
 
 /**
- * Offer the authentication frame every release has accepted, version and token alone, and report
- * whether this daemon authenticates it. That is the frame the liveness probe sends.
- * @param {{ root: string, maxBytes?: number, timeoutMs?: number }} options
+ * Offer the authentication frame every release has accepted — version and token, nothing else — and
+ * return the frame the daemon answers with.
+ *
+ * No request follows it, and that is the point: a daemon from an earlier release refuses any
+ * authentication key it does not know, so this is the one conversation a client from this release
+ * can still hold with one. Its two callers read the answer their own way, because a liveness probe
+ * and a refusal diagnosis disagree about how strict an authenticated frame has to be.
+ *
+ * @param {string} socketPath @param {string} token
+ * @param {{ timeoutMs?: number, maxBytes?: number }} [options]
+ * @returns {Promise<any>} the daemon's first frame, or undefined when none arrived
  */
-async function daemonAuthenticatesTokenAlone({ root, maxBytes = 1024 * 1024, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS }) {
-  /** @type {string} */
-  let token;
-  try { token = (await fs.readFile(join(root, "daemon", "control.token"), "utf8")).trim(); } catch { return false; }
+export function offerTokenAuthentication(socketPath, token, { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, maxBytes = 64 * 1024 } = {}) {
   const encoder = createJsonlEncoder({ maxBytes });
   const decoder = createJsonlDecoder({ maxBytes });
-  return new Promise((resolveProbe) => {
-    const socket = net.createConnection(join(root, "daemon", "control.sock"));
+  return new Promise((resolveFrame) => {
+    const socket = net.createConnection(socketPath);
     let settled = false;
-    const timer = setTimeout(() => finish(false), timeoutMs);
-    /** @param {boolean} value */
-    const finish = (value) => {
+    const timer = setTimeout(() => finish(undefined), timeoutMs);
+    /** @param {any} frame */
+    const finish = (frame) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       socket.destroy();
-      resolveProbe(value);
+      resolveFrame(frame);
     };
     socket.once("connect", () => socket.write(encoder.encode({ version: 1, token })));
     socket.on("data", (chunk) => {
       try {
-        const frames = decoder.push(chunk);
-        if (frames.length === 0) return;
-        validateAuthentication(frames[0]);
-        finish(true);
-      } catch { finish(false); }
+        const [frame] = decoder.push(chunk);
+        if (frame !== undefined) finish(frame);
+      } catch { finish(undefined); }
     });
-    socket.once("error", () => finish(false));
-    socket.once("close", () => finish(false));
+    socket.once("error", () => finish(undefined));
+    socket.once("close", () => finish(undefined));
   });
 }
 
@@ -255,7 +258,10 @@ async function daemonAuthenticatesTokenAlone({ root, maxBytes = 1024 * 1024, tim
  */
 export async function describeAuthenticationRefusal(root, error, options = {}) {
   if (!AUTHENTICATION_REFUSAL_CODES.has(error?.code)) return error;
-  if (!await daemonAuthenticatesTokenAlone({ root, ...options })) return error;
+  /** @type {string} */
+  let token;
+  try { token = (await fs.readFile(join(root, "daemon", "control.token"), "utf8")).trim(); } catch { return error; }
+  try { validateAuthentication(await offerTokenAuthentication(join(root, "daemon", "control.sock"), token, options)); } catch { return error; }
   return Object.assign(
     new Error(`This daemon is from an earlier release and refused this client's protocol ${CLIENT_PROTOCOL} authentication. Run \`pi-agents daemon restart\` to restart it on this release; the restart stops no running session.`),
     { code: "DAEMON_FROM_EARLIER_RELEASE" },

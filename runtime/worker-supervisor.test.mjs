@@ -58,35 +58,74 @@ async function setup(sessionIds = ["one"], options = {}) {
   });
   const metadataPath = join(daemon, "workers.json");
   let current = options.inspect ?? inspect;
-  const router = new RecoveredWorkerRouter({ registry, inspect: (/** @type {number} */ pid) => current(pid), metadataPath, bindTimeoutMs: 1_000 });
+  const sockets = fakeWorkerSockets();
+  const router = new RecoveredWorkerRouter({ registry, inspect: (/** @type {number} */ pid) => current(pid), metadataPath, connect: sockets.connect });
   await router.load();
   return {
-    root, runs, registry, ownership, router, metadataPath,
+    root, runs, registry, ownership, router, metadataPath, sockets,
     /** The router must see the same process world the supervisor does. @param {(pid: number) => Promise<any>} next */
     useInspect(next) { current = next; },
     workers: async () => JSON.parse(await readFile(metadataPath, "utf8")).workers,
   };
 }
 
-/** One in-process stand-in for a worker's authenticated control-socket connection. @param {(message: any) => void} onDaemonMessage */
+/** One in-process stand-in for a worker's own socket, which the daemon connects to. @param {(message: any) => void} onDaemonMessage */
 function fakeConnection(onDaemonMessage) {
   /** @type {(value?: unknown) => void} */
   let resolveClosed = () => {};
   const closed = new Promise((resolve) => { resolveClosed = resolve; });
-  return {
+  /** @type {Set<(frame: any) => void>} */
+  const listeners = new Set();
+  /** Frames written before the daemon subscribed, which a real socket holds in its buffer. @type {any[]} */
+  const buffered = [];
+  const connection = {
     closed,
     close: () => resolveClosed(undefined),
     async send(/** @type {any} */ message) { onDaemonMessage(message); },
     async request() { throw new Error("Unexpected worker request in this fixture"); },
+    /** @param {(frame: any) => void} listener */
+    onMessage(listener) {
+      listeners.add(listener);
+      for (const frame of buffered.splice(0)) listener(frame);
+      return () => listeners.delete(listener);
+    },
+    /** One frame this worker writes to whatever daemon is connected. @param {any} frame */
+    emit(frame) {
+      if (listeners.size === 0) buffered.push(frame);
+      else for (const listener of [...listeners]) listener(frame);
+    },
+  };
+  return connection;
+}
+
+/**
+ * The worker sockets a router connects to. A path nothing listens on is retried until the launch's
+ * own deadline, which is what a worker still on its way to `listen` looks like.
+ */
+function fakeWorkerSockets() {
+  /** @type {Map<string, any>} */
+  const listening = new Map();
+  return {
+    listening,
+    /** @param {{ socketPath: string, timeoutMs: number }} options */
+    async connect({ socketPath, timeoutMs }) {
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const connection = listening.get(socketPath);
+        if (connection !== undefined) return connection;
+        if (Date.now() >= deadline) throw Object.assign(new Error(`Worker socket is unreachable: ${socketPath}`), { code: "WORKER_SOCKET_UNREACHABLE" });
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    },
   };
 }
 
 /**
- * A fake worker that connects to the router's startup reservation instead of an inherited channel.
+ * A fake worker that listens on the socket the launch named for it, as a real one does.
  *
- * @param {{ router?: any, order?: string[], helloOverrides?: Record<string, unknown>, readyOverrides?: Record<string, unknown>, holdReady?: boolean, holdHello?: boolean, activateSendError?: boolean, readyExitTiming?: "before" | "after", world?: any }} [configuration]
+ * @param {{ sockets?: any, order?: string[], helloOverrides?: Record<string, unknown>, readyOverrides?: Record<string, unknown>, holdReady?: boolean, holdHello?: boolean, activateSendError?: boolean, readyExitTiming?: "before" | "after", world?: any }} [configuration]
  */
-function fakeWorkerFactory({ router, order = [], helloOverrides = {}, readyOverrides = {}, holdReady = false, holdHello = false, activateSendError = false, readyExitTiming, world } = {}) {
+function fakeWorkerFactory({ sockets, order = [], helloOverrides = {}, readyOverrides = {}, holdReady = false, holdHello = false, activateSendError = false, readyExitTiming, world } = {}) {
   let nextPid = 9100;
   /** @type {any[]} */
   const children = [];
@@ -111,15 +150,11 @@ function fakeWorkerFactory({ router, order = [], helloOverrides = {}, readyOverr
     const runId = argv[argv.indexOf("--run-id") + 1];
     const leaseId = argv[argv.indexOf("--lease-id") + 1];
     const generation = Number(argv[argv.indexOf("--generation") + 1]);
+    const socketPath = argv[argv.indexOf("--worker-socket") + 1];
     const worker = () => ({ pid: child.pid, startIdentity: String(child.pid), processGroupId: child.pid });
     const piChild = () => ({ pid: piChildPid(child.pid), startIdentity: String(piChildPid(child.pid)), processGroupId: child.pid });
-    /** @type {Promise<any> | undefined} */
-    let reservation;
     /** @param {any} frame */
-    const toDaemon = async (frame) => {
-      const entry = await reservation;
-      entry?.deliver(frame);
-    };
+    const toDaemon = (frame) => connection.emit(frame);
     const connection = fakeConnection((/** @type {any} */ message) => {
       order.push(`parent:${message.type}`);
       if (message.type === "activate") {
@@ -143,19 +178,13 @@ function fakeWorkerFactory({ router, order = [], helloOverrides = {}, readyOverr
     child.connection = connection;
     calls.push({ command, argv, options, child });
     children.push(child);
-    if (!holdHello) {
-      queueMicrotask(() => {
-        reservation = router.beginLaunchConnection({ version: 1, type: "hello", token, sessionId, runId, leaseId, generation, worker: worker(), ...helloOverrides }, connection, () => {})
-          .catch((/** @type {any} */ error) => { helloFailures.push(error); connection.close(); return undefined; });
-      });
-    }
-    /** Connect this worker's startup socket by hand, after the launch already reserved it. @param {Record<string, unknown>} [overrides] */
-    child.connect = (overrides = {}) => {
-      reservation = router.beginLaunchConnection({ version: 1, type: "hello", token, sessionId, runId, leaseId, generation, worker: worker(), ...helloOverrides, ...overrides }, connection, () => {})
-        .catch((/** @type {any} */ error) => { helloFailures.push(error); connection.close(); return undefined; });
-      return reservation;
+    /** Start listening on the socket the launch named, answering the daemon's connect with hello. @param {Record<string, unknown>} [overrides] */
+    child.listen = (overrides = {}) => {
+      sockets.listening.set(socketPath, connection);
+      queueMicrotask(() => toDaemon({ version: 1, type: "hello", token, sessionId, runId, leaseId, generation, worker: worker(), ...helloOverrides, ...overrides }));
     };
-    child.reservation = () => reservation;
+    if (!holdHello) child.listen();
+    child.socketPath = socketPath;
     return child;
   };
   return { calls, children, spawnImpl, exitGroup, helloFailures };
@@ -227,7 +256,7 @@ async function waitUntil(predicate) {
 it("creates and binds the registry before activation and reports ready after authenticated hello", async () => {
   /** @type {string[]} */
   const order = [];
-  const { runs, registry, ownership, router } = await setup();
+  const { runs, registry, ownership, router, sockets } = await setup();
   const originalBind = ownership.bindProcesses.bind(ownership);
   ownership.bindProcesses = async (...args) => {
     order.push("bind-supervisor");
@@ -238,7 +267,7 @@ it("creates and binds the registry before activation and reports ready after aut
     order.push("bind-pi-child");
     return originalBindPiChild(...args);
   };
-  const workers = fakeWorkerFactory({ router, order });
+  const workers = fakeWorkerFactory({ sockets, order });
   const supervisor = new WorkerSupervisor({
     registry,
     router,
@@ -266,8 +295,8 @@ it("creates and binds the registry before activation and reports ready after aut
 });
 
 it("records the model Pi confirmed at readiness and leaves it absent when Pi named none", async () => {
-  const { runs, registry, ownership, router } = await setup(["one", "two"]);
-  const confirming = fakeWorkerFactory({ router, readyOverrides: { model: { provider: "openai-codex", id: "gpt-5.6-sol" } } });
+  const { runs, registry, ownership, router, sockets } = await setup(["one", "two"]);
+  const confirming = fakeWorkerFactory({ sockets, readyOverrides: { model: { provider: "openai-codex", id: "gpt-5.6-sol" } } });
   const confirmingSupervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, spawnImpl: confirming.spawnImpl, inspect, randomId: () => "confirmed-model-token" });
   await confirmingSupervisor.launch({
     sessionId: "one",
@@ -281,7 +310,7 @@ it("records the model Pi confirmed at readiness and leaves it absent when Pi nam
   expect(confirming.calls[0].argv).toEqual(expect.arrayContaining(["--model-provider", "anthropic", "--model-id", "requested"]));
   expect(await getRecord(registry, "one")).toMatchObject({ processState: "LIVE", model: { provider: "openai-codex", id: "gpt-5.6-sol" } });
 
-  const silent = fakeWorkerFactory({ router });
+  const silent = fakeWorkerFactory({ sockets });
   const silentSupervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, spawnImpl: silent.spawnImpl, inspect, randomId: () => "unconfirmed-model-token" });
   await silentSupervisor.launch({
     sessionId: "two",
@@ -298,58 +327,58 @@ it("records the model Pi confirmed at readiness and leaves it absent when Pi nam
 });
 
 it("authenticates and adopts the startup socket before activation, and persists the run token privately", async () => {
-  const { runs, registry, ownership, router, metadataPath, workers: persisted } = await setup();
-  const workers = fakeWorkerFactory({ router, holdHello: true });
+  const { runs, registry, ownership, router, sockets, metadataPath, workers: persisted } = await setup();
+  const workers = fakeWorkerFactory({ sockets, holdHello: true });
   const supervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "startup-socket-token", cliVersion: "9.9.9" });
   const launched = supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-startup" });
 
   await waitUntil(async () => workers.children.length === 1);
   // The run and its token are durable before the worker is spawned, so a replacement daemon can
   // authenticate the same run.
-  expect(await persisted()).toEqual([{ sessionId: "one", runId: "run-startup", leaseId: expect.any(String), generation: 1, token: "startup-socket-token", proto: 1, cliVersion: "9.9.9" }]);
+  expect(await persisted()).toEqual([{ sessionId: "one", runId: "run-startup", leaseId: expect.any(String), generation: 1, token: "startup-socket-token", socketPath: workers.children[0].socketPath, proto: 2, cliVersion: "9.9.9" }]);
   expect((await stat(metadataPath)).mode & 0o777).toBe(0o600);
   expect(workers.calls[0].options.stdio).toEqual(["ignore", expect.any(Number), expect.any(Number)]);
   expect(workers.calls[0].options.env.NODE_CHANNEL_FD).toBeUndefined();
 
-  await workers.children[0].connect();
+  workers.children[0].listen();
   const handle = await launched;
   const adopted = router.route("one");
   expect(adopted).toMatchObject({ metadata: { sessionId: "one", token: "startup-socket-token" }, connection: workers.children[0].connection });
   expect(adopted.routeGeneration).toBeGreaterThan(0);
-  expect(await persisted()).toEqual([{ sessionId: "one", runId: "run-startup", leaseId: handle.leaseId, generation: 1, identity: handle.identity, piChildIdentity: handle.piChildIdentity, token: "startup-socket-token", proto: 1, cliVersion: "9.9.9", routeGeneration: adopted.routeGeneration }]);
+  expect(await persisted()).toEqual([{ sessionId: "one", runId: "run-startup", leaseId: handle.leaseId, generation: 1, identity: handle.identity, piChildIdentity: handle.piChildIdentity, token: "startup-socket-token", socketPath: workers.children[0].socketPath, proto: 2, cliVersion: "9.9.9", routeGeneration: adopted.routeGeneration }]);
   await supervisor.close();
 });
 
-it("holds an early startup socket until the spawned PID is registered", async () => {
-  const { runs, registry, ownership, router } = await setup();
-  const workers = fakeWorkerFactory({ router, holdHello: true });
-  // Publish the spawned PID by hand so the worker's hello provably arrives before the daemon knows it.
-  const reserve = router.reserve.bind(router);
-  /** @type {() => void} */
-  let publishPid = () => {};
-  router.reserve = async (/** @type {any} */ launch) => {
-    const reservation = await reserve(launch);
-    const spawned = reservation.spawned.bind(reservation);
-    reservation.spawned = (/** @type {number} */ pid) => { publishPid = () => spawned(pid); };
-    return reservation;
-  };
-  const supervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "early-hello-token" });
+// A spawned worker takes a moment to reach listen, so the daemon's connect retries rather than
+// refusing. Past the launch's own deadline it stops, and the launch fails by name.
+it("retries the connect until the spawned worker listens, and gives up at the launch deadline", async () => {
+  const { runs, registry, ownership, router, sockets } = await setup(["one", "two"]);
+  const workers = fakeWorkerFactory({ sockets, holdHello: true });
+  const supervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "late-listen-token", startTimeoutMs: 2_000 });
 
-  const launched = supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-early" });
+  const launched = supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-late" });
   await waitUntil(async () => workers.children.length === 1);
-  let held = true;
-  const bound = workers.children[0].connect().then((/** @type {any} */ value) => { held = false; return value; });
+  let settled = false;
+  void launched.then(() => { settled = true; }, () => { settled = true; });
   await new Promise((resolve) => setTimeout(resolve, 20));
-  expect(held).toBe(true);
-  publishPid();
-  await expect(bound).resolves.toBeDefined();
+  expect(settled).toBe(false);
+  workers.children[0].listen();
   await expect(launched).resolves.toMatchObject({ sessionId: "one", ready: true });
+
+  const silent = fakeWorkerFactory({ sockets, holdHello: true });
+  const impatient = new WorkerSupervisor({
+    registry, router, ownership, runsDirectory: runs, spawnImpl: silent.spawnImpl, inspect,
+    randomId: () => "never-listens-token", startTimeoutMs: 60, ...fastLaunchStop,
+  });
+  await expect(impatient.launch({ sessionId: "two", canonicalSessionFile: (await getRecord(registry, "two")).canonicalSessionFile, cwd: "/repo", runId: "run-silent" }))
+    .rejects.toMatchObject({ code: "WORKER_SOCKET_UNREACHABLE" });
+  expect(router.route("two")).toBeUndefined();
   await supervisor.close();
 });
 
-it("rejects a startup socket without the per-run token", async () => {
-  const { runs, registry, ownership, router } = await setup();
-  const workers = fakeWorkerFactory({ router, holdHello: true, helloOverrides: { token: "not-the-run-token" } });
+it("rejects a worker socket that answers without the per-run token", async () => {
+  const { runs, registry, ownership, router, sockets } = await setup();
+  const workers = fakeWorkerFactory({ sockets, holdHello: true, helloOverrides: { token: "not-the-run-token" } });
   const supervisor = new WorkerSupervisor({
     registry, router, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect,
     randomId: () => "expected-run-token", startTimeoutMs: 60, ...fastLaunchStop,
@@ -357,28 +386,28 @@ it("rejects a startup socket without the per-run token", async () => {
 
   const launched = supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-forged" });
   await waitUntil(async () => workers.children.length === 1);
-  await expect(workers.children[0].connect()).resolves.toBeUndefined();
-  expect(workers.helloFailures).toEqual([expect.objectContaining({ code: "WORKER_AUTHENTICATION_FAILED" })]);
-  await expect(launched).rejects.toMatchObject({ code: "WORKER_START_TIMEOUT" });
+  workers.children[0].listen();
+  await expect(launched).rejects.toMatchObject({ code: "WORKER_HELLO_MISMATCH" });
   expect(router.route("one")).toBeUndefined();
   expect((await getRecord(registry, "one")).ownership).toBeUndefined();
 });
 
 it("holds pre-adoption worker frames on the reservation and hands them over in arrival order", async () => {
-  const { runs, registry, ownership, router } = await setup();
-  const workers = fakeWorkerFactory({ router, holdReady: true });
+  const { runs, registry, ownership, router, sockets } = await setup();
+  const workers = fakeWorkerFactory({ sockets, holdReady: true });
   const supervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, inspect, randomId: () => "buffered-frames-token", startTimeoutMs: 200, ...fastLaunchStop });
   const launched = supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-buffered" });
 
-  await waitUntil(async () => (await workers.children[0]?.reservation())?.connection !== undefined);
-  const reservation = await workers.children[0].reservation();
-  for (const sequence of [1, 2, 3]) reservation.deliver({ version: 1, type: "pi_frame", token: "buffered-frames-token", sessionId: "one", frame: { sequence } });
+  await waitUntil(async () => router.reservationFor("buffered-frames-token")?.connection !== undefined);
+  const reservation = /** @type {any} */ (router.reservationFor("buffered-frames-token"));
+  for (const sequence of [1, 2, 3]) workers.children[0].connection.emit({ version: 1, type: "pi_frame", token: "buffered-frames-token", sessionId: "one", frame: { sequence } });
+  await waitUntil(async () => reservation.buffered.length === 3);
   expect(reservation.drainBuffered().map((/** @type {any} */ frame) => frame.frame.sequence)).toEqual([1, 2, 3]);
   await expect(launched).rejects.toMatchObject({ code: "WORKER_START_TIMEOUT" });
 });
 
 it("classifies missing Pi discovery as a pre-child refusal", async () => {
-  const { runs, registry, ownership, router } = await setup();
+  const { runs, registry, ownership, router, sockets } = await setup();
   const supervisor = new WorkerSupervisor({
     registry,
     router,
@@ -393,8 +422,8 @@ it("classifies missing Pi discovery as a pre-child refusal", async () => {
 });
 
 it("refuses a startup socket whose claimed identity is not the spawned process-group leader", async () => {
-  const { runs, registry, ownership, router } = await setup(["one", "two"]);
-  const badIdentity = fakeWorkerFactory({ router, helloOverrides: {
+  const { runs, registry, ownership, router, sockets } = await setup(["one", "two"]);
+  const badIdentity = fakeWorkerFactory({ sockets, helloOverrides: {
     worker: { pid: 777, startIdentity: "forged", processGroupId: 777 },
   } });
   const identitySupervisor = new WorkerSupervisor({
@@ -414,7 +443,7 @@ it("refuses a startup socket whose claimed identity is not the spawned process-g
     runId: "run-identity",
   })).rejects.toMatchObject({ code: "WORKER_IDENTITY_MISMATCH" });
 
-  const badRun = fakeWorkerFactory({ router, helloOverrides: { runId: "another-run" } });
+  const badRun = fakeWorkerFactory({ sockets, helloOverrides: { runId: "another-run" } });
   const runSupervisor = new WorkerSupervisor({
     registry,
     router,
@@ -438,8 +467,8 @@ it("refuses a startup socket whose claimed identity is not the spawned process-g
 });
 
 it("atomically enforces the live-worker cap across concurrent different-session launches", async () => {
-  const { runs, registry, ownership, router } = await setup(["one", "two"]);
-  const workers = fakeWorkerFactory({ router, holdReady: true });
+  const { runs, registry, ownership, router, sockets } = await setup(["one", "two"]);
+  const workers = fakeWorkerFactory({ sockets, holdReady: true });
   const supervisor = new WorkerSupervisor({
     registry,
     router,
@@ -463,7 +492,7 @@ it("atomically enforces the live-worker cap across concurrent different-session 
 });
 
 it("releases pending ownership after spawn failure", async () => {
-  const { runs, registry, ownership, router } = await setup();
+  const { runs, registry, ownership, router, sockets } = await setup();
   const supervisor = new WorkerSupervisor({
     registry,
     router,
@@ -490,10 +519,10 @@ it.each([
   ["activation send", { activateSendError: true }],
   ["readiness authentication", { readyOverrides: { token: "wrong" } }],
 ])("stops and releases durable ownership after %s failure", async (_boundary, workerOptions) => {
-  const { runs, registry, ownership, router, useInspect } = await setup();
+  const { runs, registry, ownership, router, sockets, useInspect } = await setup();
   const world = processWorld();
   useInspect(world.seams.inspect);
-  const workers = fakeWorkerFactory({ router, ...workerOptions, world });
+  const workers = fakeWorkerFactory({ sockets, ...workerOptions, world });
   const supervisor = new WorkerSupervisor({
     registry,
     router,
@@ -516,8 +545,8 @@ it.each([
 });
 
 it("releases ownership and cap capacity when a ready worker and its Pi child both exit", async () => {
-  const { runs, registry, ownership, router, useInspect } = await setup(["one", "two"]);
-  const workers = fakeWorkerFactory({ router });
+  const { runs, registry, ownership, router, sockets, useInspect } = await setup(["one", "two"]);
+  const workers = fakeWorkerFactory({ sockets });
   const world = processWorld();
   useInspect(world.seams.inspect);
   const supervisor = new WorkerSupervisor({
@@ -540,8 +569,8 @@ it("releases ownership and cap capacity when a ready worker and its Pi child bot
 });
 
 it("retains ownership and refuses a second writer while the orphaned Pi child stays exact and live", async () => {
-  const { runs, registry, ownership, router, useInspect } = await setup();
-  const workers = fakeWorkerFactory({ router });
+  const { runs, registry, ownership, router, sockets, useInspect } = await setup();
+  const workers = fakeWorkerFactory({ sockets });
   const world = processWorld({ signalKills: false });
   useInspect(world.seams.inspect);
   const supervisor = new WorkerSupervisor({
@@ -573,8 +602,8 @@ it("retains ownership and refuses a second writer while the orphaned Pi child st
 });
 
 it("releases ownership once the orphaned Pi child is provably gone", async () => {
-  const { runs, registry, ownership, router, useInspect } = await setup();
-  const workers = fakeWorkerFactory({ router });
+  const { runs, registry, ownership, router, sockets, useInspect } = await setup();
+  const workers = fakeWorkerFactory({ sockets });
   const world = processWorld({ signalKills: false });
   useInspect(world.seams.inspect);
   const supervisor = new WorkerSupervisor({
@@ -601,8 +630,8 @@ it.each([
   ["ambiguous", (/** @type {any} */ world, /** @type {number} */ pid) => world.hide(pid)],
   ["a recycled process id", (/** @type {any} */ world, /** @type {number} */ pid) => world.recycle(pid, "recycled")],
 ])("retains ownership and signals nothing when the recorded Pi child inspection is %s", async (_name, confuse) => {
-  const { runs, registry, ownership, router, useInspect } = await setup();
-  const workers = fakeWorkerFactory({ router });
+  const { runs, registry, ownership, router, sockets, useInspect } = await setup();
+  const workers = fakeWorkerFactory({ sockets });
   const world = processWorld();
   useInspect(world.seams.inspect);
   const supervisor = new WorkerSupervisor({
@@ -627,10 +656,10 @@ it.each([
 });
 
 it("reconciles an exit observed before readiness persistence without restoring LIVE", async () => {
-  const { runs, registry, ownership, router, useInspect } = await setup();
+  const { runs, registry, ownership, router, sockets, useInspect } = await setup();
   const world = processWorld();
   useInspect(world.seams.inspect);
-  const workers = fakeWorkerFactory({ router, readyExitTiming: "before", world });
+  const workers = fakeWorkerFactory({ sockets, readyExitTiming: "before", world });
   const supervisor = new WorkerSupervisor({
     registry,
     router,
@@ -647,10 +676,10 @@ it("reconciles an exit observed before readiness persistence without restoring L
 });
 
 it("retries failed terminal release during admission and admits the next session", async () => {
-  const { runs, registry, ownership, router, useInspect } = await setup(["one", "two"]);
+  const { runs, registry, ownership, router, sockets, useInspect } = await setup(["one", "two"]);
   const world = processWorld();
   useInspect(world.seams.inspect);
-  const workers = fakeWorkerFactory({ router, world });
+  const workers = fakeWorkerFactory({ sockets, world });
   const originalRelease = ownership.release.bind(ownership);
   let releases = 0;
   ownership.release = async (...args) => {
@@ -669,20 +698,20 @@ it("retries failed terminal release during admission and admits the next session
 });
 
 it("does not charge an ownership-free stale LIVE record against managed capacity", async () => {
-  const { runs, registry, ownership, router } = await setup(["one", "two"]);
+  const { runs, registry, ownership, router, sockets } = await setup(["one", "two"]);
   const one = await getRecord(registry, "one");
   await registry.update("one", one.revision, { processState: "LIVE", updatedAt: "2026-08-25T12:03:00.000Z" });
-  const workers = fakeWorkerFactory({ router });
+  const workers = fakeWorkerFactory({ sockets });
   const supervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, maxLive: 1, spawnImpl: workers.spawnImpl, inspect, randomId: () => "stale-live-cap-token" });
 
   await expect(supervisor.launch({ sessionId: "two", canonicalSessionFile: (await getRecord(registry, "two")).canonicalSessionFile, cwd: "/repo", runId: "stale-live-cap" })).resolves.toMatchObject({ sessionId: "two" });
 });
 
 it("routes stop through verified Task 6 identity and releases only after observed exit", async () => {
-  const { runs, registry, ownership, router, useInspect } = await setup();
+  const { runs, registry, ownership, router, sockets, useInspect } = await setup();
   const world = processWorld();
   useInspect(world.seams.inspect);
-  const workers = fakeWorkerFactory({ router, world });
+  const workers = fakeWorkerFactory({ sockets, world });
   const supervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, randomId: () => "stop-token", ...world.seams });
   const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-stop" });
   let inspections = 0;
@@ -706,10 +735,10 @@ it("routes stop through verified Task 6 identity and releases only after observe
 });
 
 it("releases stale exact identity without signaling a replacement process", async () => {
-  const { runs, registry, ownership, router, useInspect } = await setup();
+  const { runs, registry, ownership, router, sockets, useInspect } = await setup();
   const world = processWorld();
   useInspect(world.seams.inspect);
-  const workers = fakeWorkerFactory({ router, world });
+  const workers = fakeWorkerFactory({ sockets, world });
   const supervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, randomId: () => "stale-token", ...world.seams });
   const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-stale" });
   const requestGraceful = vi.fn();

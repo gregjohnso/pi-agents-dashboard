@@ -7,12 +7,11 @@ import { afterEach, expect, it } from "vitest";
 import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
 import { RecoveredWorkerRouter } from "../runtime/reconciliation.mjs";
 import { RegistryStore } from "../runtime/registry-store.mjs";
-import { createWorkerControlSocket } from "../runtime/test-fixtures.mjs";
+import { createWorkerControlClient } from "../runtime/test-fixtures.mjs";
 import { WorkerSupervisor } from "../runtime/worker-supervisor.mjs";
 import { createRealProcessHarness } from "./real-process-harness.mjs";
 
 const FIXTURE = fileURLToPath(new URL("./fixtures/fake-pi.mjs", import.meta.url));
-const CONNECTOR = fileURLToPath(new URL("../runtime/daemon-connector.mjs", import.meta.url));
 const harness = createRealProcessHarness("mixed-pi-versions");
 /** @type {any[]} */
 const controlSockets = [];
@@ -43,17 +42,16 @@ it("keeps version A live after the configured executable is atomically replaced 
     const sessionFile = join(root, `${id}.jsonl`);
     await registry.create({ schemaVersion: 1, revision: 0, sessionId: id, sessionFile, canonicalSessionFile: sessionFile, cwd: root, taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "saved_session", summary: "Saved", updatedAt: now }, createdAt: now, updatedAt: now });
   }
-  const router = new RecoveredWorkerRouter({ registry, inspect: inspectProcessIdentity, metadataPath: join(root, "daemon", "workers.json") });
-  await router.load();
-  const control = await createWorkerControlSocket({ root, router, registry });
+  const control = createWorkerControlClient({ registry });
   controlSockets.push(control);
-  const launchSeams = { daemonConnector: CONNECTOR, daemonConnectConfig: control.connectConfig };
+  const router = new RecoveredWorkerRouter({ registry, inspect: inspectProcessIdentity, metadataPath: join(root, "daemon", "workers.json"), ...control.routerSeams });
+  await router.load();
   const supervisor = new WorkerSupervisor({ registry, router, runsDirectory: runs, configuredPiPath: executable, env: { ...process.env, FAKE_PI_EXIT_MS: "900" }, startTimeoutMs: 2_000 });
-  const first = await launch(supervisor, { sessionId: "a", canonicalSessionFile: join(root, "a.jsonl"), cwd: root, runId: "run-a", ...launchSeams });
+  const first = await launch(supervisor, { sessionId: "a", canonicalSessionFile: join(root, "a.jsonl"), cwd: root, runId: "run-a" });
   await writeFile(replacement, fixture.replace('"1.0.0"', '"0.84.2"'), { mode: 0o700 });
   await chmod(replacement, 0o700);
   await rename(replacement, executable);
-  const second = await launch(supervisor, { sessionId: "b", canonicalSessionFile: join(root, "b.jsonl"), cwd: root, runId: "run-b", ...launchSeams });
+  const second = await launch(supervisor, { sessionId: "b", canonicalSessionFile: join(root, "b.jsonl"), cwd: root, runId: "run-b" });
 
   expect(first.piChildIdentity.pid).not.toBe(second.piChildIdentity.pid);
   const firstRecord = await registry.get("a");

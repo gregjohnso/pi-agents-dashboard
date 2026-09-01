@@ -307,7 +307,7 @@ export class WorkerSupervisor {
 
   /**
    * Launch one session worker. Same-session launches serialize; different sessions overlap after admission.
-   * @param {{ sessionId: string, canonicalSessionFile: string, cwd: string, runId: string, sessionRecord?: import("../shared/contracts.mjs").SessionRecord, model?: { provider: string, id: string }, name?: string, piPath?: string, daemonConnector?: string, daemonConnectConfig?: Record<string, unknown>, reconnectDelaysMs?: number[] }} request
+   * @param {{ sessionId: string, canonicalSessionFile: string, cwd: string, runId: string, sessionRecord?: import("../shared/contracts.mjs").SessionRecord, model?: { provider: string, id: string }, name?: string, piPath?: string }} request
    */
   launch(request) {
     if (typeof request?.sessionId !== "string" || request.sessionId.length === 0) return Promise.reject(new TypeError("sessionId is required"));
@@ -321,8 +321,8 @@ export class WorkerSupervisor {
     });
   }
 
-  /** @param {{ sessionId: string, canonicalSessionFile: string, cwd: string, runId: string, runHash?: string, sessionRecord?: import("../shared/contracts.mjs").SessionRecord, model?: { provider: string, id: string }, name?: string, piPath?: string, daemonConnector?: string, daemonConnectConfig?: Record<string, unknown>, reconnectDelaysMs?: number[] }} request */
-  async #launch({ sessionId, canonicalSessionFile, cwd, runId, runHash, sessionRecord, model, name, piPath, daemonConnector, daemonConnectConfig = {}, reconnectDelaysMs = [100, 250, 500, 1_000, 2_000] }) {
+  /** @param {{ sessionId: string, canonicalSessionFile: string, cwd: string, runId: string, runHash?: string, sessionRecord?: import("../shared/contracts.mjs").SessionRecord, model?: { provider: string, id: string }, name?: string, piPath?: string }} request */
+  async #launch({ sessionId, canonicalSessionFile, cwd, runId, runHash, sessionRecord, model, name, piPath }) {
     if ([canonicalSessionFile, cwd, runId].some((value) => typeof value !== "string" || value.length === 0)) throw new TypeError("Worker launch fields must be non-empty strings");
     let record = await this.#registry.get(sessionId);
     if (record === undefined) {
@@ -390,20 +390,13 @@ export class WorkerSupervisor {
       ];
       if (model !== undefined) argv.push("--model-provider", model.provider, "--model-id", model.id);
       if (name !== undefined) argv.push("--name", name);
-      if (daemonConnector !== undefined) {
-        if (typeof daemonConnector !== "string" || daemonConnector.length === 0) throw new TypeError("daemonConnector must be a non-empty string");
-        if (typeof daemonConnectConfig !== "object" || daemonConnectConfig === null || Array.isArray(daemonConnectConfig)) throw new TypeError("daemonConnectConfig must be an object");
-        if (!Array.isArray(reconnectDelaysMs) || reconnectDelaysMs.length === 0 || reconnectDelaysMs.some((delay) => !Number.isSafeInteger(delay) || delay <= 0)) throw new TypeError("reconnectDelaysMs must contain positive integers");
-        argv.push(
-          "--daemon-connector", daemonConnector,
-          "--daemon-connect-config", JSON.stringify(daemonConnectConfig),
-          "--reconnect-delays-ms", JSON.stringify(reconnectDelaysMs),
-        );
-      }
       if (!this.#injectedSpawn) await this.#assertExecutable(executable);
-      // The reservation exists before spawn, so a worker that reaches the control socket before
-      // `spawn` returns waits on its token instead of being refused.
+      // The reservation names this run's socket and records it before anything is spawned, so the
+      // worker knows where to listen and a replacement daemon knows where to connect.
       reservation = await this.#router.reserve({ sessionId, runId, leaseId: lease.leaseId, generation: lease.generation, token, ...(this.#cliVersion === undefined ? {} : { cliVersion: this.#cliVersion }) });
+      // The same bound on both sides of the boundary: past it the daemon stops connecting and the
+      // worker stops listening, so neither waits on the other forever.
+      argv.push("--worker-socket", reservation.socketPath, "--startup-deadline-ms", String(this.#startTimeoutMs), "--max-frame-bytes", String(reservation.maxBytes));
       child = this.#spawn(process.execPath, argv, {
         cwd,
         env: { ...this.#env, PI_AGENTS_WORKER_TOKEN: token },
@@ -411,7 +404,6 @@ export class WorkerSupervisor {
         shell: false,
         stdio: ["ignore", stdoutHandle.fd, stderrHandle.fd],
       });
-      reservation.spawned(child.pid);
       supervision = { child, token, sessionId, lease, reservation, exit: undefined, identity: undefined, handle: undefined, route: undefined, lifecycle: "launching", activated: false, piChildStopped: false };
       const exit = observeExit(child, () => {
         if (supervision.lifecycle === "reconciled") return;
@@ -426,7 +418,7 @@ export class WorkerSupervisor {
 
       const childPid = child.pid;
       if (!Number.isSafeInteger(childPid) || /** @type {number} */ (childPid) <= 0) throw new WorkerSupervisorError("WORKER_IDENTITY_MISMATCH", "Spawned worker did not expose a valid PID");
-      const inspected = await untilWorkerExits(child, reservation.connected(this.#startTimeoutMs), "its startup connection");
+      const inspected = await untilWorkerExits(child, reservation.connected(/** @type {number} */ (childPid), this.#startTimeoutMs), "its startup connection");
       supervision.identity = inspected;
 
       await this.#ownership.bindProcesses(sessionId, lease.leaseId, lease.generation, inspected, inspected, directoryName);

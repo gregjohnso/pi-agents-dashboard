@@ -23,8 +23,8 @@ afterEach(async () => {
 /** The fake worker group: a supervisor at `pid` leads the group, and its Pi child is `pid + 100`. */
 const inspect = async (/** @type {number} */ pid) => ({ pid, startIdentity: String(pid), processGroupId: pid >= 9200 ? pid - 100 : pid });
 
-/** Spawn a worker that completes the startup-socket handshakes without a process. @param {any} router */
-function fakeWorkerSpawn(router) {
+/** Spawn a worker that listens on the socket the launch named and completes its handshakes. @param {any} sockets */
+function fakeWorkerSpawn(sockets) {
   let nextPid = 9100;
   return (/** @type {string} */ _command, /** @type {string[]} */ argv, /** @type {any} */ options) => {
     const child = /** @type {any} */ (new EventEmitter());
@@ -37,22 +37,34 @@ function fakeWorkerSpawn(router) {
     });
     const argument = (/** @type {string} */ flag) => argv[argv.indexOf(flag) + 1];
     const handshake = { sessionId: argument("--session-id"), runId: argument("--run-id"), leaseId: argument("--lease-id"), generation: Number(argument("--generation")) };
-    /** @type {Promise<any>} */
-    let reservation;
+    /** @type {Set<(frame: any) => void>} */
+    const listeners = new Set();
+    /** @type {any[]} */
+    const buffered = [];
     /** @param {any} frame */
-    const toDaemon = async (frame) => (await reservation)?.deliver(frame);
+    const toDaemon = (frame) => {
+      if (listeners.size === 0) buffered.push(frame);
+      else for (const listener of [...listeners]) listener(frame);
+    };
     /** @type {(value?: unknown) => void} */
     let resolveClosed = () => {};
     const connection = {
       closed: new Promise((resolve) => { resolveClosed = resolve; }),
       close: () => resolveClosed(undefined),
       async send(/** @type {any} */ message) {
-        if (message.type === "activate") queueMicrotask(() => void toDaemon({ version: 1, type: "pi_child", token, ...handshake, ...identity() }));
-        if (message.type === "child_bound") queueMicrotask(() => void toDaemon({ version: 1, type: "worker_ready", token, ...handshake, ...identity() }));
+        if (message.type === "activate") queueMicrotask(() => toDaemon({ version: 1, type: "pi_child", token, ...handshake, ...identity() }));
+        if (message.type === "child_bound") queueMicrotask(() => toDaemon({ version: 1, type: "worker_ready", token, ...handshake, ...identity() }));
       },
       async request() { throw new Error("Unexpected worker request"); },
+      /** @param {(frame: any) => void} listener */
+      onMessage(listener) {
+        listeners.add(listener);
+        for (const frame of buffered.splice(0)) listener(frame);
+        return () => listeners.delete(listener);
+      },
     };
-    queueMicrotask(() => { reservation = router.beginLaunchConnection({ version: 1, type: "hello", token, ...handshake, worker: identity().worker }, connection, () => {}); });
+    sockets.listening.set(argument("--worker-socket"), connection);
+    queueMicrotask(() => toDaemon({ version: 1, type: "hello", token, ...handshake, worker: identity().worker }));
     return child;
   };
 }
@@ -73,14 +85,17 @@ async function setup() {
     activity: { kind: "saved_session", summary: "Saved", updatedAt: now }, createdAt: now, updatedAt: now,
   });
   await mkdir(join(root, "daemon"), { mode: 0o700 });
-  const router = new RecoveredWorkerRouter({ registry, inspect, metadataPath: join(root, "daemon", "workers.json") });
+  /** Worker sockets, keyed by the path the launch named for each run. @type {Map<string, any>} */
+  const listening = new Map();
+  const sockets = { listening, connect: async (/** @type {any} */ { socketPath }) => listening.get(socketPath) ?? Promise.reject(Object.assign(new Error("unreachable"), { code: "WORKER_SOCKET_UNREACHABLE" })) };
+  const router = new RecoveredWorkerRouter({ registry, inspect, metadataPath: join(root, "daemon", "workers.json"), connect: sockets.connect });
   await router.load();
   const supervisor = new WorkerSupervisor({
     registry,
     router,
     ownership: new OwnershipManager(registry, { randomId: () => "lease-one" }),
     runsDirectory: runs,
-    spawnImpl: fakeWorkerSpawn(router),
+    spawnImpl: fakeWorkerSpawn(sockets),
     inspect,
     randomId: () => "trace-token",
   });

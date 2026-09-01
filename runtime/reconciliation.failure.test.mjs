@@ -5,6 +5,7 @@ import { afterEach, expect, it } from "vitest";
 
 import { RegistryStore } from "./registry-store.mjs";
 import { RecoveredWorkerRouter, reconcileRuntime } from "./reconciliation.mjs";
+import { createFakeWorkerSockets } from "./test-fixtures.mjs";
 
 /** @type {string[]} */
 const roots = [];
@@ -54,7 +55,7 @@ it("starts over a torn command journal and list history without reading or rewri
   await writeFile(eventPath, retired, { mode: 0o600 });
 
   const gone = async () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); };
-  const recovered = await reconcileRuntime({ root, daemonEpoch: "epoch", inspect: gone, waitForReconnect: async () => [] });
+  const recovered = await reconcileRuntime({ root, daemonEpoch: "epoch", inspect: gone });
   expect(/** @type {any} */ (recovered).journal).toBeUndefined();
   await recovered.close();
   const secondRecovery = await reconcileRuntime({ root, daemonEpoch: "epoch", inspect: gone });
@@ -105,18 +106,19 @@ it("retains exact ownership conflicts fail-closed for live matches, dead workers
   await registry.create(record("alive", alive));
   await registry.create(record("reused", reused));
   await registry.create(record("dead", dead));
-  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "alive", runId: "run-alive", leaseId: "lease-alive", generation: 1, identity: alive, piChildIdentity: alive }] })}\n`, { mode: 0o600 });
+  const aliveSocket = join(root, "daemon", "workers", "alive.sock");
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "alive", runId: "run-alive", leaseId: "lease-alive", generation: 1, identity: alive, piChildIdentity: alive, token: "alive-token", socketPath: aliveSocket, proto: 2 }] })}\n`, { mode: 0o600 });
+  const inspect = async (/** @type {number} */ pid) => {
+    if (pid === 101) return alive;
+    if (pid === 102) return { ...reused, startIdentity: "new" };
+    throw Object.assign(new Error("gone"), { code: "ENOENT" });
+  };
+  const sockets = createFakeWorkerSockets();
+  sockets.answer(aliveSocket, [{ version: 1, type: "worker_ready", token: "alive-token", sessionId: "alive", runId: "run-alive", leaseId: "lease-alive", generation: 1, worker: alive, piChild: alive }]);
+  const router = new RecoveredWorkerRouter({ registry, inspect, metadataPath: join(root, "daemon", "workers.json"), connect: sockets.connect });
+  await router.load();
 
-  const recovered = await reconcileRuntime({
-    root,
-    daemonEpoch: "epoch",
-    inspect: async (pid) => {
-      if (pid === 101) return alive;
-      if (pid === 102) return { ...reused, startIdentity: "new" };
-      throw Object.assign(new Error("gone"), { code: "ENOENT" });
-    },
-    waitForReconnect: async (workers) => workers.filter((worker) => worker.sessionId === "alive").map((worker) => worker.sessionId),
-  });
+  const recovered = await reconcileRuntime({ root, daemonEpoch: "epoch", inspect, router });
 
   expect(recovered.liveWorkers.map(({ sessionId }) => sessionId)).toEqual(["alive"]);
   expect(recovered.conflicts.map(({ sessionId, reason }) => [sessionId, reason])).toEqual([
@@ -190,17 +192,17 @@ it.each([
   await recovered.close();
 });
 
-/** @param {string} root */
-function launchRouter(root, inspect = async (/** @type {number} */ pid) => ({ pid, startIdentity: String(pid), processGroupId: pid })) {
+/** @param {string} root @param {any} [sockets] */
+function launchRouter(root, sockets, inspect = async (/** @type {number} */ pid) => ({ pid, startIdentity: String(pid), processGroupId: pid })) {
   const registry = new RegistryStore(join(root, "sessions"));
-  return { registry, router: new RecoveredWorkerRouter({ registry, inspect, metadataPath: join(root, "daemon", "workers.json"), bindTimeoutMs: 200 }) };
+  return { registry, router: new RecoveredWorkerRouter({ registry, inspect, metadataPath: join(root, "daemon", "workers.json"), ...(sockets === undefined ? {} : { connect: sockets.connect }) }) };
 }
 
 function fakeConnection() {
   /** @type {(value?: unknown) => void} */
   let resolveClosed = () => {};
   const closed = new Promise((resolve) => { resolveClosed = resolve; });
-  return { closed, close: () => resolveClosed(undefined), async send() {}, async request() { return undefined; } };
+  return { closed, close: () => resolveClosed(undefined), async send() {}, async request() { return undefined; }, onMessage() { return () => {}; } };
 }
 
 it.each([
@@ -208,31 +210,32 @@ it.each([
   ["lease", { leaseId: "other-lease" }, "WORKER_HELLO_MISMATCH"],
   ["generation", { generation: 9 }, "WORKER_HELLO_MISMATCH"],
   ["session", { sessionId: "other-session" }, "WORKER_HELLO_MISMATCH"],
+  ["token", { token: "forged-token" }, "WORKER_HELLO_MISMATCH"],
   ["worker PID", { worker: { pid: 9, startIdentity: "9", processGroupId: 9 } }, "WORKER_IDENTITY_MISMATCH"],
   ["process-start identity", { worker: { pid: 401, startIdentity: "recycled", processGroupId: 401 } }, "WORKER_IDENTITY_MISMATCH"],
   ["process group", { worker: { pid: 401, startIdentity: "401", processGroupId: 77 } }, "WORKER_IDENTITY_MISMATCH"],
-])("refuses a startup socket whose %s does not match the reserved launch", async (_name, overrides, code) => {
+])("refuses a worker socket whose %s does not match the reserved launch", async (_name, overrides, code) => {
   const root = await fixture();
-  const { router } = launchRouter(root);
+  const sockets = createFakeWorkerSockets();
+  const { router } = launchRouter(root, sockets);
   await router.load();
   const reservation = await router.reserve({ sessionId: "reserved", runId: "run-reserved", leaseId: "lease-reserved", generation: 1, token: "reserved-token" });
-  reservation.spawned(401);
-  const hello = { version: 1, type: "hello", token: "reserved-token", sessionId: "reserved", runId: "run-reserved", leaseId: "lease-reserved", generation: 1, worker: { pid: 401, startIdentity: "401", processGroupId: 401 }, ...overrides };
+  sockets.answer(reservation.socketPath, [{ version: 1, type: "hello", token: "reserved-token", sessionId: "reserved", runId: "run-reserved", leaseId: "lease-reserved", generation: 1, worker: { pid: 401, startIdentity: "401", processGroupId: 401 }, ...overrides }]);
 
-  await expect(router.beginLaunchConnection(hello, fakeConnection(), () => {})).rejects.toMatchObject({ code });
-  await expect(reservation.connected(50)).rejects.toMatchObject({ code });
+  await expect(reservation.connected(401, 200)).rejects.toMatchObject({ code });
   await router.close();
 });
 
-it("refuses a startup socket carrying a token no launch reserved", async () => {
+// The daemon connects, so a socket nothing is listening on is the whole refusal: there is no
+// connection for a forged token to arrive on.
+it("refuses a launch whose worker never listened on the socket the daemon named", async () => {
   const root = await fixture();
-  const { router } = launchRouter(root);
+  const sockets = createFakeWorkerSockets();
+  const { router } = launchRouter(root, sockets);
   await router.load();
   const reservation = await router.reserve({ sessionId: "reserved", runId: "run-reserved", leaseId: "lease-reserved", generation: 1, token: "reserved-token" });
-  reservation.spawned(401);
 
-  await expect(router.beginLaunchConnection({ version: 1, type: "hello", token: "forged-token", sessionId: "reserved", runId: "run-reserved", leaseId: "lease-reserved", generation: 1, worker: { pid: 401, startIdentity: "401", processGroupId: 401 } }, fakeConnection(), () => {}))
-    .rejects.toMatchObject({ code: "WORKER_AUTHENTICATION_FAILED" });
+  await expect(reservation.connected(401, 50)).rejects.toMatchObject({ code: "WORKER_SOCKET_UNREACHABLE" });
   await router.close();
 });
 
@@ -243,14 +246,15 @@ it("keeps a live worker's token in mode-0600 worker metadata across reconciliati
   const metadataPath = join(root, "daemon", "workers.json");
   const registry = new RegistryStore(join(root, "sessions"));
   await registry.create(record("live", worker));
-  await writeFile(metadataPath, `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "live", runId: "run-live", leaseId: "lease-live", generation: 1, identity: worker, piChildIdentity: piChild, token: "live-run-token" }] })}\n`, { mode: 0o600 });
+  const liveSocket = join(root, "daemon", "workers", "live.sock");
+  await writeFile(metadataPath, `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "live", runId: "run-live", leaseId: "lease-live", generation: 1, identity: worker, piChildIdentity: piChild, token: "live-run-token", socketPath: liveSocket, proto: 2 }] })}\n`, { mode: 0o600 });
+  const inspect = async (/** @type {number} */ pid) => pid === 501 ? worker : pid === 502 ? piChild : (() => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); })();
+  const sockets = createFakeWorkerSockets();
+  sockets.answer(liveSocket, [{ version: 1, type: "worker_ready", token: "live-run-token", sessionId: "live", runId: "run-live", leaseId: "lease-live", generation: 1, worker, piChild }]);
+  const router = new RecoveredWorkerRouter({ registry, inspect, metadataPath, connect: sockets.connect });
+  await router.load();
 
-  const recovered = await reconcileRuntime({
-    root,
-    daemonEpoch: "epoch",
-    inspect: async (/** @type {number} */ pid) => pid === 501 ? worker : pid === 502 ? piChild : (() => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); })(),
-    waitForReconnect: async (/** @type {any[]} */ workers) => workers.map((entry) => entry.sessionId),
-  });
+  const recovered = await reconcileRuntime({ root, daemonEpoch: "epoch", inspect, router });
   expect(recovered.conflicts).toEqual([]);
   // A replacement daemon authenticates the surviving run with the same secret it never rotated.
   expect(recovered.router.metadata("live")).toMatchObject({ token: "live-run-token" });
@@ -308,15 +312,15 @@ it("adopts every protocol-compatible route before comparing releases and persist
   }
 
   // A live authenticated version-1 route is what supplies the protocol a baseline record never wrote.
-  expect(await persistedWorkers(root)).toEqual(expect.arrayContaining([expect.objectContaining({ sessionId: "unknown", proto: 1, routeGeneration: 1 })]));
-  expect((await persistedWorkers(root)).every((/** @type {any} */ entry) => entry.proto === 1 && entry.routeGeneration === 1)).toBe(true);
+  expect(await persistedWorkers(root)).toEqual(expect.arrayContaining([expect.objectContaining({ sessionId: "unknown", proto: 2, routeGeneration: 1 })]));
+  expect((await persistedWorkers(root)).every((/** @type {any} */ entry) => entry.proto === 2 && entry.routeGeneration === 1)).toBe(true);
   expect(["older", "equal", "newer", "unknown", "unparseable"].map((sessionId) => router.releaseStatus(sessionId))).toEqual(["STALE", "CURRENT", "NEWER", "UNKNOWN", "UNKNOWN"]);
   await router.close();
 });
 
 it("leaves a worker whose recorded protocol this daemon does not speak unavailable and untouched", async () => {
   const root = await fixture();
-  const future = await liveWorker(root, "future", { proto: 2, cliVersion: "9.0.0" });
+  const future = await liveWorker(root, "future", { proto: 3, cliVersion: "9.0.0" });
   const router = await releaseRouter(root, [future], "2.0.0");
 
   await expect(router.adopt(future.ready, fakeConnection())).rejects.toMatchObject({ code: "WORKER_PROTOCOL_INCOMPATIBLE" });
@@ -330,7 +334,7 @@ it("leaves a worker whose recorded protocol this daemon does not speak unavailab
 // generation that restarts at one on every daemon start reports a reconnect that never happened.
 it("continues route generations across a replacement daemon", async () => {
   const root = await fixture();
-  const live = await liveWorker(root, "resumed", { cliVersion: "2.0.0", proto: 1, routeGeneration: 3 });
+  const live = await liveWorker(root, "resumed", { cliVersion: "2.0.0", proto: 2, routeGeneration: 3 });
   const router = await releaseRouter(root, [live], "2.0.0");
 
   await expect(router.adopt(live.ready, fakeConnection())).resolves.toMatchObject({ routeGeneration: 4 });
@@ -343,7 +347,7 @@ it("continues route generations across a replacement daemon", async () => {
 // had already decided to replace.
 it("carries one run's persisted pending replacement across adoption by a replacement daemon", async () => {
   const root = await fixture();
-  const live = await liveWorker(root, "marked", { cliVersion: "1.9.0", proto: 1, routeGeneration: 1, pendingRespawn: "upgrade" });
+  const live = await liveWorker(root, "marked", { cliVersion: "1.9.0", proto: 2, routeGeneration: 1, pendingRespawn: "upgrade" });
   const router = await releaseRouter(root, [live], "2.0.0");
 
   await expect(router.adopt(live.ready, fakeConnection())).resolves.toMatchObject({ routeGeneration: 2 });

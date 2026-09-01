@@ -8,12 +8,11 @@ import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
 import { signalProcessGroup, sleep } from "../runtime/process-signaler.mjs";
 import { RecoveredWorkerRouter } from "../runtime/reconciliation.mjs";
 import { RegistryStore } from "../runtime/registry-store.mjs";
-import { createWorkerControlSocket } from "../runtime/test-fixtures.mjs";
+import { createWorkerControlClient } from "../runtime/test-fixtures.mjs";
 import { WorkerSupervisor } from "../runtime/worker-supervisor.mjs";
 import { createRealProcessHarness } from "./real-process-harness.mjs";
 
 const FIXTURE = fileURLToPath(new URL("./fixtures/fake-pi.mjs", import.meta.url));
-const CONNECTOR = fileURLToPath(new URL("../runtime/daemon-connector.mjs", import.meta.url));
 const harness = createRealProcessHarness("installed-pi");
 /** @type {any[]} */
 const controlSockets = [];
@@ -40,17 +39,17 @@ async function setup() {
   const now = "2026-08-25T12:00:00.000Z";
   const registry = new RegistryStore(sessions);
   await registry.create({ schemaVersion: 1, revision: 0, sessionId: "one", sessionFile, canonicalSessionFile: sessionFile, cwd: root, taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "saved_session", summary: "Saved", updatedAt: now }, createdAt: now, updatedAt: now });
-  const router = new RecoveredWorkerRouter({ registry, inspect: inspectProcessIdentity, metadataPath: join(root, "daemon", "workers.json") });
-  await router.load();
-  const control = await createWorkerControlSocket({ root, router, registry });
+  const control = createWorkerControlClient({ registry });
   controlSockets.push(control);
-  return { root, runs, registry, executable, sessionFile, router, control, launchSeams: { daemonConnector: CONNECTOR, daemonConnectConfig: control.connectConfig }, log: join(root, "pi.log") };
+  const router = new RecoveredWorkerRouter({ registry, inspect: inspectProcessIdentity, metadataPath: join(root, "daemon", "workers.json"), ...control.routerSeams });
+  await router.load();
+  return { root, runs, registry, executable, sessionFile, router, control, log: join(root, "pi.log") };
 }
 
 it("omits optional launch flags by default and includes only selected model and name flags", async () => {
-  const { root, runs, registry, executable, sessionFile, log, router, control, launchSeams } = await setup();
+  const { root, runs, registry, executable, sessionFile, log, router, control } = await setup();
   const supervisor = new WorkerSupervisor({ registry, router, runsDirectory: runs, configuredPiPath: executable, env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_EXIT_MS: "700" }, startTimeoutMs: 2_000 });
-  await launch(supervisor, { sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-options", model: { provider: "fake provider", id: "model;id" }, thinkingLevel: "high", name: "name with spaces", ...launchSeams });
+  await launch(supervisor, { sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-options", model: { provider: "fake provider", id: "model;id" }, thinkingLevel: "high", name: "name with spaces" });
   const childStart = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line)).find((entry) => entry.kind === "start" && entry.argv.includes(sessionFile));
   // Pi restores its own thinking level from the session file, so no launch selects one.
   expect(childStart.argv).toEqual(["--mode", "rpc", "--session", sessionFile, "--provider", "fake provider", "--model", "model;id", "--name", "name with spaces"]);
@@ -58,25 +57,25 @@ it("omits optional launch flags by default and includes only selected model and 
 });
 
 it("rejects malformed RPC, releases ownership, and stops the exact child group", async () => {
-  const { root, runs, registry, executable, sessionFile, log, router, control, launchSeams } = await setup();
+  const { root, runs, registry, executable, sessionFile, log, router, control } = await setup();
   const supervisor = new WorkerSupervisor({ registry, router, runsDirectory: runs, configuredPiPath: executable, env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_MALFORMED_SESSION: sessionFile }, startTimeoutMs: 1_000 });
-  await expect(supervisor.launch({ sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-malformed", ...launchSeams })).rejects.toMatchObject({ code: "WORKER_PROCESS_EXITED" });
+  await expect(supervisor.launch({ sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-malformed" })).rejects.toMatchObject({ code: "WORKER_PROCESS_EXITED" });
   expect((await registry.get("one")).ownership).toBeUndefined();
   const childStart = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line)).find((entry) => entry.kind === "start" && entry.argv.includes(sessionFile));
   await expect(inspectProcessIdentity(childStart.pid)).rejects.toMatchObject({ code: expect.stringMatching(/ENOENT|ESRCH/u) });
 });
 
 it("rejects readiness when get_state reports a different canonical session file", async () => {
-  const { root, runs, registry, executable, sessionFile, router, control, launchSeams } = await setup();
+  const { root, runs, registry, executable, sessionFile, router, control } = await setup();
   const supervisor = new WorkerSupervisor({ registry, router, runsDirectory: runs, configuredPiPath: executable, env: { ...process.env, FAKE_PI_RUNTIME_STATE_SESSION_PATH: join(root, "wrong.jsonl") }, startTimeoutMs: 1_000 });
-  await expect(supervisor.launch({ sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-state-mismatch", ...launchSeams })).rejects.toMatchObject({ code: "WORKER_PROCESS_EXITED" });
+  await expect(supervisor.launch({ sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-state-mismatch" })).rejects.toMatchObject({ code: "WORKER_PROCESS_EXITED" });
   expect((await registry.get("one")).ownership).toBeUndefined();
 });
 
 it("holds a startup frame on the reservation and delivers it over the adopted route", async () => {
-  const { root, runs, registry, executable, sessionFile, router, control, launchSeams } = await setup();
+  const { root, runs, registry, executable, sessionFile, router, control } = await setup();
   const supervisor = new WorkerSupervisor({ registry, router, runsDirectory: runs, configuredPiPath: executable, env: { ...process.env, FAKE_PI_EVENT: "startup_notice", FAKE_PI_EXIT_MS: "700" }, startTimeoutMs: 2_000 });
-  await launch(supervisor, { sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-startup-frame", ...launchSeams });
+  await launch(supervisor, { sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-startup-frame" });
   // A frame Pi emitted before the route existed is held on the reservation and arrives after adoption.
   const deadline = Date.now() + 5_000;
   while (!control.frames.some((/** @type {any} */ frame) => frame.type === "pi_frame" && frame.frame?.type === "startup_notice")) {
@@ -87,7 +86,7 @@ it("holds a startup frame on the reservation and delivers it over the adopted ro
 });
 
 it("launches a distinct installed Pi child with exact structured argv and persisted runtime identity", async () => {
-  const { root, runs, registry, executable, sessionFile, log, router, control, launchSeams } = await setup();
+  const { root, runs, registry, executable, sessionFile, log, router, control } = await setup();
   const supervisor = new WorkerSupervisor({
     registry,
     router,
@@ -96,7 +95,7 @@ it("launches a distinct installed Pi child with exact structured argv and persis
     env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_EXIT_MS: "700" },
     startTimeoutMs: 2_000,
   });
-  const handle = await launch(supervisor, { sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-one", piPath: executable, ...launchSeams });
+  const handle = await launch(supervisor, { sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-one", piPath: executable });
 
   expect(handle.piChildIdentity.pid).not.toBe(handle.identity.pid);
   expect(handle.identity.processGroupId).toBe(handle.identity.pid);
@@ -142,9 +141,9 @@ async function stopWorker(supervisor, handle, route) {
 }
 
 it("delivers the operator's text once while Pi is already running a turn, with no refusal reaching him", async () => {
-  const { root, runs, registry, executable, sessionFile, log, router, launchSeams } = await setup();
+  const { root, runs, registry, executable, sessionFile, log, router } = await setup();
   const supervisor = new WorkerSupervisor({ registry, router, runsDirectory: runs, configuredPiPath: executable, env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_STREAMING: "active" }, startTimeoutMs: 5_000 });
-  const handle = await launch(supervisor, { sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-busy-prompt", ...launchSeams });
+  const handle = await launch(supervisor, { sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-busy-prompt" });
   const route = router.route("one");
 
   try {
@@ -162,9 +161,9 @@ it("delivers the operator's text once while Pi is already running a turn, with n
 });
 
 it("keeps both dashboards' text when each submits believing the same session is idle", async () => {
-  const { root, runs, registry, executable, sessionFile, log, router, launchSeams } = await setup();
+  const { root, runs, registry, executable, sessionFile, log, router } = await setup();
   const supervisor = new WorkerSupervisor({ registry, router, runsDirectory: runs, configuredPiPath: executable, env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_STREAMING: "on_prompt" }, startTimeoutMs: 5_000 });
-  const handle = await launch(supervisor, { sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-two-dashboards", ...launchSeams });
+  const handle = await launch(supervisor, { sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-two-dashboards" });
   const route = router.route("one");
   const command = (clientId, text) => route.connection.request({ version: 1, type: "command", token: route.metadata.token, id: `submit-${clientId}`, command: { clientId, requestId: `submit-${clientId}`, op: "prompt", text } }, {});
 

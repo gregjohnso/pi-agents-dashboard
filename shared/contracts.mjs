@@ -11,7 +11,7 @@ import { parseViewerSnapshot } from "./viewer-contracts.mjs";
 /** @typedef {{kind:"managed",runId:string,process:ProcessIdentity,acquiredAt:string,heartbeatAt:string}} WorkerOwnership */
 /** @typedef {{mode:"worktree",worktreePath:string,branch:string}|{mode:"shared_directory",canonicalCwd:string}} IsolationRecord */
 /** @typedef {{text:string,generatedAt:string,model:{provider:string,id:string},sourceCursor:string}} SessionSummary */
-/** @typedef {{schemaVersion:1,revision:number,sessionId:string,sessionFile:string,canonicalSessionFile:string,cwd:string,name?:string,nameGenerated?:boolean,color?:SessionColor,model?:{provider:string,id:string},thinkingLevel?:string,taskState:TaskState,processState:ProcessState,outcome:Outcome,activity:{kind:string,summary:string,updatedAt:string},ownership?:WorkerOwnership,isolation?:IsolationRecord,latestRunId?:string,runHash?:string,runtime?:RunRuntimeIdentity,summary?:SessionSummary,workerCliVersion?:string,stale?:boolean,routeGeneration?:number,createdAt:string,updatedAt:string}} SessionRecord */
+/** @typedef {{schemaVersion:1,revision:number,sessionId:string,sessionFile:string,canonicalSessionFile:string,cwd:string,name?:string,nameGenerated?:boolean,color?:SessionColor,model?:{provider:string,id:string},thinkingLevel?:string,taskState:TaskState,processState:ProcessState,outcome:Outcome,activity:{kind:string,summary:string,updatedAt:string},ownership?:WorkerOwnership,isolation?:IsolationRecord,latestRunId?:string,runHash?:string,runtime?:RunRuntimeIdentity,summary?:SessionSummary,workerCliVersion?:string,workerUnreachable?:string,stale?:boolean,routeGeneration?:number,createdAt:string,updatedAt:string}} SessionRecord */
 /** @typedef {{mode:"worktree"}|{mode:"shared_directory",confirmedCwd:string,ownerSessionIds:string[]}} LaunchIsolation */
 /** @typedef {{prompt:string,cwd:string,sourceSessionId:string,isolation:LaunchIsolation,model?:{provider:string,id:string},name?:string}} LaunchRequest */
 /** @typedef {{provider:string,id:string,thinking:boolean}} CatalogModel */
@@ -33,16 +33,17 @@ const ENVELOPE_KEYS = ["version", "clientId", "requestId", "op", "payload"];
  * protocol 5 retired the daemon-wide command journal with `resolve_delivery` and the delivery stage
  * every command answer carried, because the owning worker's durable inbox is the acceptance boundary
  * and an unattributable outcome is one `DELIVERY_UNKNOWN` failure rather than a stage to come back
- * for. A
+ * for; protocol 6 inverted the worker socket, so the daemon no longer accepts a `worker` role on its
+ * own listener at all and a worker from protocol 5 can never be adopted by a daemon on 6.
+ * A
  * frontend and a daemon on different sides of any of these cannot share a session, so the daemon refuses a
- * frontend that declares anything else at its first request. Worker and control connections
- * deliberately carry no `clientProtocol`: a live worker must survive a daemon replacement, and the
- * liveness probe and the control stop frame must still reach a daemon from the previous release,
- * which refuses this key outright. That is why no command-line path opens a frontend connection it
- * does not need, and why a refused handshake is reported as an earlier release rather than as a
- * failed authentication.
+ * frontend that declares anything else at its first request. Control connections deliberately carry
+ * no `clientProtocol`: the liveness probe and the control stop frame must still reach a daemon from
+ * the previous release, which refuses this key outright. That is why no command-line path opens a
+ * frontend connection it does not need, and why a refused handshake is reported as an earlier
+ * release rather than as a failed authentication.
  */
-export const CLIENT_PROTOCOL = 5;
+export const CLIENT_PROTOCOL = 6;
 /** Operator-chosen row tints, named for the Jobwatch palette. Dashboard metadata; Pi never sees them. */
 export const SESSION_COLORS = ["sky", "green", "amber", "rose", "cyan", "gray"];
 /** @typedef {"sky"|"green"|"amber"|"rose"|"cyan"|"gray"} SessionColor */
@@ -283,7 +284,7 @@ function validateError(value, path) {
 /** @param {unknown} value @param {string} path */
 function validateSession(value, path) {
   const session = readRecord(value, path);
-  requireKeys(session, ["schemaVersion", "revision", "sessionId", "sessionFile", "canonicalSessionFile", "cwd", "taskState", "processState", "outcome", "activity", "createdAt", "updatedAt"], ["name", "nameGenerated", "color", "model", "thinkingLevel", "ownership", "isolation", "latestRunId", "runHash", "runtime", "summary", "workerCliVersion", "stale", "routeGeneration"], path);
+  requireKeys(session, ["schemaVersion", "revision", "sessionId", "sessionFile", "canonicalSessionFile", "cwd", "taskState", "processState", "outcome", "activity", "createdAt", "updatedAt"], ["name", "nameGenerated", "color", "model", "thinkingLevel", "ownership", "isolation", "latestRunId", "runHash", "runtime", "summary", "workerCliVersion", "workerUnreachable", "stale", "routeGeneration"], path);
   if (Object.hasOwn(session, "nameGenerated") && typeof session.nameGenerated !== "boolean") throw new TypeError(`${path}.nameGenerated must be a boolean`);
   if (Object.hasOwn(session, "color") && !SESSION_COLORS.includes(session.color)) throw new TypeError(`${path}.color must be one of: ${SESSION_COLORS.join(", ")}`);
   if (Object.hasOwn(session, "summary")) {
@@ -307,6 +308,9 @@ function validateSession(value, path) {
   // the record, so a reader can tell adoption from staleness without inspecting daemon memory. An
   // absent release is unknown, which the row reports as stale.
   if (Object.hasOwn(session, "workerCliVersion")) readIdentifier(session, "workerCliVersion", `${path}.workerCliVersion`);
+  // Why a live worker cannot be reached, added to a read rather than written to the record: it is
+  // this daemon's view of a connection, and it ends the moment a route is adopted again.
+  if (Object.hasOwn(session, "workerUnreachable")) readIdentifier(session, "workerUnreachable", `${path}.workerUnreachable`);
   if (Object.hasOwn(session, "stale") && typeof session.stale !== "boolean") throw new TypeError(`${path}.stale must be a boolean`);
   if (Object.hasOwn(session, "routeGeneration") && (!Number.isSafeInteger(session.routeGeneration) || session.routeGeneration <= 0)) throw new TypeError(`${path}.routeGeneration must be a positive safe integer`);
   if (Object.hasOwn(session, "model")) readModel(session.model, `${path}.model`);

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { CLIENT_PROTOCOL } from "../shared/contracts.mjs";
-import { connectDaemon } from "./daemon-connector.mjs";
+import { startListeningWorker } from "./test-fixtures.mjs";
 import { createDaemonRuntime } from "./daemon.mjs";
 import { createIdleExit } from "./idle-exit.mjs";
 import { createJsonlDecoder, createJsonlEncoder } from "./jsonl.mjs";
@@ -38,43 +38,6 @@ afterEach(async () => {
 const IDENTITY = { pid: 401, startIdentity: "40100", processGroupId: 401 };
 const PI_CHILD = { pid: 402, startIdentity: "40200", processGroupId: 401 };
 const AT = "2026-08-25T12:00:00.000Z";
-
-/** One live worker on the daemon's own socket. A silent one never answers a command, which is what leaves it in flight. @param {any} config @param {any} worker */
-function startFakeWorker(config, worker) {
-  const controller = new AbortController();
-  let commandCount = 0;
-  /** @type {any} */
-  let live;
-  const run = (async () => {
-    while (!controller.signal.aborted) {
-      /** @type {any} */
-      let connection;
-      try {
-        connection = await connectDaemon({ config: { ...config, maxBytes: 4 * 1024 }, signal: controller.signal });
-        live = connection;
-        connection.onMessage((/** @type {any} */ frame) => {
-          if (frame?.type !== "command") return;
-          commandCount += 1;
-          if (worker.silent === true) return;
-          void connection.send({ version: 1, type: "command_result", token: worker.token, id: frame.id, ok: true, record: { clientId: frame.command.clientId, requestId: frame.command.requestId, op: frame.command.op, stage: "RPC_ACKNOWLEDGED", at: AT, result: null } });
-        });
-        await connection.send({ version: 1, type: "worker_ready", token: worker.token, sessionId: worker.sessionId, runId: worker.runId, leaseId: worker.leaseId, generation: worker.generation, worker: IDENTITY, piChild: PI_CHILD });
-        await connection.closed;
-      } catch {
-      } finally {
-        connection?.close();
-      }
-      if (!controller.signal.aborted) await new Promise((wait) => setTimeout(wait, 10));
-    }
-  })();
-  const loop = {
-    get commandCount() { return commandCount; },
-    async sendEvent(/** @type {any} */ event) { await live.send({ version: 1, type: "worker_event", token: worker.token, sessionId: worker.sessionId, event }); },
-    async stop() { controller.abort(); await run; },
-  };
-  workers.push(loop);
-  return loop;
-}
 
 /** One dashboard connection, as a raw socket, so closing it is what closing a dashboard does. @param {any} runtime */
 async function openDashboard(runtime) {
@@ -118,7 +81,12 @@ async function daemonWithWorker({ sessionId = "held", cliVersion, silent = false
   const sessionFile = join(root, "canonical", `${sessionId}.jsonl`);
   const registry = new RegistryStore(join(root, "sessions"));
   await registry.create({ schemaVersion: 1, revision: 0, sessionId, sessionFile, canonicalSessionFile: sessionFile, cwd: root, taskState, processState: "LIVE", outcome: "NONE", activity: { kind: activityKind, summary: "running", updatedAt: AT }, ownership: { kind: "managed", runId: `run-${sessionId}`, process: IDENTITY, acquiredAt: AT, heartbeatAt: AT }, latestRunId: `run-${sessionId}`, createdAt: AT, updatedAt: AT });
-  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId, runId: `run-${sessionId}`, leaseId: `lease-${sessionId}`, generation: 1, identity: IDENTITY, piChildIdentity: PI_CHILD, ...(cliVersion === undefined ? {} : { cliVersion }) }] })}\n`, { mode: 0o600 });
+  const socketPath = join(root, "daemon", "workers", `${sessionId}.sock`);
+  await mkdir(join(root, "daemon", "workers"), { mode: 0o700 });
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId, runId: `run-${sessionId}`, leaseId: `lease-${sessionId}`, generation: 1, identity: IDENTITY, piChildIdentity: PI_CHILD, token: `${sessionId}-token`, socketPath, proto: 2, ...(cliVersion === undefined ? {} : { cliVersion }) }] })}\n`, { mode: 0o600 });
+  // The worker listens before the daemon starts, which is the arrangement: the daemon connects to it.
+  const worker = await startListeningWorker({ socketPath, token: `${sessionId}-token`, sessionId, runId: `run-${sessionId}`, leaseId: `lease-${sessionId}`, generation: 1, worker: IDENTITY, piChild: PI_CHILD, silent });
+  workers.push(worker);
 
   /** @type {string[]} */
   const launches = [];
@@ -147,7 +115,6 @@ async function daemonWithWorker({ sessionId = "held", cliVersion, silent = false
     },
   });
   runtimes.push(runtime);
-  const worker = startFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId, runId: `run-${sessionId}`, leaseId: `lease-${sessionId}`, generation: 1, token: `${sessionId}-token`, silent });
   await runtime.ready;
   await vi.waitFor(() => expect(runtime.status().connectedWorkers).toContain(sessionId), { timeout: 5_000, interval: 25 });
   return { root, sessionId, registry, runtime, worker, launches, releaseLaunch };

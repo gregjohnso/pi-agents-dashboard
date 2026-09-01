@@ -14,7 +14,8 @@ import { sweepStaleWorktreeLocks } from "../isolation/lock-sweep.mjs";
 import { ensurePrivateDirectory, initializeRuntimePermissions } from "./permissions.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "./process-signaler.mjs";
-import { RecoveredWorkerRouter, reconcileRuntime } from "./reconciliation.mjs";
+import { RecoveredWorkerRouter, WORKER_UNREACHABLE, reconcileRuntime } from "./reconciliation.mjs";
+import { connectToWorker } from "./worker-socket.mjs";
 import { openSettingsStore, summarizePromptInput, summarizeWithPi } from "./summaries.mjs";
 import { RegistryStore, applySessionColor, applySessionUpdate, runSessionLifecycle } from "./registry-store.mjs";
 import { sessionCommandPayload } from "./session-command-projection.mjs";
@@ -43,7 +44,15 @@ const REPLACEABLE_RELEASES = new Set(["STALE", "UNKNOWN"]);
  * finish frees a slot and re-decides it.
  */
 const MAX_UPGRADE_RESPAWNS = 3;
-const CONNECTOR_PATH = fileURLToPath(new URL("./daemon-connector.mjs", import.meta.url));
+/**
+ * What a live worker this daemon cannot reach costs, and the one way out of it.
+ *
+ * The commonest cause is an upgrade: a worker spawned by the previous release listens on nothing,
+ * because that release had the daemon listen and the worker connect out. Stop is not blocked by it,
+ * since Stop signals the process identity the record holds and never needs the route.
+ */
+const UNREACHABLE_WORKER_MESSAGE = "This session's worker is running but cannot be reached on its socket.";
+const UNREACHABLE_WORKER_FIX = "Stop it with `pi-agents stop <full-session-id> --revision <n> --yes`, then reopen the session to start a worker this daemon can reach.";
 /** This package's manifest. Its version is the release recorded for every worker this daemon spawns. */
 const PACKAGE_MANIFEST_PATH = fileURLToPath(new URL("../package.json", import.meta.url));
 const DEFAULT_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateMs: 5_000 });
@@ -239,8 +248,60 @@ export function createBoundedSocketWriter(socket, { maxPendingBytes, maxPendingR
   };
 }
 
-/** @param {{ socketPath: string, token: string, maxBytes: number, workerRequestTimeoutMs: number, context: any }} options */
-function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutMs, context }) {
+/**
+ * Open one authenticated connection to a worker's own socket, carrying the request correlation the
+ * daemon's commands travel on.
+ *
+ * The worker listens and this connects, so a connection exists only because this daemon asked for
+ * one. A connection that ends leaves every command it carried ambiguous rather than failed: the
+ * bytes may already have reached Pi, and only the worker's replay log can say.
+ * @param {{ workerPending: Map<string, any>, workerRequestTimeoutMs: number }} options
+ */
+function createWorkerConnector({ workerPending, workerRequestTimeoutMs }) {
+  return async (/** @type {{ socketPath: string, token: string, maxBytes: number, timeoutMs: number }} */ options) => {
+    const transport = await connectToWorker(options);
+    /** @type {any} */
+    const connection = {
+      closed: transport.closed,
+      close: transport.close,
+      send: transport.send,
+      onMessage: transport.onMessage,
+      /** @param {any} message @param {any} expected */
+      request(message, expected) {
+        return new Promise((resolveRequest, rejectRequest) => {
+          const id = message.id;
+          /** @type {any} */
+          const pending = { ...expected, resolve: resolveRequest, reject: rejectRequest, connection };
+          // A worker that never answers leaves the command's delivery unknown, not failed.
+          pending.timer = setTimeout(() => {
+            if (workerPending.get(id) !== pending) return;
+            workerPending.delete(id);
+            rejectRequest(Object.assign(new Error("Worker did not answer within the delivery bound"), { code: "DELIVERY_UNKNOWN" }));
+          }, workerRequestTimeoutMs);
+          workerPending.set(id, pending);
+          Promise.resolve(transport.send(message)).catch((error) => {
+            if (workerPending.get(id) !== pending) return;
+            workerPending.delete(id);
+            clearTimeout(pending.timer);
+            rejectRequest(error);
+          });
+        });
+      },
+    };
+    transport.closed.then(() => {
+      for (const [id, pending] of workerPending) {
+        if (pending.connection !== connection || workerPending.get(id) !== pending) continue;
+        workerPending.delete(id);
+        clearTimeout(pending.timer);
+        pending.reject(Object.assign(new Error("Worker delivery became ambiguous"), { code: "DELIVERY_UNKNOWN" }));
+      }
+    }, () => {});
+    return connection;
+  };
+}
+
+/** @param {{ socketPath: string, token: string, maxBytes: number, context: any }} options */
+function createSocketServer({ socketPath, token, maxBytes, context }) {
   const sockets = new Set();
   /** Dashboard connections. A worker holds a connection too, and idle exit must not read it as a client. */
   const frontendSockets = new Set();
@@ -270,14 +331,6 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
     let attachId;
     /** @type {string | undefined} */
     let frontendClientId;
-    /** @type {any} */
-    let workerConnection;
-    /** @type {any} */
-    let workerMetadata;
-    /** @type {number | undefined} */
-    let workerRouteGeneration;
-    /** This connection is a worker's startup connection until its route is adopted. @type {any} */
-    let launchReservation;
     /** @type {Promise<void>} */
     let chain = Promise.resolve();
     const decoder = createJsonlDecoder({ maxBytes });
@@ -296,26 +349,6 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
       socket.write(encoded, (error) => error ? rejectWrite(error) : resolveWrite(undefined));
     });
     const close = () => socket.destroy();
-    /** @param {any} message @param {any} expected */
-    const requestWorker = (message, expected) => new Promise((resolveRequest, rejectRequest) => {
-      const id = message.id;
-      /** @type {any} */
-      const pending = { ...expected, resolve: resolveRequest, reject: rejectRequest, connection: workerConnection };
-      // A worker that never answers leaves the command's delivery unknown, not failed: its bytes may
-      // already have reached Pi.
-      pending.timer = setTimeout(() => {
-        if (context.workerPending.get(id) !== pending) return;
-        context.workerPending.delete(id);
-        rejectRequest(Object.assign(new Error("Worker did not answer within the delivery bound"), { code: "DELIVERY_UNKNOWN" }));
-      }, workerRequestTimeoutMs);
-      context.workerPending.set(id, pending);
-      send(message).catch((error) => {
-        if (context.workerPending.get(id) !== pending) return;
-        context.workerPending.delete(id);
-        clearTimeout(pending.timer);
-        rejectRequest(error);
-      });
-    });
     socket.on("close", () => {
       sockets.delete(socket);
       frontendSockets.delete(socket);
@@ -326,13 +359,6 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
       for (const subscription of activeViewerSubscriptions) void subscription.return?.();
       context.releaseAttachments(socket);
       resolveClosed(undefined);
-      for (const [id, pending] of context.workerPending) {
-        if (pending.connection === workerConnection && context.workerPending.get(id) === pending) {
-          context.workerPending.delete(id);
-          clearTimeout(pending.timer);
-          pending.reject(Object.assign(new Error("Worker delivery became ambiguous"), { code: "DELIVERY_UNKNOWN" }));
-        }
-      }
     });
     socket.on("error", () => {});
     socket.on("data", (chunk) => {
@@ -351,7 +377,7 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
           if (!context.admissionOpen) throw Object.assign(new Error("Daemon is shutting down"), { code: "SHUTTING_DOWN", retryable: true });
           if (!authenticated) {
             const allowed = ["version", "token", "role", "action", "clientProtocol", "attachId"];
-            if (typeof frame !== "object" || frame === null || Array.isArray(frame) || Object.keys(frame).some((key) => !allowed.includes(key)) || frame.version !== 1 || !sameToken(frame.token, token) || (frame.role !== undefined && !["frontend", "worker", "control"].includes(frame.role)) || (frame.action !== undefined && (frame.role !== "control" || frame.action !== "stop")) || (frame.clientProtocol !== undefined && !Number.isSafeInteger(frame.clientProtocol)) || (frame.attachId !== undefined && (typeof frame.attachId !== "string" || frame.attachId.length === 0 || frame.attachId.trim() !== frame.attachId))) {
+            if (typeof frame !== "object" || frame === null || Array.isArray(frame) || Object.keys(frame).some((key) => !allowed.includes(key)) || frame.version !== 1 || !sameToken(frame.token, token) || (frame.role !== undefined && !["frontend", "control"].includes(frame.role)) || (frame.action !== undefined && (frame.role !== "control" || frame.action !== "stop")) || (frame.clientProtocol !== undefined && !Number.isSafeInteger(frame.clientProtocol)) || (frame.attachId !== undefined && (typeof frame.attachId !== "string" || frame.attachId.length === 0 || frame.attachId.trim() !== frame.attachId))) {
               await send({ version: 1, ok: false, error: dashboardError(frame?.version === 1 ? "AUTHENTICATION_FAILED" : "UNSUPPORTED_VERSION", "Invalid daemon authentication") });
               socket.end();
               return;
@@ -366,33 +392,6 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
               context.requestStop();
               socket.end();
             }
-            return;
-          }
-          if (role === "worker") {
-            if (workerConnection === undefined) {
-              workerConnection = { closed, close, send, request: requestWorker };
-              // A startup connection announces itself with hello and is held against its launch
-              // reservation until the spawned PID and its exact identity are verified.
-              launchReservation = await context.router.beginLaunchConnection(frame, workerConnection, (/** @type {any} */ reservation) => {
-                workerMetadata = reservation.route.metadata;
-                workerRouteGeneration = reservation.route.routeGeneration;
-                chain = chain.then(() => context.recovery?.viewer?.ensure(reservation.sessionId)).catch(() => {});
-                for (const buffered of reservation.drainBuffered()) {
-                  chain = chain.then(() => context.handleWorkerFrame(buffered, workerConnection, workerMetadata, workerRouteGeneration)).catch(() => { socket.destroy(); });
-                }
-              });
-              if (launchReservation !== undefined) return;
-              const route = await context.router.adopt(frame, workerConnection);
-              workerMetadata = route.metadata;
-              workerRouteGeneration = route.routeGeneration;
-              void context.reconcileSessionActivity(route).catch(() => {});
-              return;
-            }
-            if (launchReservation !== undefined && launchReservation.route === undefined) {
-              launchReservation.deliver(frame);
-              return;
-            }
-            await context.handleWorkerFrame(frame, workerConnection, workerMetadata, workerRouteGeneration);
             return;
           }
           // A frontend that did not declare this release's client protocol is refused at its first
@@ -557,7 +556,26 @@ export async function createDaemonRuntime({
     const daemonEpoch = await privateText(epochPath, () => epochCandidate);
     if (daemonEpoch !== epochCandidate) throw Object.assign(new Error("Daemon epoch changed during lifecycle claim"), { code: "DAEMON_IDENTITY_CONFLICT" });
     const registry = new RegistryStore(join(root, "sessions"));
-    const router = new RecoveredWorkerRouter({ registry, inspect, metadataPath: join(daemonDirectory, "workers.json"), cliVersion });
+    /** Commands whose bytes are with a worker that still owes a reply. @type {Map<string, any>} */
+    const workerPending = new Map();
+    const router = new RecoveredWorkerRouter({
+      registry,
+      inspect,
+      metadataPath: join(daemonDirectory, "workers.json"),
+      maxBytes,
+      cliVersion,
+      connect: createWorkerConnector({ workerPending, workerRequestTimeoutMs }),
+      onWorkerFrame: (frame, connection, metadata, routeGeneration) => context.handleWorkerFrame(frame, connection, metadata, routeGeneration),
+      onRouteAdopted: async (route, launched) => {
+        unreachableWorkers.delete(route.metadata.sessionId);
+        await context.recovery?.viewer?.ensure(route.metadata.sessionId).catch(() => {});
+        // A launch already knows this session's state; a reconnect has to re-derive it from Pi,
+        // because a turn can both finish and start while the daemon is absent.
+        if (!launched) void context.reconcileSessionActivity(route).catch(() => {});
+      },
+      onWorkerUnreachable: (report) => context.reportUnreachableWorker(report),
+      reconnectTimeoutMs,
+    });
     workerSupervisor?.useRouter?.(router);
     await router.load();
     /** @type {(value?: unknown) => void} */
@@ -580,6 +598,8 @@ export async function createDaemonRuntime({
     const upgradeRespawns = new Set();
     /** Sessions the burst bound turned away, waiting for a slot. Insertion order is the order they settled. @type {Set<string>} */
     const deferredUpgradeRespawns = new Set();
+    /** Live workers this daemon could not connect to, and why. @type {Map<string, string>} */
+    const unreachableWorkers = new Map();
     /**
      * Which dashboard connections currently have each session open. An attachment grants nothing:
      * every authenticated client may write. It records that a session is on someone's screen, which
@@ -598,7 +618,7 @@ export async function createDaemonRuntime({
       viewerRecovery: undefined,
       listSubscribers: new Set(),
       router,
-      workerPending: new Map(),
+      workerPending,
       hostReport: undefined,
       notifyListChanged: () => {},
       writeResponse: responseWriter,
@@ -633,6 +653,8 @@ export async function createDaemonRuntime({
        */
       async routeCommand(request, fields = {}) {
         const route = router.route(request.payload.sessionId);
+        const unreachable = unreachableWorkers.get(request.payload.sessionId);
+        if (route === undefined && unreachable !== undefined) throw refusal(unreachable, `${UNREACHABLE_WORKER_MESSAGE} ${UNREACHABLE_WORKER_FIX}`);
         if (route?.connection === undefined || route.metadata?.token === undefined) throw refusal("WORKER_UNAVAILABLE", "No adopted worker route owns this session");
         return context.sendWorkerCommand(route, context.nextCommandId(), request, fields);
       },
@@ -649,7 +671,11 @@ export async function createDaemonRuntime({
        */
       withWorkerAdoption(session) {
         const route = router.route(session.sessionId);
-        if (route === undefined || route.metadata?.runId !== session.ownership?.runId) return session;
+        // A live worker this daemon cannot reach says so on its own row, so the operator reads why a
+        // session he can see refuses his text, and reads it before he types.
+        const unreachable = unreachableWorkers.get(session.sessionId);
+        if (route === undefined) return unreachable === undefined ? session : { ...session, workerUnreachable: unreachable };
+        if (route.metadata?.runId !== session.ownership?.runId) return session;
         return {
           ...session,
           ...(route.metadata.cliVersion === undefined ? {} : { workerCliVersion: route.metadata.cliVersion }),
@@ -923,8 +949,6 @@ export async function createDaemonRuntime({
               // Pi restores its own thinking level from the canonical session file, so a restart asks for none.
               ...(record.model === undefined ? {} : { model: record.model }),
               ...(record.name === undefined ? {} : { name: record.name }),
-              daemonConnector: CONNECTOR_PATH,
-              daemonConnectConfig: { socketPath: join(daemonDirectory, "control.sock"), tokenPath, maxBytes },
             });
             // The launch registered and adopted its own route; this only opens the viewer stream.
             await context.recovery.viewer.ensure(handle.sessionId);
@@ -978,6 +1002,17 @@ export async function createDaemonRuntime({
           if (attached?.size === 0) attachedConnections.delete(sessionId);
         }
         attachedSessions.delete(socket);
+      },
+      /**
+       * Say, once, that a live worker is out of reach and what ends it. The worker keeps running and
+       * is never signalled here; the row carries the same answer until a route is adopted again.
+       * @param {{ sessionId: string, cause?: string, message?: string }} report
+       */
+      reportUnreachableWorker({ sessionId, cause = WORKER_UNREACHABLE, message }) {
+        if (unreachableWorkers.get(sessionId) === cause) return;
+        unreachableWorkers.set(sessionId, cause);
+        recordDiagnostic({ event: "worker_unreachable", sessionId, code: cause, message, fix: UNREACHABLE_WORKER_FIX, at: new Date().toISOString() });
+        context.notifyListChanged();
       },
       /** @param {any} frame @param {any} connection @param {any} metadata @param {number} routeGeneration */
       async handleWorkerFrame(frame, connection, metadata, routeGeneration) {
@@ -1125,7 +1160,7 @@ export async function createDaemonRuntime({
               /** @type {any} */
               let handle;
               try {
-                handle = await workerSupervisor.launch({ ...launch, daemonConnector: CONNECTOR_PATH, daemonConnectConfig: { socketPath: join(daemonDirectory, "control.sock"), tokenPath, maxBytes } });
+                handle = await workerSupervisor.launch(launch);
                 // The launch registered and adopted its own route; this only opens the viewer stream.
                 await context.recovery.viewer.ensure(handle.sessionId);
               } finally {
@@ -1275,7 +1310,7 @@ export async function createDaemonRuntime({
       },
     };
     const socketPath = join(daemonDirectory, "control.sock");
-    socketServer = createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutMs, context });
+    socketServer = createSocketServer({ socketPath, token, maxBytes, context });
     await socketServer.listen();
     socketOwned = true;
     context.listSubscribers = socketServer.listSubscribers;
@@ -1294,24 +1329,19 @@ export async function createDaemonRuntime({
       inspect,
       router,
       signal: recoveryController.signal,
+      adoptTimeoutMs: reconnectTimeoutMs,
       onViewerReady: (viewer) => { context.viewerRecovery = viewer; },
-      waitForReconnect: async (workers) => {
-        const expected = workers.filter((worker) => worker.metadata !== undefined).map((worker) => worker.sessionId);
-        if (expected.length === 0) return [];
-        const deadline = Date.now() + reconnectTimeoutMs;
-        while (Date.now() < deadline && !recoveryController.signal.aborted) {
-          const connected = router.connectedSessionIds();
-          if (expected.every((sessionId) => connected.includes(sessionId))) return connected;
-          await new Promise((resolveWait) => setTimeout(resolveWait, 10));
-        }
-        return router.connectedSessionIds();
-      },
     });
     const ready = (async () => {
       try {
         context.recovery = reconcile === undefined ? await defaultReconcile() : await reconcile({ root, daemonEpoch, router, defaultReconcile, signal: recoveryController.signal });
         context.viewerRecovery = context.recovery.viewer;
-        if (context.recovery.conflicts.length > 0) throw Object.assign(new Error("Worker ownership conflicts block daemon recovery"), { code: "OWNERSHIP_CONFLICT", conflicts: context.recovery.conflicts });
+        // A worker this daemon could not reach does not refuse the start. It is still running, it
+        // still owns Pi, and refusing here would take every other session down with it; the row it
+        // owns says why it is out of reach and what to do about it.
+        for (const unreachable of context.recovery.unreachableWorkers ?? []) context.reportUnreachableWorker(unreachable);
+        const blocking = context.recovery.conflicts.filter((/** @type {any} */ conflict) => conflict.reason !== WORKER_UNREACHABLE);
+        if (blocking.length > 0) throw Object.assign(new Error("Worker ownership conflicts block daemon recovery"), { code: "OWNERSHIP_CONFLICT", conflicts: blocking });
         if ((context.recovery.repairedSessions ?? []).length > 0) context.notifyListChanged();
         context.state = "READY";
         await updateDaemonLifecycleState(claim, "READY");

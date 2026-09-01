@@ -2,12 +2,12 @@ import net from "node:net";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { access, lstat, mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { atomicWriteJson } from "./atomic-file.mjs";
-import { connectDaemon } from "./daemon-connector.mjs";
+import { listenForDaemon } from "./worker-socket.mjs";
 import { createJsonlDecoder, createJsonlEncoder } from "./jsonl.mjs";
 import { createBoundedSocketWriter, createDaemonRuntime } from "./daemon.mjs";
 import { RegistryStore, registryCoordinationScope, runSessionLifecycle } from "./registry-store.mjs";
@@ -89,8 +89,19 @@ function rawExchange(socketPath, chunks, { halfClose = false } = {}) {
   });
 }
 
-/** @param {{ socketPath: string, tokenPath: string }} config @param {any} worker */
-function startPersistentFakeWorker(config, worker) {
+/** The socket one run's worker listens on, which the daemon names before it spawns. @param {string} stateRoot @param {string} sessionId */
+function workerSocketPath(stateRoot, sessionId) {
+  return join(stateRoot, "daemon", "workers", `${sessionId}.sock`);
+}
+
+/**
+ * One live worker listening on its own socket, which the daemon connects to.
+ *
+ * It outlives every daemon that connects, as a real worker does, and answers each new connection
+ * with its readiness frame. `workerSocketPath` is the path the roster records for the same run.
+ * @param {string} stateRoot @param {any} worker
+ */
+function startPersistentFakeWorker(stateRoot, worker) {
   const controller = new AbortController();
   let connectionCount = 0;
   let commandCount = 0;
@@ -103,12 +114,18 @@ function startPersistentFakeWorker(config, worker) {
   let alive = true;
   /** @type {any} */
   let live;
+  /** @type {any} */
+  let listener;
   const run = (async () => {
+    const socketPath = workerSocketPath(stateRoot, worker.sessionId);
+    await mkdir(dirname(socketPath), { recursive: true, mode: 0o700 });
+    listener = await listenForDaemon({ socketPath, token: worker.token, maxBytes: 1024 });
     while (!controller.signal.aborted) {
       /** @type {any} */
       let connection;
       try {
-        connection = await connectDaemon({ config: { ...config, maxBytes: 1024 }, signal: controller.signal });
+        connection = await listener.next();
+        if (connection === undefined) return;
         live = connection;
         connectionCount += 1;
         connection.onMessage((/** @type {any} */ frame) => {
@@ -149,14 +166,11 @@ function startPersistentFakeWorker(config, worker) {
         for (const frame of worker.framesAfterReady ?? []) await connection.send({ version: 1, type: "pi_frame", token: worker.token, sessionId: worker.sessionId, frame });
         await connection.closed;
       } catch {
-      } finally {
-        connection?.close();
+        return;
       }
-      if (!controller.signal.aborted) await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    alive = false;
-  })();
-  const loop = { pid: worker.identity.pid, get alive() { return alive; }, get connectionCount() { return connectionCount; }, get commandCount() { return commandCount; }, get commandIds() { return [...commandIds]; }, get commands() { return [...commands]; }, async sendFrame(/** @type {any} */ frame) { await live.send({ version: 1, type: "pi_frame", token: worker.token, sessionId: worker.sessionId, frame }); }, async sendEvent(/** @type {any} */ event) { await live.send({ version: 1, type: "worker_event", token: worker.token, sessionId: worker.sessionId, event }); }, async stop() { controller.abort(); await run; } };
+  })().finally(() => { alive = false; });
+  const loop = { pid: worker.identity.pid, get alive() { return alive; }, get connectionCount() { return connectionCount; }, get commandCount() { return commandCount; }, get commandIds() { return [...commandIds]; }, get commands() { return [...commands]; }, async sendFrame(/** @type {any} */ frame) { await live.send({ version: 1, type: "pi_frame", token: worker.token, sessionId: worker.sessionId, frame }); }, async sendEvent(/** @type {any} */ event) { await live.send({ version: 1, type: "worker_event", token: worker.token, sessionId: worker.sessionId, event }); }, async stop() { controller.abort(); await listener?.close(); await run; } };
   workerLoops.push(loop);
   return loop;
 }
@@ -306,14 +320,14 @@ it("marks a stopped session STOPPED rather than leaving it ready", async () => {
   };
   const registry = new RegistryStore(join(stateRoot, "sessions"));
   await registry.create({ schemaVersion: 1, revision: 0, sessionId: "stopping", sessionFile: "/sessions/stopping.jsonl", canonicalSessionFile: "/sessions/stopping.jsonl", cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "assistant_stream", summary: "streaming", updatedAt: now }, ownership: { kind: "managed", runId: "run-stopping", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-stopping", createdAt: now, updatedAt: now });
-  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "stopping", runId: "run-stopping", leaseId: "lease-stopping", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "stopping", runId: "run-stopping", leaseId: "lease-stopping", generation: 1, identity, piChildIdentity: piChild, token: "stopping-token", socketPath: workerSocketPath(stateRoot, "stopping"), proto: 2 }] })}\n`, { mode: 0o600 });
   const runtime = await createDaemonRuntime({
     root: stateRoot, inspect,
     signalProcessGroupImpl: async () => {},
     stopPolicy: { gracefulMs: 200, terminateMs: 200 },
   });
   runtimes.push(runtime);
-  startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "stopping", runId: "run-stopping", leaseId: "lease-stopping", generation: 1, identity, piChildIdentity: piChild, token: "stopping-token", results: { get_state: { sessionId: "stopping", isStreaming: true } } });
+  startPersistentFakeWorker(stateRoot, { sessionId: "stopping", runId: "run-stopping", leaseId: "lease-stopping", generation: 1, identity, piChildIdentity: piChild, token: "stopping-token", results: { get_state: { sessionId: "stopping", isStreaming: true } } });
   await runtime.ready;
   const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
   await client.ready;
@@ -403,10 +417,10 @@ it("clears a stale WORKING session when the reconnected worker reports an idle P
   const registry = new RegistryStore(join(stateRoot, "sessions"));
   const now = "2026-08-25T12:00:00.000Z";
   await registry.create({ schemaVersion: 1, revision: 0, sessionId: "stale", sessionFile: "/sessions/stale.jsonl", canonicalSessionFile: "/sessions/stale.jsonl", cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "assistant_stream", summary: "Pi assistant streaming", updatedAt: now }, ownership: { kind: "managed", runId: "run-stale", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-stale", createdAt: now, updatedAt: now });
-  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "stale", runId: "run-stale", leaseId: "lease-stale", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "stale", runId: "run-stale", leaseId: "lease-stale", generation: 1, identity, piChildIdentity: piChild, token: "stale-token", socketPath: workerSocketPath(stateRoot, "stale"), proto: 2 }] })}\n`, { mode: 0o600 });
   const runtime = await createDaemonRuntime({ root: stateRoot, inspect });
   runtimes.push(runtime);
-  startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "stale", runId: "run-stale", leaseId: "lease-stale", generation: 1, identity, piChildIdentity: piChild, token: "stale-token", results: { get_state: { sessionId: "stale", isStreaming: false } } });
+  startPersistentFakeWorker(stateRoot, { sessionId: "stale", runId: "run-stale", leaseId: "lease-stale", generation: 1, identity, piChildIdentity: piChild, token: "stale-token", results: { get_state: { sessionId: "stale", isStreaming: false } } });
   await runtime.ready;
 
   await vi.waitFor(async () => expect(await registry.get("stale")).toMatchObject({ taskState: "READY", processState: "LIVE" }), { timeout: 5_000 });
@@ -422,10 +436,10 @@ it("marks a ready session working when the reconnected worker reports a streamin
   const now = "2026-08-25T12:00:00.000Z";
   // A turn that starts while the worker is disconnected drops its agent_start, so the row reads READY.
   await registry.create({ schemaVersion: 1, revision: 0, sessionId: "resumed", sessionFile: "/sessions/resumed.jsonl", canonicalSessionFile: "/sessions/resumed.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "assistant_final", summary: "done", updatedAt: now }, ownership: { kind: "managed", runId: "run-resumed", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-resumed", createdAt: now, updatedAt: now });
-  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "resumed", runId: "run-resumed", leaseId: "lease-resumed", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "resumed", runId: "run-resumed", leaseId: "lease-resumed", generation: 1, identity, piChildIdentity: piChild, token: "resumed-token", socketPath: workerSocketPath(stateRoot, "resumed"), proto: 2 }] })}\n`, { mode: 0o600 });
   const runtime = await createDaemonRuntime({ root: stateRoot, inspect });
   runtimes.push(runtime);
-  startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "resumed", runId: "run-resumed", leaseId: "lease-resumed", generation: 1, identity, piChildIdentity: piChild, token: "resumed-token", results: { get_state: { sessionId: "resumed", isStreaming: true } } });
+  startPersistentFakeWorker(stateRoot, { sessionId: "resumed", runId: "run-resumed", leaseId: "lease-resumed", generation: 1, identity, piChildIdentity: piChild, token: "resumed-token", results: { get_state: { sessionId: "resumed", isStreaming: true } } });
   await runtime.ready;
 
   await vi.waitFor(async () => expect(await registry.get("resumed")).toMatchObject({ taskState: "WORKING", processState: "LIVE" }), { timeout: 5_000 });
@@ -480,10 +494,10 @@ it("keeps the worker connection when a concurrent record write loses the worker 
   const registry = new RegistryStore(join(stateRoot, "sessions"));
   const now = "2026-08-25T12:00:00.000Z";
   await registry.create({ schemaVersion: 1, revision: 0, sessionId: "cas", sessionFile: "/sessions/cas.jsonl", canonicalSessionFile: "/sessions/cas.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "idle", summary: "Idle", updatedAt: now }, ownership: { kind: "managed", runId: "run-cas", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-cas", createdAt: now, updatedAt: now });
-  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "cas", runId: "run-cas", leaseId: "lease-cas", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "cas", runId: "run-cas", leaseId: "lease-cas", generation: 1, identity, piChildIdentity: piChild, token: "cas-token", socketPath: workerSocketPath(stateRoot, "cas"), proto: 2 }] })}\n`, { mode: 0o600 });
   const runtime = await createDaemonRuntime({ root: stateRoot, inspect, reconnectTimeoutMs: 1_000 });
   runtimes.push(runtime);
-  const worker = startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "cas", runId: "run-cas", leaseId: "lease-cas", generation: 1, identity, piChildIdentity: piChild, token: "cas-token" });
+  const worker = startPersistentFakeWorker(stateRoot, { sessionId: "cas", runId: "run-cas", leaseId: "lease-cas", generation: 1, identity, piChildIdentity: piChild, token: "cas-token" });
   await runtime.ready;
   await vi.waitFor(() => expect(worker.connectionCount).toBe(1));
 
@@ -619,10 +633,10 @@ it("refuses a session query and serves session toggles from the owning worker", 
   const registry = new RegistryStore(join(stateRoot, "sessions"));
   const now = "2026-08-25T12:00:00.000Z";
   await registry.create({ schemaVersion: 1, revision: 0, sessionId: "query", sessionFile: "/sessions/query.jsonl", canonicalSessionFile: "/sessions/query.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-query", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-query", createdAt: now, updatedAt: now });
-  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "query", runId: "run-query", leaseId: "lease-query", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "query", runId: "run-query", leaseId: "lease-query", generation: 1, identity, piChildIdentity: piChild, token: "query-token", socketPath: workerSocketPath(stateRoot, "query"), proto: 2 }] })}\n`, { mode: 0o600 });
   const runtime = await createDaemonRuntime({ root: stateRoot, inspect });
   runtimes.push(runtime);
-  const worker = startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "query", runId: "run-query", leaseId: "lease-query", generation: 1, identity, piChildIdentity: piChild, token: "query-token", results: {} });
+  const worker = startPersistentFakeWorker(stateRoot, { sessionId: "query", runId: "run-query", leaseId: "lease-query", generation: 1, identity, piChildIdentity: piChild, token: "query-token", results: {} });
   await runtime.ready;
   const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
   await client.ready;
@@ -661,10 +675,10 @@ it("bounds a worker request that is never answered and reports it as ambiguous",
   const registry = new RegistryStore(join(stateRoot, "sessions"));
   const now = "2026-08-25T12:00:00.000Z";
   await registry.create({ schemaVersion: 1, revision: 0, sessionId: "silent", sessionFile: "/sessions/silent.jsonl", canonicalSessionFile: "/sessions/silent.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-silent", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-silent", createdAt: now, updatedAt: now });
-  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "silent", runId: "run-silent", leaseId: "lease-silent", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "silent", runId: "run-silent", leaseId: "lease-silent", generation: 1, identity, piChildIdentity: piChild, token: "silent-token", socketPath: workerSocketPath(stateRoot, "silent"), proto: 2 }] })}\n`, { mode: 0o600 });
   const runtime = await createDaemonRuntime({ root: stateRoot, inspect, workerRequestTimeoutMs: 150 });
   runtimes.push(runtime);
-  const worker = startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "silent", runId: "run-silent", leaseId: "lease-silent", generation: 1, identity, piChildIdentity: piChild, token: "silent-token", silent: true });
+  const worker = startPersistentFakeWorker(stateRoot, { sessionId: "silent", runId: "run-silent", leaseId: "lease-silent", generation: 1, identity, piChildIdentity: piChild, token: "silent-token", silent: true });
   await runtime.ready;
   const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
   await client.ready;
@@ -691,10 +705,10 @@ it("answers a routed command with no durable stage and writes no command journal
   const registry = new RegistryStore(join(stateRoot, "sessions"));
   const now = "2026-08-25T12:00:00.000Z";
   await registry.create({ schemaVersion: 1, revision: 0, sessionId: "inbox", sessionFile: "/sessions/inbox.jsonl", canonicalSessionFile: "/sessions/inbox.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-inbox", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-inbox", createdAt: now, updatedAt: now });
-  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "inbox", runId: "run-inbox", leaseId: "lease-inbox", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "inbox", runId: "run-inbox", leaseId: "lease-inbox", generation: 1, identity, piChildIdentity: piChild, token: "inbox-token", socketPath: workerSocketPath(stateRoot, "inbox"), proto: 2 }] })}\n`, { mode: 0o600 });
   const runtime = await createDaemonRuntime({ root: stateRoot, inspect });
   runtimes.push(runtime);
-  const worker = startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "inbox", runId: "run-inbox", leaseId: "lease-inbox", generation: 1, identity, piChildIdentity: piChild, token: "inbox-token", results: {} });
+  const worker = startPersistentFakeWorker(stateRoot, { sessionId: "inbox", runId: "run-inbox", leaseId: "lease-inbox", generation: 1, identity, piChildIdentity: piChild, token: "inbox-token", results: {} });
   await runtime.ready;
   const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
   await client.ready;
@@ -720,11 +734,11 @@ it("discovers slash commands and delivers one session command to the owning work
   const registry = new RegistryStore(join(stateRoot, "sessions"));
   const now = "2026-08-25T12:00:00.000Z";
   await registry.create({ schemaVersion: 1, revision: 0, sessionId: "menu", sessionFile: "/sessions/menu.jsonl", canonicalSessionFile: "/sessions/menu.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-menu", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-menu", createdAt: now, updatedAt: now });
-  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "menu", runId: "run-menu", leaseId: "lease-menu", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "menu", runId: "run-menu", leaseId: "lease-menu", generation: 1, identity, piChildIdentity: piChild, token: "menu-token", socketPath: workerSocketPath(stateRoot, "menu"), proto: 2 }] })}\n`, { mode: 0o600 });
   const runtime = await createDaemonRuntime({ root: stateRoot, inspect });
   runtimes.push(runtime);
   const menu = { commands: [{ name: "/review", source: "extension", description: "Review" }], models: [{ provider: "anthropic", id: "claude" }], model: { provider: "anthropic", id: "claude" }, thinkingLevels: ["off", "high"], thinkingLevel: "high" };
-  const worker = startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "menu", runId: "run-menu", leaseId: "lease-menu", generation: 1, identity, piChildIdentity: piChild, token: "menu-token", results: { get_session_commands: menu } });
+  const worker = startPersistentFakeWorker(stateRoot, { sessionId: "menu", runId: "run-menu", leaseId: "lease-menu", generation: 1, identity, piChildIdentity: piChild, token: "menu-token", results: { get_session_commands: menu } });
   await runtime.ready;
   const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
   await client.ready;
@@ -1061,10 +1075,10 @@ it("durably admits authenticated Pi frames while worker reconnect reconciliation
   const registry = new RegistryStore(join(stateRoot, "sessions"));
   const now = "2026-08-25T12:00:00.000Z";
   await registry.create({ schemaVersion: 1, revision: 0, sessionId: "early", sessionFile: "/sessions/early.jsonl", canonicalSessionFile: "/sessions/early.jsonl", cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-early", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-early", createdAt: now, updatedAt: now });
-  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "early", runId: "run-early", leaseId: "lease-early", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "early", runId: "run-early", leaseId: "lease-early", generation: 1, identity, piChildIdentity: piChild, token: "early-token", socketPath: workerSocketPath(stateRoot, "early"), proto: 2 }] })}\n`, { mode: 0o600 });
   const runtime = await createDaemonRuntime({ root: stateRoot, inspect, reconnectTimeoutMs: 1_000 });
   runtimes.push(runtime);
-  startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "early", runId: "run-early", leaseId: "lease-early", generation: 1, identity, piChildIdentity: piChild, token: "early-token", framesAfterReady: [{ type: "message_end", message: { role: "user", content: "during recovery", timestamp: Date.parse(now) } }] });
+  startPersistentFakeWorker(stateRoot, { sessionId: "early", runId: "run-early", leaseId: "lease-early", generation: 1, identity, piChildIdentity: piChild, token: "early-token", framesAfterReady: [{ type: "message_end", message: { role: "user", content: "during recovery", timestamp: Date.parse(now) } }] });
   await runtime.ready;
   const frontend = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 4096 });
   await frontend.ready;
@@ -1082,10 +1096,10 @@ it("ingests Pi frames and keeps their order while a lifecycle operation holds th
   const registry = new RegistryStore(join(stateRoot, "sessions"));
   const now = "2026-08-25T12:00:00.000Z";
   await registry.create({ schemaVersion: 1, revision: 0, sessionId: "stream", sessionFile: "/sessions/stream.jsonl", canonicalSessionFile: "/sessions/stream.jsonl", cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-stream", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-stream", createdAt: now, updatedAt: now });
-  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "stream", runId: "run-stream", leaseId: "lease-stream", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "stream", runId: "run-stream", leaseId: "lease-stream", generation: 1, identity, piChildIdentity: piChild, token: "stream-token", socketPath: workerSocketPath(stateRoot, "stream"), proto: 2 }] })}\n`, { mode: 0o600 });
   const runtime = await createDaemonRuntime({ root: stateRoot, inspect, reconnectTimeoutMs: 1_000 });
   runtimes.push(runtime);
-  const worker = startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "stream", runId: "run-stream", leaseId: "lease-stream", generation: 1, identity, piChildIdentity: piChild, token: "stream-token" });
+  const worker = startPersistentFakeWorker(stateRoot, { sessionId: "stream", runId: "run-stream", leaseId: "lease-stream", generation: 1, identity, piChildIdentity: piChild, token: "stream-token" });
   await runtime.ready;
   const frontend = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 65536 });
   await frontend.ready;
@@ -1138,10 +1152,10 @@ it("reconnects two surviving fake workers through the concrete connector after d
   for (const worker of workers) {
     await registry.create({ schemaVersion: 1, revision: 0, sessionId: worker.sessionId, sessionFile: `/sessions/${worker.sessionId}.jsonl`, canonicalSessionFile: `/sessions/${worker.sessionId}.jsonl`, cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: worker.runId, process: worker.identity, acquiredAt: now, heartbeatAt: now }, latestRunId: worker.runId, createdAt: now, updatedAt: now });
   }
-  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: workers.map(({ token: _token, malformedRequestId: _malformedRequestId, ...worker }) => worker) })}\n`, { mode: 0o600 });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: workers.map(({ malformedRequestId: _malformedRequestId, results: _results, ...worker }) => ({ ...worker, socketPath: workerSocketPath(stateRoot, worker.sessionId), proto: 2 })) })}\n`, { mode: 0o600 });
 
   const firstRuntime = await createDaemonRuntime({ root: stateRoot, inspect, hostProbe: async () => ({ blockers: [] }), reconnectTimeoutMs: 1_000 });
-  const loops = workers.map((worker) => startPersistentFakeWorker({ socketPath: firstRuntime.socketPath, tokenPath: firstRuntime.tokenPath }, worker));
+  const loops = workers.map((worker) => startPersistentFakeWorker(stateRoot, worker));
   await firstRuntime.ready;
   const frontend = connect({ socketPath: firstRuntime.socketPath, token: firstRuntime.token });
   await frontend.ready;
@@ -1220,11 +1234,11 @@ it("adopts live workers of every release and reports each one's release and rout
   for (const worker of workers) {
     await registry.create({ schemaVersion: 1, revision: 0, sessionId: worker.sessionId, sessionFile: `/sessions/${worker.sessionId}.jsonl`, canonicalSessionFile: `/sessions/${worker.sessionId}.jsonl`, cwd: "/repo", taskState: "WAITING", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: worker.runId, process: worker.identity, acquiredAt: now, heartbeatAt: now }, latestRunId: worker.runId, createdAt: now, updatedAt: now });
   }
-  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: workers.map(({ token: _token, ...worker }) => worker) })}\n`, { mode: 0o600 });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: workers.map((worker) => ({ ...worker, socketPath: workerSocketPath(stateRoot, worker.sessionId), proto: 2 })) })}\n`, { mode: 0o600 });
 
   const runtime = await createDaemonRuntime({ root: stateRoot, inspect, hostProbe: async () => ({ blockers: [] }), reconnectTimeoutMs: 2_000, cliVersion: "2.0.0" });
   runtimes.push(runtime);
-  const loops = workers.map((worker) => startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, worker));
+  const loops = workers.map((worker) => startPersistentFakeWorker(stateRoot, worker));
   await runtime.ready;
   const frontend = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 64 * 1024 });
   // An older or unknown worker never refuses daemon startup.
@@ -1269,7 +1283,7 @@ async function replaceableWorker({ sessionId, cliVersion, taskState, activityKin
   let alive = true;
   const registry = new RegistryStore(join(stateRoot, "sessions"));
   await registry.create({ schemaVersion: 1, revision: 0, sessionId, sessionFile: join(stateRoot, `${sessionId}.jsonl`), canonicalSessionFile: join(stateRoot, `${sessionId}.jsonl`), cwd: stateRoot, taskState, processState: "LIVE", outcome: "NONE", activity: { kind: activityKind, summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: `run-${sessionId}`, process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: `run-${sessionId}`, createdAt: now, updatedAt: now });
-  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId, runId: `run-${sessionId}`, leaseId: `lease-${sessionId}`, generation: 1, identity, piChildIdentity, ...(cliVersion === undefined ? {} : { cliVersion }), ...(pendingRespawn === undefined ? {} : { pendingRespawn }) }] })}\n`, { mode: 0o600 });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId, runId: `run-${sessionId}`, leaseId: `lease-${sessionId}`, generation: 1, identity, piChildIdentity, token: `${sessionId}-token`, socketPath: workerSocketPath(stateRoot, sessionId), proto: 2, ...(cliVersion === undefined ? {} : { cliVersion }), ...(pendingRespawn === undefined ? {} : { pendingRespawn }) }] })}\n`, { mode: 0o600 });
   /** @type {Array<[number, string]>} */
   const signals = [];
   /** @type {string[]} */
@@ -1295,7 +1309,7 @@ async function replaceableWorker({ sessionId, cliVersion, taskState, activityKin
     workerSupervisor: { useRouter() {}, async launch(/** @type {any} */ request) { launches.push(request.sessionId); return { sessionId: request.sessionId }; }, async close() {} },
   });
   runtimes.push(runtime);
-  const loop = startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId, runId: `run-${sessionId}`, leaseId: `lease-${sessionId}`, generation: 1, identity, piChildIdentity, token: `${sessionId}-token` });
+  const loop = startPersistentFakeWorker(stateRoot, { sessionId, runId: `run-${sessionId}`, leaseId: `lease-${sessionId}`, generation: 1, identity, piChildIdentity, token: `${sessionId}-token` });
   await runtime.ready;
   await vi.waitFor(() => expect(runtime.status().connectedWorkers).toContain(sessionId), { timeout: 5_000, interval: 25 });
   return { stateRoot, registry, runtime, loop, identity, signals, launches, diagnostics, now };
@@ -1367,7 +1381,7 @@ async function burstReplaceableWorkers(sessionIds) {
   for (const worker of workers) {
     await registry.create({ schemaVersion: 1, revision: 0, sessionId: worker.sessionId, sessionFile: join(stateRoot, `${worker.sessionId}.jsonl`), canonicalSessionFile: join(stateRoot, `${worker.sessionId}.jsonl`), cwd: stateRoot, taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "tool", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: worker.runId, process: worker.identity, acquiredAt: now, heartbeatAt: now }, latestRunId: worker.runId, createdAt: now, updatedAt: now });
   }
-  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: workers.map(({ token: _token, ...worker }) => worker) })}\n`, { mode: 0o600 });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: workers.map((worker) => ({ ...worker, socketPath: workerSocketPath(stateRoot, worker.sessionId), proto: 2 })) })}\n`, { mode: 0o600 });
   const identities = new Map(workers.flatMap((worker) => [[worker.identity.pid, worker.identity], [worker.piChildIdentity.pid, worker.piChildIdentity]]));
   const groups = new Map(workers.map((worker) => [worker.identity.processGroupId, [worker.identity.pid, worker.piChildIdentity.pid]]));
   const livePids = new Set(identities.keys());
@@ -1406,7 +1420,7 @@ async function burstReplaceableWorkers(sessionIds) {
     },
   });
   runtimes.push(runtime);
-  const loops = Object.fromEntries(workers.map((worker) => [worker.sessionId, startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, worker)]));
+  const loops = Object.fromEntries(workers.map((worker) => [worker.sessionId, startPersistentFakeWorker(stateRoot, worker)]));
   await runtime.ready;
   await vi.waitFor(() => expect(runtime.status().connectedWorkers).toHaveLength(workers.length), { timeout: 5_000, interval: 25 });
   /** Let one held replacement launch finish. Releasing an already released launch does nothing. @param {string} sessionId */
@@ -1586,6 +1600,62 @@ it("admits no second writer when a dead supervisor leaves a live Pi child", asyn
   client.close();
 });
 
+// Operator-visible failure: a worker spawned by the previous release listens on nothing, because
+// that release had the daemon listen and the worker connect out. A daemon that refused to start over
+// it would take every other session down with it, and one that said nothing would leave a session
+// the operator can see refusing his text for no stated reason.
+it("starts over a worker from the previous release, says why it is out of reach on its own row, and never signals it", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const now = "2026-08-25T00:00:00.000Z";
+  const identity = { pid: 931, startIdentity: "previous-release-supervisor", processGroupId: 931 };
+  const piChild = { pid: 932, startIdentity: "previous-release-pi", processGroupId: 931 };
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "outbound", sessionFile: "/sessions/outbound.jsonl", canonicalSessionFile: "/sessions/outbound.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "assistant_final", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-outbound", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-outbound", createdAt: now, updatedAt: now });
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "saved", sessionFile: "/sessions/saved.jsonl", canonicalSessionFile: "/sessions/saved.jsonl", cwd: "/repo", taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "saved_session", summary: "Saved", updatedAt: now }, createdAt: now, updatedAt: now });
+  // Exactly what the previous release wrote: a run with a token and no socket, at worker protocol 1.
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "outbound", runId: "run-outbound", leaseId: "lease-outbound", generation: 1, identity, piChildIdentity: piChild, token: "outbound-token", proto: 1 }] })}\n`, { mode: 0o600 });
+  /** @type {any[]} */
+  const diagnostics = [];
+  /** @type {any[]} */
+  const signals = [];
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    reconnectTimeoutMs: 500,
+    recordDiagnostic: (/** @type {any} */ entry) => diagnostics.push(entry),
+    signalProcessGroupImpl: (/** @type {number} */ pgid, /** @type {string} */ signal) => { signals.push({ pgid, signal }); },
+    inspect: async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === identity.pid ? identity : piChild,
+  });
+  runtimes.push(runtime);
+
+  // The daemon starts. Refusing here would strand every session on this root, not just this one.
+  await expect(runtime.ready).resolves.toBeDefined();
+  expect(runtime.status()).toMatchObject({ state: "READY" });
+  expect(diagnostics).toContainEqual(expect.objectContaining({
+    event: "worker_unreachable",
+    sessionId: "outbound",
+    code: "WORKER_PROTOCOL_INCOMPATIBLE",
+    fix: expect.stringContaining("pi-agents stop <full-session-id> --revision <n> --yes"),
+  }));
+
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 65536 });
+  await client.ready;
+  client.send({ version: 1, clientId: "operator", requestId: "rows", op: "get_state", payload: {} });
+  const rows = /** @type {any} */ (await client.next()).result.sessions;
+  expect(rows.find((/** @type {any} */ row) => row.sessionId === "outbound")).toMatchObject({ workerUnreachable: "WORKER_PROTOCOL_INCOMPATIBLE" });
+  // Only that session says it. A session with no worker at all is unchanged.
+  expect(rows.find((/** @type {any} */ row) => row.sessionId === "saved")).not.toHaveProperty("workerUnreachable");
+
+  // His text is refused by name, with the fix on the refusal, rather than waiting out a delivery bound.
+  client.send({ version: 1, clientId: "operator", requestId: "text", op: "prompt", payload: { sessionId: "outbound", text: "are you there" } });
+  expect(await client.next()).toMatchObject({ ok: false, error: { code: "WORKER_PROTOCOL_INCOMPATIBLE", message: expect.stringContaining("pi-agents stop") } });
+
+  // Nothing was signalled: the worker and its Pi child keep running, and Stop is still his to take.
+  expect(signals).toEqual([]);
+  expect((await registry.get("outbound"))?.ownership).toMatchObject({ runId: "run-outbound" });
+  client.close();
+});
+
 it("relaunches a stopped session whose recorded worker processes are both gone", async () => {
   const stateRoot = await root();
   for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
@@ -1629,10 +1699,10 @@ it("records the model Pi actually selected so the list can show it", async () =>
   const now = "2026-08-25T12:00:00.000Z";
   // A launch that names no model still runs on Pi's default, and the row must say which.
   await registry.create({ schemaVersion: 1, revision: 0, sessionId: "modelled", sessionFile: "/sessions/modelled.jsonl", canonicalSessionFile: "/sessions/modelled.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "assistant_final", summary: "done", updatedAt: now }, ownership: { kind: "managed", runId: "run-modelled", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-modelled", createdAt: now, updatedAt: now });
-  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "modelled", runId: "run-modelled", leaseId: "lease-modelled", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "modelled", runId: "run-modelled", leaseId: "lease-modelled", generation: 1, identity, piChildIdentity: piChild, token: "modelled-token", socketPath: workerSocketPath(stateRoot, "modelled"), proto: 2 }] })}\n`, { mode: 0o600 });
   const runtime = await createDaemonRuntime({ root: stateRoot, inspect });
   runtimes.push(runtime);
-  startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "modelled", runId: "run-modelled", leaseId: "lease-modelled", generation: 1, identity, piChildIdentity: piChild, token: "modelled-token", results: { get_state: { sessionId: "modelled", isStreaming: false, model: { provider: "openai-codex", id: "gpt-5.6-sol" }, thinkingLevel: "high" } } });
+  startPersistentFakeWorker(stateRoot, { sessionId: "modelled", runId: "run-modelled", leaseId: "lease-modelled", generation: 1, identity, piChildIdentity: piChild, token: "modelled-token", results: { get_state: { sessionId: "modelled", isStreaming: false, model: { provider: "openai-codex", id: "gpt-5.6-sol" }, thinkingLevel: "high" } } });
   await runtime.ready;
 
   await vi.waitFor(async () => expect(await registry.get("modelled")).toMatchObject({ model: { provider: "openai-codex", id: "gpt-5.6-sol" }, thinkingLevel: "high" }), { timeout: 5_000 });
@@ -1792,6 +1862,8 @@ it("orders viewer frames across startup route adoption", async () => {
   let runtime;
   /** @type {any} */
   let worker;
+  /** @type {any} */
+  let listener;
   runtime = await createDaemonRuntime({
     root: stateRoot,
     inspect,
@@ -1804,23 +1876,25 @@ it("orders viewer frames across startup route adoption", async () => {
       /** @param {any} suppliedRouter */
       useRouter(suppliedRouter) { router = suppliedRouter; },
       async launch() {
+        // The reservation names this run's socket before anything is spawned; the worker listens on
+        // it, and the daemon connects. Nothing here is a startup connection the worker had to make.
         const reservation = await router.reserve({ sessionId: "ordered", runId: "run-ordered", leaseId: "lease-ordered", generation: 1, token: "ordered-run-token" });
-        worker = connect({ socketPath: runtime.socketPath, token: runtime.token, role: "worker", maxBytes: 8192 });
-        await worker.ready;
-        worker.send({ version: 1, type: "hello", token: "ordered-run-token", sessionId: "ordered", runId: "run-ordered", leaseId: "lease-ordered", generation: 1, worker: identity });
-        // These three reach the daemon while the hello is still waiting for the spawned PID.
-        worker.send(message(0));
-        worker.send(message(1));
-        worker.send(turnStart);
-        reservation.spawned(identity.pid);
-        await reservation.connected(4_000);
+        listener = await listenForDaemon({ socketPath: reservation.socketPath, token: "ordered-run-token", maxBytes: 8192 });
+        const connected = reservation.connected(identity.pid, 4_000);
+        worker = await listener.next();
+        await worker.send({ version: 1, type: "hello", token: "ordered-run-token", sessionId: "ordered", runId: "run-ordered", leaseId: "lease-ordered", generation: 1, worker: identity });
+        // These three reach the daemon while the launch is still verifying who answered.
+        await worker.send(message(0));
+        await worker.send(message(1));
+        await worker.send(turnStart);
+        await connected;
         const current = await registry.get("ordered");
         if (current === undefined) throw new Error("ordered record missing");
         await registry.update("ordered", current.revision, { ownership: { kind: "managed", runId: "run-ordered", process: identity, acquiredAt: createdAt, heartbeatAt: createdAt }, latestRunId: "run-ordered", processState: "LIVE", updatedAt: createdAt });
-        worker.send({ version: 1, type: "worker_ready", token: "ordered-run-token", sessionId: "ordered", runId: "run-ordered", leaseId: "lease-ordered", generation: 1, worker: identity, piChild });
+        await worker.send({ version: 1, type: "worker_ready", token: "ordered-run-token", sessionId: "ordered", runId: "run-ordered", leaseId: "lease-ordered", generation: 1, worker: identity, piChild });
         const ready = await reservation.waitFor("worker_ready", 4_000);
         // This one arrives while the route is being adopted.
-        worker.send(message(2));
+        await worker.send(message(2));
         await router.register({ sessionId: "ordered", runId: "run-ordered", leaseId: "lease-ordered", generation: 1, identity, piChildIdentity: piChild });
         const route = await router.adopt(ready, reservation.connection);
         reservation.adopt(route);
@@ -1855,13 +1929,14 @@ it("orders viewer frames across startup route adoption", async () => {
 
   // And these two arrive over the adopted route, after the subscription: each crosses the seam once,
   // in source order, with a distinct stable ID and a distinct cursor.
-  worker.send(message(3));
-  worker.send(message(4));
+  await worker.send(message(3));
+  await worker.send(message(4));
   const delivered = [await client.next(), await client.next()];
   expect(delivered.map((/** @type {any} */ event) => event.payload.content[0].text)).toEqual(["frame 3", "frame 4"]);
   expect(new Set(delivered.map((/** @type {any} */ event) => event.eventId)).size).toBe(2);
   expect(delivered.map((/** @type {any} */ event) => BigInt(event.cursor.sequence) - BigInt(subscribed.result.cursor.sequence))).toEqual([1n, 2n]);
   worker.close();
+  await listener.close();
   client.close();
 });
 
@@ -1920,7 +1995,7 @@ async function liveSessionRoot(stateRoot, sessionId) {
   const registry = new RegistryStore(join(stateRoot, "sessions"));
   await registry.create({ schemaVersion: 1, revision: 0, sessionId, sessionFile: `/sessions/${sessionId}.jsonl`, canonicalSessionFile: `/sessions/${sessionId}.jsonl`, cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-shared", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-shared", createdAt: now, updatedAt: now });
   const worker = { sessionId, runId: "run-shared", leaseId: "lease-shared", generation: 1, identity, piChildIdentity, token: "shared-worker-token" };
-  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId, runId: worker.runId, leaseId: worker.leaseId, generation: 1, identity, piChildIdentity, token: worker.token }] })}\n`, { mode: 0o600 });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId, runId: worker.runId, leaseId: worker.leaseId, generation: 1, identity, piChildIdentity, token: worker.token, socketPath: workerSocketPath(stateRoot, sessionId), proto: 2 }] })}\n`, { mode: 0o600 });
   return { inspect, registry, worker };
 }
 
@@ -1931,7 +2006,7 @@ it("orders concurrent commands from three dashboard processes on one session", a
   const { inspect, worker } = await liveSessionRoot(stateRoot, "shared");
   const runtime = await createDaemonRuntime({ root: stateRoot, inspect, reconnectTimeoutMs: 1_000 });
   runtimes.push(runtime);
-  const loop = startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, worker);
+  const loop = startPersistentFakeWorker(stateRoot, worker);
   await runtime.ready;
 
   // Three dashboard processes of one installation: three process-scoped attachIds, one stable clientId.
@@ -1960,7 +2035,7 @@ it("leaves worker identity exactly as it was when the daemon restarts mid-sessio
   const stateRoot = await root();
   const { inspect, registry, worker } = await liveSessionRoot(stateRoot, "resident");
   const firstRuntime = await createDaemonRuntime({ root: stateRoot, inspect, reconnectTimeoutMs: 1_000 });
-  const loop = startPersistentFakeWorker({ socketPath: firstRuntime.socketPath, tokenPath: firstRuntime.tokenPath }, worker);
+  const loop = startPersistentFakeWorker(stateRoot, worker);
   await firstRuntime.ready;
   const before = connect({ socketPath: firstRuntime.socketPath, token: firstRuntime.token, attachId: "attach-before", maxBytes: 8192 });
   expect(await before.ready).toMatchObject({ version: 1, kind: "authenticated" });

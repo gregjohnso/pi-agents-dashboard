@@ -12,6 +12,7 @@ import { createDashboardLayout, renderSessionRow } from "../app/list/dashboard-l
 import { createDaemonRuntime } from "../runtime/daemon.mjs";
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
 import { RegistryStore } from "../runtime/registry-store.mjs";
+import { startListeningWorker } from "../runtime/test-fixtures.mjs";
 import { CLIENT_PROTOCOL } from "../shared/contracts.mjs";
 import { forbidMutationBeneath, mutationAttempts, releaseMutationGuards } from "./fixtures/path-mutation-guard.mjs";
 
@@ -33,8 +34,13 @@ afterEach(async () => {
 async function fixtureRoot() {
   const root = await mkdtemp(join(tmpdir(), "dashboard-destructive-"));
   roots.push(root);
-  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(root, name), { mode: 0o700 });
+  for (const name of ["daemon", "daemon/workers", "sessions", "runs", "index"]) await mkdir(join(root, name), { mode: 0o700 });
   return root;
+}
+
+/** The socket one run's worker listens on, which the daemon names before it spawns. */
+function workerSocketPath(root, sessionId) {
+  return join(root, "daemon", "workers", `${sessionId}.sock`);
 }
 
 function record(root, sessionId, overrides = {}) {
@@ -99,7 +105,7 @@ it("escalates Stop through the exact group and leaves task/outcome independent",
   });
   await writeFile(session.canonicalSessionFile, "session\n");
   await registry.create(session);
-  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: session.sessionId, runId: "run-stop", leaseId: "lease-stop", generation: 1, identity: worker, piChildIdentity: worker }] })}\n`, { mode: 0o600 });
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: session.sessionId, runId: "run-stop", leaseId: "lease-stop", generation: 1, identity: worker, piChildIdentity: worker, token: "worker-token", socketPath: workerSocketPath(root, session.sessionId), proto: 2 }] })}\n`, { mode: 0o600 });
   const signals = [];
   const runtime = await createDaemonRuntime({
     root,
@@ -117,9 +123,8 @@ it("escalates Stop through the exact group and leaves task/outcome independent",
     },
   });
   runtimes.push(runtime);
-  const workerSocket = connect(runtime, "worker");
-  await workerSocket.next();
-  workerSocket.send({ version: 1, type: "worker_ready", token: "worker-token", sessionId: session.sessionId, runId: "run-stop", leaseId: "lease-stop", generation: 1, worker, piChild: worker });
+  const workerSocket = await startListeningWorker({ socketPath: workerSocketPath(root, session.sessionId), token: "worker-token", sessionId: session.sessionId, runId: "run-stop", leaseId: "lease-stop", generation: 1, worker, piChild: worker });
+  await vi.waitFor(() => expect(runtime.status().connectedWorkers).toContain(session.sessionId), { timeout: 5_000, interval: 25 });
   await runtime.ready;
 
   const frontend = connect(runtime);
@@ -145,7 +150,7 @@ it("escalates Stop through the exact group and leaves task/outcome independent",
   expect(stopped.ownership).toBeUndefined();
   await expect(access(join(root, "queue"))).rejects.toMatchObject({ code: "ENOENT" });
   frontend.close();
-  workerSocket.close();
+  await workerSocket.stop();
 });
 
 // Operator-visible failure: an upgrade that replaced a worker without the destructive convention would
@@ -163,7 +168,7 @@ it("respawns a stale worker through the guarded destructive path and preserves t
   });
   await writeFile(session.canonicalSessionFile, "session\n");
   await registry.create(session);
-  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: session.sessionId, runId: "run-respawn", leaseId: "lease-respawn", generation: 1, identity: worker, piChildIdentity: worker, cliVersion: "1.9.0" }] })}\n`, { mode: 0o600 });
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: session.sessionId, runId: "run-respawn", leaseId: "lease-respawn", generation: 1, identity: worker, piChildIdentity: worker, token: "respawn-token", socketPath: workerSocketPath(root, session.sessionId), proto: 2, cliVersion: "1.9.0" }] })}\n`, { mode: 0o600 });
   const signals = [];
   const launches = [];
   const diagnostics = [];
@@ -186,9 +191,8 @@ it("respawns a stale worker through the guarded destructive path and preserves t
     workerSupervisor: { useRouter() {}, async launch(request) { launches.push(request.sessionId); return { sessionId: request.sessionId }; }, async close() {} },
   });
   runtimes.push(runtime);
-  const workerSocket = connect(runtime, "worker");
-  await workerSocket.next();
-  workerSocket.send({ version: 1, type: "worker_ready", token: "respawn-token", sessionId: session.sessionId, runId: "run-respawn", leaseId: "lease-respawn", generation: 1, worker, piChild: worker });
+  const workerSocket = await startListeningWorker({ socketPath: workerSocketPath(root, session.sessionId), token: "respawn-token", sessionId: session.sessionId, runId: "run-respawn", leaseId: "lease-respawn", generation: 1, worker, piChild: worker });
+  await vi.waitFor(() => expect(runtime.status().connectedWorkers).toContain(session.sessionId), { timeout: 5_000, interval: 25 });
   await runtime.ready;
   const frontend = connect(runtime);
   await frontend.next();
@@ -208,7 +212,7 @@ it("respawns a stale worker through the guarded destructive path and preserves t
   expect(await readFile(session.canonicalSessionFile, "utf8")).toBe("session\n");
   await expect(access(join(root, "queue"))).rejects.toMatchObject({ code: "ENOENT" });
   frontend.close();
-  workerSocket.close();
+  await workerSocket.stop();
 });
 
 // Operator-visible failure: the daemon replaced a stale worker at a safe boundary and left the row on
@@ -226,7 +230,7 @@ it("shows a replacement as work in progress on the row and in the transcript", a
   });
   await writeFile(session.canonicalSessionFile, "");
   await registry.create(session);
-  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: session.sessionId, runId: "run-visible", leaseId: "lease-visible", generation: 1, identity: worker, piChildIdentity: worker, cliVersion: "1.9.0" }] })}\n`, { mode: 0o600 });
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: session.sessionId, runId: "run-visible", leaseId: "lease-visible", generation: 1, identity: worker, piChildIdentity: worker, token: "visible-token", socketPath: workerSocketPath(root, session.sessionId), proto: 2, cliVersion: "1.9.0" }] })}\n`, { mode: 0o600 });
   // The row the operator stares at is the one the daemon holds while the replacement worker starts,
   // so it is read at the launch the replacement asks for, not after that launch has finished.
   const rowsWhileStarting = [];
@@ -249,9 +253,8 @@ it("shows a replacement as work in progress on the row and in the transcript", a
     },
   });
   runtimes.push(runtime);
-  const workerSocket = connect(runtime, "worker");
-  await workerSocket.next();
-  workerSocket.send({ version: 1, type: "worker_ready", token: "visible-token", sessionId: session.sessionId, runId: "run-visible", leaseId: "lease-visible", generation: 1, worker, piChild: worker });
+  const workerSocket = await startListeningWorker({ socketPath: workerSocketPath(root, session.sessionId), token: "visible-token", sessionId: session.sessionId, runId: "run-visible", leaseId: "lease-visible", generation: 1, worker, piChild: worker });
+  await vi.waitFor(() => expect(runtime.status().connectedWorkers).toContain(session.sessionId), { timeout: 5_000, interval: 25 });
   await runtime.ready;
   const frontend = connect(runtime);
   await frontend.next();
@@ -269,7 +272,7 @@ it("shows a replacement as work in progress on the row and in the transcript", a
   const snapshot = await frontend.next();
   expect(snapshot.result.snapshot.items.map((item) => item.text ?? "").join("\n")).toContain("Restarting this session's worker");
   frontend.close();
-  workerSocket.close();
+  await workerSocket.stop();
 });
 
 it("keeps stale ownership unresolved until exact terminal process evidence exists", async () => {
@@ -280,13 +283,12 @@ it("keeps stale ownership unresolved until exact terminal process evidence exist
   const session = record(root, "stale-stop", { processState: "LIVE", ownership: { kind: "managed", runId: "run-stale", process: worker, acquiredAt: "2026-08-25T12:00:00.000Z", heartbeatAt: "2026-08-25T12:00:00.000Z" }, latestRunId: "run-stale" });
   await writeFile(session.canonicalSessionFile, "session\n");
   await registry.create(session);
-  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: session.sessionId, runId: "run-stale", leaseId: "lease-stale", generation: 1, identity: worker, piChildIdentity: worker }] })}\n`, { mode: 0o600 });
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: session.sessionId, runId: "run-stale", leaseId: "lease-stale", generation: 1, identity: worker, piChildIdentity: worker, token: "stale-token", socketPath: workerSocketPath(root, session.sessionId), proto: 2 }] })}\n`, { mode: 0o600 });
   let stale = false;
   const runtime = await createDaemonRuntime({ root, reconnectTimeoutMs: 1_000, inspect: async (pid) => pid === process.pid ? { pid, startIdentity: "1", processGroupId: process.pid } : stale ? replacement : worker });
   runtimes.push(runtime);
-  const workerSocket = connect(runtime, "worker");
-  await workerSocket.next();
-  workerSocket.send({ version: 1, type: "worker_ready", token: "stale-token", sessionId: session.sessionId, runId: "run-stale", leaseId: "lease-stale", generation: 1, worker, piChild: worker });
+  const workerSocket = await startListeningWorker({ socketPath: workerSocketPath(root, session.sessionId), token: "stale-token", sessionId: session.sessionId, runId: "run-stale", leaseId: "lease-stale", generation: 1, worker, piChild: worker });
+  await vi.waitFor(() => expect(runtime.status().connectedWorkers).toContain(session.sessionId), { timeout: 5_000, interval: 25 });
   await runtime.ready;
   stale = true;
   const frontend = connect(runtime);
@@ -295,7 +297,7 @@ it("keeps stale ownership unresolved until exact terminal process evidence exist
   expect(await frontend.next()).toMatchObject({ ok: false, error: { code: "STALE_IDENTITY" } });
   expect(await registry.get(session.sessionId)).toMatchObject({ processState: "LIVE", ownership: { runId: "run-stale", process: worker } });
   frontend.close();
-  workerSocket.close();
+  await workerSocket.stop();
 });
 
 // Operator-visible failure: rm unlinking Pi's canonical session file or removing a managed worktree

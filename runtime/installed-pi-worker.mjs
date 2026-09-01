@@ -1,6 +1,5 @@
 import { spawn } from "node:child_process";
 import { createHash, timingSafeEqual } from "node:crypto";
-import { pathToFileURL } from "node:url";
 
 import { piConfirmedModel } from "../shared/contracts.mjs";
 import { openPiExecutableBinding } from "./pi-executable.mjs";
@@ -9,9 +8,11 @@ import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { openRotatingDiagnostics } from "./rotating-diagnostics.mjs";
 import { sessionEventForPiEvent } from "./session-event-mapping.mjs";
 import { MAX_LIVE_TAIL_BYTES, createLiveTail } from "./worker-live-tail.mjs";
-import { createWorkerCommandDispatcher, createWorkerReplayStore, maintainDaemonConnection, replayDeliveryIsAmbiguous } from "./worker.mjs";
+import { listenForDaemon } from "./worker-socket.mjs";
+import { createWorkerCommandDispatcher, createWorkerReplayStore, replayDeliveryIsAmbiguous, serveDaemonConnections } from "./worker.mjs";
 
 const MAX_PENDING_PARENT_MESSAGES = 256;
+const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
 /** A crash report must not outlive its own exit: stop waiting for the channel and leave. */
 const CRASH_REPORT_TIMEOUT_MS = 1_000;
 
@@ -30,20 +31,20 @@ function parseArgs(argv) {
     if (!key?.startsWith("--") || value === undefined) throw new TypeError("Worker arguments must be flag/value pairs");
     values.set(key.slice(2), value);
   }
-  for (const required of ["session-id", "canonical-session-file", "cwd", "run-id", "lease-id", "generation", "replay-path", "pi-executable", "pi-identity", "capabilities", "diagnostics-directory"]) {
+  for (const required of ["session-id", "canonical-session-file", "cwd", "run-id", "lease-id", "generation", "replay-path", "pi-executable", "pi-identity", "capabilities", "diagnostics-directory", "worker-socket", "startup-deadline-ms"]) {
     if (!values.has(required)) throw new TypeError(`Missing worker argument: --${required}`);
   }
   const generation = Number(values.get("generation"));
   if (!Number.isSafeInteger(generation) || generation <= 0) throw new TypeError("Worker generation must be positive");
+  const startupDeadlineMs = Number(values.get("startup-deadline-ms"));
+  if (!Number.isSafeInteger(startupDeadlineMs) || startupDeadlineMs <= 0) throw new TypeError("Worker startup deadline must be positive");
+  const maxFrameBytes = values.has("max-frame-bytes") ? Number(values.get("max-frame-bytes")) : DEFAULT_MAX_FRAME_BYTES;
+  if (!Number.isSafeInteger(maxFrameBytes) || maxFrameBytes < 128) throw new TypeError("Worker frame bound must be at least 128 bytes");
   let executable;
   let capabilities;
-  let daemonConnectConfig;
-  let reconnectDelaysMs;
   try {
     executable = JSON.parse(values.get("pi-identity"));
     capabilities = JSON.parse(values.get("capabilities"));
-    daemonConnectConfig = JSON.parse(values.get("daemon-connect-config") ?? "{}");
-    reconnectDelaysMs = JSON.parse(values.get("reconnect-delays-ms") ?? "[100,250,500,1000,2000]");
   } catch (cause) {
     throw new TypeError("Worker structured arguments must contain valid JSON", { cause });
   }
@@ -51,7 +52,7 @@ function parseArgs(argv) {
     sessionId: values.get("session-id"), canonicalSessionFile: values.get("canonical-session-file"), cwd: values.get("cwd"), runId: values.get("run-id"),
     leaseId: values.get("lease-id"), generation, replayPath: values.get("replay-path"), piExecutable: values.get("pi-executable"), executable, capabilities,
     diagnosticsDirectory: values.get("diagnostics-directory"), model: values.has("model-provider") ? { provider: values.get("model-provider"), id: values.get("model-id") } : undefined,
-    name: values.get("name"), daemonConnector: values.get("daemon-connector"), daemonConnectConfig, reconnectDelaysMs,
+    name: values.get("name"), workerSocket: values.get("worker-socket"), startupDeadlineMs, maxFrameBytes,
   };
 }
 
@@ -61,12 +62,23 @@ export async function runInstalledPiWorker(runtimeProcess) {
   const options = parseArgs(runtimeProcess.argv.slice(2));
   const token = runtimeProcess.env.PI_AGENTS_WORKER_TOKEN;
   if (typeof token !== "string" || token.length === 0) throw new Error("Worker requires an authenticated launch token");
-  if (options.daemonConnector === undefined) throw new Error("Worker requires the daemon control socket");
   const reconnectController = new AbortController();
-  const connectorTarget = options.daemonConnector.startsWith("file:") ? options.daemonConnector : pathToFileURL(options.daemonConnector).href;
-  const connector = await import(connectorTarget);
+  // This worker owns its socket. The daemon named the path before it spawned this process and
+  // recorded it against this run, so a replacement daemon reconnects to it rather than waiting to be
+  // found. Nothing exists at that path until this call, which is why a daemon that died between
+  // naming it and spawning leaves nothing a later daemon can mistake for a live worker.
+  const listener = await listenForDaemon({ socketPath: options.workerSocket, token, maxBytes: options.maxFrameBytes });
+  /**
+   * A worker nobody ever connects to holds no Pi child and none of the operator's text, so waiting
+   * forever costs a process and gains nothing. This bounds the launch handshake only: once readiness
+   * is sent it is cleared, and from then on the worker outlives daemon absence indefinitely.
+   */
+  const startupDeadline = setTimeout(() => {
+    runtimeProcess.stderr.write(`${JSON.stringify({ event: "worker_startup_deadline", code: "WORKER_STARTUP_DEADLINE", sessionId: options.sessionId, runId: options.runId, socketPath: options.workerSocket, deadlineMs: options.startupDeadlineMs, at: new Date().toISOString() })}\n`);
+    void listener.close().finally(() => runtimeProcess.exit(1));
+  }, options.startupDeadlineMs);
   // The startup connection is the only worker channel: a launch carries no inter-process channel.
-  const launchConnection = await connector.connectDaemon({ config: options.daemonConnectConfig, signal: reconnectController.signal });
+  const launchConnection = await listener.next();
   /** @type {((message: any) => Promise<unknown>) | undefined} */
   let sendToDaemon = (/** @type {any} */ message) => Promise.resolve(launchConnection.send(message));
   /** @param {any} message */
@@ -138,7 +150,7 @@ export async function runInstalledPiWorker(runtimeProcess) {
   // Pi has not written the newest of them to its own session file yet, so the process that produced
   // them is the one that keeps them. The whole tail travels in one frame, so it stays under half of
   // the control socket's own bound.
-  const liveTail = createLiveTail({ maxBytes: Math.min(MAX_LIVE_TAIL_BYTES, Math.floor((options.daemonConnectConfig?.maxBytes ?? MAX_LIVE_TAIL_BYTES * 2) / 2)) });
+  const liveTail = createLiveTail({ maxBytes: Math.min(MAX_LIVE_TAIL_BYTES, Math.floor(options.maxFrameBytes / 2)) });
   adapter.onFrame((frame) => {
     liveTail.record(frame);
     sendWorkerMessage({ version: 1, type: "pi_frame", token, sessionId: options.sessionId, frame });
@@ -164,9 +176,13 @@ export async function runInstalledPiWorker(runtimeProcess) {
     if (shuttingDown) return;
     shuttingDown = true;
     reconnectController.abort();
+    clearTimeout(startupDeadline);
     await dispatcher.close().catch(() => {});
     await adapter.close().catch(() => {});
     piChild.stdin?.end();
+    // The worker owns this socket, so it removes it: a path left behind is one a later daemon would
+    // connect to and be refused by, when the honest answer is that this run is gone.
+    await listener.close().catch(() => {});
     await diagnostics.close().catch(() => {});
     runtimeProcess.exit(0);
   };
@@ -188,13 +204,16 @@ export async function runInstalledPiWorker(runtimeProcess) {
   const confirmedModel = piConfirmedModel(initialState);
   const ready = { version: 1, type: "worker_ready", token, sessionId: options.sessionId, runId: options.runId, leaseId: options.leaseId, generation: options.generation, worker: supervisorIdentity, piChild: piChildIdentity, ...(confirmedModel === undefined ? {} : { model: confirmedModel }) };
   await launchConnection.send(ready);
+  // The launch is over, so the startup bound is over with it. From here the worker is Pi's parent
+  // and outlives daemon absence indefinitely, which is the point of it owning the socket.
+  clearTimeout(startupDeadline);
 
   void Promise.resolve(launchConnection.closed).finally(() => {
     if (shuttingDown) return;
     sendToDaemon = undefined;
-    void maintainDaemonConnection({
-      signal: reconnectController.signal, delaysMs: options.reconnectDelaysMs, sleep: (/** @type {number} */ ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms)),
-      connect: async () => connector.connectDaemon({ config: options.daemonConnectConfig, signal: reconnectController.signal }),
+    void serveDaemonConnections({
+      signal: reconnectController.signal,
+      accept: () => listener.next(),
       onConnection: async (/** @type {any} */ connection) => {
         const connectionSend = (/** @type {any} */ message) => Promise.resolve(connection.send(message));
         sendToDaemon = connectionSend;
@@ -222,7 +241,9 @@ export async function runInstalledPiWorker(runtimeProcess) {
   };
   piChild.once("exit", (code, signal) => {
     if (shuttingDown) return;
-    void reportPiChildExit(code, signal).catch(() => {}).finally(() => diagnostics.close().catch(() => {}).finally(() => runtimeProcess.exit(0)));
+    void reportPiChildExit(code, signal).catch(() => {})
+      .finally(() => listener.close().catch(() => {}))
+      .finally(() => diagnostics.close().catch(() => {}).finally(() => runtimeProcess.exit(0)));
   });
   const testExitMs = Number(runtimeProcess.env.PI_AGENTS_TEST_EXIT_MS);
   if (Number.isSafeInteger(testExitMs) && testExitMs > 0) setTimeout(() => piChild.kill("SIGTERM"), testExitMs);

@@ -255,30 +255,32 @@ function closeConnectionBestEffort(connection) {
 }
 
 /**
- * A module named by `--daemon-connector` exports `connectDaemon({ config, signal })`.
- * Its connection exposes `closed`, `close`, `onMessage(listener)`, and `send(message)`.
+ * Serve daemon connections on this worker's own socket for as long as the worker runs.
  *
- * Maintain a daemon transport without coupling its lifetime to the Pi adapter.
- * @param {{ connect: () => Promise<{ closed: Promise<unknown>, close?: () => unknown }>, onConnection: (connection: unknown) => Promise<void> | void, delaysMs: readonly number[], sleep: (ms: number) => Promise<void>, signal?: AbortSignal }} options
+ * The worker listens and the daemon connects, so there is no backoff and no schedule here: a daemon
+ * that is absent simply never arrives, and one that starts connects immediately. A worker survives
+ * daemon absence indefinitely on purpose, which is why this loop has no bound of its own; the launch
+ * handshake carries the only deadline, and it is over before this begins.
+ *
+ * @param {{ accept: () => Promise<any>, onConnection: (connection: any) => Promise<void> | void, signal?: AbortSignal }} options
  */
-export async function maintainDaemonConnection({ connect, onConnection, delaysMs, sleep, signal }) {
-  if (typeof connect !== "function" || typeof onConnection !== "function" || typeof sleep !== "function") {
-    throw new TypeError("Reconnect dependencies must be functions");
-  }
-  if (!Array.isArray(delaysMs) || delaysMs.length === 0 || delaysMs.some((delay) => !Number.isSafeInteger(delay) || delay <= 0)) {
-    throw new TypeError("Reconnect delays must contain positive integers");
-  }
-  let failureCount = 0;
+export async function serveDaemonConnections({ accept, onConnection, signal }) {
+  if (typeof accept !== "function" || typeof onConnection !== "function") throw new TypeError("Accept dependencies must be functions");
   while (!signal?.aborted) {
     /** @type {{ closed: Promise<unknown>, close?: () => unknown } | undefined} */
     let connection;
+    // A listener that is closed ends this loop rather than spinning on it: nothing else will arrive.
     try {
-      connection = await connect();
+      connection = await accept();
+    } catch {
+      return;
+    }
+    if (connection === undefined) return;
+    try {
       await onConnection(connection);
-      failureCount = 0;
       if (!signal?.aborted) {
         await new Promise((resolveClosed) => {
-          const activeConnection = /** @type {{ closed: Promise<unknown>, close?: () => unknown }} */ (connection);
+          const active = /** @type {{ closed: Promise<unknown>, close?: () => unknown }} */ (connection);
           let settled = false;
           const finish = () => {
             if (settled) return;
@@ -287,24 +289,18 @@ export async function maintainDaemonConnection({ connect, onConnection, delaysMs
             resolveClosed(undefined);
           };
           const onAbort = () => {
-            closeConnectionBestEffort(activeConnection);
+            closeConnectionBestEffort(active);
             finish();
           };
           signal?.addEventListener("abort", onAbort, { once: true });
-          Promise.resolve(activeConnection.closed).then(finish, finish);
+          Promise.resolve(active.closed).then(finish, finish);
           if (signal?.aborted) onAbort();
         });
       }
     } catch {
+      // One connection's failure costs that connection; the next daemon to connect gets a fresh one.
     } finally {
       closeConnectionBestEffort(connection);
-    }
-    if (signal?.aborted) return;
-    const delay = delaysMs[Math.min(failureCount, delaysMs.length - 1)];
-    failureCount += 1;
-    try {
-      await sleep(delay);
-    } catch {
     }
   }
 }

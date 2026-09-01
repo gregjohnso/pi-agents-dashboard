@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { createDaemonClient } from "../app/daemon-client.mjs";
-import { connectDaemon } from "../runtime/daemon-connector.mjs";
+import { listenForDaemon } from "../runtime/worker-socket.mjs";
 import { createDaemonRuntime } from "../runtime/daemon.mjs";
 import { RegistryStore } from "../runtime/registry-store.mjs";
 import { createLiveTail } from "../runtime/worker-live-tail.mjs";
@@ -51,7 +51,8 @@ async function liveSession() {
     ownership: { kind: "managed", runId: "run-shared", process: identity, acquiredAt: at, heartbeatAt: at },
     latestRunId: "run-shared", createdAt: at, updatedAt: at,
   });
-  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "session-1", runId: "run-shared", leaseId: "lease-shared", generation: 1, identity, piChildIdentity, token: workerToken }] })}\n`, { mode: 0o600 });
+  await mkdir(join(root, "daemon", "workers"), { recursive: true, mode: 0o700 });
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "session-1", runId: "run-shared", leaseId: "lease-shared", generation: 1, identity, piChildIdentity, token: workerToken, socketPath: workerSocketPath(root), proto: 2 }] })}\n`, { mode: 0o600 });
   return { root, sessionFile, registry };
 }
 
@@ -74,29 +75,29 @@ async function openClient(daemon, clientId) {
  * same module: frames produced while no daemon is listening stay in memory and are replayed on the
  * next connection, and the tail's own bound decides what survives.
  */
-function fakeWorker({ socketPath, tokenPath, maxBytes = undefined }) {
+async function fakeWorker({ root, maxBytes = undefined }) {
   const controller = new AbortController();
   const tail = createLiveTail(maxBytes === undefined ? {} : { maxBytes });
   /** @type {any} */
   let live;
   let connections = 0;
+  const listener = await listenForDaemon({ socketPath: workerSocketPath(root), token: workerToken, maxBytes: 512 * 1024 });
   const run = (async () => {
     while (!controller.signal.aborted) {
       /** @type {any} */
       let connection;
       try {
-        connection = await connectDaemon({ config: { socketPath, tokenPath, maxBytes: 512 * 1024 }, signal: controller.signal });
+        connection = await listener.next();
+        if (connection === undefined) return;
         live = connection;
         connections += 1;
         await connection.send({ version: 1, type: "worker_ready", token: workerToken, sessionId: "session-1", runId: "run-shared", leaseId: "lease-shared", generation: 1, worker: identity, piChild: piChildIdentity });
         if (connections > 1) await connection.send({ version: 1, type: "pi_tail", token: workerToken, sessionId: "session-1", frames: tail.frames(), dropped: tail.dropped });
         await connection.closed;
-      } catch {
-      } finally {
         live = undefined;
-        connection?.close();
+      } catch {
+        return;
       }
-      if (!controller.signal.aborted) await new Promise((resolve) => setTimeout(resolve, 10));
     }
   })();
   const worker = {
@@ -109,10 +110,15 @@ function fakeWorker({ socketPath, tokenPath, maxBytes = undefined }) {
     get dropped() { return tail.dropped; },
     /** Lose the daemon connection without losing Pi, which is what a socket error looks like here. */
     drop() { live?.close(); },
-    async stop() { controller.abort(); await run; },
+    async stop() { controller.abort(); await listener.close(); await run; },
   };
   workers.push(worker);
   return worker;
+}
+
+/** The socket this session's worker listens on, which the daemon names before it spawns. @param {string} root */
+function workerSocketPath(root) {
+  return join(root, "daemon", "workers", "session-1.sock");
 }
 
 /** @param {any} daemon */
@@ -132,7 +138,7 @@ function assistantText(items) {
 it("keeps no durable viewer transcript beside Pi's own session file", async () => {
   const { root } = await liveSession();
   const daemon = await openDaemon(root);
-  const worker = fakeWorker({ socketPath: daemon.socketPath, tokenPath: daemon.tokenPath });
+  const worker = await fakeWorker({ root });
   await daemon.ready;
   await waitForWorker(daemon);
   const client = await openClient(daemon, "client-no-durable");
@@ -150,7 +156,7 @@ it("keeps no durable viewer transcript beside Pi's own session file", async () =
 it("replays the frames a worker buffered while the daemon was absent, once", async () => {
   const { root, sessionFile } = await liveSession();
   const first = await openDaemon(root);
-  const worker = fakeWorker({ socketPath: first.socketPath, tokenPath: first.tokenPath });
+  const worker = await fakeWorker({ root });
   await first.ready;
   await waitForWorker(first);
   await worker.frame({ type: "message_start", message: { role: "assistant", timestamp: at } });
@@ -179,7 +185,7 @@ it("replays the frames a worker buffered while the daemon was absent, once", asy
 it("tells a viewer to resynchronize when its worker reconnects mid-turn, with no lost or duplicated item", async () => {
   const { root, sessionFile } = await liveSession();
   const daemon = await openDaemon(root);
-  const worker = fakeWorker({ socketPath: daemon.socketPath, tokenPath: daemon.tokenPath });
+  const worker = await fakeWorker({ root });
   await daemon.ready;
   await waitForWorker(daemon);
   const client = await openClient(daemon, "client-midturn");
@@ -212,7 +218,7 @@ it("tells a viewer to resynchronize when its worker reconnects mid-turn, with no
 it("delivers an extension UI request that arrived before any frontend attached", async () => {
   const { root } = await liveSession();
   const first = await openDaemon(root);
-  const worker = fakeWorker({ socketPath: first.socketPath, tokenPath: first.tokenPath, maxBytes: 512 });
+  const worker = await fakeWorker({ root, maxBytes: 512 });
   await first.ready;
   await waitForWorker(first);
   await worker.frame({ type: "extension_ui_request", id: "ui-1", method: "confirm", title: "Overwrite the file?" });
@@ -239,7 +245,7 @@ it("delivers an extension UI request that arrived before any frontend attached",
 it("serves canonical history plus the surviving tail when the worker's buffer overflowed", async () => {
   const { root, sessionFile } = await liveSession();
   const first = await openDaemon(root);
-  const worker = fakeWorker({ socketPath: first.socketPath, tokenPath: first.tokenPath, maxBytes: 256 });
+  const worker = await fakeWorker({ root, maxBytes: 256 });
   await first.ready;
   await waitForWorker(first);
   await first.close();

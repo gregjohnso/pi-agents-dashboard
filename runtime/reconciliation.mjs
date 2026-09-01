@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import * as fs from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { atomicWriteJson } from "./atomic-file.mjs";
 import { traceSessionLock } from "./lock-trace.mjs";
@@ -10,13 +10,12 @@ import { createSessionHistoryReader, SessionHistoryError } from "./session-histo
 import { reduceSessionState } from "./state-reducer.mjs";
 import { createViewerNormalizer } from "./viewer-normalizer.mjs";
 import { createViewerStream } from "./viewer-stream.mjs";
+import { WORKER_SOCKET_PROTOCOL, connectToWorker } from "./worker-socket.mjs";
 
 /** Frames the startup connection carries before its route is adopted. */
-const LAUNCH_CONTROL_TYPES = ["pi_child", "worker_ready"];
+const LAUNCH_CONTROL_TYPES = ["hello", "pi_child", "worker_ready"];
 /** A startup connection holds only what the launch has not consumed yet; a flood is a defect, not backpressure. */
 const MAX_RESERVATION_BUFFERED_FRAMES = 256;
-/** The worker socket protocol this daemon speaks, recorded per worker and independent of any release. */
-const WORKER_PROTOCOL_VERSION = 1;
 /**
  * The one reason a run is marked for replacement: its code is behind the daemon's, or unknown. The
  * mark is written before the daemon signals anything, so a restart resumes the guarded replacement
@@ -77,21 +76,23 @@ function deferred() {
 /**
  * One launch this daemon reserved before it spawned the worker, keyed by the per-run token.
  *
- * A worker can reach the control socket before `spawn` returns, so a startup connection whose PID is
- * not published yet waits here instead of being refused.
+ * The daemon names this run's socket here, before anything is spawned, and connects to it once the
+ * worker is listening. Nothing creates that path until the worker does, so a daemon that dies
+ * between the reservation and the spawn leaves no socket a later daemon could read as a live worker.
  */
 class LaunchReservation {
   /** @param {any} options */
-  constructor({ token, sessionId, runId, leaseId, generation, inspect, release }) {
+  constructor({ token, sessionId, runId, leaseId, generation, socketPath, maxBytes, inspect, connect, release }) {
     this.token = token;
     this.sessionId = sessionId;
     this.runId = runId;
     this.leaseId = leaseId;
     this.generation = generation;
+    this.socketPath = socketPath;
+    this.maxBytes = maxBytes;
     this.inspect = inspect;
+    this.connect = connect;
     this.release = release;
-    this.spawnedPid = deferred();
-    this.connectionArrived = deferred();
     /** @type {any} */
     this.connection = undefined;
     /** @type {any} */
@@ -106,65 +107,44 @@ class LaunchReservation {
     this.buffered = [];
     /** @type {((reservation: LaunchReservation) => void) | undefined} */
     this.onAdopted = undefined;
+    /** Detach this launch's frame listener once the route it established takes them over. */
+    this.stopDelivering = () => {};
     this.closed = false;
   }
 
-  /** The exact PID exists only after `spawn` returns. @param {number} pid */
-  spawned(pid) {
-    this.spawnedPid.resolve(pid);
-  }
-
-  /** The launch waits here for its own worker to arrive and be verified. @param {number} timeoutMs */
-  connected(timeoutMs) {
-    /** @type {any} */
-    let timer;
-    return Promise.race([
-      /** @type {Promise<any>} */ (this.connectionArrived.promise),
-      new Promise((_, rejectWait) => {
-        timer = setTimeout(() => rejectWait(Object.assign(new Error("Timed out waiting for the worker startup connection"), { code: "WORKER_START_TIMEOUT" })), timeoutMs);
-        timer.unref?.();
-      }),
-    ]).finally(() => clearTimeout(timer));
-  }
-
-  /** @param {any} frame @param {any} connection @param {number} timeoutMs */
-  async bind(frame, connection, timeoutMs) {
-    try {
-      return await this.#bind(frame, connection, timeoutMs);
-    } catch (error) {
-      this.connectionArrived.reject(error);
-      throw error;
-    }
-  }
-
-  /** @param {any} frame @param {any} connection @param {number} timeoutMs */
-  async #bind(frame, connection, timeoutMs) {
-    if (this.connection !== undefined) throw Object.assign(new Error("A startup connection already claimed this launch"), { code: "WORKER_ALREADY_CONNECTED" });
-    if (frame.sessionId !== this.sessionId || frame.runId !== this.runId || frame.leaseId !== this.leaseId || frame.generation !== this.generation) {
-      throw Object.assign(new Error("Startup connection did not match the reserved launch"), { code: "WORKER_HELLO_MISMATCH" });
-    }
-    /** @type {any} */
-    let timer;
-    const pid = await Promise.race([
-      this.spawnedPid.promise,
-      new Promise((_, rejectWait) => {
-        timer = setTimeout(() => rejectWait(Object.assign(new Error("Spawned PID did not arrive before the startup connection deadline"), { code: "WORKER_SPAWN_TIMEOUT" })), timeoutMs);
-        timer.unref?.();
-      }),
-    ]).finally(() => clearTimeout(timer));
-    const inspected = await this.inspect(pid);
-    if (!sameIdentity(frame.worker, inspected) || inspected.pid !== pid || inspected.processGroupId !== pid) {
-      throw Object.assign(new Error("Startup connection claimed an identity that is not the spawned process-group leader"), { code: "WORKER_IDENTITY_MISMATCH" });
+  /**
+   * Connect to the worker this launch just spawned and verify who answered.
+   *
+   * The PID is already known here, because the daemon connects rather than being connected to; the
+   * only wait is for the worker to reach `listen`, which the connect retries through.
+   * @param {number} pid @param {number} timeoutMs
+   */
+  async connected(pid, timeoutMs) {
+    if (this.connection !== undefined) throw Object.assign(new Error("This launch is already connected"), { code: "WORKER_ALREADY_CONNECTED" });
+    const connection = await this.connect({ socketPath: this.socketPath, token: this.token, maxBytes: this.maxBytes, timeoutMs });
+    if (this.closed) {
+      connection.close?.();
+      throw Object.assign(new Error("Launch reservation was released"), { code: "WORKER_CHANNEL_CLOSED" });
     }
     this.connection = connection;
+    this.stopDelivering = connection.onMessage((/** @type {any} */ frame) => this.deliver(frame));
+    const frame = await this.waitFor("hello", timeoutMs);
+    if (!sameToken(frame.token, this.token) || frame.sessionId !== this.sessionId || frame.runId !== this.runId || frame.leaseId !== this.leaseId || frame.generation !== this.generation) {
+      throw Object.assign(new Error("Worker socket did not answer for the reserved launch"), { code: "WORKER_HELLO_MISMATCH" });
+    }
+    const inspected = await this.inspect(pid);
+    if (!sameIdentity(frame.worker, inspected) || inspected.pid !== pid || inspected.processGroupId !== pid) {
+      throw Object.assign(new Error("Worker socket claimed an identity that is not the spawned process-group leader"), { code: "WORKER_IDENTITY_MISMATCH" });
+    }
     this.identity = inspected;
-    this.connectionArrived.resolve(inspected);
     return inspected;
   }
 
   /** Hand one startup frame to its waiter, or hold it until the route is adopted. @param {any} frame */
   deliver(frame) {
-    if (LAUNCH_CONTROL_TYPES.includes(frame?.type) && sameToken(frame?.token, this.token)) {
+    // The token is checked by each frame's own consumer rather than here, so a frame carrying the
+    // wrong one is refused by name instead of leaving its launch waiting out the startup bound.
+    if (LAUNCH_CONTROL_TYPES.includes(frame?.type)) {
       const waiter = this.waiters.get(frame.type);
       if (waiter === undefined) {
         this.pending.push(frame);
@@ -214,9 +194,11 @@ class LaunchReservation {
   close() {
     if (this.closed) return;
     this.closed = true;
-    this.connectionArrived.reject(Object.assign(new Error("Launch reservation was released"), { code: "WORKER_CHANNEL_CLOSED" }));
     for (const waiter of this.waiters.values()) waiter.reject(Object.assign(new Error("Launch reservation was released"), { code: "WORKER_CHANNEL_CLOSED" }));
     this.waiters.clear();
+    // A launch that never adopted its route owns this connection, so releasing the reservation closes
+    // it. Once adopted the route owns it, and the daemon keeps it.
+    if (this.route === undefined) this.connection?.close?.();
     this.release();
   }
 }
@@ -232,12 +214,19 @@ function validIdentity(value) {
  * @param {any} worker
  */
 function validateWorkerMetadata(worker) {
-  const allowed = ["sessionId", "runId", "leaseId", "generation", "identity", "piChildIdentity", "token", "proto", "cliVersion", "routeGeneration", "pendingRespawn"];
+  const allowed = ["sessionId", "runId", "leaseId", "generation", "identity", "piChildIdentity", "token", "socketPath", "proto", "cliVersion", "routeGeneration", "pendingRespawn"];
   const bound = worker?.identity !== undefined || worker?.piChildIdentity !== undefined;
   const counter = (/** @type {unknown} */ value) => value === undefined || (Number.isSafeInteger(value) && /** @type {number} */ (value) > 0);
-  if (typeof worker !== "object" || worker === null || Array.isArray(worker) || Object.keys(worker).some((key) => !allowed.includes(key)) || [worker.sessionId, worker.runId, worker.leaseId].some((value) => typeof value !== "string" || value.length === 0) || !Number.isSafeInteger(worker.generation) || worker.generation <= 0 || (bound && (!validIdentity(worker.identity) || !validIdentity(worker.piChildIdentity))) || (worker.token !== undefined && (typeof worker.token !== "string" || worker.token.length === 0)) || !counter(worker.proto) || !counter(worker.routeGeneration) || (worker.pendingRespawn !== undefined && worker.pendingRespawn !== PENDING_RESPAWN_UPGRADE) || (worker.cliVersion !== undefined && (typeof worker.cliVersion !== "string" || worker.cliVersion.length === 0))) throw new TypeError("Worker recovery metadata record is invalid");
+  if (typeof worker !== "object" || worker === null || Array.isArray(worker) || Object.keys(worker).some((key) => !allowed.includes(key)) || [worker.sessionId, worker.runId, worker.leaseId].some((value) => typeof value !== "string" || value.length === 0) || !Number.isSafeInteger(worker.generation) || worker.generation <= 0 || (bound && (!validIdentity(worker.identity) || !validIdentity(worker.piChildIdentity))) || (worker.token !== undefined && (typeof worker.token !== "string" || worker.token.length === 0)) || (worker.socketPath !== undefined && (typeof worker.socketPath !== "string" || worker.socketPath.length === 0)) || !counter(worker.proto) || !counter(worker.routeGeneration) || (worker.pendingRespawn !== undefined && worker.pendingRespawn !== PENDING_RESPAWN_UPGRADE) || (worker.cliVersion !== undefined && (typeof worker.cliVersion !== "string" || worker.cliVersion.length === 0))) throw new TypeError("Worker recovery metadata record is invalid");
   return worker;
 }
+
+/**
+ * A live worker this daemon could not connect to. It is a report, never a signal: the worker is Pi's
+ * parent and keeps running, so the session stays live, says on its own row why it is out of reach,
+ * and is still stoppable by recorded process identity. Every other conflict still refuses the start.
+ */
+export const WORKER_UNREACHABLE = "WORKER_UNREACHABLE";
 
 /**
  * A launch never outlives the daemon that ran it, so a still-"launching" record with no owning
@@ -251,6 +240,29 @@ export function abandonedLaunch(record) {
 /** @param {unknown} error */
 function exited(error) {
   return error instanceof Error && ["ENOENT", "ESRCH"].includes(/** @type {NodeJS.ErrnoException} */ (error).code ?? "");
+}
+
+/**
+ * A short, unique file name for one run's worker socket.
+ *
+ * Short because a Unix socket path is bounded at 108 bytes on Linux and a state root under a home
+ * directory already spends half of that; unique because a respawn is a new run under the same
+ * session, and two runs must never name the same socket. It carries no secret: the run's token
+ * authenticates the connection, and this only has to be distinct.
+ * @param {{ sessionId: string, runId: string, generation: number }} run
+ */
+function runSocketName(run) {
+  return createHash("sha256").update(`${run.sessionId}\0${run.runId}\0${run.generation}`, "utf8").digest("hex").slice(0, 16);
+}
+
+/**
+ * Remove one ended run's socket file. The worker unlinks its own on a graceful stop; this covers the
+ * run that was killed, so a path a later daemon would only be refused by does not survive its run.
+ * @param {{ socketPath?: string }} worker
+ */
+async function forgetSocket(worker) {
+  if (typeof worker?.socketPath !== "string") return;
+  await fs.unlink(worker.socketPath).catch(() => {});
 }
 
 export class RecoveredWorkerRouter {
@@ -267,15 +279,30 @@ export class RecoveredWorkerRouter {
   #loaded = false;
   /** @type {Map<string, LaunchReservation>} */
   #reservations = new Map();
-  #bindTimeoutMs;
+  #socketsDirectory;
+  #maxBytes;
+  #connect;
+  #onWorkerFrame;
+  #onRouteAdopted;
+  #onWorkerUnreachable;
+  #reconnectTimeoutMs;
+  #closing = false;
   #cliVersion;
 
-  /** @param {{ registry: RegistryStore, inspect(pid: number): Promise<any>, metadataPath: string, bindTimeoutMs?: number, cliVersion?: string }} options */
-  constructor({ registry, inspect, metadataPath, bindTimeoutMs = 15_000, cliVersion = undefined }) {
+  /**
+   * @param {{ registry: RegistryStore, inspect(pid: number): Promise<any>, metadataPath: string, maxBytes?: number, connect?: (options: { socketPath: string, token: string, maxBytes: number, timeoutMs: number }) => Promise<any>, onWorkerFrame?: (frame: any, connection: any, metadata: any, routeGeneration: number) => Promise<void>, onRouteAdopted?: (route: any, launched: boolean) => Promise<void>, onWorkerUnreachable?: (report: { sessionId: string, cause: string, message: string }) => void, reconnectTimeoutMs?: number, cliVersion?: string }} options
+   */
+  constructor({ registry, inspect, metadataPath, maxBytes = 1024 * 1024, connect = connectToWorker, onWorkerFrame = async () => {}, onRouteAdopted = async () => {}, onWorkerUnreachable = () => {}, reconnectTimeoutMs = 15_000, cliVersion = undefined }) {
     this.#registry = registry;
     this.#inspect = inspect;
     this.#metadataPath = metadataPath;
-    this.#bindTimeoutMs = bindTimeoutMs;
+    this.#socketsDirectory = join(dirname(metadataPath), "workers");
+    this.#maxBytes = maxBytes;
+    this.#connect = connect;
+    this.#onWorkerFrame = onWorkerFrame;
+    this.#onRouteAdopted = onRouteAdopted;
+    this.#onWorkerUnreachable = onWorkerUnreachable;
+    this.#reconnectTimeoutMs = reconnectTimeoutMs;
     this.#cliVersion = cliVersion;
     this.#lifecycle = registryCoordinationScope(registry).lifecycle;
   }
@@ -309,49 +336,117 @@ export class RecoveredWorkerRouter {
   }
 
   /**
-   * Reserve one run before its worker is spawned, so a startup connection that arrives before the
-   * PID is published has something to wait on, and so a replacement daemon can authenticate the
-   * same run from durable state.
+   * Reserve one run, naming the socket its worker will listen on, before anything is spawned.
+   *
+   * The path is durable state from this moment, so a replacement daemon reconnects to the same run
+   * from `daemon/workers.json` alone. Nothing here creates the path: the worker does, by listening.
    * @param {{ sessionId: string, runId: string, leaseId: string, generation: number, token: string, cliVersion?: string }} launch
    */
   async reserve(launch) {
     return this.#lifecycle.runNested(launch.sessionId, async () => {
       if (this.#reservations.has(launch.token)) throw Object.assign(new Error("Launch token is already reserved"), { code: "WORKER_TOKEN_REUSED" });
+      await fs.mkdir(this.#socketsDirectory, { recursive: true, mode: 0o700 });
+      const socketPath = join(this.#socketsDirectory, `${runSocketName(launch)}.sock`);
       const worker = validateWorkerMetadata({
         sessionId: launch.sessionId,
         runId: launch.runId,
         leaseId: launch.leaseId,
         generation: launch.generation,
         token: launch.token,
-        proto: WORKER_PROTOCOL_VERSION,
+        socketPath,
+        proto: WORKER_SOCKET_PROTOCOL,
         ...(launch.cliVersion === undefined ? {} : { cliVersion: launch.cliVersion }),
       });
       this.#workers.set(launch.sessionId, worker);
       await this.#persist();
       const reservation = new LaunchReservation({
         ...launch,
+        socketPath,
+        maxBytes: this.#maxBytes,
         inspect: (/** @type {number} */ pid) => this.#inspect(pid),
+        connect: this.#connect,
         release: () => { if (this.#reservations.get(launch.token) === reservation) this.#reservations.delete(launch.token); },
       });
+      // The launch owns this connection's frames until its route exists; from adoption the route does.
+      reservation.onAdopted = (/** @type {LaunchReservation} */ adopted) => {
+        adopted.stopDelivering();
+        this.#serveConnection(adopted.connection, true, adopted.drainBuffered()).adopted(adopted.route);
+      };
       this.#reservations.set(launch.token, reservation);
       return reservation;
     });
   }
 
   /**
-   * Claim one worker startup connection for the launch that minted its token. Returns undefined for
-   * any frame that is not a startup hello, so a reconnecting worker still adopts its route directly.
-   * @param {any} frame @param {any} connection @param {(reservation: LaunchReservation) => void} onAdopted
+   * Hold one connection's frames until its route exists, then deliver them in arrival order.
+   *
+   * A worker writes its readiness and its live tail in one step, so the tail is already in flight
+   * while adoption is still running. Buffering it here is what keeps a rebuild from losing the only
+   * copy of the frames Pi has not written to its own file yet.
+   * @param {any} connection @param {boolean} launched @param {any[]} [initialFrames]
    */
-  async beginLaunchConnection(frame, connection, onAdopted) {
-    if (frame?.type !== "hello") return undefined;
-    const allowed = ["version", "type", "token", "sessionId", "runId", "leaseId", "generation", "worker"];
-    if (typeof frame !== "object" || Array.isArray(frame) || frame.version !== 1 || Object.keys(frame).some((key) => !allowed.includes(key))) throw Object.assign(new Error("Invalid worker hello frame"), { code: "INVALID_WORKER_FRAME" });
-    const reservation = typeof frame.token === "string" ? this.#reservations.get(frame.token) : undefined;
-    if (reservation === undefined || !sameToken(frame.token, reservation.token)) throw Object.assign(new Error("Worker hello does not match any launch this daemon spawned"), { code: "WORKER_AUTHENTICATION_FAILED" });
-    reservation.onAdopted = onAdopted;
-    await reservation.bind(frame, connection, this.#bindTimeoutMs);
-    return reservation;
+  #serveConnection(connection, launched, initialFrames = []) {
+    const buffered = [...initialFrames];
+    /** @type {any} */
+    let route;
+    let chain = Promise.resolve();
+    /** @param {any} frame */
+    const run = (frame) => {
+      chain = chain.then(() => this.#onWorkerFrame(frame, connection, route.metadata, route.routeGeneration)).catch(() => connection.close?.());
+    };
+    connection.onMessage((/** @type {any} */ frame) => {
+      // The frame that establishes a route is never one of the frames routed over it.
+      if (frame?.type === "worker_ready") return;
+      if (route === undefined) buffered.push(frame);
+      else run(frame);
+    });
+    return {
+      /** @param {any} adopted */
+      adopted: (adopted) => {
+        route = adopted;
+        chain = chain.then(() => this.#onRouteAdopted(adopted, launched)).catch(() => {});
+        for (const frame of buffered.splice(0)) run(frame);
+      },
+    };
+  }
+
+  /**
+   * Connect to one live worker's own socket and adopt the route it answers with.
+   *
+   * This is what a daemon replacement costs now: the roster names the socket and the token, so
+   * adoption is a connect and a readiness frame rather than a negotiation over a connection the
+   * worker had to start. A run this daemon cannot reach is reported, never signalled.
+   * @param {string} sessionId @param {number} timeoutMs
+   */
+  async connectRun(sessionId, timeoutMs) {
+    const metadata = this.#workers.get(sessionId);
+    if (metadata === undefined) throw Object.assign(new Error("No reserved run owns this session"), { code: "WORKER_METADATA_MISSING" });
+    if (metadata.proto !== WORKER_SOCKET_PROTOCOL || typeof metadata.socketPath !== "string" || typeof metadata.token !== "string") {
+      throw Object.assign(new Error(`This session's worker speaks worker protocol ${metadata.proto ?? 1}, not ${WORKER_SOCKET_PROTOCOL}: it listens on no socket, so this daemon cannot reach it`), { code: "WORKER_PROTOCOL_INCOMPATIBLE" });
+    }
+    const connection = await this.#connect({ socketPath: metadata.socketPath, token: metadata.token, maxBytes: this.#maxBytes, timeoutMs });
+    /** @type {any} */
+    let resolveReady;
+    /** @type {any} */
+    let rejectReady;
+    const readyFrame = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+    const removeReadyListener = connection.onMessage((/** @type {any} */ frame) => { if (frame?.type === "worker_ready") resolveReady(frame); });
+    const timer = setTimeout(() => rejectReady(Object.assign(new Error("Worker did not announce readiness on its own socket"), { code: "WORKER_START_TIMEOUT" })), timeoutMs);
+    timer.unref?.();
+    connection.closed.then(() => rejectReady(Object.assign(new Error("Worker socket closed before readiness"), { code: "WORKER_SOCKET_UNREACHABLE" })), () => {});
+    try {
+      const served = this.#serveConnection(connection, false);
+      const ready = await readyFrame;
+      removeReadyListener();
+      const route = await this.adopt(ready, connection);
+      served.adopted(route);
+      return route;
+    } catch (error) {
+      connection.close?.();
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /** @param {any} handle */
@@ -372,7 +467,8 @@ export class RecoveredWorkerRouter {
         identity: handle.identity,
         piChildIdentity: handle.piChildIdentity,
         ...(carried?.token === undefined ? {} : { token: carried.token }),
-        proto: WORKER_PROTOCOL_VERSION,
+        ...(carried?.socketPath === undefined ? {} : { socketPath: carried.socketPath }),
+        proto: WORKER_SOCKET_PROTOCOL,
         ...(carried?.cliVersion === undefined ? {} : { cliVersion: carried.cliVersion }),
       });
       await this.#persist();
@@ -384,7 +480,7 @@ export class RecoveredWorkerRouter {
     });
   }
 
-  /** Drop one run's durable worker entry, including its token. @param {string} sessionId @param {string} token */
+  /** Drop one run's durable worker entry, including its token and its socket. @param {string} sessionId @param {string} token */
   async forgetRun(sessionId, token) {
     return this.#lifecycle.runNested(sessionId, async () => {
       const current = this.#workers.get(sessionId);
@@ -393,6 +489,7 @@ export class RecoveredWorkerRouter {
       const route = this.#routes.get(sessionId);
       this.#routes.delete(sessionId);
       await this.#persist();
+      await forgetSocket(current);
       route?.connection.close?.();
     });
   }
@@ -400,6 +497,11 @@ export class RecoveredWorkerRouter {
   /** @param {string} sessionId */
   metadata(sessionId) {
     return this.#workers.get(sessionId);
+  }
+
+  /** The launch this daemon reserved under one run token, while that launch is still running. @param {string} token */
+  reservationFor(token) {
+    return this.#reservations.get(token);
   }
 
   /** Compare one worker's recorded release with this daemon's, which callers do only after adoption. @param {string} sessionId */
@@ -454,7 +556,7 @@ export class RecoveredWorkerRouter {
       if (expected.token !== undefined && expected.token !== frame.token) throw Object.assign(new Error("Worker authentication failed"), { code: "WORKER_AUTHENTICATION_FAILED" });
       // Protocol compatibility is decided before anything else about this worker, and an incompatible
       // one simply stays unreachable: nothing here signals the process it belongs to.
-      if (expected.proto !== undefined && expected.proto !== WORKER_PROTOCOL_VERSION) throw Object.assign(new Error(`Worker speaks protocol ${expected.proto}, not ${WORKER_PROTOCOL_VERSION}`), { code: "WORKER_PROTOCOL_INCOMPATIBLE" });
+      if (expected.proto !== undefined && expected.proto !== WORKER_SOCKET_PROTOCOL) throw Object.assign(new Error(`Worker speaks protocol ${expected.proto}, not ${WORKER_SOCKET_PROTOCOL}`), { code: "WORKER_PROTOCOL_INCOMPATIBLE" });
       const routeGeneration = (this.#routeGenerations.get(frame.sessionId) ?? 0) + 1;
       this.#routeGenerations.set(frame.sessionId, routeGeneration);
       const record = await this.#registry.get(frame.sessionId);
@@ -471,7 +573,7 @@ export class RecoveredWorkerRouter {
         expected.token = frame.token;
       }
       // An authenticated live version-1 route is itself the proof of a baseline record's protocol.
-      expected.proto = WORKER_PROTOCOL_VERSION;
+      expected.proto = WORKER_SOCKET_PROTOCOL;
       expected.routeGeneration = routeGeneration;
       await this.#persist();
       const previous = this.#routes.get(frame.sessionId);
@@ -479,7 +581,12 @@ export class RecoveredWorkerRouter {
       this.#routes.set(frame.sessionId, route);
       previous?.connection.close?.();
       connection.closed.finally(() => {
-        if (this.#routes.get(frame.sessionId) === route) this.#routes.delete(frame.sessionId);
+        if (this.#routes.get(frame.sessionId) !== route) return;
+        this.#routes.delete(frame.sessionId);
+        // The worker owns the socket and outlives this connection, so a route that drops is this
+        // daemon's to re-open. Leaving it closed would strand a live session in silence until the
+        // next daemon start; a reconnect that fails reports the run unreachable instead.
+        void this.#reopenRoute(frame.sessionId, expected.runId);
       }).catch(() => {});
       return route;
     }, "router_adopt");
@@ -488,6 +595,22 @@ export class RecoveredWorkerRouter {
   /** @param {string} sessionId */
   route(sessionId) {
     return this.#routes.get(sessionId);
+  }
+
+  /**
+   * Re-open one live run's route after its connection dropped. Only the run that still owns the
+   * session is re-opened, and never during shutdown: a deliberate close must stay closed.
+   * @param {string} sessionId @param {string} runId
+   */
+  async #reopenRoute(sessionId, runId) {
+    if (this.#closing || this.#workers.get(sessionId)?.runId !== runId || this.#routes.has(sessionId)) return;
+    try {
+      await this.connectRun(sessionId, this.#reconnectTimeoutMs);
+    } catch (error) {
+      if (this.#closing || this.#workers.get(sessionId)?.runId !== runId) return;
+      const failure = /** @type {any} */ (error);
+      this.#onWorkerUnreachable({ sessionId, cause: failure?.code ?? "WORKER_SOCKET_UNREACHABLE", message: error instanceof Error ? error.message : "Worker socket is unreachable" });
+    }
   }
 
   /** Serialize a daemon lifecycle action with route adoption, replacement, and worker frames. @param {string} sessionId @param {(state: any) => Promise<any>} action */
@@ -511,6 +634,7 @@ export class RecoveredWorkerRouter {
           this.#workers.delete(sessionId);
           this.#routes.delete(sessionId);
           await this.#persist();
+          await forgetSocket(metadata);
           route?.connection.close?.();
         },
       });
@@ -566,6 +690,7 @@ export class RecoveredWorkerRouter {
   }
 
   async close() {
+    this.#closing = true;
     for (const reservation of [...this.#reservations.values()]) reservation.close();
     const routes = [...this.#routes.values()];
     this.#routes.clear();
@@ -757,8 +882,8 @@ async function createViewerRecovery({ daemonEpoch, registry }) {
   };
 }
 
-/** @param {{ root: string, daemonEpoch: string, inspect(pid: number): Promise<any>, waitForReconnect?: (workers: any[], router: RecoveredWorkerRouter) => Promise<string[]>, onViewerReady?: (viewer: any) => void | Promise<void>, router?: RecoveredWorkerRouter, signal?: AbortSignal }} options */
-export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReconnect = async () => [], onViewerReady = () => {}, router: suppliedRouter, signal }) {
+/** @param {{ root: string, daemonEpoch: string, inspect(pid: number): Promise<any>, adoptTimeoutMs?: number, onViewerReady?: (viewer: any) => void | Promise<void>, router?: RecoveredWorkerRouter, signal?: AbortSignal }} options */
+export async function reconcileRuntime({ root, daemonEpoch, inspect, adoptTimeoutMs = 15_000, onViewerReady = () => {}, router: suppliedRouter, signal }) {
   const registry = new RegistryStore(join(root, "sessions"));
   /** @type {any} */
   let viewer;
@@ -870,17 +995,24 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReco
       liveWorkers.push({ sessionId: record.sessionId, runId: record.ownership.runId, identity: actual, piChildIdentity: piChild, metadata });
     }
     cancelled();
-    const reconnected = new Set(await waitForReconnect(liveWorkers, router));
-    cancelled();
-    for (const worker of liveWorkers) {
-      if (!reconnected.has(worker.sessionId) && !router.connectedSessionIds().includes(worker.sessionId)) conflicts.push({ sessionId: worker.sessionId, reason: "WORKER_RECONNECT_TIMEOUT", ownership: worker });
-    }
+    // Adoption is a connect, not a wait. The roster names each live worker's socket and its token, so
+    // this daemon reaches every one of them at once and learns immediately which it cannot, instead
+    // of polling for workers that have to find it first.
+    await Promise.all(liveWorkers.map(async (worker) => {
+      try {
+        await router.connectRun(worker.sessionId, adoptTimeoutMs);
+      } catch (error) {
+        const failure = /** @type {any} */ (error);
+        conflicts.push({ sessionId: worker.sessionId, reason: "WORKER_UNREACHABLE", cause: failure?.code ?? "WORKER_SOCKET_UNREACHABLE", message: error instanceof Error ? error.message : "Worker socket is unreachable", ownership: worker });
+      }
+    }));
     await atomicWriteJson(join(root, "daemon", "reconciliation.json"), { schemaVersion: 1, daemonEpoch, completedAt: new Date().toISOString(), conflicts });
     return {
       registry,
       router,
       liveWorkers,
       conflicts,
+      unreachableWorkers: conflicts.filter((conflict) => conflict.reason === WORKER_UNREACHABLE),
       repairedSessions,
       viewer,
       async close() {

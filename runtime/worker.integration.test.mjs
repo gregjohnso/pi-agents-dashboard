@@ -1,6 +1,7 @@
-import { mkdtemp, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import net from "node:net";
+import { lstat, mkdtemp, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { afterEach, expect, it } from "vitest";
@@ -10,11 +11,10 @@ import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "./process-signaler.mjs";
 import { RecoveredWorkerRouter } from "./reconciliation.mjs";
 import { RegistryStore } from "./registry-store.mjs";
-import { createWorkerControlSocket } from "./test-fixtures.mjs";
-import { maintainDaemonConnection } from "./worker.mjs";
+import { createWorkerControlClient } from "./test-fixtures.mjs";
+import { serveDaemonConnections } from "./worker.mjs";
 import { WorkerSupervisor } from "./worker-supervisor.mjs";
 
-const CONNECTOR = fileURLToPath(new URL("./daemon-connector.mjs", import.meta.url));
 
 /** @type {any[]} */
 const controlSockets = [];
@@ -116,15 +116,15 @@ process.stdin.on("data", (chunk) => {
   }
 });
 `, { mode: 0o700 });
-  const router = new RecoveredWorkerRouter({ registry, inspect: inspectProcessIdentity, metadataPath: join(root, "daemon", "workers.json") });
-  await router.load();
-  const control = await createWorkerControlSocket({ root, router, registry });
+  const control = createWorkerControlClient({ registry });
   controlSockets.push(control);
-  return { root, runs, registry, fakeEntry, router, control, launchSeams: { daemonConnector: CONNECTOR, daemonConnectConfig: control.connectConfig } };
+  const router = new RecoveredWorkerRouter({ registry, inspect: inspectProcessIdentity, metadataPath: join(root, "daemon", "workers.json"), ...control.routerSeams });
+  await router.load();
+  return { root, runs, registry, fakeEntry, router, control };
 }
 
 it("starts two bounded workers as distinct process-group leaders and opens sessions only after bind", async () => {
-  const { root, runs, registry, fakeEntry, router, control, launchSeams } = await setup(["one", "two"]);
+  const { root, runs, registry, fakeEntry, router, control } = await setup(["one", "two"]);
   const ownership = new OwnershipManager(registry);
   const supervisor = new WorkerSupervisor({
     registry,
@@ -136,8 +136,8 @@ it("starts two bounded workers as distinct process-group leaders and opens sessi
   });
 
   const [one, two] = await Promise.all([
-    supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-one", piPath: fakeEntry, ...launchSeams }),
-    supervisor.launch({ sessionId: "two", canonicalSessionFile: join(root, "two.jsonl"), cwd: root, runId: "run-two", piPath: fakeEntry, ...launchSeams }),
+    supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-one", piPath: fakeEntry }),
+    supervisor.launch({ sessionId: "two", canonicalSessionFile: join(root, "two.jsonl"), cwd: root, runId: "run-two", piPath: fakeEntry }),
   ]);
 
   expect(one.identity.pid).not.toBe(two.identity.pid);
@@ -160,7 +160,7 @@ it("starts two bounded workers as distinct process-group leaders and opens sessi
 });
 
 it("records the model the launched worker read from Pi at readiness", async () => {
-  const { root, runs, registry, fakeEntry, router, launchSeams } = await setup(["one"]);
+  const { root, runs, registry, fakeEntry, router } = await setup(["one"]);
   const supervisor = new WorkerSupervisor({
     registry,
     router,
@@ -169,7 +169,7 @@ it("records the model the launched worker read from Pi at readiness", async () =
     env: { ...process.env, PI_AGENTS_TEST_EXIT_MS: "700", FAKE_RPC_MODEL: JSON.stringify({ provider: "openai-codex", id: "gpt-5.6-sol" }) },
     startTimeoutMs: 5_000,
   });
-  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-model", piPath: fakeEntry, model: { provider: "anthropic", id: "requested" }, ...launchSeams });
+  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-model", piPath: fakeEntry, model: { provider: "anthropic", id: "requested" } });
 
   // Readiness is the first write that may name a model, and it names the one Pi reported rather
   // than the one the launch asked for.
@@ -180,7 +180,7 @@ it("records the model the launched worker read from Pi at readiness", async () =
 });
 
 it("fails the session with a process error when the Pi child exits unexpectedly", async () => {
-  const { root, runs, registry, fakeEntry, router, control, launchSeams } = await setup(["one"]);
+  const { root, runs, registry, fakeEntry, router, control } = await setup(["one"]);
   const supervisor = new WorkerSupervisor({
     registry,
     router,
@@ -190,7 +190,7 @@ it("fails the session with a process error when the Pi child exits unexpectedly"
     startTimeoutMs: 2_000,
     launchStopPolicy: { gracefulMs: 100, terminateMs: 100 },
   });
-  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-pi-crash", piPath: fakeEntry, ...launchSeams });
+  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-pi-crash", piPath: fakeEntry });
 
   await waitForExit(launched.identity.pid);
   await waitForOwnershipRelease(registry, "one");
@@ -199,7 +199,7 @@ it("fails the session with a process error when the Pi child exits unexpectedly"
 });
 
 it("refuses a second writer for one canonical session", async () => {
-  const { root, runs, registry, fakeEntry, router, control, launchSeams } = await setup(["one"]);
+  const { root, runs, registry, fakeEntry, router, control } = await setup(["one"]);
   const supervisor = new WorkerSupervisor({
     registry,
     router,
@@ -208,7 +208,7 @@ it("refuses a second writer for one canonical session", async () => {
     env: { ...process.env, PI_AGENTS_TEST_EXIT_MS: "500" },
     startTimeoutMs: 2_000,
   });
-  const request = { sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, piPath: fakeEntry, ...launchSeams };
+  const request = { sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, piPath: fakeEntry };
 
   const results = await Promise.allSettled([
     supervisor.launch({ ...request, runId: "run-one" }),
@@ -224,111 +224,49 @@ it("refuses a second writer for one canonical session", async () => {
   await waitForOwnershipRelease(registry, "one");
 });
 
-it("rejects invalid reconnect configuration before starting the worker loop", async () => {
-  const connect = /** @type {any} */ (undefined);
-  await expect(maintainDaemonConnection({ connect, onConnection: async () => {}, delaysMs: [5], sleep: async () => {} })).rejects.toBeInstanceOf(TypeError);
+it("rejects an accept loop with no way to accept or serve", async () => {
+  const accept = /** @type {any} */ (undefined);
+  await expect(serveDaemonConnections({ accept, onConnection: async () => {} })).rejects.toBeInstanceOf(TypeError);
 });
 
-it("reconnects with bounded backoff after repeated failures and eventually succeeds", async () => {
+it("serves each accepted daemon connection in turn and returns when the listener closes", async () => {
   /** @type {string[]} */
   const calls = [];
-  let attempts = 0;
-  const controller = new AbortController();
+  const queued = [
+    { closed: Promise.resolve(), close() {} },
+    { closed: Promise.resolve(), close() { throw new Error("cleanup failed"); } },
+  ];
+  let accepted = 0;
 
-  await maintainDaemonConnection({
-    signal: controller.signal,
-    delaysMs: [5, 10],
-    sleep: async (ms) => { calls.push(`sleep:${ms}`); },
-    connect: async () => {
-      attempts += 1;
-      calls.push(`connect:${attempts}`);
-      if (attempts < 3) throw new Error("daemon unavailable");
-      return { closed: Promise.resolve(), close() {} };
+  await serveDaemonConnections({
+    accept: async () => {
+      accepted += 1;
+      calls.push(`accept:${accepted}`);
+      const connection = queued.shift();
+      if (connection === undefined) throw Object.assign(new Error("closed"), { code: "WORKER_SOCKET_CLOSED" });
+      return connection;
     },
     onConnection: async () => {
-      calls.push(`connected:${attempts}`);
-      if (attempts === 4) controller.abort();
+      calls.push(`served:${accepted}`);
+      // A worker that listens has no backoff to schedule: the daemon connects, or it does not.
+      if (accepted === 2) throw new Error("this connection failed");
     },
   });
 
-  expect(calls).toEqual([
-    "connect:1",
-    "sleep:5",
-    "connect:2",
-    "sleep:10",
-    "connect:3",
-    "connected:3",
-    "sleep:5",
-    "connect:4",
-    "connected:4",
-  ]);
+  expect(calls).toEqual(["accept:1", "served:1", "accept:2", "served:2", "accept:3"]);
 });
 
-it("treats throwing connection cleanup as best-effort and keeps reconnecting", async () => {
+it("closes the connection it is serving and returns on shutdown", async () => {
   const controller = new AbortController();
-  let attempts = 0;
-  const reconnecting = maintainDaemonConnection({
-    signal: controller.signal,
-    delaysMs: [5],
-    sleep: async () => {},
-    connect: async () => {
-      attempts += 1;
-      if (attempts === 1) {
-        return {
-          closed: Promise.resolve(),
-          close() { throw new Error("normal cleanup failed"); },
-        };
-      }
-      return {
-        closed: Promise.resolve(),
-        async close() { throw new Error("abort cleanup failed"); },
-      };
-    },
-    onConnection: async () => {
-      if (attempts === 2) controller.abort();
-    },
-  });
+  const connection = { closed: new Promise(() => {}), async close() { throw new Error("shutdown cleanup rejected"); } };
 
-  await expect(reconnecting).resolves.toBeUndefined();
-  expect(attempts).toBe(2);
-});
-
-it("keeps retrying when setup and cleanup both fail before eventual success", async () => {
-  const controller = new AbortController();
-  let attempts = 0;
-  await expect(maintainDaemonConnection({
+  await expect(serveDaemonConnections({
     signal: controller.signal,
-    delaysMs: [5, 10],
-    sleep: async () => {},
-    connect: async () => ({
-      closed: Promise.resolve(),
-      async close() { throw new Error("cleanup rejected"); },
-    }),
-    onConnection: async () => {
-      attempts += 1;
-      if (attempts < 3) throw new Error("connection setup failed");
-      controller.abort();
-    },
-  })).resolves.toBeUndefined();
-  expect(attempts).toBe(3);
-});
-
-it("closes the active daemon connection and returns on explicit shutdown", async () => {
-  const controller = new AbortController();
-  const connection = {
-    closed: new Promise(() => {}),
-    async close() { throw new Error("shutdown cleanup rejected"); },
-  };
-  const reconnecting = maintainDaemonConnection({
-    signal: controller.signal,
-    delaysMs: [5],
-    sleep: async () => {},
-    connect: async () => connection,
+    accept: async () => connection,
     onConnection: async () => { controller.abort(); },
-  });
-
-  await expect(reconnecting).resolves.toBeUndefined();
+  })).resolves.toBeUndefined();
 });
+
 
 /** @param {string} root */
 async function workerEntries(root) {
@@ -336,8 +274,8 @@ async function workerEntries(root) {
   catch (error) { if (/** @type {NodeJS.ErrnoException} */ (error).code === "ENOENT") return []; throw error; }
 }
 
-it("reconnects after daemon restart from a socket-only launch and retains the run token across adoption", async () => {
-  const { root, runs, registry, fakeEntry, router, control, launchSeams } = await setup(["one"]);
+it("readopts a live worker by connecting to its socket again and retains the run token across adoption", async () => {
+  const { root, runs, registry, fakeEntry, router, control } = await setup(["one"]);
   const supervisor = new WorkerSupervisor({
     registry,
     router,
@@ -345,13 +283,15 @@ it("reconnects after daemon restart from a socket-only launch and retains the ru
     runsDirectory: runs,
     startTimeoutMs: 5_000,
   });
-  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-reconnect", piPath: fakeEntry, ...launchSeams, reconnectDelaysMs: [5, 10] });
+  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-reconnect", piPath: fakeEntry });
   const adopted = router.route("one");
   const [reserved] = await workerEntries(root);
   expect(reserved).toMatchObject({ sessionId: "one", runId: "run-reconnect", identity: launched.identity });
   expect(typeof reserved.token).toBe("string");
 
-  // Dropping the daemon's end of the route is what a daemon restart looks like to a live worker.
+  // Dropping the daemon's end of the route is what a lost connection looks like to a live worker.
+  // The worker keeps listening on its own socket, and this daemon re-opens the route itself rather
+  // than leaving a live session unreachable until the next daemon start.
   await supervisor.close();
   await waitUntil(() => router.route("one") !== undefined && router.route("one") !== adopted);
   const reconnected = router.route("one");
@@ -359,6 +299,7 @@ it("reconnects after daemon restart from a socket-only launch and retains the ru
   // A replacement daemon holds none of this session's frames, and Pi has not written the newest of
   // them to its own file yet, so the worker replays its live tail before anything new on this
   // connection. The launch connection sent none, because that daemon had every frame already.
+  await waitUntil(() => control.frames.some((/** @type {any} */ frame) => frame.type === "pi_tail"));
   const replayed = control.frames.filter((/** @type {any} */ frame) => frame.type === "pi_tail");
   expect(replayed).toHaveLength(1);
   expect(replayed[0]).toMatchObject({ version: 1, sessionId: "one", dropped: 0 });
@@ -397,8 +338,67 @@ it("reconnects after daemon restart from a socket-only launch and retains the ru
   await waitForOwnershipRelease(registry, "one", 5_000);
 });
 
+it("records each run's worker socket path when the run is reserved, and creates no socket file itself", async () => {
+  const { root, router } = await setup([]);
+
+  const reservation = await router.reserve({ sessionId: "one", runId: "run-reserved", leaseId: "lease-reserved", generation: 1, token: "reserved-token" });
+  try {
+    const [reserved] = await workerEntries(root);
+    // The daemon chooses the path before it spawns anything, so a replacement daemon reads it from
+    // the roster rather than negotiating it with a worker that may not exist yet.
+    expect(reserved).toMatchObject({ sessionId: "one", runId: "run-reserved", socketPath: expect.stringMatching(/\.sock$/u) });
+    expect(dirname(reserved.socketPath)).toBe(join(root, "daemon", "workers"));
+    expect(reservation.socketPath).toBe(reserved.socketPath);
+    // A daemon that dies here must leave nothing a later daemon can mistake for a live worker: the
+    // worker creates the socket by listening on it, and the daemon only names it.
+    await expect(lstat(reserved.socketPath)).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    reservation.close();
+  }
+});
+
+it("leaves the launched worker listening on the daemon's chosen path at mode 0600 and refuses an unauthenticated connection", async () => {
+  const { root, runs, registry, fakeEntry, router } = await setup(["one"]);
+  const supervisor = new WorkerSupervisor({
+    registry,
+    router,
+    ownership: new OwnershipManager(registry),
+    runsDirectory: runs,
+    startTimeoutMs: 5_000,
+  });
+  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-listening", piPath: fakeEntry });
+  try {
+    const [entry] = await workerEntries(root);
+    expect(entry.socketPath).toEqual(expect.stringMatching(/\.sock$/u));
+    const socketStats = await lstat(entry.socketPath);
+    expect(socketStats.isSocket()).toBe(true);
+    expect(socketStats.mode & 0o777).toBe(0o600);
+
+    // The worker, not the daemon, owns this socket, so it is the side that refuses. A connection
+    // carrying the wrong token is closed without a frame and without disturbing the live route.
+    const refused = await new Promise((resolveRefusal) => {
+      const probe = net.createConnection(entry.socketPath);
+      /** @type {Buffer[]} */
+      const received = [];
+      probe.on("error", () => {});
+      probe.on("data", (chunk) => received.push(chunk));
+      probe.on("close", () => resolveRefusal(Buffer.concat(received).toString("utf8")));
+      probe.on("connect", () => probe.write(`${JSON.stringify({ version: 1, type: "daemon_hello", token: "not-the-run-token" })}\n`));
+    });
+    expect(refused).toBe("");
+
+    const route = router.route("one");
+    await expect(route.connection.request({ version: 1, type: "command", token: route.metadata.token, id: "after-refusal", command: { clientId: "c", requestId: "r", op: "get_state" } }, {}))
+      .resolves.toMatchObject({ stage: "RPC_ACKNOWLEDGED" });
+  } finally {
+    await supervisor.stop(launched, { inspect: inspectProcessIdentity, requestGraceful: async () => {}, signalProcessGroup, sleep }, { gracefulMs: 500, terminateMs: 500 }).catch(() => {});
+    await waitForExit(launched.identity.pid);
+  }
+});
+
+
 it("issues a new token only for a new run and removes the old entry at terminal reconciliation", async () => {
-  const { root, runs, registry, fakeEntry, router, launchSeams } = await setup(["one"]);
+  const { root, runs, registry, fakeEntry, router } = await setup(["one"]);
   const supervisor = new WorkerSupervisor({
     registry,
     router,
@@ -408,7 +408,7 @@ it("issues a new token only for a new run and removes the old entry at terminal 
     startTimeoutMs: 5_000,
     launchStopPolicy: { gracefulMs: 100, terminateMs: 100 },
   });
-  const first = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-first", piPath: fakeEntry, ...launchSeams });
+  const first = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-first", piPath: fakeEntry });
   const firstToken = (await workerEntries(root))[0].token;
 
   await waitForExit(first.pid, 5_000);
@@ -416,7 +416,7 @@ it("issues a new token only for a new run and removes the old entry at terminal 
   await waitUntil(async () => (await workerEntries(root)).length === 0);
 
   await rm(join(root, "one.jsonl"), { force: true });
-  const second = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-second", piPath: fakeEntry, ...launchSeams });
+  const second = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-second", piPath: fakeEntry });
   const [respawned] = await workerEntries(root);
   expect(respawned.runId).toBe("run-second");
   expect(respawned.token).not.toBe(firstToken);
@@ -438,7 +438,7 @@ it("issues a new token only for a new run and removes the old entry at terminal 
 // memory to identify its worker with. If the replacement daemon cannot authenticate the live run
 // from durable state, the session goes unreachable while its worker and Pi child keep running.
 it("adopts a live socket-only worker into a replacement daemon from its persisted run token", async () => {
-  const { root, runs, registry, fakeEntry, router, control, launchSeams } = await setup(["one"]);
+  const { root, runs, registry, fakeEntry, router, control } = await setup(["one"]);
   const supervisor = new WorkerSupervisor({
     registry,
     router,
@@ -446,7 +446,7 @@ it("adopts a live socket-only worker into a replacement daemon from its persiste
     runsDirectory: runs,
     startTimeoutMs: 5_000,
   });
-  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-restart", piPath: fakeEntry, ...launchSeams, reconnectDelaysMs: [5, 10] });
+  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-restart", piPath: fakeEntry });
   const [reserved] = await workerEntries(root);
   expect(reserved).toMatchObject({ sessionId: "one", runId: "run-restart", identity: launched.identity, piChildIdentity: launched.piChildIdentity });
 
@@ -455,15 +455,16 @@ it("adopts a live socket-only worker into a replacement daemon from its persiste
   controlSockets.splice(controlSockets.indexOf(control), 1);
   await router.close();
 
-  const replacement = new RecoveredWorkerRouter({ registry, inspect: inspectProcessIdentity, metadataPath: join(root, "daemon", "workers.json") });
+  const replacementControl = createWorkerControlClient({ registry });
+  controlSockets.push(replacementControl);
+  const replacement = new RecoveredWorkerRouter({ registry, inspect: inspectProcessIdentity, metadataPath: join(root, "daemon", "workers.json"), ...replacementControl.routerSeams });
   await replacement.load();
-  // The replacement daemon knows this run only from what the launch persisted before it spawned.
-  expect(replacement.metadata("one")).toMatchObject({ runId: "run-restart", token: reserved.token, identity: launched.identity, piChildIdentity: launched.piChildIdentity });
+  // The replacement daemon knows this run only from what the launch persisted before it spawned:
+  // the socket to connect to and the token that authenticates it.
+  expect(replacement.metadata("one")).toMatchObject({ runId: "run-restart", token: reserved.token, socketPath: reserved.socketPath, identity: launched.identity, piChildIdentity: launched.piChildIdentity });
   expect(replacement.route("one")).toBeUndefined();
-  controlSockets.push(await createWorkerControlSocket({ root, router: replacement, registry }));
 
-  await waitUntil(() => replacement.route("one") !== undefined);
-  const adopted = replacement.route("one");
+  const adopted = await replacement.connectRun("one", 5_000);
   expect(adopted.metadata.token).toBe(reserved.token);
   expect(adopted.routeGeneration).toBeGreaterThan(0);
   await expect(adopted.connection.request({ version: 1, type: "command", token: adopted.metadata.token, id: "after-restart", command: { clientId: "restart-client", requestId: "restart-request", op: "prompt", text: "still alive" } }, {}))

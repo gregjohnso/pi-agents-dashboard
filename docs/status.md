@@ -17,7 +17,7 @@ None of these lose work or corrupt state. Each was found by the change that repo
 | `PROCESS_EXIT_PROOF_MS` is 2 s with no option | `cli/daemon-commands.mjs` | A daemon the kernel takes longer to reap turns a correct stop into exit code 5 `DAEMON_STILL_RUNNING`. |
 | `CRASH_REPORT_TIMEOUT_MS` is 1 s | `runtime/installed-pi-worker.mjs` | Under load a crashing worker loses its own explanation, which is the one moment that explanation matters. |
 
-| `runViewerTransition` fires `detach` without awaiting it | `app/viewer` | A fast reopen-then-delete races its own detach. |
+| `runViewerTransition` fires `detach` without awaiting it | `app/list/standalone-list.mjs` | A fast reopen-then-delete races its own detach. The client orders a reattach behind that session's in-flight detach, so what remains is a delete racing it. |
 | `migrateLegacyState` refuses any root that ever opened a viewer | `runtime/state-migration.mjs` | Pre-existing. It means that path cannot succeed on the operator's machine today. |
 | The destination daemon `migrateLegacyState` starts has no spawn seam | `runtime/state-migration.mjs` | `test/migration.integration.test.mjs` cannot record it until it publishes, so a test timing out inside `runDashboardApp` still leaks one daemon. Every other real-process suite records at the spawn. |
 
@@ -72,7 +72,7 @@ Ordered by concepts removed, not lines. Every item was verified against the code
 
 **Split `runtime/reconciliation.mjs`, 887 lines**, which currently holds three unrelated things: the worker router, the viewer subsystem, and the startup repair procedure.
 
-**Collapse the frontend's three daemon API layers into one.** A reader today must hold `createDaemonClient`, `createDaemonDashboardBackend` inside `dashboard.mjs`, and `createDaemonViewerClient` inside `standalone-list.mjs`. Highest concept reduction in the frontend, modest line reduction.
+**Collapse the frontend's three daemon API layers into one. Done.** `createDaemonDashboardBackend` and `createDaemonViewerClient` are gone; `createDaemonClient` in `app/daemon-client.mjs` owns every operation the list and the viewer send, and both controllers hold the same object. A reader no longer has to know which of two adapters reshaped an envelope, and the divergence between them is not expressible: a refusal is one typed failure on every operation, including `launch`, which used to answer with `{kind: "rejected"}` while the dashboard also matched a `{kind: "error"}` shape nothing returned. The viewer's five `typeof client.x !== "function"` capability guards went with the second shape, as did the `client.request(operation, payload)` calling convention no client had. Measured across three commits: 203 production lines removed against 82 added, net 121, with 30 test lines removed. The line reduction was the small half, as the review said.
 
 **Consolidate `app/list/` around three responsibilities.** Query projection, display-state derivation, row virtualization and responsive layout are four files that one interaction crosses; merging them into a session table is mostly movement, but reading one keystroke stops being a tour.
 

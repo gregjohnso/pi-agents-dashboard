@@ -7,7 +7,7 @@ import { stripVTControlCharacters } from "node:util";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { createDaemonClient } from "../app/daemon-client.mjs";
-import { DashboardController, createDaemonDashboardBackend } from "../app/list/dashboard.mjs";
+import { DashboardController } from "../app/list/dashboard.mjs";
 import { SPINNER_INTERVAL_MS, spinnerFrame } from "../app/spinner.mjs";
 import { createDaemonRuntime } from "../runtime/daemon.mjs";
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
@@ -95,13 +95,12 @@ async function attachWorker(runtime, sessionId) {
 async function mountDashboard(runtime, clientId) {
   const client = createDaemonClient({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 1024 * 1024, clientId });
   clients.push(client);
-  const backend = createDaemonDashboardBackend({ client, clientId, preflight: async (draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
   /** @type {string[]} */
   const rows = [];
   /** @type {any} */
   let controller;
   controller = new DashboardController({
-    backend,
+    client,
     openViewer: async () => {},
     clientId, sourceSessionId: `dashboard-${clientId}`,
     launchDefaults: { cwd: "/repo", model: { provider: "anthropic", id: "claude" }, name: "task" },

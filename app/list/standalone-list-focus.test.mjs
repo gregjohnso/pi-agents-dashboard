@@ -36,14 +36,16 @@ function workingSession() {
 function mountedDashboard() {
   const terminal = new FakeTerminal();
   const tui = new TuiAltScreen(terminal, false, undefined, { mouse: false });
-  const backend = {
-    async getSnapshot() { return { sessions: [workingSession()], cursor: { daemonEpoch: "epoch", sequence: "1" } }; },
-    async subscribeListChanges(onChanged, onError) { backend.notifyListChanged = onChanged; backend.onError = onError; return () => { backend.unsubscribed = true; }; },
+  const client = {
+    async getState() { return { sessions: [workingSession()], cursor: { daemonEpoch: "epoch", sequence: "1" } }; },
+    async subscribeListChanges(onChanged, onError) { client.notifyListChanged = onChanged; client.onError = onError; return () => { client.unsubscribed = true; }; },
     async preflightLaunch(draft) { return { canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }; },
     async launch() { return { kind: "launched", sessionId: "busy" }; },
+    async getModels() { return []; },
+    async refreshSummaries() { return []; },
   };
   const controller = new DashboardController({
-    backend, openViewer: async () => {},
+    client, openViewer: async () => {},
     clientId: "host-client", launchDefaults: { cwd: "/repo", model: { provider: "anthropic", id: "claude" }, name: "task" },
     requestRender: () => tui.requestRender(),
   });
@@ -55,7 +57,7 @@ function mountedDashboard() {
     try { return render(width, height); } finally { depth -= 1; }
   };
   standaloneList.mountStandaloneHost({ tui, getActive: () => controller });
-  return { backend, controller, terminal, tui };
+  return { client, controller, terminal, tui };
 }
 
 function paintedGlyphs(terminal) {
@@ -109,12 +111,12 @@ it("repaints the mounted list with a moving throbber and stops the timer on clos
 });
 
 it("stops the spinner timer when the dashboard closes on a subscription failure", async () => {
-  const { backend, controller, terminal, tui } = mountedDashboard();
+  const { client, controller, terminal, tui } = mountedDashboard();
   tui.start();
   await controller.open();
   await vi.waitFor(() => expect(paintedGlyphs(terminal).length).toBeGreaterThan(0), { timeout: 2_000 });
 
-  backend.onError({ code: "MALFORMED_FRAME", message: "Daemon event stream failed" });
+  client.onError({ code: "MALFORMED_FRAME", message: "Daemon event stream failed" });
   await vi.waitFor(() => expect(controller.status).toMatchObject({ kind: "error" }));
   await new Promise((resolve) => setTimeout(resolve, SPINNER_INTERVAL_MS));
   terminal.writes.length = 0;

@@ -1,7 +1,5 @@
 import { appendFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
-
 import { join } from "node:path";
 
 import { ProcessTerminal, TuiAltScreen } from "@earendil-works/pi-tui";
@@ -10,7 +8,7 @@ import { createDaemonClient } from "../daemon-client.mjs";
 import { createWheelInputTap } from "../mouse-input.mjs";
 import { createPiEditor } from "../viewer/pi-component-adapters.mjs";
 import { ViewerController } from "../viewer/viewer-controller.mjs";
-import { DashboardController, createDaemonDashboardBackend } from "./dashboard.mjs";
+import { DashboardController } from "./dashboard.mjs";
 
 /** Run one list-to-viewer transition and restore the list after any failure. @param {any} options */
 /** Opt-in stage timing for a viewer transition, so latency can be measured where the operator sits. */
@@ -109,20 +107,6 @@ export function mountStandaloneHost({ tui, getActive, getHeight, terminal }) {
 export async function createStandaloneList({ cwd, frontend }) {
   const token = (await fs.readFile(join(frontend.root, "daemon", "control.token"), "utf8")).trim();
   const client = createDaemonClient({ socketPath: join(frontend.root, "daemon", "control.sock"), token, maxBytes: 1024 * 1024, clientId: frontend.clientId, attachId: frontend.attachId });
-  const backend = createDaemonDashboardBackend({
-    client, clientId: frontend.clientId,
-    preflight: async (draft) => {
-      const canonicalCwd = await fs.realpath(draft.cwd);
-      if (draft.isolationMode !== "shared_directory") return { canonicalCwd, isolationMode: draft.isolationMode, ownerSessionIds: [] };
-      const state = await client.request({ version: 1, clientId: frontend.clientId, requestId: randomUUID(), op: "get_state", payload: {} });
-      if (!state.ok || state.result?.kind !== "state") throw Object.assign(new Error(state.error?.message ?? "Daemon state is unavailable"), state.error ?? { code: "INVALID_RESPONSE" });
-      const ownerSessionIds = state.result.sessions
-        .filter((record) => record.ownership !== undefined && (record.isolation?.mode === "shared_directory" ? record.isolation.canonicalCwd : record.cwd) === canonicalCwd)
-        .map((record) => record.sessionId)
-        .sort();
-      return { canonicalCwd, isolationMode: draft.isolationMode, ownerSessionIds };
-    },
-  });
   const terminal = createWheelInputTap(new ProcessTerminal());
   const tui = new TuiAltScreen(terminal);
   const viewerState = new Map();
@@ -167,7 +151,7 @@ export async function createStandaloneList({ cwd, frontend }) {
     switching = false;
   };
   const controller = new DashboardController({
-    backend, openViewer: openRealViewer,
+    client, openViewer: openRealViewer,
     clientId: frontend.clientId, sourceSessionId: `dashboard-${frontend.clientId}`,
     launchDefaults: { cwd }, requestRender: () => tui.requestRender(),
     onClose: () => { if (!switching && activeViewer === undefined) { tui.stop(); resolveClosed(); } },

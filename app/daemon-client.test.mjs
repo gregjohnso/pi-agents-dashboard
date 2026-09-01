@@ -113,8 +113,6 @@ describe("daemon client", () => {
       { version: 1, token: "secret", clientProtocol: CLIENT_PROTOCOL, attachId: "attach-one" },
       { version: 1, token: "secret", clientProtocol: CLIENT_PROTOCOL },
     ]);
-    // A transaction client is another connection of the same dashboard process, not another process.
-    expect(withAttachId.createTransactionClient).toBeTypeOf("function");
     expect(() => startClient({ socketPath, attachId: "" })).toThrow(/attachId/u);
   });
 
@@ -183,6 +181,82 @@ describe("daemon client", () => {
     server.socket?.destroy();
     await waitFor(() => subscriptions === 2);
     await waitFor(() => notifications > before);
+  });
+
+  // The list draws a fatal frame on its own error line, so this listener lives and dies with the
+  // subscription rather than with the whole client.
+  it("reports this connection's fatal frames to the list subscriber until it unsubscribes", async () => {
+    const socketPath = await socketPathIn("client-list-fatal-");
+    const server = await daemonServer(socketPath, ({ request: incoming, reply }) => {
+      if (incoming.op === "subscribe_list_changes") reply({ kind: "list_subscribed" });
+    });
+    const client = startClient({ socketPath, reconnectDelayMs: 1 });
+    /** @type {any[]} */
+    const failures = [];
+    const unsubscribe = await client.subscribeListChanges(() => {}, (error) => failures.push(error));
+    server.socket?.write(encodeJsonl({ version: 1, kind: "list_changed", unexpected: true }));
+    await waitFor(() => failures.length === 1);
+    expect(failures[0]).toMatchObject({ code: "MALFORMED_FRAME" });
+    unsubscribe();
+    await waitFor(() => server.connections === 2);
+    server.sockets.at(-1)?.write(encodeJsonl({ version: 1, kind: "list_changed", unexpected: true }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(failures).toHaveLength(1);
+  });
+
+  // Operator-visible failure: a snapshot with no stated coverage cannot be told from one taken before
+  // the change that provoked the read, so the list could sit on a row that never updated again. The
+  // response contract requires the cursor, and the refusal has to reach the read that asked for it.
+  it("reads rows with their coverage cursor and fails the read when a daemon sends none", async () => {
+    const socketPath = await socketPathIn("client-state-");
+    let reads = 0;
+    await daemonServer(socketPath, ({ socket, request: incoming, reply }) => {
+      reads += 1;
+      if (reads === 1) reply(emptyState);
+      else socket.write(encodeJsonl({ version: 1, requestId: incoming.requestId, ok: true, result: { kind: "state", sessions: [] } }));
+    });
+    const client = startClient({ socketPath });
+    await expect(client.getState()).resolves.toEqual({ sessions: [], cursor: emptyState.cursor });
+    await expect(client.getState()).rejects.toMatchObject({ code: "MALFORMED_RESPONSE" });
+  });
+
+  // A destructive command claims nothing: it carries the installation clientId, its own request ID,
+  // and an exact revision, and that is the whole authorization the daemon needs. It travels on its
+  // own connection, so a socket that dies mid-command is this command's ambiguity, not the list's.
+  it.each(["stop", "delete"])("sends %s alone on its own connection, with no attachment around it", async (operation) => {
+    const socketPath = await socketPathIn("client-destructive-");
+    /** @type {any[]} */
+    const requests = [];
+    const server = await daemonServer(socketPath, ({ request: incoming, connection, reply }) => {
+      requests.push({ connection, ...incoming });
+      reply({ kind: "command", sessionId: incoming.payload.sessionId });
+    });
+    const client = startClient({ socketPath, attachId: "attach-one" });
+    await client.connect();
+    await client[operation]("exact-session", 3, `${operation}-request`);
+    expect(requests).toEqual([{ connection: 2, version: 1, clientId: "client-1", requestId: `${operation}-request`, op: operation, payload: { sessionId: "exact-session", revision: 3 } }]);
+    // The second connection is another connection of the same dashboard process, not another process.
+    expect(server.authentications.map((frame) => frame.attachId)).toEqual(["attach-one", "attach-one"]);
+  });
+
+  // An ambiguous transport failure after submission is never replayed silently: it becomes
+  // DELIVERY_UNKNOWN carrying the identity it was sent under, and the row's revision is the record.
+  it.each(["stop", "delete"])("classifies %s interrupted by a dying socket as delivery unknown", async (operation) => {
+    const socketPath = await socketPathIn("client-destructive-lost-");
+    await daemonServer(socketPath, ({ socket, request: incoming }) => {
+      if (incoming.op === operation) socket.destroy();
+    });
+    const client = startClient({ socketPath });
+    await expect(within(client[operation]("exact-session", 3, `${operation}-request`)))
+      .rejects.toMatchObject({ code: "DELIVERY_UNKNOWN", clientId: "client-1", requestId: `${operation}-request` });
+  });
+
+  it.each(["stop", "delete"])("treats a refused %s as a structured refusal", async (operation) => {
+    const socketPath = await socketPathIn("client-destructive-refused-");
+    await daemonServer(socketPath, ({ refuse }) => refuse({ code: "REVISION_CONFLICT", message: `${operation} refused` }));
+    const client = startClient({ socketPath });
+    await expect(within(client[operation]("exact-session", 3, `${operation}-request`)))
+      .rejects.toMatchObject({ code: "REVISION_CONFLICT", message: `${operation} refused` });
   });
 
   // Operator-visible failure: an old daemon has no list-invalidation operation, and a subscription

@@ -1,5 +1,6 @@
 import net from "node:net";
 import { randomUUID } from "node:crypto";
+import { realpath } from "node:fs/promises";
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
 import { CLIENT_PROTOCOL, parseDaemonResponse, parseListChanged, parseViewerStreamFailed } from "../shared/contracts.mjs";
 import { parseViewerEvent, parseViewerSnapshot } from "../shared/viewer-contracts.mjs";
@@ -13,6 +14,8 @@ import { parseViewerEvent, parseViewerSnapshot } from "../shared/viewer-contract
  */
 const MAX_SEEN_REQUESTS = 256;
 const MAX_SEEN_RESPONSE_CHARACTERS = 4 * 1024 * 1024;
+/** Transport failures that leave a destructive command's fate unknown: the bytes may already be there. */
+const AMBIGUOUS_TRANSPORT_CODES = ["CONNECTION_CLOSED", "MALFORMED_FRAME", "MALFORMED_RESPONSE", "INVALID_DAEMON_RESPONSE", "UNEXPECTED_DAEMON_RESPONSE"];
 
 export class DaemonClientError extends Error {
     code;
@@ -370,7 +373,10 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
         });
         return reconnectLoop;
     }
-    /** Send one operation and unwrap its result; a daemon failure keeps that operation's own error code. */
+    /**
+     * Send one operation and unwrap its result; a daemon failure keeps that operation's own error code.
+     * @param {string} op @param {Record<string, any>} payload @param {string} [exactRequestId]
+     */
     const requestResult = async (op, payload, exactRequestId = randomUUID()) => {
         const response = await client.request({ version: 1, clientId, requestId: exactRequestId, op, payload });
         if (!response.ok)
@@ -385,6 +391,32 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
     };
     /** Detaches still in flight, by session: a fast reopen orders behind its own detach. */
     const detaching = new Map();
+    /**
+     * Send one destructive command on its own connection, so a socket that dies mid-command is this
+     * command's own ambiguity rather than the list connection's. A transport failure after the bytes
+     * left is `DELIVERY_UNKNOWN` carrying the identity it was sent under: nothing durable records it
+     * and nothing may retry it silently, so the row's revision is what the operator reads.
+     * @param {"stop" | "delete"} operation @param {string} sessionId @param {number} revision
+     * @param {string} [exactRequestId]
+     */
+    const destructive = async (operation, sessionId, revision, exactRequestId = randomUUID()) => {
+        const transaction = createDaemonClient({ socketPath, token, maxBytes, reconnectDelayMs, maxReconnectDelayMs, clientId, attachId, subscriberLimit, reconnect: false });
+        try {
+            await transaction.connect();
+            const response = await transaction.request({ version: 1, clientId, requestId: exactRequestId, op: operation, payload: { sessionId, revision } })
+                .catch((/** @type {any} */ error) => {
+                    if (AMBIGUOUS_TRANSPORT_CODES.includes(error?.code))
+                        throw Object.assign(new DaemonClientError("DELIVERY_UNKNOWN", `${operation === "stop" ? "Stop" : "Delete"} delivery is ambiguous`), { clientId, requestId: exactRequestId });
+                    throw error;
+                });
+            if (!response.ok)
+                throw new DaemonClientError(response.error.code, response.error.message, response.error.retryable === true);
+            resultOfKind(response.result, "command", operation);
+        }
+        finally {
+            await transaction.close();
+        }
+    };
     /** One bounded async iterator over a viewer subscriber's queue; returning early unregisters it. */
     const subscriberIterable = (subscriber) => ({
         [Symbol.asyncIterator]() { return this; },
@@ -407,7 +439,6 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
     });
     const client = {
         connect: startReconnectLoop,
-        createTransactionClient() { return createDaemonClient({ socketPath, token, maxBytes, reconnectDelayMs, maxReconnectDelayMs, clientId, attachId, subscriberLimit, reconnect: false }); },
         request(request) {
             if (closed)
                 return Promise.reject(new DaemonClientError("CLIENT_CLOSED", "Daemon client is closed"));
@@ -438,30 +469,78 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
             return promise;
         },
         /**
-         * Subscribe to payload-free list invalidations, then read `get_state`. Subscribing first is
+         * Subscribe to payload-free list invalidations, then read `getState`. Subscribing first is
          * what makes the read safe: a change published while the read is in flight arrives as a
          * notification instead of being missed. Establishment is awaited, so a daemon without this
          * operation refuses here rather than leaving a list that never refreshes again.
-         * @param {() => void} onChanged @returns {Promise<() => void>}
+         *
+         * `onError` receives this connection's fatal frames for as long as the subscription lives,
+         * because a stream that dies on an unreadable frame is exactly what a list must not sit
+         * through silently.
+         * @param {() => void} onChanged @param {(error: { code: string, message: string }) => void} [onError]
+         * @returns {Promise<() => void>}
          */
-        async subscribeListChanges(onChanged) {
+        async subscribeListChanges(onChanged, onError) {
             if (typeof onChanged !== "function")
                 throw new TypeError("onChanged is required");
             if (closed)
                 throw new DaemonClientError("CLIENT_CLOSED", "Daemon client is closed");
+            let active = true;
             /** @type {{ onChanged: () => void, established: boolean }} */
-            const subscriber = { onChanged, established: false };
+            const subscriber = { onChanged: () => { if (active) onChanged(); }, established: false };
+            const removeFatalListener = onError === undefined
+                ? undefined
+                : client.onFatalError((error) => { if (active) onError({ code: error.code, message: error.message }); });
             listSubscribers.add(subscriber);
             try {
                 await requestResult("subscribe_list_changes", {});
             }
             catch (error) {
+                active = false;
+                removeFatalListener?.();
                 listSubscribers.delete(subscriber);
                 throw error;
             }
             subscriber.established = true;
-            return () => { listSubscribers.delete(subscriber); };
+            return () => { active = false; removeFatalListener?.(); listSubscribers.delete(subscriber); };
         },
+        /**
+         * Current rows and the coverage cursor that says how far this daemon's list had advanced when
+         * it read them. The cursor is required by the response contract, which is what makes a
+         * snapshot distinguishable from one taken before the change that provoked the read.
+         */
+        async getState() {
+            const result = resultOfKind(await requestResult("get_state", {}), "state", "state");
+            return { sessions: result.sessions, cursor: result.cursor };
+        },
+        /**
+         * What a launch needs before it is sent: the canonical directory, and which live sessions
+         * already own it. Only a shared directory has owners worth confirming against.
+         * @param {{ cwd: string, isolationMode: string }} draft
+         */
+        async preflightLaunch(draft) {
+            const canonicalCwd = await realpath(draft.cwd);
+            if (draft.isolationMode !== "shared_directory")
+                return { canonicalCwd, isolationMode: draft.isolationMode, ownerSessionIds: [] };
+            const { sessions } = await client.getState();
+            const ownerSessionIds = sessions
+                .filter((/** @type {any} */ record) => record.ownership !== undefined && (record.isolation?.mode === "shared_directory" ? record.isolation.canonicalCwd : record.cwd) === canonicalCwd)
+                .map((/** @type {any} */ record) => record.sessionId)
+                .sort();
+            return { canonicalCwd, isolationMode: draft.isolationMode, ownerSessionIds };
+        },
+        /** @param {Record<string, any>} launchRequest @param {string} [exactRequestId] */
+        async launch(launchRequest, exactRequestId) {
+            return resultOfKind(await requestResult("launch", launchRequest, exactRequestId), "launched", "launch");
+        },
+        /** Ask for opt-in Activity summaries. Background work: the answer names the rows it will refresh. */
+        async refreshSummaries() {
+            return resultOfKind(await requestResult("refresh_summaries", {}), "summaries_refreshing", "summary refresh").sessionIds;
+        },
+        /** @param {string} sessionId @param {number} revision @param {string} [exactRequestId] */
+        stop(sessionId, revision, exactRequestId) { return destructive("stop", sessionId, revision, exactRequestId); },
+        /** @param {string} sessionId @param {number} revision @param {string} [exactRequestId] */
+        delete(sessionId, revision, exactRequestId) { return destructive("delete", sessionId, revision, exactRequestId); },
         /** @param {string} sessionId @param {string | null} color */
         async setSessionColor(sessionId, color) {
             if (typeof sessionId !== "string" || sessionId.length === 0)

@@ -84,16 +84,6 @@ async function removePreparedSession(sessionFile, expected, fsOps) {
   try { await directory.sync(); } finally { await directory.close(); }
 }
 
-/** Roll back only the exact inactive artifacts prepared before a child process existed. @param {any} launch @param {any} options */
-export async function rollbackPreparedLaunch(launch, { registry, cleanupWorktree = cleanupOwnedWorktree, fsOps = fs }) {
-  const record = await registry.get(launch.sessionId);
-  if (record?.ownership !== undefined) throw Object.assign(new Error("Prepared launch acquired live ownership"), { code: "LIVE_OWNERSHIP" });
-  const isolation = record?.isolation ?? launch.sessionRecord?.isolation;
-  if (isolation?.mode === "worktree") await cleanupWorktree(isolation, { readLiveOwnership: async () => (await registry.get(launch.sessionId))?.ownership });
-  await removePreparedSession(launch.canonicalSessionFile, launch.preparedSessionIdentity, fsOps);
-  if (record !== undefined) await registry.remove(launch.sessionId, record.revision);
-}
-
 /** Resolve one strict daemon launch into isolation, registry identity, and worker inputs. @param {any} options */
 export function createLaunchResolver({
   registry,
@@ -178,7 +168,6 @@ export function createLaunchResolver({
         sessionRecord,
         ...(payload.model === undefined ? {} : { model: { ...payload.model } }),
         ...(name === undefined ? {} : { name }),
-        ...(piSession.identity === undefined ? {} : { preparedSessionIdentity: piSession.identity }),
       };
     } catch (error) {
       try {

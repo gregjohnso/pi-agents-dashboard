@@ -29,31 +29,10 @@ it("materializes and validates a real Pi session header before launch", async ()
   }
 });
 
-it("rolls back an exact prepared session and worktree after a pre-child refusal", async () => {
-  expect(launchResolver.rollbackPreparedLaunch).toBeTypeOf("function");
-  /** @type {string[]} */
-  const order = [];
-  const record = { revision: 0, ownership: undefined, isolation: { mode: "worktree", worktreePath: "/worktree", branch: "pi-agents/prepared" } };
-  const registry = {
-    get: vi.fn(async () => record),
-    remove: vi.fn(async () => { order.push("registry"); }),
-  };
-  const directory = { async sync() { order.push("directory-sync"); }, async close() {} };
-  const fsOps = {
-    async lstat() { return { dev: 1, ino: 2, size: 3, mtimeMs: 4, isFile: () => true, isSymbolicLink: () => false }; },
-    async unlink() { order.push("session"); },
-    async open() { return directory; },
-  };
-  const cleanupWorktree = vi.fn(async () => { order.push("worktree"); return { disposition: "REMOVED" }; });
-  await launchResolver.rollbackPreparedLaunch({
-    sessionId: "session",
-    canonicalSessionFile: "/sessions/session.jsonl",
-    preparedSessionIdentity: { dev: 1, ino: 2, size: 3, mtimeMs: 4 },
-    sessionRecord: { isolation: record.isolation },
-  }, { registry, cleanupWorktree, fsOps });
-  expect(order).toEqual(["worktree", "session", "directory-sync", "registry"]);
-  expect(cleanupWorktree).toHaveBeenCalledWith(record.isolation, { readLiveOwnership: expect.any(Function) });
-  expect(registry.remove).toHaveBeenCalledWith("session", 0);
+// A launch that fails before its child exists is marked FAILED by the daemon, never rolled back, so
+// the resolver offers no rollback entry point.
+it("resolves launches and materializes sessions, and offers no rollback", async () => {
+  expect(Object.keys(launchResolver).sort()).toEqual(["createLaunchResolver", "materializePiSession", "sessionNameFromPrompt"]);
 });
 
 it("names a session from its initial prompt and keeps an explicit name", async () => {
@@ -117,7 +96,9 @@ it("builds an isolated canonical session launch from the daemon request", async 
     branch: "pi-agents/session-id",
     workerCwd: "/pi/agent/pi-agents/worktrees/session-id/packages/app",
   }));
-  const createPiSession = vi.fn(() => ({ sessionId: "session-id", sessionFile: "/pi/agent/sessions/project/session-id.jsonl" }));
+  // Pi reports the materialized file's identity; nothing downstream of resolution consumes it, so
+  // it must not reach the launch the daemon hands to the supervisor.
+  const createPiSession = vi.fn(() => ({ sessionId: "session-id", sessionFile: "/pi/agent/sessions/project/session-id.jsonl", identity: { dev: 1, ino: 2, size: 3, mtimeMs: 4 } }));
   const ids = ["session-id", "run-id"];
   const preparedRunHash = createHash("sha256").update("run-id\0session-id").digest("hex");
   const resolveLaunch = createLaunchResolver({

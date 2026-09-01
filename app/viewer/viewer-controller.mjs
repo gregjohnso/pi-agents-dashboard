@@ -54,8 +54,13 @@ function framePromptBox(lines, color, width, name) {
 // trackpad swipe into a notch count.
 const WHEEL_SCROLL_LINES = 1;
 
-const QUEUED_MESSAGE_ROWS = 3;
+const PENDING_MESSAGE_ROWS = 3;
 const MIN_TRANSCRIPT_ROWS = 3;
+
+/** The text blocks of one normalized user message, joined the way a submission was sent. @param {any} item */
+function userMessageText(item) {
+  return item.content.filter((/** @type {any} */ part) => part.type === "text").map((/** @type {any} */ part) => part.text).join("\n");
+}
 
 /**
  * Every refusal Pi writes crosses the daemon under one transport code, so printing that code puts a
@@ -124,7 +129,8 @@ export class ViewerController {
     this.cwd = cwd;
     this.menu = EMPTY_SESSION_MENU;
     this.history = [];
-    this.queued = [];
+    /** Submissions this viewer has sent and not yet seen in the transcript. @type {{ mode: "submission" | "steer", text: string, priorMatches: number }[]} */
+    this.pending = [];
     this.respondedUi = new Set();
     this.inputMode = "prompt";
     this.hideThinking = false;
@@ -198,14 +204,14 @@ export class ViewerController {
     const selectedTool = this.transcript.selectedToolId === undefined ? undefined : this.state.tools.get(this.transcript.selectedToolId);
     const toolLine = selectedTool === undefined ? [] : [` tool:${selectedTool.name} ${selectedTool.state} ${this.transcript.expandedTools.has(selectedTool.id) ? "expanded" : "collapsed"}`];
     let errorLines = this.state.errors.slice(-1).flatMap((error) => renderSystemCard({ text: describeViewerError(error), level: "error" }, width));
-    let queuedLines = this.renderQueued();
+    let pendingLines = this.renderPending();
     const connectionLines = this.daemonUnreachable ? [" Daemon unreachable · reconnecting…"] : this.streamStopped ? [" Transcript stopped · Esc to the list, then reopen this session"] : [];
     let hints = renderKeyHints(this.state, width);
-    const dockRows = () => 2 + (hints === "" ? 0 : 1) + status.length + editorLines.length + inputLabel.length + toolLine.length + errorLines.length + queuedLines.length + connectionLines.length;
+    const dockRows = () => 2 + (hints === "" ? 0 : 1) + status.length + editorLines.length + inputLabel.length + toolLine.length + errorLines.length + pendingLines.length + connectionLines.length;
     if (height - dockRows() < MIN_TRANSCRIPT_ROWS) {
       // Pi's dock gives up its own rows before the transcript loses any: spacers first, then the
       // prompt frame, then the hints. Only decoration goes; every dock line with content stays.
-      status = status.slice(1); errorLines = errorLines.slice(1); queuedLines = queuedLines.slice(1);
+      status = status.slice(1); errorLines = errorLines.slice(1); pendingLines = pendingLines.slice(1);
       if (height - dockRows() < MIN_TRANSCRIPT_ROWS) editorLines = this.editor.render(width);
       if (height - dockRows() < MIN_TRANSCRIPT_ROWS) hints = "";
     }
@@ -218,7 +224,7 @@ export class ViewerController {
       body = [...body.slice(0, start), ...overlayLines];
     }
     const footer = renderModelFooter(this.state, this.hideThinking, width);
-    const lines = [header, ...body, ...connectionLines, ...errorLines, ...queuedLines, ...status, ...toolLine, ...inputLabel, ...editorLines, footer, ...(hints === "" ? [] : [hints])].map((line) => fit(line, width));
+    const lines = [header, ...body, ...connectionLines, ...errorLines, ...pendingLines, ...status, ...toolLine, ...inputLabel, ...editorLines, footer, ...(hints === "" ? [] : [hints])].map((line) => fit(line, width));
     while (lines.length < height) lines.splice(1, 0, "");
     return lines.slice(0, height);
   }
@@ -421,10 +427,11 @@ export class ViewerController {
     } else {
       // This flag is one turn_state event behind Pi, so it cannot decide delivery: the worker sends
       // both operations to Pi with a streaming behavior and Pi queues or starts the turn from its
-      // own state. What it still decides is whether this line is drawn as pending below.
+      // own state. It is kept only for a worker predating that change, which still needs the
+      // operation name. Nothing here decides whether the text was queued or started a turn.
       const operation = this.state.working ? "follow_up" : "prompt";
-      if (!await this.sendCommand(operation, { text: submission.text })) return;
-      if (operation === "follow_up") this.queued.push({ mode: "follow_up", text: submission.text });
+      const entry = this.notePending("submission", submission.text);
+      if (!await this.sendCommand(operation, { text: submission.text })) { this.dropPending(entry); return; }
     }
     this.history.push(prompt);
     this.editor.addToHistory?.(prompt);
@@ -435,26 +442,67 @@ export class ViewerController {
   async submitSteer(text) {
     const steer = text.trim();
     if (this.state === undefined || steer.length === 0) return false;
+    const entry = this.notePending("steer", steer);
     const sent = await this.sendCommand("steer", { text: steer });
-    if (sent) this.queued.push({ mode: "steer", text: steer });
+    if (!sent) this.dropPending(entry);
     return sent;
   }
 
-  /** Drop queued messages once the session has turned them into user turns or ended the turn that held them. */
-  syncQueued() {
-    if (this.queued.length === 0) return;
-    if (this.state?.working !== true) { this.queued = []; return; }
-    const submitted = new Set(this.state.items.filter((item) => item.kind === "user_message").map((item) => item.content.filter((part) => part.type === "text").map((part) => part.text).join("\n")));
-    this.queued = this.queued.filter((entry) => !submitted.has(entry.text));
+  /**
+   * Draw one accepted submission before the transcript carries it, and draw it now rather than after
+   * the round trip: the operator has to see that his text was taken.
+   *
+   * A normalized `user_message` carries no submission identity, so its text is the only tie back to
+   * what this viewer sent. Pi matches its own queues the same way. `priorMatches` records how many
+   * transcript user messages already carried this text, so a line the operator sent an hour ago
+   * cannot clear the identical line he just sent.
+   * @param {"submission" | "steer"} mode @param {string} text
+   */
+  notePending(mode, text) {
+    const entry = { mode, text, priorMatches: (this.state?.items ?? []).filter((item) => item.kind === "user_message" && userMessageText(item) === text).length };
+    this.pending.push(entry);
+    void this.requestRender();
+    return entry;
   }
 
-  /** Render Pi's queued block, steering before follow-ups, directly above the status indicator. */
-  renderQueued() {
-    if (this.queued.length === 0) return [];
-    const ordered = [...this.queued.filter((entry) => entry.mode === "steer"), ...this.queued.filter((entry) => entry.mode === "follow_up")];
-    const shown = ordered.slice(0, QUEUED_MESSAGE_ROWS).map((entry) => ` ${entry.mode === "steer" ? "Steering" : "Follow-up"}: ${entry.text}`);
-    const remaining = ordered.length - shown.length;
-    return ["", ...shown, ...(remaining > 0 ? [` … ${remaining} more queued`] : [])];
+  /** Take one submission out of the pending block: Pi refused it, so nothing is outstanding. @param {any} entry */
+  dropPending(entry) {
+    this.pending = this.pending.filter((candidate) => candidate !== entry);
+  }
+
+  /**
+   * Drop each pending submission the transcript now carries. Pi publishes the user message when it
+   * starts the turn holding that text, whether it began immediately or waited in a queue, so that is
+   * the one thing that clears a row: no turn boundary and no cached working flag do, because neither
+   * says anything about text Pi has not shown yet.
+   */
+  syncPending() {
+    if (this.pending.length === 0) return;
+    /** @type {Map<string, number>} */
+    const landed = new Map();
+    for (const item of this.state?.items ?? []) {
+      if (item.kind !== "user_message") continue;
+      const text = userMessageText(item);
+      landed.set(text, (landed.get(text) ?? 0) + 1);
+    }
+    /** @type {Map<string, number>} */
+    const seen = new Map();
+    this.pending = this.pending.filter((entry) => {
+      const count = landed.get(entry.text) ?? 0;
+      const index = seen.get(entry.text) ?? 0;
+      seen.set(entry.text, index + 1);
+      // A snapshot window that no longer reaches the older identical message would strand this row.
+      entry.priorMatches = Math.min(entry.priorMatches, count);
+      return count < entry.priorMatches + index + 1;
+    });
+  }
+
+  /** Draw what this viewer has sent and not yet seen, in submission order, above the status indicator. */
+  renderPending() {
+    if (this.pending.length === 0) return [];
+    const shown = this.pending.slice(0, PENDING_MESSAGE_ROWS).map((entry) => ` ${entry.mode === "steer" ? "Steering" : "Pending"}: ${entry.text}`);
+    const remaining = this.pending.length - shown.length;
+    return ["", ...shown, ...(remaining > 0 ? [` … ${remaining} more pending`] : [])];
   }
 
   async sendCommand(operation, payload) {
@@ -589,6 +637,10 @@ export class ViewerController {
       const applied = this.state?.eventIds ?? [];
       this.state = createTranscriptState(snapshot);
       for (const eventId of applied) this.state.eventIds.add(eventId);
+      // A message that landed while the daemon was away is in this snapshot rather than in an event,
+      // because a cursor advances only after an event is applied and this subscription resumes from
+      // the snapshot's own cursor. Its pending row has to go now or nothing else will move it.
+      this.syncPending();
       this.transcript.update(this.state);
       this.installOverlay();
       const unsubscribe = await this.client.subscribe(this.sessionId, snapshot.cursor, (event) => this.processEvent(event), (error) => this.streamFailed(error));
@@ -625,7 +677,7 @@ export class ViewerController {
       // restores the one reload a later refusal may spend.
       this.streamStopped = false;
       this.streamReloaded = false;
-      this.syncQueued();
+      this.syncPending();
       this.transcript.update(this.state);
       this.installOverlay();
       await this.requestRender();

@@ -542,26 +542,91 @@ describe("frontend resume across a reconnect", () => {
 });
 
 describe("Pi interactive-mode parity", () => {
-  it("lists queued steer and follow-up messages under the editor until the session consumes them", async () => {
-    const f = fixture({ snapshot: { taskState: "WORKING" } });
+  const view = (/** @type {any} */ f) => stripVTControlCharacters(f.instance.render(80, 24).join("\n"));
+  const pendingRows = (/** @type {any} */ f) => view(f).split("\n").filter((line) => /Pending:|Steering:/u.test(line)).map((line) => line.trim());
+  const event = (/** @type {string} */ sequence, /** @type {any} */ payload) => ({ version: 1, sessionId: "s", eventId: `e${sequence}`, cursor: { daemonEpoch: "epoch", sessionId: "s", sequence }, timestamp, payload });
+
+  // The operator's own view of the lost-prompt fix: this frontend believes the session is idle while
+  // Pi has already started a turn, so it cannot say whether Pi began this text or queued it. What it
+  // can say is that the text was accepted and has not appeared yet, and it must keep saying it until
+  // the transcript carries the text.
+  it("shows every accepted submission as pending, in submission order, until the transcript carries it", async () => {
+    const f = fixture();
     await f.instance.open();
-    f.instance.editor.setText("next");
+
+    f.instance.editor.setText("deploy it");
     f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(f.commands.at(-1)?.operation).toBe("follow_up"));
-    await f.instance.submitSteer("urgent");
-    const queued = f.instance.render(80, 24).map(stripVTControlCharacters).join("\n");
-    expect(queued).toContain(" Steering: urgent");
-    expect(queued).toContain(" Follow-up: next");
+    await vi.waitFor(() => expect(f.commands.at(-1)?.operation).toBe("prompt"));
+    expect(view(f)).toContain(" Pending: deploy it");
 
-    await f.emit({ version: 1, sessionId: "s", eventId: "consumed", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "user_message", itemId: "queued-next", content: [{ type: "text", text: "next" }] } });
-    const consumed = f.instance.render(80, 24).map(stripVTControlCharacters).join("\n");
-    expect(consumed).not.toContain("Follow-up: next");
-    expect(consumed).toContain(" Steering: urgent");
+    await f.instance.submitSteer("stop at the tests");
+    f.instance.editor.setText("then tag it");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.commands).toHaveLength(3));
+    expect(pendingRows(f)).toEqual(["Pending: deploy it", "Steering: stop at the tests", "Pending: then tag it"]);
 
-    await f.emit({ version: 1, sessionId: "s", eventId: "settled", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "2" }, timestamp, payload: { kind: "turn_state", working: false } });
-    expect(f.instance.render(80, 24).map(stripVTControlCharacters).join("\n")).not.toContain("Steering: urgent");
+    // A settled turn is not proof about text Pi has not shown yet, so it drops nothing.
+    await f.emit(event("1", { kind: "turn_state", working: false }));
+    expect(pendingRows(f)).toEqual(["Pending: deploy it", "Steering: stop at the tests", "Pending: then tag it"]);
+
+    await f.emit(event("2", { kind: "user_message", itemId: "landed", content: [{ type: "text", text: "deploy it" }] }));
+    expect(pendingRows(f)).toEqual(["Steering: stop at the tests", "Pending: then tag it"]);
   });
 
+  it("keeps text the transcript already carried pending until this submission's own copy lands", async () => {
+    const f = fixture({ snapshot: { taskState: "WORKING" } });
+    await f.instance.open();
+    f.instance.editor.setText("hello");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.commands).toHaveLength(1));
+
+    // The snapshot's own user message says "hello" too; it is not this submission.
+    await f.emit(event("1", { kind: "system_message", itemId: "noise", text: "working", level: "info" }));
+    expect(pendingRows(f)).toEqual(["Pending: hello"]);
+
+    await f.emit(event("2", { kind: "user_message", itemId: "second-hello", content: [{ type: "text", text: "hello" }] }));
+    expect(pendingRows(f)).toEqual([]);
+  });
+
+  it("takes a refused submission out of the pending block and leaves the text in the composer", async () => {
+    /** @type {(error: Error) => void} */
+    let refuse = () => {};
+    const f = fixture({ command: async () => new Promise((_resolve, reject) => { refuse = reject; }) });
+    await f.instance.open();
+    f.instance.editor.setText("ship it");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.commands).toHaveLength(1));
+    expect(pendingRows(f)).toEqual(["Pending: ship it"]);
+
+    refuse(Object.assign(new Error("Cannot submit a prompt while compaction is in progress."), { code: "RPC_COMMAND_FAILED", retryable: false }));
+    await vi.waitFor(() => expect(pendingRows(f)).toEqual([]));
+    expect(view(f)).toContain("Pi refused this command: Cannot submit a prompt");
+    expect(f.instance.editor.getText()).toBe("ship it");
+  });
+
+  // A pending row is this frontend's own memory, and a rebuild replaces the transcript it is matched
+  // against. The cursor advances only after an event is applied, so a message that landed while the
+  // daemon was away arrives in the rebuild's snapshot rather than as an event: without a sync there,
+  // the row it belongs to would sit on screen until some later event happened to arrive.
+  it("clears a pending row the reconnect snapshot already carries and keeps one it does not", async () => {
+    const landed = { kind: "user_message", itemId: "landed-while-away", content: [{ type: "text", text: "first" }] };
+    const f = fixture({
+      attach: async () => ({ kind: "attached", sessionId: "s" }),
+      snapshot: (/** @type {number} */ call) => call === 0 ? { taskState: "WORKING" } : { taskState: "WORKING", items: [landed] },
+    });
+    await f.instance.open();
+    for (const text of ["first", "second"]) {
+      f.instance.editor.setText(text);
+      f.instance.handleInput("\r");
+    }
+    await vi.waitFor(() => expect(f.commands).toHaveLength(2));
+    expect(pendingRows(f)).toEqual(["Pending: first", "Pending: second"]);
+
+    await f.connection({ connected: false });
+    await f.connection({ connected: true });
+
+    expect(pendingRows(f)).toEqual(["Pending: second"]);
+  });
 });
 
 describe("daemon outage", () => {

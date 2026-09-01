@@ -53,7 +53,7 @@ Shared-directory launches ask you to type the exact canonical path before launch
 
 ## Use the viewer like Pi
 
-The viewer shows the normalized Pi transcript and uses Pi's editor components. Type a prompt and press Enter. If Pi is working, a submitted prompt becomes a follow-up.
+The viewer shows the normalized Pi transcript and uses Pi's editor components. Type a prompt and press Enter. If Pi is working, it queues the text behind the running turn. Either way the line is listed as pending under the transcript until it shows up there as your message.
 
 Pi owns the slash prefix in the viewer. The viewer passes unknown slash-prefixed text to Pi as a prompt and offers Pi's discovered commands alongside dashboard commands. Run `/help` there for the viewer's current commands and keys.
 

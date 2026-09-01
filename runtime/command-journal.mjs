@@ -75,8 +75,7 @@ export async function createCommandJournal({ path, now = () => new Date().toISOS
   } catch (cause) {
     await store.close();
     if (cause instanceof CommandJournalError) throw cause;
-    const code = cause instanceof AppendStoreError && cause.code === "RECORD_TOO_LARGE" ? "JOURNAL_CORRUPT" : "JOURNAL_CORRUPT";
-    throw new CommandJournalError(code, cause instanceof Error ? cause.message : "Command journal is corrupt", { cause });
+    throw new CommandJournalError("JOURNAL_CORRUPT", cause instanceof Error ? cause.message : "Command journal is corrupt", { cause });
   }
 
   let tail = Promise.resolve();

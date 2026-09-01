@@ -33,7 +33,9 @@ Write the failing test first and watch it fail for the right reason. Every test 
 
 No test may run model inference or make a provider request. Bounded fake executables ([test/fixtures/fake-pi.mjs](../test/fixtures/fake-pi.mjs)) and deterministic process inspectors ([runtime/test-fixtures.mjs](../runtime/test-fixtures.mjs)) stand in for Pi and for `/proc`.
 
-Every test builds its own state root with `mkdtemp` and passes it explicitly. A test that starts a daemon is responsible for stopping it.
+Every test builds its own state root with `mkdtemp` and passes it explicitly. A test that starts a real daemon, worker or Pi child does it through [test/real-process-harness.mjs](../test/real-process-harness.mjs), which records each process in a durable ledger the instant its identity can be read and reaps it in `cleanup`. Stopping a process yourself is still correct; the ledger is what covers the case that leaks, which is a test that times out before its own teardown runs.
+
+The ledger ([test/process-ledger.mjs](../test/process-ledger.mjs)) is swept at both ends of a run by the `globalSetup` in [test/reap-test-processes.mjs](../test/reap-test-processes.mjs). Two rules make that safe on a machine that also runs the operator's own daemon: nothing is signalled that a harness did not record, and every signal goes through `stopVerifiedProcessGroup`, so a recorded PID a later process now owns is refused. A ledger a live run still owns is skipped, which is why the sweep needs no opt-in flag. An entry naming a process that already exited is what a clean run looks like and is reported as nothing at all.
 
 Real-process acceptance suites are timing sensitive. On a loaded shared machine they fail as timeouts; rerun a suspicious failure in isolation with a longer `--testTimeout` before believing it.
 

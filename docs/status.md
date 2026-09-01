@@ -19,6 +19,7 @@ None of these lose work or corrupt state. Each was found by the change that repo
 | `PENDING_LOCK_TIMEOUT_MS` unreachable at two call sites | `cli/session-commands.mjs` | Same shape as the probe timeout already fixed: a default no caller can raise. |
 | `runViewerTransition` fires `detach` without awaiting it | `app/viewer` | A fast reopen-then-delete races its own detach. |
 | `migrateLegacyState` refuses any root that ever opened a viewer | `runtime/state-migration.mjs` | Pre-existing. It means that path cannot succeed on the operator's machine today. |
+| The destination daemon `migrateLegacyState` starts has no spawn seam | `runtime/state-migration.mjs` | `test/migration.integration.test.mjs` cannot record it until it publishes, so a test timing out inside `runDashboardApp` still leaks one daemon. Every other real-process suite records at the spawn. |
 
 ## Two open questions that are not defects
 
@@ -60,8 +61,6 @@ Not adopted, deliberately: their PTY hosting and terminal-byte rendering. `docs/
 Ordered by concepts removed, not lines. Every item was verified against the code by the review that proposed it; where a review argued against a change, that verdict is recorded too.
 
 **Delete `runtime/control-server.mjs`, 148 lines.** A second socket-server implementation whose only consumer is its own test; production uses the private one inside `daemon.mjs`. Port its malformed-frame and socket-mode coverage to the surviving server first, then delete. Verified by search.
-
-**Fix the test cleanup model before anything else touches processes.** Detached-daemon cleanup is opt-in, reads a stale `ps` snapshot, and signals by PID with no immediate identity revalidation, which contradicts the repository's own signaling invariant and cannot clean up a test that times out before its local teardown runs. That defect leaked 47 daemons in one evening, the oldest alive 38 hours, and load reached 49. One real-process harness plus a durable process ledger: net 120 to 220 lines removed, 100 to 140 moved.
 
 **Split transport out of `runtime/daemon.mjs` into `runtime/daemon-server.mjs`.** Socket lifecycle, authentication, role selection, the frontend protocol gate, JSONL framing, per-socket ordering, worker reply correlation, subscription lifetimes, bounded queues, shutdown draining. About 250 lines move out of a 1,549-line file that every commit in this release had to touch, which made it the serialization point for all parallel work. Do not split the rest of the request handler into one file per operation: its first half is a dispatch table, but its second half is a transaction coordinator and distributing that would add imports without removing concepts.
 

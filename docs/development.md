@@ -63,7 +63,7 @@ The code is JavaScript with JSDoc types checked by TypeScript. `tsconfig.json` c
 
 Comments earn their place. Keep a measured number, a stated ordering constraint, or a specific trap. Delete anything that restates the code.
 
-Prefer small additive edits. The daemon's failpoint seams, journal stage transitions, and lock ordering encode recovery behavior that is cheap to break and expensive to re-verify.
+Prefer small additive edits. The failpoint seams in the command journal, the viewer store, and state migration, along with journal stage transitions and lock ordering, encode recovery behavior that is cheap to break and expensive to re-verify.
 
 ## Constraints that are not visible in the code
 

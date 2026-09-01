@@ -537,8 +537,6 @@ export async function createDaemonRuntime({
   modelCatalog = createModelCatalog({ executable: summaryExecutable, spawn: spawnProcess, env: summaryEnv }),
   randomId = randomUUID,
   responseWriter = async (/** @type {any} */ { value, write }) => write(value),
-  closeFailpoint = async () => {},
-  destructiveFailpoint = async () => {},
   recordDiagnostic = (/** @type {any} */ entry) => { process.stderr.write(`${JSON.stringify(entry)}\n`); },
   stopPolicy = DEFAULT_STOP_POLICY,
   signalProcessGroupImpl = signalProcessGroup,
@@ -549,7 +547,7 @@ export async function createDaemonRuntime({
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 128) throw new TypeError("maxBytes must be at least 128");
   if (!Number.isSafeInteger(workerRequestTimeoutMs) || workerRequestTimeoutMs <= 0) throw new TypeError("workerRequestTimeoutMs must be a positive integer");
   if (typeof randomId !== "function") throw new TypeError("randomId must be a function");
-  if (typeof responseWriter !== "function" || typeof closeFailpoint !== "function" || typeof destructiveFailpoint !== "function" || typeof recordDiagnostic !== "function" || typeof signalProcessGroupImpl !== "function" || typeof sleepImpl !== "function") throw new TypeError("Daemon runtime seams must be functions");
+  if (typeof responseWriter !== "function" || typeof recordDiagnostic !== "function" || typeof signalProcessGroupImpl !== "function" || typeof sleepImpl !== "function") throw new TypeError("Daemon runtime seams must be functions");
   if (!Number.isSafeInteger(stopPolicy?.gracefulMs) || stopPolicy.gracefulMs <= 0 || !Number.isSafeInteger(stopPolicy?.terminateMs) || stopPolicy.terminateMs <= 0) throw new TypeError("stopPolicy must contain approved positive integer waits");
   await ensureLayout(root);
   const daemonDirectory = join(root, "daemon");
@@ -1249,7 +1247,6 @@ export async function createDaemonRuntime({
               if (lockedMetadata === undefined || lockedMetadata.runId !== record.ownership.runId || !sameProcessIdentity(lockedMetadata.identity, record.ownership.process)) {
                 return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("OWNERSHIP_CONFLICT", "Durable worker lease does not match the SessionRecord"));
               }
-              await destructiveFailpoint("stop_before_delivery", request, record);
               await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
               const exactRecord = await registry.get(request.payload.sessionId);
               if (exactRecord?.revision !== record.revision || exactRecord.ownership === undefined || !sameProcessIdentity(exactRecord.ownership.process, record.ownership.process)) {
@@ -1439,13 +1436,9 @@ export async function createDaemonRuntime({
         closePromise = (async () => {
           /** @type {unknown[]} */
           const errors = [];
-          /** @param {string} stage @param {() => unknown | Promise<unknown>} action */
-          const cleanup = async (stage, action) => {
-            try {
-              await closeFailpoint(stage);
-            } catch (error) {
-              errors.push(error);
-            }
+          // Every stage runs even after an earlier one failed, and each failure is reported together.
+          /** @param {() => unknown | Promise<unknown>} action */
+          const cleanup = async (action) => {
             try {
               await action();
             } catch (error) {
@@ -1454,13 +1447,13 @@ export async function createDaemonRuntime({
           };
           context.admissionOpen = false;
           recoveryController.abort();
-          await cleanup("request_admission", () => socketServer.beginShutdown());
-          await cleanup("reconciliation", async () => { await Promise.allSettled([ready]); });
-          await cleanup("request_chains", () => socketServer.drainAndClose());
-          await cleanup("supervisor", async () => workerSupervisor?.close?.());
-          await cleanup("launch_result_store", async () => context.launchResults?.close());
-          await cleanup("recovery_stores", async () => context.recovery?.close());
-          await cleanup("lifecycle", () => releaseDaemonLifecycle(claim));
+          await cleanup(() => socketServer.beginShutdown());
+          await cleanup(async () => { await Promise.allSettled([ready]); });
+          await cleanup(() => socketServer.drainAndClose());
+          await cleanup(async () => workerSupervisor?.close?.());
+          await cleanup(async () => context.launchResults?.close());
+          await cleanup(async () => context.recovery?.close());
+          await cleanup(() => releaseDaemonLifecycle(claim));
           closeState = errors.length === 0 ? "CLOSED" : "FAILED_CLOSED";
           if (errors.length > 0) {
             const failure = new AggregateError(errors, "Daemon close completed with cleanup errors");

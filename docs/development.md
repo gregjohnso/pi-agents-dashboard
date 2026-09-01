@@ -23,7 +23,7 @@ Focused runs use the raw vitest task:
 pixi run vitest -- run app/mouse-input.test.mjs --testTimeout=20000
 ```
 
-The suite is 982 tests across 89 files. A full run takes about 3 minutes on an unloaded machine and can take twice that under load.
+The suite is 987 tests across 89 files. A full run takes about 3 minutes on an unloaded machine and can take twice that under load.
 
 ## Tests
 
@@ -74,6 +74,8 @@ Prefer small additive edits. The failpoint seams in the command journal, the vie
 **Pi's version exists only behind `--version`.** `pi --help` in 0.84.3 opens with the description banner `pi - AI coding assistant with read, bash, edit, write tools` and prints no version anywhere, so [runtime/pi-capability-probe.mjs](../runtime/pi-capability-probe.mjs) spawns `pi --version` for it and accepts the first non-empty line only when the whole line is a semantic version. Anything else records `null`. An absent version never refuses a launch: `missingRequired` decides admission from the commands and events the executable actually supports, which is also why the probe no longer spawns `--help` at all. A prose string stored where a version belongs would read as a real release to every later comparison. A canary at the end of [runtime/pi-capability-probe.test.mjs](../runtime/pi-capability-probe.test.mjs) asserts the installed Pi still keeps its version behind `--version` and out of `--help`; when it fails, Pi moved the version and the probe should follow it rather than grow a help parser again. `runtime.piVersion` is the installed Pi's version; the worker's own release is the separate `cliVersion` in `daemon/workers.json`, and that is the one `RecoveredWorkerRouter.releaseStatus` compares.
 
 **Escape cannot drain Pi's queued messages.** The RPC exposes no queue-clearing command; the adapter has `abort` and nothing else ([runtime/pi-rpc-adapter.mjs](../runtime/pi-rpc-adapter.mjs)). The queued block the viewer draws is the frontend's own mirror of what it sent, not a read of Pi's queue.
+
+**Pi decides what happens to text that arrives during a run.** A viewer picks `prompt` or `follow_up` from a `working` flag fed by turn_state events, which is always at least one event behind Pi, so that choice cannot decide delivery: Pi refuses a bare `prompt` mid-run, and a `follow_up` sent to an idle Pi is parked with no turn to carry it. The worker therefore sends both operations to Pi as one `prompt` carrying `streamingBehavior: "followUp"` ([runtime/worker.mjs](../runtime/worker.mjs)). Pi reads its own state in the same step it applies that behavior, so it starts the turn when idle and queues the text as a follow-up when it is not, and no window exists in which the operator's line can be refused or lost. A Pi that does not read the field still refuses; that refusal is acknowledged, meaning nothing was queued, so the worker resubmits the same text through `follow_up`. An explicit steer is the operator's own choice and still travels as `steer`.
 
 **Summaries are opt-in and cost tokens.** `settings.summaryModel` defaults to `null` ([runtime/summaries.mjs](../runtime/summaries.mjs)). Setting it makes the daemon spawn real `pi --print --no-session --no-tools` inference to write names and one-line summaries. Never enable it in a test or a default.
 

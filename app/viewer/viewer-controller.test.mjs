@@ -77,6 +77,16 @@ describe("viewer commands", () => {
     expect(f.instance.closedState).toBe(false);
   });
 
+  it("shows a Pi refusal as the sentence Pi wrote, with no transport code in front of it", async () => {
+    const f = fixture({ snapshot: { errors: [{ code: "RPC_COMMAND_FAILED", message: "Cannot submit a prompt while compaction is in progress.", retryable: false }] } });
+    await f.instance.open();
+
+    const dock = f.instance.render(100, 24).map(stripVTControlCharacters).join(" ");
+    expect(dock).not.toContain("RPC_COMMAND_FAILED");
+    expect(dock).toContain("Pi refused this command: Cannot submit a prompt while compaction is in progress.");
+    await f.instance.close();
+  });
+
   it("keeps a working pending overlay through Ctrl+C and disposes it once it responds", async () => {
     const f = fixture({ snapshot: { taskState: "WORKING", pendingUi: [{ id: "ui-working", method: "confirm", title: "Continue?" }] } });
     await f.instance.open();

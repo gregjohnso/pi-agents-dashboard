@@ -57,6 +57,16 @@ const WHEEL_SCROLL_LINES = 1;
 const QUEUED_MESSAGE_ROWS = 3;
 const MIN_TRANSCRIPT_ROWS = 3;
 
+/**
+ * Every refusal Pi writes crosses the daemon under one transport code, so printing that code puts a
+ * protocol token in front of the sentence that tells the operator what happened and what to do about
+ * it. Dashboard codes stay: each names the part of this system that failed, and nothing else does.
+ * @param {{ code: string, message: string }} error
+ */
+function describeViewerError(error) {
+  return error.code === "RPC_COMMAND_FAILED" ? `Pi refused this command: ${error.message}` : `${error.code}: ${error.message}`;
+}
+
 /** Lay out Pi's footer: sourced viewer status on the left, the model and its thinking level right-aligned. */
 function renderModelFooter({ model, thinkingLevel }, hideThinking, width) {
   if (width <= 0) return "";
@@ -187,7 +197,7 @@ export class ViewerController {
     const inputLabel = this.inputMode === "steer" ? [" Steer at next supported boundary"] : this.steerStatus === undefined ? [] : [` Steer ${this.steerStatus}`];
     const selectedTool = this.transcript.selectedToolId === undefined ? undefined : this.state.tools.get(this.transcript.selectedToolId);
     const toolLine = selectedTool === undefined ? [] : [` tool:${selectedTool.name} ${selectedTool.state} ${this.transcript.expandedTools.has(selectedTool.id) ? "expanded" : "collapsed"}`];
-    let errorLines = this.state.errors.slice(-1).flatMap((error) => renderSystemCard({ text: `${error.code}: ${error.message}`, level: "error" }, width));
+    let errorLines = this.state.errors.slice(-1).flatMap((error) => renderSystemCard({ text: describeViewerError(error), level: "error" }, width));
     let queuedLines = this.renderQueued();
     const connectionLines = this.daemonUnreachable ? [" Daemon unreachable · reconnecting…"] : this.streamStopped ? [" Transcript stopped · Esc to the list, then reopen this session"] : [];
     let hints = renderKeyHints(this.state, width);
@@ -409,6 +419,9 @@ export class ViewerController {
       if (!await this.sendCommand("session_command", submission.payload)) return;
       await this.loadMenu();
     } else {
+      // This flag is one turn_state event behind Pi, so it cannot decide delivery: the worker sends
+      // both operations to Pi with a streaming behavior and Pi queues or starts the turn from its
+      // own state. What it still decides is whether this line is drawn as pending below.
       const operation = this.state.working ? "follow_up" : "prompt";
       if (!await this.sendCommand(operation, { text: submission.text })) return;
       if (operation === "follow_up") this.queued.push({ mode: "follow_up", text: submission.text });

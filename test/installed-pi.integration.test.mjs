@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, expect, it } from "vitest";
 
 import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
+import { signalProcessGroup, sleep } from "../runtime/process-signaler.mjs";
 import { RecoveredWorkerRouter } from "../runtime/reconciliation.mjs";
 import { RegistryStore } from "../runtime/registry-store.mjs";
 import { createWorkerControlSocket } from "../runtime/test-fixtures.mjs";
@@ -120,4 +121,60 @@ it("launches a distinct installed Pi child with exact structured argv and persis
 
   await supervisor.close();
   await expect(inspectProcessIdentity(handle.piChildIdentity.pid)).resolves.toEqual(handle.piChildIdentity);
+});
+
+/** Read every command the fake Pi children were asked to run, in order. @param {string} log */
+async function piCommands(log) {
+  return (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line)).filter((entry) => entry.kind === "command");
+}
+
+/** Stop one launched worker through the verified process-identity boundary Stop uses. */
+async function stopWorker(supervisor, handle, route) {
+  await supervisor.stop(handle, {
+    inspect: inspectProcessIdentity,
+    requestGraceful: async () => { await route.connection.send({ version: 1, type: "shutdown", token: route.metadata.token }); },
+    signalProcessGroup,
+    sleep,
+  }, { gracefulMs: 5_000, terminateMs: 5_000 });
+}
+
+it("delivers the operator's text once while Pi is already running a turn, with no refusal reaching him", async () => {
+  const { root, runs, registry, executable, sessionFile, log, router, launchSeams } = await setup();
+  const supervisor = new WorkerSupervisor({ registry, router, runsDirectory: runs, configuredPiPath: executable, env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_STREAMING: "active" }, startTimeoutMs: 5_000 });
+  const handle = await supervisor.launch({ sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-busy-prompt", ...launchSeams });
+  const route = router.route("one");
+
+  try {
+    // Pi started this turn before any turn_state event reached the dashboard, so the dashboard still
+    // believes the session is idle and sends `prompt`. Pi's state decides, not that cached belief.
+    await expect(route.connection.request({ version: 1, type: "command", token: route.metadata.token, id: "busy-prompt", command: { clientId: "dashboard", requestId: "push", op: "prompt", text: "push" } }, {}))
+      .resolves.toMatchObject({ stage: "RPC_ACKNOWLEDGED" });
+
+    expect((await piCommands(log)).filter((entry) => entry.message === "push")).toEqual([
+      expect.objectContaining({ command: "prompt", streamingBehavior: "followUp" }),
+    ]);
+  } finally {
+    await stopWorker(supervisor, handle, route);
+  }
+});
+
+it("keeps both dashboards' text when each submits believing the same session is idle", async () => {
+  const { root, runs, registry, executable, sessionFile, log, router, launchSeams } = await setup();
+  const supervisor = new WorkerSupervisor({ registry, router, runsDirectory: runs, configuredPiPath: executable, env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_STREAMING: "on_prompt" }, startTimeoutMs: 5_000 });
+  const handle = await supervisor.launch({ sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-two-dashboards", ...launchSeams });
+  const route = router.route("one");
+  const command = (clientId, text) => route.connection.request({ version: 1, type: "command", token: route.metadata.token, id: `submit-${clientId}`, command: { clientId, requestId: `submit-${clientId}`, op: "prompt", text } }, {});
+
+  try {
+    // The first submission starts the turn. The second dashboard's cache cannot have seen that yet.
+    await expect(command("dashboard-a", "ship it")).resolves.toMatchObject({ stage: "RPC_ACKNOWLEDGED" });
+    await expect(command("dashboard-b", "and push")).resolves.toMatchObject({ stage: "RPC_ACKNOWLEDGED" });
+
+    expect((await piCommands(log)).filter((entry) => ["ship it", "and push"].includes(entry.message))).toEqual([
+      expect.objectContaining({ command: "prompt", message: "ship it" }),
+      expect.objectContaining({ command: "prompt", message: "and push", streamingBehavior: "followUp" }),
+    ]);
+  } finally {
+    await stopWorker(supervisor, handle, route);
+  }
 });

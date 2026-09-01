@@ -11,6 +11,9 @@ initializeRuntimePermissions();
 const MAX_REPLAY_RECORD_BYTES = 1024 * 1024;
 const WORKER_OPERATIONS = new Set(["prompt", "steer", "follow_up", "interrupt", "ui_response", "get_state", "get_session_commands", "session_command"]);
 const MAX_MENU_ENTRIES = 1_000;
+// Pi 0.84.3 refuses a prompt sent during a run with "Agent is already processing. Specify
+// streamingBehavior ('steer' or 'followUp') to queue the message."
+const PI_ALREADY_PROCESSING = /already processing/iu;
 
 /** @param {any} value @param {string} fallbackSource */
 function menuCommand(value, fallbackSource) {
@@ -54,6 +57,30 @@ function assertSessionCommand(request) {
   }
   if (request?.command === "abort_retry") return;
   if (request?.command !== "compact") throw invalid(`session_command is unsupported: ${request?.command ?? "missing"}`);
+}
+
+/**
+ * Deliver the operator's text and let Pi decide whether it starts a turn or joins the queue.
+ *
+ * Only Pi knows whether a run is active, and it moves first: a dashboard's `working` flag comes from
+ * a turn_state event that is still in flight, so a frontend that chooses between `prompt` and
+ * `follow_up` from that cache is deciding on remote state it cannot see. `streamingBehavior` removes
+ * the decision: Pi reads its own state and applies the behavior in the same step, so no window
+ * exists in which the text can be refused. Idle Pi ignores the field and starts the turn.
+ *
+ * A Pi that does not read the field still refuses mid-run, and that refusal is acknowledged, meaning
+ * nothing was queued. Resubmitting the same text through `follow_up` is then the recovery, so the
+ * text is delivered once either way and the operator never sees the refusal.
+ * @param {any} adapter @param {string | undefined} text
+ */
+async function deliverOperatorText(adapter, text) {
+  try {
+    return await adapter.prompt(text, "followUp");
+  } catch (cause) {
+    const failure = /** @type {{ code?: unknown, message?: unknown }} */ (cause);
+    if (failure?.code !== "RPC_COMMAND_FAILED" || !PI_ALREADY_PROCESSING.test(String(failure?.message ?? ""))) throw cause;
+    return await adapter.followUp(text);
+  }
 }
 
 /** @param {any} adapter @param {any} request */
@@ -178,9 +205,9 @@ export function createWorkerCommandDispatcher({ replay, adapter }) {
       let resultValue;
       try {
         switch (command.op) {
-          case "prompt": resultValue = await adapter.prompt(command.text); break;
+          case "prompt":
+          case "follow_up": resultValue = await deliverOperatorText(adapter, command.text); break;
           case "steer": resultValue = await adapter.steer(command.text); break;
-          case "follow_up": resultValue = await adapter.followUp(command.text); break;
           case "interrupt": resultValue = await adapter.abort(); break;
           case "ui_response": resultValue = await adapter.uiResponse(command.response); break;
           case "get_state": resultValue = await adapter.getState(); break;

@@ -178,6 +178,56 @@ it("records an explicit Pi error acknowledgement before the terminal failure", a
   await adapter.close();
 });
 
+it("tells Pi what to do with text that arrives during a run, for both operations a dashboard sends", async () => {
+  /** @type {any[]} */
+  const seen = [];
+  const child = fakeRpcProcess((command, process) => {
+    seen.push(command);
+    process.stdout.write(`${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true })}\n`);
+  });
+  const adapter = await PiRpcAdapter.start({ cwd: "/tmp", sessionFile: "/tmp/fake-session.jsonl", env: {}, executable: "/installed/pi", spawnImpl: () => child });
+  const replay = await createWorkerReplayStore({ append: async () => {} });
+  const dispatcher = createWorkerCommandDispatcher({ replay, adapter });
+
+  // A dashboard picks the operation from a `working` flag that is one event behind Pi. Either pick
+  // reaches Pi as one prompt carrying the behavior, so Pi's own state decides what happens to it.
+  await dispatcher.deliver({ clientId: "client", requestId: "believed-idle", op: "prompt", text: "push" });
+  await dispatcher.deliver({ clientId: "client", requestId: "believed-working", op: "follow_up", text: "then deploy" });
+
+  expect(seen.map(({ type, message, streamingBehavior }) => ({ type, message, streamingBehavior }))).toEqual([
+    { type: "prompt", message: "push", streamingBehavior: "followUp" },
+    { type: "prompt", message: "then deploy", streamingBehavior: "followUp" },
+  ]);
+  await dispatcher.close();
+  await adapter.close();
+});
+
+it("resubmits the same text as a follow-up when Pi refuses a prompt it is already too busy to accept", async () => {
+  /** @type {any[]} */
+  const records = [];
+  /** @type {any[]} */
+  const seen = [];
+  // A Pi that does not read `streamingBehavior` refuses every prompt while it is running a turn.
+  const child = fakeRpcProcess((command, process) => {
+    seen.push(command);
+    const refused = command.type === "prompt";
+    process.stdout.write(`${JSON.stringify(refused
+      ? { id: command.id, type: "response", command: command.type, success: false, error: "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message." }
+      : { id: command.id, type: "response", command: command.type, success: true })}\n`);
+  });
+  const adapter = await PiRpcAdapter.start({ cwd: "/tmp", sessionFile: "/tmp/fake-session.jsonl", env: {}, executable: "/installed/pi", spawnImpl: () => child });
+  const replay = await createWorkerReplayStore({ append: async (record) => { records.push(record); } });
+  const dispatcher = createWorkerCommandDispatcher({ replay, adapter });
+
+  await expect(dispatcher.deliver({ clientId: "client", requestId: "busy", op: "prompt", text: "push" })).resolves.toMatchObject({ stage: "RPC_ACKNOWLEDGED" });
+
+  // The refusal is acknowledged, so Pi queued nothing: the text is delivered exactly once.
+  expect(seen.map(({ type, message }) => [type, message])).toEqual([["prompt", "push"], ["follow_up", "push"]]);
+  expect(records.map((record) => record.stage)).toEqual(["RECEIVED", "RPC_WRITE_STARTED", "RPC_ACKNOWLEDGED"]);
+  await dispatcher.close();
+  await adapter.close();
+});
+
 it("fails unsupported operations before recording RPC_WRITE_STARTED", async () => {
   /** @type {any[]} */
   const records = [];

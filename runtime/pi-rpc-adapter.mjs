@@ -301,8 +301,12 @@ export class PiRpcAdapter {
     }
   }
 
-  /** @param {string} text */
-  async prompt(text) { await this.#request("prompt", { message: text }); }
+  /**
+   * Send one prompt. `streamingBehavior` is how Pi is told what to do with text that arrives during
+   * a run: without it Pi refuses the prompt, with it Pi queues the same text as a steer or follow-up.
+   * @param {string} text @param {"steer" | "followUp"} [streamingBehavior]
+   */
+  async prompt(text, streamingBehavior) { await this.#request("prompt", streamingBehavior === undefined ? { message: text } : { message: text, streamingBehavior }); }
   /** @param {string} text */
   async steer(text) { await this.#request("steer", { message: text }); }
   /** @param {string} text */

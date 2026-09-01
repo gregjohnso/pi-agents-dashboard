@@ -3,6 +3,12 @@ import { appendFileSync, writeFileSync } from "node:fs";
 
 const logPath = process.env.FAKE_PI_LOG;
 const missing = new Set((process.env.FAKE_PI_MISSING ?? "").split(",").filter(Boolean));
+// Pi refuses a `prompt` sent during a run unless the caller names `streamingBehavior`, and queues it
+// as a steer or a follow-up when it does. FAKE_PI_STREAMING models that state machine: "active"
+// starts with a run already going, "on_prompt" starts idle and begins one on the first accepted
+// prompt. Unset, this fake accepts every prompt exactly as it always has.
+const streamingMode = process.env.FAKE_PI_STREAMING;
+let streaming = streamingMode === "active";
 const log = (entry) => {
   if (logPath) appendFileSync(logPath, `${JSON.stringify({ pid: process.pid, ...entry })}\n`, { mode: 0o600 });
 };
@@ -43,7 +49,7 @@ process.stdin.on("data", (chunk) => {
     const type = command.type;
     const responseId = process.env.FAKE_PI_WRONG_RESPONSE_ID === type ? `wrong-${command.id}` : command.id;
     const validPrompt = ["prompt", "follow_up", "steer"].includes(type) && typeof command.message === "string";
-    log({ kind: "command", command: type, message: validPrompt ? command.message : undefined, valid: validPrompt, providerInvocation: validPrompt });
+    log({ kind: "command", command: type, message: validPrompt ? command.message : undefined, valid: validPrompt, providerInvocation: validPrompt, streamingBehavior: validPrompt ? command.streamingBehavior : undefined });
     if (type === "extension_ui_response" && process.env.FAKE_PI_DELAYED_UNKNOWN_EXTENSION_UI_RESPONSE_MS) {
       setTimeout(() => process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: false, error: "unknown command" })}\n`), Number(process.env.FAKE_PI_DELAYED_UNKNOWN_EXTENSION_UI_RESPONSE_MS));
       continue;
@@ -66,6 +72,13 @@ process.stdin.on("data", (chunk) => {
     if (["prompt", "follow_up", "steer"].includes(type) && typeof command.message !== "string") {
       process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: false, error: "message is required" })}\n`);
       continue;
+    }
+    if (streamingMode !== undefined && validPrompt) {
+      if (type === "prompt" && streaming && command.streamingBehavior === undefined) {
+        process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: false, error: "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message." })}\n`);
+        continue;
+      }
+      if (type === "prompt") streaming = true;
     }
     if (type === "extension_ui_response" && process.env.FAKE_PI_ONE_WAY_EXTENSION_UI_RESPONSE === "1") continue;
     if (type === "extension_ui_response" && typeof command.requestId !== "string") {

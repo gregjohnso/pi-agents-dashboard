@@ -184,7 +184,10 @@ export function createWorkerCommandDispatcher({ replay, adapter }) {
         throw Object.assign(new Error(existing.error?.message ?? "Pi delivery failed"), { code: existing.error?.code ?? "RPC_FAILED" });
       }
 
-      const base = { clientId: command.clientId, requestId: command.requestId, op: command.op };
+      // The operator's text goes on every record of this command, because this log is the only
+      // durable copy of it: acceptance is the RECEIVED fsync below, and a crash before Pi answers
+      // must leave what he typed on disk rather than only the fact that something was in flight.
+      const base = { clientId: command.clientId, requestId: command.requestId, op: command.op, ...(command.text === undefined ? {} : { text: command.text }) };
       if (existing === undefined || existing.stage === "DELIVERY_UNKNOWN") await replay.append({ ...base, stage: "RECEIVED" });
       if (!WORKER_OPERATIONS.has(command.op)) {
         const cause = Object.assign(new Error(`Unsupported worker operation: ${command.op}`), { code: "UNSUPPORTED_WORKER_OPERATION" });

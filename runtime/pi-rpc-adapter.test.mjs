@@ -117,6 +117,25 @@ it("recovers a durable in-flight Pi write as ambiguous without writing again", a
   await dispatcher.close();
 });
 
+// Acceptance is this fsync and nothing else: there is no daemon-side journal holding the operator's
+// text, so a record that does not carry it leaves a crash between acceptance and the Pi write with
+// no durable copy of what he typed.
+it("keeps the operator's text on every durable record that accepts it", async () => {
+  /** @type {any[]} */
+  const records = [];
+  const replay = await createWorkerReplayStore({ append: async (record) => { records.push(record); } });
+  const dispatcher = createWorkerCommandDispatcher({ replay, adapter: {
+    async prompt() { throw Object.assign(new Error("stream closed"), { code: "RPC_STREAM_CLOSED" }); },
+  } });
+
+  await expect(dispatcher.deliver({ clientId: "client", requestId: "accepted-text", op: "prompt", text: "the exact words he typed" })).rejects.toMatchObject({ code: "DELIVERY_UNKNOWN" });
+  expect(records.map((record) => [record.stage, record.text])).toEqual([
+    ["RECEIVED", "the exact words he typed"],
+    ["RPC_WRITE_STARTED", "the exact words he typed"],
+    ["DELIVERY_UNKNOWN", "the exact words he typed"],
+  ]);
+});
+
 it("marks stream loss after RPC_WRITE_STARTED as delivery unknown", async () => {
   const code = "RPC_STREAM_CLOSED";
   /** @type {any[]} */

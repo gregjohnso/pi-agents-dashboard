@@ -174,7 +174,7 @@ function canonicalJson(value) {
 
 /** @param {any} record @param {any} pending */
 function validateWorkerSuccess(record, pending) {
-  const allowed = ["clientId", "requestId", "op", "stage", "at", "result", "stderr"];
+  const allowed = ["clientId", "requestId", "op", "stage", "at", "result", "stderr", "text"];
   if (typeof record !== "object" || record === null || Array.isArray(record) || Object.keys(record).some((key) => !allowed.includes(key)) || record.clientId !== pending.clientId || record.requestId !== pending.requestId || record.op !== pending.op || record.stage !== "RPC_ACKNOWLEDGED" || typeof record.at !== "string") throw Object.assign(new Error("Worker result does not match the pending durable command"), { code: "INVALID_WORKER_RESULT" });
 }
 

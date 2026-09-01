@@ -1,5 +1,5 @@
 import { stripVTControlCharacters } from "node:util";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { jobwatchTheme } from "./dashboard-theme.mjs";
 import { spinnerFrame } from "../spinner.mjs";
 import { displaySessionState } from "./session-state.mjs";
@@ -32,6 +32,28 @@ function densityForWidth(width) {
 }
 /** Wide enough for a model id such as claude-opus-5 or gpt-5.6-sol. */
 const MODEL_WIDTH = 16;
+/** The prompt marker, and the column its continuation rows line up under. */
+const PROMPT_MARKER = " \u276f ";
+/**
+ * How tall the prompt box may grow, copied from pi-tui's Editor: it shows max(5, 30% of the
+ * terminal) and scrolls past that, so the dashboard's prompt reaches the same bound Pi's does.
+ */
+const PROMPT_MIN_ROWS = 5;
+const PROMPT_HEIGHT_FRACTION = 0.3;
+/**
+ * Wrap one draft into the rows the prompt box would paint, marker included.
+ *
+ * Wrapping is pi-tui's own `wrapTextWithAnsi`: word boundaries first, graphemes when a single word
+ * is wider than the box, so a wide character is never split across a cell.
+ * @param {string} draft @param {number} width
+ * @returns {string[]} One string per row, each already indented under the marker.
+ */
+export function wrapPromptDraft(draft, width) {
+    const indent = visibleWidth(PROMPT_MARKER);
+    const usable = Math.max(1, normalizedDimension(width) - indent);
+    return wrapTextWithAnsi(plainText(String(draft)), usable)
+        .map((text, index) => `${index === 0 ? PROMPT_MARKER : " ".repeat(indent)}${text}`);
+}
 function columnsForWidth(width) {
     if (width <= 0)
         return [];
@@ -70,19 +92,29 @@ function columnsForWidth(width) {
     }
     return [{ key: "activity", width }];
 }
-/** Compute responsive dashboard columns and the bounded list viewport. */
-export function createDashboardLayout(width, height) {
+/**
+ * Compute responsive dashboard columns and the bounded list viewport.
+ * @param {number} width @param {number} height
+ * @param {{ promptRows?: number }} [options] Rows the current draft needs; the dock grows into the list to hold them.
+ */
+export function createDashboardLayout(width, height, options = {}) {
     const normalizedWidth = normalizedDimension(width);
     const normalizedHeight = normalizedDimension(height);
     // Title, working directory, section border, column header. The context line sits in the dock.
     const listTop = Math.min(normalizedHeight >= 12 ? 4 : 3, normalizedHeight);
     // Border, prompt, closing rule, status, context. A short terminal drops the rule for a list row.
-    const dockRows = normalizedHeight >= 12 ? 5 : 4;
+    const baseDockRows = normalizedHeight >= 12 ? 5 : 4;
+    const baseListHeight = Math.max(0, normalizedHeight - listTop - baseDockRows);
+    // The box stops at Pi's own cap, and never at the cost of the list's last row.
+    const cap = Math.max(PROMPT_MIN_ROWS, Math.floor(normalizedHeight * PROMPT_HEIGHT_FRACTION));
+    const promptRows = Math.min(Math.max(1, normalizedDimension(options.promptRows ?? 1)), cap, Math.max(1, baseListHeight));
+    const dockRows = baseDockRows + promptRows - 1;
     return {
         width: normalizedWidth,
         height: normalizedHeight,
         density: densityForWidth(normalizedWidth),
         listTop,
+        promptRows,
         dockRows,
         listHeight: Math.max(0, normalizedHeight - listTop - dockRows),
         columns: columnsForWidth(normalizedWidth),

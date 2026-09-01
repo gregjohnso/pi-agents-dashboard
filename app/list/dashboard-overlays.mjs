@@ -184,30 +184,12 @@ export function describeOverlay(overlay, options = {}) {
             ],
         };
     }
-    if (overlay.kind === "shared_directory_confirmation") {
-        return {
-            title: "Shared directory",
-            rows: [
-                { text: "This session shares a directory with other owners.", emphasis: true },
-                { text: `Type exactly: ${overlay.canonicalCwd}` },
-                { text: `> ${options.confirmationText ?? ""}` },
-            ],
-        };
-    }
     return {
-        title: "Delivery unknown",
+        title: "Shared directory",
         rows: [
-            { text: "The daemon cannot prove this command was delivered.", emphasis: true },
-            { text: `Choose ${overlay.actions.join(" or ")}; no automatic retry.` },
+            { text: "This session shares a directory with other owners.", emphasis: true },
+            { text: `Type exactly: ${overlay.canonicalCwd}` },
+            { text: `> ${options.confirmationText ?? ""}` },
         ],
-    };
-}
-/** Return explicit resolution choices for an ambiguous durable command. */
-export function createDeliveryUnknownOverlay(clientId, requestId) {
-    return {
-        kind: "delivery_unknown",
-        clientId,
-        requestId,
-        actions: ["retry_at_risk", "abandon"],
     };
 }

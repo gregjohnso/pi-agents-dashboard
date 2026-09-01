@@ -25,7 +25,7 @@ async function matches(identity) {
 // the test was about is long gone. The record has to be on disk while the start is still waiting,
 // because a runner killed during that wait writes nothing afterwards.
 it("records a daemon child on disk while the start command is still waiting for it", async () => {
-  const root = await harness.stateRoot("real-process-harness-", ["daemon", "sessions", "queue", "runs", "index"]);
+  const root = await harness.stateRoot("real-process-harness-", ["daemon", "sessions", "runs", "index"]);
 
   // 200 ms is far below a cold start, so the command gives up on a child that is still starting.
   const started = await harness.daemon("start", { root, timeoutMs: 200 });
@@ -39,7 +39,7 @@ it("records a daemon child on disk while the start command is still waiting for 
 });
 
 it("stops the daemon it started and leaves an empty ledger behind", async () => {
-  const root = await harness.stateRoot("real-process-harness-", ["daemon", "sessions", "queue", "runs", "index"]);
+  const root = await harness.stateRoot("real-process-harness-", ["daemon", "sessions", "runs", "index"]);
   const started = await harness.daemon("start", { root, timeoutMs: 45_000 });
   expect(started).toMatchObject({ code: 0, result: { kind: "daemon_started" } });
   const publication = started.result.publication;

@@ -1,4 +1,4 @@
-// One cold-launch sample: journal acceptance through the first usable viewer snapshot, plus the
+// One cold-launch sample: the launch request through the first usable viewer snapshot, plus the
 // resident cost a prewarmed spare would pay. Runs real Pi inference against the installed CLI, so it
 // is not a test, is never imported by vitest, and must run on a SLURM node, never on a login node.
 //
@@ -149,6 +149,9 @@ async function main() {
       return reply.result;
     };
 
+    // t0 is this client's own clock at the moment it sent the launch. The daemon records nothing
+    // durable about a command, so there is no acceptance timestamp on disk to read instead.
+    const launchRequestedAt = Date.now();
     const launched = await request("launch", {
       prompt: PROMPT,
       cwd: repository,
@@ -177,12 +180,8 @@ async function main() {
       await sleep(READY_POLL_MS);
     }
 
-    const journal = (await readFile(join(root, "queue", "commands.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-    const accepted = journal.find((record) => record.status?.requestId === requestId && record.status?.stage === "ACCEPTED");
-    if (accepted === undefined) throw new Error("launch journal has no ACCEPTED record for this request");
-
     /** @type {Record<string, number>} */
-    const timestamps = { journalAcceptedAt: Date.parse(accepted.status.acceptedAt), firstUsableSnapshotAt };
+    const timestamps = { launchRequestedAt, firstUsableSnapshotAt };
     const workerSpawnedAt = spawnedAt(clock, readyRow?.ownership?.process?.startIdentity);
     const piChildSpawnedAt = spawnedAt(clock, readyRow?.runtime?.piChild?.startIdentity);
     if (workerSpawnedAt !== undefined) timestamps.workerSpawnedAt = workerSpawnedAt;

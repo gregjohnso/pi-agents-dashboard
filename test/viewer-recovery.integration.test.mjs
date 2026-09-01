@@ -38,7 +38,7 @@ async function liveSession() {
   const directory = await mkdtemp(join(tmpdir(), "viewer-recovery-"));
   directories.push(directory);
   const root = join(directory, "state");
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(root, name), { recursive: true, mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(root, name), { recursive: true, mode: 0o700 });
   const sessionFile = join(directory, "canonical.jsonl");
   await writeFile(sessionFile, [
     JSON.stringify({ type: "session", version: 3, id: "session-1", timestamp: at, cwd: directory }),

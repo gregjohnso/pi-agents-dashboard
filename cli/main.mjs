@@ -12,14 +12,13 @@ const HELP = `Usage: pi-agents [--pi-bin /absolute/path/to/pi]
        pi-agents respawn <full-session-id> --revision <n> --yes
        pi-agents daemon start|status|restart|recover|stop [--stop-workers --yes]
        pi-agents session cleanup <full-session-id> --revision <n> --yes
-       pi-agents session resolve-delivery <full-client-id> <full-request-id> retry_at_risk|abandon --yes
 
 With no arguments, pi-agents opens the machine-local session list.
 `;
 const SESSION_VERBS = new Set(["stop", "rm", "respawn"]);
 /** Recovery operations Claude Code has no verb for, so they stay under the session namespace. */
-const RECOVERY_VERBS = new Set(["cleanup", "resolve-delivery"]);
-const RECOVERY_USAGE = "Usage: pi-agents session cleanup <full-id> --revision <n> --yes | session resolve-delivery <full-client-id> <full-request-id> retry_at_risk|abandon --yes";
+const RECOVERY_VERBS = new Set(["cleanup"]);
+const RECOVERY_USAGE = "Usage: pi-agents session cleanup <full-id> --revision <n> --yes";
 const LOGS_USAGE = "Usage: pi-agents logs [<full-session-id>]";
 
 async function defaultOpenApp(options) {

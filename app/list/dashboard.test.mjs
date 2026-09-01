@@ -47,7 +47,6 @@ class FakeBackend {
     requests = [];
     stop = vi.fn();
     delete = vi.fn();
-    resolveDelivery = vi.fn(async () => { });
     constructor(sessions) {
         this.snapshot = { sessions, cursor: nextCoverage() };
     }
@@ -89,8 +88,8 @@ function controller(backend, overrides = {}) {
     });
 }
 /**
- * A destructive backend call that keys its command the way runtime/command-journal.mjs does:
- * one request ID owns one exact payload, and the same ID with a changed revision is a conflict.
+ * A destructive backend call that refuses to see the same request ID carry two different payloads,
+ * so a re-aimed revision that reuses its ID is a conflict rather than a silent second command.
  */
 function journalledDestructive(refuse) {
     const revisionsById = new Map();
@@ -518,18 +517,19 @@ describe("dashboard controller", () => {
         await vi.waitFor(() => expect(backend.requests).toHaveLength(2));
         expect(backend.requests[1]).toMatchObject({ isolation: { mode: "shared_directory", confirmedCwd: "/repo" } });
     });
-    it("surfaces DELIVERY_UNKNOWN actions and never automatically retries", async () => {
+// Nothing durable records an ambiguous launch and nothing may retry it, so the operator gets his
+// prompt back and one error line naming the code.
+    it("hands back the prompt and never retries a launch whose delivery is ambiguous", async () => {
         const backend = new FakeBackend([]);
-        backend.launch = vi.fn(async () => ({ kind: "delivery_unknown", clientId: "stable-client", requestId: "launch-unknown" }));
+        backend.launch = vi.fn(async () => ({ kind: "rejected", error: { code: "DELIVERY_UNKNOWN", message: "Launch delivery is ambiguous" } }));
         const dashboard = controller(backend);
         await dashboard.open();
         dashboard.setComposerPrompt("Implement it");
         await dashboard.submitComposer();
         expect(backend.launch).toHaveBeenCalledTimes(1);
-        expect(dashboard.overlay).toMatchObject({ kind: "delivery_unknown", actions: ["retry_at_risk", "abandon"] });
-        await dashboard.resolveUnknownDelivery("abandon");
-        expect(backend.resolveDelivery).toHaveBeenCalledWith("stable-client", "launch-unknown", "abandon");
-        expect(backend.launch).toHaveBeenCalledTimes(1);
+        expect(dashboard.overlay).toBeUndefined();
+        expect(dashboard.status).toMatchObject({ kind: "error", code: "DELIVERY_UNKNOWN" });
+        expect(dashboard.composerDraft.prompt).toBe("Implement it");
     });
     it("opens the selection through the injected viewer boundary on an empty Enter or Right, and launches once the prompt has text", async () => {
         const openSelectedViewer = vi.fn(async () => {});
@@ -553,11 +553,6 @@ describe("dashboard controller", () => {
         it.each([
             ["help", async (dashboard) => { dashboard.toggleHelp(); }, "Help", "this help"],
             ["metadata", async (dashboard) => { dashboard.toggleMetadata(); }, "Session", "taskState"],
-            ["delivery unknown", async (dashboard, backend) => {
-                backend.launch = vi.fn(async () => ({ kind: "delivery_unknown", clientId: "stable-client", requestId: "launch-unknown" }));
-                dashboard.setComposerPrompt("Implement it");
-                await dashboard.submitComposer();
-            }, "Delivery unknown", "retry_at_risk"],
             ["shared directory", async (dashboard) => {
                 dashboard.setComposerPrompt("Shared change");
                 dashboard.setIsolationMode("shared_directory");
@@ -1245,7 +1240,7 @@ describe("daemon dashboard backend", () => {
             async connect() {},
             async request(request) {
                 requests.push(request);
-                return { version: 1, requestId: request.requestId, ok: true, result: { kind: "command", status: { clientId: "stable-client", requestId: request.requestId, operation, stage: "COMPLETED", acceptedAt: timestamp, updatedAt: timestamp } } };
+                return { version: 1, requestId: request.requestId, ok: true, result: { kind: "command", sessionId: "exact-session" } };
             },
             subscribe() { return { async *[Symbol.asyncIterator]() {} }; },
         };
@@ -1273,12 +1268,11 @@ describe("daemon dashboard backend", () => {
         await expect(backend[operation]("exact-session", 3, `${operation}-request`)).rejects.toMatchObject({ code: "DELIVERY_UNKNOWN", clientId: "stable-client", requestId: `${operation}-request` });
         expect(requests).toEqual([operation]);
     });
-    it.each(["stop", "delete"])("treats durable %s FAILED as a structured refusal", async (operation) => {
-        const status = { clientId: "stable-client", requestId: `${operation}-request`, operation, stage: "FAILED", acceptedAt: timestamp, updatedAt: timestamp, error: { code: "SESSION_REFUSED", message: `${operation} refused`, retryable: false } };
+    it.each(["stop", "delete"])("treats a refused %s as a structured refusal", async (operation) => {
         const client = {
             async connect() { },
             async request(request) {
-                return { version: 1, requestId: request.requestId, ok: true, result: { kind: "command", status } };
+                return { version: 1, requestId: request.requestId, ok: false, error: { code: "SESSION_REFUSED", message: `${operation} refused`, retryable: false } };
             },
             subscribe() { return { async *[Symbol.asyncIterator]() { } }; },
             async close() { },

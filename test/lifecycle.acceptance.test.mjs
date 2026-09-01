@@ -47,7 +47,7 @@ function record(root, sessionId) {
 }
 
 async function setupRoot(prefix) {
-  return harness.stateRoot(prefix, ["canonical", "daemon", "sessions", "queue", "runs", "index"]);
+  return harness.stateRoot(prefix, ["canonical", "daemon", "sessions", "runs", "index"]);
 }
 
 function request(clientId, requestId, op, payload) {
@@ -197,7 +197,7 @@ it("keeps two mixed-version fake Pi children alive across frontend close and dae
     const attachment = await second.request(request("frontend-after", `attach-${sessionId}`, "attach", { sessionId }));
     expect(attachment).toMatchObject({ ok: true, result: { kind: "attached", sessionId } });
     const response = await second.request(request("frontend-after", `prompt-${sessionId}`, "prompt", { sessionId, text: `later ${sessionId}` }));
-    expect(response).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+    expect(response).toMatchObject({ ok: true, result: { kind: "command" } });
   }
 
   for (const sessionId of ["one", "two"]) {

@@ -366,11 +366,20 @@ it("reconnects after daemon restart from a socket-only launch and retains the ru
   // Adoption never rotates a run's token, so the same secret still authenticates this worker.
   expect((await workerEntries(root))[0].token).toBe(reserved.token);
 
-  await expect(reconnected.connection.request({ version: 1, type: "command", token: reconnected.metadata.token, id: "reconnected-command", command: { clientId: "reconnect-client", requestId: "reconnect-request", op: "prompt", text: "still alive" } }, {}))
-    .resolves.toMatchObject({ stage: "RPC_ACKNOWLEDGED" });
+  const command = { clientId: "reconnect-client", requestId: "reconnect-request", op: "prompt", text: "still alive" };
+  await expect(reconnected.connection.request({ version: 1, type: "command", token: reconnected.metadata.token, id: "reconnected-command", command }, {}))
+    .resolves.toMatchObject({ stage: "RPC_ACKNOWLEDGED", text: "still alive" });
+  // The worker's inbox is the acceptance boundary, so the same request identity delivered twice
+  // reaches Pi once: the second is answered from the record the first one fsynced. No daemon-side
+  // journal exists to refuse it, and the operator's own words are on that record.
+  await expect(reconnected.connection.request({ version: 1, type: "command", token: reconnected.metadata.token, id: "reconnected-command-again", command }, {}))
+    .resolves.toMatchObject({ stage: "RPC_ACKNOWLEDGED", text: "still alive" });
 
   // The run token is private: it must not reach any captured worker output or rotating diagnostic.
   const runDirectory = join(runs, (await registry.get("one"))?.runHash ?? "missing");
+  const replay = (await readFile(join(runDirectory, "worker-replay.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line)).filter((entry) => entry.requestId === "reconnect-request");
+  expect(replay.map((entry) => entry.stage)).toEqual(["RECEIVED", "RPC_WRITE_STARTED", "RPC_ACKNOWLEDGED"]);
+  expect(replay.every((entry) => entry.text === "still alive")).toBe(true);
   const captured = await Promise.all((await readdir(runDirectory, { recursive: true, withFileTypes: true }))
     .filter((entry) => entry.isFile())
     .map((entry) => readFile(join(entry.parentPath ?? runDirectory, entry.name), "utf8").catch(() => "")));

@@ -72,8 +72,8 @@ it("prints standalone help without opening the app", async () => {
   const help = output.stdout.join("");
   expect(help).toContain("With no arguments");
   // Both commands now exist, so the help advertises both and hides neither.
-  for (const advertised of ["pi-agents agents", "pi-agents attach", "pi-agents logs [<full-session-id>]", "pi-agents stop|rm", "pi-agents respawn", "session cleanup", "session resolve-delivery"]) expect(help).toContain(advertised);
-  for (const absent of ["session status", "session stop", "session delete"]) expect(help).not.toContain(absent);
+  for (const advertised of ["pi-agents agents", "pi-agents attach", "pi-agents logs [<full-session-id>]", "pi-agents stop|rm", "pi-agents respawn", "session cleanup"]) expect(help).toContain(advertised);
+  for (const absent of ["session status", "session stop", "session delete", "resolve-delivery"]) expect(help).not.toContain(absent);
   expect(openApp).not.toHaveBeenCalled();
 });
 
@@ -137,7 +137,7 @@ it.each([
   const output = capture();
   const runSessionCommand = async (received) => {
     expect(received).toEqual(argv);
-    return { code: 0, result: { kind: "command", status: { stage: "COMPLETED" } } };
+    return { code: 0, result: { kind: "command", sessionId: "full-session-id" } };
   };
   const code = await runCli([...argv, "--json"], { io: output.io, runSessionCommand });
   expect(code).toBe(0);
@@ -149,18 +149,23 @@ it.each([
   ["stop", ["session", "stop", "full-session-id", "--revision", "3", "--yes"]],
   ["delete", ["session", "delete", "full-session-id", "--revision", "3", "--yes"]],
 ])("rejects the retired session %s form as ordinary syntax", async (_name, argv) => {
-  const runSessionCommand = vi.fn(async () => ({ code: 0, result: { kind: "command", status: { stage: "COMPLETED" } } }));
+  const runSessionCommand = vi.fn(async () => ({ code: 0, result: { kind: "command", sessionId: "full-session-id" } }));
   expect(await runCli(argv, { io: capture().io, runSessionCommand })).toBe(2);
   expect(runSessionCommand).not.toHaveBeenCalled();
 });
 
-it.each([
-  ["cleanup", ["cleanup", "full-session-id", "--revision", "3", "--yes"]],
-  ["resolve-delivery", ["resolve-delivery", "full-client-id", "full-request-id", "abandon", "--yes"]],
-])("keeps recovery command %s under the session namespace", async (_name, argv) => {
-  const runSessionCommand = vi.fn(async () => ({ code: 0, result: { kind: "command", status: { stage: "COMPLETED" } } }));
+it("keeps recovery command cleanup under the session namespace", async () => {
+  const argv = ["cleanup", "full-session-id", "--revision", "3", "--yes"];
+  const runSessionCommand = vi.fn(async () => ({ code: 0, result: { kind: "command", sessionId: "full-session-id" } }));
   expect(await runCli(["session", ...argv], { io: capture().io, runSessionCommand })).toBe(0);
   expect(runSessionCommand).toHaveBeenCalledWith(argv, undefined);
+});
+
+// The delivery-resolution verb is gone with the journal it settled, so it is ordinary bad syntax.
+it("refuses the retired session resolve-delivery verb as ordinary syntax", async () => {
+  const runSessionCommand = vi.fn(async () => ({ code: 0 }));
+  expect(await runCli(["session", "resolve-delivery", "full-client-id", "full-request-id", "abandon", "--yes"], { io: capture().io, runSessionCommand })).toBe(2);
+  expect(runSessionCommand).not.toHaveBeenCalled();
 });
 
 // Operator-visible failure, 2026-08-31: against a daemon from the previous release these printed

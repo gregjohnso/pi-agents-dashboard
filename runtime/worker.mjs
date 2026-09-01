@@ -169,7 +169,7 @@ export function createWorkerCommandDispatcher({ replay, adapter }) {
     });
   }
 
-  /** @param {{ clientId: string, requestId: string, op: string, text?: string, response?: unknown, sessionCommand?: any, retryAtRisk?: boolean }} command */
+  /** @param {{ clientId: string, requestId: string, op: string, text?: string, response?: unknown, sessionCommand?: any }} command */
   function deliver(command) {
     const result = tail.then(async () => {
       if (typeof command?.clientId !== "string" || typeof command.requestId !== "string") {
@@ -177,9 +177,10 @@ export function createWorkerCommandDispatcher({ replay, adapter }) {
       }
       const existing = replay.current(command);
       if (existing?.stage === "RPC_ACKNOWLEDGED") return existing;
-      if (existing?.stage === "DELIVERY_UNKNOWN" && command.retryAtRisk !== true) {
-        throw Object.assign(new Error("Pi delivery is ambiguous"), { code: "DELIVERY_UNKNOWN" });
-      }
+      // An identity recorded ambiguous is never delivered again. Only Pi can say whether the first
+      // write landed, and it exposes no idempotency key, so a retry here could apply the operator's
+      // text twice with nothing able to tell afterwards.
+      if (existing?.stage === "DELIVERY_UNKNOWN") throw Object.assign(new Error("Pi delivery is ambiguous"), { code: "DELIVERY_UNKNOWN" });
       if (existing?.stage === "FAILED") {
         throw Object.assign(new Error(existing.error?.message ?? "Pi delivery failed"), { code: existing.error?.code ?? "RPC_FAILED" });
       }
@@ -188,7 +189,7 @@ export function createWorkerCommandDispatcher({ replay, adapter }) {
       // durable copy of it: acceptance is the RECEIVED fsync below, and a crash before Pi answers
       // must leave what he typed on disk rather than only the fact that something was in flight.
       const base = { clientId: command.clientId, requestId: command.requestId, op: command.op, ...(command.text === undefined ? {} : { text: command.text }) };
-      if (existing === undefined || existing.stage === "DELIVERY_UNKNOWN") await replay.append({ ...base, stage: "RECEIVED" });
+      if (existing === undefined) await replay.append({ ...base, stage: "RECEIVED" });
       if (!WORKER_OPERATIONS.has(command.op)) {
         const cause = Object.assign(new Error(`Unsupported worker operation: ${command.op}`), { code: "UNSUPPORTED_WORKER_OPERATION" });
         await replay.append({ ...base, stage: "FAILED", error: { code: cause.code, message: cause.message, retryable: false } });

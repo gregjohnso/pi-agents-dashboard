@@ -198,7 +198,7 @@ The live daemon log showed adoption from release 2.1.246 through the referenced 
 
 An equivalent implementation should serialize replacement per session, revalidate worker and child identities at the boundary, and use structured idle state only. It should leave newer or busy code running when automatic replacement is unsafe. [I, unverified]
 
-**Adopt:** identity-first adoption, stale marking, idle or explicit replacement, and downgrade refusal. Keep our durable command stages across replacement because dropping them would hide failed or ambiguous delivery. Do not require every live worker to match the daemon release before list startup. See [Changes 5.3 and 5.4](../architecture-plan.md#commit-53-feat-adopt-compatible-workers-across-upgrades). [O][B]
+**Adopt:** identity-first adoption, stale marking, idle or explicit replacement, and downgrade refusal. A replacement worker opens a new run directory and reads no earlier run's replay log, so nothing the replaced worker had accepted is redelivered; a command in flight across a replacement is reported ambiguous, as `docs/command-acceptance.md` records. Do not require every live worker to match the daemon release before list startup. See [Changes 5.3 and 5.4](../architecture-plan.md#commit-53-feat-adopt-compatible-workers-across-upgrades). [O][B]
 
 ## Linux clients share one editor and one terminal size
 
@@ -208,7 +208,7 @@ All clients also share one PTY size. A resize from any client changes the agent'
 
 Windows instead removes existing attachers when a new one opens the session, using `EKICKED`. This is a platform branch, not Linux writer ownership. [B]
 
-Shared typing is Claude Code's observed behavior. This project now adopts it. Any authenticated attached client may submit structured commands, and the daemon orders and journals them per session. [O][B]
+Shared typing is Claude Code's observed behavior. This project now adopts it. Any authenticated client may submit structured commands, and the daemon orders them per session; the owning worker's durable inbox is where each one becomes durable. [O][B]
 
 **Adopt now:** any number of read-write clients and connection-scoped attachment state. Delete composer and observer roles, role grants and releases, takeover, `session_access_changed`, claim recovery, and `SESSION_IN_USE`. Keep per-client rendering instead of shared resize because the current viewer has no shared PTY to resize. See [Change 8](../architecture-plan.md#change-8-every-client-can-write-and-frontend-state-stays-local). [B]
 
@@ -228,7 +228,7 @@ Terminal bytes are rendering only. The bounded PTY tail supports reconnect and d
 
 Claude Code exposes `agents`, `attach`, `logs`, `stop`, and `rm`. These names separate listing, viewing, diagnostics, process shutdown, and record removal. [B]
 
-**Adopt now:** name the list entry point `agents`; name direct session opening `attach`; add `logs`; rename `session stop` to `stop`; and rename `session delete` to `rm`. Delete the old `session status`, `session stop`, and `session delete` parser branches rather than retaining aliases. Keep `session cleanup` and `session resolve-delivery` as recovery commands because they represent work that Claude Code's command set does not perform. See [Changes 11 and 12](../architecture-plan.md#change-11-logs-exposes-the-error-already-on-disk). [B]
+**Adopt now:** name the list entry point `agents`; name direct session opening `attach`; add `logs`; rename `session stop` to `stop`; and rename `session delete` to `rm`. Delete the old `session status`, `session stop`, and `session delete` parser branches rather than retaining aliases. Keep `session cleanup` as a recovery command because it represents work that Claude Code's command set does not perform. **Adopted:** `session resolve-delivery` is gone with the daemon command journal it settled, which is also what Claude Code has: no daemon-side command record at all. See [Changes 11 and 12](../architecture-plan.md#change-11-logs-exposes-the-error-already-on-disk). [B]
 
 ## Sources
 

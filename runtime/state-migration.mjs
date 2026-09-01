@@ -14,9 +14,14 @@ const CANONICAL_MARKER = "CANONICAL";
 const LEGACY_MARKER = "MIGRATED";
 const LOCK = ".migration.lock";
 const RECONCILIATION_MARKER = ".reconciliation-started";
-const COMMAND_ENVELOPE_KEYS = ["version", "clientId", "requestId", "op", "payload"];
-const COMMAND_STATUS_KEYS = ["clientId", "requestId", "operation", "stage", "acceptedAt", "updatedAt", "error"];
-const COMMAND_STAGES = ["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED", "DELIVERY_UNKNOWN", "FAILED"];
+/**
+ * Durable formats this release deleted. A legacy root still holds them, so migration recognizes each
+ * one and carries none of them forward: the daemon-wide command journal and the two client-side
+ * records that existed only to give it a stable retry identity. Their content is never parsed,
+ * because nothing will read it again, and refusing the root over a format nobody reads would leave
+ * the operator unable to migrate at all.
+ */
+const DROPPED_LEGACY_ARTIFACTS = [/^queue\/commands\.jsonl$/u, /^daemon\/launch-results\.json$/u, /^cli\/pending\/[^/]+\.json$/u];
 
 /** @param {string} code @param {string} message @param {Record<string, unknown>} [details] */
 function migrationError(code, message, details = {}) { return Object.assign(new Error(message), { code, ...details }); }
@@ -32,42 +37,6 @@ function digest(value) { return createHash("sha256").update(value).digest("hex")
 /** @param {any} value @param {readonly string[]} keys @param {string} label */
 function exactObject(value, keys, label) { if (typeof value !== "object" || value === null || Array.isArray(value) || Object.keys(value).some((key) => !keys.includes(key))) throw new TypeError(`${label} is invalid`); }
 /** @param {any} value */
-function nonEmptyString(value) { return typeof value === "string" && value.length > 0; }
-/**
- * Validate one durable journal envelope written by any release.
- *
- * Migration reads history, so it cannot judge a record against the operations this release can still
- * run: an operation was legitimate when its record was written, and deleting the feature does not
- * corrupt the journal. What must still hold is what makes the record readable and internally
- * consistent, because a daemon recovering this journal indexes it by client and request and resumes
- * it from its stage. So the version-1 envelope shape, agreement between command and status on
- * client, request and operation, a canonical fingerprint, and a stage this release can still
- * recover are all required; the operation name and the payload shape are not.
- *
- * The fingerprint is checked for presence, never recomputed. It covers the command as the writing
- * release normalized it, and this release's parser drops retired payload keys, so a recomputed
- * digest would differ for records that are old rather than corrupt.
- * @param {any} journal
- */
-function validJournalRecord(journal) {
-  try {
-    exactObject(journal, ["commandCanonical", "command", "status"], "Journal record");
-    const { commandCanonical, command, status } = journal;
-    exactObject(command, COMMAND_ENVELOPE_KEYS, "Journal command");
-    exactObject(status, COMMAND_STATUS_KEYS, "Journal command status");
-    if (command.version !== 1 || !Object.hasOwn(command, "payload")) return false;
-    if (![commandCanonical, command.clientId, command.requestId, command.op].every(nonEmptyString)) return false;
-    if (![status.clientId, status.requestId, status.operation, status.acceptedAt, status.updatedAt].every(nonEmptyString)) return false;
-    if (!COMMAND_STAGES.includes(status.stage)) return false;
-    if (status.clientId !== command.clientId || status.requestId !== command.requestId || status.operation !== command.op) return false;
-    if (Object.hasOwn(status, "error")) {
-      exactObject(status.error, ["code", "message", "retryable"], "Journal command error");
-      if (!nonEmptyString(status.error.code) || typeof status.error.message !== "string" || typeof status.error.retryable !== "boolean") return false;
-    }
-    return true;
-  } catch { return false; }
-}
-/** @param {any} value */
 function validIdentity(value) { return Number.isSafeInteger(value?.pid) && value.pid > 0 && typeof value.startIdentity === "string" && value.startIdentity.length > 0 && Number.isSafeInteger(value.processGroupId) && value.processGroupId > 0; }
 /** @param {string} text @param {(value:any)=>boolean} validate @param {string} label */
 function validateJsonLines(text, validate, label) {
@@ -76,10 +45,9 @@ function validateJsonLines(text, validate, label) {
   if (!values.every(validate)) throw new TypeError(`${label} is invalid`);
   return values;
 }
-/** @param {any} value */
-function validLaunchResults(value) { return value?.schemaVersion === 1 && typeof value.results === "object" && value.results !== null && !Array.isArray(value.results) && Object.keys(value).length === 2 && Object.keys(value).every((key) => ["schemaVersion", "results"].includes(key)) && Object.values(value.results).every((result) => typeof result?.sessionId === "string" && result.sessionId.length > 0 && Object.keys(result).length === 1); }
 /** @param {string} relative @param {string} text */
 function validateLegacyArtifact(relative, text) {
+  if (DROPPED_LEGACY_ARTIFACTS.some((pattern) => pattern.test(relative))) return;
   try {
     if (relative === "dashboard.json") { convertLegacyDashboardConfig(JSON.parse(text)); return; }
     if (/^sessions\/[^/]+\.json$/u.test(relative)) { const record = validateSessionRecord(JSON.parse(text)); if (`sessions/${record.sessionId}.json` !== relative) throw new TypeError("Registry filename and session ID differ"); return; }
@@ -95,14 +63,8 @@ function validateLegacyArtifact(relative, text) {
       if (publication.schemaVersion !== 1 || !validIdentity(publication) || typeof publication.daemonEpoch !== "string" || typeof publication.tokenPath !== "string" || typeof publication.startedAt !== "string" || !["STARTING", "RECONCILING", "READY", "FAILED"].includes(publication.state)) throw new TypeError("Daemon publication is invalid");
       return;
     }
-    if (relative === "daemon/launch-results.json") { if (!validLaunchResults(JSON.parse(text))) throw new TypeError("Launch result store is invalid"); return; }
-    if (relative === "queue/commands.jsonl") {
-      validateJsonLines(text, validJournalRecord, "Command journal");
-      return;
-    }
-    if (relative === "daemon/reconciliation.json") { const value = JSON.parse(text); exactObject(value, ["schemaVersion", "daemonEpoch", "completedAt", "conflicts", "recoveryActions"], "Reconciliation record"); if (value.schemaVersion !== 1 || typeof value.daemonEpoch !== "string" || typeof value.completedAt !== "string" || !Array.isArray(value.conflicts) || !Array.isArray(value.recoveryActions)) throw new TypeError("Reconciliation record is invalid"); return; }
+    if (relative === "daemon/reconciliation.json") { const value = JSON.parse(text); exactObject(value, ["schemaVersion", "daemonEpoch", "completedAt", "conflicts"], "Reconciliation record"); if (value.schemaVersion !== 1 || typeof value.daemonEpoch !== "string" || typeof value.completedAt !== "string" || !Array.isArray(value.conflicts)) throw new TypeError("Reconciliation record is invalid"); return; }
     if (relative === "cli/client-id") { const clientId = text.trim(); if (clientId.length === 0 || clientId.includes("/") || clientId.includes("\0") || clientId !== text.trim()) throw new TypeError("CLI identity is invalid"); return; }
-    if (/^cli\/pending\/[^/]+\.json$/u.test(relative)) { const value = JSON.parse(text); exactObject(value, ["schemaVersion", "action", "sessionId", "revision", "clientId", "requestId"], "Pending CLI request"); if (value.schemaVersion !== 1 || !["stop", "delete", "respawn"].includes(value.action) || typeof value.sessionId !== "string" || value.sessionId.length === 0 || !Number.isSafeInteger(value.revision) || value.revision < 0 || [value.clientId, value.requestId].some((entry) => typeof entry !== "string" || entry.length === 0)) throw new TypeError("Pending CLI request is invalid"); return; }
     if (/^runs\/[^/]+\/(worker\.stdout\.log|worker\.stderr\.log)$/u.test(relative)) return;
     if (/^runs\/[^/]+\/worker-replay\.jsonl$/u.test(relative)) { validateJsonLines(text, validateWorkerReplayRecord, "Worker replay store"); return; }
     throw new TypeError(`Unknown legacy state artifact: ${relative}`);
@@ -160,8 +122,9 @@ async function validatePublishedDestination(root, files, expectedUserId, fsOps) 
 }
 /** @param {string} root @param {Array<{relative:string,sha256:string}>} files @param {any} fsOps */
 async function validateReconciledDestination(root, files, fsOps) {
-  // `frontend-state.json` is retired: nothing reads or writes it. A destination root an earlier
-  // release wrote still holds one, and refusing to migrate into that root would be a false collision.
+  // `frontend-state.json` and `queue/` are retired: nothing reads or writes either. A destination
+  // root an earlier release wrote still holds them, and refusing to migrate into that root would be
+  // a false collision.
   const allowed = new Set([LOCK, MANIFEST, CANONICAL_MARKER, RECONCILIATION_MARKER, "daemon", "sessions", "queue", "runs", "index", "cli", "frontend-state.json", "dashboard.json", ...files.map((file) => file.relative.split("/")[0])]);
   const collision = (await fsOps.readdir(root)).find((/** @type {string} */ name) => !allowed.has(name));
   if (collision !== undefined) throw migrationError("DESTINATION_COLLISION", `Destination contains unexpected artifact: ${collision}`);
@@ -275,7 +238,7 @@ export async function migrateLegacyState({ legacyRoot, destinationRoot, expected
     const destinationIdentity = digest(JSON.stringify({ realpath: await fsOps.realpath(destinationRoot), dev: destinationMetadata.dev, ino: destinationMetadata.ino }));
     const migrationId = digest(JSON.stringify([tree.identity, destinationIdentity, 1, 2]));
     const manifestPath = join(destinationRoot, MANIFEST);
-    const preparedEntries = tree.entries.map((entry) => {
+    const preparedEntries = tree.entries.filter((entry) => !DROPPED_LEGACY_ARTIFACTS.some((pattern) => pattern.test(entry.relative))).map((entry) => {
       if (entry.type !== "file") return entry;
       let text = entry.text ?? "";
       if (entry.relative === "dashboard.json") { try { text = `${JSON.stringify(convertLegacyDashboardConfig(JSON.parse(text)), null, 2)}\n`; } catch (error) { throw migrationError("MALFORMED_LEGACY_STATE", "Legacy dashboard configuration is invalid", { cause: error }); } }

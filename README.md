@@ -81,10 +81,11 @@ Session IDs are exact; a prefix does not match. `--revision <n>` is the `revisio
 
 `logs` works before a session's worker is ready, which is when a launch is most likely to have failed. It resolves the run directory from the record's own root-relative run hash, so it keeps working after the state root is renamed, and it refuses any source that is not a regular file the operator owns.
 
-Two recovery commands have no Claude Code equivalent and stay under `session`:
+One recovery command has no Claude Code equivalent and stays under `session`:
 
 - `pi-agents session cleanup <full-session-id> --revision <n> --yes` removes a stopped session's managed worktree.
-- `pi-agents session resolve-delivery <full-client-id> <full-request-id> retry_at_risk|abandon --yes` settles a `stop`, `rm`, or `respawn` whose delivery the daemon left ambiguous.
+
+A `stop`, `rm` or `respawn` whose answer is lost exits `DELIVERY_UNKNOWN`. There is nothing to settle: read the row with `pi-agents agents --json`, because its revision and process state are written before the answer and say whether the command landed. Reissuing against the revision you were given is refused if it already did. See [docs/command-acceptance.md](docs/command-acceptance.md).
 
 Add `--json` to any command for one machine-readable object on standard output.
 

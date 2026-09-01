@@ -45,7 +45,7 @@ const at = "2026-08-25T12:00:00.000Z";
 async function daemonWithLiveSession(sessionId) {
   const root = await mkdtemp(join(tmpdir(), "pi-agents-throbber-"));
   roots.push(root);
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(root, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(root, name), { mode: 0o700 });
   const registry = new RegistryStore(join(root, "sessions"));
   await registry.create({
     schemaVersion: 1, revision: 0, sessionId, sessionFile: `/sessions/${sessionId}.jsonl`, canonicalSessionFile: `/sessions/${sessionId}.jsonl`,

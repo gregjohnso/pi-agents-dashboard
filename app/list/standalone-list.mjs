@@ -15,8 +15,9 @@ import { DashboardController, createDaemonDashboardBackend } from "./dashboard.m
 export function createDaemonViewerClient({ client, clientId }) {
   const request = async (op, payload) => {
     const response = await client.request({ version: 1, clientId, requestId: randomUUID(), op, payload });
+    // A refused or ambiguous command is a typed failure on the response envelope, so this throws for
+    // both and the viewer keeps the operator's text in its composer.
     if (!response.ok) throw Object.assign(new Error(response.error.message), response.error);
-    if (response.result?.kind === "command" && response.result.status.stage === "FAILED") throw Object.assign(new Error(response.result.status.error?.message ?? "Viewer command failed"), response.result.status.error);
     return response.result;
   };
   /** @type {Map<string, Promise<unknown>>} */

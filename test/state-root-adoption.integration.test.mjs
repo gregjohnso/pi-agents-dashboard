@@ -42,7 +42,7 @@ function record(root, sessionId) {
 async function previousStateRoot(sessionIds) {
   const parent = await harness.stateRoot("pi-agents-adoption-integration-");
   const previousRoot = join(parent, "pi-dashboard");
-  for (const directory of ["canonical", "daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(previousRoot, directory), { recursive: true, mode: 0o700 });
+  for (const directory of ["canonical", "daemon", "sessions", "runs", "index"]) await mkdir(join(previousRoot, directory), { recursive: true, mode: 0o700 });
   for (const sessionId of sessionIds) {
     await writeFile(join(previousRoot, "sessions", `${sessionId}.json`), `${JSON.stringify(record(previousRoot, sessionId), null, 2)}\n`, { mode: 0o600 });
     await writeFile(join(previousRoot, "canonical", `${sessionId}.jsonl`), "", { mode: 0o600 });

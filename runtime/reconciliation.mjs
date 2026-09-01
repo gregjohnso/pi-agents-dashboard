@@ -3,7 +3,6 @@ import * as fs from "node:fs/promises";
 import { join } from "node:path";
 
 import { atomicWriteJson } from "./atomic-file.mjs";
-import { createCommandJournal } from "./command-journal.mjs";
 import { traceSessionLock } from "./lock-trace.mjs";
 import { RegistryStore, registryCoordinationScope } from "./registry-store.mjs";
 import { SessionCoordinator } from "./session-coordinator.mjs";
@@ -252,24 +251,6 @@ export function abandonedLaunch(record) {
 /** @param {unknown} error */
 function exited(error) {
   return error instanceof Error && ["ENOENT", "ESRCH"].includes(/** @type {NodeJS.ErrnoException} */ (error).code ?? "");
-}
-
-/** @param {string} path @returns {Promise<any[]>} */
-async function latestJournalRecords(path) {
-  let text;
-  try {
-    text = await fs.readFile(path, "utf8");
-  } catch (error) {
-    if (error instanceof Error && /** @type {NodeJS.ErrnoException} */ (error).code === "ENOENT") return [];
-    throw error;
-  }
-  const latest = new Map();
-  for (const line of text.trimEnd().split("\n")) {
-    if (line.length === 0) continue;
-    const record = JSON.parse(line);
-    if (record?.status?.clientId !== undefined && record?.status?.requestId !== undefined) latest.set(`${record.status.clientId}\0${record.status.requestId}`, record);
-  }
-  return [...latest.values()];
 }
 
 export class RecoveredWorkerRouter {
@@ -779,9 +760,6 @@ async function createViewerRecovery({ daemonEpoch, registry }) {
 /** @param {{ root: string, daemonEpoch: string, inspect(pid: number): Promise<any>, waitForReconnect?: (workers: any[], router: RecoveredWorkerRouter) => Promise<string[]>, onViewerReady?: (viewer: any) => void | Promise<void>, router?: RecoveredWorkerRouter, signal?: AbortSignal }} options */
 export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReconnect = async () => [], onViewerReady = () => {}, router: suppliedRouter, signal }) {
   const registry = new RegistryStore(join(root, "sessions"));
-  const journalPath = join(root, "queue", "commands.jsonl");
-  /** @type {any} */
-  let journal;
   /** @type {any} */
   let viewer;
   const router = suppliedRouter ?? new RecoveredWorkerRouter({ registry, inspect, metadataPath: join(root, "daemon", "workers.json") });
@@ -789,8 +767,6 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReco
     if (signal?.aborted) throw Object.assign(new Error("Reconciliation was cancelled"), { code: "RECONCILIATION_CANCELLED" });
   };
   try {
-    cancelled();
-    journal = await createCommandJournal({ path: journalPath });
     cancelled();
     await router.load();
     viewer = await createViewerRecovery({ daemonEpoch, registry });
@@ -899,32 +875,22 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReco
     for (const worker of liveWorkers) {
       if (!reconnected.has(worker.sessionId) && !router.connectedSessionIds().includes(worker.sessionId)) conflicts.push({ sessionId: worker.sessionId, reason: "WORKER_RECONNECT_TIMEOUT", ownership: worker });
     }
-    const commands = await latestJournalRecords(journalPath);
-    const recoveryActions = commands.map((record) => ({
-      clientId: record.status.clientId,
-      requestId: record.status.requestId,
-      sessionId: record.command?.payload?.sessionId,
-      command: record.command,
-      action: record.status.stage === "ACCEPTED" ? "SAFE_REDELIVERY" : record.status.stage === "DELIVERY_UNKNOWN" ? "DELIVERY_AMBIGUOUS" : "NO_REDELIVERY",
-    }));
-    await atomicWriteJson(join(root, "daemon", "reconciliation.json"), { schemaVersion: 1, daemonEpoch, completedAt: new Date().toISOString(), conflicts, recoveryActions });
+    await atomicWriteJson(join(root, "daemon", "reconciliation.json"), { schemaVersion: 1, daemonEpoch, completedAt: new Date().toISOString(), conflicts });
     return {
       registry,
-      journal,
       router,
       liveWorkers,
       conflicts,
       repairedSessions,
-      recoveryActions,
       viewer,
       async close() {
-        const results = await Promise.allSettled([router.close(), journal.close(), viewer.close()]);
+        const results = await Promise.allSettled([router.close(), viewer.close()]);
         const errors = results.filter((result) => result.status === "rejected").map((result) => result.reason);
         if (errors.length > 0) throw new AggregateError(errors, "Reconciliation stores closed with errors");
       },
     };
   } catch (error) {
-    await Promise.allSettled([journal?.close(), viewer?.close()]);
+    await Promise.allSettled([viewer?.close()]);
     if (suppliedRouter === undefined) await router.close().catch(() => {});
     throw error;
   }

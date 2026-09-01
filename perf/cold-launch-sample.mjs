@@ -7,19 +7,19 @@ export const LAUNCH_TRACE_STAGES = ["ready_persisted"];
 /**
  * Every instant one sample must carry, in launch order.
  *
- * `journalAcceptedAt` comes from the command journal, the two spawn instants from Linux process
- * start ticks in the session record, `readyPersistedAt` from the launch trace, and
- * `firstUsableSnapshotAt` from the measuring client's own clock.
+ * `launchRequestedAt` and `firstUsableSnapshotAt` come from the measuring client's own clock, the
+ * two spawn instants from Linux process start ticks in the session record, and `readyPersistedAt`
+ * from the launch trace.
  */
 export const SAMPLE_TIMESTAMPS = [
-  "journalAcceptedAt",
+  "launchRequestedAt",
   "workerSpawnedAt",
   "piChildSpawnedAt",
   "readyPersistedAt",
   "firstUsableSnapshotAt",
 ];
 
-/** Spawn through ready must be more than this fraction of acceptance through first usable snapshot. */
+/** Spawn through ready must be more than this fraction of request through first usable snapshot. */
 export const DOMINANCE_THRESHOLD = 0.5;
 
 /** A spare can save at most the median spawn-through-ready time; below this it is not worth its residency. */
@@ -65,14 +65,14 @@ export function sampleIntervals(timestamps) {
     if (at(current) < at(previous)) throw sampleError("STAGE_ORDER", `Sample stage ${current} precedes ${previous}`);
   }
   return {
-    journalAcceptedToWorkerSpawnMs: at("workerSpawnedAt") - at("journalAcceptedAt"),
+    launchRequestedToWorkerSpawnMs: at("workerSpawnedAt") - at("launchRequestedAt"),
     workerSpawnToPiChildSpawnMs: at("piChildSpawnedAt") - at("workerSpawnedAt"),
     piChildSpawnToReadyPersistedMs: at("readyPersistedAt") - at("piChildSpawnedAt"),
     readyPersistedToFirstUsableSnapshotMs: at("firstUsableSnapshotAt") - at("readyPersistedAt"),
     // The maximum a prewarmed spare could remove from a launch.
     spawnThroughReadyMs: at("readyPersistedAt") - at("workerSpawnedAt"),
     // The whole latency an operator waits, which the saving must dominate.
-    acceptanceToFirstUsableSnapshotMs: at("firstUsableSnapshotAt") - at("journalAcceptedAt"),
+    requestToFirstUsableSnapshotMs: at("firstUsableSnapshotAt") - at("launchRequestedAt"),
   };
 }
 
@@ -101,12 +101,12 @@ export function reduceSamples(samples) {
   }
 
   const saving = /** @type {{ medianMs: number, p95Ms: number }} */ (intervals.spawnThroughReadyMs);
-  const total = /** @type {{ medianMs: number, p95Ms: number }} */ (intervals.acceptanceToFirstUsableSnapshotMs);
+  const total = /** @type {{ medianMs: number, p95Ms: number }} */ (intervals.requestToFirstUsableSnapshotMs);
   const dominanceMedian = saving.medianMs / total.medianMs;
   const dominanceP95 = saving.p95Ms / total.p95Ms;
   // The per-launch ratio, reported because "dominates at the median" also reads as the median of the
   // per-launch shares. The gate uses the ratio of the two distributions' quantiles.
-  const perSampleShare = samples.map((sample) => /** @type {number} */ (sample.intervals.spawnThroughReadyMs) / /** @type {number} */ (sample.intervals.acceptanceToFirstUsableSnapshotMs));
+  const perSampleShare = samples.map((sample) => /** @type {number} */ (sample.intervals.spawnThroughReadyMs) / /** @type {number} */ (sample.intervals.requestToFirstUsableSnapshotMs));
   const dominanceHolds = dominanceMedian > DOMINANCE_THRESHOLD && dominanceP95 > DOMINANCE_THRESHOLD;
   const savingHolds = saving.medianMs >= MINIMUM_MEDIAN_SAVING_MS;
 

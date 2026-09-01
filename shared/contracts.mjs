@@ -3,7 +3,6 @@ import { parseViewerSnapshot } from "./viewer-contracts.mjs";
 /** @typedef {"WORKING" | "WAITING" | "READY" | "FAILED" | "STOPPED"} TaskState */
 /** @typedef {"LIVE" | "SLEEPING" | "EXITED" | "STALE"} ProcessState */
 /** @typedef {"NONE" | "COMPLETED" | "READY_FOR_REVIEW"} Outcome */
-/** @typedef {"retry_at_risk" | "abandon"} DeliveryResolution */
 /** @typedef {null | boolean | number | string | any[] | {[key: string]: any}} JsonValue */
 /** @typedef {{pid:number,startIdentity:string,processGroupId:number}} ProcessIdentity */
 /** @typedef {{realpath:string,device:string,inode:string,size:number,modifiedTimeNs:string}} ExecutableIdentity */
@@ -18,9 +17,7 @@ import { parseViewerSnapshot } from "./viewer-contracts.mjs";
 /** @typedef {{provider:string,id:string,thinking:boolean}} CatalogModel */
 /** How far a daemon's session list had advanced when it read a snapshot. @typedef {{daemonEpoch:string,sequence:string}} ListCursor */
 /** @typedef {{daemonEpoch:string,sessionId:string,sequence:string}} ViewerCursor */
-/** @typedef {"ACCEPTED"|"DELIVERY_ATTEMPTED"|"WORKER_ACKNOWLEDGED"|"COMPLETED"|"DELIVERY_UNKNOWN"|"FAILED"} CommandStage */
 /** @typedef {{code:string,message:string,retryable:boolean}} DashboardError */
-/** @typedef {{clientId:string,requestId:string,operation:string,stage:CommandStage,acceptedAt:string,updatedAt:string,error?:DashboardError}} CommandStatus */
 /** @typedef {{version:number,clientId:string,requestId:string,op:string,payload:any}} ClientRequest */
 /** @typedef {any} DaemonResponse */
 /** @typedef {{version:1,kind:"list_changed"}} ListChanged */
@@ -32,7 +29,11 @@ const ENVELOPE_KEYS = ["version", "clientId", "requestId", "op", "payload"];
  * invalidations; protocol 3 removed the access role from the attach request and its reply, so a
  * protocol-2 client reads that reply as a refusal of the role it asked for; protocol 4 retired
  * `get_viewer_snapshot` and the viewer resume cursor, because the daemon keeps no durable viewer
- * events to replay and answers `subscribe_viewer` with the snapshot its subscription continues. A
+ * events to replay and answers `subscribe_viewer` with the snapshot its subscription continues;
+ * protocol 5 retired the daemon-wide command journal with `resolve_delivery` and the delivery stage
+ * every command answer carried, because the owning worker's durable inbox is the acceptance boundary
+ * and an unattributable outcome is one `DELIVERY_UNKNOWN` failure rather than a stage to come back
+ * for. A
  * frontend and a daemon on different sides of any of these cannot share a session, so the daemon refuses a
  * frontend that declares anything else at its first request. Worker and control connections
  * deliberately carry no `clientProtocol`: a live worker must survive a daemon replacement, and the
@@ -41,13 +42,12 @@ const ENVELOPE_KEYS = ["version", "clientId", "requestId", "op", "payload"];
  * does not need, and why a refused handshake is reported as an earlier release rather than as a
  * failed authentication.
  */
-export const CLIENT_PROTOCOL = 4;
+export const CLIENT_PROTOCOL = 5;
 /** Operator-chosen row tints, named for the Jobwatch palette. Dashboard metadata; Pi never sees them. */
 export const SESSION_COLORS = ["sky", "green", "amber", "rose", "cyan", "gray"];
 /** @typedef {"sky"|"green"|"amber"|"rose"|"cyan"|"gray"} SessionColor */
 
-const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "respawn", "ui_response", "subscribe_list_changes", "subscribe_viewer", "resolve_delivery", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries", "set_session_color", "get_models"];
-const COMMAND_STAGES = ["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED", "DELIVERY_UNKNOWN", "FAILED"];
+const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "respawn", "ui_response", "subscribe_list_changes", "subscribe_viewer", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries", "set_session_color", "get_models"];
 const SESSION_COMMANDS = ["set_model", "compact", "set_session_name", "abort_retry"];
 const MAX_MENU_ENTRIES = 1_000;
 // Matches MAX_MODELS in runtime/pi-model-catalog.mjs, which stops reading `pi --list-models` there.
@@ -271,19 +271,7 @@ export function parseClientRequest(value) {
   }
   // A viewer subscription carries no resume cursor: the daemon retains no event to replay from, so it
   // answers with the snapshot the subscription continues.
-  if (op === "subscribe_viewer") return { ...base, payload: readSessionPayload(request.payload, op) };
-  const payload = readRecord(request.payload, "resolve_delivery payload"); rejectUnknownKeys(payload, ["targetClientId", "targetRequestId", "resolution"], "resolve_delivery payload");
-  return { ...base, payload: { targetClientId: readIdentifier(payload, "targetClientId", "resolve_delivery payload.targetClientId"), targetRequestId: readIdentifier(payload, "targetRequestId", "resolve_delivery payload.targetRequestId"), resolution: readEnum(payload, "resolution", ["retry_at_risk", "abandon"], "resolve_delivery payload.resolution") } };
-}
-
-/** @param {unknown} value @param {string} path */
-function validateCommandStatus(value, path) {
-  const status = readRecord(value, path);
-  requireKeys(status, ["clientId", "requestId", "operation", "stage", "acceptedAt", "updatedAt"], ["error"], path);
-  for (const key of ["clientId", "requestId", "acceptedAt", "updatedAt"]) readIdentifier(status, key, `${path}.${key}`);
-  readEnum(status, "operation", OPERATIONS, `${path}.operation`);
-  readEnum(status, "stage", COMMAND_STAGES, `${path}.stage`);
-  if (Object.hasOwn(status, "error")) validateError(status.error, `${path}.error`);
+  return { ...base, payload: readSessionPayload(request.payload, "subscribe_viewer") };
 }
 
 /** @param {unknown} value @param {string} path */
@@ -373,7 +361,10 @@ export function parseDaemonResponse(value) {
   if (kind === "state") { requireKeys(result, ["kind", "sessions", "cursor"], [], "daemon response.result"); if (!Array.isArray(result.sessions)) throw new TypeError("sessions must be an array"); result.sessions.forEach((session, index) => validateSession(session, `daemon response.result.sessions[${index}]`)); readCursor(result.cursor, "daemon response.result.cursor"); }
   else if (kind === "list_subscribed") requireKeys(result, ["kind"], [], "daemon response.result");
   else if (["launched", "attached", "detached"].includes(kind)) { requireKeys(result, ["kind", "sessionId"], [], "daemon response.result"); readIdentifier(result, "sessionId"); }
-  else if (kind === "command") { requireKeys(result, ["kind", "status"], [], "daemon response.result"); validateCommandStatus(result.status, "status"); }
+  // A command answer names the session it acted on and nothing else. Whether the operator's text was
+  // durably taken is the owning worker's inbox to answer, and a command whose outcome cannot be
+  // attributed is a DELIVERY_UNKNOWN failure rather than a result with a stage in it.
+  else if (kind === "command") { requireKeys(result, ["kind", "sessionId"], [], "daemon response.result"); readIdentifier(result, "sessionId", "daemon response.result.sessionId"); }
   else if (kind === "session_commands") validateSessionCommands(result);
   else if (kind === "settings") {
     requireKeys(result, ["kind", "summaryModel"], [], "daemon response.result");

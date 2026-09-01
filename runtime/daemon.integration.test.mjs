@@ -173,9 +173,9 @@ it("closes a subscriber whose output queue outgrows its bound", () => {
 });
 
 // Operator-visible failure: a second dashboard on a session could read it and not answer it, because
-// the first one held the only writable attachment. Every authenticated client writes now, and the
-// journal is where a command becomes durable, whether or not that client ever opened the session.
-it("journals every mutation from an authenticated client that never attached", async () => {
+// the first one held the only writable attachment. Every authenticated client writes now, whether or
+// not it ever opened the session, and each command is refused or routed on its own merits.
+it("accepts every mutation from an authenticated client that never attached", async () => {
   const runtime = await createDaemonRuntime({ root: await root() });
   runtimes.push(runtime);
   await runtime.ready;
@@ -199,8 +199,7 @@ it("journals every mutation from an authenticated client that never attached", a
       const request = { version: 1, clientId, requestId: `${clientId}-${op}`, op, payload };
       client.send(request);
       // This session does not exist, so each command fails on its own merits after acceptance.
-      expect(await client.next(), `${clientId} ${op}`).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "FAILED" } } });
-      expect(await runtime.commandStatus(request), `${clientId} ${op}`).toMatchObject({ clientId, requestId: request.requestId });
+      expect(await client.next(), `${clientId} ${op}`).toMatchObject({ ok: false, error: { code: expect.any(String) } });
     }
   }
   attached.close();
@@ -241,7 +240,7 @@ it("shares one daemon across two effective Pi config roots and rejects mutations
 
 it("forgets a session whose worker lease points at a dead process", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const now = "2026-08-25T12:00:00.000Z";
   const identity = { pid: 909, startIdentity: "90901", processGroupId: 909 };
   const sessionFile = join(stateRoot, "leased.jsonl");
@@ -262,14 +261,14 @@ it("forgets a session whose worker lease points at a dead process", async () => 
   client.send({ version: 1, clientId: "viewer", requestId: "attach-leased", op: "attach", payload: { sessionId: "leased" } });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
   client.send({ version: 1, clientId: "viewer", requestId: "forget-leased", op: "delete", payload: { sessionId: "leased", revision: 0 } });
-  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command" } });
   expect(await registry.get("leased")).toBeUndefined();
   client.close();
 });
 
 it("forgets a dead session without touching its Pi session file, and never resurrects it on attach", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const now = "2026-08-25T12:00:00.000Z";
   const sessionFile = join(stateRoot, "forgotten.jsonl");
   await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "forgotten", timestamp: now, cwd: stateRoot })}\n`, { mode: 0o600 });
@@ -287,7 +286,7 @@ it("forgets a dead session without touching its Pi session file, and never resur
   expect(launch).not.toHaveBeenCalled();
 
   client.send({ version: 1, clientId: "viewer", requestId: "forget", op: "delete", payload: { sessionId: "forgotten", revision: 0 } });
-  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command" } });
   expect(await registry.get("forgotten")).toBeUndefined();
   expect(await readFile(sessionFile, "utf8")).toContain("\"type\":\"session\"");
   client.close();
@@ -295,7 +294,7 @@ it("forgets a dead session without touching its Pi session file, and never resur
 
 it("marks a stopped session STOPPED rather than leaving it ready", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const now = "2026-08-25T12:00:00.000Z";
   const identity = { pid: 701, startIdentity: "77001", processGroupId: 701 };
   const piChild = { pid: 702, startIdentity: "77002", processGroupId: 701 };
@@ -324,7 +323,7 @@ it("marks a stopped session STOPPED rather than leaving it ready", async () => {
   if (current === undefined) throw new Error("stopping record missing");
   setTimeout(() => { workerAlive = false; }, 20);
   client.send({ version: 1, clientId: "viewer", requestId: "stop-request", op: "stop", payload: { sessionId: "stopping", revision: current.revision } });
-  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command" } });
 
   expect(await registry.get("stopping")).toMatchObject({ taskState: "STOPPED", processState: "EXITED", outcome: "NONE" });
   client.close();
@@ -332,7 +331,7 @@ it("marks a stopped session STOPPED rather than leaving it ready", async () => {
 
 it("repairs an abandoned launch to FAILED and leaves finished sessions untouched", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const registry = new RegistryStore(join(stateRoot, "sessions"));
   const now = "2026-08-25T12:00:00.000Z";
   await registry.create({ schemaVersion: 1, revision: 0, sessionId: "abandoned", sessionFile: "/sessions/abandoned.jsonl", canonicalSessionFile: "/sessions/abandoned.jsonl", cwd: "/repo", taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "launching", summary: "hello?", updatedAt: now }, createdAt: now, updatedAt: now });
@@ -365,7 +364,7 @@ it("repairs an abandoned launch to FAILED and leaves finished sessions untouched
 // start, and 18 MB of it had accumulated on the operator's machine.
 it("invalidates a list subscription after a durable change, carrying no payload and no position", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const registry = new RegistryStore(join(stateRoot, "sessions"));
   const now = "2026-08-25T12:00:00.000Z";
   await registry.create({ schemaVersion: 1, revision: 0, sessionId: "tinted", sessionFile: "/sessions/tinted.jsonl", canonicalSessionFile: "/sessions/tinted.jsonl", cwd: "/repo", taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "saved_session", summary: "Saved", updatedAt: now }, createdAt: now, updatedAt: now });
@@ -397,7 +396,7 @@ it("invalidates a list subscription after a durable change, carrying no payload 
 
 it("clears a stale WORKING session when the reconnected worker reports an idle Pi", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const identity = { pid: 601, startIdentity: "stale-worker", processGroupId: 601 };
   const piChild = { pid: 602, startIdentity: "stale-pi", processGroupId: 601 };
   const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === 601 ? identity : piChild;
@@ -415,7 +414,7 @@ it("clears a stale WORKING session when the reconnected worker reports an idle P
 
 it("marks a ready session working when the reconnected worker reports a streaming Pi", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const identity = { pid: 611, startIdentity: "resumed-worker", processGroupId: 611 };
   const piChild = { pid: 612, startIdentity: "resumed-pi", processGroupId: 611 };
   const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === 611 ? identity : piChild;
@@ -434,7 +433,7 @@ it("marks a ready session working when the reconnected worker reports a streamin
 
 it("summarizes sessions only after the opt-in model is chosen and reuses cached summaries", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const now = "2026-08-25T12:00:00.000Z";
   const sessionFile = join(stateRoot, "canonical.jsonl");
   await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "summary", timestamp: now, cwd: stateRoot })}\n${JSON.stringify({ type: "message", id: "user-1", parentId: null, timestamp: now, message: { role: "user", content: "fix the loader" } })}\n`, { mode: 0o600 });
@@ -474,7 +473,7 @@ it("summarizes sessions only after the opt-in model is chosen and reuses cached 
 
 it("keeps the worker connection when a concurrent record write loses the worker event a compare-and-swap", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const identity = { pid: 271, startIdentity: "worker-cas", processGroupId: 271 };
   const piChild = { pid: 272, startIdentity: "pi-cas", processGroupId: 271 };
   const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === 271 ? identity : piChild;
@@ -514,7 +513,7 @@ it("keeps the worker connection when a concurrent record write loses the worker 
 
 it("selects sessions to summarize without republishing a durable viewer snapshot", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const now = "2026-08-25T12:00:00.000Z";
   const sessionFile = join(stateRoot, "canonical.jsonl");
   await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "quiet", timestamp: now, cwd: stateRoot })}\n${JSON.stringify({ type: "message", id: "user-1", parentId: null, timestamp: now, message: { role: "user", content: "fix the loader" } })}\n`, { mode: 0o600 });
@@ -604,7 +603,7 @@ it("reaches a freshly launched worker over its adopted startup route before any 
   client.send({ version: 1, clientId: "viewer", requestId: "menu-fresh", op: "get_session_commands", payload: { sessionId: "fresh" } });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "session_commands", models: [{ provider: "anthropic", id: "claude" }] } });
   client.send({ version: 1, clientId: "viewer", requestId: "prompt-fresh", op: "prompt", payload: { sessionId: "fresh", text: "hello" } });
-  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command" } });
   // Every launch and steady-state message crossed one authenticated route, including the first prompt.
   expect(delivered.map((/** @type {any} */ entry) => entry.op)).toEqual(["prompt", "get_session_commands", "prompt"]);
   expect(new Set(delivered.map((/** @type {any} */ entry) => entry.token))).toEqual(new Set(["fresh-run-token"]));
@@ -613,7 +612,7 @@ it("reaches a freshly launched worker over its adopted startup route before any 
 
 it("refuses a session query and serves session toggles from the owning worker", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const identity = { pid: 431, startIdentity: "query-worker", processGroupId: 431 };
   const piChild = { pid: 432, startIdentity: "query-pi", processGroupId: 431 };
   const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === 431 ? identity : piChild;
@@ -642,7 +641,7 @@ it("refuses a session query and serves session toggles from the owning worker", 
 
   // The retry brake outlives the settings passthrough, and it is the only zero-argument variant left.
   client.send({ version: 1, clientId: "viewer", requestId: "abort-retry", op: "session_command", payload: { sessionId: "query", command: "abort_retry" } });
-  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command" } });
 
   // get_state is the daemon's own reconnect probe, not a frontend request.
   const delivered = worker.commands.filter((/** @type {any} */ command) => !["get_session_commands", "get_state"].includes(command.op));
@@ -651,11 +650,11 @@ it("refuses a session query and serves session toggles from the owning worker", 
   client.close();
 });
 
-// Operator-visible failure: a Pi that answers nothing left the request pending in the daemon with
-// no reply and no journal movement, so the dashboard showed a command that never finished.
-it("bounds a worker request that is never answered and records it as ambiguous", async () => {
+// Operator-visible failure: a Pi that answers nothing left the request pending in the daemon with no
+// reply at all, so the dashboard showed a command that never finished.
+it("bounds a worker request that is never answered and reports it as ambiguous", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const identity = { pid: 441, startIdentity: "silent-worker", processGroupId: 441 };
   const piChild = { pid: 442, startIdentity: "silent-pi", processGroupId: 441 };
   const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === 441 ? identity : piChild;
@@ -675,14 +674,46 @@ it("bounds a worker request that is never answered and records it as ambiguous",
   client.send({ version: 1, clientId: "viewer", requestId: "prompt-silent", op: "prompt", payload: { sessionId: "silent", text: "hello" } });
   const settled = await Promise.race([client.next(), new Promise((resolve) => setTimeout(() => resolve("stalled"), 3_000))]);
   // Ambiguous, never FAILED: the command's bytes may already have reached Pi.
-  expect(settled).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "DELIVERY_UNKNOWN" } } });
+  expect(settled).toMatchObject({ ok: false, error: { code: "DELIVERY_UNKNOWN" } });
   expect(worker.commands.filter((/** @type {any} */ command) => command.op === "prompt")).toHaveLength(1);
+  client.close();
+});
+
+// The worker's durable inbox is the acceptance boundary. The daemon records nothing about a command:
+// it routes it, waits for that worker's reply, and answers with the outcome. An outcome it cannot
+// attribute is one DELIVERY_UNKNOWN failure, not a stage a second request could come back for.
+it("answers a routed command with no durable stage and writes no command journal", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "runs"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const identity = { pid: 451, startIdentity: "inbox-worker", processGroupId: 451 };
+  const piChild = { pid: 452, startIdentity: "inbox-pi", processGroupId: 451 };
+  const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === 451 ? identity : piChild;
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const now = "2026-08-25T12:00:00.000Z";
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "inbox", sessionFile: "/sessions/inbox.jsonl", canonicalSessionFile: "/sessions/inbox.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-inbox", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-inbox", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "inbox", runId: "run-inbox", leaseId: "lease-inbox", generation: 1, identity, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  const runtime = await createDaemonRuntime({ root: stateRoot, inspect });
+  runtimes.push(runtime);
+  const worker = startPersistentFakeWorker({ socketPath: runtime.socketPath, tokenPath: runtime.tokenPath }, { sessionId: "inbox", runId: "run-inbox", leaseId: "lease-inbox", generation: 1, identity, piChildIdentity: piChild, token: "inbox-token", results: {} });
+  await runtime.ready;
+  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 8192 });
+  await client.ready;
+
+  client.send({ version: 1, clientId: "viewer", requestId: "prompt-inbox", op: "prompt", payload: { sessionId: "inbox", text: "hello" } });
+  const answered = /** @type {any} */ (await client.next());
+  expect(answered).toMatchObject({ ok: true, result: { kind: "command", sessionId: "inbox" } });
+  expect(Object.hasOwn(answered.result, "status")).toBe(false);
+  expect(worker.commands.filter((/** @type {any} */ command) => command.op === "prompt")).toHaveLength(1);
+
+  // Nothing durable names this command anywhere on the state root.
+  await expect(access(join(stateRoot, "queue"))).rejects.toMatchObject({ code: "ENOENT" });
+  await expect(access(join(stateRoot, "daemon", "launch-results.json"))).rejects.toMatchObject({ code: "ENOENT" });
   client.close();
 });
 
 it("discovers slash commands and delivers one session command to the owning worker", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const identity = { pid: 401, startIdentity: "menu-worker", processGroupId: 401 };
   const piChild = { pid: 402, startIdentity: "menu-pi", processGroupId: 401 };
   const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === 401 ? identity : piChild;
@@ -705,9 +736,9 @@ it("discovers slash commands and delivers one session command to the owning work
   expect(served).toMatchObject({ ok: true, result: { kind: "session_commands", sessionId: "menu", commands: menu.commands, models: menu.models, model: menu.model } });
   for (const key of ["thinkingLevels", "thinkingLevel"]) expect(Object.hasOwn(served.result, key), key).toBe(false);
   client.send({ version: 1, clientId: "viewer", requestId: "model-request", op: "session_command", payload: { sessionId: "menu", command: "set_model", model: { provider: "anthropic", id: "claude" } } });
-  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command" } });
   client.send({ version: 1, clientId: "viewer", requestId: "rename-request", op: "session_command", payload: { sessionId: "menu", command: "set_session_name", name: "Coverage loader" } });
-  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command" } });
   await vi.waitFor(async () => expect(await new RegistryStore(join(stateRoot, "sessions")).get("menu")).toMatchObject({ name: "Coverage loader" }));
   const delivered = worker.commands.filter((/** @type {any} */ command) => command.op !== "get_state");
   expect(delivered.map((/** @type {any} */ command) => command.op)).toEqual(["get_session_commands", "session_command", "session_command"]);
@@ -715,9 +746,9 @@ it("discovers slash commands and delivers one session command to the owning work
   expect(delivered[2].sessionCommand).toEqual({ command: "set_session_name", name: "Coverage loader" });
   client.close();
 });
-// Operator-visible failure: an attachment used to be a durable claim, journaled and stored, so one
+// Operator-visible failure: an attachment used to be a durable claim, recorded and stored, so one
 // dashboard opening a session both excluded the others and left 697 KB of attachment records behind.
-// It is connection state now: no journal entry, no artifact, no list invalidation, and no exclusion.
+// It is connection state now: no durable record, no artifact, no list invalidation, and no exclusion.
 it("opens one session on three connections at once, durably recording nothing", async () => {
   const stateRoot = await root();
   const runtime = await createDaemonRuntime({ root: stateRoot });
@@ -743,8 +774,7 @@ it("opens one session on three connections at once, durably recording nothing", 
   watcher.send({ version: 1, clientId: "watcher", requestId: "read", op: "get_state", payload: {} });
   expect(await watcher.next()).toMatchObject({ ok: true, requestId: "read", result: { kind: "state" } });
   await expect(access(join(stateRoot, "daemon", "attachment-results.jsonl"))).rejects.toMatchObject({ code: "ENOENT" });
-  const journal = await readFile(join(stateRoot, "queue", "commands.jsonl"), "utf8").catch(() => "");
-  expect(journal).toBe("");
+  await expect(access(join(stateRoot, "queue"))).rejects.toMatchObject({ code: "ENOENT" });
   watcher.close();
   for (const dashboard of dashboards) dashboard.close();
 });
@@ -822,7 +852,10 @@ it("publishes failed recovery status and removes lifecycle artifacts on close", 
   await expect(access(runtime.socketPath)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
-it("journals launch before the irreversible call and refuses ambiguous duplicate retry", async () => {
+// Row D of docs/command-acceptance.md: a launch that failed after the irreversible call reports its
+// own error and records nothing. Reissuing it is the operator's decision, so it reaches the
+// supervisor again rather than being answered from a durable stage.
+it("reports a failed launch once and never answers a reissue from a durable stage", async () => {
   const stateRoot = await root();
   let launches = 0;
   const runtime = await createDaemonRuntime({
@@ -841,10 +874,10 @@ it("journals launch before the irreversible call and refuses ambiguous duplicate
   const launch = { version: 1, clientId: "launcher", requestId: "exact-launch", op: "launch", payload: { prompt: "go", cwd: "/repo", sourceSessionId: "source", isolation: { mode: "worktree" } } };
   client.send(launch);
   expect(await client.next()).toMatchObject({ ok: false, error: { code: "LAUNCH_CRASH" } });
-  expect(await runtime.commandStatus(launch)).toMatchObject({ stage: "DELIVERY_UNKNOWN" });
   client.send(launch);
-  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "DELIVERY_UNKNOWN" } } });
-  expect(launches).toBe(1);
+  expect(await client.next()).toMatchObject({ ok: false, error: { code: "LAUNCH_CRASH" } });
+  expect(launches).toBe(2);
+  await expect(access(join(stateRoot, "queue"))).rejects.toMatchObject({ code: "ENOENT" });
   client.close();
 });
 
@@ -872,20 +905,16 @@ it("retains a visible failed session when startup is refused before a child exis
   client.send(launch);
   expect(await client.next()).toMatchObject({ ok: false, error: { code: "UNSUPPORTED_PI_CAPABILITY" } });
   expect(await new RegistryStore(join(stateRoot, "sessions")).get("prepared")).toMatchObject({ taskState: "FAILED", processState: "EXITED", activity: { kind: "launch_failed", summary: "unsupported" } });
-  expect(await runtime.commandStatus(launch)).toMatchObject({ stage: "FAILED", error: { code: "UNSUPPORTED_PI_CAPABILITY" } });
   client.close();
 });
 
-it("replays a durably terminal launch after deterministic response loss without relaunching", async () => {
+// Row D of docs/command-acceptance.md: the response is lost after the worker is already running.
+// The daemon records nothing, so it cannot answer a reissue with the session it already made. The
+// session it did make is in the list, which is where the operator sees he has one and stops.
+it("keeps the launched session and records nothing when its response is lost", async () => {
   const stateRoot = await root();
   let launches = 0;
   let loseFirstResponse = true;
-  /** @type {((value?: unknown) => void) | undefined} */
-  let responseReached;
-  /** @type {((value?: unknown) => void) | undefined} */
-  let releaseResponse;
-  const responseReachedPromise = new Promise((resolve) => { responseReached = resolve; });
-  const responseGate = new Promise((resolve) => { releaseResponse = resolve; });
   const workerIdentity = { pid: 701, startIdentity: "worker-701", processGroupId: 701 };
   const now = "2026-08-25T12:00:00.000Z";
   const runtime = await createDaemonRuntime({
@@ -909,8 +938,6 @@ it("replays a durably terminal launch after deterministic response loss without 
     responseWriter: async (/** @type {any} */ { request, value, write, close }) => {
       if (request.requestId !== "lost-launch-response" || !loseFirstResponse) return write(value);
       loseFirstResponse = false;
-      responseReached?.();
-      await responseGate;
       close();
       throw Object.assign(new Error("injected response loss"), { code: "SOCKET_CLOSED" });
     },
@@ -921,21 +948,12 @@ it("replays a durably terminal launch after deterministic response loss without 
   const firstClient = connect({ socketPath: runtime.socketPath, token: runtime.token });
   await firstClient.ready;
   firstClient.send(launch);
-  await responseReachedPromise;
-  const journalStages = (await readFile(join(stateRoot, "queue", "commands.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line).status.stage);
-  expect(journalStages).toEqual(["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED"]);
-  expect(await runtime.commandStatus(launch)).toMatchObject({ stage: "COMPLETED" });
-  expect(JSON.parse(await readFile(join(stateRoot, "daemon", "launch-results.json"), "utf8"))).toMatchObject({ results: { "launcher\u0000lost-launch-response": { sessionId: "launch-once" } } });
-  expect(launches).toBe(1);
-  /** @type {(value?: unknown) => void} */ (releaseResponse)();
   await firstClient.closed;
-
-  const retry = connect({ socketPath: runtime.socketPath, token: runtime.token });
-  await retry.ready;
-  retry.send(launch);
-  expect(await retry.next()).toMatchObject({ ok: true, result: { kind: "launched", sessionId: "launch-once" } });
   expect(launches).toBe(1);
-  retry.close();
+  // The row survives the lost answer, and nothing durable claims the launch was accepted.
+  expect(await new RegistryStore(join(stateRoot, "sessions")).get("launch-once")).toMatchObject({ sessionId: "launch-once", processState: "LIVE" });
+  await expect(access(join(stateRoot, "queue"))).rejects.toMatchObject({ code: "ENOENT" });
+  await expect(access(join(stateRoot, "daemon", "launch-results.json"))).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 it("refuses a launch naming a model Pi does not offer, before anything is prepared", async () => {
@@ -957,15 +975,14 @@ it("refuses a launch naming a model Pi does not offer, before anything is prepar
   // The model of the operator's saved draft: a provider and an id Pi never offered.
   const refused = { version: 1, clientId: "launcher", requestId: "unknown-model", op: "launch", payload: { prompt: "go", cwd: "/repo", sourceSessionId: "source", isolation: { mode: "worktree" }, model: { provider: "openai", id: "id" } } };
   client.send(refused);
-  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "FAILED", error: { code: "MODEL_UNKNOWN" } } } });
+  expect(await client.next()).toMatchObject({ ok: false, error: { code: "MODEL_UNKNOWN" } });
   // Nothing was prepared: the refusal precedes resolution, so there is no record, worktree, Pi file,
   // worker, list event, or row to clean up.
   expect(resolveLaunchRequest).not.toHaveBeenCalled();
   expect(launch).not.toHaveBeenCalled();
   expect(await new RegistryStore(join(stateRoot, "sessions")).list()).toEqual([]);
   await expect(access(join(stateRoot, "index", "events.jsonl"))).rejects.toMatchObject({ code: "ENOENT" });
-  expect((await readFile(join(stateRoot, "queue", "commands.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line).status.stage)).toEqual(["ACCEPTED", "FAILED"]);
-  expect(await runtime.commandStatus(refused)).toMatchObject({ stage: "FAILED", error: { code: "MODEL_UNKNOWN" } });
+  await expect(access(join(stateRoot, "queue"))).rejects.toMatchObject({ code: "ENOENT" });
 
   // A model Pi does offer passes the same check and reaches launch resolution.
   client.send({ version: 1, clientId: "launcher", requestId: "known-model", op: "launch", payload: { prompt: "go", cwd: "/repo", sourceSessionId: "source", isolation: { mode: "worktree" }, model: { provider: "openai-codex", id: "gpt-5.6-sol" } } });
@@ -1027,17 +1044,17 @@ it("waits for an admitted launch chain before lifecycle release", async () => {
   /** @type {(value?: unknown) => void} */ (releaseLaunch)();
   await closing;
   expect(closed).toBe(true);
-  const journalAfterClose = await readFile(join(stateRoot, "queue", "commands.jsonl"), "utf8");
+  const sessionsAfterClose = await new RegistryStore(join(stateRoot, "sessions")).list();
   const replacement = await createDaemonRuntime({ root: stateRoot });
   await replacement.ready;
   await replacement.close();
-  expect(await readFile(join(stateRoot, "queue", "commands.jsonl"), "utf8")).toBe(journalAfterClose);
+  expect(await new RegistryStore(join(stateRoot, "sessions")).list()).toEqual(sessionsAfterClose);
   client.close();
 });
 
 it("durably admits authenticated Pi frames while worker reconnect reconciliation is still active", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const identity = { pid: 251, startIdentity: "worker-early", processGroupId: 251 };
   const piChild = { pid: 252, startIdentity: "pi-early", processGroupId: 251 };
   const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === 251 ? identity : piChild;
@@ -1058,7 +1075,7 @@ it("durably admits authenticated Pi frames while worker reconnect reconciliation
 
 it("ingests Pi frames and keeps their order while a lifecycle operation holds the session lock", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const identity = { pid: 261, startIdentity: "worker-stream", processGroupId: 261 };
   const piChild = { pid: 262, startIdentity: "pi-stream", processGroupId: 261 };
   const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === 261 ? identity : piChild;
@@ -1102,7 +1119,7 @@ it("ingests Pi frames and keeps their order while a lifecycle operation holds th
 
 it("reconnects two surviving fake workers through the concrete connector after daemon restart", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const identities = new Map([
     [201, { pid: 201, startIdentity: "worker-one", processGroupId: 201 }],
     [211, { pid: 211, startIdentity: "pi-one", processGroupId: 201 }],
@@ -1131,7 +1148,7 @@ it("reconnects two surviving fake workers through the concrete connector after d
   frontend.send({ version: 1, clientId: "client", requestId: "attach-before-restart", op: "attach", payload: { sessionId: "one" } });
   expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
   frontend.send({ version: 1, clientId: "client", requestId: "before-restart", op: "prompt", payload: { sessionId: "one", text: "hello" } });
-  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command" } });
   frontend.close();
   await firstRuntime.close();
   expect(loops.map((loop) => [loop.pid, loop.alive])).toEqual([[201, true], [202, true]]);
@@ -1147,28 +1164,29 @@ it("reconnects two surviving fake workers through the concrete connector after d
   malformed.send({ version: 1, clientId: "client", requestId: "attach-malformed", op: "attach", payload: { sessionId: "one" } });
   expect(await malformed.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
   malformed.send({ version: 1, clientId: "client", requestId: "invalid-worker-result", op: "prompt", payload: { sessionId: "one", text: "invalid result" } });
-  expect(await malformed.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "DELIVERY_UNKNOWN" } } });
+  expect(await malformed.next()).toMatchObject({ ok: false, error: { code: "DELIVERY_UNKNOWN" } });
   malformed.close();
   const resumed = connect({ socketPath: secondRuntime.socketPath, token: secondRuntime.token });
   await resumed.ready;
   resumed.send({ version: 1, clientId: "client", requestId: "attach-resumed", op: "attach", payload: { sessionId: "two" } });
   expect(await resumed.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
   resumed.send({ version: 1, clientId: "client", requestId: "after-restart", op: "steer", payload: { sessionId: "two", text: "next" } });
-  expect(await resumed.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  expect(await resumed.next()).toMatchObject({ ok: true, result: { kind: "command" } });
   const beforeLostResponse = loops[1].commandCount;
   const lostResponse = { version: 1, clientId: "client", requestId: "lost-response", op: "prompt", payload: { sessionId: "two", text: "persist first" } };
   resumed.send(lostResponse);
   resumed.close();
-  // The socket died before the response, not before the work. Wait for the command the daemon is
-  // still finishing, so the retry below is a retry of a completed command rather than a race with it.
-  await vi.waitFor(async () => expect(await secondRuntime.commandStatus(lostResponse)).toMatchObject({ stage: "COMPLETED" }));
+  // The socket died before the response, not before the work. The daemon routes a reissue rather
+  // than answering it from a durable stage; refusing a second Pi write for one request identity is
+  // the owning worker's own inbox, proven against a real worker in runtime/worker.integration.test.mjs.
+  await vi.waitFor(() => expect(loops[1].commandCount).toBe(beforeLostResponse + 1));
   const retry = connect({ socketPath: secondRuntime.socketPath, token: secondRuntime.token });
   await retry.ready;
   retry.send({ version: 1, clientId: "client", requestId: "attach-retry", op: "attach", payload: { sessionId: "two" } });
   expect(await retry.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
   retry.send(lostResponse);
-  expect(await retry.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
-  expect(loops[1].commandCount).toBe(beforeLostResponse + 1);
+  expect(await retry.next()).toMatchObject({ ok: true, result: { kind: "command" } });
+  expect(loops[1].commandCount).toBe(beforeLostResponse + 2);
   expect(new Set(loops.flatMap((loop) => loop.commandIds)).size).toBe(loops.reduce((total, loop) => total + loop.commandIds.length, 0));
   retry.close();
   await secondRuntime.close();
@@ -1181,7 +1199,7 @@ it("reconnects two surviving fake workers through the concrete connector after d
 // ended the sessions. Adoption comes first, and the row says which worker is out of date.
 it("adopts live workers of every release and reports each one's release and route generation in its row", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const now = "2026-08-25T12:00:00.000Z";
   /** @type {Array<[string, string | undefined]>} */
   const releases = [["older", "1.9.0"], ["equal", "2.0.0"], ["newer", "2.1.0"], ["unknown", undefined]];
@@ -1244,7 +1262,7 @@ it("adopts live workers of every release and reports each one's release and rout
  */
 async function replaceableWorker({ sessionId, cliVersion, taskState, activityKind = "assistant_final", pendingRespawn }) {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const now = "2026-08-25T12:00:00.000Z";
   const identity = { pid: 401, startIdentity: "40100", processGroupId: 401 };
   const piChildIdentity = { pid: 402, startIdentity: "40200", processGroupId: 401 };
@@ -1333,7 +1351,7 @@ it("resumes a replacement its predecessor promised, after it has adopted that wo
  */
 async function burstReplaceableWorkers(sessionIds) {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const now = "2026-08-25T12:00:00.000Z";
   const registry = new RegistryStore(join(stateRoot, "sessions"));
   const workers = sessionIds.map((sessionId, index) => {
@@ -1437,7 +1455,7 @@ it.each(/** @type {Array<[string, import("../shared/contracts.mjs").TaskState, s
 
   frontend.send({ version: 1, clientId: "client", requestId: "respawn-busy", op: "respawn", payload: { sessionId: "guarded", revision: 0 } });
 
-  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { operation: "respawn", stage: "FAILED", error: { code: "SESSION_BUSY" } } } });
+  expect(await frontend.next()).toMatchObject({ ok: false, error: { code: "SESSION_BUSY" } });
   expect(live.signals).toEqual([]);
   expect(live.launches).toEqual([]);
   expect(live.diagnostics).toEqual([expect.objectContaining({ event: "respawn_refused", sessionId: "guarded", code: "SESSION_BUSY" })]);
@@ -1451,7 +1469,7 @@ it("replaces an idle worker of unknown release on request and refuses to downgra
   const newer = await replaceableWorker({ sessionId: "guarded", cliVersion: "2.1.0", taskState: "READY" });
   const newerFrontend = await openSession(newer.runtime, "guarded");
   newerFrontend.send({ version: 1, clientId: "client", requestId: "respawn-newer", op: "respawn", payload: { sessionId: "guarded", revision: 0 } });
-  expect(await newerFrontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "FAILED", error: { code: "WORKER_NEWER_THAN_DAEMON" } } } });
+  expect(await newerFrontend.next()).toMatchObject({ ok: false, error: { code: "WORKER_NEWER_THAN_DAEMON" } });
   expect(newer.signals).toEqual([]);
   expect(newer.launches).toEqual([]);
   // An idle newer worker is never replaced on its own either.
@@ -1467,7 +1485,7 @@ it("replaces an idle worker of unknown release on request and refuses to downgra
   const frontend = await openSession(unknown.runtime, "nameless");
   frontend.send({ version: 1, clientId: "client", requestId: "respawn-unknown", op: "respawn", payload: { sessionId: "nameless", revision: 0 } });
 
-  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { operation: "respawn", stage: "COMPLETED" } } });
+  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", sessionId: "nameless" } });
   expect(unknown.signals).toEqual([[unknown.identity.processGroupId, "SIGTERM"]]);
   expect(unknown.launches).toEqual(["nameless"]);
   frontend.close();
@@ -1476,7 +1494,7 @@ it("replaces an idle worker of unknown release on request and refuses to downgra
 
 it("colors a session across summary churn without a revision conflict", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const now = "2026-08-25T12:00:00.000Z";
   const sessionFile = join(stateRoot, "canonical.jsonl");
   await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "summary", timestamp: now, cwd: stateRoot })}\n${JSON.stringify({ type: "message", id: "user-1", parentId: null, timestamp: now, message: { role: "user", content: "fix the loader" } })}\n`, { mode: 0o600 });
@@ -1514,7 +1532,7 @@ it("colors a session across summary churn without a revision conflict", async ()
 
 it("repairs a session whose supervisor and Pi child are both gone and reaches READY", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const now = "2026-08-25T12:00:00.000Z";
   const identity = { pid: 701, startIdentity: "dead-supervisor", processGroupId: 701 };
   const piChild = { pid: 702, startIdentity: "dead-pi", processGroupId: 701 };
@@ -1537,7 +1555,7 @@ it("repairs a session whose supervisor and Pi child are both gone and reaches RE
 
 it("admits no second writer when a dead supervisor leaves a live Pi child", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const now = "2026-08-25T12:00:00.000Z";
   const identity = { pid: 711, startIdentity: "gone-supervisor", processGroupId: 711 };
   const piChild = { pid: 712, startIdentity: "live-pi", processGroupId: 711 };
@@ -1570,7 +1588,7 @@ it("admits no second writer when a dead supervisor leaves a live Pi child", asyn
 
 it("relaunches a stopped session whose recorded worker processes are both gone", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const now = "2026-08-25T00:00:00.000Z";
   const registry = new RegistryStore(join(stateRoot, "sessions"));
   await registry.create({ schemaVersion: 1, revision: 0, sessionId: "stopped", sessionFile: "/sessions/stopped.jsonl", canonicalSessionFile: "/sessions/stopped.jsonl", cwd: "/repo", taskState: "STOPPED", processState: "EXITED", outcome: "NONE", activity: { kind: "assistant_final", summary: "Saved", updatedAt: now }, latestRunId: "run-stopped", createdAt: now, updatedAt: now });
@@ -1603,7 +1621,7 @@ it("relaunches a stopped session whose recorded worker processes are both gone",
 
 it("records the model Pi actually selected so the list can show it", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const identity = { pid: 621, startIdentity: "modelled-worker", processGroupId: 621 };
   const piChild = { pid: 622, startIdentity: "modelled-pi", processGroupId: 621 };
   const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === 621 ? identity : piChild;
@@ -1647,7 +1665,7 @@ it("marks a launch failed when the worker dies before it is ready", async () => 
 
 it("refuses an activating attach while the recorded Pi child of a gone supervisor is alive", async () => {
   const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const now = "2026-08-25T00:00:00.000Z";
   const registry = new RegistryStore(join(stateRoot, "sessions"));
   await registry.create({ schemaVersion: 1, revision: 0, sessionId: "orphan-writer", sessionFile: "/sessions/orphan-writer.jsonl", canonicalSessionFile: "/sessions/orphan-writer.jsonl", cwd: "/repo", taskState: "STOPPED", processState: "EXITED", outcome: "NONE", activity: { kind: "assistant_final", summary: "Saved", updatedAt: now }, latestRunId: "run-orphan-writer", createdAt: now, updatedAt: now });
@@ -1820,13 +1838,19 @@ it("orders viewer frames across startup route adoption", async () => {
 
   // The snapshot covers everything ingested up to the moment the subscription opened, and nothing
   // published before it is retained anywhere, so this is the only place those frames can appear.
-  /** @type {any} */
-  let subscribed;
+  // The wait for ingestion runs on throwaway connections: a retry on this one would leave a second
+  // live subscription behind, and the live events below would then arrive twice.
+  const subscribe = { version: 1, clientId: "viewer", requestId: "ordered-subscription", op: "subscribe_viewer", payload: { sessionId: "ordered" } };
   await vi.waitFor(async () => {
-    client.send({ version: 1, clientId: "viewer", requestId: `ordered-${randomUUID()}`, op: "subscribe_viewer", payload: { sessionId: "ordered" } });
-    subscribed = await client.next();
-    expect(subscribed.result.snapshot.items).toHaveLength(3);
+    const probe = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 65536 });
+    await probe.ready;
+    probe.send({ ...subscribe, requestId: `ordered-probe-${randomUUID()}` });
+    const answer = /** @type {any} */ (await probe.next());
+    probe.close();
+    expect(answer.result.snapshot.items).toHaveLength(3);
   }, { timeout: 4_000 });
+  client.send(subscribe);
+  const subscribed = /** @type {any} */ (await client.next());
   expect(subscribed.result.snapshot.items.map((/** @type {any} */ item) => item.content[0].text)).toEqual([0, 1, 2].map((index) => `frame ${index}`));
 
   // And these two arrive over the adopted route, after the subscription: each crosses the seam once,
@@ -1882,7 +1906,7 @@ it("refuses a frontend that did not declare this release's client protocol, once
  * @param {string} stateRoot @param {string} sessionId
  */
 async function liveSessionRoot(stateRoot, sessionId) {
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const now = "2026-08-25T12:00:00.000Z";
   const identity = { pid: 811, startIdentity: "worker-shared", processGroupId: 811 };
   const piChildIdentity = { pid: 812, startIdentity: "pi-shared", processGroupId: 811 };
@@ -1902,7 +1926,7 @@ async function liveSessionRoot(stateRoot, sessionId) {
 
 // Operator-visible failure: one dashboard held the session's composer claim and every other one was
 // refused, so the second terminal could read the session and not answer it.
-it("orders and journals concurrent commands from three dashboard processes on one session", async () => {
+it("orders concurrent commands from three dashboard processes on one session", async () => {
   const stateRoot = await root();
   const { inspect, worker } = await liveSessionRoot(stateRoot, "shared");
   const runtime = await createDaemonRuntime({ root: stateRoot, inspect, reconnectTimeoutMs: 1_000 });
@@ -1919,16 +1943,14 @@ it("orders and journals concurrent commands from three dashboard processes on on
   // No attachment, claim, or grant precedes a mutation: every authenticated client may write.
   requests.forEach((request, index) => dashboards[index].send(request));
   const responses = await Promise.all(dashboards.map((dashboard) => dashboard.next()));
-  for (const response of responses) expect(response).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED", clientId: "installation-1" } } });
+  for (const response of responses) expect(response).toMatchObject({ ok: true, result: { kind: "command", sessionId: "shared" } });
 
-  const journal = (await readFile(join(stateRoot, "queue", "commands.jsonl"), "utf8")).split("\n").filter((line) => line.length > 0).map((line) => JSON.parse(line));
-  expect(new Set(journal.map((record) => record.status.clientId))).toEqual(new Set(["installation-1"]));
-  const journalOrder = [...new Set(journal.map((record) => record.status.requestId))];
-  expect(journalOrder.sort()).toEqual(["prompt-0", "prompt-1", "prompt-2"]);
-  // The per-session coordinator delivered them in exactly the order the journal accepted them. The
-  // worker also answers this daemon's own adoption probe, which is not a journaled client command.
-  const accepted = journal.filter((record) => record.status.stage === "ACCEPTED").map((record) => record.status.requestId);
-  expect(loop.commands.map((command) => command.requestId).filter((requestId) => requestId.startsWith("prompt-"))).toEqual(accepted);
+  // Every prompt reached the one worker that owns this session, once each, and its inbox is where
+  // each became durable. The worker also answers this daemon's own adoption probe, which is not a
+  // client command.
+  const delivered = loop.commands.map((command) => command.requestId).filter((requestId) => requestId.startsWith("prompt-"));
+  expect([...delivered].sort()).toEqual(["prompt-0", "prompt-1", "prompt-2"]);
+  await expect(access(join(stateRoot, "queue"))).rejects.toMatchObject({ code: "ENOENT" });
   for (const dashboard of dashboards) dashboard.close();
 });
 
@@ -1943,7 +1965,7 @@ it("leaves worker identity exactly as it was when the daemon restarts mid-sessio
   const before = connect({ socketPath: firstRuntime.socketPath, token: firstRuntime.token, attachId: "attach-before", maxBytes: 8192 });
   expect(await before.ready).toMatchObject({ version: 1, kind: "authenticated" });
   before.send({ version: 1, clientId: "installation-1", requestId: "before-restart", op: "prompt", payload: { sessionId: "resident", text: "before" } });
-  expect(await before.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  expect(await before.next()).toMatchObject({ ok: true, result: { kind: "command" } });
   before.close();
 
   // routeGeneration is the one field adoption is allowed to move; everything identifying the process is not.
@@ -1965,7 +1987,7 @@ it("leaves worker identity exactly as it was when the daemon restarts mid-sessio
   const after = connect({ socketPath: secondRuntime.socketPath, token: secondRuntime.token, attachId: "attach-after", maxBytes: 8192 });
   await after.ready;
   after.send({ version: 1, clientId: "installation-1", requestId: "after-restart", op: "prompt", payload: { sessionId: "resident", text: "after" } });
-  expect(await after.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  expect(await after.next()).toMatchObject({ ok: true, result: { kind: "command" } });
   after.close();
   await secondRuntime.close();
   runtimes.splice(runtimes.indexOf(secondRuntime), 1);

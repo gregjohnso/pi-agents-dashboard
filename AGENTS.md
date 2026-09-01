@@ -16,7 +16,7 @@ Record what you learn in the reference document in your own words. Do not copy A
 
 Copy it by default. Diverging needs a hard reason, meaning the alternative loses the operator's work, corrupts durable state, hides a failure from him, or Pi cannot support it. These are not reasons: it is not how we built it, it feels safer, or we already wrote the other version.
 
-Five divergences are deliberate and each has a hard reason. We keep a durable command journal with delivery stages, because terminal writes cannot express them. Our workers survive daemon absence indefinitely rather than a 60-second orphan timeout, because that timeout could end running work. Rows use structured state, never inference from terminal output or Pi's session file, because inference hides failures. `rm` forgets only the dashboard record and never touches Pi's canonical file or a worktree. The viewer reconstructs the session rather than hosting a pseudo-terminal, because Pi exposes no repaint, readiness, or detach channel.
+Four divergences are deliberate and each has a hard reason. Our workers survive daemon absence indefinitely rather than a 60-second orphan timeout, because that timeout could end running work. Rows use structured state, never inference from terminal output or Pi's session file, because inference hides failures. `rm` forgets only the dashboard record and never touches Pi's canonical file or a worktree. The viewer reconstructs the session rather than hosting a pseudo-terminal, because Pi exposes no repaint, readiness, or detach channel.
 
 ## Read before you change anything
 

@@ -11,7 +11,7 @@ import { createDashboardLayout, renderColumnHeader, wrapPromptDraft, } from "./d
 import { jobwatchTheme } from "./dashboard-theme.mjs";
 import { displaySessionState } from "./session-state.mjs";
 import { StopClearGesture } from "./stop-clear-gesture.mjs";
-import { destructiveAction, createChoiceOverlay, createCommandMenuOverlay, createDeliveryUnknownOverlay, createHelpOverlay, createMetadataOverlay, createPathCompletionOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, describeOverlay, filterChoiceOverlay, } from "./dashboard-overlays.mjs";
+import { destructiveAction, createChoiceOverlay, createCommandMenuOverlay, createHelpOverlay, createMetadataOverlay, createPathCompletionOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, describeOverlay, filterChoiceOverlay, } from "./dashboard-overlays.mjs";
 import { draftChoices, parseListCommand } from "./list-commands.mjs";
 import { applyCwdCompletion, cwdArgument, suggestDirectories, } from "./path-completion.mjs";
 import { createLaunchDraft, prepareLaunchRequest, } from "./launch-composer.mjs";
@@ -72,15 +72,6 @@ export function createDaemonDashboardBackend({ client, clientId, preflight, requ
             throw Object.assign(new Error(response.error.message), response.error);
         if (response.result.kind !== "command")
             throw Object.assign(new Error(`Daemon returned the wrong ${operation} result`), { code: "INVALID_RESPONSE" });
-        if (response.result.status.stage === "DELIVERY_UNKNOWN") {
-            throw Object.assign(new Error(`${operation === "stop" ? "Stop" : "Delete"} delivery is ambiguous`), { code: "DELIVERY_UNKNOWN", clientId: response.result.status.clientId, requestId: response.result.status.requestId });
-        }
-        if (response.result.status.stage === "FAILED") {
-            const error = response.result.status.error ?? { code: "COMMAND_FAILED", message: `${operation} failed`, retryable: false };
-            throw Object.assign(new Error(error.message), error);
-        }
-        if (response.result.status.stage !== "COMPLETED")
-            throw Object.assign(new Error(`${operation} ended in ${response.result.status.stage}`), { code: response.result.status.stage });
     };
     return {
         async getSnapshot() {
@@ -120,15 +111,6 @@ export function createDaemonDashboardBackend({ client, clientId, preflight, requ
                 return { kind: "rejected", error: daemonFailure(response) };
             if (response.result.kind === "launched")
                 return { kind: "launched", sessionId: response.result.sessionId };
-            if (response.result.kind === "command" && response.result.status.stage === "DELIVERY_UNKNOWN") {
-                return { kind: "delivery_unknown", clientId: response.result.status.clientId, requestId: response.result.status.requestId };
-            }
-            if (response.result.kind === "command") {
-                return {
-                    kind: "rejected",
-                    error: response.result.status.error ?? { code: response.result.status.stage, message: `Launch ended in ${response.result.status.stage}` },
-                };
-            }
             return { kind: "rejected", error: { code: "INVALID_RESPONSE", message: "Daemon returned the wrong launch result" } };
         },
         /** Every model the installed Pi will accept, for the launch composer's picker. */
@@ -147,11 +129,6 @@ export function createDaemonDashboardBackend({ client, clientId, preflight, requ
             if (response.result.kind !== "summaries_refreshing")
                 throw Object.assign(new Error("Daemon returned the wrong summary refresh result"), { code: "INVALID_RESPONSE" });
             return response.result.sessionIds;
-        },
-        async resolveDelivery(targetClientId, targetRequestId, resolution) {
-            const response = await request("resolve_delivery", { targetClientId, targetRequestId, resolution });
-            if (!response.ok)
-                throw Object.assign(new Error(response.error.message), response.error);
         },
         async stop(sessionId, revision, exactRequestId) {
             requireCompletedDestructive("stop", await requestDestructive("stop", sessionId, revision, exactRequestId));
@@ -700,13 +677,6 @@ export class DashboardController {
         this.overlay = undefined;
         await this.launch(prepared.request);
     }
-    async resolveUnknownDelivery(resolution) {
-        if (this.overlay?.kind !== "delivery_unknown")
-            return;
-        const { clientId, requestId } = this.overlay;
-        await this.backend.resolveDelivery(clientId, requestId, resolution);
-        this.overlay = undefined;
-    }
     /**
      * Ctrl+X stops a running session. A second press within the gesture window clears it, and a session
      * that is already stopped needs the same two presses, so one keystroke can never remove anything.
@@ -781,8 +751,6 @@ export class DashboardController {
                     if (current === undefined || destructiveAction(current) !== action)
                         throw error;
                     attemptRevision = current.revision;
-                    // The journal keys a command by request ID and refuses the same ID carrying a
-                    // different payload, so a re-aimed revision needs its own ID or it conflicts.
                     attemptRequestId = this.requestId();
                     await new Promise((resolve) => setTimeout(resolve, 25));
                 }
@@ -797,11 +765,10 @@ export class DashboardController {
                 this.status = { kind: "ready" };
         }
         catch (error) {
-            const typed = error;
-            if (typed.code === "DELIVERY_UNKNOWN")
-                this.overlay = createDeliveryUnknownOverlay(typed.clientId ?? this.clientId, typed.requestId ?? attemptRequestId);
-            else
-                this.setError(error, `${action.toUpperCase()}_FAILED`);
+            // An ambiguous destructive command is one error line, not a question. Nothing durable
+            // records it any more and nothing may retry it: the row's revision and process state are
+            // where the operator reads what happened.
+            this.setError(error, `${action.toUpperCase()}_FAILED`);
         }
         this.requestRender();
     }
@@ -1231,15 +1198,10 @@ export class DashboardController {
             this.requestRender?.();
             return;
         }
-        // A refused launch must hand the typed prompt back. The backend answers a FAILED command with
+        // A refused launch must hand the typed prompt back. The backend answers a refusal with
         // `rejected`, never `error`, so matching only `error` silently ate the draft on every refusal.
         if (outcome.kind === "error" || outcome.kind === "rejected")
             this.restoreDraft(request.prompt);
-        if (outcome.kind === "delivery_unknown") {
-            this.focus = "list";
-            this.overlay = createDeliveryUnknownOverlay(outcome.clientId, outcome.requestId);
-            return;
-        }
         this.status = { kind: "error", code: outcome.error.code, message: outcome.error.message };
     }
     renderOverlay(lines) {

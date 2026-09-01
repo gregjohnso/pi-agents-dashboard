@@ -31,23 +31,8 @@ const rmArgv = ["rm", "exact-session-id", "--revision", "4", "--yes"];
 const respawnArgv = ["respawn", "exact-session-id", "--revision", "4", "--yes"];
 const authenticated = { version: 1, kind: "authenticated", state: "READY", recovering: false, daemonEpoch: "epoch", pid: 1 };
 
-/** @param {string} operation @param {string} stage @param {string} clientId @param {string} requestId */
-function commandStatus(operation, stage, clientId, requestId) {
-  const at = "2026-08-25T12:00:00.000Z";
-  return { clientId, requestId, operation, stage, acceptedAt: at, updatedAt: at };
-}
-
-/** A destructive request the daemon never confirms, which leaves one pending record behind. */
-const ambiguousRequest = async (_op, _payload, requestId) => ({ kind: "command", status: { stage: "DELIVERY_UNKNOWN", clientId: "cli-stable", requestId } });
-const completedRequest = async (_op, _payload, requestId) => ({ kind: "command", status: { stage: "COMPLETED", clientId: "cli-stable", requestId } });
-
-/** Run one ambiguous Delete and return the single pending record it published. @param {string} root @param {any} [request] */
-async function pendingAfterAmbiguousDelete(root, request = ambiguousRequest) {
-  await runSessionCommand(rmArgv, { root, randomId: () => "stable", request });
-  const directory = join(root, "cli", "pending");
-  const [name] = (await readdir(directory)).filter((candidate) => candidate.endsWith(".json"));
-  return { directory, name, key: name.slice(0, -5), path: join(directory, name) };
-}
+/** A destructive command whose outcome the daemon could not attribute. */
+const ambiguousRequest = async () => { throw Object.assign(new Error("Daemon response was lost after submission"), { code: "DELIVERY_UNKNOWN" }); };
 
 async function daemonServer(root, respond, authentication = authenticated, { closeOnInputEnd = true } = {}) {
   const daemon = join(root, "daemon");
@@ -89,7 +74,7 @@ it("sends the exact revision-bound stop alone", async () => {
   const operations = [];
   const request = vi.fn(async (op, payload) => {
     operations.push([op, payload]);
-    return { kind: "command", status: { stage: "COMPLETED" } };
+    return { kind: "command", sessionId: "exact-session-id" };
   });
   await expect(runSessionCommand(stopArgv, { heldConnectionRequest: request, root })).resolves.toMatchObject({ code: 0 });
   expect(operations).toEqual([["stop", { sessionId: "exact-session-id", revision: 4 }]]);
@@ -130,30 +115,28 @@ it.each([
   expect(request).not.toHaveBeenCalled();
 });
 
-// rm is the operator's verb only. The daemon operation and the durable pending action keep the
-// spelling a running daemon and an earlier release already wrote, because both cross a boundary.
-it("sends rm as the delete operation and records delete as the pending action", async () => {
+// rm is the operator's verb only; the wire operation keeps the spelling a running daemon already
+// speaks. An ambiguous answer names the session and revision he can read the outcome from, and
+// writes nothing: the row's own revision is the record.
+it("sends rm as the delete operation and records nothing about the attempt", async () => {
   const root = await stateRoot();
   const request = vi.fn(ambiguousRequest);
-  await expect(runSessionCommand(rmArgv, { root, randomId: () => "stable", request })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN" } });
+  await expect(runSessionCommand(rmArgv, { root, randomId: () => "stable", request })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN", sessionId: "exact-session-id", revision: 4 } });
   expect(request.mock.calls[0][0]).toBe("delete");
-  const { path } = await pendingAfterAmbiguousDelete(root, request);
-  expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ action: "delete", sessionId: "exact-session-id", revision: 4 });
+  await expect(readdir(join(root, "cli", "pending"))).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 // respawn ends a worker's process group, so it takes the same convention as stop and rm: a full
-// identifier, an exact revision, and explicit confirmation, with its own durable pending action.
-it("sends the exact revision-bound respawn and records respawn as the pending action", async () => {
+// identifier, an exact revision, and explicit confirmation.
+it("sends the exact revision-bound respawn alone", async () => {
   const root = await stateRoot();
   const operations = [];
-  const request = vi.fn(async (op, payload, requestId) => {
+  const request = vi.fn(async (op, payload) => {
     operations.push([op, payload]);
-    return { kind: "command", status: { stage: "DELIVERY_UNKNOWN", clientId: "cli-stable", requestId } };
+    throw Object.assign(new Error("Daemon response was lost after submission"), { code: "DELIVERY_UNKNOWN" });
   });
   await expect(runSessionCommand(respawnArgv, { root, randomId: () => "stable", heldConnectionRequest: request })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN" } });
   expect(operations).toEqual([["respawn", { sessionId: "exact-session-id", revision: 4 }]]);
-  const [name] = (await readdir(join(root, "cli", "pending"))).filter((candidate) => candidate.endsWith(".json"));
-  expect(JSON.parse(await readFile(join(root, "cli", "pending", name), "utf8"))).toMatchObject({ action: "respawn", sessionId: "exact-session-id", revision: 4 });
 });
 
 it("reads every session row for agents without opening the list", async () => {
@@ -243,36 +226,6 @@ it("refuses cleanup when revision changes or live ownership appears", async () =
     cleanupManagedWorktree,
   })).resolves.toMatchObject({ code: 1, error: { code: "REVISION_CONFLICT" } });
   expect(cleanupManagedWorktree).not.toHaveBeenCalled();
-});
-
-it("fails closed rather than mixing a rotated CLI identity with a pending request ID", async () => {
-  const root = await stateRoot();
-  const request = vi.fn(async (_op, _payload, requestId) => ({ kind: "command", status: { stage: "DELIVERY_UNKNOWN", clientId: "cli-original", requestId } }));
-
-  await runSessionCommand(rmArgv, { request, root, randomId: () => "original" });
-  await writeFile(join(root, "cli", "client-id"), "cli-rotated\n", { mode: 0o600 });
-
-  await expect(runSessionCommand(rmArgv, { request, root })).rejects.toMatchObject({
-    code: "CLI_CLIENT_IDENTITY_CHANGED",
-    pendingClientId: "cli-original",
-    currentClientId: "cli-rotated",
-  });
-  expect(request).toHaveBeenCalledTimes(1);
-});
-
-it("persists and reuses an ambiguous destructive request identity until durable completion", async () => {
-  const root = await stateRoot();
-  const requestIds = [];
-  const request = vi.fn(async (_op, _payload, requestId) => {
-    requestIds.push(requestId);
-    return requestIds.length === 1
-      ? { kind: "command", status: { stage: "DELIVERY_UNKNOWN", clientId: "cli", requestId } }
-      : { kind: "command", status: { stage: "COMPLETED", clientId: "cli", requestId } };
-  });
-  await expect(runSessionCommand(rmArgv, { request, root })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN" } });
-  await expect(runSessionCommand(rmArgv, { request, root })).resolves.toMatchObject({ code: 0 });
-  expect(requestIds).toHaveLength(2);
-  expect(requestIds[1]).toBe(requestIds[0]);
 });
 
 it.each([
@@ -379,150 +332,28 @@ it.each([
 // The request reached the daemon and its answer was unusable, so the delete may already have run.
 it("classifies a destructive response that cannot be parsed as delivery unknown", async () => {
   const root = await stateRoot();
-  const server = await daemonServer(root, (socket, encoder, frame) => socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "command", status: { stage: "MYSTERY" } } })));
+  const server = await daemonServer(root, (socket, encoder, frame) => socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "command" } })));
   const requester = await createPersistentDaemonRequester({ root, clientId: "cli-stable", maxBytes: 4096, timeoutMs: 2_000 });
   await expect(requester.request("delete", { sessionId: "exact", revision: 1 }, "unparseable-request")).rejects.toMatchObject({ code: "DELIVERY_UNKNOWN", clientId: "cli-stable", requestId: "unparseable-request", submitted: true });
   await requester.close();
   await closeServer(server);
 });
 
-it("classifies an unvalidated delete response as delivery unknown and retains pending identity", async () => {
+// A command answer for another session is not this command's answer.
+it("refuses a command answer that names a different session", async () => {
   const root = await stateRoot();
-  const server = await daemonServer(root, (socket, encoder, frame) => socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "mystery" } })));
-  await expect(runSessionCommand(rmArgv, { root, randomId: () => "stable", timeoutMs: 200 })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN", clientId: "cli-stable", requestId: expect.any(String) } });
-  expect(await readdir(join(root, "cli", "pending"))).toHaveLength(1);
-  await closeServer(server);
-});
-
-it.each([
-  ["wrong operation", commandStatus("delete", "COMPLETED", "cli-stable", "strict-request")],
-  ["nonterminal stage", commandStatus("stop", "ACCEPTED", "cli-stable", "strict-request")],
-])("rejects command result with %s", async (_name, status) => {
-  const root = await stateRoot();
-  const frame = { version: 1, requestId: "strict-request", ok: true, result: { kind: "command", status } };
+  const frame = { version: 1, requestId: "strict-request", ok: true, result: { kind: "command", sessionId: "another-session" } };
   const server = await daemonServer(root, (socket, encoder) => socket.write(encoder.encode(frame)));
   const requester = createDaemonRequester({ root, clientId: "cli-stable", maxBytes: 4096, timeoutMs: 200 });
   await expect(requester("stop", { sessionId: "exact", revision: 1 }, "strict-request")).rejects.toMatchObject({ code: "UNEXPECTED_DAEMON_RESPONSE" });
   await closeServer(server);
 });
 
-it("publishes only complete pending winners while concurrent creators wait on the per-key lock", async () => {
+it("classifies an unvalidated delete response as delivery unknown", async () => {
   const root = await stateRoot();
-  let releasePublish;
-  const publishBlocked = new Promise((resolve) => { releasePublish = resolve; });
-  let enteredPublish;
-  const publishEntered = new Promise((resolve) => { enteredPublish = resolve; });
-  const requestIds = [];
-  const request = vi.fn(async (_op, _payload, requestId) => {
-    requestIds.push(requestId);
-    return { kind: "command", status: { stage: "DELIVERY_UNKNOWN", clientId: "cli-stable", requestId } };
-  });
-  const first = runSessionCommand(rmArgv, {
-    root,
-    randomId: () => "stable",
-    request,
-    pendingFailpoint: async (stage) => {
-      if (stage === "pending_before_publish") {
-        enteredPublish();
-        await publishBlocked;
-      }
-    },
-  });
-  await publishEntered;
-  const second = runSessionCommand(rmArgv, { root, randomId: () => "stable", request });
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  expect((await readdir(join(root, "cli", "pending"))).filter((name) => name.endsWith(".json"))).toEqual([]);
-  releasePublish();
-  await Promise.all([first, second]);
-  expect(new Set(requestIds).size).toBe(1);
-  const [name] = (await readdir(join(root, "cli", "pending"))).filter((candidate) => candidate.endsWith(".json"));
-  expect(JSON.parse(await readFile(join(root, "cli", "pending", name), "utf8"))).toMatchObject({ requestId: requestIds[0] });
-});
-
-it("restores and refuses a replacement raced into atomic pending clear", async () => {
-  const root = await stateRoot();
-  const { path } = await pendingAfterAmbiguousDelete(root);
-  const original = JSON.parse(await readFile(path, "utf8"));
-  let releaseClear;
-  const clearBlocked = new Promise((resolve) => { releaseClear = resolve; });
-  let enteredClear;
-  const clearEntered = new Promise((resolve) => { enteredClear = resolve; });
-  const completing = runSessionCommand(rmArgv, {
-    root,
-    request: completedRequest,
-    pendingFailpoint: async (stage) => {
-      if (stage === "pending_before_clear") {
-        enteredClear();
-        await clearBlocked;
-      }
-    },
-  });
-  await clearEntered;
-  const replacement = { ...original, requestId: "replacement-request" };
-  await rm(path);
-  await writeFile(path, `${JSON.stringify(replacement)}\n`, { mode: 0o600 });
-  releaseClear();
-  await expect(completing).rejects.toMatchObject({ code: "CLI_STATE_UNSAFE" });
-  expect(JSON.parse(await readFile(path, "utf8"))).toEqual(replacement);
-});
-
-it("recovers the exact atomic tombstone left by a crashed pending clearer", async () => {
-  const root = await stateRoot();
-  const requestIds = [];
-  const request = vi.fn(async (_op, _payload, requestId) => {
-    requestIds.push(requestId);
-    return { kind: "command", status: { stage: "DELIVERY_UNKNOWN", clientId: "cli-stable", requestId } };
-  });
-  const { directory, name, key, path } = await pendingAfterAmbiguousDelete(root, request);
-  await rename(path, join(directory, `.${key}.clear.crashed.tmp`));
-
-  await runSessionCommand(rmArgv, { root, randomId: () => "stable", request });
-
-  expect(requestIds[1]).toBe(requestIds[0]);
-  expect(await readFile(join(directory, name), "utf8")).toContain(requestIds[0]);
-  expect((await readdir(directory)).some((candidate) => candidate.includes(".clear."))).toBe(false);
-});
-
-it("recovers a dead exact pending lock holder before clearing", async () => {
-  const root = await stateRoot();
-  const { directory, key } = await pendingAfterAmbiguousDelete(root);
-  const lockPath = join(directory, `.${key}.lock`);
-  const token = "dead-token";
-  await mkdir(lockPath, { mode: 0o700 });
-  await writeFile(join(lockPath, token), `${JSON.stringify({ token, owner: { pid: 2147483647, startIdentity: "1" } })}\n`, { mode: 0o600 });
-
-  await expect(runSessionCommand(rmArgv, { root, request: completedRequest })).resolves.toMatchObject({ code: 0 });
-  expect((await readdir(directory)).filter((candidate) => candidate.endsWith(".json"))).toEqual([]);
-});
-
-it.each(["corrupt", "symlink"])("fails closed for %s pending state", async (kind) => {
-  const root = await stateRoot();
-  const { path } = await pendingAfterAmbiguousDelete(root);
-  if (kind === "corrupt") await writeFile(path, "not-json\n", { mode: 0o600 });
-  if (kind === "symlink") {
-    const target = join(root, "pending-target");
-    await writeFile(target, "{}\n", { mode: 0o600 });
-    await rm(path);
-    await symlink(target, path);
-  }
-  await expect(runSessionCommand(rmArgv, { root, request: ambiguousRequest })).rejects.toMatchObject({ code: expect.stringMatching(/^CLI_STATE_/u) });
-});
-
-it("resolves delivery only for exact full client/request IDs and clears abandoned pending state", async () => {
-  const root = await stateRoot();
-  let destructiveRequestId;
-  const request = vi.fn(async (op, payload, requestId) => {
-    if (op === "delete") {
-      destructiveRequestId = requestId;
-      return { kind: "command", status: { stage: "DELIVERY_UNKNOWN", clientId: "target-client-full", requestId } };
-    }
-    expect(payload).toEqual({ targetClientId: "target-client-full", targetRequestId: destructiveRequestId, resolution: "abandon" });
-    return { kind: "command", status: { stage: "FAILED", clientId: "target-client-full", requestId: destructiveRequestId } };
-  });
-  await runSessionCommand(rmArgv, { request, root });
-  await expect(runSessionCommand(["resolve-delivery", "target-client-full", destructiveRequestId, "abandon", "--yes"], { request, root })).resolves.toMatchObject({ code: 0 });
-  expect(request).toHaveBeenCalledTimes(2);
-  await expect(runSessionCommand(["resolve-delivery", "target", destructiveRequestId, "abandon", "--yes", "extra"], { request, root })).resolves.toMatchObject({ code: 2 });
+  const server = await daemonServer(root, (socket, encoder, frame) => socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "mystery" } })));
+  await expect(runSessionCommand(rmArgv, { root, randomId: () => "stable", timeoutMs: 200 })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN", sessionId: "exact-session-id" } });
+  await closeServer(server);
 });
 
 it("derives the destructive deadline from the daemon stop policy and never shortens it", async () => {

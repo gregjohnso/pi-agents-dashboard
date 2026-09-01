@@ -1,5 +1,5 @@
 import net from "node:net";
-import { mkdir, mkdtemp, readFile, readlink, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readlink, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -33,7 +33,7 @@ afterEach(async () => {
 async function fixtureRoot() {
   const root = await mkdtemp(join(tmpdir(), "dashboard-destructive-"));
   roots.push(root);
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(root, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(root, name), { mode: 0o700 });
   return root;
 }
 
@@ -85,7 +85,7 @@ function request(clientId, requestId, op, payload) {
   return { version: 1, clientId, requestId, op, payload };
 }
 
-it("journals Stop before exact-group escalation and leaves task/outcome independent", async () => {
+it("escalates Stop through the exact group and leaves task/outcome independent", async () => {
   const root = await fixtureRoot();
   const worker = { pid: 9101, startIdentity: "910100", processGroupId: 9101 };
   const sentinelPgid = 9202;
@@ -125,7 +125,7 @@ it("journals Stop before exact-group escalation and leaves task/outcome independ
   const frontend = connect(runtime);
   await frontend.next();
   frontend.send(request("client", "stop-request", "stop", { sessionId: session.sessionId, revision: 0 }));
-  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "DELIVERY_UNKNOWN" } } });
+  expect(await frontend.next()).toMatchObject({ ok: false, error: { code: "DELIVERY_UNKNOWN" } });
   expect(killRequested).toBe(true);
   expect(signals).toEqual([
     { pgid: worker.processGroupId, signal: "SIGTERM" },
@@ -135,16 +135,15 @@ it("journals Stop before exact-group escalation and leaves task/outcome independ
   const pending = await registry.get(session.sessionId);
   expect(pending).toMatchObject({ revision: 0, processState: "LIVE", taskState: "READY", outcome: "READY_FOR_REVIEW", ownership: { runId: "run-stop" } });
 
+  // Nothing to resolve and nothing to declare: the row never moved, so the same revision-guarded
+  // Stop is simply reissued, and this time the process group is provably gone.
   alive = false;
-  frontend.send(request("client", "resolve-stop", "resolve_delivery", { targetClientId: "client", targetRequestId: "stop-request", resolution: "retry_at_risk" }));
-  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "ACCEPTED" } } });
-  frontend.send(request("client", "stop-request", "stop", { sessionId: session.sessionId, revision: 0 }));
-  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { stage: "COMPLETED" } } });
+  frontend.send(request("client", "stop-retry", "stop", { sessionId: session.sessionId, revision: 0 }));
+  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", sessionId: session.sessionId } });
   const stopped = await registry.get(session.sessionId);
   expect(stopped).toMatchObject({ processState: "EXITED", taskState: "STOPPED", outcome: "READY_FOR_REVIEW" });
   expect(stopped.ownership).toBeUndefined();
-  const journal = await readFile(join(root, "queue", "commands.jsonl"), "utf8");
-  expect(journal.indexOf('"stage":"DELIVERY_ATTEMPTED"')).toBeLessThan(journal.lastIndexOf('"stage":"WORKER_ACKNOWLEDGED"'));
+  await expect(access(join(root, "queue"))).rejects.toMatchObject({ code: "ENOENT" });
   frontend.close();
   workerSocket.close();
 });
@@ -197,18 +196,17 @@ it("respawns a stale worker through the guarded destructive path and preserves t
   frontend.send(request("client", "no-revision", "respawn", { sessionId: session.sessionId }));
   expect(await frontend.next()).toMatchObject({ ok: false, error: { code: "REVISION_REQUIRED" } });
   frontend.send(request("client", "wrong-revision", "respawn", { sessionId: session.sessionId, revision: 7 }));
-  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "FAILED", error: { code: "REVISION_CONFLICT" } } } });
+  expect(await frontend.next()).toMatchObject({ ok: false, error: { code: "REVISION_CONFLICT" } });
   expect(signals).toEqual([]);
   expect(diagnostics).toEqual([expect.objectContaining({ event: "respawn_refused", sessionId: session.sessionId, code: "REVISION_CONFLICT" })]);
 
   frontend.send(request("client", "respawn-request", "respawn", { sessionId: session.sessionId, revision: 0 }));
-  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { operation: "respawn", stage: "COMPLETED" } } });
+  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", sessionId: session.sessionId } });
 
   expect(signals).toEqual([{ pgid: worker.processGroupId, signal: "SIGTERM" }]);
   expect(launches).toEqual(["respawn-target"]);
   expect(await readFile(session.canonicalSessionFile, "utf8")).toBe("session\n");
-  const journal = await readFile(join(root, "queue", "commands.jsonl"), "utf8");
-  expect(journal.indexOf('"stage":"DELIVERY_ATTEMPTED"')).toBeLessThan(journal.lastIndexOf('"stage":"WORKER_ACKNOWLEDGED"'));
+  await expect(access(join(root, "queue"))).rejects.toMatchObject({ code: "ENOENT" });
   frontend.close();
   workerSocket.close();
 });
@@ -259,7 +257,7 @@ it("shows a replacement as work in progress on the row and in the transcript", a
   await frontend.next();
 
   frontend.send(request("client", "visible-respawn-request", "respawn", { sessionId: session.sessionId, revision: 0 }));
-  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", status: { operation: "respawn", stage: "COMPLETED" } } });
+  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command", sessionId: session.sessionId } });
 
   expect(rowsWhileStarting).toHaveLength(1);
   const row = stripVTControlCharacters(renderSessionRow(rowsWhileStarting[0], createDashboardLayout(160, 40), { now: Date.parse("2026-08-25T12:00:10.000Z") }));
@@ -294,7 +292,7 @@ it("keeps stale ownership unresolved until exact terminal process evidence exist
   const frontend = connect(runtime);
   await frontend.next();
   frontend.send(request("client", "stale-stop-request", "stop", { sessionId: session.sessionId, revision: 0 }));
-  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "FAILED", error: { code: "STALE_IDENTITY" } } } });
+  expect(await frontend.next()).toMatchObject({ ok: false, error: { code: "STALE_IDENTITY" } });
   expect(await registry.get(session.sessionId)).toMatchObject({ processState: "LIVE", ownership: { runId: "run-stale", process: worker } });
   frontend.close();
   workerSocket.close();
@@ -322,7 +320,7 @@ it("gains no delete path from a supplied trash callback", async () => {
 
   expect(mutationAttempts()).toEqual([]);
   expect(trash).not.toHaveBeenCalled();
-  expect(response).toMatchObject({ result: { status: { stage: "COMPLETED" } } });
+  expect(response).toMatchObject({ ok: true, result: { kind: "command" } });
   await expect(readFile(session.canonicalSessionFile, "utf8")).resolves.toBe("session\n");
   expect(await registry.get(session.sessionId)).toBeUndefined();
   frontend.close();
@@ -347,7 +345,7 @@ it("refuses a revision-free Delete, a live one, and one another dashboard has op
   frontend.send(request("legacy-client", "legacy-delete", "delete", { sessionId: live.sessionId }));
   expect(await frontend.next()).toMatchObject({ ok: false, error: { code: "REVISION_REQUIRED" } });
   frontend.send(request("client", "live-delete-request", "delete", { sessionId: live.sessionId, revision: 0 }));
-  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "FAILED", error: { code: "SESSION_LIVE" } } } });
+  expect(await frontend.next()).toMatchObject({ ok: false, error: { code: "SESSION_LIVE" } });
   // Another dashboard has this row on screen. Every client may write, but Delete still refuses to
   // remove a session out from under one, because the row would vanish while it was being read.
   const other = connect(runtime, "frontend", "another-dashboard-process");
@@ -355,7 +353,7 @@ it("refuses a revision-free Delete, a live one, and one another dashboard has op
   other.send(request("client", "attach-observed", "attach", { sessionId: observed.sessionId }));
   expect(await other.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
   frontend.send(request("client", "attached-delete", "delete", { sessionId: observed.sessionId, revision: 0 }));
-  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "FAILED", error: { code: "SESSION_ATTACHED" } } } });
+  expect(await frontend.next()).toMatchObject({ ok: false, error: { code: "SESSION_ATTACHED" } });
   other.close();
 
   expect(mutationAttempts()).toEqual([]);
@@ -385,7 +383,7 @@ it("forgets a session the deleting dashboard still holds open on its own other c
   const transaction = connect(runtime, "frontend", "one-dashboard-process");
   await transaction.next();
   transaction.send(request("client", "same-process-delete", "delete", { sessionId: session.sessionId, revision: 0 }));
-  expect(await transaction.next()).toMatchObject({ result: { status: { stage: "COMPLETED" } } });
+  expect(await transaction.next()).toMatchObject({ ok: true, result: { kind: "command" } });
   expect(await registry.get(session.sessionId)).toBeUndefined();
   list.close();
   transaction.close();
@@ -408,14 +406,13 @@ it("forgets an inactive row and preserves the canonical Pi file and the worktree
   forbidMutationBeneath(session.canonicalSessionFile, worktreePath);
 
   frontend.send(request("client", "forget-inactive-request", "delete", { sessionId: session.sessionId, revision: 0 }));
-  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "COMPLETED" } } });
+  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command" } });
 
   expect(mutationAttempts()).toEqual([]);
   await expect(readFile(session.canonicalSessionFile, "utf8")).resolves.toBe("session\n");
   await expect(readFile(join(worktreePath, "src", "sentinel"), "utf8")).resolves.toBe("keep\n");
   expect(await registry.get(session.sessionId)).toBeUndefined();
-  const journal = await readFile(join(root, "queue", "commands.jsonl"), "utf8");
-  expect(journal.indexOf('"stage":"DELIVERY_ATTEMPTED"')).toBeLessThan(journal.lastIndexOf('"stage":"WORKER_ACKNOWLEDGED"'));
+  await expect(access(join(root, "queue"))).rejects.toMatchObject({ code: "ENOENT" });
   frontend.close();
 });
 
@@ -437,7 +434,7 @@ it("forgets a row whose canonical session file is a symlink without following or
   forbidMutationBeneath(linked.canonicalSessionFile, target);
 
   frontend.send(request("client", "linked-delete-request", "delete", { sessionId: linked.sessionId, revision: 0 }));
-  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "COMPLETED" } } });
+  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command" } });
 
   expect(mutationAttempts()).toEqual([]);
   expect(await readlink(linked.canonicalSessionFile)).toBe(target);
@@ -461,7 +458,7 @@ it("refuses Delete at a changed revision and keeps the row and its paths", async
   forbidMutationBeneath(session.canonicalSessionFile);
 
   frontend.send(request("client", "changed-revision-request", "delete", { sessionId: session.sessionId, revision: 0 }));
-  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "FAILED", error: { code: "REVISION_CONFLICT" } } } });
+  expect(await frontend.next()).toMatchObject({ ok: false, error: { code: "REVISION_CONFLICT" } });
 
   expect(mutationAttempts()).toEqual([]);
   await expect(readFile(session.canonicalSessionFile, "utf8")).resolves.toBe("session\n");
@@ -494,12 +491,12 @@ it("refuses Delete while stale worker metadata is authoritative and forgets once
   forbidMutationBeneath(session.canonicalSessionFile);
 
   frontend.send(request("client", "stale-metadata-request", "delete", { sessionId: session.sessionId, revision: 0 }));
-  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "FAILED", error: { code: "OWNERSHIP_CONFLICT" } } } });
+  expect(await frontend.next()).toMatchObject({ ok: false, error: { code: "OWNERSHIP_CONFLICT" } });
   expect(await registry.get(session.sessionId)).toBeDefined();
 
   alive = false;
   frontend.send(request("client", "stale-metadata-retry", "delete", { sessionId: session.sessionId, revision: 0 }));
-  expect(await frontend.next()).toMatchObject({ result: { status: { stage: "COMPLETED" } } });
+  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "command" } });
 
   expect(mutationAttempts()).toEqual([]);
   await expect(readFile(session.canonicalSessionFile, "utf8")).resolves.toBe("session\n");
@@ -538,7 +535,7 @@ it("refuses Delete while a relaunch of the same session is in flight", async () 
   activating.send(request("activating-client", "activate-attach", "attach", { sessionId: session.sessionId, activate: true }));
   await started;
   deleting.send(request("deleting-client", "relaunching-delete-request", "delete", { sessionId: session.sessionId, revision: 0 }));
-  expect(await deleting.next()).toMatchObject({ result: { status: { stage: "FAILED", error: { code: "OWNERSHIP_CONFLICT" } } } });
+  expect(await deleting.next()).toMatchObject({ ok: false, error: { code: "OWNERSHIP_CONFLICT" } });
 
   expect(mutationAttempts()).toEqual([]);
   await expect(readFile(session.canonicalSessionFile, "utf8")).resolves.toBe("session\n");

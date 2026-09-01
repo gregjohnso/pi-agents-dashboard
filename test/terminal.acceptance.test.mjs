@@ -41,7 +41,6 @@ class DashboardBackend {
   constructor(sessions) { this.snapshot = { sessions, cursor: nextCoverage() }; }
   stop = vi.fn(async () => {});
   delete = vi.fn(async () => {});
-  resolveDelivery = vi.fn(async () => {});
   setSessions(sessions) { this.snapshot = { sessions, cursor: nextCoverage() }; }
   async getSnapshot() { return this.snapshot; }
   async subscribeListChanges(onChanged, onError) { this.notifyListChanged = onChanged; this.onError = onError; return () => { this.unsubscribed = true; }; }

@@ -7,7 +7,6 @@ import { fileURLToPath } from "node:url";
 
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
-import { atomicWriteJson } from "./atomic-file.mjs";
 import { claimDaemonLifecycle, releaseDaemonLifecycle, updateDaemonLifecycleState } from "./daemon-lifecycle.mjs";
 import { createJsonlDecoder, createJsonlEncoder, JsonlFramingError } from "./jsonl.mjs";
 import { createLaunchResolver } from "./launch-resolver.mjs";
@@ -31,7 +30,8 @@ initializeRuntimePermissions();
 
 const DEFAULT_MAX_BYTES = 1024 * 1024;
 const WORKER_DELIVERED_COMMANDS = ["prompt", "steer", "follow_up", "interrupt", "ui_response", "session_command"];
-const DURABLE_COMMANDS = new Set([...WORKER_DELIVERED_COMMANDS, "stop", "delete", "respawn"]);
+/** Operations that change a session: routed to its worker, or acting on its record and its process. */
+const SESSION_MUTATIONS = new Set([...WORKER_DELIVERED_COMMANDS, "stop", "delete", "respawn"]);
 /** Stop dispositions that prove the signalled process group is gone. */
 const TERMINAL_STOP_DISPOSITIONS = ["ALREADY_EXITED", "GRACEFUL", "TERMINATED", "KILLED"];
 /** Release statuses whose worker this daemon replaces. A newer worker is never downgraded. */
@@ -81,6 +81,11 @@ function response(requestId, result) {
   return { version: 1, requestId, ok: true, result };
 }
 
+/** Refuse one operation with a code its caller can act on. @param {string} code @param {string} message @param {boolean} [retryable] */
+function refusal(code, message, retryable = false) {
+  return Object.assign(new Error(message), { code, retryable });
+}
+
 /** @param {string} requestId @param {any} error */
 function failure(requestId, error) {
   return { version: 1, requestId, ok: false, error: dashboardError(error?.code ?? "REQUEST_FAILED", error instanceof Error ? error.message : "Request failed", error?.retryable === true) };
@@ -91,7 +96,7 @@ async function ensureLayout(root) {
   await fs.mkdir(root, { recursive: true, mode: 0o700 });
   await fs.chmod(root, 0o700);
   await ensurePrivateDirectory(root);
-  for (const directory of ["daemon", "sessions", "queue", "runs", "index"]) await ensurePrivateDirectory(join(root, directory));
+  for (const directory of ["daemon", "sessions", "runs", "index"]) await ensurePrivateDirectory(join(root, directory));
 }
 
 /** @param {string} path */
@@ -126,40 +131,6 @@ async function privateText(path, create) {
 
 async function checkDefaultHost() {
   return { blockers: [], daemonOwnedStartup: true };
-}
-
-/** @param {string} path */
-async function createLaunchResultStore(path) {
-  /** @type {Record<string, { sessionId: string }>} */
-  let results = {};
-  try {
-    const value = JSON.parse(await fs.readFile(path, "utf8"));
-    if (value?.schemaVersion !== 1 || typeof value.results !== "object" || value.results === null || Array.isArray(value.results) || Object.keys(value).some((key) => !["schemaVersion", "results"].includes(key))) throw new TypeError("Launch result store is invalid");
-    for (const result of Object.values(value.results)) if (typeof result?.sessionId !== "string" || result.sessionId.length === 0 || Object.keys(result).some((key) => key !== "sessionId")) throw new TypeError("Launch result store is invalid");
-    results = value.results;
-  } catch (error) {
-    if (!(error instanceof Error) || /** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT") throw error;
-  }
-  let tail = Promise.resolve();
-  const key = (/** @type {any} */ request) => `${request.clientId}\0${request.requestId}`;
-  return {
-    /** @param {any} request */
-    get(request) { return results[key(request)]; },
-    /** @param {any} request @param {{ sessionId: string }} result */
-    put(request, result) {
-      const operation = tail.then(async () => {
-        const existing = results[key(request)];
-        if (existing !== undefined && existing.sessionId !== result.sessionId) throw Object.assign(new Error("Launch result conflicts with the durable request"), { code: "IDEMPOTENCY_CONFLICT" });
-        if (existing !== undefined) return existing;
-        results = { ...results, [key(request)]: result };
-        await atomicWriteJson(path, { schemaVersion: 1, results });
-        return result;
-      });
-      tail = operation.then(() => {}, () => {});
-      return operation;
-    },
-    async close() { await tail; },
-  };
 }
 
 /** @param {unknown} value @returns {string} */
@@ -618,7 +589,6 @@ export async function createDaemonRuntime({
       recovery: undefined,
       viewerRecovery: undefined,
       listSubscribers: new Set(),
-      launchResults: undefined,
       router,
       workerPending: new Map(),
       hostReport: undefined,
@@ -633,35 +603,28 @@ export async function createDaemonRuntime({
         usedCommandIds.add(id);
         return id;
       },
-      /** Send one command over an exact route, carrying the pending identity handleWorkerFrame checks the reply against. @param {any} route @param {string} id @param {any} durableRequest @param {Record<string, unknown>} [fields] */
-      sendWorkerCommand(route, id, durableRequest, fields = {}) {
+      /** Send one command over an exact route, carrying the pending identity handleWorkerFrame checks the reply against. @param {any} route @param {string} id @param {any} clientRequest @param {Record<string, unknown>} [fields] */
+      sendWorkerCommand(route, id, clientRequest, fields = {}) {
         const { metadata, connection, routeGeneration } = route;
-        const { clientId, requestId, op } = durableRequest;
+        const { clientId, requestId, op } = clientRequest;
         return connection.request(
           { version: 1, type: "command", token: metadata.token, id, command: { clientId, requestId, op, ...fields } },
-          { clientId, requestId, op, durableRequest, metadata, routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation },
+          { clientId, requestId, op, clientRequest, metadata, routeGeneration, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation },
         );
       },
-      /** Ask this session's worker one non-durable question over its adopted route. @param {any} request */
-      async askWorker(request) {
+      /**
+       * Route one command to the worker that owns this session and answer with that worker's reply.
+       *
+       * The daemon writes nothing durable here. The owning worker's replay log is the acceptance
+       * boundary: it records the operator's text before the Pi write, and it is the only thing that
+       * can say afterwards whether that write happened. A reply that never arrives, or a worker that
+       * cannot attribute one, reaches the caller as DELIVERY_UNKNOWN and never as a clean failure.
+       * @param {any} request @param {Record<string, unknown>} [fields]
+       */
+      async routeCommand(request, fields = {}) {
         const route = router.route(request.payload.sessionId);
-        if (route?.connection === undefined || route.metadata?.token === undefined) throw Object.assign(new Error("No exact recovered worker owns this session"), { code: "WORKER_UNAVAILABLE" });
-        return context.sendWorkerCommand(route, context.nextCommandId(), request);
-      },
-      /** Deliver one durable command over this session's adopted route. @param {any} request */
-      async deliverOverRoute(request) {
-        const route = router.route(request.payload.sessionId);
-        if (route?.connection === undefined || route.metadata?.token === undefined) throw Object.assign(new Error("No adopted worker route owns this session"), { code: "WORKER_UNAVAILABLE" });
-        const accepted = await context.recovery.journal.accept(request);
-        if (accepted.stage !== "ACCEPTED") return accepted;
-        await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
-        try {
-          await context.sendWorkerCommand(route, context.nextCommandId(), request, { text: request.payload.text });
-        } catch {
-          return context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
-        }
-        await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-        return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
+        if (route?.connection === undefined || route.metadata?.token === undefined) throw refusal("WORKER_UNAVAILABLE", "No adopted worker route owns this session");
+        return context.sendWorkerCommand(route, context.nextCommandId(), request, fields);
       },
       /**
        * Add this session's adopted worker to one public row, so a reader of `agents --json` can tell
@@ -722,9 +685,9 @@ export async function createDaemonRuntime({
        * boundary: the revision, the adopted route, both recorded process identities, the release, and
        * the idle state. The replacement runs to the same exact-identity signalling boundary Stop uses,
        * so nothing is signalled that is not still the process this session recorded.
-       * @param {string} sessionId @param {{ revision?: number, beforeSignal?: () => Promise<unknown> }} [options]
+       * @param {string} sessionId @param {{ revision?: number }} [options]
        */
-      async replaceStaleWorker(sessionId, { revision, beforeSignal = async () => {} } = {}) {
+      async replaceStaleWorker(sessionId, { revision } = {}) {
         /** @param {string} code @param {string} message */
         const refusal = (code, message) => Object.assign(new Error(message), { code });
         return router.runSession(sessionId, async (/** @type {any} */ { metadata, route, forget }) => {
@@ -743,7 +706,6 @@ export async function createDaemonRuntime({
           await router.markPendingRespawn(sessionId, metadata.runId);
           const announced = record.activity;
           await context.announceWorkerReplacement(record);
-          await beforeSignal();
           const disposition = await stopVerifiedProcessGroup(record.ownership.process, {
             inspect,
             requestGraceful: async () => { await route.connection.send({ version: 1, type: "shutdown", token: metadata.token }).catch(() => {}); },
@@ -1016,7 +978,7 @@ export async function createDaemonRuntime({
           if (frame.version !== 1 || typeof frame.id !== "string" || typeof frame.ok !== "boolean" || Object.keys(frame).some((key) => !allowed.includes(key))) throw Object.assign(new Error("Invalid worker command-result frame"), { code: "INVALID_WORKER_FRAME" });
           await router.runCurrent(metadata, connection, routeGeneration, async () => {
             const pending = context.workerPending.get(frame.id);
-            if (pending === undefined || pending.connection !== connection || pending.metadata !== metadata || pending.routeGeneration !== routeGeneration || pending.sessionId !== metadata.sessionId || pending.runId !== metadata.runId || pending.leaseId !== metadata.leaseId || pending.generation !== metadata.generation || pending.durableRequest?.clientId !== pending.clientId || pending.durableRequest?.requestId !== pending.requestId || pending.durableRequest?.op !== pending.op || pending.durableRequest?.payload?.sessionId !== pending.sessionId) return;
+            if (pending === undefined || pending.connection !== connection || pending.metadata !== metadata || pending.routeGeneration !== routeGeneration || pending.sessionId !== metadata.sessionId || pending.runId !== metadata.runId || pending.leaseId !== metadata.leaseId || pending.generation !== metadata.generation || pending.clientRequest?.clientId !== pending.clientId || pending.clientRequest?.requestId !== pending.requestId || pending.clientRequest?.op !== pending.op || pending.clientRequest?.payload?.sessionId !== pending.sessionId) return;
             if (frame.ok) validateWorkerSuccess(frame.record, pending);
             else validateWorkerFailure(frame.error);
             if (context.workerPending.get(frame.id) !== pending) return;
@@ -1078,7 +1040,7 @@ export async function createDaemonRuntime({
         if (previousTaskState !== "READY") context.scheduleUpgradeRespawn(metadata.sessionId, settled);
       },
       /** @param {any} request @param {{ socket: net.Socket, attachId: string | undefined } | undefined} connection @param {string} [authenticatedClientId] */
-      async handleRequest(request, connection, authenticatedClientId = request.clientId, duringRecovery = false) {
+      async handleRequest(request, connection, authenticatedClientId = request.clientId) {
         const socket = connection?.socket;
         const attachId = connection?.attachId;
         if (!context.admissionOpen) throw Object.assign(new Error("Daemon is shutting down"), { code: "SHUTTING_DOWN", retryable: true });
@@ -1104,7 +1066,7 @@ export async function createDaemonRuntime({
             return { kind: "session_colored", sessionId: updated.sessionId, revision: updated.revision, color: updated.color ?? null };
           }, "set_session_color");
         }
-        if (context.state !== "READY" && !duringRecovery) throw Object.assign(new Error(context.state === "FAILED" ? context.stateError?.message ?? "Daemon recovery failed" : "Daemon recovery is still in progress"), { code: context.state === "FAILED" ? context.stateError?.code ?? "RECOVERY_FAILED" : "RECOVERING", retryable: context.state !== "FAILED" });
+        if (context.state !== "READY") throw Object.assign(new Error(context.state === "FAILED" ? context.stateError?.message ?? "Daemon recovery failed" : "Daemon recovery is still in progress"), { code: context.state === "FAILED" ? context.stateError?.code ?? "RECOVERY_FAILED" : "RECOVERING", retryable: context.state !== "FAILED" });
         if (request.op === "subscribe_viewer") {
           if (socket === undefined) throw new TypeError("Viewer subscription requires a live socket");
           // The snapshot and the subscription are taken together, under this session's frame lock, so
@@ -1117,25 +1079,10 @@ export async function createDaemonRuntime({
           context.listSubscribers.add(socket);
           return { kind: "list_subscribed" };
         }
-        if (request.op === "resolve_delivery") {
-          const status = await context.recovery.journal.resolveDelivery({ clientId: request.payload.targetClientId, requestId: request.payload.targetRequestId }, request.payload.resolution);
-          context.notifyListChanged();
-          return { kind: "command", status };
-        }
         if (request.op === "launch") {
-          const accepted = await context.recovery.journal.accept(request);
-          const priorResult = context.launchResults.get(request);
-          if (accepted.stage === "COMPLETED" && priorResult !== undefined) return { kind: "launched", sessionId: priorResult.sessionId };
-          if (accepted.stage !== "ACCEPTED") return { kind: "command", status: accepted };
           context.hostReport ??= await hostProbe();
-          if (context.hostReport.blockers?.length > 0 || context.hostReport.daemonOwnedStartup === false) {
-            const status = await context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("UNSUPPORTED_HOST", "Pi host does not support daemon-owned product launch"));
-            return { kind: "command", status };
-          }
-          if (workerSupervisor === undefined || typeof resolveLaunchRequest !== "function") {
-            const status = await context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("LAUNCH_UNAVAILABLE", "Daemon launch resolver is unavailable"));
-            return { kind: "command", status };
-          }
+          if (context.hostReport.blockers?.length > 0 || context.hostReport.daemonOwnedStartup === false) throw refusal("UNSUPPORTED_HOST", "Pi host does not support daemon-owned product launch");
+          if (workerSupervisor === undefined || typeof resolveLaunchRequest !== "function") throw refusal("LAUNCH_UNAVAILABLE", "Daemon launch resolver is unavailable");
           const requestedModel = request.payload.model;
           if (requestedModel !== undefined) {
             /** @type {any[] | undefined} */
@@ -1151,11 +1098,9 @@ export async function createDaemonRuntime({
             // Admission runs before resolution, so a refused model leaves no record, Pi file, worktree,
             // worker, or row to clean up. The frontend picker is an earlier check, not this one.
             if (catalog !== undefined && !catalog.some((/** @type {any} */ model) => model.provider === requestedModel.provider && model.id === requestedModel.id)) {
-              const status = await context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("MODEL_UNKNOWN", `Pi does not offer ${requestedModel.provider}/${requestedModel.id}`));
-              return { kind: "command", status };
+              throw refusal("MODEL_UNKNOWN", `Pi does not offer ${requestedModel.provider}/${requestedModel.id}`);
             }
           }
-          await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
           /** @type {any} */
           let launch;
           try {
@@ -1176,8 +1121,7 @@ export async function createDaemonRuntime({
               } finally {
                 launchingSessions.delete(launch.sessionId);
               }
-              const persisted = await context.launchResults.put(request, { sessionId: handle.sessionId });
-              return { kind: "launched", sessionId: persisted.sessionId };
+              return { kind: "launched", sessionId: handle.sessionId };
             }, "launch");
             // The first prompt's reply arrives on the worker socket and is handled through the same
             // session lifecycle lock the launch holds, so it is delivered after that lock is released.
@@ -1189,33 +1133,23 @@ export async function createDaemonRuntime({
                 op: "prompt",
                 payload: { sessionId: launched.sessionId, text: launch.initialPrompt },
               };
-              const promptStatus = await context.deliverOverRoute(promptRequest);
-              if (promptStatus?.stage !== "COMPLETED") throw Object.assign(new Error(promptStatus?.error?.message ?? `Initial prompt ended in ${promptStatus?.stage ?? "an unknown state"}`), { code: promptStatus?.error?.code ?? promptStatus?.stage ?? "INITIAL_PROMPT_FAILED" });
+              await context.routeCommand(promptRequest, { text: launch.initialPrompt });
             }
-            // The launch journal stays short of COMPLETED until the first prompt is delivered.
-            await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-            await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
             return launched;
           } catch (error) {
             const launchError = /** @type {any} */ (error);
-            const current = await context.recovery.journal.get(request);
             // A worker that died before it was ready leaves no lease behind, so nothing owns this session
             // and the row must say the launch failed. Leaving it at STARTING makes the list lie for hours.
             const prepared = launch === undefined ? undefined : await registry.get(launch.sessionId);
-            const unowned = prepared !== undefined && prepared.ownership === undefined;
-            if (current?.stage === "DELIVERY_ATTEMPTED" && (launchError?.preChild === true || unowned) && launch !== undefined) {
-              if (prepared !== undefined) {
-                const updated = await registry.update(prepared.sessionId, prepared.revision, {
-                  taskState: "FAILED",
-                  processState: "EXITED",
-                  activity: { kind: "launch_failed", summary: error instanceof Error ? error.message : "Launch failed", updatedAt: new Date().toISOString() },
-                  updatedAt: new Date().toISOString(),
-                });
-                context.notifyListChanged();
-              }
-              await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-              await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "FAILED", dashboardError(launchError.code ?? "LAUNCH_FAILED", error instanceof Error ? error.message : "Launch failed"));
-            } else if (current?.stage === "DELIVERY_ATTEMPTED") await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
+            if ((launchError?.preChild === true || prepared?.ownership === undefined) && prepared !== undefined) {
+              const updated = await registry.update(prepared.sessionId, prepared.revision, {
+                taskState: "FAILED",
+                processState: "EXITED",
+                activity: { kind: "launch_failed", summary: error instanceof Error ? error.message : "Launch failed", updatedAt: new Date().toISOString() },
+                updatedAt: new Date().toISOString(),
+              });
+              context.notifyListChanged();
+            }
             throw error;
           }
         }
@@ -1225,62 +1159,43 @@ export async function createDaemonRuntime({
           return context.attachConnection(request, connection, authenticatedClientId);
         }
         if (request.op === "get_session_commands") {
-          const menu = (await context.askWorker(request))?.result ?? {};
+          const menu = (await context.routeCommand(request))?.result ?? {};
           return {
             kind: "session_commands", sessionId: request.payload.sessionId,
             commands: menu.commands ?? [], models: menu.models ?? [], model: menu.model ?? null,
           };
         }
-        if (!DURABLE_COMMANDS.has(request.op)) throw Object.assign(new Error(`Unsupported daemon operation: ${request.op}`), { code: "UNSUPPORTED_OPERATION" });
-        const accepted = await context.recovery.journal.accept(request);
-        let status = accepted;
-        const changed = accepted.stage === "ACCEPTED";
-        if (accepted.stage === "ACCEPTED") {
-          const route = router.route(request.payload.sessionId);
-          const connection = route?.connection;
-          const metadata = route?.metadata;
+        if (!SESSION_MUTATIONS.has(request.op)) throw refusal("UNSUPPORTED_OPERATION", `Unsupported daemon operation: ${request.op}`);
+        try {
           if (WORKER_DELIVERED_COMMANDS.includes(request.op)) {
-            if (connection === undefined || metadata?.token === undefined) {
-              status = await context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("WORKER_UNAVAILABLE", "No exact recovered worker owns this session"));
-            } else {
-              const id = context.nextCommandId();
-              await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
-              const retryAtRisk = (await context.recovery.journal.history(request)).some((/** @type {any} */ prior) => prior.stage === "DELIVERY_UNKNOWN");
-              try {
-                await context.sendWorkerCommand(route, id, request, { text: request.payload.text, response: request.op === "ui_response" ? { requestId: request.payload.uiRequestId, response: request.payload.response } : undefined, sessionCommand: request.op === "session_command" ? sessionCommandPayload(request.payload) : undefined, retryAtRisk });
-                await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-                status = await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
-              } catch (error) {
-                const deliveryError = /** @type {any} */ (error);
-                const current = await context.recovery.journal.get(request);
-                if (current?.stage !== "DELIVERY_ATTEMPTED") status = current;
-                else if (deliveryError?.delivered === true) {
-                  await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-                  status = await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "FAILED", dashboardError(deliveryError.code ?? "RPC_FAILED", deliveryError.message));
-                } else status = await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
-              }
+            await context.routeCommand(request, {
+              text: request.payload.text,
+              response: request.op === "ui_response" ? { requestId: request.payload.uiRequestId, response: request.payload.response } : undefined,
+              sessionCommand: request.op === "session_command" ? sessionCommandPayload(request.payload) : undefined,
+            });
+            if (request.op === "session_command" && request.payload.command === "set_session_name") {
+              await runSessionLifecycle(registry, request.payload.sessionId, async () => {
+                const current = await registry.get(request.payload.sessionId);
+                if (current === undefined || current.name === request.payload.name) return;
+                const updated = await registry.update(current.sessionId, current.revision, { name: request.payload.name, nameGenerated: false, updatedAt: new Date().toISOString() });
+                context.notifyListChanged();
+              }, "set_session_name");
             }
           } else if (request.op === "stop") {
-            const retryAtRisk = (await context.recovery.journal.history(request)).some((/** @type {any} */ prior) => prior.stage === "DELIVERY_UNKNOWN");
-            status = await router.runSession(request.payload.sessionId, async (/** @type {any} */ { metadata: lockedMetadata, route: lockedRoute, forget }) => {
+            await router.runSession(request.payload.sessionId, async (/** @type {any} */ { metadata: lockedMetadata, route: lockedRoute, forget }) => {
               const record = await registry.get(request.payload.sessionId);
-              if (record === undefined) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("SESSION_NOT_FOUND", "The exact session does not exist"));
-              const retryObservedTerminal = retryAtRisk && record.revision === request.payload.revision + 1 && record.ownership === undefined && record.processState === "EXITED";
-              if (record.revision !== request.payload.revision && !retryObservedTerminal) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("REVISION_CONFLICT", "Session revision changed before Stop"));
-              if (record.ownership === undefined || !["LIVE", "SLEEPING", "STALE"].includes(record.processState)) {
-                if (!retryAtRisk) return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("SESSION_NOT_ACTIVE", "Stop requires current authoritative ownership"));
-                await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
-                await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-                return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
-              }
+              if (record === undefined) throw refusal("SESSION_NOT_FOUND", "The exact session does not exist");
+              // The revision is the guard, and it is the whole guard: a Stop the operator reissues after
+              // an ambiguous answer is refused here, and the row he refused against says whether the
+              // first one landed.
+              if (record.revision !== request.payload.revision) throw refusal("REVISION_CONFLICT", "Session revision changed before Stop");
+              if (record.ownership === undefined || !["LIVE", "SLEEPING", "STALE"].includes(record.processState)) throw refusal("SESSION_NOT_ACTIVE", "Stop requires current authoritative ownership");
               if (lockedMetadata === undefined || lockedMetadata.runId !== record.ownership.runId || !sameProcessIdentity(lockedMetadata.identity, record.ownership.process)) {
-                return context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError("OWNERSHIP_CONFLICT", "Durable worker lease does not match the SessionRecord"));
+                throw refusal("OWNERSHIP_CONFLICT", "Durable worker lease does not match the SessionRecord");
               }
-              await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
               const exactRecord = await registry.get(request.payload.sessionId);
               if (exactRecord?.revision !== record.revision || exactRecord.ownership === undefined || !sameProcessIdentity(exactRecord.ownership.process, record.ownership.process)) {
-                await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-                return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "FAILED", dashboardError("OWNERSHIP_CONFLICT", "Ownership changed at the signaling boundary"));
+                throw refusal("OWNERSHIP_CONFLICT", "Ownership changed at the signaling boundary");
               }
               let disposition;
               try {
@@ -1290,20 +1205,16 @@ export async function createDaemonRuntime({
                   signalProcessGroup: signalProcessGroupImpl,
                   sleep: sleepImpl,
                 }, stopPolicy);
-              } catch (error) {
-                const current = await context.recovery.journal.get(request);
-                if (current?.stage === "DELIVERY_ATTEMPTED") return context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
-                throw error;
+              } catch (cause) {
+                throw Object.assign(new Error("Stop failed where it may already have signalled", { cause }), { code: "DELIVERY_UNKNOWN", retryable: false });
               }
-              const observedTerminal = TERMINAL_STOP_DISPOSITIONS.includes(disposition.disposition);
-              if (disposition.disposition === "KILL_REQUESTED" || disposition.signaled === true) {
-                return context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN");
-              }
+              // Signalled without proof of exit. The operator reads the row for the answer; nothing here
+              // guesses that the process group is gone.
+              if (disposition.disposition === "KILL_REQUESTED" || disposition.signaled === true) throw refusal("DELIVERY_UNKNOWN", `Stop signalled without proof of exit: ${disposition.disposition}`);
               if (["STALE_IDENTITY", "AMBIGUOUS_IDENTITY", "CANCELLED"].includes(disposition.disposition)) {
-                await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-                return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "FAILED", dashboardError(disposition.disposition, `Stop refused at exact identity boundary: ${disposition.disposition}`));
+                throw refusal(disposition.disposition, `Stop refused at exact identity boundary: ${disposition.disposition}`);
               }
-              if (observedTerminal) {
+              if (TERMINAL_STOP_DISPOSITIONS.includes(disposition.disposition)) {
                 const latest = await registry.get(request.payload.sessionId);
                 if (latest?.revision === exactRecord.revision && latest.ownership?.runId === exactRecord.ownership.runId) {
                   // Stop is a task-state verdict; a reviewable outcome the session already earned stays intact.
@@ -1313,71 +1224,44 @@ export async function createDaemonRuntime({
                 }
                 await forget();
               }
-              await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-              return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
             });
           } else if (request.op === "respawn") {
             try {
-              await context.replaceStaleWorker(request.payload.sessionId, {
-                revision: request.payload.revision,
-                beforeSignal: () => context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED"),
-              });
-              await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-              status = await context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
+              await context.replaceStaleWorker(request.payload.sessionId, { revision: request.payload.revision });
             } catch (error) {
               context.recordRespawnRefusal(request.payload.sessionId, error);
-              const respawnError = /** @type {any} */ (error);
-              const current = await context.recovery.journal.get(request);
-              // Past the signalling boundary this command cannot report a clean failure: the worker it
-              // signalled may already be gone, exactly as Stop reports its own ambiguity.
-              status = current?.stage === "DELIVERY_ATTEMPTED"
-                ? await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "DELIVERY_UNKNOWN")
-                : await context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError(respawnError?.code ?? "RESPAWN_FAILED", error instanceof Error ? error.message : "Respawn failed"));
+              throw error;
             }
-          } else if (request.op === "delete") {
-            status = await router.runSession(request.payload.sessionId, async (/** @type {any} */ { metadata: lockedMetadata, route: lockedRoute, forget }) => {
-              /** @param {string} code @param {string} message */
-              const refuse = (code, message) => context.recovery.journal.transition(request, ["ACCEPTED"], "FAILED", dashboardError(code, message));
+          } else {
+            await router.runSession(request.payload.sessionId, async (/** @type {any} */ { metadata: lockedMetadata, route: lockedRoute, forget }) => {
               const record = await registry.get(request.payload.sessionId);
-              if (record === undefined) return refuse("SESSION_NOT_FOUND", "The exact session does not exist");
-              if (record.revision !== request.payload.revision) return refuse("REVISION_CONFLICT", "Session revision changed before Delete");
-              if (record.ownership !== undefined || ["LIVE", "SLEEPING"].includes(record.processState)) return refuse("SESSION_LIVE", "Delete refuses a live or owned session");
+              if (record === undefined) throw refusal("SESSION_NOT_FOUND", "The exact session does not exist");
+              if (record.revision !== request.payload.revision) throw refusal("REVISION_CONFLICT", "Session revision changed before Delete");
+              if (record.ownership !== undefined || ["LIVE", "SLEEPING"].includes(record.processState)) throw refusal("SESSION_LIVE", "Delete refuses a live or owned session");
               // A lease whose worker process is provably gone cannot be authoritative; reclaim it instead of refusing forever.
               if (lockedMetadata !== undefined && lockedRoute === undefined && await processIsGone(lockedMetadata.identity, inspect)) {
                 await forget();
                 lockedMetadata = undefined;
               }
-              if (lockedMetadata !== undefined || lockedRoute !== undefined || launchingSessions.has(record.sessionId)) return refuse("OWNERSHIP_CONFLICT", "A worker lease, route, or launch is still authoritative");
+              if (lockedMetadata !== undefined || lockedRoute !== undefined || launchingSessions.has(record.sessionId)) throw refusal("OWNERSHIP_CONFLICT", "A worker lease, route, or launch is still authoritative");
               // Another dashboard has this row open, so removing it would empty a screen someone is
               // reading. One dashboard's own second connection is not another dashboard: a destructive
               // command travels on its own socket, and its list connection may still hold the session.
               const attached = attachedConnections.get(record.sessionId);
               const heldElsewhere = [...(attached ?? []).entries()].some(([candidate, held]) => candidate !== socket && (attachId === undefined || held.attachId !== attachId));
-              if (heldElsewhere) return refuse("SESSION_ATTACHED", "Delete refuses a session another dashboard has open");
+              if (heldElsewhere) throw refusal("SESSION_ATTACHED", "Delete refuses a session another dashboard has open");
               // Delete forgets the dashboard record and nothing else. Pi's canonical session file and any
               // managed worktree belong to the operator, so no path beneath either is ever mutated here.
-              await context.recovery.journal.transition(request, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
               await registry.remove(record.sessionId, record.revision);
-              await context.recovery.journal.transition(request, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-              return context.recovery.journal.transition(request, ["WORKER_ACKNOWLEDGED"], "COMPLETED");
             });
           }
+        } finally {
+          // Invalidate whatever the outcome, under this session's lifecycle lock so the invalidation
+          // cannot overtake a write the same lock is still making. A refused command may still have
+          // reclaimed a dead lease or signalled a process on its way to refusing.
+          await runSessionLifecycle(registry, request.payload.sessionId, async () => context.notifyListChanged(), "notify_list_changed");
         }
-        if (request.op === "session_command" && request.payload.command === "set_session_name" && status.stage === "COMPLETED") {
-          await runSessionLifecycle(registry, request.payload.sessionId, async () => {
-            const current = await registry.get(request.payload.sessionId);
-            if (current === undefined || current.name === request.payload.name) return;
-            const updated = await registry.update(current.sessionId, current.revision, { name: request.payload.name, nameGenerated: false, updatedAt: new Date().toISOString() });
-            context.notifyListChanged();
-          }, "set_session_name");
-        }
-        if (changed) {
-          // Notify under this session's lifecycle lock, so the invalidation cannot overtake a write
-          // the same lock is still making.
-          if (typeof request.payload?.sessionId === "string") await runSessionLifecycle(registry, request.payload.sessionId, async () => context.notifyListChanged(), "notify_list_changed");
-          else context.notifyListChanged();
-        }
-        return { kind: "command", status };
+        return { kind: "command", sessionId: request.payload.sessionId };
       },
     };
     const socketPath = join(daemonDirectory, "control.sock");
@@ -1418,13 +1302,7 @@ export async function createDaemonRuntime({
         context.recovery = reconcile === undefined ? await defaultReconcile() : await reconcile({ root, daemonEpoch, router, defaultReconcile, signal: recoveryController.signal });
         context.viewerRecovery = context.recovery.viewer;
         if (context.recovery.conflicts.length > 0) throw Object.assign(new Error("Worker ownership conflicts block daemon recovery"), { code: "OWNERSHIP_CONFLICT", conflicts: context.recovery.conflicts });
-        context.launchResults = await createLaunchResultStore(join(daemonDirectory, "launch-results.json"));
         if ((context.recovery.repairedSessions ?? []).length > 0) context.notifyListChanged();
-        for (const action of context.recovery.recoveryActions) {
-          // An attachment is connection-scoped state now, so a journal entry an earlier release wrote
-          // for one names a connection that no longer exists and is never redelivered.
-          if (action.action === "SAFE_REDELIVERY" && !["attach", "detach"].includes(action.command.op)) await context.handleRequest(action.command, undefined, action.command.clientId, true);
-        }
         context.state = "READY";
         await updateDaemonLifecycleState(claim, "READY");
         // A replacement an earlier daemon promised resumes only now, after its worker was adopted. A
@@ -1457,8 +1335,6 @@ export async function createDaemonRuntime({
       attachedFrontends() { return socketServer.sockets.size; },
       /** Workers whose supervisor and Pi child are still recorded as live. */
       liveWorkers() { return router.connectedSessionIds().length; },
-      /** @param {any} key */
-      async commandStatus(key) { await ready; return context.recovery.journal.get(key); },
       close() {
         if (closePromise !== undefined) return closePromise;
         closeState = "CLOSING";
@@ -1480,7 +1356,6 @@ export async function createDaemonRuntime({
           await cleanup(async () => { await Promise.allSettled([ready]); });
           await cleanup(() => socketServer.drainAndClose());
           await cleanup(async () => workerSupervisor?.close?.());
-          await cleanup(async () => context.launchResults?.close());
           await cleanup(async () => context.recovery?.close());
           await cleanup(() => releaseDaemonLifecycle(claim));
           closeState = errors.length === 0 ? "CLOSED" : "FAILED_CLOSED";

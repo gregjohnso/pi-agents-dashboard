@@ -55,7 +55,7 @@ function sessionRecord(root, sessionId, overrides = {}) {
 async function seedRoot(clientId) {
   const root = await mkdtemp(join(tmpdir(), "pi-agents-resync-acceptance-"));
   roots.push(root);
-  for (const directory of ["canonical", "daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(root, directory), { recursive: true, mode: 0o700 });
+  for (const directory of ["canonical", "daemon", "sessions", "runs", "index"]) await mkdir(join(root, directory), { recursive: true, mode: 0o700 });
   await writeFile(join(root, "daemon", "epoch"), `${EPOCH}\n`, { mode: 0o600 });
 
   const registry = new RegistryStore(join(root, "sessions"));

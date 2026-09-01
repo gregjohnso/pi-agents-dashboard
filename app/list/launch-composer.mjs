@@ -54,7 +54,7 @@ export function prepareLaunchRequest(draft, preflight, confirmation) {
     if (draft.name.trim() !== "") request.name = draft.name;
     return { kind: "ready", request };
 }
-/** Reduce composer focus and delivery states without performing transport effects. */
+/** Reduce composer focus and the prepared launch without performing transport effects. */
 export function reduceLaunchComposer(state, event) {
     switch (event.type) {
         case "focus":
@@ -66,19 +66,8 @@ export function reduceLaunchComposer(state, event) {
         case "submit": {
             const prepared = prepareLaunchRequest(state.draft, event.preflight, event.confirmation);
             return prepared.kind === "ready"
-                ? { ...state, focus: "list", launch: prepared.request, deliveryUnknown: undefined }
+                ? { ...state, focus: "list", launch: prepared.request }
                 : { ...state, launch: undefined };
         }
-        case "deliveryUnknown":
-            return {
-                ...state,
-                focus: "list",
-                launch: undefined,
-                deliveryUnknown: {
-                    clientId: event.clientId,
-                    requestId: event.requestId,
-                    actions: ["retry_at_risk", "abandon"],
-                },
-            };
     }
 }

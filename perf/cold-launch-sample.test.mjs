@@ -5,7 +5,7 @@ import { DOMINANCE_THRESHOLD, MINIMUM_MEDIAN_SAVING_MS, reduceSamples, sampleInt
 /** One complete set of stage instants, in epoch milliseconds. @param {Partial<Record<string, number>>} [overrides] */
 function timestamps(overrides = {}) {
   return {
-    journalAcceptedAt: 1_000,
+    launchRequestedAt: 1_000,
     workerSpawnedAt: 1_100,
     piChildSpawnedAt: 1_500,
     readyPersistedAt: 2_600,
@@ -43,12 +43,12 @@ it("fails a sample whose stages did not happen in launch order", () => {
 
 it("derives both decision intervals plus every per-stage interval", () => {
   expect(sampleIntervals(timestamps())).toEqual({
-    journalAcceptedToWorkerSpawnMs: 100,
+    launchRequestedToWorkerSpawnMs: 100,
     workerSpawnToPiChildSpawnMs: 400,
     piChildSpawnToReadyPersistedMs: 1_100,
     readyPersistedToFirstUsableSnapshotMs: 200,
     spawnThroughReadyMs: 1_500,
-    acceptanceToFirstUsableSnapshotMs: 1_800,
+    requestToFirstUsableSnapshotMs: 1_800,
   });
 });
 
@@ -60,12 +60,12 @@ it("emits a median and a 95th percentile for every interval", () => {
   expect(reduced.n).toBe(5);
   expect(reduced.intervals.spawnThroughReadyMs).toMatchObject({ medianMs: 2_300, p95Ms: 3_100, minMs: 1_500, maxMs: 3_100 });
   expect(Object.keys(reduced.intervals)).toEqual([
-    "journalAcceptedToWorkerSpawnMs",
+    "launchRequestedToWorkerSpawnMs",
     "workerSpawnToPiChildSpawnMs",
     "piChildSpawnToReadyPersistedMs",
     "readyPersistedToFirstUsableSnapshotMs",
     "spawnThroughReadyMs",
-    "acceptanceToFirstUsableSnapshotMs",
+    "requestToFirstUsableSnapshotMs",
   ]);
 });
 
@@ -88,7 +88,7 @@ it("proposes a spare only when spawn-through-ready dominates at median and p95 a
 
   // Spawn through ready is 90 percent of a 200 ms launch: dominant, but saves far less than a second.
   const tooSmall = reduceSamples([0, 10, 20].map((jitter) => sample({
-    journalAcceptedAt: 1_000,
+    launchRequestedAt: 1_000,
     workerSpawnedAt: 1_010,
     piChildSpawnedAt: 1_040,
     readyPersistedAt: 1_190 + jitter,

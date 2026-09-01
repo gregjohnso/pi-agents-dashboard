@@ -24,7 +24,7 @@ async function stateParent(sessionIds) {
   const parent = await harness.stateRoot("pi-agents-daemon-lifecycle-", [join(".pi", "agent")]);
   const previousRoot = join(parent, "pi-dashboard");
   const at = "2026-08-25T12:00:00.000Z";
-  for (const directory of ["canonical", "daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(previousRoot, directory), { recursive: true, mode: 0o700 });
+  for (const directory of ["canonical", "daemon", "sessions", "runs", "index"]) await mkdir(join(previousRoot, directory), { recursive: true, mode: 0o700 });
   for (const sessionId of sessionIds) {
     const canonicalSessionFile = join(previousRoot, "canonical", `${sessionId}.jsonl`);
     const record = {

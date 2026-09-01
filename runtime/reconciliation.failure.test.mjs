@@ -1,10 +1,8 @@
-import { appendFile, mkdtemp, mkdir, readFile, readdir, readlink, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, readlink, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createHash } from "node:crypto";
 import { afterEach, expect, it } from "vitest";
 
-import { createCommandJournal } from "./command-journal.mjs";
 import { RegistryStore } from "./registry-store.mjs";
 import { RecoveredWorkerRouter, reconcileRuntime } from "./reconciliation.mjs";
 
@@ -38,52 +36,31 @@ function record(sessionId, identity) {
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "dashboard-recovery-"));
   roots.push(root);
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(root, name), { mode: 0o700 });
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(root, name), { mode: 0o700 });
   return root;
 }
 
-it("reopens truncated stores and converts unresolved delivery to DELIVERY_UNKNOWN", async () => {
+// Operator-visible failure: a crash tears whatever the daemon was appending. This release appends
+// no command journal and no list history, so recovery must read neither and recreate neither, and a
+// torn copy of either from an earlier release must not stop a daemon from starting.
+it("starts over a torn command journal and list history without reading or rewriting either", async () => {
   const root = await fixture();
+  await mkdir(join(root, "queue"), { mode: 0o700 });
   const journalPath = join(root, "queue", "commands.jsonl");
-  const journal = await createCommandJournal({ path: journalPath });
-  const command = /** @type {import("../shared/contracts.mjs").ClientRequest} */ ({ version: 1, clientId: "client", requestId: "request", op: "prompt", payload: { sessionId: "one", text: "hello" } });
-  await journal.accept(command);
-  await journal.transition(command, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
-  await journal.close();
-  await writeFile(join(root, "runs", "worker-replay.jsonl"), `${JSON.stringify({ clientId: "client", requestId: "request", op: "prompt", stage: "RECEIVED", at: "2026-08-25T12:00:00.000Z" })}\n`, { mode: 0o600 });
-  await appendFile(journalPath, "{\"torn\":");
-
-  // A retired list history, torn by the same crash. Recovery must neither read it nor recreate it.
+  const journal = `${JSON.stringify({ commandCanonical: "{}", command: { version: 1, clientId: "client", requestId: "request", op: "prompt", payload: { sessionId: "one", text: "hello" } }, status: { clientId: "client", requestId: "request", operation: "prompt", stage: "DELIVERY_ATTEMPTED", acceptedAt: "2026-08-25T12:00:00.000Z", updatedAt: "2026-08-25T12:00:00.000Z" } })}\n{"torn":`;
+  await writeFile(journalPath, journal, { mode: 0o600 });
   const eventPath = join(root, "index", "events.jsonl");
   const retired = `${JSON.stringify({ version: 1, cursor: { daemonEpoch: "epoch", sequence: "1" }, occurredAt: "2026-08-25T12:00:00.000Z", kind: "attachment_changed", payload: { sessionId: "one", clientId: "client", role: "observer", attached: true } })}\n{"torn":`;
   await writeFile(eventPath, retired, { mode: 0o600 });
 
-  const recovered = await reconcileRuntime({ root, daemonEpoch: "epoch", inspect: async () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); }, waitForReconnect: async () => [] });
-  expect(await recovered.journal.get(command)).toMatchObject({ stage: "DELIVERY_UNKNOWN" });
-  expect(recovered.recoveryActions).toContainEqual(expect.objectContaining({ clientId: "client", requestId: "request", sessionId: "one", action: "DELIVERY_AMBIGUOUS" }));
+  const gone = async () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); };
+  const recovered = await reconcileRuntime({ root, daemonEpoch: "epoch", inspect: gone, waitForReconnect: async () => [] });
+  expect(/** @type {any} */ (recovered).journal).toBeUndefined();
   await recovered.close();
-  const secondRecovery = await reconcileRuntime({ root, daemonEpoch: "epoch", inspect: async () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); } });
-  expect(await secondRecovery.journal.get(command)).toMatchObject({ stage: "DELIVERY_UNKNOWN" });
+  const secondRecovery = await reconcileRuntime({ root, daemonEpoch: "epoch", inspect: gone });
   await secondRecovery.close();
+  expect(await readFile(journalPath, "utf8")).toBe(journal);
   expect(await readFile(eventPath, "utf8")).toBe(retired);
-});
-
-it("redelivers only ACCEPTED commands and never acknowledged or worker-local RECEIVED attempts", async () => {
-  const root = await fixture();
-  const journal = await createCommandJournal({ path: join(root, "queue", "commands.jsonl") });
-  const accepted = /** @type {import("../shared/contracts.mjs").ClientRequest} */ ({ version: 1, clientId: "client", requestId: "accepted", op: "prompt", payload: { sessionId: "one", text: "safe" } });
-  const acknowledged = /** @type {import("../shared/contracts.mjs").ClientRequest} */ ({ ...accepted, requestId: "acknowledged", payload: { ...accepted.payload, text: "done" } });
-  await journal.accept(accepted);
-  await journal.accept(acknowledged);
-  await journal.transition(acknowledged, ["ACCEPTED"], "DELIVERY_ATTEMPTED");
-  await journal.transition(acknowledged, ["DELIVERY_ATTEMPTED"], "WORKER_ACKNOWLEDGED");
-  await journal.close();
-  const recovered = await reconcileRuntime({ root, daemonEpoch: "epoch", inspect: async () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); } });
-  expect(recovered.recoveryActions.map(({ clientId, requestId, sessionId, action }) => ({ clientId, requestId, sessionId, action }))).toEqual([
-    { clientId: "client", requestId: "accepted", sessionId: "one", action: "SAFE_REDELIVERY" },
-    { clientId: "client", requestId: "acknowledged", sessionId: "one", action: "NO_REDELIVERY" },
-  ]);
-  await recovered.close();
 });
 
 it("validates the authoritative Pi child and invalidates frames from replaced routes", async () => {

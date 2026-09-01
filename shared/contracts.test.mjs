@@ -29,7 +29,6 @@ const acceptedRequests = [
   ["respawn", { sessionId: "session", revision: 2 }],
   ["subscribe_list_changes", {}],
   ["subscribe_viewer", { sessionId: "session" }],
-  ["resolve_delivery", { targetClientId: "client", targetRequestId: "request", resolution: "abandon" }],
   ["get_session_commands", { sessionId: "session" }],
   ["get_settings", {}],
   ["set_settings", { summaryModel: { provider: "anthropic", id: "haiku" } }],
@@ -74,6 +73,9 @@ const rejectedRequests = [
   ["the retired list subscription", "subscribe", {}, /operation/iu],
   ["a retired list subscription resuming from a cursor", "subscribe", { after: { daemonEpoch: "epoch", sequence: "2" } }, /operation/iu],
   ["the retired list acknowledgement", "ack", { cursor: { daemonEpoch: "epoch", sequence: "2" } }, /operation/iu],
+  // There is no daemon-side command journal, so there is no stage to resolve. An unattributable
+  // outcome is reported once, as a DELIVERY_UNKNOWN failure, and the operator reissues.
+  ["the retired delivery resolution", "resolve_delivery", { targetClientId: "client", targetRequestId: "request", resolution: "abandon" }, /operation must be one of/u],
 ];
 
 const sessionRecord = { schemaVersion: 1, revision: 1, sessionId: "s", sessionFile: "/s.jsonl", canonicalSessionFile: "/s.jsonl", cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "idle", summary: "Idle", updatedAt: "2026-01-01T00:00:00.000Z" }, summary: { text: "Refactored the loader and ran tests", generatedAt: "2026-01-01T00:00:00.000Z", model: { provider: "anthropic", id: "haiku" }, sourceCursor: "42" }, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" };
@@ -102,7 +104,7 @@ const acceptedResponses = [
   ["session state carrying the daemon's coverage cursor", ok({ kind: "state", sessions: [sessionRecord], cursor: { daemonEpoch: "epoch", sequence: "6778" } })],
   ["session state reporting one adopted worker's release and route generation", ok({ kind: "state", sessions: [{ ...sessionRecord, workerCliVersion: "1.4.2", stale: false, routeGeneration: 3 }], cursor: coverage })],
   ["session state reporting an adopted worker whose release is unknown", ok({ kind: "state", sessions: [{ ...sessionRecord, stale: true, routeGeneration: 1 }], cursor: coverage })],
-  ["a respawn command status", ok({ kind: "command", status: { clientId: "client", requestId: "request", operation: "respawn", stage: "COMPLETED", acceptedAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" } })],
+  ["a respawn acknowledgement", ok({ kind: "command", sessionId: "session" })],
   ["the installed Pi's model catalog", ok(modelCatalog)],
   // One answer opens the stream and carries the snapshot it continues, because nothing is retained
   // that a second request could replay from.
@@ -137,6 +139,10 @@ const rejectedResponses = [
   ["unknown field on a failure", { version: 1, requestId: "request", ok: false, error: { code: "DENIED", message: "denied", retryable: false }, unknown: true }, /unknown/iu],
   ["a viewer subscription without the snapshot it continues", ok({ kind: "viewer_subscribed", cursor: viewerCursor }), /snapshot is required/u],
   ["a retired separate snapshot read", ok({ kind: "viewer_snapshot", snapshot: viewerSnapshot }), /kind/iu],
+  // A command answer says which session it belongs to and nothing else. The delivery stage it used
+  // to carry named a daemon-side journal record that no longer exists.
+  ["a command answer carrying a durable delivery stage", ok({ kind: "command", sessionId: "session", status: { clientId: "client", requestId: "request", operation: "respawn", stage: "COMPLETED", acceptedAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" } }), /unknown/iu],
+  ["a command answer without its session", ok({ kind: "command" }), /sessionId is required/u],
 ];
 
 describe("command contracts", () => {

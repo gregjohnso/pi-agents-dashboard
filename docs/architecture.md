@@ -30,6 +30,16 @@ The worker owns Pi's stdin, stdout, and stderr pipes. Pi treats the RPC stdin pi
 
 The daemon may exit without stopping a worker. The worker remains Pi's parent and reconnects through [`maintainDaemonConnection`](../runtime/worker.mjs). Closing the frontend or restarting the daemon therefore does not make Pi depend on a terminal or daemon socket.
 
+## The daemon runs on demand
+
+There is no resident daemon. [`createIdleExit`](../runtime/idle-exit.mjs) ends one that has had nothing to do for [`DEFAULT_IDLE_EXIT_MS`](../runtime/idle-exit.mjs), 30 seconds, and `--idle-exit-ms` or `PI_AGENTS_IDLE_EXIT_MS` selects another window. Zero keeps the daemon resident and now has to be asked for; a value that cannot be read refuses the start rather than silently staying up forever. A dashboard, or any command that needs a daemon, starts one through [`runDaemonCommand`](../cli/daemon-commands.mjs) and finds the current build rather than whatever build a long-lived process loaded.
+
+Idle is decided by `idleHold` in [`runtime/daemon.mjs`](../runtime/daemon.mjs), which names the first reason this daemon must stay up: a scheduled worker replacement, a launch in progress, a command whose bytes are with a worker that still owes a reply, or a connected dashboard. No connected client is necessary but not sufficient, because a worker holds a connection too: only connections that authenticated as `frontend` count, so a session with nobody watching it is not a client. Each accepted connection re-arms the window before it authenticates, which is what keeps a liveness probe from being followed by an exit and then the connect that probe was for.
+
+Live workers deliberately do not hold the daemon open, which is Claude Code's answer as well. A worker is Pi's parent, survives daemon absence indefinitely, keeps its live tail, and keeps writing its durable delivery replay log, while Pi keeps writing the canonical session file; none of that needs a daemon. Holding the daemon open for them would mean any operator with one running session never gets an on-demand daemon at all. Nothing has to wake the daemon for a session to keep working: the worker's reconnect loop retries the same socket path indefinitely, and the operator's next command starts a daemon that adopts the worker, ingests the tail it replays, and re-derives task state from Pi.
+
+An idle exit signals nothing. It resolves the same stop the daemon takes from `SIGTERM`, and `WorkerSupervisor.close` drops the daemon end of every route without touching a process group, so no session ends and no live session becomes unreachable.
+
 ## A launch moves through five boundaries
 
 1. [`DashboardController.submitComposer`](../app/list/dashboard.mjs) treats a nonempty, non-slash line as a launch. The frontend canonicalizes the working directory and asks for exact confirmation when shared-directory isolation is selected.
@@ -108,6 +118,7 @@ Two owned paths are outside the state root. Canonical Pi session files remain in
 
 ## Changes must preserve these invariants
 
+- **An idle exit is not a stop.** The daemon exits only when `idleHold` names nothing. It never signals a worker, never ends a session, and never leaves a live session unreachable: the next command starts a daemon that adopts it.
 - **The daemon is the only writer of session records.** Frontends and workers send versioned messages. Registry creation, updates, and removal stay in the daemon through [`RegistryStore`](../runtime/registry-store.mjs).
 - **One daemon owns a state root, and a replacement waits for proof.** `daemon stop`, and the stop half of `daemon restart`, report success only after the published PID, process start identity, and process group stop matching in [`waitForProcessExit`](../cli/daemon-commands.mjs). An absent `daemon/pid.json` is not that proof, because the daemon removes it as the last step of its own shutdown and can still be running afterwards. `daemon start` with no explicit root resolves it through [`adoptRenamedStateRoot`](../runtime/state-root-adoption.mjs), so every start path adopts, defers, or refuses rather than opening an empty root beside existing sessions. Its wait for a healthy endpoint runs to a 90 s deadline, so [`waitForStatus`](../cli/daemon-commands.mjs) reports the wait on the caller's error stream from three seconds on: the command's own result is written only after that wait ends, and the standalone dashboard starts the daemon before it opens the interface.
 - **Ownership outlives uncertainty.** Release ownership only after both the supervisor and its Pi child are provably gone. PID alone is insufficient. [`WorkerSupervisor`](../runtime/worker-supervisor.mjs) compares PID, process start identity, and process-group ID, and retains the lease when a child identity is live or ambiguous.

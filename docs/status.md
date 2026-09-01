@@ -52,3 +52,31 @@ Order matters: 1 is independent, 2 depends on 1, 3 and 4 are independent of both
 **4. Make the daemon exit when the last client disconnects.** Claude Code's daemon runs on demand and exits when idle, with `--keep-workers` leaving detached sessions running; service install is disabled in the version installed here. We already have an idle-exit interval driven by `PI_AGENTS_IDLE_EXIT_MS`; the change is to make on-demand the default and stop treating a resident daemon as the normal state. Small in lines, large in what can go wrong while nobody is watching.
 
 Not adopted, deliberately: their PTY hosting and terminal-byte rendering. `docs/tmux-prototype-report.md` records why — killing the host kills every hosted session, terminal writes cannot prove Pi accepted text, and structured Stop and honest row state are both lost.
+
+## Cleanup queue, from four read-only reviews
+
+Ordered by concepts removed, not lines. Every item was verified against the code by the review that proposed it; where a review argued against a change, that verdict is recorded too.
+
+**Delete `runtime/control-server.mjs`, 148 lines.** A second socket-server implementation whose only consumer is its own test; production uses the private one inside `daemon.mjs`. Port its malformed-frame and socket-mode coverage to the surviving server first, then delete. Verified by search.
+
+**Fix the test cleanup model before anything else touches processes.** Detached-daemon cleanup is opt-in, reads a stale `ps` snapshot, and signals by PID with no immediate identity revalidation, which contradicts the repository's own signaling invariant and cannot clean up a test that times out before its local teardown runs. That defect leaked 47 daemons in one evening, the oldest alive 38 hours, and load reached 49. One real-process harness plus a durable process ledger: net 120 to 220 lines removed, 100 to 140 moved.
+
+**Split transport out of `runtime/daemon.mjs` into `runtime/daemon-server.mjs`.** Socket lifecycle, authentication, role selection, the frontend protocol gate, JSONL framing, per-socket ordering, worker reply correlation, subscription lifetimes, bounded queues, shutdown draining. About 250 lines move out of a 1,549-line file that every commit in this release had to touch, which made it the serialization point for all parallel work. Do not split the rest of the request handler into one file per operation: its first half is a dispatch table, but its second half is a transaction coordinator and distributing that would add imports without removing concepts.
+
+**Split `runtime/reconciliation.mjs`, 887 lines**, which currently holds three unrelated things: the worker router, the viewer subsystem, and the startup repair procedure.
+
+**Collapse the frontend's three daemon API layers into one.** A reader today must hold `createDaemonClient`, `createDaemonDashboardBackend` inside `dashboard.mjs`, and `createDaemonViewerClient` inside `standalone-list.mjs`. Highest concept reduction in the frontend, modest line reduction.
+
+**Consolidate `app/list/` around three responsibilities.** Query projection, display-state derivation, row virtualization and responsive layout are four files that one interaction crosses; merging them into a session table is mostly movement, but reading one keystroke stops being a tour.
+
+**Delegate more of the list to public Pi and pi-tui exports.** The viewer already uses Pi's `CustomEditor` and gets wrapping and history free; the list hand-rolls an append-only composer because pi-tui's `Editor` claims Ctrl chords the list needs. Generic overlays and autocomplete are still candidates. Package-root exports only.
+
+**Reorganize the CLI around one client.** `cli/session-commands.mjs` is 874 lines and partly reimplements what `app/daemon-client.mjs` already does against the same socket with the same envelopes. One client with two front ends is smaller. Medium reorganization, not a dramatic reduction.
+
+**Contracts stay as they are.** A review costed replacing 422 hand-written lines with a declarative table and concluded the win is not real: these validators run on every frame across a process boundary, and their messages name the exact offending field, which was load-bearing while debugging this release. 422 lines is what strictness costs.
+
+**Consolidate duplicated test layers.** Controller-level repetitions of behavior already owned by focused units; four candidates measured at 45 to 150 lines each. Keep the real-process suites that catch what a unit test cannot, and say which failure each one catches.
+
+**Close the remaining doubles that cannot fail the way production fails.** Three defects shipped behind a fully green suite because a fake only modelled success: a fake `request` hid a broken `daemon stop --stop-workers`, a fake server that accepted every viewer subscription hid a frozen viewer, and a fixture Pi emitting a help banner reinforced the bug it should have caught. The remaining sites are listed in the test review. This is per-site work and it costs real-process time, so it is a judgment call rather than a sweep.
+
+**`runtime/daemon.integration.test.mjs` is nearly 2,000 lines** and tests every extracted concern through one seam, which reinforces `daemon.mjs` as the only place a change can land. Split it alongside the production split, not before.

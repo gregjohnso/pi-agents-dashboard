@@ -6,8 +6,9 @@ import { parseViewerEvent, parseViewerSnapshot } from "../shared/viewer-contract
 /**
  * How much answered-request history one client keeps to deduplicate a repeated request ID.
  * Every caller here mints a fresh `randomUUID` per operation, so a repeat only comes from a retry
- * of a still-recent request; past these bounds the request goes back to the daemon, whose command
- * journal deduplicates a mutation by clientId and requestId. The character budget is what keeps a
+ * of a still-recent request; past these bounds the request goes back to the daemon, which routes it
+ * to the owning worker, whose replay log refuses a second Pi write for one clientId and requestId.
+ * The character budget is what keeps a
  * viewer snapshot, the one large response this client can receive, from being retained forever.
  */
 const MAX_SEEN_REQUESTS = 256;

@@ -53,8 +53,8 @@ async function splitRootsError(root, previousRoot, fsOps) {
 /**
  * Adopt the state root this product shipped under before the pi-agents rename.
  *
- * The adoption is one `rename` of the directory itself, so the operator's sessions, command
- * journal, and worker leases move together or not at all; there is no half-migrated state to
+ * The adoption is one `rename` of the directory itself, so the operator's sessions, worker leases
+ * and run directories move together or not at all; there is no half-migrated state to
  * recover. Every path a stopped worker recorded is either outside the state root (canonical
  * session files, managed worktrees) or recomputed from the root at start, so a lease written under
  * the previous root still validates afterwards. The single exception is `daemon/pid.json`, whose

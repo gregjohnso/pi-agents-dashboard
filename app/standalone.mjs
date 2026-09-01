@@ -74,8 +74,9 @@ async function defaultConnectOrStart(options) {
   const started = await runDaemonCommand("start", { root: options.root, piBin: options.piBin, env: options.env, stderr: options.stderr });
   if (started.code !== 0) throw Object.assign(new Error(started.error?.message ?? "Daemon did not start"), { code: started.error?.code ?? "DAEMON_START_FAILED" });
   const clientId = await loadCliClientIdentity({ root: options.root });
-  // `clientId` is this installation and survives every restart, because the command journal and
-  // delivery resolution key off it. `attachId` is this dashboard process and dies with it, which is
-  // what lets three dashboards of one installation hold their own connection state.
+  // `clientId` is this installation and survives every restart, because it and the request ID are
+  // the identity a worker's replay log keys a command by. `attachId` is this dashboard process and
+  // dies with it, which is what lets three dashboards of one installation hold their own
+  // connection state.
   return { root: options.root, clientId, attachId: randomUUID(), piBin: options.piBin, async close() {} };
 }

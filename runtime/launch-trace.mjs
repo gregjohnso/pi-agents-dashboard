@@ -5,10 +5,10 @@ import { appendFileSync } from "node:fs";
 // recordLaunchStage return without touching the filesystem. The destination is read per call, not
 // cached, so a measurement can enable it after this module is imported.
 //
-// Every other instant a cold-launch sample needs is already durable and needs no hook: journal
-// acceptance from the command journal's `acceptedAt`, worker and Pi child spawn from the process
-// start ticks in the session record's ownership and runtime identities, and the first usable viewer
-// snapshot from the measuring client's own clock. Readiness persistence has no durable trace,
+// Every other instant a cold-launch sample needs is already durable or already on the measuring
+// client's clock and needs no hook: worker and Pi child spawn from the process start ticks in the
+// session record's ownership and runtime identities, and the launch request and the first usable
+// viewer snapshot from the client that sent them. Readiness persistence has no durable trace,
 // because the row's `updatedAt` moves on as soon as the first turn starts.
 
 /** The launch stages a run may be asked to record. Named for what happened, not for its transport. */

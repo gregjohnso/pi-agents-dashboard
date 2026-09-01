@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { stripVTControlCharacters } from "node:util";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
@@ -604,6 +605,24 @@ describe("Pi interactive-mode parity", () => {
     expect(f.instance.editor.getText()).toBe("ship it");
   });
 
+  // Pi expands a leading slash before the text becomes a message, so this submission may reach the
+  // transcript changed or never reach it at all, and no event could ever clear its row.
+  it("draws no pending row for slash text, on the prompt path and on the steer path", async () => {
+    const f = fixture({ menu: async () => ({ commands: [{ name: "/review", source: "extension" }], models: [], model: null }) });
+    await f.instance.open();
+    await f.instance.menuLoaded;
+
+    f.instance.editor.setText("/review the diff");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.commands.at(-1)).toEqual({ operation: "prompt", payload: { sessionId: "s", text: "/review the diff" } }));
+    expect(pendingRows(f)).toEqual([]);
+
+    await f.instance.submitSteer("/skill:lint everything");
+    await f.instance.submitSteer("plain steering");
+    expect(f.commands.map(({ operation }) => operation)).toEqual(["prompt", "steer", "steer"]);
+    expect(pendingRows(f)).toEqual(["Steering: plain steering"]);
+  });
+
   // A pending row is this frontend's own memory, and a rebuild replaces the transcript it is matched
   // against. The cursor advances only after an event is applied, so a message that landed while the
   // daemon was away arrives in the rebuild's snapshot rather than as an event: without a sync there,
@@ -755,6 +774,31 @@ describe("transcript scrolling keys and wheel", () => {
     expect(tail).toContain("fresh");
   });
 
+});
+
+describe("installed Pi behavior the pending block depends on", () => {
+  const piSource = (/** @type {string} */ path) => readFile(new URL(`../../node_modules/@earendil-works/pi-coding-agent/dist/${path}`, import.meta.url), "utf8");
+
+  // Canary: Pi 0.84.3 expands a submitted slash before the text becomes a message. `session.prompt`
+  // defaults `expandPromptTemplates` to true and RPC mode never overrides it, and `steer` and
+  // `followUp` expand skills and prompt templates too, so text starting with "/" can reach the
+  // transcript changed or, as an extension command, never reach it at all. That is why notePending
+  // draws no row for it. When this fails, Pi changed how it treats a submitted slash: if it grew
+  // verbatim delivery or a submission identity in its reply, delete that exception rather than
+  // keeping it out of caution.
+  it("still expands a submitted slash on every path a submission travels", async () => {
+    const session = await piSource("core/agent-session.js");
+    expect(session).toContain("options?.expandPromptTemplates ?? true");
+    for (const operation of ["steer", "followUp"]) {
+      const opens = `async ${operation}(text, images) {`;
+      expect(session).toContain(opens);
+      expect(session.slice(session.indexOf(opens), session.indexOf("await this._queue", session.indexOf(opens)))).toContain("expandPromptTemplate(expandedText");
+    }
+
+    const rpc = await piSource("modes/rpc/rpc-mode.js");
+    expect(rpc).toContain('case "prompt": {');
+    expect(rpc.slice(rpc.indexOf('case "prompt": {'), rpc.indexOf('case "steer": {'))).not.toContain("expandPromptTemplates");
+  });
 });
 
 describe("viewer prompt", () => {

@@ -456,17 +456,22 @@ export class ViewerController {
    * what this viewer sent. Pi matches its own queues the same way. `priorMatches` records how many
    * transcript user messages already carried this text, so a line the operator sent an hour ago
    * cannot clear the identical line he just sent.
+   *
+   * Text starting with `/` gets no row at all: Pi expands a submitted slash before it becomes a
+   * message, so it can reach the transcript changed or, as an extension command, never reach it.
    * @param {"submission" | "steer"} mode @param {string} text
    */
   notePending(mode, text) {
+    if (text.startsWith("/")) return undefined;
     const entry = { mode, text, priorMatches: (this.state?.items ?? []).filter((item) => item.kind === "user_message" && userMessageText(item) === text).length };
     this.pending.push(entry);
     void this.requestRender();
     return entry;
   }
 
-  /** Take one submission out of the pending block: Pi refused it, so nothing is outstanding. @param {any} entry */
+  /** Take one submission out of the pending block: Pi refused it, so nothing is outstanding. @param {any} [entry] */
   dropPending(entry) {
+    if (entry === undefined) return;
     this.pending = this.pending.filter((candidate) => candidate !== entry);
   }
 

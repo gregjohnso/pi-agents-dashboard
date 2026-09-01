@@ -130,8 +130,11 @@ function viewerFixture(snapshotOverrides = {}, options = {}) {
     async return() { return { value: undefined, done: true }; },
   };
   const client = {
-    async subscribe() { return { snapshot: viewerSnapshot(snapshotOverrides), events, unsubscribe() {} }; },
+    async subscribeViewer() { return { snapshot: viewerSnapshot(snapshotOverrides), events, unsubscribe() {} }; },
     async command(operation, payload) { commands.push({ operation, payload }); },
+    async attach(sessionId) { return { kind: "attached", sessionId }; },
+    async sessionMenu() { return { commands: [], models: [], model: null, color: null }; },
+    onConnectionChange() { return () => {}; },
   };
   const persistence = { async load() {}, async save() {} };
   const onReturn = options.onReturn ?? vi.fn();

@@ -318,7 +318,7 @@ it("stops each exact live worker on one held connection, claiming nothing", asyn
   };
   const endpoints = [{ status: "HEALTHY", daemonState: "READY", publication }, { status: "ABSENT" }];
   await expect(runDaemonCommand("stop", {
-    root: "/state", inspectEndpoint: async () => endpoints.shift() ?? { status: "ABSENT" }, heldConnectionRequest: request,
+    root: "/state", inspectEndpoint: async () => endpoints.shift() ?? { status: "ABSENT" }, request: request,
     stopWorkers: true, yes: true, stopProcessGroup: async () => ({ disposition: "GRACEFUL" }),
   })).resolves.toMatchObject({ code: 0, result: { kind: "daemon_stopped", stoppedSessionIds: ["live"] } });
   expect(operations).toEqual([["get_state", {}], ["stop", { sessionId: "live", revision: 4 }]]);
@@ -333,7 +333,7 @@ it("gives every worker stop the daemon's full escalation window and reports the 
   const result = await runDaemonCommand("stop", {
     root,
     inspectEndpoint: async () => endpoints.shift() ?? { status: "ABSENT" },
-    createPersistentRequester: async ({ timeoutMs }) => {
+    createRequester: async ({ timeoutMs }) => {
       timeouts.push(timeoutMs);
       return {
         request: async (op) => {
@@ -359,7 +359,7 @@ it("keeps the daemon running when the stop socket disconnects after submission",
   const stopProcessGroup = vi.fn();
   await expect(runDaemonCommand("stop", {
     root: "/state", inspectEndpoint: async () => ({ status: "HEALTHY", daemonState: "READY", publication }),
-    heldConnectionRequest: async (op, ...rest) => { operations.push(op); return respond(op, ...rest); },
+    request: async (op, ...rest) => { operations.push(op); return respond(op, ...rest); },
     stopWorkers: true, yes: true, stopProcessGroup,
   })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN" } });
   expect(operations.slice(0, 2)).toEqual(["get_state", "stop"]);
@@ -533,7 +533,7 @@ it("still refuses a daemon stop while workers are live and --stop-workers is abs
   const result = await runDaemonCommand("stop", {
     root: "/state",
     inspectEndpoint: async () => ({ status: "HEALTHY", daemonState: "READY", publication }),
-    heldConnectionRequest: async () => ({ kind: "state", sessions: [liveSession] }),
+    request: async () => ({ kind: "state", sessions: [liveSession] }),
     stopProcessGroup,
   });
 

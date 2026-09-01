@@ -60,12 +60,9 @@ async function dashboard(root, clientId) {
 
 /** @param {any} client @param {string} sessionId */
 async function viewerItemCount(client, sessionId) {
-  const subscription = client.subscribeViewer(sessionId);
-  try {
-    return (await subscription.established).items.length;
-  } finally {
-    await subscription.return?.();
-  }
+  const { snapshot, unsubscribe } = await client.subscribeViewer(sessionId);
+  unsubscribe();
+  return snapshot.items.length;
 }
 
 // Operator-visible behaviour: closing every dashboard leaves no resident daemon, and the sessions the

@@ -6,7 +6,7 @@ import { stripVTControlCharacters } from "node:util";
 import { afterEach, expect, it } from "vitest";
 
 import { createDaemonClient } from "../app/daemon-client.mjs";
-import { DashboardController, createDaemonDashboardBackend } from "../app/list/dashboard.mjs";
+import { DashboardController } from "../app/list/dashboard.mjs";
 import { createDaemonRuntime } from "../runtime/daemon.mjs";
 import { RegistryStore } from "../runtime/registry-store.mjs";
 
@@ -77,17 +77,20 @@ async function seedRoot(clientId) {
 
 /** Count the requests the list actually puts on the wire. @param {any} client @param {string[]} operations */
 function recordingRequests(client, operations) {
-  return {
+  const recorded = {
     ...client,
     request(/** @type {any} */ request) {
       operations.push(request.op);
       return client.request(request);
     },
-    subscribeListChanges(/** @type {any} */ onChanged) {
+    subscribeListChanges(/** @type {any} */ onChanged, /** @type {any} */ onError) {
       operations.push("subscribe_list_changes");
-      return client.subscribeListChanges(onChanged);
+      return client.subscribeListChanges(onChanged, onError);
     },
+    getState() { operations.push("get_state"); return client.getState(); },
+    async preflightLaunch(/** @type {any} */ draft) { return { canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }; },
   };
+  return recorded;
 }
 
 /** Open one real dashboard against one real daemon and return what the operator would see. @param {{ root: string, clientId: string, attachId?: string }} options */
@@ -98,11 +101,10 @@ async function openDashboard({ root, clientId, attachId = "resync-acceptance-pro
   const client = createDaemonClient({ socketPath: runtime.socketPath, token: runtime.token, clientId, attachId, maxBytes: 256 * 1024, reconnect: false });
   /** @type {string[]} */
   const operations = [];
-  const backend = createDaemonDashboardBackend({ client: recordingRequests(client, operations), clientId, preflight: async (/** @type {any} */ draft) => ({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }) });
   /** @type {any} */
   let dashboard;
   dashboard = new DashboardController({
-    backend,
+    client: recordingRequests(client, operations),
     openViewer: async () => {},
     clientId,
     sourceSessionId: `dashboard-${clientId}`,

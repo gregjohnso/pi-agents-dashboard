@@ -14,12 +14,11 @@ const MAX_FRAME_BYTES = 1024 * 1024;
  */
 async function defaultConnect({ root, clientId, sessionId }) {
   const { createDaemonClient } = await import(new URL("../app/daemon-client.mjs", import.meta.url).href);
-  const { createDaemonViewerClient } = await import(new URL("../app/list/standalone-list.mjs", import.meta.url).href);
   const { createStandaloneViewer } = await import(new URL("../app/standalone.mjs", import.meta.url).href);
   const token = (await readFile(join(root, "daemon", "control.token"), "utf8")).trim();
   const client = createDaemonClient({ socketPath: join(root, "daemon", "control.sock"), token, maxBytes: MAX_FRAME_BYTES, clientId, attachId: randomUUID() });
   await client.connect();
-  const viewerClient = createDaemonViewerClient({ client, clientId });
+  const viewerClient = client;
   /** @type {any} */
   let viewerState;
   return {

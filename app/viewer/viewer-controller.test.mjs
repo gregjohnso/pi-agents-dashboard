@@ -78,17 +78,20 @@ function fixture(overrides = {}) {
   /** @type {any[]} */
   const subscriptions = [];
   let snapshots = 0;
+  // One client, the shape the daemon client itself has: every method is present, so a viewer that
+  // reached for one this fixture omitted would fail here the way it fails against the real daemon.
   const client = {
-    async subscribe() {
+    async subscribeViewer() {
       order.push("snapshot");
       const subscription = createSubscription(order);
       subscriptions.push(subscription);
       return { snapshot: snapshot(typeof overrides.snapshot === "function" ? overrides.snapshot(snapshots++) : overrides.snapshot), events: subscription.events, unsubscribe: () => subscription.unsubscribe() };
     },
     onConnectionChange(next) { connectionListener = next; return () => { connectionListener = undefined; }; },
-    ...(overrides.attach === undefined ? {} : { attach: async (sessionId) => { attached.push(sessionId); return overrides.attach(sessionId); } }),
+    async attach(sessionId) { attached.push(sessionId); return overrides.attach?.(sessionId) ?? { kind: "attached", sessionId }; },
+    async detach(sessionId) { return { kind: "detached", sessionId }; },
     async command(operation, payload) { commands.push({ operation, payload }); return overrides.command?.(operation, payload); },
-    ...(overrides.menu === undefined ? {} : { menu: overrides.menu }),
+    sessionMenu: overrides.menu ?? (async () => ({ commands: [], models: [], model: null, color: null })),
     // A trap, not a seam the viewer uses: the resume cursor is the frontend's own, and nothing here
     // may report it to the daemon.
     async ack(_sessionId, cursor) { order.push(`ack:${cursor.sequence}`); },
@@ -219,7 +222,7 @@ describe("viewer commands", () => {
   it("records why an open failed before it closes", async () => {
     const failure = Object.assign(new Error("Unknown viewer session"), { code: "SESSION_NOT_FOUND" });
     const f = fixture();
-    f.client.subscribe = async () => { throw failure; };
+    f.client.subscribeViewer = async () => { throw failure; };
     await expect(f.instance.open()).rejects.toThrow(failure);
     expect(f.instance.openError).toBe(failure);
   });
@@ -227,6 +230,8 @@ describe("viewer commands", () => {
   it("opens one picker per bare built-in, applies the choice, and refuses a mistyped argument", async () => {
     const f = fixture({ menu: async () => ({ commands: [], models: [{ provider: "anthropic", id: "claude" }, { provider: "openai", id: "gpt-5" }], model: null }) });
     await f.instance.open();
+    // The picker is built from the menu, which loads behind the open on purpose.
+    await f.instance.menuLoaded;
 
     f.instance.editor.setText("/model");
     f.instance.handleInput("\r");
@@ -770,7 +775,7 @@ describe("refused viewer subscription", () => {
     const f = fixture();
     await f.instance.open();
     const gone = Object.assign(new Error("Viewer session does not exist"), { code: "SESSION_NOT_FOUND" });
-    f.client.subscribe = async () => { throw gone; };
+    f.client.subscribeViewer = async () => { throw gone; };
 
     await f.refuseStream(gone);
 

@@ -1,5 +1,4 @@
 import { appendFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import { join } from "node:path";
 
@@ -9,79 +8,7 @@ import { createDaemonClient } from "../daemon-client.mjs";
 import { createWheelInputTap } from "../mouse-input.mjs";
 import { createPiEditor } from "../viewer/pi-component-adapters.mjs";
 import { ViewerController } from "../viewer/viewer-controller.mjs";
-import { DashboardController, createDaemonDashboardBackend } from "./dashboard.mjs";
-
-/** Adapt one daemon client to the viewer controller's ordered public-v1 seam. */
-export function createDaemonViewerClient({ client, clientId }) {
-  const request = async (op, payload) => {
-    const response = await client.request({ version: 1, clientId, requestId: randomUUID(), op, payload });
-    // A refused or ambiguous command is a typed failure on the response envelope, so this throws for
-    // both and the viewer keeps the operator's text in its composer.
-    if (!response.ok) throw Object.assign(new Error(response.error.message), response.error);
-    return response.result;
-  };
-  /** @type {Map<string, Promise<unknown>>} */
-  const detaching = new Map();
-  return {
-    async attach(sessionId) {
-      // A fast reopen can outrun its own detach, and the two would then race on this connection's
-      // record of the session. Ordering them per session is enough; another session never waits here.
-      await detaching.get(sessionId)?.catch(() => {});
-      const attached = await request("attach", { sessionId, activate: true });
-      if (attached?.kind !== "attached") throw Object.assign(new Error("Daemon returned the wrong attachment result"), { code: "INVALID_RESPONSE", retryable: false });
-      return attached;
-    },
-    detach(sessionId) {
-      const tracked = request("detach", { sessionId }).finally(() => { if (detaching.get(sessionId) === tracked) detaching.delete(sessionId); });
-      detaching.set(sessionId, tracked);
-      return tracked;
-    },
-    async menu(sessionId) {
-      const result = await request("get_session_commands", { sessionId });
-      if (result?.kind !== "session_commands") throw Object.assign(new Error("Daemon returned the wrong session command menu"), { code: "INVALID_RESPONSE" });
-      const settings = await request("get_settings", {}).catch(() => undefined);
-      const state = await request("get_state", {}).catch(() => undefined);
-      const record = state?.kind === "state" ? state.sessions.find((/** @type {any} */ session) => session.sessionId === sessionId) : undefined;
-      return {
-        ...result,
-        summaryModel: settings?.kind === "settings" ? settings.summaryModel : null,
-        color: record?.color ?? null,
-        name: record?.name,
-        ...(record === undefined ? {} : { registryRevision: record.revision }),
-      };
-    },
-    /** @param {string} sessionId @param {string | null} color */
-    async setSessionColor(sessionId, color) {
-      return client.setSessionColor(sessionId, color);
-    },
-    /** @param {Record<string, any>} payload */
-    async setSettings(payload) {
-      const result = await request("set_settings", payload);
-      if (result?.kind !== "settings") throw Object.assign(new Error("Daemon returned the wrong settings result"), { code: "INVALID_RESPONSE" });
-      return result;
-    },
-    /**
-     * Open one subscription and hand back the snapshot it continues. The caller reads `events` only
-     * after it has built its transcript from that snapshot; anything the daemon published in between
-     * is already queued inside the client.
-     * @param {string} sessionId
-     */
-    async subscribe(sessionId) {
-      const subscription = client.subscribeViewer(sessionId);
-      const iterator = subscription[Symbol.asyncIterator]();
-      let snapshot;
-      try {
-        snapshot = await subscription.established;
-      } catch (error) {
-        await iterator.return?.();
-        throw error;
-      }
-      return { snapshot, events: iterator, unsubscribe: () => { void iterator.return?.(); } };
-    },
-    command(operation, payload) { return request(operation, payload); },
-    onConnectionChange(listener) { return client.onConnectionChange?.(listener); },
-  };
-}
+import { DashboardController } from "./dashboard.mjs";
 
 /** Run one list-to-viewer transition and restore the list after any failure. @param {any} options */
 /** Opt-in stage timing for a viewer transition, so latency can be measured where the operator sits. */
@@ -91,14 +18,14 @@ function markTransition(stage, startedAt) {
   try { appendFileSync(path, `${new Date().toISOString()} ${stage} ${Math.round(performance.now() - startedAt)}ms\n`); } catch {}
 }
 
-export async function runViewerTransition({ sessionId, viewerClient, controller, createViewer, activateViewer, activateList, restoreListFocus, onRestoreClosed, shouldRestore }) {
+export async function runViewerTransition({ sessionId, client, controller, createViewer, activateViewer, activateList, restoreListFocus, onRestoreClosed, shouldRestore }) {
   const startedAt = performance.now();
   let attached = false;
   let restoreList = false;
   let viewer;
   let failure;
   try {
-    await viewerClient.attach(sessionId);
+    await client.attach(sessionId);
     markTransition("attached", startedAt);
     attached = true;
     restoreList = true;
@@ -122,7 +49,7 @@ export async function runViewerTransition({ sessionId, viewerClient, controller,
     await viewer?.close().catch(() => {});
     // Detaching is cleanup, not a precondition for drawing the list. The client keeps the promise so
     // a later attach for this session still waits behind it; the operator does not.
-    if (attached) void viewerClient.detach(sessionId).catch(() => {});
+    if (attached) void client.detach(sessionId).catch(() => {});
     if (restoreList && shouldRestore()) { await controller.open(); markTransition("list-reopened", startedAt); }
     if (shouldRestore()) {
       if (controller.closed) onRestoreClosed?.();
@@ -180,23 +107,8 @@ export function mountStandaloneHost({ tui, getActive, getHeight, terminal }) {
 export async function createStandaloneList({ cwd, frontend }) {
   const token = (await fs.readFile(join(frontend.root, "daemon", "control.token"), "utf8")).trim();
   const client = createDaemonClient({ socketPath: join(frontend.root, "daemon", "control.sock"), token, maxBytes: 1024 * 1024, clientId: frontend.clientId, attachId: frontend.attachId });
-  const backend = createDaemonDashboardBackend({
-    client, clientId: frontend.clientId,
-    preflight: async (draft) => {
-      const canonicalCwd = await fs.realpath(draft.cwd);
-      if (draft.isolationMode !== "shared_directory") return { canonicalCwd, isolationMode: draft.isolationMode, ownerSessionIds: [] };
-      const state = await client.request({ version: 1, clientId: frontend.clientId, requestId: randomUUID(), op: "get_state", payload: {} });
-      if (!state.ok || state.result?.kind !== "state") throw Object.assign(new Error(state.error?.message ?? "Daemon state is unavailable"), state.error ?? { code: "INVALID_RESPONSE" });
-      const ownerSessionIds = state.result.sessions
-        .filter((record) => record.ownership !== undefined && (record.isolation?.mode === "shared_directory" ? record.isolation.canonicalCwd : record.cwd) === canonicalCwd)
-        .map((record) => record.sessionId)
-        .sort();
-      return { canonicalCwd, isolationMode: draft.isolationMode, ownerSessionIds };
-    },
-  });
   const terminal = createWheelInputTap(new ProcessTerminal());
   const tui = new TuiAltScreen(terminal);
-  const viewerClient = createDaemonViewerClient({ client, clientId: frontend.clientId });
   const viewerState = new Map();
   let resolveClosed;
   let switching = false;
@@ -210,12 +122,12 @@ export async function createStandaloneList({ cwd, frontend }) {
     if (switching || activeViewer !== undefined) return;
     switching = true;
     await runViewerTransition({
-      sessionId, viewerClient, controller,
+      sessionId, client, controller,
       createViewer() {
         const editor = createPiEditor({ tui });
         let viewer;
         viewer = new ViewerController({
-          sessionId, client: viewerClient, editor, cwd,
+          sessionId, client, editor, cwd,
           persistence: { async load() { return viewerState.get(sessionId); }, async save(value) { viewerState.set(sessionId, structuredClone(value)); } },
           requestRender: () => tui.requestRender(), onReturn: () => { void viewer.close(); },
           onDashboardAction: (/** @type {string} */ action) => {
@@ -239,7 +151,7 @@ export async function createStandaloneList({ cwd, frontend }) {
     switching = false;
   };
   const controller = new DashboardController({
-    backend, openViewer: openRealViewer,
+    client, openViewer: openRealViewer,
     clientId: frontend.clientId, sourceSessionId: `dashboard-${frontend.clientId}`,
     launchDefaults: { cwd }, requestRender: () => tui.requestRender(),
     onClose: () => { if (!switching && activeViewer === undefined) { tui.stop(); resolveClosed(); } },

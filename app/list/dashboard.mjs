@@ -27,117 +27,6 @@ async function existingDirectory(path) {
 }
 /** Idle time before a typed path is listed. pi-tui lists it synchronously, so no keystroke may start one. */
 const COMPLETION_DEBOUNCE_MS = 60;
-function daemonFailure(response) {
-    return { code: response.error.code, message: response.error.message };
-}
-/** Adapt the reconnecting daemon client into current snapshots driven by list invalidations. */
-export function createDaemonDashboardBackend({ client, clientId, preflight, requestId = randomUUID, }) {
-    const request = async (op, payload, exactRequestId = requestId()) => {
-        return client.request({ version: 1, clientId, requestId: exactRequestId, op, payload });
-    };
-    const refreshState = async () => {
-        const response = await request("get_state", {});
-        if (!response.ok)
-            throw Object.assign(new Error(response.error.message), response.error);
-        if (response.result.kind !== "state")
-            throw Object.assign(new Error("Daemon returned the wrong state result"), { code: "INVALID_RESPONSE" });
-        // The coverage cursor states how far the daemon's list had advanced when it read these rows.
-        // Without it a snapshot cannot be told from one taken before the change that provoked the
-        // read, which is the window subscribing first exists to close.
-        if (response.result.cursor === undefined)
-            throw Object.assign(new Error("Daemon state result carries no coverage cursor"), { code: "INVALID_RESPONSE" });
-        return { sessions: response.result.sessions, cursor: response.result.cursor };
-    };
-    /**
-     * Send one destructive command on its own connection, so a socket that dies mid-command is this
-     * command's own ambiguity rather than the list connection's.
-     */
-    const requestDestructive = async (operation, sessionId, revision, exactRequestId) => {
-        const transaction = client.createTransactionClient?.() ?? client;
-        const ownsTransaction = transaction !== client;
-        try {
-            if (ownsTransaction) await transaction.connect();
-            try { return await transaction.request({ version: 1, clientId, requestId: exactRequestId, op: operation, payload: { sessionId, revision } }); }
-            catch (error) {
-                if (["CONNECTION_CLOSED", "MALFORMED_FRAME", "MALFORMED_RESPONSE", "INVALID_DAEMON_RESPONSE", "UNEXPECTED_DAEMON_RESPONSE"].includes(error?.code)) throw Object.assign(new Error(`${operation === "stop" ? "Stop" : "Delete"} delivery is ambiguous`), { code: "DELIVERY_UNKNOWN", clientId, requestId: exactRequestId });
-                throw error;
-            }
-        }
-        finally {
-            if (ownsTransaction) await transaction.close();
-        }
-    };
-    const requireCompletedDestructive = (operation, response) => {
-        if (!response.ok)
-            throw Object.assign(new Error(response.error.message), response.error);
-        if (response.result.kind !== "command")
-            throw Object.assign(new Error(`Daemon returned the wrong ${operation} result`), { code: "INVALID_RESPONSE" });
-    };
-    return {
-        async getSnapshot() {
-            await client.connect();
-            return refreshState();
-        },
-        /**
-         * Subscribe to payload-free list invalidations. Establishment is awaited so a daemon that
-         * does not have the operation refuses here, instead of leaving a list frozen on rows it read
-         * once. The notification carries nothing, so the caller owes exactly one refetch.
-         */
-        async subscribeListChanges(onInvalidated, onError) {
-            let active = true;
-            const removeFatalListener = client.onFatalError?.((error) => {
-                if (active)
-                    onError({ code: error.code, message: error.message });
-            });
-            let unsubscribe;
-            try {
-                unsubscribe = await client.subscribeListChanges(() => { if (active) onInvalidated(); });
-            }
-            catch (error) {
-                active = false;
-                removeFatalListener?.();
-                throw error;
-            }
-            return () => {
-                active = false;
-                removeFatalListener?.();
-                unsubscribe();
-            };
-        },
-        preflightLaunch: preflight,
-        async launch(launchRequest, exactRequestId = requestId()) {
-            const response = await request("launch", launchRequest, exactRequestId);
-            if (!response.ok)
-                return { kind: "rejected", error: daemonFailure(response) };
-            if (response.result.kind === "launched")
-                return { kind: "launched", sessionId: response.result.sessionId };
-            return { kind: "rejected", error: { code: "INVALID_RESPONSE", message: "Daemon returned the wrong launch result" } };
-        },
-        /** Every model the installed Pi will accept, for the launch composer's picker. */
-        async getModels() {
-            const response = await request("get_models", {});
-            if (!response.ok)
-                throw Object.assign(new Error(response.error.message), response.error);
-            if (response.result.kind !== "models")
-                throw Object.assign(new Error("Daemon returned the wrong model catalog result"), { code: "INVALID_RESPONSE" });
-            return response.result.models;
-        },
-        async refreshSummaries() {
-            const response = await request("refresh_summaries", {});
-            if (!response.ok)
-                throw Object.assign(new Error(response.error.message), response.error);
-            if (response.result.kind !== "summaries_refreshing")
-                throw Object.assign(new Error("Daemon returned the wrong summary refresh result"), { code: "INVALID_RESPONSE" });
-            return response.result.sessionIds;
-        },
-        async stop(sessionId, revision, exactRequestId) {
-            requireCompletedDestructive("stop", await requestDestructive("stop", sessionId, revision, exactRequestId));
-        },
-        async delete(sessionId, revision, exactRequestId) {
-            requireCompletedDestructive("delete", await requestDestructive("delete", sessionId, revision, exactRequestId));
-        },
-    };
-}
 function defaultQuery() {
     return { view: "live" };
 }
@@ -237,7 +126,7 @@ function renderOverlayPanel(described, width, areaHeight) {
 }
 /** Own dashboard subscription, focus, selection, launch, rendering, and disposal. */
 export class DashboardController {
-    backend;
+    client;
     openViewer;
     clientId;
     sourceSessionId;
@@ -294,7 +183,7 @@ export class DashboardController {
     overlay;
     status = { kind: "loading" };
     constructor(options) {
-        this.backend = options.backend;
+        this.client = options.client;
         if (typeof options.openViewer !== "function")
             throw new TypeError("openViewer is required");
         this.openViewer = options.openViewer;
@@ -332,7 +221,7 @@ export class DashboardController {
             // Subscribe before reading, never after: a change published while the read is in flight
             // then arrives as an invalidation and provokes one refetch, rather than being lost.
             this.listChangePending = true;
-            const unsubscribe = await this.backend.subscribeListChanges(() => this.noteListChanged(generation), (error) => { if (this.isCurrentOpen(generation))
+            const unsubscribe = await this.client.subscribeListChanges(() => this.noteListChanged(generation), (error) => { if (this.isCurrentOpen(generation))
                 this.fail(error); });
             if (!this.isCurrentOpen(generation)) {
                 unsubscribe();
@@ -521,10 +410,8 @@ export class DashboardController {
      * answer is read once, on the first picker that needs it, and never at startup or per keystroke.
      */
     async catalogModels() {
-        if (typeof this.backend.getModels !== "function")
-            return [];
         try {
-            this.modelCatalog ??= Promise.resolve(this.backend.getModels());
+            this.modelCatalog ??= Promise.resolve(this.client.getModels());
             const models = await this.modelCatalog;
             this.modelCatalogFailure = undefined;
             return models;
@@ -646,7 +533,7 @@ export class DashboardController {
         this.composerDraft = { ...this.composerDraft, prompt: "" };
         this.requestRender?.();
         try {
-            const preflight = await this.backend.preflightLaunch(submitted);
+            const preflight = await this.client.preflightLaunch(submitted);
             const prepared = prepareLaunchRequest(submitted, preflight);
             if (prepared.kind === "confirmation_required") {
                 this.pendingShared = { draft: submitted, preflight };
@@ -736,7 +623,7 @@ export class DashboardController {
             let attemptRevision = revision;
             for (let attempt = 1; ; attempt += 1) {
                 try {
-                    await this.backend[action](sessionId, attemptRevision, attemptRequestId);
+                    await this.client[action](sessionId, attemptRevision, attemptRequestId);
                     break;
                 }
                 catch (error) {
@@ -744,7 +631,7 @@ export class DashboardController {
                         throw error;
                     // The cached list can be many revisions behind, so ask the daemon rather than
                     // retrying against a copy that will conflict forever.
-                    const snapshot = await this.backend.getSnapshot().catch(() => undefined);
+                    const snapshot = await this.client.getState().catch(() => undefined);
                     if (snapshot !== undefined)
                         this.applySnapshot(snapshot);
                     const current = this.sessions.find((candidate) => candidate.sessionId === sessionId);
@@ -1172,9 +1059,7 @@ export class DashboardController {
     }
     /** Ask the daemon for opt-in Activity summaries; absence of a summary model is not an error. */
     refreshSummaries() {
-        if (typeof this.backend.refreshSummaries !== "function")
-            return;
-        void Promise.resolve(this.backend.refreshSummaries()).catch(() => { });
+        void Promise.resolve(this.client.refreshSummaries()).catch(() => { });
     }
     async launch(request) {
         // Show the list before the daemon answers: startup takes seconds and the session row arrives by subscription.
@@ -1184,9 +1069,15 @@ export class DashboardController {
         this.pendingLaunches = [...this.pendingLaunches, pending];
         this.rebuildList();
         this.requestRender?.();
-        let outcome;
+        let failure;
         try {
-            outcome = await this.backend.launch(request, this.requestId());
+            await this.client.launch(request, this.requestId());
+        }
+        catch (error) {
+            // A refusal and a transport failure cost the operator the same thing: his text and the
+            // session it was for. One path hands the prompt back, because `confirmSharedLaunch` is
+            // invoked from a keystroke with `void` and anything raised past here vanished with the draft.
+            failure = this.typedError(error, "LAUNCH_FAILED");
         }
         finally {
             // Always retire the placeholder: a throw used to leave a STARTING row that never resolved.
@@ -1194,15 +1085,12 @@ export class DashboardController {
             this.rebuildList();
             this.requestRender?.();
         }
-        if (outcome.kind === "launched") {
+        if (failure === undefined) {
             this.requestRender?.();
             return;
         }
-        // A refused launch must hand the typed prompt back. The backend answers a refusal with
-        // `rejected`, never `error`, so matching only `error` silently ate the draft on every refusal.
-        if (outcome.kind === "error" || outcome.kind === "rejected")
-            this.restoreDraft(request.prompt);
-        this.status = { kind: "error", code: outcome.error.code, message: outcome.error.message };
+        this.restoreDraft(request.prompt);
+        this.status = { kind: "error", code: failure.code, message: failure.message };
     }
     renderOverlay(lines) {
         // A `/cwd` path being completed outranks the one command-menu row it would otherwise show.
@@ -1267,11 +1155,9 @@ export class DashboardController {
                 if (!this.isCurrentOpen(generation))
                     throw Object.assign(new Error("Dashboard is closed"), { code: "DASHBOARD_CLOSED" });
                 this.listChangePending = false;
-                const snapshot = await this.backend.getSnapshot(this.openController?.signal);
+                const snapshot = await this.client.getState();
                 if (!this.isCurrentOpen(generation))
                     throw Object.assign(new Error("Dashboard is closed"), { code: "DASHBOARD_CLOSED" });
-                if (snapshot.cursor === undefined)
-                    throw Object.assign(new Error("List snapshot carries no coverage cursor"), { code: "INVALID_RESPONSE" });
                 this.applySnapshot(snapshot);
                 this.coverageCursor = snapshot.cursor;
                 this.requestRender?.();

@@ -165,13 +165,13 @@ export class ViewerController {
       // One call opens the subscription and answers with the snapshot it continues, so no event can
       // fall between the two. Events published while this transcript is being built wait in the
       // subscription's own queue until the pump below reads them.
-      const subscription = await this.client.subscribe(this.sessionId);
+      const subscription = await this.client.subscribeViewer(this.sessionId);
       this.state = createTranscriptState(parseViewerSnapshot(subscription.snapshot));
       this.editor.focused = true;
       this.transcript = new TranscriptModel({ state: this.state, adapters: this.adapters });
       this.installOverlay();
       this.consume(subscription);
-      this.watchConnection = this.client.onConnectionChange?.((status) => this.onConnection(status));
+      this.watchConnection = this.client.onConnectionChange((status) => this.onConnection(status));
       await this.requestRender();
       // The menu is a round trip to this session's worker and Pi. Nothing the first frame draws needs
       // it, so it loads behind the open: a worker that answers slowly, or not at all, can no longer
@@ -357,9 +357,8 @@ export class ViewerController {
 
   /** Load and install the session's discovered slash-command menu. */
   async loadMenu() {
-    if (typeof this.client.menu !== "function") return;
     try {
-      const menu = await this.client.menu(this.sessionId);
+      const menu = await this.client.sessionMenu(this.sessionId);
       this.menu = {
         commands: Array.isArray(menu?.commands) ? menu.commands : [],
         models: Array.isArray(menu?.models) ? menu.models : [],
@@ -537,8 +536,7 @@ export class ViewerController {
   async sendCommand(operation, payload) {
     const request = { sessionId: this.sessionId, ...payload };
     try {
-      if (typeof this.client.command === "function") await this.client.command(operation, request);
-      else await this.client.request(operation, request);
+      await this.client.command(operation, request);
       return true;
     } catch (error) {
       const typed = /** @type {any} */ (error);
@@ -589,10 +587,6 @@ export class ViewerController {
 
   /** Apply the dashboard's session color. Registry metadata only: no Pi worker is involved. @param {string | null} color */
   async sendSessionColor(color) {
-    if (typeof this.client.setSessionColor !== "function") {
-      await this.recordError({ code: "SESSION_COLOR_UNAVAILABLE", message: "This frontend cannot change a session color", retryable: false });
-      return false;
-    }
     try {
       const result = await this.client.setSessionColor(this.sessionId, color);
       this.sessionColor = result?.color ?? undefined;
@@ -606,10 +600,6 @@ export class ViewerController {
   }
 
   async sendSettings(payload) {
-    if (typeof this.client.setSettings !== "function") {
-      await this.recordError({ code: "SETTINGS_UNAVAILABLE", message: "This frontend cannot change dashboard settings", retryable: false });
-      return false;
-    }
     try {
       await this.client.setSettings(payload);
       return true;
@@ -658,11 +648,9 @@ export class ViewerController {
     this.unsubscribe?.();
     this.unsubscribe = undefined;
     let attachError;
-    if (typeof this.client.attach === "function") {
-      try { await this.client.attach(this.sessionId); } catch (error) { attachError = error; }
-    }
+    try { await this.client.attach(this.sessionId); } catch (error) { attachError = error; }
     try {
-      const subscription = await this.client.subscribe(this.sessionId);
+      const subscription = await this.client.subscribeViewer(this.sessionId);
       const applied = this.state?.eventIds ?? [];
       this.state = createTranscriptState(parseViewerSnapshot(subscription.snapshot));
       for (const eventId of applied) this.state.eventIds.add(eventId);

@@ -145,9 +145,8 @@ it("keeps no durable viewer transcript beside Pi's own session file", async () =
   const subscription = await client.subscribeViewer("session-1");
   await worker.frame({ type: "message_start", message: { role: "assistant", timestamp: at } });
   await worker.frame({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "streaming" } });
-  const iterator = subscription[Symbol.asyncIterator]();
-  await iterator.next();
-  await iterator.return?.();
+  await subscription.events.next();
+  subscription.unsubscribe();
   await client.close();
 
   // Pi's session file is the only transcript on disk. The live tail lives in the worker's memory.
@@ -174,9 +173,8 @@ it("replays the frames a worker buffered while the daemon was absent, once", asy
   await second.ready;
   await waitForWorker(second);
   const client = await openClient(second, "client-tail");
-  const subscription = await client.subscribeViewer("session-1");
-  const snapshot = await subscription.established;
-  await subscription[Symbol.asyncIterator]().return?.();
+  const { snapshot, unsubscribe } = await client.subscribeViewer("session-1");
+  unsubscribe();
   expect(snapshot.items.map((/** @type {any} */ item) => item.itemId)).toEqual(["user-1", "assistant-1", expect.any(String)]);
   expect(assistantText(snapshot.items)).toBe("answer|partial and more");
   await client.close();
@@ -190,21 +188,19 @@ it("tells a viewer to resynchronize when its worker reconnects mid-turn, with no
   await waitForWorker(daemon);
   const client = await openClient(daemon, "client-midturn");
   const first = await client.subscribeViewer("session-1");
-  await first.established;
   await worker.frame({ type: "message_start", message: { role: "assistant", timestamp: at } });
   await worker.frame({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "mid" } });
-  await vi.waitFor(async () => expect((await first.next()).value.payload.kind).toBeDefined());
+  await vi.waitFor(async () => expect((await first.events.next()).value.payload.kind).toBeDefined());
 
   // The worker's socket dies mid-turn while Pi keeps going. Its reconnect replays the tail, which
   // rebuilds this session, so the subscription the viewer is reading can no longer describe it.
   worker.drop();
   await vi.waitFor(() => expect(worker.connections).toBeGreaterThan(1));
   await worker.frame({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "-turn" } });
-  await expect(vi.waitFor(() => first.next(), { timeout: 5_000 })).rejects.toMatchObject({ code: "VIEWER_RESYNCHRONIZED" });
+  await expect(vi.waitFor(() => first.events.next(), { timeout: 5_000 })).rejects.toMatchObject({ code: "VIEWER_RESYNCHRONIZED" });
 
-  const rebuilt = await client.subscribeViewer("session-1");
-  const snapshot = await rebuilt.established;
-  await rebuilt.return?.();
+  const { snapshot, unsubscribe } = await client.subscribeViewer("session-1");
+  unsubscribe();
   expect(snapshot.items.map((/** @type {any} */ item) => item.kind)).toEqual(["user_message", "assistant_message"]);
   expect(assistantText(snapshot.items)).toBe("mid-turn");
   await client.close();
@@ -231,9 +227,8 @@ it("delivers an extension UI request that arrived before any frontend attached",
   await second.ready;
   await waitForWorker(second);
   const client = await openClient(second, "client-ui");
-  const subscription = await client.subscribeViewer("session-1");
-  const snapshot = await subscription.established;
-  await subscription.return?.();
+  const { snapshot, unsubscribe } = await client.subscribeViewer("session-1");
+  unsubscribe();
   expect(worker.dropped).toBeGreaterThan(0);
   expect(snapshot.pendingUi).toEqual([{ id: "ui-1", method: "confirm", title: "Overwrite the file?" }]);
   await client.close();
@@ -259,9 +254,8 @@ it("serves canonical history plus the surviving tail when the worker's buffer ov
   await second.ready;
   await waitForWorker(second);
   const client = await openClient(second, "client-overflow");
-  const subscription = await client.subscribeViewer("session-1");
-  const snapshot = await subscription.established;
-  await subscription.return?.();
+  const { snapshot, unsubscribe } = await client.subscribeViewer("session-1");
+  unsubscribe();
   expect(worker.dropped).toBeGreaterThan(0);
   expect(snapshot.errors).toEqual([]);
   expect(snapshot.items.map((/** @type {any} */ item) => item.itemId)).toEqual(["user-1", "assistant-1", expect.any(String)]);

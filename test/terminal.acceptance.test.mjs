@@ -37,30 +37,32 @@ function nextCoverage() {
   return { daemonEpoch: "epoch", sequence: String(coverageSequence) };
 }
 
-class DashboardBackend {
+class FakeDaemonClient {
   constructor(sessions) { this.snapshot = { sessions, cursor: nextCoverage() }; }
   stop = vi.fn(async () => {});
   delete = vi.fn(async () => {});
   setSessions(sessions) { this.snapshot = { sessions, cursor: nextCoverage() }; }
-  async getSnapshot() { return this.snapshot; }
+  async getState() { return this.snapshot; }
   async subscribeListChanges(onChanged, onError) { this.notifyListChanged = onChanged; this.onError = onError; return () => { this.unsubscribed = true; }; }
   async preflightLaunch(draft) { return { canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] }; }
   async launch() { return { kind: "launched", sessionId: "new" }; }
+  async getModels() { return []; }
+  async refreshSummaries() { return []; }
 }
 
 function dashboardFixture(sessions, overrides = {}) {
-  const backend = new DashboardBackend(sessions);
+  const client = new FakeDaemonClient(sessions);
   const openViewer = overrides.openViewer ?? vi.fn(async () => {});
   const onClose = overrides.onClose ?? vi.fn();
   const dashboard = new DashboardController({
-    backend, openViewer, onClose,
+    client, openViewer, onClose,
     clientId: "terminal-client",
     requestId: () => "terminal-request",
     launchDefaults: { cwd: "/repo", model: { provider: "", id: "" }, name: "" },
     requestRender: () => {},
     now: () => Date.parse(timestamp) + 12 * 60 * 60 * 1_000,
   });
-  return { backend, dashboard, onClose, openViewer };
+  return { client, dashboard, onClose, openViewer };
 }
 
 function viewerSnapshot(overrides = {}) {
@@ -130,8 +132,11 @@ function viewerFixture(snapshotOverrides = {}, options = {}) {
     async return() { return { value: undefined, done: true }; },
   };
   const client = {
-    async subscribe() { return { snapshot: viewerSnapshot(snapshotOverrides), events, unsubscribe() {} }; },
+    async subscribeViewer() { return { snapshot: viewerSnapshot(snapshotOverrides), events, unsubscribe() {} }; },
     async command(operation, payload) { commands.push({ operation, payload }); },
+    async attach(sessionId) { return { kind: "attached", sessionId }; },
+    async sessionMenu() { return { commands: [], models: [], model: null, color: null }; },
+    onConnectionChange() { return () => {}; },
   };
   const persistence = { async load() {}, async save() {} };
   const onReturn = options.onReturn ?? vi.fn();
@@ -215,13 +220,13 @@ it("drives list navigation, search/filter/sort/group, metadata/help, composer, c
   // Ctrl+X stops on the first press; a second press soon after clears the stopped session.
   f.dashboard.selectSession("live");
   f.dashboard.handleInput("\x18");
-  await vi.waitFor(() => expect(f.backend.stop).toHaveBeenCalledWith("live", 4, "terminal-request"));
+  await vi.waitFor(() => expect(f.client.stop).toHaveBeenCalledWith("live", 4, "terminal-request"));
   await vi.waitFor(() => expect(f.dashboard.stopClearArmed).toBe(true));
-  f.backend.setSessions([session("live", { revision: 5, processState: "EXITED" }), session("saved", { revision: 7, processState: "EXITED" })]);
-  await f.backend.notifyListChanged();
+  f.client.setSessions([session("live", { revision: 5, processState: "EXITED" }), session("saved", { revision: 7, processState: "EXITED" })]);
+  await f.client.notifyListChanged();
   f.dashboard.render(80, 24);
   f.dashboard.handleInput("\x18");
-  await vi.waitFor(() => expect(f.backend.delete).toHaveBeenCalledWith("live", 5, "terminal-request"));
+  await vi.waitFor(() => expect(f.client.delete).toHaveBeenCalledWith("live", 5, "terminal-request"));
 
   // Tab reaches no launch field any more, so it cannot move a cursor away from the prompt.
   f.dashboard.handleInput("\t");
@@ -229,8 +234,8 @@ it("drives list navigation, search/filter/sort/group, metadata/help, composer, c
   f.dashboard.handleInput("\x03");
   await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith({ kind: "closed" }));
   expect(f.dashboard.composerDraft.prompt).toBe("draft");
-  expect(f.backend.stop).toHaveBeenCalledTimes(1);
-  expect(f.backend.delete).toHaveBeenCalledTimes(1);
+  expect(f.client.stop).toHaveBeenCalledTimes(1);
+  expect(f.client.delete).toHaveBeenCalledTimes(1);
 });
 
 it("drives viewer prompt/follow-up/steer/interrupt, tools, pending UI, and read-only restrictions", async () => {

@@ -58,9 +58,8 @@ function request(clientId, requestId, op, payload) {
 async function waitForSnapshot(client, sessionId, predicate) {
   const deadline = Date.now() + 2_000;
   for (;;) {
-    const subscription = client.subscribeViewer(sessionId);
-    const snapshot = await subscription.established;
-    await subscription.return?.();
+    const { snapshot, unsubscribe } = await client.subscribeViewer(sessionId);
+    unsubscribe();
     if (predicate(snapshot)) return snapshot;
     if (Date.now() >= deadline) throw new Error(`Viewer snapshot for ${sessionId} did not reach the expected state`);
     await new Promise((resolve) => setTimeout(resolve, 20));

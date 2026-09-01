@@ -30,8 +30,10 @@ const ENVELOPE_KEYS = ["version", "clientId", "requestId", "op", "payload"];
  * The frontend protocol this release speaks, declared as `clientProtocol` in the socket
  * authentication frame. Protocol 2 replaced the replayed list-event stream with payload-free
  * invalidations; protocol 3 removed the access role from the attach request and its reply, so a
- * protocol-2 client reads that reply as a refusal of the role it asked for. A frontend and
- * a daemon on different sides of either change cannot share a session, so the daemon refuses a
+ * protocol-2 client reads that reply as a refusal of the role it asked for; protocol 4 retired
+ * `get_viewer_snapshot` and the viewer resume cursor, because the daemon keeps no durable viewer
+ * events to replay and answers `subscribe_viewer` with the snapshot its subscription continues. A
+ * frontend and a daemon on different sides of any of these cannot share a session, so the daemon refuses a
  * frontend that declares anything else at its first request. Worker and control connections
  * deliberately carry no `clientProtocol`: a live worker must survive a daemon replacement, and the
  * liveness probe and the control stop frame must still reach a daemon from the previous release,
@@ -39,12 +41,12 @@ const ENVELOPE_KEYS = ["version", "clientId", "requestId", "op", "payload"];
  * does not need, and why a refused handshake is reported as an earlier release rather than as a
  * failed authentication.
  */
-export const CLIENT_PROTOCOL = 3;
+export const CLIENT_PROTOCOL = 4;
 /** Operator-chosen row tints, named for the Jobwatch palette. Dashboard metadata; Pi never sees them. */
 export const SESSION_COLORS = ["sky", "green", "amber", "rose", "cyan", "gray"];
 /** @typedef {"sky"|"green"|"amber"|"rose"|"cyan"|"gray"} SessionColor */
 
-const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "respawn", "ui_response", "subscribe_list_changes", "get_viewer_snapshot", "subscribe_viewer", "resolve_delivery", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries", "set_session_color", "get_models"];
+const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "respawn", "ui_response", "subscribe_list_changes", "subscribe_viewer", "resolve_delivery", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries", "set_session_color", "get_models"];
 const COMMAND_STAGES = ["ACCEPTED", "DELIVERY_ATTEMPTED", "WORKER_ACKNOWLEDGED", "COMPLETED", "DELIVERY_UNKNOWN", "FAILED"];
 const SESSION_COMMANDS = ["set_model", "compact", "set_session_name", "abort_retry"];
 const MAX_MENU_ENTRIES = 1_000;
@@ -245,7 +247,7 @@ export function parseClientRequest(value) {
     if (!Object.hasOwn(payload, "response")) throw new TypeError("ui_response payload.response is required");
     return { ...base, payload: { sessionId: readIdentifier(payload, "sessionId", "ui_response payload.sessionId"), uiRequestId: readIdentifier(payload, "uiRequestId", "ui_response payload.uiRequestId"), response: readJsonValue(payload.response, "ui_response payload.response") } };
   }
-  if (["get_viewer_snapshot", "get_session_commands"].includes(op)) return { ...base, payload: readSessionPayload(request.payload, op) };
+  if (op === "get_session_commands") return { ...base, payload: readSessionPayload(request.payload, op) };
   if (op === "session_command") {
     const payload = readRecord(request.payload, "session_command payload");
     const command = readEnum(payload, "command", SESSION_COMMANDS, "session_command payload.command");
@@ -267,14 +269,9 @@ export function parseClientRequest(value) {
     rejectUnknownKeys(payload, ["sessionId", "command", "instructions"], "session_command payload");
     return { ...base, payload: Object.hasOwn(payload, "instructions") ? { sessionId, command, instructions: readText(payload, "instructions", "session_command payload.instructions") } : { sessionId, command } };
   }
-  if (op === "subscribe_viewer") {
-    const payload = readRecord(request.payload, "subscribe_viewer payload"); rejectUnknownKeys(payload, ["sessionId", "after"], "subscribe_viewer payload");
-    const sessionId = readIdentifier(payload, "sessionId", "subscribe_viewer payload.sessionId");
-    if (!Object.hasOwn(payload, "after")) return { ...base, payload: { sessionId } };
-    const after = readViewerCursor(payload.after, "subscribe_viewer payload.after");
-    if (after.sessionId !== sessionId) throw new TypeError("subscribe_viewer cursor session does not match payload session");
-    return { ...base, payload: { sessionId, after } };
-  }
+  // A viewer subscription carries no resume cursor: the daemon retains no event to replay from, so it
+  // answers with the snapshot the subscription continues.
+  if (op === "subscribe_viewer") return { ...base, payload: readSessionPayload(request.payload, op) };
   const payload = readRecord(request.payload, "resolve_delivery payload"); rejectUnknownKeys(payload, ["targetClientId", "targetRequestId", "resolution"], "resolve_delivery payload");
   return { ...base, payload: { targetClientId: readIdentifier(payload, "targetClientId", "resolve_delivery payload.targetClientId"), targetRequestId: readIdentifier(payload, "targetRequestId", "resolve_delivery payload.targetRequestId"), resolution: readEnum(payload, "resolution", ["retry_at_risk", "abandon"], "resolve_delivery payload.resolution") } };
 }
@@ -368,7 +365,7 @@ export function parseDaemonResponse(value) {
   if (!response.ok) { requireKeys(response, ["version", "requestId", "ok", "error"], [], "daemon response"); validateError(response.error, "daemon response.error"); return response; }
   requireKeys(response, ["version", "requestId", "ok", "result"], [], "daemon response");
   const result = readRecord(response.result, "daemon response.result");
-  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "list_subscribed", "viewer_snapshot", "viewer_subscribed", "session_commands", "settings", "models", "summaries_refreshing", "session_colored"], "daemon response.result.kind");
+  const kind = readEnum(result, "kind", ["state", "launched", "attached", "detached", "command", "list_subscribed", "viewer_subscribed", "session_commands", "settings", "models", "summaries_refreshing", "session_colored"], "daemon response.result.kind");
   // `cursor` is how far the daemon's list had advanced when it read this snapshot, and it is
   // required: it is read before the registry, never after, so the snapshot always covers at least
   // that position. That ordering is what lets a client subscribe, read, and know the read cannot
@@ -401,9 +398,27 @@ export function parseDaemonResponse(value) {
     if (result.color !== null && !SESSION_COLORS.includes(result.color)) throw new TypeError(`daemon response.result.color must be null or one of: ${SESSION_COLORS.join(", ")}`);
   }
   else if (kind === "summaries_refreshing") { requireKeys(result, ["kind", "sessionIds"], [], "daemon response.result"); if (!Array.isArray(result.sessionIds)) throw new TypeError("daemon response.result.sessionIds must be an array"); result.sessionIds.forEach((/** @type {unknown} */ sessionId, /** @type {number} */ index) => { if (typeof sessionId !== "string" || sessionId.length === 0) throw new TypeError(`daemon response.result.sessionIds[${index}] must be a non-empty string`); }); }
-  else if (kind === "viewer_snapshot") { requireKeys(result, ["kind", "snapshot"], [], "daemon response.result"); parseViewerSnapshot(result.snapshot); }
-  else { requireKeys(result, ["kind", "cursor"], [], "daemon response.result"); readViewerCursor(result.cursor, "daemon response.result.cursor"); }
+  else { requireKeys(result, ["kind", "cursor", "snapshot"], [], "daemon response.result"); readViewerCursor(result.cursor, "daemon response.result.cursor"); parseViewerSnapshot(result.snapshot); }
   return response;
+}
+
+/**
+ * Parse one strict version-1 viewer stream failure.
+ *
+ * The daemon publishes this when a subscription stops for a reason its reader has to act on: its
+ * bounded queue overflowed, or the session's normalized state was rebuilt from canonical history and
+ * the worker's tail. It is a frame rather than a second response because the establishing request was
+ * already answered, and a response frame for an answered request reaches no pending request at all.
+ * @param {unknown} value @returns {{ version: 1, kind: "viewer_stream_failed", sessionId: string, error: DashboardError }}
+ */
+export function parseViewerStreamFailed(value) {
+  const notification = readRecord(value, "viewer stream failure");
+  requireKeys(notification, ["version", "kind", "sessionId", "error"], [], "viewer stream failure");
+  if (notification.version !== 1) throw new TypeError("Viewer stream failure version must be 1");
+  if (notification.kind !== "viewer_stream_failed") throw new TypeError("Viewer stream failure kind must be viewer_stream_failed");
+  readIdentifier(notification, "sessionId", "viewer stream failure.sessionId");
+  validateError(notification.error, "viewer stream failure.error");
+  return /** @type {any} */ (notification);
 }
 
 /**

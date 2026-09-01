@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 
-import { parseClientRequest, parseDaemonResponse, parseListChanged } from "./contracts.mjs";
+import { parseClientRequest, parseDaemonResponse, parseListChanged, parseViewerStreamFailed } from "./contracts.mjs";
+
+const viewerCursor = { daemonEpoch: "epoch", sessionId: "session", sequence: "7" };
+const viewerSnapshot = {
+  version: 1, sessionId: "session", registryRevision: 2, cursor: viewerCursor, runtime: null,
+  taskState: "READY", processState: "LIVE", outcome: "NONE",
+  activity: { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "source", startedAt: "2026-01-01T00:00:00.000Z" },
+  model: null, thinkingLevel: null, items: [], tools: [], pendingUi: [], errors: [],
+};
 
 const envelope = { version: 1, clientId: "client-1", requestId: "request-1" };
 
@@ -20,8 +28,7 @@ const acceptedRequests = [
   ["delete", { sessionId: "session", revision: 2 }],
   ["respawn", { sessionId: "session", revision: 2 }],
   ["subscribe_list_changes", {}],
-  ["get_viewer_snapshot", { sessionId: "session" }],
-  ["subscribe_viewer", { sessionId: "session", after: { daemonEpoch: "epoch", sessionId: "session", sequence: "2" } }],
+  ["subscribe_viewer", { sessionId: "session" }],
   ["resolve_delivery", { targetClientId: "client", targetRequestId: "request", resolution: "abandon" }],
   ["get_session_commands", { sessionId: "session" }],
   ["get_settings", {}],
@@ -38,6 +45,9 @@ const acceptedRequests = [
 /** Every request the wire must refuse, beyond the per-variant unknown-field matrix. @type {Array<[string, string, Record<string, any>, RegExp]>} */
 const rejectedRequests = [
   ["the retired viewer acknowledgement operation", "ack_viewer", { cursor: { daemonEpoch: "epoch", sessionId: "session", sequence: "2" } }, /operation must be one of/u],
+  // The daemon keeps no viewer events, so there is nothing to fetch separately and nothing to resume from.
+  ["the retired separate snapshot read", "get_viewer_snapshot", { sessionId: "session" }, /operation must be one of/u],
+  ["a viewer resume cursor", "subscribe_viewer", { sessionId: "session", after: { daemonEpoch: "epoch", sessionId: "session", sequence: "2" } }, /unknown/iu],
   ["color outside the palette", "set_session_color", { sessionId: "session", color: "chartreuse" }, /color/iu],
   ["empty color", "set_session_color", { sessionId: "session", color: "" }, /color/iu],
   ["color without a session", "set_session_color", { color: "amber" }, /sessionId/iu],
@@ -94,6 +104,9 @@ const acceptedResponses = [
   ["session state reporting an adopted worker whose release is unknown", ok({ kind: "state", sessions: [{ ...sessionRecord, stale: true, routeGeneration: 1 }], cursor: coverage })],
   ["a respawn command status", ok({ kind: "command", status: { clientId: "client", requestId: "request", operation: "respawn", stage: "COMPLETED", acceptedAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" } })],
   ["the installed Pi's model catalog", ok(modelCatalog)],
+  // One answer opens the stream and carries the snapshot it continues, because nothing is retained
+  // that a second request could replay from.
+  ["a viewer subscription and the snapshot it continues", ok({ kind: "viewer_subscribed", cursor: viewerCursor, snapshot: viewerSnapshot })],
   ["an empty model catalog", ok({ kind: "models", models: [] })],
   ["typed failure", { version: 1, requestId: "request", ok: false, error: { code: "DENIED", message: "denied", retryable: false } }],
 ];
@@ -122,6 +135,8 @@ const rejectedResponses = [
   ["a catalog model with a non-boolean thinking flag", ok({ kind: "models", models: [{ provider: "anthropic", id: "claude", thinking: "yes" }] }), /thinking/iu],
   ["an unbounded model catalog", ok({ kind: "models", models: Array.from({ length: 2_001 }, (_, index) => ({ provider: "p", id: `m-${index}`, thinking: false })) }), /bounded/iu],
   ["unknown field on a failure", { version: 1, requestId: "request", ok: false, error: { code: "DENIED", message: "denied", retryable: false }, unknown: true }, /unknown/iu],
+  ["a viewer subscription without the snapshot it continues", ok({ kind: "viewer_subscribed", cursor: viewerCursor }), /snapshot is required/u],
+  ["a retired separate snapshot read", ok({ kind: "viewer_snapshot", snapshot: viewerSnapshot }), /kind/iu],
 ];
 
 describe("command contracts", () => {
@@ -170,6 +185,22 @@ describe("command contracts", () => {
   it("rejects every out-of-contract daemon response", () => {
     for (const [name, response, message] of rejectedResponses) {
       expect(() => parseDaemonResponse(response), name).toThrow(message);
+    }
+  });
+
+  // Operator-visible failure: a viewer whose stream stopped kept drawing the last state it had. The
+  // establishing request is already answered by then, so this is a frame of its own rather than a
+  // second response nothing would own.
+  it("accepts one viewer stream failure and refuses anything else on that frame", () => {
+    const failed = { version: 1, kind: "viewer_stream_failed", sessionId: "session", error: { code: "SUBSCRIBER_OVERFLOW", message: "bound reached", retryable: false } };
+    expect(parseViewerStreamFailed(failed)).toEqual(failed);
+    for (const [name, value] of [
+      ["no session", { version: 1, kind: "viewer_stream_failed", error: failed.error }],
+      ["no error", { version: 1, kind: "viewer_stream_failed", sessionId: "session" }],
+      ["an event carried on it", { ...failed, event: { eventId: "event-1" } }],
+      ["a version this release does not speak", { ...failed, version: 2 }],
+    ]) {
+      expect(() => parseViewerStreamFailed(value), /** @type {string} */ (name)).toThrow();
     }
   });
 

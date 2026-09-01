@@ -10,7 +10,7 @@ import { SessionCoordinator } from "./session-coordinator.mjs";
 import { createSessionHistoryReader, SessionHistoryError } from "./session-history.mjs";
 import { reduceSessionState } from "./state-reducer.mjs";
 import { createViewerNormalizer } from "./viewer-normalizer.mjs";
-import { createViewerStore } from "./viewer-store.mjs";
+import { createViewerStream } from "./viewer-stream.mjs";
 
 /** Frames the startup connection carries before its route is adopted. */
 const LAUNCH_CONTROL_TYPES = ["pi_child", "worker_ready"];
@@ -593,21 +593,28 @@ export class RecoveredWorkerRouter {
   }
 }
 
-/** Recover every per-session normalized stream before daemon mutation admission. @param {{ root: string, daemonEpoch: string, registry: RegistryStore }} options */
-async function createViewerRecovery({ root, daemonEpoch, registry }) {
-  const directory = join(root, "index", "viewer");
+/**
+ * Open every per-session normalized viewer read model before daemon mutation admission.
+ *
+ * Nothing here is durable. Completed history comes from Pi's own session file on every read, the
+ * frames Pi has not written there yet come from the worker's bounded tail, and the merge of the two
+ * is one normalizer per session held in this daemon's memory. A restart therefore rebuilds rather
+ * than recovers, and `index/viewer` is never opened.
+ * @param {{ daemonEpoch: string, registry: RegistryStore }} options
+ */
+async function createViewerRecovery({ daemonEpoch, registry }) {
   /** @type {Map<string, any>} */
   const sessions = new Map();
-  /** One in-flight open per session, so a second caller joins the first instead of building its own store. @type {Map<string, Promise<any>>} */
+  /** One in-flight open per session, so a second caller joins the first instead of building its own reader. @type {Map<string, Promise<any>>} */
   const opening = new Map();
 
   /** @param {any} state */
-  async function publish(state) {
+  async function snapshotState(state) {
     const current = await registry.get(state.sessionId);
     if (current === undefined) throw Object.assign(new Error(`Unknown viewer session: ${state.sessionId}`), { code: "SESSION_NOT_FOUND" });
-    const snapshot = state.normalizer.snapshot({
+    return state.normalizer.snapshot({
       daemonEpoch,
-      sequence: state.store.currentCursor().sequence,
+      sequence: state.stream.currentCursor().sequence,
       registryRevision: current.revision,
       runtime: current.runtime ?? null,
       model: current.model ?? null,
@@ -616,7 +623,6 @@ async function createViewerRecovery({ root, daemonEpoch, registry }) {
       processState: current.processState,
       outcome: current.outcome,
     });
-    return state.store.publishSnapshot(snapshot, state.normalizer.checkpoint());
   }
 
   /** @param {any} state */
@@ -624,23 +630,28 @@ async function createViewerRecovery({ root, daemonEpoch, registry }) {
     const history = await state.reader.read();
     for (const error of history.errors) state.normalizer.consumeError(error);
     for (const item of history.entries) {
-      const drafts = state.normalizer.consumeHistory(item.entry, { ...item.position, sourceId: item.sourceId });
-      for (const draft of drafts) {
-        try {
-          await state.store.append(draft);
-        } catch (error) {
-          // A published event is authoritative: frontends already consumed it at that cursor, so re-derived drift never rewrites history.
-          if (/** @type {any} */ (error)?.code !== "VIEWER_EVENT_ID_CONFLICT") throw error;
-        }
-      }
+      for (const draft of state.normalizer.consumeHistory(item.entry, { ...item.position, sourceId: item.sourceId })) state.stream.append(draft);
+    }
+  }
+
+  /** Open one no-follow reader over Pi's canonical file, or a reader that reports why it could not. @param {any} record @param {any} normalizer */
+  async function openHistoryReader(record, normalizer) {
+    try {
+      return await createSessionHistoryReader({ path: record.canonicalSessionFile });
+    } catch (error) {
+      const missing = /** @type {NodeJS.ErrnoException} */ (error)?.code === "ENOENT";
+      if (!missing && !(error instanceof SessionHistoryError)) throw error;
+      const historyError = /** @type {SessionHistoryError} */ (error);
+      normalizer.consumeError({ code: missing ? "SESSION_HISTORY_MISSING" : historyError.code, message: missing ? "Canonical session history is unavailable" : historyError.message, retryable: missing });
+      return { async read() { return { entries: [], errors: [], position: { byteOffset: 0, line: 0 } }; }, async close() {} };
     }
   }
 
   /**
    * Join whichever attempt is already opening this session, or start the only one. The in-flight
    * promise is recorded before this function's first await, so two concurrent callers cannot both
-   * reach openNewSession and drop the loser's event, checkpoint and history handles unclosed. A
-   * rejected attempt is forgotten rather than cached, so the next caller opens the session again.
+   * reach openNewSession and drop the loser's history handle unclosed. A rejected attempt is
+   * forgotten rather than cached, so the next caller opens the session again.
    * @param {any} record
    */
   async function openSession(record) {
@@ -655,35 +666,29 @@ async function createViewerRecovery({ root, daemonEpoch, registry }) {
 
   /** @param {any} record */
   async function openNewSession(record) {
-    const store = await createViewerStore({ directory, sessionId: record.sessionId, daemonEpoch });
+    const stream = createViewerStream({ sessionId: record.sessionId, daemonEpoch });
     const normalizer = createViewerNormalizer({ sessionId: record.sessionId, protocolVersion: 1, now: () => new Date().toISOString() });
-    let reader;
-    try {
-      reader = await createSessionHistoryReader({ path: record.canonicalSessionFile });
-    } catch (error) {
-      const missing = /** @type {NodeJS.ErrnoException} */ (error)?.code === "ENOENT";
-      if (!missing && !(error instanceof SessionHistoryError)) throw error;
-      const historyError = /** @type {SessionHistoryError} */ (error);
-      normalizer.consumeError({ code: missing ? "SESSION_HISTORY_MISSING" : historyError.code, message: missing ? "Canonical session history is unavailable" : historyError.message, retryable: missing });
-      reader = { async read() { return { entries: [], errors: [], position: { byteOffset: 0, line: 0 } }; }, async close() {} };
-    }
-    const state = { sessionId: record.sessionId, store, normalizer, reader };
+    const reader = await openHistoryReader(record, normalizer);
+    const state = { sessionId: record.sessionId, stream, normalizer, reader };
     sessions.set(record.sessionId, state);
-    const snapshot = await store.getSnapshot();
-    if (snapshot !== undefined) normalizer.restore(snapshot);
-    const replay = await store.replay(snapshot?.cursor);
-    for (const event of replay) normalizer.applyViewerEvent(event);
-    const checkpoint = await store.getCheckpoint();
-    if (checkpoint !== undefined) normalizer.restoreCheckpoint(checkpoint);
-    await readHistory(state);
-    await publish(state);
+    try {
+      await readHistory(state);
+    } catch (error) {
+      // Canonical history Pi wrote in a shape this normalizer refuses leaves no half-read session
+      // behind: the handle is closed and the map forgets it, so a later open reads the file again
+      // rather than serving the state this attempt stopped in the middle of.
+      sessions.delete(record.sessionId);
+      stream.close();
+      await reader.close().catch(() => {});
+      throw error;
+    }
     return state;
   }
 
   try {
     for (const record of await registry.list()) await openSession(record);
   } catch (error) {
-    await Promise.allSettled([...sessions.values()].flatMap((state) => [state.reader.close(), state.store.close()]));
+    await Promise.allSettled([...sessions.values()].map((state) => state.reader.close()));
     throw error;
   }
 
@@ -698,36 +703,37 @@ async function createViewerRecovery({ root, daemonEpoch, registry }) {
     async ingest(sessionId, frame) {
       const state = sessions.get(sessionId);
       if (state === undefined) throw Object.assign(new Error(`Unknown viewer session: ${sessionId}`), { code: "SESSION_NOT_FOUND" });
-      /** @type {any[]} */
-      const persisted = [];
-      for (const draft of state.normalizer.consumeFrame(frame)) persisted.push(await state.store.append(draft));
-      await publish(state);
-      return persisted;
+      return state.normalizer.consumeFrame(frame).map((/** @type {any} */ draft) => state.stream.append(draft));
     },
     /**
-     * One session's normalized transcript and cursor, read from memory. Unlike snapshot it reads no
-     * canonical history and publishes no snapshot, so background work never puts a durable write on
-     * a request the operator is waiting behind.
+     * One session's normalized transcript, read from memory. Unlike snapshot it reads no canonical
+     * history, so background work never puts file IO on a request the operator is waiting behind.
      * @param {string} sessionId
      */
     transcript(sessionId) {
       const state = sessions.get(sessionId);
       if (state === undefined) return undefined;
-      return { sequence: state.store.currentCursor().sequence, items: state.normalizer.transcriptItems() };
+      return { sequence: state.stream.currentCursor().sequence, items: state.normalizer.transcriptItems() };
     },
-    /** @param {string} sessionId */
-    async snapshot(sessionId) {
+    /**
+     * One snapshot and the subscription that continues it. Both are taken here, in one step, because
+     * an event published between them would be missing from the snapshot and from the subscription:
+     * nothing is retained to replay it from. The caller holds this session's frame lock, which is what
+     * an ingest takes, so no frame can land in that gap.
+     * @param {string} sessionId
+     */
+    async subscribe(sessionId) {
       const state = sessions.get(sessionId);
       if (state === undefined) throw Object.assign(new Error(`Unknown viewer session: ${sessionId}`), { code: "SESSION_NOT_FOUND" });
       await readHistory(state);
-      return publish(state);
+      const snapshot = await snapshotState(state);
+      return { snapshot, cursor: state.stream.currentCursor(), subscription: state.stream.subscribe() };
     },
-    /** @param {string} sessionId */
-    store(sessionId) { return sessions.get(sessionId)?.store; },
     async close() {
-      const results = await Promise.allSettled([...sessions.values()].flatMap((state) => [state.reader.close(), state.store.close()]));
+      for (const state of sessions.values()) state.stream.close();
+      const results = await Promise.allSettled([...sessions.values()].map((state) => state.reader.close()));
       const errors = results.filter((result) => result.status === "rejected").map((result) => result.reason);
-      if (errors.length > 0) throw new AggregateError(errors, "Viewer recovery stores closed with errors");
+      if (errors.length > 0) throw new AggregateError(errors, "Viewer history readers closed with errors");
     },
   };
 }
@@ -749,7 +755,7 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, waitForReco
     journal = await createCommandJournal({ path: journalPath });
     cancelled();
     await router.load();
-    viewer = await createViewerRecovery({ root, daemonEpoch, registry });
+    viewer = await createViewerRecovery({ daemonEpoch, registry });
     await onViewerReady(viewer);
     cancelled();
     /** Session records this recovery rewrote. The list is invalidated once for all of them. @type {any[]} */

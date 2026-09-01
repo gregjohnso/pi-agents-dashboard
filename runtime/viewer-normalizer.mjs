@@ -8,8 +8,8 @@ const MAX_TEXT_BYTES = 65_536;
  * Half of the 1 MiB control-socket frame bound the daemon and every frontend enforce
  * (`DEFAULT_MAX_BYTES`, runtime/daemon.mjs). A snapshot is one frame, and a session's transcript
  * grows without limit, so the newest items are kept within this budget and older ones are left to
- * the durable event stream and the canonical session file. The remaining half absorbs the response
- * envelope and the runtime block, so no amount of use can make a session's snapshot unsendable.
+ * Pi's canonical session file. The remaining half absorbs the response envelope and the runtime
+ * block, so no amount of use can make a session's snapshot unsendable.
  */
 const MAX_SNAPSHOT_BYTES = 512 * 1024;
 /** Newest session errors carried in a snapshot; each is bounded, their count was not. */
@@ -191,23 +191,6 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     throw new ViewerNormalizerError(code, error.message, sessionId);
   }
 
-  /** Return private restart state that is never part of the viewer v1 wire protocol. */
-  function checkpoint() {
-    return { activeAssistant: currentAssistant === undefined ? null : { itemId: currentAssistant.itemId, blocks: currentAssistant.blocks.flatMap((/** @type {any} */ block, /** @type {number} */ contentIndex) => block === undefined ? [] : [{ contentIndex, type: block.type, text: block.text }]) } };
-  }
-
-  /** @param {any} restored */
-  function restoreCheckpoint(restored) {
-    currentAssistant = undefined;
-    if (restored?.activeAssistant === null || restored?.activeAssistant === undefined) return;
-    const blocks = [];
-    for (const block of restored.activeAssistant.blocks) blocks[block.contentIndex] = { type: block.type, text: block.text };
-    const itemId = restored.activeAssistant.itemId;
-    currentAssistant = { itemId, blocks, delta: 0 };
-    const content = blocks.filter(Boolean).map((/** @type {any} */ block) => ({ ...block }));
-    if (content.length > 0 || items.has(itemId)) items.set(itemId, { kind: "assistant_message", itemId, content });
-  }
-
   /** @param {Record<string, unknown>} payload @param {string} [preferredId] @param {string} [at] */
   function publish(payload, preferredId, at = now()) {
     const eventId = preferredId ?? deterministicId(String(payload.kind), { index: ++liveIndex, payload });
@@ -216,7 +199,7 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     if (prior === serialized) return [];
     if (prior !== undefined) incompatible("VIEWER_EVENT_ID_CONFLICT", `Stable viewer event ID ${eventId} was reused with changed content`);
     emitted.set(eventId, serialized);
-    return [{ eventId, timestamp: at, payload, internalCheckpoint: checkpoint() }];
+    return [{ eventId, timestamp: at, payload }];
   }
 
   /** @param {string} phase @param {string} label @param {string} sourceEventId @param {Record<string, unknown>} [optional] */
@@ -500,54 +483,6 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     return publish({ kind: "unknown_pi_event", piType: bound(frame.type, 4_096), summary: bound(summary, MAX_SUMMARY_BYTES) }, sourceId, at);
   }
 
-  /** Apply one already-durable event while reconstructing normalizer state. @param {any} event */
-  function applyViewerEvent(event) {
-    if (event?.sessionId !== sessionId || typeof event.eventId !== "string" || record(event.payload) === undefined) incompatible("INVALID_VIEWER_EVENT", "Durable viewer event does not match the normalizer session");
-    const payload = event.payload;
-    emitted.set(event.eventId, canonical(payload));
-    if (["user_message", "assistant_message", "system_message"].includes(payload.kind)) {
-      items.set(payload.itemId, payload);
-      if (payload.kind === "assistant_message" && currentAssistant?.itemId === payload.itemId) currentAssistant = undefined;
-    } else if (["image_placeholder", "file_placeholder"].includes(payload.kind)) items.set(payload.attachment.id, payload);
-    else if (payload.kind === "unknown_pi_event") items.set(event.eventId, payload);
-    else if (payload.kind === "assistant_delta") {
-      if (currentAssistant?.itemId !== payload.itemId) currentAssistant = { itemId: payload.itemId, blocks: [], delta: 0 };
-      const block = currentAssistant.blocks[0] ?? { type: "text", text: "" };
-      block.text = bound(`${block.text}${payload.delta}`, MAX_TEXT_BYTES);
-      currentAssistant.blocks[0] = block;
-      currentAssistant.delta += 1;
-      items.set(payload.itemId, { kind: "assistant_message", itemId: payload.itemId, content: currentAssistant.blocks.filter(Boolean).map((/** @type {any} */ entry) => ({ ...entry })) });
-    } else if (["tool_started", "tool_updated", "tool_finished"].includes(payload.kind)) noteTool(payload.tool);
-    else if (payload.kind === "pending_ui_request") pendingUi.set(payload.request.id, payload.request);
-    else if (payload.kind === "ui_resolved") pendingUi.delete(payload.requestId);
-    else if (payload.kind === "model_state") model = payload.provider === null || payload.model === null ? null : { provider: payload.provider, id: payload.model };
-    else if (payload.kind === "thinking_state") thinkingLevel = payload.level;
-    else if (payload.kind === "activity") activity = payload;
-  }
-
-  /** Restore one validated published snapshot before applying newer durable events. @param {any} restored */
-  function restore(restored) {
-    if (restored?.sessionId !== sessionId) incompatible("VIEWER_SESSION_MISMATCH", "Viewer snapshot does not match the normalizer session");
-    items.clear(); tools.clear(); pendingUi.clear(); errors.splice(0);
-    for (const item of restored.items) {
-      if (item.itemId === SNAPSHOT_TRUNCATED_ITEM_ID) continue;
-      items.set(item.itemId ?? item.attachment?.id ?? deterministicId("restored-item", item), item);
-    }
-    for (const tool of restored.tools) noteTool(tool);
-    for (const request of restored.pendingUi) pendingUi.set(request.id, request);
-    errors.push(...restored.errors);
-    model = restored.model;
-    thinkingLevel = restored.thinkingLevel;
-    activity = restored.activity;
-    currentAssistant = undefined;
-    if (restored.activeAssistant !== undefined) restoreCheckpoint({ activeAssistant: restored.activeAssistant });
-    else if (["assistant_streaming", "thinking"].includes(activity.phase)) {
-      const assistants = restored.items.filter((/** @type {any} */ item) => item.kind === "assistant_message");
-      const partial = assistants.at(-1);
-      if (partial !== undefined) currentAssistant = { itemId: partial.itemId, blocks: partial.content.map((/** @type {any} */ block) => ({ ...block })), delta: 0 };
-    }
-  }
-
   /** Add one bounded canonical-history error to snapshot state. @param {any} error */
   function consumeError(error) {
     const candidate = { code: requiredString(error?.code, "SESSION_HISTORY_PARSE_ERROR"), message: bound(typeof error?.message === "string" ? error.message : "Canonical session history could not be parsed", MAX_SUMMARY_BYTES), retryable: error?.retryable === true };
@@ -613,5 +548,5 @@ export function createViewerNormalizer({ sessionId, protocolVersion, now }) {
     return [...items.values()];
   }
 
-  return { consumeHistory, consumeFrame, applyViewerEvent, restore, checkpoint, restoreCheckpoint, consumeError, snapshot, transcriptItems };
+  return { consumeHistory, consumeFrame, consumeError, snapshot, transcriptItems };
 }

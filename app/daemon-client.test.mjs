@@ -271,93 +271,92 @@ describe("daemon client", () => {
     expect(fatalErrors).toEqual([expect.objectContaining({ code: "MALFORMED_FRAME" })]);
   });
 
-  it("resumes a viewer subscription from the applied cursor, not the delivered one", async () => {
-    const socketPath = await socketPathIn("viewer-resume-");
-    /** @type {any[]} */
-    const subscriptions = [];
-    const zero = { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "0" };
-    const one = { ...zero, sequence: "1" };
-    const event = { version: 1, sessionId: "session-1", eventId: "event-1", cursor: one, timestamp: "2026-08-25T00:00:00.000Z", payload: { kind: "user_message", itemId: "user-1", content: [{ type: "text", text: "hello" }] } };
-    const server = await daemonServer(socketPath, ({ socket, request: incoming, reply }) => {
-      if (incoming.op !== "subscribe_viewer") return;
-      subscriptions.push(incoming.payload.after);
-      reply({ kind: "viewer_subscribed", cursor: incoming.payload.after });
-      if (subscriptions.length === 1) socket.write(encodeJsonl(event));
-    });
-    const client = startClient({ socketPath, reconnectDelayMs: 1, maxBytes: 4096 });
-    const subscription = client.subscribeViewer("session-1", zero)[Symbol.asyncIterator]();
-    await waitFor(() => subscriptions.length === 1);
-    await expect(within(subscription.next())).resolves.toMatchObject({ value: { eventId: "event-1" }, done: false });
+  const viewerCursor = { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "0" };
+  const viewerSnapshot = {
+    version: 1, sessionId: "session-1", registryRevision: 1, cursor: viewerCursor, runtime: null,
+    taskState: "READY", processState: "SLEEPING", outcome: "NONE",
+    activity: { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "source", startedAt: "2026-08-25T00:00:00.000Z" },
+    model: null, thinkingLevel: null, items: [], tools: [], pendingUi: [], errors: [],
+  };
+  const viewerEvent = { version: 1, sessionId: "session-1", eventId: "event-1", cursor: { ...viewerCursor, sequence: "1" }, timestamp: "2026-08-25T00:00:00.000Z", payload: { kind: "user_message", itemId: "user-1", content: [{ type: "text", text: "hello" }] } };
 
-    // Handed over is not applied: a drop here has to replay the event rather than skip it.
-    server.socket?.destroy();
-    await waitFor(() => subscriptions.length === 2);
-    expect(subscriptions[1]).toEqual(zero);
-
-    subscription.applied(one);
-    server.socket?.destroy();
-    await waitFor(() => subscriptions.length === 3);
-    expect(subscriptions[2]).toEqual(one);
-    await subscription.return?.();
-  });
-
-  // Operator-visible failure: a viewer whose socket broke while more events than the subscriber
-  // bound accumulated reconnected, was refused, and then sat on a frozen transcript while this
-  // client still reported the connection healthy. The list stopped doing this when it started
-  // awaiting its own subscription; the viewer kept sending one and reading nothing back.
-  it.each([
-    ["resumed subscription refused on reconnect", 2, "SUBSCRIBER_OVERFLOW", "Initial viewer replay exceeds the subscriber bound"],
-    ["first subscription refused outright", 1, "SESSION_NOT_FOUND", "Viewer session does not exist"],
-  ])("ends a viewer subscription with the daemon's refusal: %s", async (_name, refusedConnection, code, message) => {
-    const socketPath = await socketPathIn("viewer-refused-");
-    const zero = { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "0" };
-    /** @type {number[]} */
-    const subscriptions = [];
-    const server = await daemonServer(socketPath, ({ request: incoming, connection, reply, refuse }) => {
-      if (incoming.op !== "subscribe_viewer") return;
-      subscriptions.push(connection);
-      if (connection === refusedConnection) refuse({ code, message });
-      else reply({ kind: "viewer_subscribed", cursor: zero });
-    });
-    const client = startClient({ socketPath, reconnectDelayMs: 1, maxBytes: 4096 });
-    const subscription = client.subscribeViewer("session-1", zero)[Symbol.asyncIterator]();
-    const reading = subscription.next().then(() => "the refused subscription delivered an event", (/** @type {unknown} */ error) => error);
-    await waitFor(() => subscriptions.length === 1);
-    if (refusedConnection === 2) {
-      server.socket?.destroy();
-      await waitFor(() => subscriptions.length === 2);
-    }
-
-    // The reader was already waiting, so a refusal that only records itself still hangs it forever.
-    await expect(within(reading)).resolves.toMatchObject({ code, message });
-    await expect(within(subscription.next())).rejects.toMatchObject({ code });
-  });
-
-  it("gets viewer snapshots and subscribes by session cursor", async () => {
+  // The subscriber is registered before the request goes out, so an event the daemon writes in the
+  // same chunk as its answer is queued rather than dropped. Nothing retains it to replay.
+  it("opens one subscription that carries its own snapshot and queues events behind it", async () => {
     const socketPath = await socketPathIn("viewer-client-");
     /** @type {string[]} */
     const operations = [];
-    const zero = { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "0" };
-    const one = { ...zero, sequence: "1" };
-    const activity = { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "source", startedAt: "2026-08-25T00:00:00.000Z" };
-    const snapshot = { version: 1, sessionId: "session-1", registryRevision: 1, cursor: zero, runtime: null, taskState: "READY", processState: "SLEEPING", outcome: "NONE", activity, model: null, thinkingLevel: null, items: [], tools: [], pendingUi: [], errors: [] };
-    const event = { version: 1, sessionId: "session-1", eventId: "event-1", cursor: one, timestamp: "2026-08-25T00:00:00.000Z", payload: { kind: "user_message", itemId: "user-1", content: [{ type: "text", text: "hello" }] } };
     await daemonServer(socketPath, ({ socket, request: incoming, reply }) => {
       operations.push(incoming.op);
-      if (incoming.op === "get_viewer_snapshot") reply({ kind: "viewer_snapshot", snapshot });
-      else if (incoming.op === "subscribe_viewer") {
-        reply({ kind: "viewer_subscribed", cursor: zero });
-        socket.write(encodeJsonl(event));
-      }
+      if (incoming.op !== "subscribe_viewer") return;
+      expect(incoming.payload).toEqual({ sessionId: "session-1" });
+      socket.write(encodeJsonl({ version: 1, requestId: incoming.requestId, ok: true, result: { kind: "viewer_subscribed", cursor: viewerCursor, snapshot: viewerSnapshot } }) + encodeJsonl(viewerEvent));
     });
     const client = startClient({ socketPath, maxBytes: 4096 });
-    await expect(client.getViewerSnapshot("session-1")).resolves.toEqual(snapshot);
-    const iterator = client.subscribeViewer("session-1", zero)[Symbol.asyncIterator]();
-    const delivered = await within(iterator.next());
-    expect(delivered).toEqual({ value: event, done: false });
+    const subscription = client.subscribeViewer("session-1");
+    await expect(within(subscription.established)).resolves.toEqual(viewerSnapshot);
+    await expect(within(subscription.next())).resolves.toEqual({ value: viewerEvent, done: false });
+    expect(/** @type {Record<string, unknown>} */ (client).getViewerSnapshot).toBeUndefined();
     expect(/** @type {Record<string, unknown>} */ (client).ackViewer).toBeUndefined();
-    expect(operations).toEqual(["get_viewer_snapshot", "subscribe_viewer"]);
-    await iterator.return?.();
+    expect(operations).toEqual(["subscribe_viewer"]);
+    await subscription.return?.();
+  });
+
+  // Operator-visible failure: a viewer whose subscription the daemon refused sat on a frozen
+  // transcript while this client still reported the connection healthy. The list stopped doing this
+  // when it started awaiting its own subscription; the viewer kept sending one and reading nothing back.
+  it("ends a viewer subscription, and its snapshot, with the daemon's refusal", async () => {
+    const socketPath = await socketPathIn("viewer-refused-");
+    await daemonServer(socketPath, ({ request: incoming, refuse }) => {
+      if (incoming.op === "subscribe_viewer") refuse({ code: "SESSION_NOT_FOUND", message: "Viewer session does not exist" });
+    });
+    const client = startClient({ socketPath, reconnectDelayMs: 1, maxBytes: 4096 });
+    const subscription = client.subscribeViewer("session-1");
+    const reading = subscription.next().then(() => "the refused subscription delivered an event", (/** @type {unknown} */ error) => error);
+    // The reader was already waiting, so a refusal that only records itself still hangs it forever.
+    await expect(within(reading)).resolves.toMatchObject({ code: "SESSION_NOT_FOUND" });
+    await expect(within(subscription.established)).rejects.toMatchObject({ code: "SESSION_NOT_FOUND" });
+    await expect(within(subscription.next())).rejects.toMatchObject({ code: "SESSION_NOT_FOUND" });
+  });
+
+  // A viewer subscription dies with its connection and is never reopened here: only the reader that
+  // builds a transcript from a fresh snapshot can use a new one, and the daemon answers every
+  // subscription with one.
+  it("ends a viewer subscription when its connection drops instead of resubscribing", async () => {
+    const socketPath = await socketPathIn("viewer-dropped-");
+    /** @type {number[]} */
+    const subscriptions = [];
+    const server = await daemonServer(socketPath, ({ request: incoming, connection, reply }) => {
+      if (incoming.op !== "subscribe_viewer") return;
+      subscriptions.push(connection);
+      reply({ kind: "viewer_subscribed", cursor: viewerCursor, snapshot: viewerSnapshot });
+    });
+    const client = startClient({ socketPath, reconnectDelayMs: 1, maxBytes: 4096 });
+    const subscription = client.subscribeViewer("session-1");
+    await within(subscription.established);
+    const reading = subscription.next().then(() => "delivered", (/** @type {unknown} */ error) => error);
+
+    server.socket?.destroy();
+    await expect(within(reading)).resolves.toMatchObject({ code: "CONNECTION_CLOSED" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(subscriptions).toEqual([1]);
+  });
+
+  // The daemon publishes this frame when a stream stops for a reason its reader has to act on. It
+  // arrives after the establishing request was answered, so nothing else could carry it.
+  it("ends a viewer subscription on the daemon's stream-failure frame", async () => {
+    const socketPath = await socketPathIn("viewer-stream-failed-");
+    await daemonServer(socketPath, ({ socket, request: incoming, reply }) => {
+      if (incoming.op !== "subscribe_viewer") return;
+      reply({ kind: "viewer_subscribed", cursor: viewerCursor, snapshot: viewerSnapshot });
+      // After the snapshot has landed: a failure in the same chunk as the answer ends the
+      // subscription before its snapshot is delivered, which the refusal above already covers.
+      setTimeout(() => socket.write(encodeJsonl({ version: 1, kind: "viewer_stream_failed", sessionId: "session-1", error: { code: "SUBSCRIBER_OVERFLOW", message: "Viewer subscriber exceeded its bounded queue", retryable: false } })), 0);
+    });
+    const client = startClient({ socketPath, maxBytes: 4096 });
+    const subscription = client.subscribeViewer("session-1");
+    await within(subscription.established);
+    await expect(within(subscription.next())).rejects.toMatchObject({ code: "SUBSCRIBER_OVERFLOW" });
   });
 
   it("reports the daemon going away and coming back", async () => {
@@ -395,9 +394,9 @@ describe("daemon client", () => {
     const cursor = { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "0" };
     const activity = { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "source", startedAt: "2026-08-25T00:00:00.000Z" };
     const snapshot = { version: 1, sessionId: "session-1", registryRevision: 1, cursor, runtime: null, taskState: "READY", processState: "SLEEPING", outcome: "NONE", activity, model: null, thinkingLevel: null, items: [{ kind: "assistant_message", itemId: "answer", content: Array.from({ length: 10 }, () => ({ type: "text", text: "x".repeat(60_000) })) }], tools: [], pendingUi: [], errors: [] };
-    const server = await daemonServer(socketPath, ({ reply }) => reply({ kind: "viewer_snapshot", snapshot }));
+    const server = await daemonServer(socketPath, ({ reply }) => reply({ kind: "viewer_subscribed", cursor, snapshot }));
     const client = startClient({ socketPath, maxBytes: 1024 * 1024 });
-    const read = (/** @type {string} */ requestId) => client.request({ version: 1, clientId: "client-1", requestId, op: "get_viewer_snapshot", payload: { sessionId: "session-1" } });
+    const read = (/** @type {string} */ requestId) => client.request({ version: 1, clientId: "client-1", requestId, op: "subscribe_viewer", payload: { sessionId: "session-1" } });
     for (let index = 0; index < 8; index += 1) await read(`snapshot-${index}`);
     const answered = server.requests;
 

@@ -20,19 +20,71 @@ function editor() {
   let text = "";
   return { focused: false, disableSubmit: false, onSubmit: undefined, onChange: undefined, autocompleteProvider: undefined, setAutocompleteProvider(provider) { this.autocompleteProvider = provider; }, setText(value) { text = value; this.onChange?.(value); }, getText() { return text; }, addToHistory: vi.fn(), handleInput(data) { if (data === "\r") this.onSubmit?.(text); else if (data.length === 1 && data >= " ") { text += data; this.onChange?.(text); } }, render: () => [`> ${text}`] };
 }
+/**
+ * One subscription's event queue, read by the controller's own pump rather than by a listener this
+ * fixture calls. A double that hands events straight to `processEvent` cannot fail the way the pump
+ * fails, and the pump is what turns a stream failure into a rebuild.
+ */
+function createSubscription(order) {
+  /** @type {any[]} */
+  const queue = [];
+  /** @type {any} */
+  let waiter;
+  /** @type {unknown} */
+  let failure;
+  let ended = false;
+  const events = {
+    async next() {
+      if (queue.length > 0) return { value: queue.shift(), done: false };
+      if (failure !== undefined) { const raised = failure; failure = undefined; throw raised; }
+      if (ended) return { value: undefined, done: true };
+      return new Promise((resolve, reject) => { waiter = { resolve, reject }; });
+    },
+    async return() {
+      if (!ended) order.push("unsubscribe");
+      ended = true;
+      waiter?.resolve({ value: undefined, done: true });
+      waiter = undefined;
+      return { value: undefined, done: true };
+    },
+  };
+  return {
+    events,
+    unsubscribe() { void events.return(); },
+    /** @param {any} event */
+    push(event) {
+      if (waiter === undefined) { queue.push(event); return; }
+      const waiting = waiter;
+      waiter = undefined;
+      waiting.resolve({ value: event, done: false });
+    },
+    /** @param {unknown} raised */
+    fail(raised) {
+      if (waiter === undefined) { failure = raised; return; }
+      const waiting = waiter;
+      waiter = undefined;
+      waiting.reject(raised);
+    },
+    get ended() { return ended; },
+  };
+}
+
 function fixture(overrides = {}) {
-  let listener;
-  let streamError;
   let connectionListener;
   const commands = [];
   const order = [];
   const saved = [];
   const attached = [];
-  const subscribed = [];
+  /** @type {any[]} */
+  const subscriptions = [];
   let snapshots = 0;
   const client = {
-    async getSnapshot() { order.push("snapshot"); return snapshot(typeof overrides.snapshot === "function" ? overrides.snapshot(snapshots++) : overrides.snapshot); },
-    subscribe(_sessionId, cursor, next, onError) { subscribed.push(cursor); listener = next; streamError = onError; return () => order.push("unsubscribe"); },
+    async subscribe() {
+      order.push("snapshot");
+      const subscription = createSubscription(order);
+      subscriptions.push(subscription);
+      return { snapshot: snapshot(typeof overrides.snapshot === "function" ? overrides.snapshot(snapshots++) : overrides.snapshot), events: subscription.events, unsubscribe: () => subscription.unsubscribe() };
+    },
     onConnectionChange(next) { connectionListener = next; return () => { connectionListener = undefined; }; },
     ...(overrides.attach === undefined ? {} : { attach: async (sessionId) => { attached.push(sessionId); return overrides.attach(sessionId); } }),
     async command(operation, payload) { commands.push({ operation, payload }); return overrides.command?.(operation, payload); },
@@ -44,7 +96,34 @@ function fixture(overrides = {}) {
   const persistence = { async load() { return overrides.persisted; }, async save(value) { await overrides.save?.(value); saved.push(structuredClone(value)); order.push(`persist:${value.cursor?.sequence ?? "draft"}`); } };
   const dashboard = [];
   const instance = new ViewerController({ sessionId: "s", client, editor: overrides.editor ?? editor(), persistence, requestRender: async () => { order.push("render"); }, onReturn: vi.fn(), now: () => 0, onDashboardAction: (action) => dashboard.push(action) });
-  return { instance, client, commands, order, saved, dashboard, attached, subscribed, emit: (event) => listener(event), refuseStream: (error) => streamError(error), connection: (status) => connectionListener(status) };
+  // Observe the pump: `emit` and `refuseStream` settle exactly as the controller's own handling of
+  // that event or failure settled, so a test never polls for work the pump has already finished.
+  /** @param {string} method @returns {() => any} */
+  const observe = (method) => {
+    const original = instance[method].bind(instance);
+    /** @type {any} */
+    let settled;
+    instance[method] = async (/** @type {any} */ value) => {
+      try {
+        const result = await original(value);
+        settled?.resolve(result);
+        return result;
+      } catch (error) {
+        settled?.reject(error);
+        throw error;
+      }
+    };
+    return (/** @type {any} */ handler) => new Promise((resolve, reject) => { settled = { resolve, reject }; handler(); });
+  };
+  const onProcessed = observe("processEvent");
+  const onStreamFailed = observe("streamFailed");
+  const live = () => subscriptions.filter((subscription) => !subscription.ended).at(-1) ?? subscriptions.at(-1);
+  return {
+    instance, client, commands, order, saved, dashboard, attached, subscriptions,
+    emit: (event) => onProcessed(() => live().push(event)),
+    refuseStream: (error) => onStreamFailed(() => live().fail(error)),
+    connection: (status) => connectionListener(status),
+  };
 }
 
 describe("viewer commands", () => {
@@ -140,7 +219,7 @@ describe("viewer commands", () => {
   it("records why an open failed before it closes", async () => {
     const failure = Object.assign(new Error("Unknown viewer session"), { code: "SESSION_NOT_FOUND" });
     const f = fixture();
-    f.client.getSnapshot = async () => { throw failure; };
+    f.client.subscribe = async () => { throw failure; };
     await expect(f.instance.open()).rejects.toThrow(failure);
     expect(f.instance.openError).toBe(failure);
   });
@@ -410,38 +489,21 @@ describe("viewer rendering and navigation", () => {
     expect(matrix).toMatchSnapshot();
   });
 
-  it("replays from origin into exact message/tool chronology before continuing live without a gap", async () => {
-    const base = snapshot({
-      items: [
-        { kind: "user_message", itemId: "u1", content: [{ type: "text", text: "one" }] },
-        { kind: "assistant_message", itemId: "a1", content: [{ type: "text", text: "calling" }] },
-        { kind: "assistant_message", itemId: "a2", content: [{ type: "text", text: "done" }] },
-      ],
-      tools: [{ id: "tool", name: "bash", state: "completed", arguments: {}, result: [{ type: "text", text: "ok" }], startedAt: timestamp, finishedAt: timestamp }],
-      cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "4" },
-    });
-    const payloads = [
-      { kind: "user_message", itemId: "u1", content: [{ type: "text", text: "one" }] },
-      { kind: "assistant_message", itemId: "a1", content: [{ type: "text", text: "calling" }] },
-      { kind: "tool_finished", tool: base.tools[0] },
-      { kind: "assistant_message", itemId: "a2", content: [{ type: "text", text: "done" }] },
-      { kind: "system_message", itemId: "live", text: "live after snapshot", level: "info" },
-    ];
-    const client = {
-      replayFromOrigin: true,
-      async getSnapshot() { return base; },
-      async subscribe(_sessionId, cursor, next) {
-        expect(cursor.sequence).toBe("0");
-        for (const [index, payload] of payloads.entries()) await next({ version: 1, sessionId: "s", eventId: `ordered-${index + 1}`, cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: String(index + 1) }, timestamp, payload });
-        return () => {};
+  // The snapshot a subscription carries is the transcript's start, and events continue it. Nothing
+  // replays, so an event that arrives while this viewer is still building state waits in the
+  // subscription's queue rather than being dropped or applied out of order.
+  it("continues the subscription's own snapshot with events queued while it was building", async () => {
+    const f = fixture({
+      snapshot: {
+        items: [{ kind: "user_message", itemId: "u1", content: [{ type: "text", text: "one" }] }],
+        cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "4" },
       },
-      async command() {},
-    };
-    const instance = new ViewerController({ sessionId: "s", client, editor: editor(), persistence: { async load() {}, async save() {} }, requestRender: async () => {} });
-    await instance.open();
-    expect(instance.state.items.map((item) => item.itemId)).toEqual(["u1", "a1", "tool:tool", "a2", "live"]);
-    expect(instance.state.cursor.sequence).toBe("5");
-    await instance.close();
+    });
+    await f.instance.open();
+    await f.emit({ version: 1, sessionId: "s", eventId: "ordered-5", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "5" }, timestamp, payload: { kind: "assistant_message", itemId: "a1", content: [{ type: "text", text: "live after snapshot" }] } });
+    expect(f.instance.state.items.map((item) => item.itemId)).toEqual(["u1", "a1"]);
+    expect(f.instance.state.cursor.sequence).toBe("5");
+    await f.instance.close();
   });
 
   it("stops a working agent with Escape and leaves on the next one, draft and all", async () => {
@@ -508,8 +570,7 @@ describe("frontend resume across a reconnect", () => {
     await f.connection({ connected: false });
     await f.connection({ connected: true });
 
-    expect(identities(f.instance)).toEqual([identity]);
-    expect(f.subscribed.at(-1)).toEqual(at);
+expect(identities(f.instance)).toEqual([identity]);
     expect(f.order.filter((entry) => entry.startsWith("ack:"))).toEqual([]);
   });
 
@@ -535,7 +596,6 @@ describe("frontend resume across a reconnect", () => {
     await f.connection({ connected: false });
     await f.connection({ connected: true });
 
-    expect(f.subscribed.at(-1)).toEqual(at);
     await f.emit({ version: 1, sessionId: "s", eventId: "next", cursor: { ...at, sequence: "2" }, timestamp, payload: { kind: "system_message", itemId: "n", text: "after the drop", level: "info" } });
     expect(identities(f.instance)).toEqual([identity, "n"]);
     expect(f.order.filter((entry) => entry.startsWith("ack:"))).toEqual([]);
@@ -694,12 +754,12 @@ describe("refused viewer subscription", () => {
     expect(view()).toContain("Working");
 
     await f.refuseStream(overflow());
-    expect(f.subscribed).toHaveLength(2);
+    expect(f.subscriptions).toHaveLength(2);
     expect(f.order.filter((entry) => entry === "snapshot")).toHaveLength(2);
 
     // A refusal answered by another reload is a request loop, so the second one is the operator's.
     await f.refuseStream(overflow());
-    expect(f.subscribed).toHaveLength(2);
+    expect(f.subscriptions).toHaveLength(2);
     expect(view()).toContain("SUBSCRIBER_OVERFLOW");
     expect(view()).toContain("Transcript stopped");
     expect(view()).not.toContain("Working");
@@ -710,7 +770,7 @@ describe("refused viewer subscription", () => {
     const f = fixture();
     await f.instance.open();
     const gone = Object.assign(new Error("Viewer session does not exist"), { code: "SESSION_NOT_FOUND" });
-    f.client.getSnapshot = async () => { throw gone; };
+    f.client.subscribe = async () => { throw gone; };
 
     await f.refuseStream(gone);
 

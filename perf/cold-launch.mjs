@@ -169,7 +169,7 @@ async function main() {
       const state = await request("get_state", {});
       const row = state.sessions.find((/** @type {any} */ record) => record.sessionId === sessionId);
       if (row?.processState === "LIVE" && row.runtime !== undefined) {
-        await request("get_viewer_snapshot", { sessionId });
+        await request("subscribe_viewer", { sessionId });
         firstUsableSnapshotAt = Date.now();
         readyRow = row;
         break;

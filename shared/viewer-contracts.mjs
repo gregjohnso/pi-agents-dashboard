@@ -99,17 +99,19 @@ export function parseViewerEvent(value) {
   string(event.sessionId, "viewer event.sessionId"); string(event.eventId, "viewer event.eventId"); string(event.timestamp, "viewer event.timestamp"); const parsedCursor = cursor(event.cursor, "viewer event.cursor"); if (parsedCursor.sessionId !== event.sessionId) throw new TypeError("viewer cursor session does not match event session"); payload(event.payload, "viewer event.payload"); return /** @type {ViewerEvent} */ (event);
 }
 
-/** Parse one strict normalized viewer snapshot. @param {unknown} value @returns {ViewerSnapshot} */
+/**
+ * Parse one strict normalized viewer snapshot.
+ *
+ * A snapshot is built for one response and never stored, so every key here is one both sides of the
+ * current frontend protocol send.
+ * @param {unknown} value @returns {ViewerSnapshot}
+ */
 export function parseViewerSnapshot(value) {
-  // `role` is a retired key. The operator's index/viewer/*.snapshot.json files carry one, so it is
-  // accepted for recovery and dropped below; no viewer, editor, or republished snapshot sees it.
-  const snapshot = record(value, "viewer snapshot"); exact(snapshot, ["version", "sessionId", "registryRevision", "cursor", "runtime", "taskState", "processState", "outcome", "activity", "model", "thinkingLevel", "items", "tools", "pendingUi", "errors"], ["role"], "viewer snapshot"); if (snapshot.version !== 1) throw new TypeError("viewer snapshot.version must be 1");
+  const snapshot = record(value, "viewer snapshot"); exact(snapshot, ["version", "sessionId", "registryRevision", "cursor", "runtime", "taskState", "processState", "outcome", "activity", "model", "thinkingLevel", "items", "tools", "pendingUi", "errors"], [], "viewer snapshot"); if (snapshot.version !== 1) throw new TypeError("viewer snapshot.version must be 1");
   string(snapshot.sessionId, "viewer snapshot.sessionId"); if (!Number.isSafeInteger(snapshot.registryRevision) || snapshot.registryRevision < 0) throw new TypeError("viewer snapshot.registryRevision is invalid"); const parsedCursor = cursor(snapshot.cursor, "viewer snapshot.cursor"); if (parsedCursor.sessionId !== snapshot.sessionId) throw new TypeError("viewer cursor session does not match snapshot session");
   if (snapshot.runtime !== null) runtime(snapshot.runtime, "viewer snapshot.runtime"); enumeration(snapshot.taskState, ["WORKING", "WAITING", "READY", "FAILED", "STOPPED"], "viewer snapshot.taskState"); enumeration(snapshot.processState, ["LIVE", "SLEEPING", "EXITED", "STALE"], "viewer snapshot.processState"); enumeration(snapshot.outcome, ["NONE", "COMPLETED", "READY_FOR_REVIEW"], "viewer snapshot.outcome");
   const activity = payload(snapshot.activity, "viewer snapshot.activity"); if (activity.kind !== "activity") throw new TypeError("viewer snapshot.activity must be activity");
   if (snapshot.model !== null) { const model = record(snapshot.model, "viewer snapshot.model"); exact(model, ["provider", "id"], [], "viewer snapshot.model"); string(model.provider, "viewer snapshot.model.provider"); string(model.id, "viewer snapshot.model.id"); } string(snapshot.thinkingLevel, "viewer snapshot.thinkingLevel", true);
   if (!Array.isArray(snapshot.items) || !Array.isArray(snapshot.tools) || !Array.isArray(snapshot.pendingUi) || !Array.isArray(snapshot.errors)) throw new TypeError("viewer snapshot collections must be arrays"); snapshot.items.forEach((item, index) => { const parsed = payload(item, `viewer snapshot.items[${index}]`); if (!ITEM_KINDS.includes(parsed.kind)) throw new TypeError(`viewer snapshot.items[${index}] is not a viewer item`); }); snapshot.tools.forEach((item, index) => tool(item, `viewer snapshot.tools[${index}]`)); snapshot.pendingUi.forEach((item, index) => uiRequest(item, `viewer snapshot.pendingUi[${index}]`)); snapshot.errors.forEach((entry, index) => { const error = record(entry, `viewer snapshot.errors[${index}]`); exact(error, ["code", "message", "retryable"], [], `viewer snapshot.errors[${index}]`); string(error.code, `viewer snapshot.errors[${index}].code`); if (typeof error.message !== "string" || typeof error.retryable !== "boolean") throw new TypeError(`viewer snapshot.errors[${index}] is invalid`); });
-  if (!Object.hasOwn(snapshot, "role")) return snapshot;
-  const { role: _retiredRole, ...current } = snapshot;
-  return current;
+  return snapshot;
 }

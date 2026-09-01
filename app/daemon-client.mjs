@@ -1,7 +1,7 @@
 import net from "node:net";
 import { randomUUID } from "node:crypto";
 import { createJsonlDecoder, createJsonlEncoder } from "../runtime/jsonl.mjs";
-import { CLIENT_PROTOCOL, parseDaemonResponse, parseListChanged } from "../shared/contracts.mjs";
+import { CLIENT_PROTOCOL, parseDaemonResponse, parseListChanged, parseViewerStreamFailed } from "../shared/contracts.mjs";
 import { parseViewerEvent, parseViewerSnapshot } from "../shared/viewer-contracts.mjs";
 /**
  * How much answered-request history one client keeps to deduplicate a repeated request ID.
@@ -29,11 +29,6 @@ function canonical(value) {
         return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonical(record[key])}`).join(",")}}`;
     }
     return JSON.stringify(value) ?? "undefined";
-}
-function laterViewerCursor(current, candidate) {
-    if (current === undefined || current.daemonEpoch !== candidate.daemonEpoch || current.sessionId !== candidate.sessionId)
-        return candidate;
-    return BigInt(candidate.sequence) >= BigInt(current.sequence) ? candidate : current;
 }
 /** Create a bounded JSONL daemon client with optional reconnect-and-replay behavior. */
 export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelayMs = 50, maxReconnectDelayMs = 1_000, clientId, attachId = undefined, subscriberLimit = 100, reconnect = true, }) {
@@ -145,46 +140,42 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
             pending.delete(subscriber.subscribeRequestId);
             subscriber.subscribeRequestId = undefined;
         }
+        subscriber.rejectSnapshot(subscriber.error ?? new DaemonClientError("VIEWER_SUBSCRIPTION_ENDED", "Viewer subscription ended before the daemon answered"));
         wakeViewerSubscriber(subscriber);
     };
     /**
-     * Establish or re-establish one viewer subscription through a tracked request, so the daemon's
-     * answer has an owner. Sent fire-and-forget, a refusal — a replay past the subscriber bound, a
-     * session the daemon no longer holds, a cursor from a dead epoch — reached the response dispatcher,
-     * matched no pending request and was dropped, leaving the viewer reading a stream nobody opened.
+     * Establish one viewer subscription through a tracked request, so the daemon's answer has an
+     * owner. Sent fire-and-forget, a refusal reached the response dispatcher, matched no pending
+     * request and was dropped, leaving the viewer reading a stream nobody opened. The accepted answer
+     * carries the snapshot this subscription continues, which the reader awaits before it reads any
+     * event: events that arrive first are already queued behind it.
      * @param {any} subscriber
      */
     const sendViewerSubscribe = (subscriber) => {
         const requestId = randomUUID();
         subscriber.subscribeRequestId = requestId;
-        const payload = { sessionId: subscriber.sessionId, ...(subscriber.resumeAfter === undefined ? {} : { after: subscriber.resumeAfter }) };
-        void client.request({ version: 1, clientId, requestId, op: "subscribe_viewer", payload }).then((response) => {
-            if (subscriber.subscribeRequestId !== requestId || response.ok)
+        void client.request({ version: 1, clientId, requestId, op: "subscribe_viewer", payload: { sessionId: subscriber.sessionId } }).then((response) => {
+            if (subscriber.subscribeRequestId !== requestId)
                 return;
-            endViewerSubscriber(subscriber, new DaemonClientError(response.error.code, response.error.message));
+            if (!response.ok) {
+                endViewerSubscriber(subscriber, new DaemonClientError(response.error.code, response.error.message));
+                return;
+            }
+            subscriber.subscribeRequestId = undefined;
+            try {
+                subscriber.resolveSnapshot(parseViewerSnapshot(response.result.snapshot));
+            }
+            catch (error) {
+                endViewerSubscriber(subscriber, error);
+            }
         }, (/** @type {unknown} */ error) => {
             if (subscriber.subscribeRequestId === requestId) endViewerSubscriber(subscriber, error);
         });
-    };
-    /**
-     * A viewer subscription belongs to the connection that accepted it, so its establishing request
-     * does too. Resending that request with the rest of the pending work would leave the daemon
-     * holding two accepted subscriptions for one reader, each delivering every event; the reconnect
-     * issues exactly one fresh request per subscriber instead.
-     */
-    const dropViewerSubscribeRequests = () => {
-        for (const subscriber of viewerSubscribers) {
-            if (subscriber.subscribeRequestId === undefined)
-                continue;
-            pending.delete(subscriber.subscribeRequestId);
-            subscriber.subscribeRequestId = undefined;
-        }
     };
     const sendSubscriptions = () => {
         for (const subscriber of listSubscribers) {
             if (subscriber.established) resubscribeListChanges(subscriber);
         }
-        for (const subscriber of viewerSubscribers) sendViewerSubscribe(subscriber);
     };
     const dispatchViewerEvent = (event) => {
         for (const subscriber of viewerSubscribers) {
@@ -253,7 +244,6 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                         if (authentication !== null && authentication.kind === "authenticated" && authentication.version === 1) {
                             authenticated = true;
                             everConnected = true;
-                            dropViewerSubscribeRequests();
                             for (const item of pending.values())
                                 sendPending(item);
                             sendSubscriptions();
@@ -305,6 +295,12 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
                     else if (typeof record === "object" && record !== null && Object.hasOwn(record, "eventId")) {
                         dispatchViewerEvent(parseViewerEvent(record));
                     }
+                    else if (typeof record === "object" && record !== null && /** @type {any} */ (record).kind === "viewer_stream_failed") {
+                        const failed = parseViewerStreamFailed(record);
+                        for (const subscriber of [...viewerSubscribers]) {
+                            if (subscriber.sessionId === failed.sessionId) endViewerSubscriber(subscriber, new DaemonClientError(failed.error.code, failed.error.message));
+                        }
+                    }
                     else {
                         parseListChanged(record);
                         for (const subscriber of [...listSubscribers]) subscriber.onChanged();
@@ -326,12 +322,15 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
             reportConnection(false);
             const closedError = (submitted = false) => Object.assign(new DaemonClientError("CONNECTION_CLOSED", "Daemon connection closed"), { submitted });
             failAttempt(closedError());
+            // A viewer subscription dies with its connection and is never reopened here: the daemon
+            // answers a new one with a fresh snapshot, and only the reader that builds a transcript
+            // from that snapshot can use it. The reader is told, and it reopens.
+            for (const subscriber of [...viewerSubscribers]) endViewerSubscriber(subscriber, closedError());
+            viewerSubscribers.clear();
             if (!reconnect) {
                 for (const item of pending.values()) item.reject(closedError(item.sent));
                 pending.clear();
                 listSubscribers.clear();
-                for (const subscriber of [...viewerSubscribers]) endViewerSubscriber(subscriber, closedError());
-                viewerSubscribers.clear();
             }
             else if (!closed && hasWork()) void startReconnectLoop().catch(() => { });
         });
@@ -460,30 +459,31 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
         async getModels() {
             return (await requestResult("get_models", {})).models;
         },
-        async getViewerSnapshot(sessionId) {
+        /**
+         * Open one viewer subscription and the snapshot it continues.
+         *
+         * The subscriber is registered before the request is sent, so an event the daemon publishes in
+         * the same chunk as its answer is queued rather than dropped. `established` resolves with that
+         * answer's snapshot; the caller builds its transcript from it and then reads this iterator.
+         */
+        subscribeViewer(sessionId) {
             if (typeof sessionId !== "string" || sessionId.length === 0)
                 throw new TypeError("sessionId is required");
-            return parseViewerSnapshot((await requestResult("get_viewer_snapshot", { sessionId })).snapshot);
-        },
-        subscribeViewer(sessionId, after) {
-            if (typeof sessionId !== "string" || sessionId.length === 0)
-                throw new TypeError("sessionId is required");
-            if (after !== undefined && after.sessionId !== sessionId)
-                throw new DaemonClientError("VIEWER_SESSION_MISMATCH", "Viewer cursor belongs to another session");
-            const subscriber = { sessionId, resumeAfter: after, queue: [], ended: closed };
-            if (!closed) {
+            /** @type {any} */
+            const subscriber = { sessionId, queue: [], ended: closed, resolveSnapshot: () => { }, rejectSnapshot: () => { } };
+            /** @type {Promise<any>} */
+            const established = new Promise((resolve, reject) => {
+                subscriber.resolveSnapshot = resolve;
+                subscriber.rejectSnapshot = reject;
+            });
+            established.catch(() => { });
+            if (closed)
+                subscriber.rejectSnapshot(new DaemonClientError("CLIENT_CLOSED", "Daemon client is closed"));
+            else {
                 viewerSubscribers.add(subscriber);
                 sendViewerSubscribe(subscriber);
             }
-            return {
-                ...subscriberIterable(subscriber),
-                /**
-                 * Move the cursor this subscription resumes from after a reconnect. The daemon holds
-                 * no viewer cursor for this client, so the consumer calls this once it has applied
-                 * the event; a drop before that replays the event instead of skipping it.
-                 */
-                applied(cursor) { subscriber.resumeAfter = laterViewerCursor(subscriber.resumeAfter, cursor); },
-            };
+            return { established, ...subscriberIterable(subscriber) };
         },
         onFatalError(listener) {
             fatalErrorListeners.add(listener);

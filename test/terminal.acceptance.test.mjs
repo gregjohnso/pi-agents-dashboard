@@ -118,17 +118,39 @@ function editor() {
 }
 
 function viewerFixture(snapshotOverrides = {}, options = {}) {
-  let listener;
+  /** @type {any} */
+  let waiter;
+  /** @type {any[]} */
+  const queue = [];
   const commands = [];
+  const events = {
+    async next() {
+      if (queue.length > 0) return { value: queue.shift(), done: false };
+      return new Promise((resolve) => { waiter = resolve; });
+    },
+    async return() { return { value: undefined, done: true }; },
+  };
   const client = {
-    async getSnapshot() { return viewerSnapshot(snapshotOverrides); },
-    subscribe(_sessionId, _cursor, next) { listener = next; return () => {}; },
+    async subscribe() { return { snapshot: viewerSnapshot(snapshotOverrides), events, unsubscribe() {} }; },
     async command(operation, payload) { commands.push({ operation, payload }); },
   };
   const persistence = { async load() {}, async save() {} };
   const onReturn = options.onReturn ?? vi.fn();
   const controller = new ViewerController({ sessionId: "viewer-session", client, editor: editor(), persistence, onReturn, requestRender: () => {}, now: options.now ?? (() => Date.parse(timestamp)) });
-  return { commands, controller, emit: (event) => listener(event), onReturn };
+  // The controller's own pump reads these, so a test drives the same path the daemon client feeds.
+  const emit = (value) => {
+    const settled = new Promise((resolve, reject) => {
+      const processEvent = controller.processEvent.bind(controller);
+      controller.processEvent = async (incoming) => {
+        controller.processEvent = processEvent;
+        try { const result = await processEvent(incoming); resolve(result); return result; } catch (error) { reject(error); throw error; }
+      };
+    });
+    if (waiter === undefined) queue.push(value);
+    else { const resume = waiter; waiter = undefined; resume({ value, done: false }); }
+    return settled;
+  };
+  return { commands, controller, emit, onReturn };
 }
 
 function event(sequence, payload) {

@@ -267,7 +267,7 @@ it("shows a replacement as work in progress on the row and in the transcript", a
   expect(row).not.toContain("EXITED");
   expect(row).toContain("Replacing this session's worker");
 
-  frontend.send(request("client", "visible-snapshot", "get_viewer_snapshot", { sessionId: session.sessionId }));
+  frontend.send(request("client", "visible-snapshot", "subscribe_viewer", { sessionId: session.sessionId }));
   const snapshot = await frontend.next();
   expect(snapshot.result.snapshot.items.map((item) => item.text ?? "").join("\n")).toContain("Restarting this session's worker");
   frontend.close();

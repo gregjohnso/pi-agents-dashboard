@@ -509,14 +509,11 @@ it("selects sessions to summarize without republishing a durable viewer snapshot
   client.send({ version: 1, clientId: "viewer", requestId: "settings-quiet", op: "set_settings", payload: { summaryModel: { provider: "anthropic", id: "haiku" } } });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "settings" } });
 
-  // Selection must stay a memory read: republishing one snapshot per session put a durable write per
-  // session on the request the frontend makes when it returns to the list.
-  const snapshotPath = join(stateRoot, "index", "viewer", `${createHash("sha256").update("quiet").digest("hex")}.snapshot.json`);
-  // atomicWriteJson renames a fresh temporary file into place, so a republish always changes the inode.
-  const before = await stat(snapshotPath);
+  // Selection must stay a memory read: it reads the normalized transcript this daemon already holds
+  // and touches no file, so returning to the list never puts IO per session on that request.
   client.send({ version: 1, clientId: "viewer", requestId: "refresh-quiet", op: "refresh_summaries", payload: {} });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "summaries_refreshing", sessionIds: ["quiet"] } });
-  expect((await stat(snapshotPath)).ino).toBe(before.ino);
+  await expect(stat(join(stateRoot, "index", "viewer"))).rejects.toMatchObject({ code: "ENOENT" });
 
   releaseSummary();
   await vi.waitFor(async () => expect((await registry.get("quiet"))?.summary).toMatchObject({ text: "Fixes the loader" }));
@@ -989,8 +986,8 @@ it("durably admits authenticated Pi frames while worker reconnect reconciliation
   await runtime.ready;
   const frontend = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 4096 });
   await frontend.ready;
-  frontend.send({ version: 1, clientId: "viewer", requestId: "early-snapshot", op: "get_viewer_snapshot", payload: { sessionId: "early" } });
-  expect(await frontend.next()).toMatchObject({ ok: true, result: { snapshot: { items: [expect.objectContaining({ kind: "user_message", content: [{ type: "text", text: "during recovery" }] })] } } });
+  frontend.send({ version: 1, clientId: "viewer", requestId: "early-snapshot", op: "subscribe_viewer", payload: { sessionId: "early" } });
+  expect(await frontend.next()).toMatchObject({ ok: true, result: { kind: "viewer_subscribed", snapshot: { items: [expect.objectContaining({ kind: "user_message", content: [{ type: "text", text: "during recovery" }] })] } } });
   frontend.close();
 });
 
@@ -1023,14 +1020,13 @@ it("ingests Pi frames and keeps their order while a lifecycle operation holds th
       await worker.sendFrame({ type: "message_end", message: { role: "user", content: `frame ${index}`, timestamp: Date.parse(now) + index } });
     }
     // Ingest that still needed the lifecycle lock could not finish until releaseLock ran.
+    /** @type {any} */
+    let ordered;
     await vi.waitFor(async () => {
-      frontend.send({ version: 1, clientId: "viewer", requestId: `snapshot-${randomUUID()}`, op: "get_viewer_snapshot", payload: { sessionId: "stream" } });
-      const response = await frontend.next();
-      expect(response.result.snapshot.items).toHaveLength(6);
+      frontend.send({ version: 1, clientId: "viewer", requestId: `snapshot-${randomUUID()}`, op: "subscribe_viewer", payload: { sessionId: "stream" } });
+      ordered = await frontend.next();
+      expect(ordered.result.snapshot.items).toHaveLength(6);
     }, { timeout: 5_000 });
-
-    frontend.send({ version: 1, clientId: "viewer", requestId: "ordered", op: "get_viewer_snapshot", payload: { sessionId: "stream" } });
-    const ordered = await frontend.next();
     expect(ordered.result.snapshot.items.map((/** @type {any} */ item) => item.content[0].text)).toEqual([0, 1, 2, 3, 4, 5].map((index) => `frame ${index}`));
   } finally {
     releaseLock();
@@ -1757,25 +1753,25 @@ it("orders viewer frames across startup route adoption", async () => {
   client.send({ version: 1, clientId: "viewer", requestId: "launch-ordered", op: "launch", payload: { prompt: "start", cwd: "/repo", sourceSessionId: "source", isolation: { mode: "shared_directory", confirmedCwd: "/repo", ownerSessionIds: [] } } });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "launched", sessionId: "ordered" } });
 
-  // And these two arrive over the adopted route.
+  // The snapshot covers everything ingested up to the moment the subscription opened, and nothing
+  // published before it is retained anywhere, so this is the only place those frames can appear.
+  /** @type {any} */
+  let subscribed;
+  await vi.waitFor(async () => {
+    client.send({ version: 1, clientId: "viewer", requestId: `ordered-${randomUUID()}`, op: "subscribe_viewer", payload: { sessionId: "ordered" } });
+    subscribed = await client.next();
+    expect(subscribed.result.snapshot.items).toHaveLength(3);
+  }, { timeout: 4_000 });
+  expect(subscribed.result.snapshot.items.map((/** @type {any} */ item) => item.content[0].text)).toEqual([0, 1, 2].map((index) => `frame ${index}`));
+
+  // And these two arrive over the adopted route, after the subscription: each crosses the seam once,
+  // in source order, with a distinct stable ID and a distinct cursor.
   worker.send(message(3));
   worker.send(message(4));
-
-  await vi.waitFor(async () => {
-    client.send({ version: 1, clientId: "viewer", requestId: `ordered-${randomUUID()}`, op: "get_viewer_snapshot", payload: { sessionId: "ordered" } });
-    const response = await client.next();
-    expect(response.result.snapshot.items).toHaveLength(5);
-  }, { timeout: 4_000 });
-  client.send({ version: 1, clientId: "viewer", requestId: "ordered-final", op: "get_viewer_snapshot", payload: { sessionId: "ordered" } });
-  const snapshot = /** @type {any} */ (await client.next());
-  expect(snapshot.result.snapshot.items.map((/** @type {any} */ item) => item.content[0].text))
-    .toEqual([0, 1, 2, 3, 4].map((index) => `frame ${index}`));
-
-  // Each frame crossed the boundary exactly once, in source order, with a distinct stable ID.
-  const durable = (await readFile(join(stateRoot, "index", "viewer", `${createHash("sha256").update("ordered").digest("hex")}.events.jsonl`), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-  expect(durable.map((/** @type {any} */ event) => event.payload.kind === "user_message" ? event.payload.content[0].text : event.payload.kind))
-    .toEqual(["frame 0", "frame 1", "turn_state", "activity", "frame 2", "frame 3", "frame 4"]);
-  expect(new Set(durable.map((/** @type {any} */ event) => event.eventId)).size).toBe(durable.length);
+  const delivered = [await client.next(), await client.next()];
+  expect(delivered.map((/** @type {any} */ event) => event.payload.content[0].text)).toEqual(["frame 3", "frame 4"]);
+  expect(new Set(delivered.map((/** @type {any} */ event) => event.eventId)).size).toBe(2);
+  expect(delivered.map((/** @type {any} */ event) => BigInt(event.cursor.sequence) - BigInt(subscribed.result.cursor.sequence))).toEqual([1n, 2n]);
   worker.close();
   client.close();
 });
@@ -1909,41 +1905,6 @@ it("leaves worker identity exactly as it was when the daemon restarts mid-sessio
   await secondRuntime.close();
   runtimes.splice(runtimes.indexOf(secondRuntime), 1);
   expect(loop.alive).toBe(true);
-});
-
-// The operator's index/viewer/*.snapshot.json files were written by the release that still had
-// access roles. Recovery must read one and publish it forward without its retired `role`.
-it("recovers a viewer snapshot written with a retired role and republishes it without one", async () => {
-  const stateRoot = await root();
-  for (const name of ["daemon", "sessions", "queue", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
-  await mkdir(join(stateRoot, "index", "viewer"), { mode: 0o700 });
-  const now = "2026-08-25T12:00:00.000Z";
-  const sessionFile = join(stateRoot, "legacy.jsonl");
-  await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "legacy", timestamp: now, cwd: stateRoot })}\n`, { mode: 0o600 });
-  const registry = new RegistryStore(join(stateRoot, "sessions"));
-  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "legacy", sessionFile, canonicalSessionFile: sessionFile, cwd: stateRoot, taskState: "READY", processState: "EXITED", outcome: "NONE", activity: { kind: "assistant_final", summary: "done", updatedAt: now }, createdAt: now, updatedAt: now });
-  const daemonEpoch = randomUUID();
-  await writeFile(join(stateRoot, "daemon", "epoch"), daemonEpoch, { mode: 0o600 });
-  const stem = createHash("sha256").update("legacy").digest("hex");
-  const snapshotPath = join(stateRoot, "index", "viewer", `${stem}.snapshot.json`);
-  await writeFile(snapshotPath, `${JSON.stringify({
-    version: 1, sessionId: "legacy", registryRevision: 0, cursor: { daemonEpoch, sessionId: "legacy", sequence: "0" }, runtime: null,
-    role: "composer", taskState: "READY", processState: "EXITED", outcome: "NONE",
-    activity: { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "seed", startedAt: now },
-    model: null, thinkingLevel: null, items: [], tools: [], pendingUi: [], errors: [],
-  })}\n`, { mode: 0o600 });
-
-  const runtime = await createDaemonRuntime({ root: stateRoot });
-  runtimes.push(runtime);
-  await runtime.ready;
-  const client = connect({ socketPath: runtime.socketPath, token: runtime.token, attachId: "attach-legacy", maxBytes: 16384 });
-  await client.ready;
-  client.send({ version: 1, clientId: "installation-1", requestId: "snapshot", op: "get_viewer_snapshot", payload: { sessionId: "legacy" } });
-  const response = await client.next();
-  expect(response).toMatchObject({ ok: true, result: { kind: "viewer_snapshot" } });
-  expect(response.result.snapshot).not.toHaveProperty("role");
-  expect(JSON.parse(await readFile(snapshotPath, "utf8"))).not.toHaveProperty("role");
-  client.close();
 });
 
 it("authenticates a control stop that carries no client protocol", async () => {

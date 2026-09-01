@@ -107,14 +107,11 @@ describe("authenticated control server", () => {
     expect(received).toHaveLength(0);
   });
 
-  it("dispatches strict viewer snapshot and subscribe operations", async () => {
+  it("dispatches the strict viewer subscribe operation", async () => {
     const { socketPath, received } = await fixture();
-    const viewerRequests = [
-      { version: 1, clientId: "client-1", requestId: "viewer-1", op: "get_viewer_snapshot", payload: { sessionId: "session-1" } },
-      { version: 1, clientId: "client-1", requestId: "viewer-2", op: "subscribe_viewer", payload: { sessionId: "session-1", after: { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "0" } } },
-    ];
+    const viewerRequests = [{ version: 1, clientId: "client-1", requestId: "viewer-1", op: "subscribe_viewer", payload: { sessionId: "session-1" } }];
     const responses = await exchange(socketPath, [auth, ...viewerRequests.map((value) => `${JSON.stringify(value)}\n`)]);
-    expect(responses.slice(1)).toHaveLength(2);
+    expect(responses.slice(1)).toHaveLength(1);
     expect(received).toEqual(viewerRequests);
   });
 });

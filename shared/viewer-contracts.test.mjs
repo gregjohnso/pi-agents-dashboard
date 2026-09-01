@@ -59,12 +59,8 @@ it("strictly parses the frozen version-1 viewer snapshot", () => {
   expect(() => parseViewerSnapshot({ ...snapshot, activeAssistant: { itemId: "a1", blocks: [{ contentIndex: 0, type: "text", text: "hel" }] } }), "internal assistant checkpoint state").toThrow(/unknown/iu);
 });
 
-// The operator's index/viewer/*.snapshot.json files were written when a snapshot carried an access
-// role. The key is accepted so daemon recovery still reads them, and dropped so no viewer can
-// render it, gate an editor on it, or publish it forward.
-it("tolerates a retired role on a persisted snapshot and drops it", () => {
-  const stored = { ...snapshot, role: "composer" };
-  const parsed = parseViewerSnapshot(stored);
-  expect(parsed).toEqual(snapshot);
-  expect(parsed).not.toHaveProperty("role");
+// A snapshot is built for one response and never stored, so a key only an earlier release wrote is
+// refused rather than accepted and dropped.
+it("refuses the retired access role", () => {
+  expect(() => parseViewerSnapshot({ ...snapshot, role: "composer" })).toThrow(/unknown/iu);
 });

@@ -446,10 +446,10 @@ async function openPathsUnder(directory) {
 }
 
 // Operator-visible failure: a launch calls ensure from the worker's bound connection and again after
-// workerSupervisor.launch returns. Both missing the session map built two stores, and the loser's
-// event, checkpoint and history handles were dropped unclosed. Node 25 turns that into a fatal
-// ERR_INVALID_STATE when the collector finalizes them, killing the daemon a minute after a launch.
-it("opens one viewer store for concurrent ensure calls on the same session and leaks no descriptor", async () => {
+// workerSupervisor.launch returns. Both missing the session map built two read models, and the
+// loser's canonical-history handle was dropped unclosed. Node 25 turns that into a fatal
+// ERR_INVALID_STATE when the collector finalizes it, killing the daemon a minute after a launch.
+it("opens one viewer read model for concurrent ensure calls on the same session and leaks no descriptor", async () => {
   const root = await fixture();
   const registry = new RegistryStore(join(root, "sessions"));
   const recovered = await reconcileRuntime({ root, daemonEpoch: "epoch", inspect: async () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); } });
@@ -463,11 +463,9 @@ it("opens one viewer store for concurrent ensure calls on the same session and l
   const [first, second] = await Promise.all([recovered.viewer.ensure("racing"), recovered.viewer.ensure("racing")]);
   const opened = await openPathsUnder(root);
 
-  const viewerDirectory = join(await realpath(root), "index", "viewer");
-  const stem = createHash("sha256").update("racing").digest("hex");
-  expect(opened.filter((path) => !before.includes(path))).toEqual([join(viewerDirectory, `${stem}.checkpoints.jsonl`), join(viewerDirectory, `${stem}.events.jsonl`), canonicalSessionFile]);
+  // Pi's own session file is the only thing this daemon opens for a viewer.
+  expect(opened.filter((path) => !before.includes(path))).toEqual([canonicalSessionFile]);
   expect(second).toBe(first);
-  expect(first.store).toBe(recovered.viewer.store("racing"));
 
   await recovered.close();
 });
@@ -478,18 +476,16 @@ it("lets the next caller retry a session whose first concurrent open failed", as
   const registry = new RegistryStore(join(root, "sessions"));
   const recovered = await reconcileRuntime({ root, daemonEpoch: "epoch", inspect: async () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); } });
   const canonicalSessionFile = join(await realpath(root), "retried.jsonl");
-  await writeFile(canonicalSessionFile, "", { mode: 0o600 });
+  // A required Pi shape this normalizer refuses fails the open for both concurrent callers.
+  await writeFile(canonicalSessionFile, `${JSON.stringify({ type: "message", id: "broken", message: { role: "assistant" } })}\n`, { mode: 0o600 });
   const created = await registry.create({ ...record("retried", { pid: 802, startIdentity: "retried-worker", processGroupId: 802 }), sessionFile: canonicalSessionFile, canonicalSessionFile });
 
-  // A directory where the events file belongs makes the store open fail for both concurrent callers.
-  const stem = createHash("sha256").update("retried").digest("hex");
-  await mkdir(join(root, "index", "viewer"), { recursive: true, mode: 0o700 });
-  const blocker = join(root, "index", "viewer", `${stem}.events.jsonl`);
-  await mkdir(blocker, { mode: 0o700 });
+  const before = await openPathsUnder(root);
   const attempts = await Promise.allSettled([recovered.viewer.ensure("retried"), recovered.viewer.ensure("retried")]);
   expect(attempts.map((attempt) => attempt.status)).toEqual(["rejected", "rejected"]);
+  expect(await openPathsUnder(root)).toEqual(before);
 
-  await rm(blocker, { recursive: true });
+  await writeFile(canonicalSessionFile, `${JSON.stringify({ type: "message", id: "fixed", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } })}\n`, { mode: 0o600 });
   await expect(recovered.viewer.ensure("retried")).resolves.toMatchObject({ sessionId: created.sessionId });
   await recovered.close();
 });

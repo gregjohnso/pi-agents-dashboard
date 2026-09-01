@@ -22,7 +22,6 @@ export function createDaemonViewerClient({ client, clientId }) {
   /** @type {Map<string, Promise<unknown>>} */
   const detaching = new Map();
   return {
-    replayFromOrigin: false,
     async attach(sessionId) {
       // A fast reopen can outrun its own detach, and the two would then race on this connection's
       // record of the session. Ordering them per session is enough; another session never waits here.
@@ -36,7 +35,6 @@ export function createDaemonViewerClient({ client, clientId }) {
       detaching.set(sessionId, tracked);
       return tracked;
     },
-    getSnapshot: (sessionId) => client.getViewerSnapshot(sessionId),
     async menu(sessionId) {
       const result = await request("get_session_commands", { sessionId });
       if (result?.kind !== "session_commands") throw Object.assign(new Error("Daemon returned the wrong session command menu"), { code: "INVALID_RESPONSE" });
@@ -61,20 +59,23 @@ export function createDaemonViewerClient({ client, clientId }) {
       if (result?.kind !== "settings") throw Object.assign(new Error("Daemon returned the wrong settings result"), { code: "INVALID_RESPONSE" });
       return result;
     },
-    subscribe(sessionId, cursor, next, onError) {
-      let active = true;
-      const iterator = client.subscribeViewer(sessionId, cursor)[Symbol.asyncIterator]();
-      void (async () => {
-        try {
-          while (active) {
-            const value = await iterator.next();
-            if (value.done || !active) return;
-            await next(value.value);
-            iterator.applied(value.value.cursor);
-          }
-        } catch (error) { if (active) onError(error); }
-      })();
-      return () => { active = false; void iterator.return?.(); };
+    /**
+     * Open one subscription and hand back the snapshot it continues. The caller reads `events` only
+     * after it has built its transcript from that snapshot; anything the daemon published in between
+     * is already queued inside the client.
+     * @param {string} sessionId
+     */
+    async subscribe(sessionId) {
+      const subscription = client.subscribeViewer(sessionId);
+      const iterator = subscription[Symbol.asyncIterator]();
+      let snapshot;
+      try {
+        snapshot = await subscription.established;
+      } catch (error) {
+        await iterator.return?.();
+        throw error;
+      }
+      return { snapshot, events: iterator, unsubscribe: () => { void iterator.return?.(); } };
     },
     command(operation, payload) { return request(operation, payload); },
     onConnectionChange(listener) { return client.onConnectionChange?.(listener); },

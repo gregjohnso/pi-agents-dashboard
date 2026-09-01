@@ -2,17 +2,16 @@ import { describe, expect, it, vi } from "vitest";
 
 import { createDaemonViewerClient, runViewerTransition } from "./standalone-list.mjs";
 
-it("adapts the installed daemon client to origin replay, mutation, applied cursors, and detach", async () => {
+it("adapts the installed daemon client to one subscription that carries its snapshot, mutation, and detach", async () => {
   const requests = [];
-  const order = [];
-  const events = {
-    [Symbol.asyncIterator]() {
-      const queue = [{ eventId: "one", cursor: { sequence: "1" } }];
-      return {
-        async next() { const value = queue.shift(); return value === undefined ? { value: undefined, done: true } : { value, done: false }; },
-        applied(cursor) { order.push(`applied:${cursor.sequence}`); },
-      };
-    },
+  const snapshot = { sessionId: "session" };
+  const queue = [{ eventId: "one", cursor: { sequence: "1" } }];
+  let returned = false;
+  const subscription = {
+    established: Promise.resolve(snapshot),
+    [Symbol.asyncIterator]() { return this; },
+    async next() { const value = queue.shift(); return value === undefined ? { value: undefined, done: true } : { value, done: false }; },
+    async return() { returned = true; return { value: undefined, done: true }; },
   };
   const watchers = [];
   const client = {
@@ -23,28 +22,24 @@ it("adapts the installed daemon client to origin replay, mutation, applied curso
           : { kind: "command", status: { stage: "COMPLETED" } };
       return { ok: true, result };
     },
-    async getViewerSnapshot(sessionId) { return { sessionId }; },
-    subscribeViewer(sessionId, cursor) { expect([sessionId, cursor.sequence]).toEqual(["session", "0"]); return events; },
+    subscribeViewer(sessionId) { expect(sessionId).toBe("session"); return subscription; },
     onConnectionChange(listener) { watchers.push(listener); return () => watchers.pop(); },
   };
   const viewer = createDaemonViewerClient({ client, clientId: "client" });
-  expect(viewer.replayFromOrigin).toBe(false);
   // The viewer learns about a dead daemon through this seam; without it an outage is invisible.
   viewer.onConnectionChange(() => {});
   expect(watchers).toHaveLength(1);
   await viewer.attach("session");
-  const received = [];
-  const unsubscribe = viewer.subscribe("session", { sequence: "0" }, async (event) => { received.push(event); order.push(`process:${event.eventId}`); }, () => {});
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  const opened = await viewer.subscribe("session");
+  expect(opened.snapshot).toBe(snapshot);
+  await expect(opened.events.next()).resolves.toEqual({ value: { eventId: "one", cursor: { sequence: "1" } }, done: false });
   await viewer.command("interrupt", { sessionId: "session" });
   await viewer.detach("session");
-  unsubscribe();
-  expect(received).toEqual([{ eventId: "one", cursor: { sequence: "1" } }]);
-  // The resume cursor moves only once the consumer has drawn the event: a drop before that replays
-  // it, and a drop after it skips nothing.
-  expect(order).toEqual(["process:one", "applied:1"]);
-  // Nothing here reports a viewer cursor to the daemon.
+  opened.unsubscribe();
+  expect(returned).toBe(true);
+  // Nothing here reports a viewer cursor to the daemon: this release has no resume cursor at all.
   expect(viewer.ack).toBeUndefined();
+  expect(viewer.getSnapshot).toBeUndefined();
   expect(requests.map(({ op }) => op)).toEqual(["attach", "interrupt", "detach"]);
 });
 

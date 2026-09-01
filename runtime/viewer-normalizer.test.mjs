@@ -161,33 +161,28 @@ describe("viewer normalizer", () => {
     expect(events.filter((event) => event.payload.kind === "activity").at(-1)?.payload.phase).toBe(phase);
   });
 
-  it("preserves exact active assistant blocks through non-streaming snapshots and durable replay", () => {
-    const first = normalizer();
-    first.consumeFrame({ type: "message_start", message: { role: "assistant", content: [], timestamp: Date.parse(AT) } });
+  // A streaming assistant message is normalizer state, and it is the one thing Pi's canonical file
+  // does not carry yet. Nothing persists it, so the exact blocks have to survive inside one
+  // normalizer for as long as the frames keep arriving.
+  it("keeps exact active assistant blocks out of the snapshot's public shape while it streams", () => {
+    const subject = normalizer();
+    subject.consumeFrame({ type: "message_start", message: { role: "assistant", content: [], timestamp: Date.parse(AT) } });
     const drafts = [
-      ...first.consumeFrame({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "reason" } }),
-      ...first.consumeFrame({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 2, delta: "ans" } }),
-      ...first.consumeFrame({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "read", args: {} }),
+      ...subject.consumeFrame({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "reason" } }),
+      ...subject.consumeFrame({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 2, delta: "ans" } }),
+      ...subject.consumeFrame({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "read", args: {} }),
     ];
-    const snapshot = first.snapshot({ daemonEpoch: "epoch-1", sequence: "5", registryRevision: 1, runtime: null, taskState: "WORKING", processState: "LIVE", outcome: "NONE" });
+    const snapshot = subject.snapshot({ daemonEpoch: "epoch-1", sequence: "5", registryRevision: 1, runtime: null, taskState: "WORKING", processState: "LIVE", outcome: "NONE" });
     expect(snapshot.activity.phase).toBe("tool_running");
     expect(snapshot).not.toHaveProperty("activeAssistant");
-    expect(first.checkpoint()).toEqual({ activeAssistant: { itemId: drafts[0].payload.itemId, blocks: [{ contentIndex: 0, type: "thinking", text: "reason" }, { contentIndex: 2, type: "text", text: "ans" }] } });
+    expect(snapshot.items).toContainEqual({ kind: "assistant_message", itemId: drafts[0].payload.itemId, content: [{ type: "thinking", text: "reason" }, { type: "text", text: "ans" }] });
     expect(() => parseViewerSnapshot(snapshot)).not.toThrow();
     for (const draft of drafts) expect(() => parseViewerEvent({ version: 1, sessionId: "session-1", eventId: draft.eventId, cursor: { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "1" }, timestamp: draft.timestamp, payload: draft.payload })).not.toThrow();
 
-    const fromSnapshot = normalizer();
-    fromSnapshot.restore(snapshot);
-    fromSnapshot.restoreCheckpoint(first.checkpoint());
-    const replayed = normalizer();
-    for (const [index, draft] of drafts.entries()) replayed.applyViewerEvent({ version: 1, sessionId: "session-1", eventId: draft.eventId, cursor: { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: String(index + 1) }, timestamp: draft.timestamp, payload: draft.payload });
-    replayed.restoreCheckpoint(drafts.at(-1)?.internalCheckpoint);
-    expect(replayed.snapshot({ daemonEpoch: "epoch-1", sequence: "5", registryRevision: 1, runtime: null, taskState: "WORKING", processState: "LIVE", outcome: "NONE" }).items).toContainEqual({ kind: "assistant_message", itemId: drafts[0].payload.itemId, content: [{ type: "thinking", text: "reason" }, { type: "text", text: "ans" }] });
-    for (const restored of [fromSnapshot, replayed]) {
-      const continued = restored.consumeFrame({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 2, delta: "wer" } });
-      expect(continued[0].payload).toEqual({ kind: "assistant_delta", itemId: drafts[0].payload.itemId, delta: "wer" });
-      expect(restored.checkpoint()).toEqual({ activeAssistant: { itemId: drafts[0].payload.itemId, blocks: [{ contentIndex: 0, type: "thinking", text: "reason" }, { contentIndex: 2, type: "text", text: "answer" }] } });
-    }
+    const continued = subject.consumeFrame({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 2, delta: "wer" } });
+    expect(continued[0].payload).toEqual({ kind: "assistant_delta", itemId: drafts[0].payload.itemId, delta: "wer" });
+    expect(subject.snapshot({ daemonEpoch: "epoch-1", sequence: "6", registryRevision: 1, runtime: null, taskState: "WORKING", processState: "LIVE", outcome: "NONE" }).items)
+      .toContainEqual({ kind: "assistant_message", itemId: drafts[0].payload.itemId, content: [{ type: "thinking", text: "reason" }, { type: "text", text: "answer" }] });
   });
 
   it("maps documented model and thinking replacement frames", () => {
@@ -262,32 +257,28 @@ describe("viewer normalizer", () => {
   it("keeps a long session's snapshot inside one wire frame and says what it left out", () => {
     const subject = normalizer();
     for (let index = 0; index < 64; index += 1) {
-      subject.applyViewerEvent({ version: 1, sessionId: "session-1", eventId: `event-${index}`, cursor: { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: String(index + 1) }, timestamp: AT, payload: { kind: "assistant_message", itemId: `answer-${index}`, content: [{ type: "text", text: "x".repeat(60_000) }] } });
+      subject.consumeHistory({ type: "message", id: `answer-${index}`, timestamp: AT, message: { role: "assistant", content: [{ type: "text", text: `${index}${"x".repeat(60_000)}` }] } }, position(index));
     }
     const snapshot = subject.snapshot({ daemonEpoch: "epoch-1", sequence: "64", registryRevision: 1, runtime: null, taskState: "READY", processState: "LIVE", outcome: "NONE" });
 
     expect(() => parseViewerSnapshot(snapshot)).not.toThrow();
-    expect(() => createJsonlEncoder({ maxBytes: WIRE_FRAME_BYTES }).encode({ version: 1, requestId: "r", ok: true, result: { kind: "viewer_snapshot", snapshot } })).not.toThrow();
+    expect(() => createJsonlEncoder({ maxBytes: WIRE_FRAME_BYTES }).encode({ version: 1, requestId: "r", ok: true, result: { kind: "viewer_subscribed", cursor: { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "64" }, snapshot } })).not.toThrow();
     expect(snapshot.items.at(-1)).toMatchObject({ itemId: "answer-63" });
     expect(snapshot.items[0]).toMatchObject({ kind: "system_message", itemId: SNAPSHOT_TRUNCATED_ITEM_ID, level: "info" });
     expect(snapshot.items.length).toBeLessThan(64);
-
-    // A trimmed snapshot restores as the window it carries, without the marker becoming a transcript card.
-    const restored = normalizer();
-    restored.restore(snapshot);
-    const republished = restored.snapshot({ daemonEpoch: "epoch-1", sequence: "64", registryRevision: 1, runtime: null, taskState: "READY", processState: "LIVE", outcome: "NONE" });
-    expect(republished.items.some((/** @type {any} */ item) => item.itemId === SNAPSHOT_TRUNCATED_ITEM_ID)).toBe(false);
-    expect(republished.items.at(-1)).toMatchObject({ itemId: "answer-63" });
+    // The window is what one frame carries, not what the session holds: the earlier entries stay in
+    // Pi's canonical file and in this normalizer, so the next snapshot can still reach them.
+    expect(subject.transcriptItems()).toHaveLength(64);
   });
 
   it("leaves out even the newest entry when it alone would not fit one wire frame", () => {
     const subject = normalizer();
     for (let index = 0; index < 40; index += 1) subject.consumeError({ code: `HISTORY_${index}`, message: "y".repeat(4_000) });
-    subject.applyViewerEvent({ version: 1, sessionId: "session-1", eventId: "huge", cursor: { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "1" }, timestamp: AT, payload: { kind: "assistant_message", itemId: "huge", content: Array.from({ length: 12 }, () => ({ type: "text", text: "x".repeat(60_000) })) } });
+    subject.consumeHistory({ type: "message", id: "huge", timestamp: AT, message: { role: "assistant", content: Array.from({ length: 12 }, () => ({ type: "text", text: "x".repeat(60_000) })) } }, position(1));
     const snapshot = subject.snapshot({ daemonEpoch: "epoch-1", sequence: "1", registryRevision: 1, runtime: null, taskState: "READY", processState: "LIVE", outcome: "NONE" });
 
     expect(() => parseViewerSnapshot(snapshot)).not.toThrow();
-    expect(() => createJsonlEncoder({ maxBytes: WIRE_FRAME_BYTES }).encode({ version: 1, requestId: "r", ok: true, result: { kind: "viewer_snapshot", snapshot } })).not.toThrow();
+    expect(() => createJsonlEncoder({ maxBytes: WIRE_FRAME_BYTES }).encode({ version: 1, requestId: "r", ok: true, result: { kind: "viewer_subscribed", cursor: { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "1" }, snapshot } })).not.toThrow();
     expect(snapshot.items).toEqual([expect.objectContaining({ itemId: SNAPSHOT_TRUNCATED_ITEM_ID })]);
     expect(snapshot.errors.length).toBeLessThan(40);
     expect(snapshot.errors.at(-1)).toMatchObject({ code: "HISTORY_39" });

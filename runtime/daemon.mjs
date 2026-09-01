@@ -447,13 +447,20 @@ function createSocketServer({ socketPath, token, maxBytes, workerRequestTimeoutM
           try {
             const result = await context.handleRequest(request, { socket, attachId }, frontendClientId);
             viewerSubscription = result?._viewerSubscription;
-            const publicResult = viewerSubscription === undefined ? result : { kind: result.kind, cursor: result.cursor };
+            const publicResult = viewerSubscription === undefined ? result : { kind: result.kind, cursor: result.cursor, snapshot: result.snapshot };
             await context.writeResponse({ request, value: response(request.requestId, publicResult), write: send, close });
             if (viewerSubscription !== undefined) {
               let active = viewerSubscriptions.get(socket);
               if (active === undefined) { active = new Set(); viewerSubscriptions.set(socket, active); }
               active.add(viewerSubscription);
-              void pumpViewerSubscription(viewerSubscription, send).catch(() => socket.destroy()).finally(() => active.delete(viewerSubscription));
+              const sessionId = request.payload.sessionId;
+              // A stream that stops mid-turn says so on its own frame rather than destroying this
+              // socket. Destroying it took the session list down with one viewer's bound, and a
+              // second response frame for an answered request reaches no pending request at all.
+              void pumpViewerSubscription(viewerSubscription, send)
+                .catch((error) => send({ version: 1, kind: "viewer_stream_failed", sessionId, error: dashboardError(/** @type {any} */ (error)?.code ?? "VIEWER_STREAM_FAILED", error instanceof Error ? error.message : "Viewer stream stopped") }))
+                .catch(() => socket.destroy())
+                .finally(() => active.delete(viewerSubscription));
             }
           } catch (error) {
             await viewerSubscription?.return?.();
@@ -1075,13 +1082,12 @@ export async function createDaemonRuntime({
           }, "set_session_color");
         }
         if (context.state !== "READY" && !duringRecovery) throw Object.assign(new Error(context.state === "FAILED" ? context.stateError?.message ?? "Daemon recovery failed" : "Daemon recovery is still in progress"), { code: context.state === "FAILED" ? context.stateError?.code ?? "RECOVERY_FAILED" : "RECOVERING", retryable: context.state !== "FAILED" });
-        if (request.op === "get_viewer_snapshot") return { kind: "viewer_snapshot", snapshot: await context.recovery.viewer.snapshot(request.payload.sessionId) };
         if (request.op === "subscribe_viewer") {
           if (socket === undefined) throw new TypeError("Viewer subscription requires a live socket");
-          const store = context.recovery.viewer.store(request.payload.sessionId);
-          if (store === undefined) throw Object.assign(new Error("Viewer session does not exist"), { code: "SESSION_NOT_FOUND" });
-          const subscription = store.subscribe(request.payload.after);
-          return { kind: "viewer_subscribed", cursor: store.currentCursor(), _viewerSubscription: subscription };
+          // The snapshot and the subscription are taken together, under this session's frame lock, so
+          // no ingested frame falls between them. Nothing is retained that could replay one.
+          const opened = await router.runFrame(request.payload.sessionId, () => context.recovery.viewer.subscribe(request.payload.sessionId));
+          return { kind: "viewer_subscribed", cursor: opened.cursor, snapshot: opened.snapshot, _viewerSubscription: opened.subscription };
         }
         if (request.op === "subscribe_list_changes") {
           if (socket === undefined) throw new TypeError("List subscription requires a live socket");

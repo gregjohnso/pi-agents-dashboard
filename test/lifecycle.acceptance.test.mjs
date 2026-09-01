@@ -86,27 +86,16 @@ function request(clientId, requestId, op, payload) {
   return { version: 1, clientId, requestId, op, payload };
 }
 
+/** Open one viewer subscription per attempt until its snapshot satisfies `predicate`. */
 async function waitForSnapshot(client, sessionId, predicate) {
   const deadline = Date.now() + 2_000;
   for (;;) {
-    const snapshot = await client.getViewerSnapshot(sessionId);
+    const subscription = client.subscribeViewer(sessionId);
+    const snapshot = await subscription.established;
+    await subscription.return?.();
     if (predicate(snapshot)) return snapshot;
     if (Date.now() >= deadline) throw new Error(`Viewer snapshot for ${sessionId} did not reach the expected state`);
     await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-}
-
-async function nextMatching(iterator, predicate) {
-  const deadline = Date.now() + 2_000;
-  for (;;) {
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) throw new Error("Viewer replay did not contain the expected event");
-    const next = await Promise.race([
-      iterator.next(),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("Viewer replay timed out")), remaining)),
-    ]);
-    if (next.done) throw new Error("Viewer replay ended before the expected event");
-    if (predicate(next.value)) return next.value;
   }
 }
 
@@ -215,8 +204,7 @@ it("keeps two mixed-version fake Pi children alive across frontend close and dae
   expect(probeLog.filter((entry) => entry.kind === "start" && entry.argv.includes("--mode")).every((entry) => entry.argv.slice(0, 4).join(" ") === `--mode rpc --session ${entry.argv[3]}` && entry.providerInvocation === false)).toBe(true);
   expect(probeLog.filter((entry) => entry.kind === "command").every((entry) => entry.providerInvocation === false)).toBe(true);
 
-  const prior = new Map();
-  for (const sessionId of ["one", "two"]) prior.set(sessionId, (await first.getViewerSnapshot(sessionId)).cursor);
+  for (const sessionId of ["one", "two"]) expect((await waitForSnapshot(first, sessionId, () => true)).sessionId).toBe(sessionId);
   await first.close();
   await firstRuntime.close();
   runtimes.splice(runtimes.indexOf(firstRuntime), 1);
@@ -246,12 +234,11 @@ it("keeps two mixed-version fake Pi children alive across frontend close and dae
 
   for (const sessionId of ["one", "two"]) {
     const expectedText = `later:${join(root, "canonical", `${sessionId}.jsonl`)}`;
+    // The replacement daemon persisted no viewer transcript of its own, so this text can only have
+    // come from Pi's canonical session file, read and normalized again on this subscription.
     const snapshot = await waitForSnapshot(second, sessionId, (value) => JSON.stringify(value.items).includes(expectedText));
     expect(snapshot.sessionId).toBe(sessionId);
-    const replay = second.subscribeViewer(sessionId, prior.get(sessionId))[Symbol.asyncIterator]();
-    const replayed = await nextMatching(replay, (value) => value.payload.kind === "assistant_message" && JSON.stringify(value.payload).includes(expectedText));
-    expect(BigInt(replayed.cursor.sequence)).toBeGreaterThan(BigInt(prior.get(sessionId).sequence));
-    await replay.return?.();
+    expect(await readdir(join(root, "index"))).toEqual([]);
   }
   await second.close();
 }, 20_000);

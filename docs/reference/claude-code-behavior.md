@@ -179,6 +179,14 @@ Resume reads the roster, verifies PID plus process-start identity, reconnects to
 
 **Adopt:** attachment lifetime is connection-scoped and later attach starts from current state. **Divergence kept:** our workers survive daemon absence indefinitely because a 60-second orphan timeout can terminate the operator's running work. **Divergence kept:** host-level Left interception remains deferred because Pi cannot emit the context-aware detach request. See [Change 8 and the PTY viewer deferral](../architecture-plan.md#change-8-every-client-can-write-and-frontend-state-stays-local). [B]
 
+## The daemon runs on demand and exits when the last client disconnects
+
+`claude daemon --help` states that service install is disabled in this version, and that the daemon runs on demand and exits when the last client disconnects. The subcommands it offers are `run`, `status`, `logs`, `uninstall`, and `stop`; `uninstall` removes a background service (launchctl or systemd) that this version no longer installs. So a resident daemon is not the normal state here, and the roster, not a running supervisor, is what makes a session findable again. [O]
+
+The measure is clients, not sessions. `daemon stop` terminates background sessions by default and takes `--keep-workers` to leave detached sessions running, so exit and session termination are separate decisions rather than one. Idle exit is the branch that keeps them: the PTY host's orphan watchdog, not the daemon, decides what happens to a session afterwards, and it gives a replacement daemon 60 seconds before it starts terminating. `--any` on `stop` additionally reaches a transient, non-service daemon, which is what an on-demand daemon is. [O][B]
+
+**Adopt:** on demand by default, and clients rather than live sessions as the measure of idle. **Divergence kept:** our workers hold no orphan watchdog and survive daemon absence indefinitely, so an idle exit here leaves a session running until the operator's next command starts a daemon that adopts it, rather than starting a 60-second countdown against his work. Our idle also has to cover a command in flight, a launch, and a scheduled worker replacement, because those are daemon-side work that Claude Code's PTY host owns instead. See [Change 4 in the status document](../status.md#next-adopt-claude-codes-process-shape). [O][B]
+
 ## Release changes adopt workers before replacing them
 
 Daemon release, worker release, and protocol compatibility are independent facts. The daemon lock records its release and launch target. The roster records each worker's `cliVersion`. Both protocols use integer `proto: 1`. [O][B]

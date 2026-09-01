@@ -99,6 +99,8 @@ pi-agents daemon restart
 
 A running daemon holds the code it loaded at startup while it spawns workers from the code now on disk. If the two disagree, launches fail with `WORKER_PROCESS_EXITED` until the daemon restarts. Live sessions survive a daemon restart; their workers reconnect.
 
+The daemon runs on demand: it exits about 30 seconds after the last dashboard closes, so closing every dashboard and reopening one also picks up the new build. `PI_AGENTS_IDLE_EXIT_MS` changes that window, and `0` keeps the daemon running until you stop it. An exit leaves every session running; the next `pi-agents` starts a daemon that adopts them.
+
 ## Troubleshooting
 
 - **`pi` cannot be found or executed:** put the installed executable on `PATH`, or start with `pi-agents --pi-bin /absolute/path/to/pi`. The override must be absolute.

@@ -1,10 +1,6 @@
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-
 import { expect, it } from "vitest";
 
-import { convertLegacyDashboardConfig, loadDashboardConfig, writeDashboardConfig } from "./config.mjs";
+import { convertLegacyDashboardConfig, loadDashboardConfig } from "./config.mjs";
 
 const REVIEWED_DEFAULT_CONFIG = {
   schemaVersion: 2,
@@ -15,6 +11,12 @@ const REVIEWED_DEFAULT_CONFIG = {
   stop: { gracefulMs: 5_000, terminateMs: 5_000 },
   diagnostics: { rpcSegmentBytes: 8_388_608, rpcSegments: 4, stderrBytes: 8_388_608 },
 };
+
+// Nothing in this package writes dashboard.json; the operator does. Migration rewrites the legacy
+// file through convertLegacyDashboardConfig and its own staged copy.
+it("reads and converts configuration, and never writes it", async () => {
+  expect(Object.keys(await import("./config.mjs")).sort()).toEqual(["convertLegacyDashboardConfig", "loadDashboardConfig"]);
+});
 
 it("rejects every unknown key and invalid schema 2 value", () => {
   expect(() => loadDashboardConfig({ unexpected: true })).toThrow(/unknown/i);
@@ -41,16 +43,6 @@ it("preserves reviewed schema 1 limits, timings, history, and isolation-adjacent
   });
 });
 
-it("validates and atomically serializes a mode-0600 complete configuration", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-agents-config-"));
-  const configPath = join(directory, "dashboard.json");
-  try {
-    await writeFile(configPath, '{"old":true}\n', { mode: 0o600 });
-    await writeDashboardConfig(configPath, { workers: { maxLive: 3 } });
-    expect(JSON.parse(await readFile(configPath, "utf8"))).toEqual({ ...REVIEWED_DEFAULT_CONFIG, workers: { ...REVIEWED_DEFAULT_CONFIG.workers, maxLive: 3 } });
-    expect((await stat(configPath)).mode & 0o777).toBe(0o600);
-    expect(await readdir(directory)).toEqual(["dashboard.json"]);
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
+it("applies the reviewed release defaults to an absent configuration", () => {
+  expect(loadDashboardConfig({})).toEqual(REVIEWED_DEFAULT_CONFIG);
 });

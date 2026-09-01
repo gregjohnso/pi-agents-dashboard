@@ -1,6 +1,4 @@
-import { randomUUID } from "node:crypto";
-import { chmod, rename, rm, writeFile } from "node:fs/promises";
-import { isAbsolute, basename, dirname, join } from "node:path";
+import { isAbsolute } from "node:path";
 
 /** @typedef {{schemaVersion:1,migrationId:string,sourceIdentity:string,destinationIdentity:string,state:"PREPARED"|"PUBLISHED"|"RECONCILED",configFrom:1,configTo:2,createdAt:string,updatedAt:string}} MigrationManifest */
 /** @typedef {{schemaVersion:2,pi:{executable:string|null},workers:{maxLive:number|null,idleRetentionMs:number},history:{completedWindowHours:number|null,indexRefreshMs:number},daemon:{heartbeatMs:number,staleAfterMs:number,startTimeoutMs:number},stop:{gracefulMs:number,terminateMs:number},diagnostics:{rpcSegmentBytes:number,rpcSegments:number,stderrBytes:number}}} DashboardConfig */
@@ -75,16 +73,4 @@ export function convertLegacyDashboardConfig(input) {
     ...(Object.hasOwn(legacy, "daemon") ? { daemon: legacy.daemon } : {}),
     ...(Object.hasOwn(legacy, "stop") ? { stop: legacy.stop } : {}),
   });
-}
-
-/** Validate and atomically replace a complete mode-0600 configuration. @param {string} path @param {unknown} input */
-export async function writeDashboardConfig(path, input) {
-  const config = loadDashboardConfig(input);
-  const temporaryPath = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
-  try {
-    await writeFile(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
-    await chmod(temporaryPath, 0o600);
-    await rename(temporaryPath, path);
-    await chmod(path, 0o600);
-  } finally { await rm(temporaryPath, { force: true }); }
 }

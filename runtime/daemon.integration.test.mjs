@@ -2090,7 +2090,15 @@ async function adoptedCrashWorker(sessionId) {
   for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
   const identity = { pid: 281, startIdentity: `worker-${sessionId}`, processGroupId: 281 };
   const piChild = { pid: 282, startIdentity: `pi-${sessionId}`, processGroupId: 281 };
-  const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === identity.pid ? identity : piChild;
+  // The Pi child of a crash frame has exited by the time the frame is sent, so this process world
+  // answers for it exactly as Linux does: the pid is gone once the crash is emitted.
+  let piChildLive = true;
+  const inspect = async (/** @type {number} */ pid) => {
+    if (pid === process.pid) return { pid, startIdentity: "daemon", processGroupId: process.pid };
+    if (pid === identity.pid) return identity;
+    if (pid === piChild.pid && piChildLive) return piChild;
+    throw Object.assign(new Error("gone"), { code: "ESRCH" });
+  };
   const registry = new RegistryStore(join(stateRoot, "sessions"));
   const now = "2026-08-25T12:00:00.000Z";
   await registry.create({ schemaVersion: 1, revision: 0, sessionId, sessionFile: `/sessions/${sessionId}.jsonl`, canonicalSessionFile: `/sessions/${sessionId}.jsonl`, cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "idle", summary: "Idle", updatedAt: now }, ownership: { kind: "managed", runId: `run-${sessionId}`, process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: `run-${sessionId}`, runHash: `${sessionId}-run`, createdAt: now, updatedAt: now });
@@ -2101,7 +2109,7 @@ async function adoptedCrashWorker(sessionId) {
   const loop = startPersistentFakeWorker(stateRoot, { sessionId, runId: `run-${sessionId}`, leaseId: `lease-${sessionId}`, generation: 1, identity, piChildIdentity: piChild, token: `${sessionId}-token` });
   await runtime.ready;
   await vi.waitFor(() => expect(loop.connectionCount).toBe(1));
-  return { stateRoot, registry, runtime, loop, identity, piChild };
+  return { stateRoot, registry, runtime, loop, identity, piChild, exitPiChild() { piChildLive = false; } };
 }
 
 // Operator-visible failure: a worker from a build before the durable terminal cause sends the same
@@ -2110,6 +2118,7 @@ async function adoptedCrashWorker(sessionId) {
 it("records a Pi child crash from an adopted worker that publishes no durable cause", async () => {
   const live = await adoptedCrashWorker("legacy");
 
+  live.exitPiChild();
   await live.loop.sendEvent({ type: "PI_CHILD_CRASHED", at: "2026-08-25T12:01:00.000Z", summary: "Pi exited unexpectedly (SIGSEGV)" });
 
   await vi.waitFor(async () => expect(await live.registry.get("legacy")).toMatchObject({ taskState: "FAILED", processState: "EXITED", activity: { kind: "process_error", summary: "Pi exited unexpectedly (SIGSEGV)" } }), { timeout: 5_000, interval: 25 });
@@ -2121,6 +2130,7 @@ it("records a Pi child crash from an adopted worker that publishes no durable ca
 // child. A cause record that exists and does not validate stays refused, absent one or not.
 it("refuses a Pi child crash whose durable cause names another Pi child", async () => {
   const live = await adoptedCrashWorker("forged");
+  live.exitPiChild();
   await writeFile(join(live.stateRoot, "runs", "forged-run", "terminal-cause.json"), `${JSON.stringify({ schemaVersion: 1, sessionId: "forged", runId: "run-forged", leaseId: "lease-forged", generation: 1, worker: live.identity, piChild: { ...live.piChild, startIdentity: "another-child" }, event: { type: "PI_CHILD_CRASHED", at: "2026-08-25T12:01:00.000Z", summary: "Pi exited unexpectedly (SIGSEGV)" } })}\n`, { mode: 0o600 });
 
   await live.loop.sendEvent({ type: "PI_CHILD_CRASHED", at: "2026-08-25T12:01:00.000Z", summary: "Pi exited unexpectedly (SIGSEGV)" });

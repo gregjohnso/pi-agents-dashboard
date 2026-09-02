@@ -1064,6 +1064,12 @@ export async function createDaemonRuntime({
         if (context.state !== "READY") throw Object.assign(new Error("Daemon recovery is still in progress"), { code: "RECOVERING", retryable: true });
         const eventKeys = ["version", "type", "token", "sessionId", "event"];
         if (frame.type !== "worker_event" || frame.version !== 1 || frame.sessionId !== metadata.sessionId || Object.keys(frame).some((key) => !eventKeys.includes(key)) || typeof frame.event !== "object" || frame.event === null || Array.isArray(frame.event)) throw Object.assign(new Error("Invalid worker frame"), { code: "INVALID_WORKER_FRAME" });
+        /**
+         * How this frame's route is verified before it reaches the registry. Every frame but one is
+         * verified against both live process identities.
+         * @type {(action: () => Promise<any>) => Promise<any>}
+         */
+        let serializeFrame = (action) => router.runCurrent(metadata, connection, routeGeneration, action);
         if (frame.event.type === "PI_CHILD_CRASHED") {
           const runHash = (await registry.get(frame.sessionId))?.runHash;
           const causePath = typeof runHash === "string" ? workerTerminalCausePath(root, runHash) : undefined;
@@ -1097,12 +1103,14 @@ export async function createDaemonRuntime({
             context.notifyListChanged();
             return;
           }
+          // This frame is the report that the Pi child exited, so the route is verified without it.
+          serializeFrame = (action) => router.runCurrentTerminalEvent(metadata, connection, routeGeneration, action);
         }
         /** @type {string | undefined} */
         let previousTaskState;
         /** @type {any} */
         let settled;
-        await router.runCurrent(metadata, connection, routeGeneration, async () => {
+        await serializeFrame(async () => {
           // Re-read and re-reduce when another writer wins the compare-and-swap. Throwing here reaches
           // the worker socket's error path, which destroys the connection: losing a race with a color,
           // rename or summary write must not cost the supervisor its route.

@@ -678,22 +678,38 @@ export class RecoveredWorkerRouter {
   }
 
   /**
-   * Verify a terminal-cause frame against the current route, lease, worker, and both recorded identities.
-   * The Pi child has exited by definition, so only its exact recorded identity can be checked here.
-   * @param {any} metadata @param {any} connection @param {number} routeGeneration @param {any} cause @param {(record: any) => Promise<any>} action
+   * Verify one terminal frame against the current route, ownership, lease, and live worker identity,
+   * and against the durable cause when the worker published one. The Pi child has exited by
+   * definition, so nothing here inspects it: only its recorded identity is compared.
+   * @param {any} metadata @param {any} connection @param {number} routeGeneration @param {any} cause
    */
+  async #assertCurrentTerminal(metadata, connection, routeGeneration, cause) {
+    this.#assertRoute(metadata, connection, routeGeneration);
+    const record = await this.#registry.get(metadata.sessionId);
+    this.#assertRoute(metadata, connection, routeGeneration);
+    if (record?.ownership === undefined || record.ownership.runId !== metadata.runId || !sameIdentity(record.ownership.process, metadata.identity)) throw Object.assign(new Error("Worker no longer owns the durable session"), { code: "OWNERSHIP_CONFLICT" });
+    if (this.#workers.get(metadata.sessionId)?.leaseId !== metadata.leaseId || this.#workers.get(metadata.sessionId)?.generation !== metadata.generation) throw Object.assign(new Error("Worker lease or generation changed"), { code: "OWNERSHIP_CONFLICT" });
+    if (cause !== undefined && !validWorkerTerminalCause(cause, { sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation, worker: metadata.identity, piChild: metadata.piChildIdentity })) throw Object.assign(new Error("Terminal cause does not match the owning run"), { code: "OWNERSHIP_CONFLICT" });
+    const actualWorker = await this.#inspect(metadata.identity.pid);
+    this.#assertRoute(metadata, connection, routeGeneration);
+    if (!sameIdentity(actualWorker, metadata.identity)) throw Object.assign(new Error("Worker process identity changed"), { code: "PROCESS_IDENTITY_CONFLICT" });
+    return record;
+  }
+
+  /** Serialize one terminal frame the worker backed with a durable cause. @param {any} metadata @param {any} connection @param {number} routeGeneration @param {any} cause @param {(record: any) => Promise<any>} action */
   runCurrentTerminal(metadata, connection, routeGeneration, cause, action) {
-    return this.#serializeRoute(metadata.sessionId, async () => {
-      this.#assertRoute(metadata, connection, routeGeneration);
-      const record = await this.#registry.get(metadata.sessionId);
-      this.#assertRoute(metadata, connection, routeGeneration);
-      if (record?.ownership === undefined || record.ownership.runId !== metadata.runId || !sameIdentity(record.ownership.process, metadata.identity)) throw Object.assign(new Error("Worker no longer owns the durable session"), { code: "OWNERSHIP_CONFLICT" });
-      if (this.#workers.get(metadata.sessionId)?.leaseId !== metadata.leaseId || this.#workers.get(metadata.sessionId)?.generation !== metadata.generation || !validWorkerTerminalCause(cause, { sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation, worker: metadata.identity, piChild: metadata.piChildIdentity })) throw Object.assign(new Error("Terminal cause does not match the owning run"), { code: "OWNERSHIP_CONFLICT" });
-      const actualWorker = await this.#inspect(metadata.identity.pid);
-      this.#assertRoute(metadata, connection, routeGeneration);
-      if (!sameIdentity(actualWorker, metadata.identity)) throw Object.assign(new Error("Worker process identity changed"), { code: "PROCESS_IDENTITY_CONFLICT" });
-      return action(record);
-    }, "router_terminal_frame");
+    return this.#serializeRoute(metadata.sessionId, async () => action(await this.#assertCurrentTerminal(metadata, connection, routeGeneration, cause)), "router_terminal_frame");
+  }
+
+  /**
+   * Serialize one terminal frame from a worker that published no durable cause, which is what a
+   * worker built before that format sends. Everything but the cause is verified as it is for a
+   * cause-backed frame, and the exited Pi child is not inspected: this frame is the report of its
+   * exit, so requiring it to answer would refuse every legacy crash and drop the route with it.
+   * @param {any} metadata @param {any} connection @param {number} routeGeneration @param {(record: any) => Promise<any>} action
+   */
+  runCurrentTerminalEvent(metadata, connection, routeGeneration, action) {
+    return this.#serializeRoute(metadata.sessionId, async () => action(await this.#assertCurrentTerminal(metadata, connection, routeGeneration, undefined)), "router_terminal_frame");
   }
 
   /** Ingest one session's viewer frames in arrival order, off the lifecycle lock. @template T @param {string} sessionId @param {() => Promise<T>} action */

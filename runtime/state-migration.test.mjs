@@ -1,6 +1,7 @@
 import { chmod, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { afterEach, expect, it, vi } from "vitest";
 
@@ -194,6 +195,52 @@ it.each(["frontend-state.json", "daemon/event-acks.json", "dashboard.json"])("re
   await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: vi.fn() })).rejects.toMatchObject({ code: "MALFORMED_LEGACY_STATE" });
   expect((await stat(join(paths.legacyRoot, relative))).isDirectory()).toBe(true);
   await expect(stat(join(paths.destinationRoot, relative))).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+// Operator-visible failure: the release line's own daemon creates `daemon/workers` for its run
+// sockets and every launch creates `runs/<run>/diagnostics`. Both stand empty in a stopped root, and
+// refusing them leaves the operator unable to migrate a root this release wrote itself.
+it.each(["daemon/workers", "runs/one-run/diagnostics"])("migrates a legacy root holding the empty %s directory the daemon creates", async (relative) => {
+  const paths = await fixture();
+  await mkdir(join(paths.legacyRoot, relative), { recursive: true, mode: 0o700 });
+
+  await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {} })).resolves.toMatchObject({ status: "MIGRATED" });
+  expect((await stat(join(paths.destinationRoot, relative))).isDirectory()).toBe(true);
+});
+
+// Operator-visible failure: an empty socket or diagnostic directory is the only shape this release
+// can carry forward. Contents it cannot read must still refuse the migration before anything is
+// written to the destination, rather than arrive there as durable state no code names.
+it.each(["daemon/workers/state.json", "runs/one-run/diagnostics/rpc.0.jsonl"])("refuses the unsupported legacy file %s", async (relative) => {
+  const paths = await fixture();
+  await mkdir(dirname(join(paths.legacyRoot, relative)), { recursive: true, mode: 0o700 });
+  await writeFile(join(paths.legacyRoot, relative), "{}\n", { mode: 0o600 });
+
+  await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: vi.fn() })).rejects.toMatchObject({ code: "MALFORMED_LEGACY_STATE", message: `Malformed legacy artifact: ${relative}` });
+  await expect(stat(join(paths.destinationRoot, relative.split("/")[0]))).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+it.each(["daemon/workers/nested", "runs/one-run/diagnostics/nested"])("refuses the unknown legacy directory %s", async (relative) => {
+  const paths = await fixture();
+  await mkdir(join(paths.legacyRoot, relative), { recursive: true, mode: 0o700 });
+
+  await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: vi.fn() })).rejects.toMatchObject({ code: "MALFORMED_LEGACY_STATE", relative });
+  await expect(stat(join(paths.destinationRoot, relative.split("/")[0]))).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+it("refuses a worker socket left in the legacy daemon/workers directory", async () => {
+  const paths = await fixture();
+  const socketDirectory = join(paths.legacyRoot, "daemon", "workers");
+  await mkdir(socketDirectory, { recursive: true, mode: 0o700 });
+  const server = createServer();
+  await new Promise((resolve, reject) => { server.once("error", reject); server.listen(join(socketDirectory, "run.sock"), () => resolve(undefined)); });
+
+  try {
+    await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: vi.fn() })).rejects.toMatchObject({ code: "UNSAFE_LEGACY_STATE" });
+  } finally {
+    await new Promise((resolve) => server.close(() => resolve(undefined)));
+  }
+  await expect(stat(join(paths.destinationRoot, "daemon"))).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 // Operator-visible failure: a destination an earlier release wrote still holds the retired viewer

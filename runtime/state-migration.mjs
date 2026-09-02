@@ -33,8 +33,13 @@ const DROPPED_LEGACY_ARTIFACTS = [
  * Directories a legacy root may hold. A directory standing where a file belongs is not a format this
  * release reads, so migration refuses it rather than copying durable state no code names into a
  * destination where the daemon then finds a directory at a private file's path.
+ *
+ * `daemon/workers` holds run sockets and `runs/<run>/diagnostics` holds Pi's rotating diagnostics.
+ * Both are created by the release line this migrates from and both stand empty in a stopped root, so
+ * refusing them would refuse a root this product wrote itself. Neither is admitted with contents:
+ * a socket is not a file, and no diagnostic file is a legacy artifact this release reads.
  */
-const LEGACY_DIRECTORIES = [/^(sessions|daemon|cli|queue|runs|index)$/u, /^cli\/pending$/u, /^runs\/[^/]+$/u, /^index\/.+$/u];
+const LEGACY_DIRECTORIES = [/^(sessions|daemon|cli|queue|runs|index)$/u, /^cli\/pending$/u, /^daemon\/workers$/u, /^runs\/[^/]+$/u, /^runs\/[^/]+\/diagnostics$/u, /^index\/.+$/u];
 
 /**
  * Paths this release drops or prunes. A destination an earlier release, or an earlier attempt at this

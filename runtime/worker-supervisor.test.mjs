@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -717,6 +717,36 @@ it("records a crashed Pi child's durable cause before it releases the lease", as
   await vi.waitFor(async () => expect((await getRecord(registry, "one")).ownership).toBeUndefined(), { timeout: 5_000, interval: 5 });
   expect(await getRecord(registry, "one")).toMatchObject({ taskState: "FAILED", processState: "EXITED", activity: { kind: "process_error", summary: "Pi exited unexpectedly (SIGSEGV)" } });
   await expect(stat(causePath)).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+// Operator-visible failure: retiring the cause is cleanup, and a run directory this supervisor can no
+// longer write made that cleanup abort the release. The lease then outlived the dead worker and every
+// later launch of the session was refused as an ownership conflict.
+it("releases the lease when a crashed Pi child's cause cannot be retired", async () => {
+  const { runs, registry, ownership, router, sockets, useInspect, workers: workerMetadata } = await setup(["one"], { randomId: () => "lease-stuck" });
+  const world = processWorld();
+  useInspect(world.seams.inspect);
+  const workers = fakeWorkerFactory({ sockets, world });
+  const supervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, randomId: () => "stuck-token", ...world.seams });
+  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-stuck" });
+  const piChild = await world.seams.inspect(piChildPid(launched.identity.pid));
+  const runDirectory = join(runs, (await getRecord(registry, "one")).runHash);
+  const causePath = join(runDirectory, "terminal-cause.json");
+  await writeFile(causePath, `${JSON.stringify({ schemaVersion: 1, sessionId: "one", runId: "run-stuck", leaseId: "lease-stuck", generation: 1, worker: launched.identity, piChild, event: { type: "PI_CHILD_CRASHED", at: "2026-08-25T12:05:00.000Z", summary: "Pi exited unexpectedly (SIGSEGV)" } })}\n`, { mode: 0o600 });
+  // A readable run directory nothing may unlink from: retiring the cause fails with EACCES.
+  await chmod(runDirectory, 0o500);
+
+  try {
+    workers.exitGroup(workers.children[0]);
+
+    await vi.waitFor(async () => expect((await getRecord(registry, "one")).ownership).toBeUndefined(), { timeout: 5_000, interval: 5 });
+    expect(await getRecord(registry, "one")).toMatchObject({ taskState: "FAILED", processState: "EXITED", activity: { kind: "process_error", summary: "Pi exited unexpectedly (SIGSEGV)" } });
+    await vi.waitFor(async () => expect(await workerMetadata()).toEqual([]), { timeout: 5_000, interval: 5 });
+    // The record it could not delete stays where a later reader finds it, and reapplying it is idempotent.
+    await expect(stat(causePath)).resolves.toMatchObject({ mode: expect.any(Number) });
+  } finally {
+    await chmod(runDirectory, 0o700);
+  }
 });
 
 it("does not charge an ownership-free stale LIVE record against managed capacity", async () => {

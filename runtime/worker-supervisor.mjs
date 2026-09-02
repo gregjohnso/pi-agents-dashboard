@@ -256,6 +256,8 @@ export class WorkerSupervisor {
    * supervisor exit it caused and gives up after a fixed window, so the lease release is the last
    * moment that cause can still reach the row. It writes the record directly rather than through
    * `#writeWorkerEventLocked`, whose terminal tail would re-enter this reconciliation.
+   *
+   * Returns the path of the cause this consumed, which the caller retires after the release.
    * @param {any} supervision
    */
   async #applyTerminalCauseLocked(supervision) {
@@ -269,12 +271,12 @@ export class WorkerSupervisor {
       worker: supervision.identity,
       piChild: supervision.piChildIdentity,
     });
-    if (cause === undefined) return;
+    if (cause === undefined) return undefined;
     const current = await this.#registry.get(supervision.sessionId);
     const ownsRecord = current !== undefined && current.ownership?.runId === supervision.lease.runId &&
       current.ownership?.acquiredAt === supervision.lease.acquiredAt &&
       sameIdentity(current.ownership?.process, supervision.identity);
-    if (!ownsRecord) return;
+    if (!ownsRecord) return undefined;
     const next = reduceSessionState(current, cause.event);
     if (next !== current) {
       await this.#registry.update(supervision.sessionId, current.revision, {
@@ -285,7 +287,7 @@ export class WorkerSupervisor {
         updatedAt: next.updatedAt,
       });
     }
-    await retireWorkerTerminalCause(causePath);
+    return causePath;
   }
 
   /** @param {any} supervision @param {boolean} [verifiedTerminal] */
@@ -299,8 +301,12 @@ export class WorkerSupervisor {
     supervision.handle = undefined;
     if (handle !== undefined) this.#handles.delete(handle);
     if (!(await this.#piChildTerminalLocked(supervision))) return;
-    await this.#applyTerminalCauseLocked(supervision);
+    const consumedCause = await this.#applyTerminalCauseLocked(supervision);
     await this.#ownership.release(supervision.sessionId, supervision.lease.leaseId, supervision.lease.generation);
+    // Retiring the cause is cleanup and runs after the release for that reason: a run directory this
+    // supervisor can no longer write must not strand the lease on a dead worker. A cause that survives
+    // is read again as the same crash, which repeats this transition rather than inventing one.
+    if (consumedCause !== undefined) await retireWorkerTerminalCause(consumedCause).catch(() => {});
     // The token is private per-run state, so a proven-terminal run leaves nothing behind to authenticate.
     await this.#router?.forgetRun(supervision.sessionId, supervision.token);
     supervision.lifecycle = "reconciled";

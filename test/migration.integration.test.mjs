@@ -1,17 +1,30 @@
 import { chmod, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { afterEach, expect, it } from "vitest";
 
 import { runDashboardApp } from "../app/standalone.mjs";
+import { inspectProcessIdentity } from "../runtime/process-identity-linux.mjs";
 import { migrateLegacyState } from "../runtime/state-migration.mjs";
 import { expectDaemonCommand } from "./daemon-command-assertions.mjs";
+import { readProcessLedger } from "./process-ledger.mjs";
 import { createRealProcessHarness } from "./real-process-harness.mjs";
 
 const harness = createRealProcessHarness("migration");
 
 afterEach(() => harness.cleanup());
+
+/** @param {{ pid: number, startIdentity: string, processGroupId: number }} identity */
+async function processMatches(identity) {
+  try {
+    const actual = await inspectProcessIdentity(identity.pid);
+    return actual.pid === identity.pid && actual.startIdentity === identity.startIdentity && actual.processGroupId === identity.processGroupId;
+  } catch {
+    return false;
+  }
+}
 
 async function attempt(mutator, expectedCode) {
   const parent = await mkdtemp(join(tmpdir(), "migration-unsafe-"));
@@ -45,17 +58,49 @@ it("publishes and reconciles exactly one real destination daemon", async () => {
     cwd: parent,
     env: { HOME: parent, XDG_STATE_HOME: parent, XDG_RUNTIME_DIR: join(parent, "runtime") },
     initialize: async () => {},
+    startDaemon: (options) => harness.daemon("start", options),
     connectOrStart: async ({ root }) => ({ root, clientId: "migration-acceptance", async close() {} }),
     openList: async () => ({ closed: Promise.resolve(), async close() {} }),
   });
   const status = await harness.daemon("status", { root: destinationRoot });
   expectDaemonCommand("status", status, { code: 0, result: { publication: { pid: expect.any(Number) } } });
-  // `migrateLegacyState` starts this daemon through `reconcileDestination`, deep enough that the
-  // harness never sees its spawn. Recording the published identity here is the earliest point a
-  // later timeout can still be reaped from; a timeout inside `runDashboardApp` above still leaks.
-  await harness.record("reconciled destination daemon", status.result.publication);
+  expect((await readProcessLedger(harness.ledgerPath())).processes).toEqual([
+    { label: expect.stringContaining("daemon child"), identity: expect.objectContaining({ pid: status.result.publication.pid, startIdentity: status.result.publication.startIdentity, processGroupId: status.result.publication.processGroupId }) },
+  ]);
   const secondStart = await harness.daemon("start", { root: destinationRoot });
   expectDaemonCommand("start", secondStart, { code: 0, result: { alreadyRunning: true, publication: { pid: status.result.publication.pid } } });
+}, 120_000);
+
+it("records and reaps a destination daemon when the application times out before publication", async () => {
+  const parent = await harness.stateRoot("migration-delayed-daemon-");
+  const legacyRoot = join(parent, "pi-agents-dashboard");
+  const destinationRoot = harness.daemonRoot(join(parent, "pi-agents"));
+  const delayedImport = join(parent, "delay-daemon-start.mjs");
+  await mkdir(legacyRoot, { mode: 0o700 });
+  await writeFile(join(legacyRoot, "dashboard.json"), JSON.stringify({ schemaVersion: 1 }), { mode: 0o600 });
+  await writeFile(delayedImport, "await new Promise((resolve) => setTimeout(resolve, 60_000));\n", { mode: 0o600 });
+  const env = { ...process.env, HOME: parent, XDG_STATE_HOME: parent, XDG_RUNTIME_DIR: join(parent, "runtime"), NODE_OPTIONS: `--import=${delayedImport}` };
+  const application = runDashboardApp({
+    cwd: parent,
+    env,
+    initialize: async () => {},
+    startDaemon: (options) => harness.daemon("start", { ...options, env, timeoutMs: 60_000 }),
+    connectOrStart: async ({ root }) => ({ root, clientId: "migration-timeout", async close() {} }),
+    openList: async () => ({ closed: Promise.resolve(), async close() {} }),
+  });
+  const applicationOutcome = application.then(() => undefined, (error) => error);
+
+  expect(await Promise.race([applicationOutcome.then(() => "settled"), delay(250, "publication timeout")])).toBe("publication timeout");
+  await expect.poll(async () => {
+    try { return (await readProcessLedger(harness.ledgerPath())).processes; } catch { return []; }
+  }, { timeout: 5_000 }).toHaveLength(1);
+  const [recorded] = (await readProcessLedger(harness.ledgerPath())).processes;
+  expect(await processMatches(recorded.identity)).toBe(true);
+
+  await harness.cleanup();
+
+  expect(await processMatches(recorded.identity)).toBe(false);
+  expect(await applicationOutcome).toMatchObject({ code: "DAEMON_START_FAILED" });
 }, 120_000);
 
 it.each([

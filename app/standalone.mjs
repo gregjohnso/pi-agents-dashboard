@@ -16,6 +16,8 @@ const { loadCliClientIdentity } = await import(new URL("../cli/session-commands.
 
 /** @param {string} path */
 async function exists(path) { try { await access(path); return true; } catch { return false; } }
+/** @param {any} options */
+async function defaultStartDaemon(options) { return runDaemonCommand("start", options); }
 
 /** Create a public-component full-screen viewer around the normalized client seam. */
 export function createStandaloneViewer({ sessionId, client, persistence, onReturn, terminal = new ProcessTerminal(), now }) {
@@ -41,6 +43,7 @@ export async function runDashboardApp({
   cwd, piBin, env, stdin, stdout, stderr,
   initialize = async () => { initializeRuntimePermissions(); },
   migrate,
+  startDaemon = defaultStartDaemon,
   connectOrStart,
   openList,
 }) {
@@ -52,7 +55,7 @@ export async function runDashboardApp({
       legacyRoot: roots.legacyStateRoot, destinationRoot: roots.destinationStateRoot, expectedUserId: process.getuid(),
       inspectLegacyRuntime: () => inspectRuntimeActivity({ stateRoot: roots.legacyStateRoot, runtimeRoot: roots.legacyRuntimeRoot }),
       reconcileDestination: async ({ root }) => {
-        const started = await runDaemonCommand("start", { root });
+        const started = await startDaemon({ root });
         if (started.code !== 0) throw Object.assign(new Error(started.error?.message ?? "Destination reconciliation failed"), { code: started.error?.code ?? "RECONCILIATION_FAILED" });
       },
     });
@@ -60,7 +63,7 @@ export async function runDashboardApp({
   // The daemon start runs before the interface exists, so its own slow-start reporting needs this
   // terminal's error stream: a hung start would otherwise leave the operator a blank screen.
   const frontend = connectOrStart === undefined
-    ? await defaultConnectOrStart({ root: roots.destinationStateRoot, piBin, env, stderr })
+    ? await defaultConnectOrStart({ root: roots.destinationStateRoot, piBin, env, stderr, startDaemon })
     : await connectOrStart({ root: roots.destinationStateRoot, piBin, env, stderr });
   const listOptions = { cwd, piBin, env, stdin, stdout, stderr, frontend };
   const list = openList === undefined
@@ -69,9 +72,9 @@ export async function runDashboardApp({
   try { await list.closed; } finally { await list.close(); await frontend.close(); }
 }
 
-/** @param {{root:string,piBin?:string,env:NodeJS.ProcessEnv,stderr?:NodeJS.WritableStream}} options */
+/** @param {{root:string,piBin?:string,env:NodeJS.ProcessEnv,stderr?:NodeJS.WritableStream,startDaemon:(options:any)=>Promise<any>}} options */
 async function defaultConnectOrStart(options) {
-  const started = await runDaemonCommand("start", { root: options.root, piBin: options.piBin, env: options.env, stderr: options.stderr });
+  const started = await options.startDaemon({ root: options.root, piBin: options.piBin, env: options.env, stderr: options.stderr });
   if (started.code !== 0) throw Object.assign(new Error(started.error?.message ?? "Daemon did not start"), { code: started.error?.code ?? "DAEMON_START_FAILED" });
   const clientId = await loadCliClientIdentity({ root: options.root });
   // `clientId` is this installation and survives every restart, because it and the request ID are

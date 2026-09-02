@@ -101,10 +101,6 @@ it.each([
   ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, routeGeneration: 0 }] })],
   ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, pendingRespawn: "later" }] })],
   ["unknown-state.json", JSON.stringify({ value: true })],
-  // Retired artifacts. No production code names either one, so neither has a validator and both are
-  // simply unknown to a migration: nothing parses, migrates, or deletes the copies already on disk.
-  ["frontend-state.json", JSON.stringify({ schemaVersion: 1, clientId: "client", viewState: {}, launchDraft: {} })],
-  ["daemon/attachment-results.jsonl", `${JSON.stringify({ schemaVersion: 1, phase: "COMPLETED" })}\n`],
 ])("refuses malformed legacy artifact %s", async (relative, text) => {
   const paths = await fixture();
   const directory = join(paths.legacyRoot, relative.split("/").slice(0, -1).join("/"));
@@ -168,6 +164,23 @@ it("drops the deleted command journal and its client-side retry records", async 
   for (const relative of [["queue", "commands.jsonl"], ["daemon", "launch-results.json"], ["cli", "pending", "one.json"]]) {
     await expect(readFile(join(paths.destinationRoot, ...relative), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   }
+});
+
+it.each([
+  ["index/viewer/events.jsonl", "this retired index record is not JSON\n", "index"],
+  ["frontend-state.json", "{", undefined],
+  ["daemon/attachment-results.jsonl", "this retired attachment result is not JSON\n", "daemon"],
+  ["daemon/event-acks.json", "{", "daemon"],
+])("drops retired viewer artifact %s without recreating its empty directory", async (relative, text, emptyDirectory) => {
+  const paths = await fixture();
+  const directory = join(paths.legacyRoot, relative.split("/").slice(0, -1).join("/"));
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await writeFile(join(paths.legacyRoot, relative), text, { mode: 0o600 });
+
+  await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {} })).resolves.toMatchObject({ status: "MIGRATED" });
+  await expect(readFile(join(paths.destinationRoot, relative), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  if (emptyDirectory !== undefined) await expect(stat(join(paths.destinationRoot, emptyDirectory))).rejects.toMatchObject({ code: "ENOENT" });
+  expect(await readFile(join(paths.legacyRoot, relative), "utf8")).toBe(text);
 });
 
 it("recovers mutable PUBLISHED output only after the reconciliation marker is durable", async () => {

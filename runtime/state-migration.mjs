@@ -16,12 +16,18 @@ const LOCK = ".migration.lock";
 const RECONCILIATION_MARKER = ".reconciliation-started";
 /**
  * Durable formats this release deleted. A legacy root still holds them, so migration recognizes each
- * one and carries none of them forward: the daemon-wide command journal and the two client-side
- * records that existed only to give it a stable retry identity. Their content is never parsed,
- * because nothing will read it again, and refusing the root over a format nobody reads would leave
- * the operator unable to migrate at all.
+ * one and carries none of them forward. Their content is never parsed, because nothing will read it
+ * again, and refusing the root over a format nobody reads would leave the operator unable to migrate.
  */
-const DROPPED_LEGACY_ARTIFACTS = [/^queue\/commands\.jsonl$/u, /^daemon\/launch-results\.json$/u, /^cli\/pending\/[^/]+\.json$/u];
+const DROPPED_LEGACY_ARTIFACTS = [
+  /^queue\/commands\.jsonl$/u,
+  /^daemon\/launch-results\.json$/u,
+  /^cli\/pending\/[^/]+\.json$/u,
+  /^index\/.+$/u,
+  /^frontend-state\.json$/u,
+  /^daemon\/attachment-results\.jsonl$/u,
+  /^daemon\/event-acks\.json$/u,
+];
 
 /** @param {string} code @param {string} message @param {Record<string, unknown>} [details] */
 function migrationError(code, message, details = {}) { return Object.assign(new Error(message), { code, ...details }); }
@@ -238,7 +244,13 @@ export async function migrateLegacyState({ legacyRoot, destinationRoot, expected
     const destinationIdentity = digest(JSON.stringify({ realpath: await fsOps.realpath(destinationRoot), dev: destinationMetadata.dev, ino: destinationMetadata.ino }));
     const migrationId = digest(JSON.stringify([tree.identity, destinationIdentity, 1, 2]));
     const manifestPath = join(destinationRoot, MANIFEST);
-    const preparedEntries = tree.entries.filter((entry) => !DROPPED_LEGACY_ARTIFACTS.some((pattern) => pattern.test(entry.relative))).map((entry) => {
+    const retainedFiles = tree.entries.filter((entry) => entry.type === "file" && !DROPPED_LEGACY_ARTIFACTS.some((pattern) => pattern.test(entry.relative)));
+    const preparedEntries = tree.entries.filter((entry) => {
+      if (entry.type === "file") return retainedFiles.includes(entry);
+      if (/^(index|queue)(?:\/|$)/u.test(entry.relative) || /^cli\/pending(?:\/|$)/u.test(entry.relative)) return false;
+      if (["cli", "daemon"].includes(entry.relative)) return retainedFiles.some((file) => file.relative.startsWith(`${entry.relative}/`));
+      return true;
+    }).map((entry) => {
       if (entry.type !== "file") return entry;
       let text = entry.text ?? "";
       if (entry.relative === "dashboard.json") { try { text = `${JSON.stringify(convertLegacyDashboardConfig(JSON.parse(text)), null, 2)}\n`; } catch (error) { throw migrationError("MALFORMED_LEGACY_STATE", "Legacy dashboard configuration is invalid", { cause: error }); } }

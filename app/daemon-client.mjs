@@ -400,6 +400,8 @@ export function createDaemonClient({ socketPath, token, maxBytes, reconnectDelay
      * @param {string} [exactRequestId]
      */
     const destructive = async (operation, sessionId, revision, exactRequestId = randomUUID()) => {
+        if (operation === "delete")
+            await detaching.get(sessionId)?.catch(() => { });
         const transaction = createDaemonClient({ socketPath, token, maxBytes, reconnectDelayMs, maxReconnectDelayMs, clientId, attachId, subscriberLimit, reconnect: false });
         try {
             await transaction.connect();

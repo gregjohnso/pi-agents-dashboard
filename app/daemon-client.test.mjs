@@ -556,6 +556,40 @@ describe("daemon client", () => {
     expect(order).toEqual(["detach:start", "attach:other", "detach:done", "attach:session-1"]);
   });
 
+  it("holds delete behind the same session's in-flight detach and lets another session past", async () => {
+    const socketPath = await socketPathIn("client-delete-detach-order-");
+    /** @type {string[]} */
+    const order = [];
+    /** @type {(() => void) | undefined} */
+    let rejectDetach;
+    await daemonServer(socketPath, ({ request: incoming, reply, refuse }) => {
+      if (incoming.op === "detach") {
+        order.push("detach:start");
+        rejectDetach = () => {
+          order.push("detach:failed");
+          refuse({ code: "DETACH_FAILED", message: "Detach failed" });
+        };
+        return;
+      }
+      order.push(`delete:${incoming.payload.sessionId}:${incoming.requestId}`);
+      reply({ kind: "command", sessionId: incoming.payload.sessionId });
+    });
+    const client = startClient({ socketPath, maxBytes: 4096 });
+    void client.detach("session-1").catch(() => {});
+    await waitFor(() => order.length === 1);
+    const sameSessionDelete = client.delete("session-1", 7, "same-delete-request");
+    await expect(within(client.delete("other", 8, "other-delete-request"))).resolves.toBeUndefined();
+    expect(order).toEqual(["detach:start", "delete:other:other-delete-request"]);
+    rejectDetach?.();
+    await expect(within(sameSessionDelete)).resolves.toBeUndefined();
+    expect(order).toEqual([
+      "detach:start",
+      "delete:other:other-delete-request",
+      "detach:failed",
+      "delete:session-1:same-delete-request",
+    ]);
+  });
+
   // The commands are what the operator asked for; the summary model and the row are decoration the
   // viewer has defaults for, so neither may fail an otherwise good menu.
   it("reads a session menu and keeps it when the settings and rows behind it refuse", async () => {

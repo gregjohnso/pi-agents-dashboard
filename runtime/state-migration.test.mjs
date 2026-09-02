@@ -208,10 +208,35 @@ it.each(["daemon/workers", "runs/one-run/diagnostics"])("migrates a legacy root 
   expect((await stat(join(paths.destinationRoot, relative))).isDirectory()).toBe(true);
 });
 
-// Operator-visible failure: an empty socket or diagnostic directory is the only shape this release
-// can carry forward. Contents it cannot read must still refuse the migration before anything is
+// Operator-visible failure: a stopped run keeps the rotating RPC and stderr segments this release
+// still writes. Refusing them leaves the operator unable to migrate a root that holds one crashed
+// run's only diagnostics, and rewriting them would destroy the evidence they exist to carry.
+it("migrates the rotating RPC and stderr segments a run leaves behind", async () => {
+  const paths = await fixture();
+  const segments = {
+    "rpc.00000000.jsonl": `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "session/prompt" })}\n${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { stopReason: "end_turn" } })}\n`,
+    "rpc.00000001.jsonl": `${JSON.stringify({ type: "diagnostic_truncation", removedBytes: 8_388_608, removedRecords: 12 })}\n`,
+    "stderr.00000000.jsonl": "pi: model provider returned 429\npi: retrying in 2s\n",
+  };
+  const directory = join(paths.legacyRoot, "runs", "a2f9c1", "diagnostics");
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  for (const [name, text] of Object.entries(segments)) await writeFile(join(directory, name), text, { mode: 0o600 });
+
+  await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {} })).resolves.toMatchObject({ status: "MIGRATED" });
+
+  for (const [name, text] of Object.entries(segments)) {
+    const migrated = join(paths.destinationRoot, "runs", "a2f9c1", "diagnostics", name);
+    expect(await readFile(migrated)).toEqual(Buffer.from(text));
+    expect((await stat(migrated)).mode & 0o777).toBe(0o600);
+    expect(await readFile(join(directory, name))).toEqual(Buffer.from(text));
+  }
+  expect((await stat(join(paths.destinationRoot, "runs", "a2f9c1", "diagnostics"))).mode & 0o777).toBe(0o700);
+});
+
+// Operator-visible failure: only the segment names `openRotatingWriter` writes are carried forward.
+// Any other content of a socket or diagnostic directory must refuse the migration before anything is
 // written to the destination, rather than arrive there as durable state no code names.
-it.each(["daemon/workers/state.json", "runs/one-run/diagnostics/rpc.0.jsonl"])("refuses the unsupported legacy file %s", async (relative) => {
+it.each(["daemon/workers/state.json", "runs/one-run/diagnostics/rpc.0.jsonl", "runs/one-run/diagnostics/stdout.00000000.jsonl"])("refuses the unsupported legacy file %s", async (relative) => {
   const paths = await fixture();
   await mkdir(dirname(join(paths.legacyRoot, relative)), { recursive: true, mode: 0o700 });
   await writeFile(join(paths.legacyRoot, relative), "{}\n", { mode: 0o600 });

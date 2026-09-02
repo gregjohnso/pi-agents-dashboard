@@ -36,8 +36,9 @@ const DROPPED_LEGACY_ARTIFACTS = [
  *
  * `daemon/workers` holds run sockets and `runs/<run>/diagnostics` holds Pi's rotating diagnostics.
  * Both are created by the release line this migrates from and both stand empty in a stopped root, so
- * refusing them would refuse a root this product wrote itself. Neither is admitted with contents:
- * a socket is not a file, and no diagnostic file is a legacy artifact this release reads.
+ * refusing them would refuse a root this product wrote itself. `daemon/workers` is never admitted
+ * with contents, because a socket is not a file; `runs/<run>/diagnostics` admits only the segment
+ * names `openRotatingWriter` writes.
  */
 const LEGACY_DIRECTORIES = [/^(sessions|daemon|cli|queue|runs|index)$/u, /^cli\/pending$/u, /^daemon\/workers$/u, /^runs\/[^/]+$/u, /^runs\/[^/]+\/diagnostics$/u, /^index\/.+$/u];
 
@@ -94,6 +95,10 @@ function validateLegacyArtifact(relative, text) {
     if (relative === "daemon/reconciliation.json") { const value = JSON.parse(text); exactObject(value, ["schemaVersion", "daemonEpoch", "completedAt", "conflicts"], "Reconciliation record"); if (value.schemaVersion !== 1 || typeof value.daemonEpoch !== "string" || typeof value.completedAt !== "string" || !Array.isArray(value.conflicts)) throw new TypeError("Reconciliation record is invalid"); return; }
     if (relative === "cli/client-id") { const clientId = text.trim(); if (clientId.length === 0 || clientId.includes("/") || clientId.includes("\0") || clientId !== text.trim()) throw new TypeError("CLI identity is invalid"); return; }
     if (/^runs\/[^/]+\/(worker\.stdout\.log|worker\.stderr\.log)$/u.test(relative)) return;
+    // Rotating diagnostics this release still writes: `runtime/rotating-diagnostics.mjs` names every
+    // segment `<rpc|stderr>.<index padded to 8 digits>.jsonl`. They are carried opaquely, because
+    // they exist to record what a crashed run actually emitted and no reader parses them.
+    if (/^runs\/[^/]+\/diagnostics\/(rpc|stderr)\.\d{8,}\.jsonl$/u.test(relative)) return;
     if (/^runs\/[^/]+\/worker-replay\.jsonl$/u.test(relative)) { validateJsonLines(text, validateWorkerReplayRecord, "Worker replay store"); return; }
     throw new TypeError(`Unknown legacy state artifact: ${relative}`);
   } catch (error) { throw migrationError("MALFORMED_LEGACY_STATE", `Malformed legacy artifact: ${relative}`, { cause: error }); }

@@ -92,6 +92,7 @@ export function reduceSessionState(record, event) {
         outcome: record.outcome,
       });
     case "WORKER_EXITED":
+      if (record.taskState === "FAILED" && record.processState === "EXITED" && record.activity.kind === "process_error") return record;
       return transition(record, event.at, {
         taskState: "READY",
         processState: "EXITED",

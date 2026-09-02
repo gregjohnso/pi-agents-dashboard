@@ -13,7 +13,13 @@ const log = (entry) => {
   if (logPath) appendFileSync(logPath, `${JSON.stringify({ pid: process.pid, ...entry })}\n`, { mode: 0o600 });
 };
 
-log({ kind: "start", argv: process.argv.slice(2), providerInvocation: false });
+log({
+  kind: "start",
+  argv: process.argv.slice(2),
+  providerInvocation: false,
+  workerTokenPresent: Object.hasOwn(process.env, "PI_AGENTS_WORKER_TOKEN"),
+  boundaryMarker: process.env.PI_AGENTS_BOUNDARY_MARKER,
+});
 if (process.argv.includes("--version")) {
   process.stdout.write(process.env.FAKE_PI_VERSION_OUTPUT ?? `${process.env.FAKE_PI_VERSION ?? "1.0.0"}\n`);
   process.exit(Number(process.env.FAKE_PI_VERSION_EXIT ?? "0"));

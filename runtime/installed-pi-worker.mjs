@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, timingSafeEqual } from "node:crypto";
+import { dirname, join } from "node:path";
 
 import { piConfirmedModel } from "../shared/contracts.mjs";
 import { openPiExecutableBinding } from "./pi-executable.mjs";
@@ -10,6 +11,7 @@ import { sessionEventForPiEvent } from "./session-event-mapping.mjs";
 import { MAX_LIVE_TAIL_BYTES, createLiveTail } from "./worker-live-tail.mjs";
 import { listenForDaemon } from "./worker-socket.mjs";
 import { createWorkerCommandDispatcher, createWorkerReplayStore, replayDeliveryIsAmbiguous, serveDaemonConnections } from "./worker.mjs";
+import { WORKER_TERMINAL_CAUSE_FILE, publishWorkerTerminalCause, retireWorkerTerminalCause } from "./worker-terminal-cause.mjs";
 
 const MAX_PENDING_PARENT_MESSAGES = 256;
 const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
@@ -89,11 +91,16 @@ export async function runInstalledPiWorker(runtimeProcess) {
   let transportMessageHandler;
   /** @type {Set<(message: any) => boolean>} */
   const launchWaiters = new Set();
+  /** @type {((message: any) => boolean) | undefined} */
+  let terminalCauseAcknowledgement;
+  /** @param {any} message */
+  const acceptTerminalCauseAcknowledgement = (message) => terminalCauseAcknowledgement?.(message) === true;
   /** @param {any} message */
   const onDaemonMessage = (message) => {
     for (const waiter of [...launchWaiters]) {
       if (waiter(message)) return;
     }
+    if (acceptTerminalCauseAcknowledgement(message)) return;
     if (!matchesToken(message?.token, token) || !["command", "shutdown"].includes(message.type)) return;
     const send = (/** @type {any} */ response) => sendToDaemon?.(response);
     if (transportMessageHandler !== undefined) {
@@ -137,9 +144,11 @@ export async function runInstalledPiWorker(runtimeProcess) {
   const executableBinding = await openPiExecutableBinding(options.executable);
   const diagnostics = await openRotatingDiagnostics({ directory: options.diagnosticsDirectory });
   const argv = piRpcArgv({ sessionFile: options.canonicalSessionFile, model: options.model, name: options.name });
+  const piEnvironment = { ...runtimeProcess.env };
+  delete piEnvironment.PI_AGENTS_WORKER_TOKEN;
   let piChild;
   try {
-    piChild = spawn(executableBinding.executionPath, argv, { cwd: options.cwd, env: runtimeProcess.env, detached: false, shell: false, stdio: ["pipe", "pipe", "pipe", executableBinding.handle.fd] });
+    piChild = spawn(executableBinding.executionPath, argv, { cwd: options.cwd, env: piEnvironment, detached: false, shell: false, stdio: ["pipe", "pipe", "pipe", executableBinding.handle.fd] });
   } finally {
     await executableBinding.handle.close();
   }
@@ -188,6 +197,7 @@ export async function runInstalledPiWorker(runtimeProcess) {
   };
   /** @param {any} message @param {(message: any) => Promise<unknown> | unknown} send */
   const onTransportMessage = (message, send) => {
+    if (acceptTerminalCauseAcknowledgement(message)) return;
     if (!matchesToken(message?.token, token)) return;
     if (message.type === "shutdown") { void shutdown(); return; }
     if (message.type !== "command") return;
@@ -235,9 +245,32 @@ export async function runInstalledPiWorker(runtimeProcess) {
   /** @param {number | null} code @param {NodeJS.Signals | null} signal */
   const reportPiChildExit = async (code, signal) => {
     const event = { type: "PI_CHILD_CRASHED", at: new Date().toISOString(), summary: `Pi exited unexpectedly (${signal ?? code ?? "unknown"})` };
-    const message = { version: 1, type: "worker_event", token, sessionId: options.sessionId, event };
-    const delivered = Promise.resolve(sendToDaemon?.(message));
-    await Promise.race([delivered, new Promise((resolveTimeout) => setTimeout(resolveTimeout, CRASH_REPORT_TIMEOUT_MS))]);
+    const cause = {
+      schemaVersion: 1,
+      sessionId: options.sessionId,
+      runId: options.runId,
+      leaseId: options.leaseId,
+      generation: options.generation,
+      worker: supervisorIdentity,
+      piChild: piChildIdentity,
+      event,
+    };
+    const causePath = join(dirname(options.replayPath), WORKER_TERMINAL_CAUSE_FILE);
+    await publishWorkerTerminalCause(causePath, cause);
+    let acknowledged = false;
+    /** @type {(value?: unknown) => void} */
+    let resolveAcknowledged;
+    const acknowledgement = new Promise((resolve) => { resolveAcknowledged = resolve; });
+    terminalCauseAcknowledgement = (message) => {
+      if (!matchesToken(message?.token, token) || message?.version !== 1 || message?.type !== "terminal_cause_ack" || message.sessionId !== options.sessionId || message.runId !== options.runId || message.leaseId !== options.leaseId || message.generation !== options.generation) return false;
+      acknowledged = true;
+      resolveAcknowledged();
+      return true;
+    };
+    void Promise.resolve(sendToDaemon?.({ version: 1, type: "worker_event", token, sessionId: options.sessionId, event })).catch(() => {});
+    await Promise.race([acknowledgement, new Promise((resolveTimeout) => setTimeout(resolveTimeout, CRASH_REPORT_TIMEOUT_MS))]);
+    terminalCauseAcknowledgement = undefined;
+    if (acknowledged) await retireWorkerTerminalCause(causePath);
   };
   piChild.once("exit", (code, signal) => {
     if (shuttingDown) return;

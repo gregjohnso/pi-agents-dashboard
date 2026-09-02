@@ -211,8 +211,8 @@ export function createWorkerControlClient({ registry }) {
     return connection;
   };
 
-  /** @param {any} frame */
-  const onWorkerFrame = async (frame) => {
+  /** @param {any} frame @param {any} connection @param {any} metadata */
+  const onWorkerFrame = async (frame, connection, metadata) => {
     frames.push(frame);
     if (frame.type === "command_result") {
       const request = pending.get(frame.id);
@@ -224,8 +224,10 @@ export function createWorkerControlClient({ registry }) {
     const current = await registry.get(frame.sessionId);
     if (current?.ownership?.runId !== routeMetadata.runId) return;
     const next = reduceSessionState(current, frame.event);
-    if (next === current) return;
-    await registry.update(frame.sessionId, current.revision, { taskState: next.taskState, processState: next.processState, outcome: next.outcome, activity: next.activity, updatedAt: next.updatedAt });
+    if (next !== current) await registry.update(frame.sessionId, current.revision, { taskState: next.taskState, processState: next.processState, outcome: next.outcome, activity: next.activity, updatedAt: next.updatedAt });
+    if (frame.event?.type === "PI_CHILD_CRASHED" && metadata !== undefined) {
+      await connection.send({ version: 1, type: "terminal_cause_ack", token: metadata.token, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
+    }
   };
 
   return {

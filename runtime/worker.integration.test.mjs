@@ -194,7 +194,9 @@ it("fails the session with a process error when the Pi child exits unexpectedly"
 
   await waitForExit(launched.identity.pid);
   await waitForOwnershipRelease(registry, "one");
-  expect(await registry.get("one")).toMatchObject({ taskState: "FAILED", processState: "EXITED", activity: { kind: "process_error" } });
+  const crashed = await registry.get("one");
+  expect(crashed).toMatchObject({ taskState: "FAILED", processState: "EXITED", activity: { kind: "process_error" } });
+  await expect(stat(join(runs, crashed?.runHash ?? "missing", "terminal-cause.json"))).rejects.toMatchObject({ code: "ENOENT" });
   await supervisor.close();
 });
 

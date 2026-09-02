@@ -11,6 +11,7 @@ import { reduceSessionState } from "./state-reducer.mjs";
 import { createViewerNormalizer } from "./viewer-normalizer.mjs";
 import { createViewerStream } from "./viewer-stream.mjs";
 import { WORKER_SOCKET_PROTOCOL, connectToWorker } from "./worker-socket.mjs";
+import { readWorkerTerminalCause, retireWorkerTerminalCause, validWorkerTerminalCause, workerTerminalCausePath } from "./worker-terminal-cause.mjs";
 
 /** Frames the startup connection carries before its route is adopted. */
 const LAUNCH_CONTROL_TYPES = ["hello", "pi_child", "worker_ready"];
@@ -670,6 +671,25 @@ export class RecoveredWorkerRouter {
     }, "router_frame");
   }
 
+  /**
+   * Verify a terminal-cause frame against the current route, lease, worker, and both recorded identities.
+   * The Pi child has exited by definition, so only its exact recorded identity can be checked here.
+   * @param {any} metadata @param {any} connection @param {number} routeGeneration @param {any} cause @param {(record: any) => Promise<any>} action
+   */
+  runCurrentTerminal(metadata, connection, routeGeneration, cause, action) {
+    return this.#serializeRoute(metadata.sessionId, async () => {
+      this.#assertRoute(metadata, connection, routeGeneration);
+      const record = await this.#registry.get(metadata.sessionId);
+      this.#assertRoute(metadata, connection, routeGeneration);
+      if (record?.ownership === undefined || record.ownership.runId !== metadata.runId || !sameIdentity(record.ownership.process, metadata.identity)) throw Object.assign(new Error("Worker no longer owns the durable session"), { code: "OWNERSHIP_CONFLICT" });
+      if (this.#workers.get(metadata.sessionId)?.leaseId !== metadata.leaseId || this.#workers.get(metadata.sessionId)?.generation !== metadata.generation || !validWorkerTerminalCause(cause, { sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation, worker: metadata.identity, piChild: metadata.piChildIdentity })) throw Object.assign(new Error("Terminal cause does not match the owning run"), { code: "OWNERSHIP_CONFLICT" });
+      const actualWorker = await this.#inspect(metadata.identity.pid);
+      this.#assertRoute(metadata, connection, routeGeneration);
+      if (!sameIdentity(actualWorker, metadata.identity)) throw Object.assign(new Error("Worker process identity changed"), { code: "PROCESS_IDENTITY_CONFLICT" });
+      return action(record);
+    }, "router_terminal_frame");
+  }
+
   /** Ingest one session's viewer frames in arrival order, off the lifecycle lock. @template T @param {string} sessionId @param {() => Promise<T>} action */
   runFrame(sessionId, action) {
     return traceSessionLock("viewer_ingest", sessionId, (traced) => this.#frames.run(sessionId, traced), action);
@@ -933,7 +953,16 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, adoptTimeou
         if (current === undefined || current.revision !== record.revision || current.ownership === undefined) {
           return { reason: supervisorReason, ownership: record.ownership, metadata };
         }
-        const next = reduceSessionState(current, { type: "WORKER_EXITED", at: new Date().toISOString() });
+        const causePath = typeof current.runHash === "string" ? workerTerminalCausePath(root, current.runHash) : undefined;
+        const cause = causePath === undefined ? undefined : await readWorkerTerminalCause(causePath, {
+          sessionId: current.sessionId,
+          runId: metadata.runId,
+          leaseId: metadata.leaseId,
+          generation: metadata.generation,
+          worker: metadata.identity,
+          piChild: metadata.piChildIdentity,
+        });
+        const next = reduceSessionState(current, cause?.event ?? { type: "WORKER_EXITED", at: new Date().toISOString() });
         const updated = await registry.update(current.sessionId, current.revision, {
           taskState: next.taskState,
           processState: next.processState,
@@ -944,6 +973,7 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, adoptTimeou
         });
         // Worker metadata is what lets a later daemon find this child again, so it is forgotten only now.
         await forget();
+        if (cause !== undefined) await retireWorkerTerminalCause(/** @type {string} */ (causePath));
         repairedSessions.push(updated);
         return undefined;
       });

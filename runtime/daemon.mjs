@@ -24,6 +24,7 @@ import { createIdleExit, resolveIdleExitMs } from "./idle-exit.mjs";
 import { spawn as spawnProcess } from "node:child_process";
 import { createModelCatalog } from "./pi-model-catalog.mjs";
 import { WorkerSupervisor } from "./worker-supervisor.mjs";
+import { readWorkerTerminalCause, retireWorkerTerminalCause, workerTerminalCausePath } from "./worker-terminal-cause.mjs";
 import { loadDashboardConfig } from "../shared/config.mjs";
 import { CLIENT_PROTOCOL, parseClientRequest, piConfirmedModel } from "../shared/contracts.mjs";
 
@@ -1063,6 +1064,36 @@ export async function createDaemonRuntime({
         if (context.state !== "READY") throw Object.assign(new Error("Daemon recovery is still in progress"), { code: "RECOVERING", retryable: true });
         const eventKeys = ["version", "type", "token", "sessionId", "event"];
         if (frame.type !== "worker_event" || frame.version !== 1 || frame.sessionId !== metadata.sessionId || Object.keys(frame).some((key) => !eventKeys.includes(key)) || typeof frame.event !== "object" || frame.event === null || Array.isArray(frame.event)) throw Object.assign(new Error("Invalid worker frame"), { code: "INVALID_WORKER_FRAME" });
+        if (frame.event.type === "PI_CHILD_CRASHED") {
+          const current = await registry.get(frame.sessionId);
+          if (current === undefined || typeof current.runHash !== "string") throw Object.assign(new Error("Pi child crash has no owning run directory"), { code: "INVALID_WORKER_FRAME" });
+          const runHash = current.runHash;
+          const causePath = workerTerminalCausePath(root, runHash);
+          const cause = await readWorkerTerminalCause(causePath, {
+            sessionId: metadata.sessionId,
+            runId: metadata.runId,
+            leaseId: metadata.leaseId,
+            generation: metadata.generation,
+            worker: metadata.identity,
+            piChild: metadata.piChildIdentity,
+          });
+          if (cause === undefined || cause.event.at !== frame.event.at || cause.event.summary !== frame.event.summary) throw Object.assign(new Error("Pi child crash has no valid durable cause"), { code: "INVALID_WORKER_FRAME" });
+          await router.runCurrentTerminal(metadata, connection, routeGeneration, cause, async (owned) => {
+            if (owned.runHash !== runHash) throw Object.assign(new Error("Terminal cause no longer matches the owning run"), { code: "OWNERSHIP_CONFLICT" });
+            const next = reduceSessionState(owned, cause.event);
+            await registry.update(owned.sessionId, owned.revision, {
+              taskState: next.taskState,
+              processState: next.processState,
+              outcome: next.outcome,
+              activity: next.activity,
+              updatedAt: next.updatedAt,
+            });
+          });
+          await retireWorkerTerminalCause(causePath);
+          await connection.send({ version: 1, type: "terminal_cause_ack", token: metadata.token, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
+          context.notifyListChanged();
+          return;
+        }
         /** @type {string | undefined} */
         let previousTaskState;
         /** @type {any} */

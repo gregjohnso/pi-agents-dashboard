@@ -54,6 +54,14 @@ describe("reduceSessionState", () => {
     },
   );
 
+  // Operator-visible failure: a later liveness sweep must not turn a specific Pi crash back into a
+  // ready row after the process-error details were already persisted.
+  it("keeps a Pi child crash terminal when WORKER_EXITED is observed later", () => {
+    const crashed = reduceSessionState(baseRecord, { type: "PI_CHILD_CRASHED", at: now, summary: "Pi exited unexpectedly (SIGSEGV)" });
+
+    expect(reduceSessionState(crashed, { type: "WORKER_EXITED", at: "2026-08-25T12:01:00.000Z" })).toEqual(crashed);
+  });
+
   it("uses blocking, tool, stream, final, then process-error activity precedence", () => {
     const result = reduceSessionState(baseRecord, {
       type: "ACTIVITY_SNAPSHOT",

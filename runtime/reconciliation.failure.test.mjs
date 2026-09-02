@@ -166,6 +166,27 @@ it("reclaims a session whose supervisor and recorded Pi child are both gone or r
   await recovered.close();
 });
 
+// Operator-visible failure: a forged or stale run file must not attribute a Pi crash to a different
+// process identity and turn a generic worker exit into a specific failure.
+it("does not infer a Pi child crash from a terminal-cause record with the wrong identity", async () => {
+  const root = await fixture();
+  const registry = new RegistryStore(join(root, "sessions"));
+  const worker = { pid: 251, startIdentity: "dead-worker", processGroupId: 251 };
+  const piChild = { pid: 252, startIdentity: "dead-child", processGroupId: 251 };
+  await registry.create({ ...record("invalid-cause", worker), runHash: "invalid-cause-run" });
+  await mkdir(join(root, "runs", "invalid-cause-run"), { mode: 0o700 });
+  await writeFile(join(root, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "invalid-cause", runId: "run-invalid-cause", leaseId: "lease-invalid", generation: 1, identity: worker, piChildIdentity: piChild }] })}\n`, { mode: 0o600 });
+  const causePath = join(root, "runs", "invalid-cause-run", "terminal-cause.json");
+  await writeFile(causePath, `${JSON.stringify({ schemaVersion: 1, sessionId: "invalid-cause", runId: "run-invalid-cause", leaseId: "lease-invalid", generation: 1, worker, piChild: { ...piChild, startIdentity: "different-child" }, event: { type: "PI_CHILD_CRASHED", at: "2026-08-25T12:01:00.000Z", summary: "Pi exited unexpectedly (SIGSEGV)" } })}\n`, { mode: 0o600 });
+
+  const recovered = await reconcileRuntime({ root, daemonEpoch: "epoch", inspect: async () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); } });
+  const repaired = await registry.get("invalid-cause");
+  expect(repaired).toMatchObject({ taskState: "READY", processState: "EXITED" });
+  expect(repaired?.ownership).toBeUndefined();
+  await expect(readFile(causePath, "utf8")).resolves.toContain("different-child");
+  await recovered.close();
+});
+
 it.each([
   ["live", async () => ({ pid: 302, startIdentity: "orphan-child", processGroupId: 301 }), "PI_CHILD_ORPHANED"],
   ["unreadable", async () => { throw Object.assign(new Error("unreadable"), { code: "AMBIGUOUS_IDENTITY" }); }, "PI_CHILD_IDENTITY_AMBIGUOUS"],

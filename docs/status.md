@@ -4,6 +4,18 @@ What is left, what is known broken, and what is waiting on a decision. Read `doc
 
 Update this file when work lands. It deliberately carries no test count and no commit hashes: both are one command away and wrong the moment anyone commits.
 
+## Where this stands, 2026-09-01
+
+`standalone-dashboard` at `a748e16`, pushed, working tree clean. `pixi run test` green with no flags; `pixi run typecheck` clean. Client protocol is 6.
+
+**All four Claude Code process-shape items are done.** Items 1, 2 and 4 removed real work: the durable viewer transcript, the daemon command journal, and the assumption that a daemon should be resident. Item 3, the socket inversion, cost about 350 production lines rather than saving any; it was approved with explicit permission to decline and did not. Its gain is that adoption is now a reconnect and the daemon matters less. **If that trade is not worth it, reverting it is clean at this commit and gets harder with every change to the worker boundary.** That is the one open decision from the last session.
+
+**Measured, production `.mjs` only, counted with `git show` over `git ls-tree`:** 17,938 at the start of this work, 17,135 now. Down 803, about 4.5 percent. Line estimates from reviews missed by up to a factor of five in both directions, so measure before quoting; the only trustworthy numbers here are counted ones.
+
+**The operator's live setup.** `~/.local/bin/pi-agents` is a symlink to `~/projects/pi-agents-run/bin/pi-agents.mjs`, a detached worktree pinned to a known-good commit, currently `80dd6e9`. It is deliberately not the shared checkout: while agents held uncommitted work there, his production tool ran their half-finished code, and one restart handed him a daemon speaking a protocol invented an hour earlier and never committed. **Repoint that symlink only after a merge is green, and never point it at a tree an agent is editing.** His state root is still `~/.local/state/pi-dashboard`; five workers are live; the daemon is on demand and exits when his last dashboard closes, so finding no daemon running is expected rather than a fault.
+
+**Restart his daemon after any protocol change**, from the pinned checkout, and confirm all five workers keep their PIDs and Pi child PIDs across it. Protocol went 3 to 6 in one session; each step was a loud refusal naming the fix, which is the behavior we want, but it is also four interruptions he did not ask for.
+
 ## Waiting on the operator
 
 - `package.json` has no `"private": true`, and `README.md` tells the reader to `npm install -g pi-agents`, a package that is not published and is not intended to be. Either publish it or say plainly that a local checkout is the only install.
@@ -95,3 +107,13 @@ Two behaviours moved onto the shared client's rules. A read whose connection die
 **Close the remaining doubles that cannot fail the way production fails.** Three defects shipped behind a fully green suite because a fake only modelled success: a fake `request` hid a broken `daemon stop --stop-workers`, a fake server that accepted every viewer subscription hid a frozen viewer, and a fixture Pi emitting a help banner reinforced the bug it should have caught. The remaining sites are listed in the test review. This is per-site work and it costs real-process time, so it is a judgment call rather than a sweep.
 
 **`runtime/daemon.integration.test.mjs` is nearly 2,000 lines** and tests every extracted concern through one seam, which reinforces `daemon.mjs` as the only place a change can land. Split it alongside the production split, not before.
+
+## Housekeeping the next session should not have to rediscover
+
+**29 git worktrees under `~/projects/pi-agents-*` are from finished lanes.** Each holds its own `node_modules`. The branch is merged for every one of them except `pi-agents-run`, which is the operator's pinned runtime and must survive. Removing the rest is `git worktree remove` per path, after confirming its branch is an ancestor of `standalone-dashboard`. Not urgent, but it is a lot of disk and a lot of confusing checkouts.
+
+**Test process hygiene is now a ledger, not a scan.** `test/reap-detached-daemons.mjs` is gone; the harness records a process before it exists and reaps from that record at both ends of a run, revalidating identity before every signal. Before it existed, one evening leaked 47 daemons, the oldest alive 38 hours, and drove load to 49. If a session ends with strays, check the ledger rather than reaching for `ps`.
+
+**Real-process suites flake above roughly load 20** and pass in isolation: `installed-pi`, `daemon-lifecycle`, `idle-exit`, `viewer-recovery`, `real-process-harness`, `state-root-adoption`. Rerun the file alone before believing a failure, and check the diff against the merge base. Three separate defects this session were misread as load flakes and three genuine flakes were misread as defects, so do both checks rather than one.
+
+**Do not measure with `git checkout <ref> -- .`.** It stages the older tree, and the next commit sweeps deleted files back in. That is exactly how `cf0ea1e`, a commit whose message says docs, resurrected six deleted files including a module deleted an hour earlier. Count with `git show` and `git ls-tree`, which touch nothing.

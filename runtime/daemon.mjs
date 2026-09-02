@@ -14,7 +14,7 @@ import { sweepStaleWorktreeLocks } from "../isolation/lock-sweep.mjs";
 import { ensurePrivateDirectory, initializeRuntimePermissions } from "./permissions.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "./process-signaler.mjs";
-import { RecoveredWorkerRouter, WORKER_UNREACHABLE, reconcileRuntime } from "./reconciliation.mjs";
+import { PI_CHILD_CRASH_REPORTED, RecoveredWorkerRouter, WORKER_UNREACHABLE, reconcileRuntime } from "./reconciliation.mjs";
 import { connectToWorker } from "./worker-socket.mjs";
 import { openSettingsStore, summarizePromptInput, summarizeWithPi } from "./summaries.mjs";
 import { RegistryStore, applySessionColor, applySessionUpdate, runSessionLifecycle } from "./registry-store.mjs";
@@ -24,7 +24,7 @@ import { createIdleExit, resolveIdleExitMs } from "./idle-exit.mjs";
 import { spawn as spawnProcess } from "node:child_process";
 import { createModelCatalog } from "./pi-model-catalog.mjs";
 import { WorkerSupervisor } from "./worker-supervisor.mjs";
-import { readWorkerTerminalCause, retireWorkerTerminalCause, workerTerminalCausePath } from "./worker-terminal-cause.mjs";
+import { inspectWorkerTerminalCause, retireWorkerTerminalCause, workerTerminalCausePath } from "./worker-terminal-cause.mjs";
 import { loadDashboardConfig } from "../shared/config.mjs";
 import { CLIENT_PROTOCOL, parseClientRequest, piConfirmedModel } from "../shared/contracts.mjs";
 
@@ -1065,11 +1065,13 @@ export async function createDaemonRuntime({
         const eventKeys = ["version", "type", "token", "sessionId", "event"];
         if (frame.type !== "worker_event" || frame.version !== 1 || frame.sessionId !== metadata.sessionId || Object.keys(frame).some((key) => !eventKeys.includes(key)) || typeof frame.event !== "object" || frame.event === null || Array.isArray(frame.event)) throw Object.assign(new Error("Invalid worker frame"), { code: "INVALID_WORKER_FRAME" });
         if (frame.event.type === "PI_CHILD_CRASHED") {
-          const current = await registry.get(frame.sessionId);
-          if (current === undefined || typeof current.runHash !== "string") throw Object.assign(new Error("Pi child crash has no owning run directory"), { code: "INVALID_WORKER_FRAME" });
-          const runHash = current.runHash;
-          const causePath = workerTerminalCausePath(root, runHash);
-          const cause = await readWorkerTerminalCause(causePath, {
+          const runHash = (await registry.get(frame.sessionId))?.runHash;
+          const causePath = typeof runHash === "string" ? workerTerminalCausePath(root, runHash) : undefined;
+          // A worker from a build that predates the durable cause sends this same authenticated frame and
+          // publishes no file. Refusing it would drop the route and leave the row reading LIVE with a dead
+          // Pi, so an absent record degrades to the verified worker-event path below. A record that is
+          // present and does not validate is a forged or stale run file, and stays refused.
+          const { present, cause } = causePath === undefined ? { present: false, cause: undefined } : await inspectWorkerTerminalCause(causePath, {
             sessionId: metadata.sessionId,
             runId: metadata.runId,
             leaseId: metadata.leaseId,
@@ -1077,22 +1079,24 @@ export async function createDaemonRuntime({
             worker: metadata.identity,
             piChild: metadata.piChildIdentity,
           });
-          if (cause === undefined || cause.event.at !== frame.event.at || cause.event.summary !== frame.event.summary) throw Object.assign(new Error("Pi child crash has no valid durable cause"), { code: "INVALID_WORKER_FRAME" });
-          await router.runCurrentTerminal(metadata, connection, routeGeneration, cause, async (owned) => {
-            if (owned.runHash !== runHash) throw Object.assign(new Error("Terminal cause no longer matches the owning run"), { code: "OWNERSHIP_CONFLICT" });
-            const next = reduceSessionState(owned, cause.event);
-            await registry.update(owned.sessionId, owned.revision, {
-              taskState: next.taskState,
-              processState: next.processState,
-              outcome: next.outcome,
-              activity: next.activity,
-              updatedAt: next.updatedAt,
+          if (present && (cause === undefined || cause.event.at !== frame.event.at || cause.event.summary !== frame.event.summary)) throw Object.assign(new Error("Pi child crash has no valid durable cause"), { code: "INVALID_WORKER_FRAME" });
+          if (cause !== undefined) {
+            await router.runCurrentTerminal(metadata, connection, routeGeneration, cause, async (owned) => {
+              if (owned.runHash !== runHash) throw Object.assign(new Error("Terminal cause no longer matches the owning run"), { code: "OWNERSHIP_CONFLICT" });
+              const next = reduceSessionState(owned, cause.event);
+              await registry.update(owned.sessionId, owned.revision, {
+                taskState: next.taskState,
+                processState: next.processState,
+                outcome: next.outcome,
+                activity: next.activity,
+                updatedAt: next.updatedAt,
+              });
             });
-          });
-          await retireWorkerTerminalCause(causePath);
-          await connection.send({ version: 1, type: "terminal_cause_ack", token: metadata.token, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
-          context.notifyListChanged();
-          return;
+            await retireWorkerTerminalCause(/** @type {string} */ (causePath));
+            await connection.send({ version: 1, type: "terminal_cause_ack", token: metadata.token, sessionId: metadata.sessionId, runId: metadata.runId, leaseId: metadata.leaseId, generation: metadata.generation });
+            context.notifyListChanged();
+            return;
+          }
         }
         /** @type {string | undefined} */
         let previousTaskState;
@@ -1371,7 +1375,7 @@ export async function createDaemonRuntime({
         // still owns Pi, and refusing here would take every other session down with it; the row it
         // owns says why it is out of reach and what to do about it.
         for (const unreachable of context.recovery.unreachableWorkers ?? []) context.reportUnreachableWorker(unreachable);
-        const blocking = context.recovery.conflicts.filter((/** @type {any} */ conflict) => conflict.reason !== WORKER_UNREACHABLE);
+        const blocking = context.recovery.conflicts.filter((/** @type {any} */ conflict) => ![WORKER_UNREACHABLE, PI_CHILD_CRASH_REPORTED].includes(conflict.reason));
         if (blocking.length > 0) throw Object.assign(new Error("Worker ownership conflicts block daemon recovery"), { code: "OWNERSHIP_CONFLICT", conflicts: blocking });
         if ((context.recovery.repairedSessions ?? []).length > 0) context.notifyListChanged();
         context.state = "READY";

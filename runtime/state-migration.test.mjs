@@ -183,6 +183,34 @@ it.each([
   expect(await readFile(join(paths.legacyRoot, relative), "utf8")).toBe(text);
 });
 
+// Operator-visible failure: a directory standing where a legacy file belongs is not a format this
+// release reads. Copying it forward puts a directory where the daemon expects a private file, which
+// fails every later launch inside reconciliation instead of during migration.
+it.each(["frontend-state.json", "daemon/event-acks.json", "dashboard.json"])("refuses a legacy directory standing at the file path %s", async (relative) => {
+  const paths = await fixture();
+  await rm(join(paths.legacyRoot, relative), { force: true });
+  await mkdir(join(paths.legacyRoot, relative), { recursive: true, mode: 0o700 });
+
+  await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: vi.fn() })).rejects.toMatchObject({ code: "MALFORMED_LEGACY_STATE" });
+  expect((await stat(join(paths.legacyRoot, relative))).isDirectory()).toBe(true);
+  await expect(stat(join(paths.destinationRoot, relative))).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+// Operator-visible failure: a destination an earlier release wrote still holds the retired viewer
+// artifacts. Resuming an interrupted migration must read them as leftovers, not as a collision no
+// retry can clear, or the dashboard never launches again without manual filesystem surgery.
+it.each(["after_manifest_publication", "before_manifest_rename"])("resumes an interrupted migration whose destination holds retired artifacts after %s", async (failedStage) => {
+  const paths = await fixture();
+  const base = { ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {} };
+  await expect(migrateLegacyState({ ...base, failpoint: async (/** @type {string} */ stage) => { if (stage === failedStage) throw new Error("crash"); } })).rejects.toThrow("crash");
+
+  await writeFile(join(paths.destinationRoot, "frontend-state.json"), "{}", { mode: 0o600 });
+  await mkdir(join(paths.destinationRoot, "queue"), { recursive: true, mode: 0o700 });
+  await writeFile(join(paths.destinationRoot, "queue", "commands.jsonl"), "", { mode: 0o600 });
+
+  await expect(migrateLegacyState(base)).resolves.toMatchObject({ status: "MIGRATED" });
+});
+
 it("recovers mutable PUBLISHED output only after the reconciliation marker is durable", async () => {
   const paths = await fixture();
   const recordPath = join(paths.destinationRoot, "sessions", "one.json");

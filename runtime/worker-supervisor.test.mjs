@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdtemp, mkdir, readFile, readdir, rm, stat } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -695,6 +695,28 @@ it("retries failed terminal release during admission and admits the next session
   await expect(supervisor.launch({ sessionId: "two", canonicalSessionFile: (await getRecord(registry, "two")).canonicalSessionFile, cwd: "/repo", runId: "release-retry-two" })).resolves.toMatchObject({ sessionId: "two" });
   expect(releases).toBeGreaterThanOrEqual(2);
   expect((await getRecord(registry, "one")).ownership).toBeUndefined();
+});
+
+// Operator-visible failure: a crashed Pi child publishes its cause and then races the supervisor exit
+// it caused. Once the worker's own report window closes, the lease release is the last moment that
+// cause can still reach the row, and without it the crash reads as an ordinary exit.
+it("records a crashed Pi child's durable cause before it releases the lease", async () => {
+  const { runs, registry, ownership, router, sockets, useInspect } = await setup(["one"], { randomId: () => "lease-crash" });
+  const world = processWorld();
+  useInspect(world.seams.inspect);
+  const workers = fakeWorkerFactory({ sockets, world });
+  const supervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, randomId: () => "crash-token", ...world.seams });
+  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-crash" });
+  const piChild = await world.seams.inspect(piChildPid(launched.identity.pid));
+  const causePath = join(runs, (await getRecord(registry, "one")).runHash, "terminal-cause.json");
+  await writeFile(causePath, `${JSON.stringify({ schemaVersion: 1, sessionId: "one", runId: "run-crash", leaseId: "lease-crash", generation: 1, worker: launched.identity, piChild, event: { type: "PI_CHILD_CRASHED", at: "2026-08-25T12:05:00.000Z", summary: "Pi exited unexpectedly (SIGSEGV)" } })}\n`, { mode: 0o600 });
+
+  // The daemon never handled the crash frame: the worker died with its report unacknowledged.
+  workers.exitGroup(workers.children[0]);
+
+  await vi.waitFor(async () => expect((await getRecord(registry, "one")).ownership).toBeUndefined(), { timeout: 5_000, interval: 5 });
+  expect(await getRecord(registry, "one")).toMatchObject({ taskState: "FAILED", processState: "EXITED", activity: { kind: "process_error", summary: "Pi exited unexpectedly (SIGSEGV)" } });
+  await expect(stat(causePath)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 it("does not charge an ownership-free stale LIVE record against managed capacity", async () => {

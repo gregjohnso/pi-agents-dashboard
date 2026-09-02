@@ -228,6 +228,12 @@ function validateWorkerMetadata(worker) {
  * and is still stoppable by recorded process identity. Every other conflict still refuses the start.
  */
 export const WORKER_UNREACHABLE = "WORKER_UNREACHABLE";
+/**
+ * A live worker whose recorded Pi child is provably gone and whose durable cause recovery already
+ * recorded. The worker still holds its lease, so this is a report about one session, not a conflict
+ * that may refuse the start and take every other session down with it.
+ */
+export const PI_CHILD_CRASH_REPORTED = "PI_CHILD_CRASH_REPORTED";
 
 /**
  * A launch never outlives the daemon that ran it, so a still-"launching" record with no owning
@@ -978,6 +984,37 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, adoptTimeou
         return undefined;
       });
     };
+    /**
+     * Record a live worker's crashed Pi child from the cause that worker published. The worker still
+     * owns the lease and still owns the acknowledgement handshake, so neither is touched here: the
+     * cause stays on disk for whichever of the worker or a later recovery consumes it.
+     * @param {any} record @param {any} metadata
+     */
+    const reportLiveWorkerPiCrash = async (record, metadata) => {
+      if (typeof record.runHash !== "string") return false;
+      const cause = await readWorkerTerminalCause(workerTerminalCausePath(root, record.runHash), {
+        sessionId: record.sessionId,
+        runId: metadata.runId,
+        leaseId: metadata.leaseId,
+        generation: metadata.generation,
+        worker: metadata.identity,
+        piChild: metadata.piChildIdentity,
+      });
+      if (cause === undefined) return false;
+      return router.runSession(record.sessionId, async () => {
+        const current = await registry.get(record.sessionId);
+        if (current === undefined || current.revision !== record.revision || current.ownership === undefined) return false;
+        const next = reduceSessionState(current, cause.event);
+        repairedSessions.push(await registry.update(current.sessionId, current.revision, {
+          taskState: next.taskState,
+          processState: next.processState,
+          outcome: next.outcome,
+          activity: next.activity,
+          updatedAt: next.updatedAt,
+        }));
+        return true;
+      });
+    };
     /** @type {any[]} */
     const liveWorkers = [];
     /** @type {any[]} */
@@ -1015,7 +1052,12 @@ export async function reconcileRuntime({ root, daemonEpoch, inspect, adoptTimeou
       try {
         piChild = metadata.piChildIdentity.pid === metadata.identity.pid ? actual : await inspect(metadata.piChildIdentity.pid);
       } catch (error) {
-        conflicts.push({ sessionId: record.sessionId, reason: exited(error) ? "PI_CHILD_EXITED" : "PI_CHILD_IDENTITY_AMBIGUOUS", ownership: record.ownership, metadata });
+        if (!exited(error)) {
+          conflicts.push({ sessionId: record.sessionId, reason: "PI_CHILD_IDENTITY_AMBIGUOUS", ownership: record.ownership, metadata });
+          continue;
+        }
+        const reported = await reportLiveWorkerPiCrash(record, metadata);
+        conflicts.push({ sessionId: record.sessionId, reason: reported ? PI_CHILD_CRASH_REPORTED : "PI_CHILD_EXITED", ownership: record.ownership, metadata });
         continue;
       }
       if (!sameIdentity(piChild, metadata.piChildIdentity)) {

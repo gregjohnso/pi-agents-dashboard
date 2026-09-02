@@ -2080,3 +2080,89 @@ it("authenticates a control stop that carries no client protocol", async () => {
   await runtime.stopRequested;
   control.close();
 });
+
+/**
+ * One adopted protocol-2 worker whose row names the run directory a crash cause would be published to.
+ * @param {string} sessionId
+ */
+async function adoptedCrashWorker(sessionId) {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const identity = { pid: 281, startIdentity: `worker-${sessionId}`, processGroupId: 281 };
+  const piChild = { pid: 282, startIdentity: `pi-${sessionId}`, processGroupId: 281 };
+  const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === identity.pid ? identity : piChild;
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const now = "2026-08-25T12:00:00.000Z";
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId, sessionFile: `/sessions/${sessionId}.jsonl`, canonicalSessionFile: `/sessions/${sessionId}.jsonl`, cwd: "/repo", taskState: "READY", processState: "LIVE", outcome: "NONE", activity: { kind: "idle", summary: "Idle", updatedAt: now }, ownership: { kind: "managed", runId: `run-${sessionId}`, process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: `run-${sessionId}`, runHash: `${sessionId}-run`, createdAt: now, updatedAt: now });
+  await mkdir(join(stateRoot, "runs", `${sessionId}-run`), { mode: 0o700 });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId, runId: `run-${sessionId}`, leaseId: `lease-${sessionId}`, generation: 1, identity, piChildIdentity: piChild, token: `${sessionId}-token`, socketPath: workerSocketPath(stateRoot, sessionId), proto: 2 }] })}\n`, { mode: 0o600 });
+  const runtime = await createDaemonRuntime({ root: stateRoot, inspect, reconnectTimeoutMs: 1_000 });
+  runtimes.push(runtime);
+  const loop = startPersistentFakeWorker(stateRoot, { sessionId, runId: `run-${sessionId}`, leaseId: `lease-${sessionId}`, generation: 1, identity, piChildIdentity: piChild, token: `${sessionId}-token` });
+  await runtime.ready;
+  await vi.waitFor(() => expect(loop.connectionCount).toBe(1));
+  return { stateRoot, registry, runtime, loop, identity, piChild };
+}
+
+// Operator-visible failure: a worker from a build before the durable terminal cause sends the same
+// authenticated crash frame and publishes no file. Refusing that frame drops the route and leaves the
+// row reading LIVE with a dead Pi until the next daemon start.
+it("records a Pi child crash from an adopted worker that publishes no durable cause", async () => {
+  const live = await adoptedCrashWorker("legacy");
+
+  await live.loop.sendEvent({ type: "PI_CHILD_CRASHED", at: "2026-08-25T12:01:00.000Z", summary: "Pi exited unexpectedly (SIGSEGV)" });
+
+  await vi.waitFor(async () => expect(await live.registry.get("legacy")).toMatchObject({ taskState: "FAILED", processState: "EXITED", activity: { kind: "process_error", summary: "Pi exited unexpectedly (SIGSEGV)" } }), { timeout: 5_000, interval: 25 });
+  expect(live.loop.connectionCount).toBe(1);
+  expect(live.loop.alive).toBe(true);
+});
+
+// Operator-visible failure: a forged or stale run file must not attribute a crash to a different Pi
+// child. A cause record that exists and does not validate stays refused, absent one or not.
+it("refuses a Pi child crash whose durable cause names another Pi child", async () => {
+  const live = await adoptedCrashWorker("forged");
+  await writeFile(join(live.stateRoot, "runs", "forged-run", "terminal-cause.json"), `${JSON.stringify({ schemaVersion: 1, sessionId: "forged", runId: "run-forged", leaseId: "lease-forged", generation: 1, worker: live.identity, piChild: { ...live.piChild, startIdentity: "another-child" }, event: { type: "PI_CHILD_CRASHED", at: "2026-08-25T12:01:00.000Z", summary: "Pi exited unexpectedly (SIGSEGV)" } })}\n`, { mode: 0o600 });
+
+  await live.loop.sendEvent({ type: "PI_CHILD_CRASHED", at: "2026-08-25T12:01:00.000Z", summary: "Pi exited unexpectedly (SIGSEGV)" });
+
+  // The refusal closes the connection, which this daemon re-opens: that reconnect is the deterministic
+  // proof the frame was rejected rather than still queued.
+  await vi.waitFor(() => expect(live.loop.connectionCount).toBe(2), { timeout: 5_000, interval: 25 });
+  expect(await live.registry.get("forged")).toMatchObject({ taskState: "READY", processState: "LIVE" });
+});
+
+// Operator-visible failure: a live worker whose Pi child crashed while no daemon was running blocked
+// recovery for the whole state root, taking every other session down with it, and its durable cause
+// was never read.
+it("starts over a live worker whose Pi child crashed and records its durable cause", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const identity = { pid: 291, startIdentity: "worker-orphan", processGroupId: 291 };
+  const piChild = { pid: 292, startIdentity: "pi-orphan", processGroupId: 291 };
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const now = "2026-08-25T12:00:00.000Z";
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "orphan", sessionFile: "/sessions/orphan.jsonl", canonicalSessionFile: "/sessions/orphan.jsonl", cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-orphan", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-orphan", runHash: "orphan-run", createdAt: now, updatedAt: now });
+  await mkdir(join(stateRoot, "runs", "orphan-run"), { mode: 0o700 });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "orphan", runId: "run-orphan", leaseId: "lease-orphan", generation: 1, identity, piChildIdentity: piChild, token: "orphan-token", socketPath: workerSocketPath(stateRoot, "orphan"), proto: 2 }] })}\n`, { mode: 0o600 });
+  const causePath = join(stateRoot, "runs", "orphan-run", "terminal-cause.json");
+  await writeFile(causePath, `${JSON.stringify({ schemaVersion: 1, sessionId: "orphan", runId: "run-orphan", leaseId: "lease-orphan", generation: 1, worker: identity, piChild, event: { type: "PI_CHILD_CRASHED", at: "2026-08-25T12:01:00.000Z", summary: "Pi exited unexpectedly (SIGSEGV)" } })}\n`, { mode: 0o600 });
+
+  const runtime = await createDaemonRuntime({
+    root: stateRoot,
+    inspect: async (/** @type {number} */ pid) => {
+      if (pid === process.pid) return { pid, startIdentity: "daemon", processGroupId: process.pid };
+      if (pid === identity.pid) return identity;
+      throw Object.assign(new Error("gone"), { code: "ESRCH" });
+    },
+    reconnectTimeoutMs: 1_000,
+  });
+  runtimes.push(runtime);
+
+  await expect(runtime.ready).resolves.toBeDefined();
+  const repaired = await registry.get("orphan");
+  expect(repaired).toMatchObject({ taskState: "FAILED", processState: "EXITED", activity: { kind: "process_error", summary: "Pi exited unexpectedly (SIGSEGV)" } });
+  // The worker still holds the lease and still owns the acknowledgement handshake, so recovery leaves
+  // both its ownership and its cause record in place.
+  expect(repaired?.ownership).toMatchObject({ runId: "run-orphan" });
+  await expect(readFile(causePath, "utf8")).resolves.toContain("PI_CHILD_CRASHED");
+});

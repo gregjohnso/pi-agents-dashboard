@@ -49,23 +49,40 @@ export async function publishWorkerTerminalCause(path, cause) {
 }
 
 /**
+ * Read only a private, owned regular file, and say whether a record was published at all. A worker
+ * from a build that predates this format publishes nothing, which reads as absent; a record that is
+ * present and malformed, unsafe, or bound to other identities is refused, never mistaken for absence.
+ * @param {string} path
+ * @param {{ sessionId: string, runId: string, leaseId: string, generation: number, worker: any, piChild: any }} expected
+ * @returns {Promise<{ present: boolean, cause: any }>}
+ */
+export async function inspectWorkerTerminalCause(path, expected) {
+  let handle;
+  try {
+    handle = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    // ENOENT is the only refusal that proves nothing was published: ELOOP, EACCES and the rest are files.
+    return { present: /** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT", cause: undefined };
+  }
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile() || metadata.uid !== process.getuid?.() || (metadata.mode & 0o777) !== 0o600) return { present: true, cause: undefined };
+    const cause = JSON.parse(await handle.readFile("utf8"));
+    return { present: true, cause: validWorkerTerminalCause(cause, expected) ? cause : undefined };
+  } catch {
+    return { present: true, cause: undefined };
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
+/**
  * Read only a private, owned regular file and return no cause for every invalid record.
  * @param {string} path
  * @param {{ sessionId: string, runId: string, leaseId: string, generation: number, worker: any, piChild: any }} expected
  */
 export async function readWorkerTerminalCause(path, expected) {
-  let handle;
-  try {
-    handle = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-    const metadata = await handle.stat();
-    if (!metadata.isFile() || metadata.uid !== process.getuid?.() || (metadata.mode & 0o777) !== 0o600) return undefined;
-    const cause = JSON.parse(await handle.readFile("utf8"));
-    return validWorkerTerminalCause(cause, expected) ? cause : undefined;
-  } catch {
-    return undefined;
-  } finally {
-    await handle?.close().catch(() => {});
-  }
+  return (await inspectWorkerTerminalCause(path, expected)).cause;
 }
 
 /** @param {string} path */

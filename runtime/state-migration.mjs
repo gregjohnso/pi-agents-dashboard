@@ -29,6 +29,23 @@ const DROPPED_LEGACY_ARTIFACTS = [
   /^daemon\/event-acks\.json$/u,
 ];
 
+/**
+ * Directories a legacy root may hold. A directory standing where a file belongs is not a format this
+ * release reads, so migration refuses it rather than copying durable state no code names into a
+ * destination where the daemon then finds a directory at a private file's path.
+ */
+const LEGACY_DIRECTORIES = [/^(sessions|daemon|cli|queue|runs|index)$/u, /^cli\/pending$/u, /^runs\/[^/]+$/u, /^index\/.+$/u];
+
+/**
+ * Paths this release drops or prunes. A destination an earlier release, or an earlier attempt at this
+ * one, published can still hold them, so recovery reads them as leftovers rather than as a foreign
+ * collision no retry can clear.
+ * @param {string} relative
+ */
+function retiredDestinationArtifact(relative) {
+  return DROPPED_LEGACY_ARTIFACTS.some((pattern) => pattern.test(relative)) || /^(index|queue|cli\/pending)(?:\/|$)/u.test(relative) || ["cli", "daemon"].includes(relative);
+}
+
 /** @param {string} code @param {string} message @param {Record<string, unknown>} [details] */
 function migrationError(code, message, details = {}) { return Object.assign(new Error(message), { code, ...details }); }
 /** @param {string} directory @param {any} fsOps */
@@ -92,6 +109,7 @@ async function inspectTree(root, expectedUserId, fsOps) {
       if (metadata.isSymbolicLink() || metadata.uid !== expectedUserId) throw migrationError("UNSAFE_LEGACY_STATE", `Unsafe legacy artifact: ${path}`);
       if (metadata.isDirectory()) {
         if ((metadata.mode & 0o777) !== DIRECTORY_MODE || await fsOps.realpath(path) !== path) throw migrationError("UNSAFE_LEGACY_STATE", `Unsafe legacy directory: ${path}`);
+        if (!LEGACY_DIRECTORIES.some((pattern) => pattern.test(childRelative))) throw migrationError("MALFORMED_LEGACY_STATE", `Unknown legacy state directory: ${childRelative}`, { relative: childRelative });
         entries.push({ relative: childRelative, type: "directory" }); await visit(path, childRelative);
       } else if (metadata.isFile()) {
         if ((metadata.mode & 0o777) !== FILE_MODE) throw migrationError("UNSAFE_LEGACY_STATE", `Unsafe legacy file mode: ${path}`);
@@ -167,6 +185,11 @@ async function validateCompletedDestination(root, entries, expectedUserId, fsOps
         continue;
       }
       const entry = expected.get(child);
+      // A retired leftover is deliberately not counted as seen: it is tolerated, never expected.
+      if (entry === undefined && !metadata.isSymbolicLink() && metadata.uid === expectedUserId && retiredDestinationArtifact(child)) {
+        if (metadata.isDirectory()) await visit(path, child);
+        continue;
+      }
       if (entry === undefined || metadata.isSymbolicLink() || metadata.uid !== expectedUserId) throw migrationError("DESTINATION_COLLISION", `Unexpected interrupted migration artifact: ${child}`);
       if (entry.type === "directory") {
         if (!metadata.isDirectory() || (metadata.mode & 0o777) !== DIRECTORY_MODE) throw migrationError("DESTINATION_COLLISION", `Interrupted migration directory is unsafe: ${child}`);
@@ -213,6 +236,7 @@ async function validateRecoveryFiles(root, files, complete, fsOps) {
       if (metadata.isSymbolicLink()) throw migrationError("DESTINATION_COLLISION", `Unsafe interrupted migration artifact: ${child}`);
       if (metadata.isDirectory()) await visit(path, child);
       else if (metadata.isFile() && expected.get(child) === digest(await fsOps.readFile(path, "utf8"))) seen.add(child);
+      else if (metadata.isFile() && retiredDestinationArtifact(child)) continue;
       else throw migrationError("DESTINATION_COLLISION", `Interrupted migration artifact changed: ${child}`);
     }
   }
@@ -278,7 +302,7 @@ export async function migrateLegacyState({ legacyRoot, destinationRoot, expected
       const generated = destinationEntries.filter((/** @type {string} */ name) => expectedTopLevels.has(name));
       const stagePresent = destinationEntries.includes(stageName);
       const temporaryNames = destinationEntries.filter((/** @type {string} */ name) => name.startsWith(`.${MANIFEST}.`) && name.endsWith(".tmp"));
-      if (destinationEntries.some((/** @type {string} */ name) => !expectedTopLevels.has(name) && name !== stageName && !temporaryNames.includes(name))) throw migrationError("DESTINATION_COLLISION", "Destination is not empty");
+      if (destinationEntries.some((/** @type {string} */ name) => !expectedTopLevels.has(name) && name !== stageName && !temporaryNames.includes(name) && !retiredDestinationArtifact(name))) throw migrationError("DESTINATION_COLLISION", "Destination is not empty");
       if (stagePresent) { await validateRecoveryFiles(join(destinationRoot, stageName), files, false, fsOps); await fsOps.rm(join(destinationRoot, stageName), { recursive: true, force: true }); }
       for (const name of temporaryNames) {
         const temporary = JSON.parse(await fsOps.readFile(join(destinationRoot, name), "utf8"));

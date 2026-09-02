@@ -13,6 +13,7 @@ import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "./process-signaler.mjs";
 import { registryCoordinationScope } from "./registry-store.mjs";
 import { reduceSessionState } from "./state-reducer.mjs";
+import { WORKER_TERMINAL_CAUSE_FILE, readWorkerTerminalCause, retireWorkerTerminalCause } from "./worker-terminal-cause.mjs";
 
 const DEFAULT_WORKER_PATH = fileURLToPath(new URL("./worker.mjs", import.meta.url));
 const admissionStates = new WeakMap();
@@ -250,6 +251,43 @@ export class WorkerSupervisor {
     return PROVEN_PI_CHILD_DISPOSITIONS.includes(result.disposition);
   }
 
+  /**
+   * Attribute a crashed Pi child from the cause its worker published. The worker's own report races the
+   * supervisor exit it caused and gives up after a fixed window, so the lease release is the last
+   * moment that cause can still reach the row. It writes the record directly rather than through
+   * `#writeWorkerEventLocked`, whose terminal tail would re-enter this reconciliation.
+   * @param {any} supervision
+   */
+  async #applyTerminalCauseLocked(supervision) {
+    if (typeof supervision.runHash !== "string" || supervision.identity === undefined || supervision.piChildIdentity === undefined) return;
+    const causePath = join(this.#runsDirectory, supervision.runHash, WORKER_TERMINAL_CAUSE_FILE);
+    const cause = await readWorkerTerminalCause(causePath, {
+      sessionId: supervision.sessionId,
+      runId: supervision.lease.runId,
+      leaseId: supervision.lease.leaseId,
+      generation: supervision.lease.generation,
+      worker: supervision.identity,
+      piChild: supervision.piChildIdentity,
+    });
+    if (cause === undefined) return;
+    const current = await this.#registry.get(supervision.sessionId);
+    const ownsRecord = current !== undefined && current.ownership?.runId === supervision.lease.runId &&
+      current.ownership?.acquiredAt === supervision.lease.acquiredAt &&
+      sameIdentity(current.ownership?.process, supervision.identity);
+    if (!ownsRecord) return;
+    const next = reduceSessionState(current, cause.event);
+    if (next !== current) {
+      await this.#registry.update(supervision.sessionId, current.revision, {
+        taskState: next.taskState,
+        processState: next.processState,
+        outcome: next.outcome,
+        activity: next.activity,
+        updatedAt: next.updatedAt,
+      });
+    }
+    await retireWorkerTerminalCause(causePath);
+  }
+
   /** @param {any} supervision @param {boolean} [verifiedTerminal] */
   async #reconcileTerminalLocked(supervision, verifiedTerminal = false) {
     if (supervision.lifecycle === "reconciled") return;
@@ -261,6 +299,7 @@ export class WorkerSupervisor {
     supervision.handle = undefined;
     if (handle !== undefined) this.#handles.delete(handle);
     if (!(await this.#piChildTerminalLocked(supervision))) return;
+    await this.#applyTerminalCauseLocked(supervision);
     await this.#ownership.release(supervision.sessionId, supervision.lease.leaseId, supervision.lease.generation);
     // The token is private per-run state, so a proven-terminal run leaves nothing behind to authenticate.
     await this.#router?.forgetRun(supervision.sessionId, supervision.token);
@@ -404,7 +443,7 @@ export class WorkerSupervisor {
         shell: false,
         stdio: ["ignore", stdoutHandle.fd, stderrHandle.fd],
       });
-      supervision = { child, token, sessionId, lease, reservation, exit: undefined, identity: undefined, handle: undefined, route: undefined, lifecycle: "launching", activated: false, piChildStopped: false };
+      supervision = { child, token, sessionId, lease, reservation, runHash: directoryName, exit: undefined, identity: undefined, handle: undefined, route: undefined, lifecycle: "launching", activated: false, piChildStopped: false };
       const exit = observeExit(child, () => {
         if (supervision.lifecycle === "reconciled") return;
         supervision.lifecycle = "terminal";

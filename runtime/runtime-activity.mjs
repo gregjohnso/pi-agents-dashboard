@@ -40,10 +40,13 @@ export async function inspectRuntimeActivity({ stateRoot, runtimeRoot = stateRoo
   const activeSupervisors = [];
   for (const worker of value.workers) {
     const identity = worker?.identity;
-    const allowed = ["sessionId", "runId", "leaseId", "generation", "identity", "piChildIdentity", "token", "proto", "cliVersion", "routeGeneration", "pendingRespawn"];
+    // `socketPath` is written at reservation, before any spawn, so every record a running daemon
+    // leaves behind carries it. This seam only has to find the roster's live supervisors, so it
+    // reads the path as a field to accept, never as a path to resolve or open.
+    const allowed = ["sessionId", "runId", "leaseId", "generation", "identity", "piChildIdentity", "token", "socketPath", "proto", "cliVersion", "routeGeneration", "pendingRespawn"];
     // A run reserved before its spawn has no identity yet, so it names no supervisor to inspect.
     const bound = identity !== undefined || worker?.piChildIdentity !== undefined;
-    if (typeof worker !== "object" || worker === null || Object.keys(worker).some((key) => !allowed.includes(key)) || [worker.sessionId, worker.runId, worker.leaseId].some((entry) => typeof entry !== "string" || entry.length === 0) || !Number.isSafeInteger(worker.generation) || worker.generation <= 0 || (bound && (!validProcessIdentity(identity) || !validProcessIdentity(worker.piChildIdentity)))) throw new TypeError("Worker metadata record is invalid");
+    if (typeof worker !== "object" || worker === null || Object.keys(worker).some((key) => !allowed.includes(key)) || [worker.sessionId, worker.runId, worker.leaseId].some((entry) => typeof entry !== "string" || entry.length === 0) || !Number.isSafeInteger(worker.generation) || worker.generation <= 0 || (bound && (!validProcessIdentity(identity) || !validProcessIdentity(worker.piChildIdentity))) || (worker.socketPath !== undefined && (typeof worker.socketPath !== "string" || worker.socketPath.length === 0))) throw new TypeError("Worker metadata record is invalid");
     if (!bound) continue;
     try { const actual = await inspect(identity.pid); if (sameProcessIdentity(actual, identity)) activeSupervisors.push(identity); }
     catch (error) { if (!["ENOENT", "ESRCH"].includes(/** @type {NodeJS.ErrnoException} */ (error).code ?? "")) throw error; }

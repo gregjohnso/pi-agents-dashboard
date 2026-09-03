@@ -5,7 +5,15 @@ import { dirname, join } from "node:path";
 
 import { afterEach, expect, it, vi } from "vitest";
 
+import { inspectRuntimeActivity } from "./runtime-activity.mjs";
 import { migrateLegacyState } from "./state-migration.mjs";
+
+// 0x80 is a bare continuation byte, 0xc3 0x28 is a truncated two-byte sequence, and 0xff never
+// appears in UTF-8. A lossy decode turns these 9 bytes into 15.
+const INVALID_UTF8 = Buffer.from([0x70, 0x69, 0x3a, 0x20, 0x80, 0xc3, 0x28, 0xff, 0x0a]);
+const SUPERVISOR = { pid: 42, startIdentity: "42", processGroupId: 42 };
+const PI_CHILD = { pid: 43, startIdentity: "43", processGroupId: 42 };
+const GONE = () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); };
 
 /** @type {string[]} */
 const roots = [];
@@ -101,6 +109,11 @@ it.each([
   ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, proto: 0 }] })],
   ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, routeGeneration: 0 }] })],
   ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, pendingRespawn: "later" }] })],
+  ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, socketPath: "" }] })],
+  ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, socketPath: 42 }] })],
+  ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, socketPath: "/tmp/pi-agents-elsewhere/run.sock" }] })],
+  ["runs/one/terminal-cause.json", JSON.stringify({ schemaVersion: 1, sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, worker: SUPERVISOR, piChild: PI_CHILD, event: { type: "WORKER_EXITED", at: "2026-08-25T12:01:00.000Z", summary: "the worker exited" } })],
+  ["runs/one/terminal-cause.json", JSON.stringify({ schemaVersion: 1, sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, worker: SUPERVISOR, piChild: PI_CHILD })],
   ["unknown-state.json", JSON.stringify({ value: true })],
 ])("refuses malformed legacy artifact %s", async (relative, text) => {
   const paths = await fixture();
@@ -305,4 +318,112 @@ it("recovers idempotently only for the same completed migration identity", async
 
   await writeFile(join(paths.destinationRoot, "collision"), "x", { mode: 0o600 });
   await expect(migrateLegacyState(options)).rejects.toMatchObject({ code: "DESTINATION_COLLISION" });
+});
+
+// Operator-visible failure: a crashed run's stdout, stderr, and rotating diagnostics are byte
+// streams, not text. A stream chunk that splits a multi-byte character, or a subprocess that writes
+// bytes UTF-8 never produces, decodes to U+FFFD, so the migrated copy is not what the run emitted
+// and the evidence these files exist to carry is silently destroyed.
+it("migrates opaque run bytes that are not valid UTF-8", async () => {
+  const paths = await fixture();
+  const runDirectory = join(paths.legacyRoot, "runs", "a2f9c1");
+  await mkdir(join(runDirectory, "diagnostics"), { recursive: true, mode: 0o700 });
+  const opaque = {
+    "worker.stdout.log": INVALID_UTF8,
+    "worker.stderr.log": INVALID_UTF8,
+    "diagnostics/stderr.00000000.jsonl": INVALID_UTF8,
+    "diagnostics/rpc.00000000.jsonl": Buffer.concat([Buffer.from(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "session/prompt" })}\n`), INVALID_UTF8]),
+  };
+  for (const [relative, bytes] of Object.entries(opaque)) await writeFile(join(runDirectory, relative), bytes, { mode: 0o600 });
+
+  await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {} })).resolves.toMatchObject({ status: "MIGRATED" });
+
+  for (const [relative, bytes] of Object.entries(opaque)) {
+    const migrated = join(paths.destinationRoot, "runs", "a2f9c1", relative);
+    expect(await readFile(migrated)).toEqual(bytes);
+    expect((await stat(migrated)).size).toBe(bytes.length);
+    expect((await stat(migrated)).mode & 0o777).toBe(0o600);
+    expect(await readFile(join(runDirectory, relative))).toEqual(bytes);
+  }
+});
+
+// Operator-visible failure: resuming an interrupted migration revalidates what was already staged.
+// Comparing decoded text on both sides makes a corrupted copy look identical to its source, so
+// recovery adopts the corruption instead of detecting it.
+it.each(["after_staged_file_fsync", "after_manifest_publication"])("revalidates opaque non-UTF-8 run bytes when resuming a migration interrupted at %s", async (failedStage) => {
+  const paths = await fixture();
+  const directory = join(paths.legacyRoot, "runs", "a2f9c1", "diagnostics");
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await writeFile(join(directory, "stderr.00000000.jsonl"), INVALID_UTF8, { mode: 0o600 });
+  const base = { ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {} };
+
+  await expect(migrateLegacyState({ ...base, failpoint: async (/** @type {string} */ stage) => { if (stage === failedStage) throw new Error("crash"); } })).rejects.toThrow("crash");
+  await expect(migrateLegacyState(base)).resolves.toMatchObject({ status: "MIGRATED" });
+
+  expect(await readFile(join(paths.destinationRoot, "runs", "a2f9c1", "diagnostics", "stderr.00000000.jsonl"))).toEqual(INVALID_UTF8);
+});
+
+// Operator-visible failure: a structured artifact that is not valid UTF-8 is not the text it claims
+// to be. Decoding it lossily migrates a corrupted control token or session name that reads as valid,
+// and the daemon then fails to authenticate far from the cause.
+it.each(["daemon/control.token", "cli/client-id", "sessions/two.json"])("refuses the structured legacy artifact %s holding invalid UTF-8", async (relative) => {
+  const paths = await fixture();
+  await mkdir(join(paths.legacyRoot, dirname(relative)), { recursive: true, mode: 0o700 });
+  const record = JSON.parse(await readFile(join(paths.legacyRoot, "sessions", "one.json"), "utf8"));
+  // The byte sits inside a JSON string value, where a lossy decode yields the legal character U+FFFD
+  // and every structural validator downstream still accepts the record.
+  const [head, tail] = JSON.stringify({ ...record, sessionId: "two", name: "SESSION_NAME" }).split("SESSION_NAME");
+  const bytes = relative === "sessions/two.json" ? Buffer.concat([Buffer.from(head, "utf8"), Buffer.from([0xff]), Buffer.from(tail, "utf8")]) : INVALID_UTF8;
+  await writeFile(join(paths.legacyRoot, relative), bytes, { mode: 0o600 });
+
+  await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: vi.fn() })).rejects.toMatchObject({ code: "MALFORMED_LEGACY_STATE", message: `Malformed legacy artifact: ${relative}` });
+  await expect(stat(join(paths.destinationRoot, "dashboard.json"))).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+// Operator-visible failure: a root whose workers are all dead is the root this migration exists to
+// rescue. Its roster names every run's own socket and its crashed run holds the cause Pi died of, so
+// refusing either field leaves the operator with no dashboard and no reason, and carrying the socket
+// path verbatim points the destination daemon's cleanup back inside the legacy root.
+it("migrates a dead root's current-format worker roster and the crash cause its run recorded", async () => {
+  const paths = await fixture();
+  const socketName = "0a1b2c3d4e5f6071.sock";
+  const worker = { sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, identity: SUPERVISOR, piChildIdentity: PI_CHILD, token: "run-token", socketPath: join(paths.legacyRoot, "daemon", "workers", socketName), proto: 2, cliVersion: "1.4.2", routeGeneration: 3 };
+  await mkdir(join(paths.legacyRoot, "daemon", "workers"), { recursive: true, mode: 0o700 });
+  await writeFile(join(paths.legacyRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [worker] })}\n`, { mode: 0o600 });
+  const cause = Buffer.from(`${JSON.stringify({ schemaVersion: 1, sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, worker: SUPERVISOR, piChild: PI_CHILD, event: { type: "PI_CHILD_CRASHED", at: "2026-08-25T12:01:00.000Z", summary: "Pi exited unexpectedly (SIGSEGV)" } })}\n`, "utf8");
+  await mkdir(join(paths.legacyRoot, "runs", "a2f9c1"), { recursive: true, mode: 0o700 });
+  await writeFile(join(paths.legacyRoot, "runs", "a2f9c1", "terminal-cause.json"), cause, { mode: 0o600 });
+
+  await expect(migrateLegacyState({
+    ...paths,
+    expectedUserId: process.getuid?.() ?? 0,
+    inspectLegacyRuntime: () => inspectRuntimeActivity({ stateRoot: paths.legacyRoot, exists: async () => true, inspectEndpoint: async () => ({ status: "ABSENT" }), inspect: async () => GONE() }),
+    reconcileDestination: async () => {},
+  })).resolves.toMatchObject({ status: "MIGRATED" });
+
+  expect(JSON.parse(await readFile(join(paths.destinationRoot, "daemon", "workers.json"), "utf8"))).toEqual({ schemaVersion: 1, workers: [{ ...worker, socketPath: join(paths.destinationRoot, "daemon", "workers", socketName) }] });
+  const migratedCause = join(paths.destinationRoot, "runs", "a2f9c1", "terminal-cause.json");
+  expect(await readFile(migratedCause)).toEqual(cause);
+  expect((await stat(migratedCause)).mode & 0o777).toBe(0o600);
+});
+
+// Operator-visible failure: a live worker still owns its session's files, so migrating underneath it
+// would split one session across two roots. The roster a live daemon writes names each run's socket,
+// and a preflight that cannot read that field refuses the root for its shape instead of blocking on
+// the process it found.
+it("refuses a legacy root whose current-format worker roster names a live supervisor", async () => {
+  const paths = await fixture();
+  const worker = { sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, identity: SUPERVISOR, piChildIdentity: PI_CHILD, token: "run-token", socketPath: join(paths.legacyRoot, "daemon", "workers", "0a1b2c3d4e5f6071.sock"), proto: 2 };
+  await mkdir(join(paths.legacyRoot, "daemon", "workers"), { recursive: true, mode: 0o700 });
+  await writeFile(join(paths.legacyRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [worker] })}\n`, { mode: 0o600 });
+  const reconcileDestination = vi.fn();
+
+  await expect(migrateLegacyState({
+    ...paths,
+    expectedUserId: process.getuid?.() ?? 0,
+    inspectLegacyRuntime: () => inspectRuntimeActivity({ stateRoot: paths.legacyRoot, exists: async () => true, inspectEndpoint: async () => ({ status: "ABSENT" }), inspect: async (/** @type {number} */ pid) => pid === SUPERVISOR.pid ? SUPERVISOR : GONE() }),
+    reconcileDestination,
+  })).rejects.toMatchObject({ code: "LEGACY_RUNTIME_ACTIVE", identities: { activeDaemon: false, activeSupervisors: [SUPERVISOR] } });
+  expect(reconcileDestination).not.toHaveBeenCalled();
+  await expect(stat(join(paths.destinationRoot, "daemon"))).rejects.toMatchObject({ code: "ENOENT" });
 });

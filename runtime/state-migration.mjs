@@ -6,9 +6,14 @@ import { basename, dirname, join, resolve } from "node:path";
 import { convertLegacyDashboardConfig } from "../shared/config.mjs";
 import { validateSessionRecord } from "./registry-store.mjs";
 import { validateWorkerReplayRecord } from "./worker-replay-contract.mjs";
+import { validWorkerTerminalCauseShape } from "./worker-terminal-cause.mjs";
 
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
+// A structured artifact that is not valid UTF-8 is not the text it claims to be: a lossy decode
+// turns each bad byte into U+FFFD, which every validator downstream reads as an ordinary character.
+const TEXT_DECODER = new TextDecoder("utf-8", { fatal: true });
+const EMPTY_FILE = Buffer.alloc(0);
 const MANIFEST = "migration-manifest.json";
 const CANONICAL_MARKER = "CANONICAL";
 const LEGACY_MARKER = "MIGRATED";
@@ -52,6 +57,18 @@ function retiredDestinationArtifact(relative) {
   return DROPPED_LEGACY_ARTIFACTS.some((pattern) => pattern.test(relative)) || /^(index|queue|cli\/pending)(?:\/|$)/u.test(relative) || ["cli", "daemon"].includes(relative);
 }
 
+/**
+ * Formats carried opaquely. A run's stdout and stderr are the raw bytes its child wrote, and
+ * `runtime/rotating-diagnostics.mjs` names every diagnostic segment `<rpc|stderr>.<index padded to 8
+ * digits>.jsonl` and appends raw chunks to it. They exist to record what a crashed run actually
+ * emitted, no reader parses them, and a stream chunk can split a character, so migration never
+ * decodes them and never re-encodes what it copies.
+ * @param {string} relative
+ */
+function opaqueLegacyArtifact(relative) {
+  return /^runs\/[^/]+\/(worker\.stdout\.log|worker\.stderr\.log)$/u.test(relative) || /^runs\/[^/]+\/diagnostics\/(rpc|stderr)\.\d{8,}\.jsonl$/u.test(relative);
+}
+
 /** @param {string} code @param {string} message @param {Record<string, unknown>} [details] */
 function migrationError(code, message, details = {}) { return Object.assign(new Error(message), { code, ...details }); }
 /** @param {string} directory @param {any} fsOps */
@@ -61,7 +78,7 @@ async function durableFile(path, value, fsOps) {
   const handle = await fsOps.open(path, "wx", FILE_MODE);
   try { await handle.chmod(FILE_MODE); await handle.writeFile(value); await handle.sync(); } finally { await handle.close(); }
 }
-/** @param {string} value */
+/** @param {string|Buffer} value */
 function digest(value) { return createHash("sha256").update(value).digest("hex"); }
 /** @param {any} value @param {readonly string[]} keys @param {string} label */
 function exactObject(value, keys, label) { if (typeof value !== "object" || value === null || Array.isArray(value) || Object.keys(value).some((key) => !keys.includes(key))) throw new TypeError(`${label} is invalid`); }
@@ -74,17 +91,22 @@ function validateJsonLines(text, validate, label) {
   if (!values.every(validate)) throw new TypeError(`${label} is invalid`);
   return values;
 }
-/** @param {string} relative @param {string} text */
-function validateLegacyArtifact(relative, text) {
+/** @param {string} relative @param {Buffer} bytes */
+function validateLegacyArtifact(relative, bytes) {
   if (DROPPED_LEGACY_ARTIFACTS.some((pattern) => pattern.test(relative))) return;
+  if (opaqueLegacyArtifact(relative)) return;
   try {
+    const text = TEXT_DECODER.decode(bytes);
     if (relative === "dashboard.json") { convertLegacyDashboardConfig(JSON.parse(text)); return; }
     if (/^sessions\/[^/]+\.json$/u.test(relative)) { const record = validateSessionRecord(JSON.parse(text)); if (`sessions/${record.sessionId}.json` !== relative) throw new TypeError("Registry filename and session ID differ"); return; }
     if (relative === "daemon/control.token") { const token = text.trim(); if (token.length === 0 || token.length > 4096 || /\s/u.test(token)) throw new TypeError("Control token is invalid"); return; }
     if (relative === "daemon/workers.json") {
       const metadata = JSON.parse(text); exactObject(metadata, ["schemaVersion", "workers"], "Worker metadata"); if (metadata.schemaVersion !== 1 || !Array.isArray(metadata.workers)) throw new TypeError("Worker metadata is invalid");
       // A run is reserved before its worker is spawned, so both identities are absent together until the launch binds them.
-      for (const worker of metadata.workers) { exactObject(worker, ["sessionId", "runId", "leaseId", "generation", "identity", "piChildIdentity", "token", "proto", "cliVersion", "routeGeneration", "pendingRespawn"], "Worker record"); const bound = worker.identity !== undefined || worker.piChildIdentity !== undefined; if ([worker.sessionId, worker.runId, worker.leaseId].some((entry) => typeof entry !== "string" || entry.length === 0) || !Number.isSafeInteger(worker.generation) || worker.generation <= 0 || (bound && (!validIdentity(worker.identity) || !validIdentity(worker.piChildIdentity))) || (worker.token !== undefined && (typeof worker.token !== "string" || worker.token.length === 0)) || ![worker.proto, worker.routeGeneration].every((entry) => entry === undefined || (Number.isSafeInteger(entry) && entry > 0)) || (worker.pendingRespawn !== undefined && worker.pendingRespawn !== "upgrade") || (worker.cliVersion !== undefined && (typeof worker.cliVersion !== "string" || worker.cliVersion.length === 0))) throw new TypeError("Worker record is invalid"); }
+      // A reservation names the socket its worker will listen on before anything is spawned, so every
+      // record a running daemon left behind carries `socketPath`. It is re-rooted, not dropped, once
+      // both roots are in scope: see `rerootWorkerSockets`.
+      for (const worker of metadata.workers) { exactObject(worker, ["sessionId", "runId", "leaseId", "generation", "identity", "piChildIdentity", "token", "socketPath", "proto", "cliVersion", "routeGeneration", "pendingRespawn"], "Worker record"); const bound = worker.identity !== undefined || worker.piChildIdentity !== undefined; if ([worker.sessionId, worker.runId, worker.leaseId].some((entry) => typeof entry !== "string" || entry.length === 0) || !Number.isSafeInteger(worker.generation) || worker.generation <= 0 || (bound && (!validIdentity(worker.identity) || !validIdentity(worker.piChildIdentity))) || (worker.token !== undefined && (typeof worker.token !== "string" || worker.token.length === 0)) || (worker.socketPath !== undefined && (typeof worker.socketPath !== "string" || worker.socketPath.length === 0)) || ![worker.proto, worker.routeGeneration].every((entry) => entry === undefined || (Number.isSafeInteger(entry) && entry > 0)) || (worker.pendingRespawn !== undefined && worker.pendingRespawn !== "upgrade") || (worker.cliVersion !== undefined && (typeof worker.cliVersion !== "string" || worker.cliVersion.length === 0))) throw new TypeError("Worker record is invalid"); }
       return;
     }
     if (relative === "daemon/pid.json") {
@@ -94,12 +116,11 @@ function validateLegacyArtifact(relative, text) {
     }
     if (relative === "daemon/reconciliation.json") { const value = JSON.parse(text); exactObject(value, ["schemaVersion", "daemonEpoch", "completedAt", "conflicts"], "Reconciliation record"); if (value.schemaVersion !== 1 || typeof value.daemonEpoch !== "string" || typeof value.completedAt !== "string" || !Array.isArray(value.conflicts)) throw new TypeError("Reconciliation record is invalid"); return; }
     if (relative === "cli/client-id") { const clientId = text.trim(); if (clientId.length === 0 || clientId.includes("/") || clientId.includes("\0") || clientId !== text.trim()) throw new TypeError("CLI identity is invalid"); return; }
-    if (/^runs\/[^/]+\/(worker\.stdout\.log|worker\.stderr\.log)$/u.test(relative)) return;
-    // Rotating diagnostics this release still writes: `runtime/rotating-diagnostics.mjs` names every
-    // segment `<rpc|stderr>.<index padded to 8 digits>.jsonl`. They are carried opaquely, because
-    // they exist to record what a crashed run actually emitted and no reader parses them.
-    if (/^runs\/[^/]+\/diagnostics\/(rpc|stderr)\.\d{8,}\.jsonl$/u.test(relative)) return;
     if (/^runs\/[^/]+\/worker-replay\.jsonl$/u.test(relative)) { validateJsonLines(text, validateWorkerReplayRecord, "Worker replay store"); return; }
+    // The cause a crashed run recorded is the only place the reason Pi died survives its worker. The
+    // identities it must match live in files a destination daemon reads at reconcile time, so this
+    // validates the record's shape and leaves that cross-check where it belongs.
+    if (/^runs\/[^/]+\/terminal-cause\.json$/u.test(relative)) { if (!validWorkerTerminalCauseShape(JSON.parse(text))) throw new TypeError("Worker terminal cause is invalid"); return; }
     throw new TypeError(`Unknown legacy state artifact: ${relative}`);
   } catch (error) { throw migrationError("MALFORMED_LEGACY_STATE", `Malformed legacy artifact: ${relative}`, { cause: error }); }
 }
@@ -109,7 +130,7 @@ async function inspectTree(root, expectedUserId, fsOps) {
   const rootRealpath = await fsOps.realpath(root);
   const rootMetadata = await fsOps.lstat(root);
   if (rootRealpath !== root || !rootMetadata.isDirectory() || rootMetadata.isSymbolicLink() || rootMetadata.uid !== expectedUserId || (rootMetadata.mode & 0o777) !== DIRECTORY_MODE) throw migrationError("UNSAFE_LEGACY_STATE", `Legacy root is not a canonical private directory: ${root}`);
-  /** @type {Array<{relative:string,type:"directory"|"file",text?:string}>} */
+  /** @type {Array<{relative:string,type:"directory"|"file",bytes?:Buffer}>} */
   const entries = [];
   /** @param {string} directory @param {string} relative */
   async function visit(directory, relative) {
@@ -124,21 +145,23 @@ async function inspectTree(root, expectedUserId, fsOps) {
       } else if (metadata.isFile()) {
         if ((metadata.mode & 0o777) !== FILE_MODE) throw migrationError("UNSAFE_LEGACY_STATE", `Unsafe legacy file mode: ${path}`);
         const handle = await fsOps.open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-        let text;
+        let bytes;
         try {
           const opened = await handle.stat();
           if (!opened.isFile() || opened.uid !== expectedUserId || (opened.mode & 0o777) !== FILE_MODE || opened.dev !== metadata.dev || opened.ino !== metadata.ino) throw migrationError("UNSAFE_LEGACY_STATE", `Legacy file identity changed: ${path}`);
-          text = await handle.readFile("utf8");
+          bytes = await handle.readFile();
           const completed = await handle.stat();
           if (completed.dev !== opened.dev || completed.ino !== opened.ino || completed.size !== opened.size || completed.mtimeMs !== opened.mtimeMs) throw migrationError("UNSAFE_LEGACY_STATE", `Legacy file changed while read: ${path}`);
         } finally { await handle.close(); }
-        validateLegacyArtifact(childRelative, text);
-        entries.push({ relative: childRelative, type: "file", text });
+        validateLegacyArtifact(childRelative, bytes);
+        entries.push({ relative: childRelative, type: "file", bytes });
       } else throw migrationError("UNSAFE_LEGACY_STATE", `Unsupported legacy artifact: ${path}`);
     }
   }
   await visit(root, "");
-  const identity = digest(JSON.stringify({ root: rootRealpath, dev: rootMetadata.dev, ino: rootMetadata.ino, entries: entries.map((entry) => [entry.relative, entry.type, entry.text === undefined ? undefined : digest(entry.text)]) }));
+  // Only hex digests reach `JSON.stringify` here: a Buffer would serialize as its byte array, which
+  // is both enormous and a second representation of content this already hashes.
+  const identity = digest(JSON.stringify({ root: rootRealpath, dev: rootMetadata.dev, ino: rootMetadata.ino, entries: entries.map((entry) => [entry.relative, entry.type, entry.bytes === undefined ? undefined : digest(entry.bytes)]) }));
   return { identity, entries };
 }
 
@@ -169,13 +192,13 @@ async function readPrivateDestinationFile(path, metadata, expectedUserId, fsOps)
   try {
     const opened = await handle.stat();
     if (!opened.isFile() || opened.uid !== expectedUserId || (opened.mode & 0o777) !== FILE_MODE || opened.dev !== metadata.dev || opened.ino !== metadata.ino) throw migrationError("MIGRATION_IDENTITY_MISMATCH", `Migrated file is unsafe: ${path}`);
-    const text = await handle.readFile("utf8");
+    const bytes = await handle.readFile();
     const completed = await handle.stat();
     if (completed.dev !== opened.dev || completed.ino !== opened.ino || completed.size !== opened.size || completed.mtimeMs !== opened.mtimeMs) throw migrationError("MIGRATION_IDENTITY_MISMATCH", `Migrated file changed while read: ${path}`);
-    return text;
+    return bytes;
   } finally { await handle.close(); }
 }
-/** @param {string} root @param {Array<{relative:string,type:"directory"|"file",text?:string}>} entries @param {number} expectedUserId @param {any} fsOps */
+/** @param {string} root @param {Array<{relative:string,type:"directory"|"file",bytes?:Buffer}>} entries @param {number} expectedUserId @param {any} fsOps */
 async function validateCompletedDestination(root, entries, expectedUserId, fsOps) {
   const expected = new Map(entries.map((entry) => [entry.relative, entry]));
   const seen = new Set();
@@ -208,10 +231,10 @@ async function validateCompletedDestination(root, entries, expectedUserId, fsOps
         continue;
       }
       if (!metadata.isFile()) throw migrationError("DESTINATION_COLLISION", `Interrupted migration artifact has the wrong type: ${child}`);
-      let text;
-      try { text = await readPrivateDestinationFile(path, metadata, expectedUserId, fsOps); }
+      let bytes;
+      try { bytes = await readPrivateDestinationFile(path, metadata, expectedUserId, fsOps); }
       catch (error) { if (/** @type {any} */ (error)?.code === "MIGRATION_IDENTITY_MISMATCH") throw error; throw migrationError("MIGRATION_IDENTITY_MISMATCH", `Migrated file is unsafe: ${child}`, { cause: error }); }
-      if (digest(text) !== digest(entry.text ?? "")) throw migrationError("MIGRATION_IDENTITY_MISMATCH", `Migrated file identity changed: ${child}`);
+      if (digest(bytes) !== digest(entry.bytes ?? EMPTY_FILE)) throw migrationError("MIGRATION_IDENTITY_MISMATCH", `Migrated file identity changed: ${child}`);
       seen.add(child);
     }
   }
@@ -245,13 +268,34 @@ async function validateRecoveryFiles(root, files, complete, fsOps) {
       const path = join(directory, name); const child = relative === "" ? name : join(relative, name); const metadata = await fsOps.lstat(path);
       if (metadata.isSymbolicLink()) throw migrationError("DESTINATION_COLLISION", `Unsafe interrupted migration artifact: ${child}`);
       if (metadata.isDirectory()) await visit(path, child);
-      else if (metadata.isFile() && expected.get(child) === digest(await fsOps.readFile(path, "utf8"))) seen.add(child);
+      else if (metadata.isFile() && expected.get(child) === digest(await fsOps.readFile(path))) seen.add(child);
       else if (metadata.isFile() && retiredDestinationArtifact(child)) continue;
       else throw migrationError("DESTINATION_COLLISION", `Interrupted migration artifact changed: ${child}`);
     }
   }
   await visit(root, "");
   if (complete && seen.size !== expected.size) throw migrationError("DESTINATION_COLLISION", "Interrupted migration output is incomplete");
+}
+
+/**
+ * Re-root every run socket a worker roster names.
+ *
+ * The path is durable state from the moment a run is reserved, so it survives the move; carried
+ * verbatim it still names the legacy root, and the destination daemon unlinks it from there the
+ * moment it retires the dead run. A path outside the legacy socket directory names nothing this
+ * release wrote, so it is refused rather than rewritten.
+ * @param {Buffer} bytes @param {string} legacyRoot @param {string} destinationRoot
+ */
+function rerootWorkerSockets(bytes, legacyRoot, destinationRoot) {
+  const metadata = JSON.parse(bytes.toString("utf8"));
+  if (!metadata.workers.some((/** @type {any} */ worker) => worker.socketPath !== undefined)) return bytes;
+  const legacySockets = join(legacyRoot, "daemon", "workers");
+  const workers = metadata.workers.map((/** @type {any} */ worker) => {
+    if (worker.socketPath === undefined) return worker;
+    if (resolve(worker.socketPath) !== worker.socketPath || dirname(worker.socketPath) !== legacySockets) throw migrationError("MALFORMED_LEGACY_STATE", "Malformed legacy artifact: daemon/workers.json", { cause: new TypeError(`Worker socket is outside the legacy root: ${worker.socketPath}`) });
+    return { ...worker, socketPath: join(destinationRoot, "daemon", "workers", basename(worker.socketPath)) };
+  });
+  return Buffer.from(`${JSON.stringify({ ...metadata, workers })}\n`, "utf8");
 }
 
 /** @param {string} path @param {unknown} value @param {any} fsOps */
@@ -286,11 +330,12 @@ export async function migrateLegacyState({ legacyRoot, destinationRoot, expected
       return true;
     }).map((entry) => {
       if (entry.type !== "file") return entry;
-      let text = entry.text ?? "";
-      if (entry.relative === "dashboard.json") { try { text = `${JSON.stringify(convertLegacyDashboardConfig(JSON.parse(text)), null, 2)}\n`; } catch (error) { throw migrationError("MALFORMED_LEGACY_STATE", "Legacy dashboard configuration is invalid", { cause: error }); } }
-      return { ...entry, text };
+      let bytes = entry.bytes ?? EMPTY_FILE;
+      if (entry.relative === "dashboard.json") { try { bytes = Buffer.from(`${JSON.stringify(convertLegacyDashboardConfig(JSON.parse(bytes.toString("utf8"))), null, 2)}\n`, "utf8"); } catch (error) { throw migrationError("MALFORMED_LEGACY_STATE", "Legacy dashboard configuration is invalid", { cause: error }); } }
+      if (entry.relative === "daemon/workers.json") bytes = rerootWorkerSockets(bytes, legacyRoot, destinationRoot);
+      return { ...entry, bytes };
     });
-    const files = preparedEntries.filter((entry) => entry.type === "file").map((entry) => ({ relative: entry.relative, type: "file", sha256: digest(entry.text ?? "") }));
+    const files = preparedEntries.filter((entry) => entry.type === "file").map((entry) => ({ relative: entry.relative, type: "file", sha256: digest(entry.bytes ?? EMPTY_FILE) }));
     const existing = await maybeManifest(manifestPath, fsOps);
     let published = existing;
     if (existing !== undefined) {
@@ -333,7 +378,7 @@ export async function migrateLegacyState({ legacyRoot, destinationRoot, expected
         const target = join(stage, entry.relative);
         if (entry.type === "directory") { await fsOps.mkdir(target, { recursive: true, mode: DIRECTORY_MODE }); await fsOps.chmod(target, DIRECTORY_MODE); continue; }
         await fsOps.mkdir(dirname(target), { recursive: true, mode: DIRECTORY_MODE });
-        await durableFile(target, entry.text ?? "", fsOps); await failpoint("after_staged_file_fsync");
+        await durableFile(target, entry.bytes ?? EMPTY_FILE, fsOps); await failpoint("after_staged_file_fsync");
       }
       await Promise.all(preparedEntries.filter((entry) => entry.type === "directory").map((entry) => syncDirectory(join(stage, entry.relative), fsOps)));
       await syncDirectory(stage, fsOps);

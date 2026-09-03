@@ -23,19 +23,33 @@ function validTimestamp(value) {
   try { return new Date(value).toISOString() === value; } catch { return false; }
 }
 
-/** @param {any} cause @param {{ sessionId: string, runId: string, leaseId: string, generation: number, worker: any, piChild: any }} expected */
-export function validWorkerTerminalCause(cause, expected) {
+/**
+ * Every field a published terminal cause must carry, with no binding to the run that produced it.
+ * A reader that holds the run's identities checks those separately; a reader that only moves the
+ * file, like a state-root migration, has nothing to bind it to and validates this alone.
+ * @param {any} cause
+ */
+export function validWorkerTerminalCauseShape(cause) {
   const keys = ["schemaVersion", "sessionId", "runId", "leaseId", "generation", "worker", "piChild", "event"];
   const eventKeys = ["type", "at", "summary"];
   return typeof cause === "object" && cause !== null && !Array.isArray(cause) &&
     Object.keys(cause).every((key) => keys.includes(key)) && Object.keys(cause).length === keys.length &&
-    cause.schemaVersion === 1 && cause.sessionId === expected.sessionId && cause.runId === expected.runId &&
-    cause.leaseId === expected.leaseId && cause.generation === expected.generation &&
-    sameIdentity(cause.worker, expected.worker) && sameIdentity(cause.piChild, expected.piChild) &&
+    cause.schemaVersion === 1 &&
+    [cause.sessionId, cause.runId, cause.leaseId].every((value) => typeof value === "string" && value.length > 0) &&
+    Number.isSafeInteger(cause.generation) && cause.generation > 0 &&
+    validIdentity(cause.worker) && validIdentity(cause.piChild) &&
     typeof cause.event === "object" && cause.event !== null && !Array.isArray(cause.event) &&
     Object.keys(cause.event).every((key) => eventKeys.includes(key)) && Object.keys(cause.event).length === eventKeys.length &&
     cause.event.type === "PI_CHILD_CRASHED" && validTimestamp(cause.event.at) &&
     typeof cause.event.summary === "string" && cause.event.summary.length > 0 && cause.event.summary.length <= 1024;
+}
+
+/** @param {any} cause @param {{ sessionId: string, runId: string, leaseId: string, generation: number, worker: any, piChild: any }} expected */
+export function validWorkerTerminalCause(cause, expected) {
+  return validWorkerTerminalCauseShape(cause) &&
+    cause.sessionId === expected.sessionId && cause.runId === expected.runId &&
+    cause.leaseId === expected.leaseId && cause.generation === expected.generation &&
+    sameIdentity(cause.worker, expected.worker) && sameIdentity(cause.piChild, expected.piChild);
 }
 
 /** @param {string} root @param {string} runHash */

@@ -789,9 +789,24 @@ describe("refused viewer subscription", () => {
 describe("transcript scrolling keys and wheel", () => {
   const longSnapshot = { items: Array.from({ length: 60 }, (_, index) => ({ kind: "system_message", itemId: `i-${index}`, text: `line ${index}`, level: "info" })) };
 
-  // Arrows scroll only when Pi's editor has nothing to offer: no draft to move within and no history
-  // to recall. Either one hands the arrows back, which keeps recall working and keeps the Left
-  // double-press gesture honest about a dirty prompt.
+  it("keeps repeated Left and Right presses in a non-empty Pi editor draft", async () => {
+    const piEditor = createPiEditor({ tui: { requestRender() {} } });
+    const f = fixture({ editor: piEditor });
+    await f.instance.open();
+    piEditor.setText("abcd");
+
+    f.instance.handleInput("\x1b[D");
+    f.instance.handleInput("\x1b[D");
+    f.instance.handleInput("X");
+    f.instance.handleInput("\x1b[C");
+    f.instance.handleInput("Y");
+
+    expect(piEditor.getText()).toBe("abXcYd");
+    expect(f.instance.onReturn).not.toHaveBeenCalled();
+  });
+
+  // Up and Down scroll only when Pi's editor has nothing to offer: no draft to move within and no
+  // history to recall. A draft or history hands them back to the editor instead.
   it.each([
     ["an empty prompt with no history", () => {}, false],
     ["recallable prompt history", (/** @type {any} */ f) => f.instance.history.push("earlier prompt"), true],

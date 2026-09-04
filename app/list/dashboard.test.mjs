@@ -1318,6 +1318,15 @@ describe("wheel scrolling", () => {
     });
 });
 
+it("draws the Sessions bar on the terminal background", async () => {
+  const dashboard = controller(new FakeDaemonClient([session("one")]));
+  await dashboard.open();
+
+  const sessionsBar = dashboard.render(80, 20).find((line) => stripVTControlCharacters(line).startsWith("╭─ Sessions "));
+  expect(sessionsBar).toContain("\x1b[49m");
+  expect(sessionsBar).not.toContain(JOBWATCH_ANSI.blackBackground);
+});
+
 it("rests a dimmed cursor on the placeholder's first character until the operator types", async () => {
   // An empty prompt must read as a caret waiting, not as text the operator has to delete.
   const dashboard = controller(new FakeDaemonClient([]));

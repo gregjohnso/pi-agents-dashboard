@@ -275,7 +275,7 @@ it("drives viewer prompt/follow-up/steer/interrupt, tools, pending UI, and read-
   await second.controller.close();
 });
 
-it("uses context-sensitive Ctrl+C, immediate Escape, and the exact clean and 500 ms dirty/history Left table", async () => {
+it("uses context-sensitive Ctrl+C, immediate Escape, and the exact clean and 500 ms empty-dirty/history Left table", async () => {
   const cleanLeft = viewerFixture({ pendingUi: [] }, { onReturn: vi.fn() });
   await cleanLeft.controller.open();
   cleanLeft.controller.handleInput("\x1b[D");
@@ -291,7 +291,8 @@ it("uses context-sensitive Ctrl+C, immediate Escape, and the exact clean and 500
   let now = 0;
   const dirty = viewerFixture({ pendingUi: [] }, { onReturn: vi.fn(), now: () => now });
   await dirty.controller.open();
-  dirty.controller.handleInput("x");
+  dirty.controller.editor.setText("x");
+  dirty.controller.editor.setText("");
   dirty.controller.handleInput("\x1b[D");
   expect(dirty.onReturn).not.toHaveBeenCalled();
   now = 500;

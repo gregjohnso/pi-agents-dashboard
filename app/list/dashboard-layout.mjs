@@ -1,6 +1,6 @@
 import { stripVTControlCharacters } from "node:util";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { jobwatchTheme } from "./dashboard-theme.mjs";
+import { JOBWATCH_ANSI, jobwatchTheme } from "./dashboard-theme.mjs";
 import { spinnerFrame } from "../spinner.mjs";
 import { displaySessionState } from "./session-state.mjs";
 const COLUMN_LABELS = {
@@ -161,18 +161,19 @@ function sessionValues(session, now) {
 export function renderSessionRow(session, layout, options) {
     const selected = options.selected ?? false;
     const values = sessionValues(session, options.now);
+    const background = JOBWATCH_ANSI.defaultBackground;
     return joinCells(layout, values, (key, text) => {
         if (key === "state")
-            return jobwatchTheme.state(session, text, selected);
+            return jobwatchTheme.state(session, text, selected, background);
         if (key === "age")
-            return jobwatchTheme.muted(text, selected);
+            return jobwatchTheme.muted(text, selected, background);
         if (key === "name") {
             // A colour marks the name, not the column: fill behind the text and leave the padding alone.
             const label = text.trimEnd();
-            return jobwatchTheme.name(label, selected, session.color) + jobwatchTheme.text(text.slice(label.length), selected);
+            return jobwatchTheme.name(label, selected, session.color, background) + jobwatchTheme.text(text.slice(label.length), selected, background);
         }
-        return jobwatchTheme.text(text, selected);
-    }, (text) => jobwatchTheme.separator(text, selected));
+        return jobwatchTheme.text(text, selected, background);
+    }, (text) => jobwatchTheme.separator(text, selected, background));
 }
 /** Render an unselectable group row that occupies one virtual list position. */
 export function renderGroupHeader(label, count, layout) {

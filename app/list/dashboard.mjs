@@ -8,7 +8,7 @@ import { sessionNameFromPrompt } from "../../runtime/launch-resolver.mjs";
 import { SPINNER_INTERVAL_MS } from "../spinner.mjs";
 import { countDashboardSessions, selectDashboardSessions, } from "./dashboard-state.mjs";
 import { createDashboardLayout, renderColumnHeader, wrapPromptDraft, } from "./dashboard-layout.mjs";
-import { jobwatchTheme } from "./dashboard-theme.mjs";
+import { JOBWATCH_ANSI, jobwatchTheme } from "./dashboard-theme.mjs";
 import { displaySessionState } from "./session-state.mjs";
 import { StopClearGesture } from "./stop-clear-gesture.mjs";
 import { destructiveAction, createChoiceOverlay, createCommandMenuOverlay, createHelpOverlay, createMetadataOverlay, createPathCompletionOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, describeOverlay, filterChoiceOverlay, } from "./dashboard-overlays.mjs";
@@ -101,7 +101,9 @@ function pendingSessionRecord(pending) {
 function sectionBorder(label, width, focused) {
     const prefix = label === "" ? "╭─" : `╭─ ${label} `;
     const line = prefix + "─".repeat(Math.max(0, width - visibleWidth(prefix)));
-    return paintPlainLine(line, width, focused ? jobwatchTheme.focusBorder : jobwatchTheme.inactiveBorder);
+    return paintPlainLine(line, width, (text) => focused
+        ? jobwatchTheme.focusBorder(text, JOBWATCH_ANSI.defaultBackground)
+        : jobwatchTheme.inactiveBorder(text, JOBWATCH_ANSI.defaultBackground));
 }
 function overlayRow(content, innerWidth, indent, paintContent) {
     const body = fitLine(stripVTControlCharacters(String(content)), innerWidth);

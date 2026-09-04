@@ -330,8 +330,14 @@ export class ViewerController {
       return;
     }
     if (matchesKey(data, Key.left)) {
+      if (this.editor.getText().length > 0) {
+        this.returnGesture.cancel();
+        this.editor.handleInput(data);
+        this.requestRender();
+        return;
+      }
       const key = "left";
-      const clean = this.editor.getText().length === 0 && !this.edited && !this.historyUsed;
+      const clean = !this.edited && !this.historyUsed;
       const result = this.returnGesture.handle(key, { clean, overlayCaptured: false });
       if (result === "armed") this.editor.handleInput(data);
       this.requestRender();

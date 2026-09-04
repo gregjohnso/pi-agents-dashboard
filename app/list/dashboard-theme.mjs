@@ -3,6 +3,7 @@ import { displaySessionState } from "./session-state.mjs";
 export const JOBWATCH_ANSI = {
     reset: "\x1b[0m",
     bold: "\x1b[1m",
+    defaultBackground: "\x1b[49m",
     blackBackground: "\x1b[48;2;0;0;0m",
     surfaceBackground: "\x1b[48;2;17;17;17m",
     headerBackground: "\x1b[48;2;2;132;199m",
@@ -55,11 +56,11 @@ export const jobwatchTheme = {
     keyHints(text) {
         return paint(text, JOBWATCH_ANSI.gray, false, JOBWATCH_ANSI.surfaceBackground);
     },
-    focusBorder(text) {
-        return paint(text, JOBWATCH_ANSI.sky, false);
+    focusBorder(text, background = JOBWATCH_ANSI.blackBackground) {
+        return paint(text, JOBWATCH_ANSI.sky, false, background);
     },
-    inactiveBorder(text) {
-        return paint(text, JOBWATCH_ANSI.gray, false);
+    inactiveBorder(text, background = JOBWATCH_ANSI.blackBackground) {
+        return paint(text, JOBWATCH_ANSI.gray, false, background);
     },
     overlayBorder(text) {
         return paint(text, JOBWATCH_ANSI.sky, false, JOBWATCH_ANSI.surfaceBackground);
@@ -83,24 +84,24 @@ export const jobwatchTheme = {
     group(text) {
         return paint(text, JOBWATCH_ANSI.sky, false, JOBWATCH_ANSI.surfaceBackground);
     },
-    state(session, text, selected) {
-        return paint(text, stateColor(session), selected);
+    state(session, text, selected, background = JOBWATCH_ANSI.blackBackground) {
+        return paint(text, stateColor(session), selected, background);
     },
-    text(text, selected) {
-        return paint(text, JOBWATCH_ANSI.text, selected);
+    text(text, selected, background = JOBWATCH_ANSI.blackBackground) {
+        return paint(text, JOBWATCH_ANSI.text, selected, background);
     },
-    name(text, selected, color) {
+    name(text, selected, color, background = JOBWATCH_ANSI.blackBackground) {
         if (color === undefined)
-            return paint(text, JOBWATCH_ANSI.text, selected);
+            return paint(text, JOBWATCH_ANSI.text, selected, background);
         // A colour is a label the operator chose, so selection must not repaint it. The row keeps the
         // colour behind black text either way; selection adds weight only.
         const bold = selected ? JOBWATCH_ANSI.bold : "";
         return `${backgroundFor(color)}${JOBWATCH_ANSI.black}${bold}${text}${JOBWATCH_ANSI.reset}`;
     },
-    muted(text, selected) {
-        return paint(text, JOBWATCH_ANSI.gray, selected);
+    muted(text, selected, background = JOBWATCH_ANSI.blackBackground) {
+        return paint(text, JOBWATCH_ANSI.gray, selected, background);
     },
-    separator(text, selected) {
-        return paint(text, JOBWATCH_ANSI.text, selected);
+    separator(text, selected, background = JOBWATCH_ANSI.blackBackground) {
+        return paint(text, JOBWATCH_ANSI.text, selected, background);
     },
 };

@@ -115,6 +115,19 @@ describe("responsive dashboard layout", () => {
     });
 });
 
+it("draws session rows on the terminal background without removing meaningful highlights", () => {
+    const layout = createDashboardLayout(120, 20);
+    const plain = renderSessionRow(fixtures[0], layout, { now });
+    expect(plain).toContain("\x1b[49m");
+    expect(plain).not.toContain(JOBWATCH_ANSI.blackBackground);
+
+    const selected = renderSessionRow(fixtures[0], layout, { now, selected: true });
+    expect(selected).toContain(JOBWATCH_ANSI.selectionBackground);
+    const colored = renderSessionRow({ ...fixtures[0], color: "amber" }, layout, { now });
+    expect(colored).toContain("\x1b[48;2;252;211;77m");
+    expect(colored).not.toContain(JOBWATCH_ANSI.blackBackground);
+});
+
 it("bolds the selected row without altering its colors", () => {
     const layout = createDashboardLayout(120, 20);
     const plain = renderSessionRow(fixtures[0], layout, { now });

@@ -3,6 +3,8 @@ import { displaySessionState } from "./session-state.mjs";
 export const JOBWATCH_ANSI = {
     reset: "\x1b[0m",
     bold: "\x1b[1m",
+    inverse: "\x1b[7m",
+    inverseOff: "\x1b[27m",
     defaultBackground: "\x1b[49m",
     blackBackground: "\x1b[48;2;0;0;0m",
     surfaceBackground: "\x1b[48;2;17;17;17m",
@@ -71,6 +73,9 @@ export const jobwatchTheme = {
     /** A dimmed block over one character: the cursor at rest, not a selection. */
     placeholderCursor(text) {
         return `${JOBWATCH_ANSI.selectionBackground}${JOBWATCH_ANSI.gray}${text}${JOBWATCH_ANSI.reset}`;
+    },
+    promptCursor(text) {
+        return `${JOBWATCH_ANSI.inverse}${text}${JOBWATCH_ANSI.inverseOff}`;
     },
     overlayMuted(text) {
         return paint(text, JOBWATCH_ANSI.gray, false, JOBWATCH_ANSI.surfaceBackground);

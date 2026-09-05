@@ -1,6 +1,7 @@
 import { stripVTControlCharacters } from "node:util";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { JOBWATCH_ANSI, jobwatchTheme } from "./dashboard-theme.mjs";
+import { markPromptCursor, normalizePromptCursor } from "./prompt-cursor.mjs";
 import { spinnerFrame } from "../spinner.mjs";
 import { displaySessionState } from "./session-state.mjs";
 const COLUMN_LABELS = {
@@ -34,6 +35,39 @@ function densityForWidth(width) {
 const MODEL_WIDTH = 16;
 /** The prompt marker, and the column its continuation rows line up under. */
 const PROMPT_MARKER = " \u276f ";
+
+function markWrappedPromptCursor(text, rows, cursorIndex, width) {
+    const cursor = normalizePromptCursor(text, cursorIndex);
+    const marked = [...rows];
+    let sourceOffset = 0;
+    for (let index = 0; index < rows.length; index += 1) {
+        const row = rows[index];
+        const rowStart = text.indexOf(row, sourceOffset);
+        if (rowStart < 0)
+            break;
+        const rowEnd = rowStart + row.length;
+        if (cursor < rowStart) {
+            const previous = index - 1;
+            if (previous >= 0 && visibleWidth(marked[previous]) < width) {
+                marked[previous] += jobwatchTheme.promptCursor(" ");
+                return marked;
+            }
+            marked[index] = `${jobwatchTheme.promptCursor(" ")}${row}`;
+            return marked;
+        }
+        if (cursor < rowEnd) {
+            marked[index] = markPromptCursor(row, cursor - rowStart, (value) => jobwatchTheme.promptCursor(value));
+            return marked;
+        }
+        sourceOffset = rowEnd;
+    }
+    const last = marked.length - 1;
+    if (last >= 0 && visibleWidth(marked[last]) < width)
+        marked[last] += jobwatchTheme.promptCursor(" ");
+    else
+        marked.push(jobwatchTheme.promptCursor(" "));
+    return marked;
+}
 /**
  * How tall the prompt box may grow, copied from pi-tui's Editor: it shows max(5, 30% of the
  * terminal) and scrolls past that, so the dashboard's prompt reaches the same bound Pi's does.
@@ -45,14 +79,16 @@ const PROMPT_HEIGHT_FRACTION = 0.3;
  *
  * Wrapping is pi-tui's own `wrapTextWithAnsi`: word boundaries first, graphemes when a single word
  * is wider than the box, so a wide character is never split across a cell.
- * @param {string} draft @param {number} width
+ * @param {string} draft @param {number} width @param {number} [cursorIndex]
  * @returns {string[]} One string per row, each already indented under the marker.
  */
-export function wrapPromptDraft(draft, width) {
+export function wrapPromptDraft(draft, width, cursorIndex) {
     const indent = visibleWidth(PROMPT_MARKER);
     const usable = Math.max(1, normalizedDimension(width) - indent);
-    return wrapTextWithAnsi(plainText(String(draft)), usable)
-        .map((text, index) => `${index === 0 ? PROMPT_MARKER : " ".repeat(indent)}${text}`);
+    const safe = plainText(String(draft));
+    const wrapped = wrapTextWithAnsi(safe, usable);
+    const marked = cursorIndex === undefined ? wrapped : markWrappedPromptCursor(safe, wrapped, cursorIndex, usable);
+    return marked.map((text, index) => `${index === 0 ? PROMPT_MARKER : " ".repeat(indent)}${text}`);
 }
 function columnsForWidth(width) {
     if (width <= 0)

@@ -14,6 +14,7 @@ import { StopClearGesture } from "./stop-clear-gesture.mjs";
 import { destructiveAction, createChoiceOverlay, createCommandMenuOverlay, createHelpOverlay, createMetadataOverlay, createPathCompletionOverlay, createSessionConfirmation, createSessionIntent, createSharedDirectoryOverlay, describeOverlay, filterChoiceOverlay, } from "./dashboard-overlays.mjs";
 import { draftChoices, parseListCommand } from "./list-commands.mjs";
 import { applyCwdCompletion, cwdArgument, suggestDirectories, } from "./path-completion.mjs";
+import { deleteBeforePromptCursor, movePromptCursor, normalizePromptCursor, } from "./prompt-cursor.mjs";
 import { createLaunchDraft, prepareLaunchRequest, } from "./launch-composer.mjs";
 import { VirtualSessionList } from "./virtual-session-list.mjs";
 /** A path the operator may launch into: it must exist now and be a directory. @param {string} path */
@@ -167,6 +168,7 @@ export class DashboardController {
     query = defaultQuery();
     focus = "list";
     composerDraft;
+    composerCursor = 0;
     launchDefaults;
     isDirectory;
     suggestDirectories;
@@ -310,13 +312,27 @@ export class DashboardController {
     focusComposer() {
         this.focus = "list";
     }
-    setComposerPrompt(prompt) {
+    setComposerPrompt(prompt, cursor = prompt.length) {
         this.composerDraft = { ...this.composerDraft, prompt };
+        this.composerCursor = normalizePromptCursor(prompt, cursor);
         // Every edit reopens the slash menu: a closed menu belongs to the text the operator escaped from.
         this.commandMenuClosed = false;
         if (!prompt.trim().startsWith("/"))
             this.commandMenuIndex = 0;
         this.scheduleCwdCompletion();
+    }
+    moveComposerCursor(delta) {
+        this.composerCursor = movePromptCursor(this.composerDraft.prompt, this.composerCursor, delta);
+        this.requestRender?.();
+    }
+    insertComposerText(text) {
+        const prompt = this.composerDraft.prompt;
+        this.setComposerPrompt(`${prompt.slice(0, this.composerCursor)}${text}${prompt.slice(this.composerCursor)}`, this.composerCursor + text.length);
+    }
+    deleteBeforeComposerCursor() {
+        const edited = deleteBeforePromptCursor(this.composerDraft.prompt, this.composerCursor);
+        if (edited.text !== this.composerDraft.prompt)
+            this.setComposerPrompt(edited.text, edited.cursor);
     }
     /**
      * Ask pi-tui for the directories a `/cwd` line admits. The listing is debounced and runs off the
@@ -533,6 +549,7 @@ export class DashboardController {
         // Clear the draft on the keystroke that sent it: a prompt still sitting in the box invites a
         // second Enter, which launches the same work twice while the daemon is still starting the first.
         this.composerDraft = { ...this.composerDraft, prompt: "" };
+        this.composerCursor = 0;
         this.requestRender?.();
         try {
             const preflight = await this.client.preflightLaunch(submitted);
@@ -736,7 +753,7 @@ export class DashboardController {
             return;
         }
         if (matchesKey(data, Key.backspace)) {
-            this.setComposerPrompt(this.composerDraft.prompt.slice(0, -1));
+            this.deleteBeforeComposerCursor();
             return;
         }
         // Escape closes the slash menu without touching the text, so a mistyped command stays editable.
@@ -747,7 +764,11 @@ export class DashboardController {
             }
             return;
         }
-        if (matchesKey(data, Key.left)) return;
+        if (matchesKey(data, Key.left)) {
+            if (this.composerDraft.prompt !== "")
+                this.moveComposerCursor(-1);
+            return;
+        }
         // Tab used to move a launch-field cursor that typing ignored and Backspace obeyed. It now
         // completes a `/cwd` directory and types nothing anywhere else; a tab inside a paste still
         // arrives as text and becomes a space.
@@ -776,7 +797,10 @@ export class DashboardController {
             return;
         }
         if (matchesKey(data, Key.right)) {
-            void this.activateSelection();
+            if (this.composerDraft.prompt !== "")
+                this.moveComposerCursor(1);
+            else
+                void this.activateSelection();
             return;
         }
         const control = CONTROLS.find(({ key }) => matchesKey(data, key));
@@ -810,7 +834,7 @@ export class DashboardController {
             // Typed and pasted text always composes a prompt, wherever the cursor sits in the list.
             const printable = this.printable(data);
             if (printable !== undefined)
-                this.setComposerPrompt(this.composerDraft.prompt + printable);
+                this.insertComposerText(printable);
         }
     }
     /**
@@ -883,10 +907,13 @@ export class DashboardController {
                 if (draftPrompt === "")
                     lines[dockTop + 1] = promptPlaceholderLine(this.width);
                 else {
-                    // Past the cap the box scrolls: typing lands at the end, so the tail is what must stay visible.
-                    const wrapped = wrapPromptDraft(draftPrompt, this.width);
-                    wrapped.slice(Math.max(0, wrapped.length - layout.promptRows)).forEach((row, index) => {
-                        lines[dockTop + 1 + index] = paintPlainLine(row, this.width, (text) => jobwatchTheme.text(text, false));
+                    const wrapped = wrapPromptDraft(draftPrompt, this.width, this.composerCursor);
+                    const cursorRow = wrapped.findIndex((row) => row.includes(JOBWATCH_ANSI.inverse));
+                    const firstVisible = cursorRow < 0
+                        ? Math.max(0, wrapped.length - layout.promptRows)
+                        : Math.min(Math.max(0, cursorRow - layout.promptRows + 1), Math.max(0, wrapped.length - layout.promptRows));
+                    wrapped.slice(firstVisible, firstVisible + layout.promptRows).forEach((row, index) => {
+                        lines[dockTop + 1 + index] = jobwatchTheme.text(fitLine(row, this.width), false);
                     });
                 }
                 const promptBottom = dockTop + layout.promptRows;
@@ -928,7 +955,7 @@ export class DashboardController {
     /** Put a failed launch's text back so the operator does not retype it. */
     restoreDraft(prompt) {
         if (this.composerDraft.prompt.trim() === "")
-            this.composerDraft = { ...this.composerDraft, prompt };
+            this.setComposerPrompt(prompt);
     }
     rebuildList() {
         const selected = this.preferredSelectionId ?? this.list.selectedSessionId;
@@ -963,7 +990,7 @@ export class DashboardController {
     }
     /** The current layout, with the dock sized to the rows the draft wraps into. */
     layout() {
-        return createDashboardLayout(this.width, this.height, { promptRows: wrapPromptDraft(this.composerDraft.prompt, this.width).length });
+        return createDashboardLayout(this.width, this.height, { promptRows: wrapPromptDraft(this.composerDraft.prompt, this.width, this.composerDraft.prompt === "" ? undefined : this.composerCursor).length });
     }
     listHeight() {
         return this.layout().listHeight;

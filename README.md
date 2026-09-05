@@ -31,7 +31,7 @@ The list uses these columns. Narrow terminals hide columns from right to left.
 - **Model** is the model Pi reported for that session. It is empty until Pi says which model it is running, and never shows what a launch asked for.
 - **Age** is the time since the session was created.
 
-Type anywhere to compose a prompt in the box at the bottom. The box wraps and grows as you type, and the list shrinks to make room. Press Enter with prompt text to launch a session. Worktree isolation is the default, so the current directory must be inside a Git repository with a commit. Press Enter with an empty prompt to open the selected session.
+Type anywhere to compose a prompt in the box at the bottom. The box wraps and grows as you type, and the list shrinks to make room. Left and Right move the prompt cursor while the box contains text. Press Enter with prompt text to launch a session. Worktree isolation is the default, so the current directory must be inside a Git repository with a commit. Press Enter or Right with an empty prompt to open the selected session.
 
 Use Up and Down to select a row. Page Up, Page Down, Home, and End move farther. The mouse wheel moves the selection. One click selects a row, and a second click opens it.
 

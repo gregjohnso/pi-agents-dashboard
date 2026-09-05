@@ -68,7 +68,8 @@ export function createHelpOverlay() {
         kind: "help",
         bindings: [
             { keys: "type anything", action: "compose a prompt; Enter launches it" },
-            { keys: "Enter / →", action: "open the selected session" },
+            { keys: "← → with prompt", action: "move the prompt cursor" },
+            { keys: "Enter / → with empty prompt", action: "open the selected session" },
             { keys: "↑ ↓ PgUp PgDn Home End", action: "move the selection" },
             { keys: "Ctrl+X", action: "stop the session; press again within 500 ms to clear it" },
             { keys: "Ctrl+F", action: "search" },

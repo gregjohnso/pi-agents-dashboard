@@ -547,6 +547,41 @@ describe("dashboard controller", () => {
         expect(dashboard.status).toMatchObject({ kind: "error", code: "DELIVERY_UNKNOWN" });
         expect(dashboard.composerDraft.prompt).toBe("Implement it");
     });
+    it("edits a non-empty launch prompt at the cursor without opening the selected session", async () => {
+        const openSelectedViewer = vi.fn(async () => {});
+        const dashboard = controller(new FakeDaemonClient([session("a")]), { openViewer: openSelectedViewer });
+        await dashboard.open();
+
+        dashboard.handleInput("abcd");
+        dashboard.handleInput("\x1b[D");
+        dashboard.handleInput("\x1b[D");
+        dashboard.handleInput("X");
+        dashboard.handleInput("\x1b[C");
+        dashboard.handleInput("Y");
+
+        expect(dashboard.composerDraft.prompt).toBe("abXcYd");
+        expect(openSelectedViewer).not.toHaveBeenCalled();
+        dashboard.handleInput("\x7f");
+        expect(dashboard.composerDraft.prompt).toBe("abXcd");
+        dashboard.handleInput("\x1b[C");
+        dashboard.handleInput("\x1b[C");
+        expect(openSelectedViewer).not.toHaveBeenCalled();
+
+        dashboard.setComposerPrompt("ad");
+        dashboard.handleInput("\x1b[D");
+        dashboard.handleInput("bc");
+        expect(dashboard.composerDraft.prompt).toBe("abcd");
+    });
+    it("moves and deletes by whole prompt graphemes", async () => {
+        const dashboard = controller(new FakeDaemonClient([]));
+        await dashboard.open();
+
+        dashboard.handleInput("A👩🏽‍💻B");
+        dashboard.handleInput("\x1b[D");
+        dashboard.handleInput("\x7f");
+
+        expect(dashboard.composerDraft.prompt).toBe("AB");
+    });
     it("opens the selection through the injected viewer boundary on an empty Enter or Right, and launches once the prompt has text", async () => {
         const openSelectedViewer = vi.fn(async () => {});
         const client = new FakeDaemonClient([session("a")]);
@@ -1327,6 +1362,21 @@ it("draws the Sessions bar on the terminal background", async () => {
   expect(sessionsBar).not.toContain(JOBWATCH_ANSI.blackBackground);
 });
 
+it("renders the launch-prompt cursor at its moved position and at the end", async () => {
+  const dashboard = controller(new FakeDaemonClient([]));
+  await dashboard.open();
+  dashboard.setComposerPrompt("abcd");
+
+  dashboard.handleInput("\x1b[D");
+  dashboard.handleInput("\x1b[D");
+  expect(dashboard.render(80, 20).join("\n")).toContain("\x1b[7mc\x1b[27m");
+
+  dashboard.handleInput("\x1b[C");
+  expect(dashboard.render(80, 20).join("\n")).toContain("\x1b[7md\x1b[27m");
+  dashboard.handleInput("\x1b[C");
+  expect(dashboard.render(80, 20).join("\n")).toContain("\x1b[7m \x1b[27m");
+});
+
 it("rests a dimmed cursor on the placeholder's first character until the operator types", async () => {
   // An empty prompt must read as a caret waiting, not as text the operator has to delete.
   const dashboard = controller(new FakeDaemonClient([]));
@@ -1391,6 +1441,17 @@ describe("prompt wrapping", () => {
     expect(rows.at(-1)).toContain("word199");
     expect(rows.join(" ")).not.toMatch(/word0\b/u);
     expect(lines.every((line) => visibleWidth(line) <= 60)).toBe(true);
+  });
+
+  it("scrolls a wrapped prompt to keep a cursor moved to the beginning visible", async () => {
+    const dashboard = controller(new FakeDaemonClient([session("a")]));
+    await dashboard.open();
+    dashboard.setComposerPrompt(CAPPED_DRAFT);
+    for (let index = 0; index < CAPPED_DRAFT.length; index += 1) dashboard.handleInput("\x1b[D");
+
+    const lines = dashboard.render(60, 24);
+    expect(lines.join("\n")).toContain("\x1b[7mw\x1b[27m");
+    expect(promptRows(lines).join(" ")).toContain("word0");
   });
 
   it("never takes the last list row, however long the draft and however short the terminal", async () => {

@@ -101,6 +101,8 @@ describe("dashboard overlays", () => {
         // only completes the directory typed after /cwd.
         expect(keys.join(" ")).not.toContain("Ctrl+J");
         expect(bindings.find((binding) => binding.keys === "Tab")?.action).toContain("/cwd");
+        expect(bindings).toContainEqual({ keys: "← → with prompt", action: "move the prompt cursor" });
+        expect(bindings).toContainEqual({ keys: "Enter / → with empty prompt", action: "open the selected session" });
         expect(keys.join(" ")).toContain("Ctrl+W");
         // Thinking is Pi's to set, so the help text offers no key or command for it.
         expect(createHelpOverlay().bindings.map((binding) => `${binding.keys} ${binding.action}`).join(" ")).not.toContain("thinking");

@@ -2,9 +2,24 @@ import { stripVTControlCharacters } from "node:util";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 
-import { createDashboardLayout, renderColumnHeader, renderGroupHeader, renderSessionRow, } from "./dashboard-layout.mjs";
+import { createDashboardLayout, renderColumnHeader, renderGroupHeader, renderSessionRow, wrapPromptDraft, } from "./dashboard-layout.mjs";
 import { JOBWATCH_ANSI } from "./dashboard-theme.mjs";
 const now = Date.parse("2026-08-25T12:00:00.000Z");
+
+it("keeps a cursor-space visible without shifting the next wrapped word", () => {
+    const rows = wrapPromptDraft("1234 abc", 8, 4);
+
+    expect(rows[0]).toContain("\x1b[7m \x1b[27m");
+    expect(stripVTControlCharacters(rows[0])).toBe(" ❯ 1234 ");
+    expect(stripVTControlCharacters(rows[1])).toBe("   abc");
+});
+
+it("marks the first grapheme on the correct row when a long word wraps", () => {
+    const rows = wrapPromptDraft("abcdefghij", 8, 5);
+
+    expect(rows[0]).not.toContain(JOBWATCH_ANSI.inverse);
+    expect(rows[1]).toContain("\x1b[7mf\x1b[27m");
+});
 function session(sessionId, overrides = {}) {
     return {
         schemaVersion: 1,

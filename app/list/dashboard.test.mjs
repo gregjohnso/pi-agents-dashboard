@@ -1333,6 +1333,21 @@ describe("worktree capability", () => {
             name: "new task",
         }]);
     });
+    it("returns the task when automatic shared-directory confirmation is cancelled", async () => {
+        const client = new FakeDaemonClient([]);
+        const dashboard = gitDashboard(client, directories.outsideGit);
+        await dashboard.open();
+        dashboard.focusComposer();
+        dashboard.setComposerPrompt("Implement it");
+        await dashboard.submitComposer();
+
+        expect(dashboard.focus).toBe("confirmation");
+        dashboard.handleInput("\x1b");
+
+        expect(dashboard.focus).toBe("list");
+        expect(dashboard.composerDraft.prompt).toBe("Implement it");
+        expect(client.requests).toEqual([]);
+    });
     it("launches a worktree from a repository with a commit", async () => {
         const client = new FakeDaemonClient([]);
         const dashboard = gitDashboard(client, directories.repository);

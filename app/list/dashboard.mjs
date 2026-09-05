@@ -703,10 +703,13 @@ export class DashboardController {
         }
         if (this.focus === "confirmation") {
             if (matchesKey(data, Key.escape)) {
+                const pending = this.pendingShared;
                 this.focus = "list";
                 this.pendingShared = undefined;
                 this.confirmationText = "";
                 this.overlay = undefined;
+                if (pending !== undefined)
+                    this.restoreDraft(pending.draft.prompt);
                 return;
             }
             if (matchesKey(data, Key.enter)) {

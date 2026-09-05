@@ -31,7 +31,7 @@ The list uses these columns. Narrow terminals hide columns from right to left.
 - **Model** is the model Pi reported for that session. It is empty until Pi says which model it is running, and never shows what a launch asked for.
 - **Age** is the time since the session was created.
 
-Type anywhere to compose a prompt in the box at the bottom. The box wraps and grows as you type, and the list shrinks to make room. Left and Right move the prompt cursor while the box contains text. Press Enter with prompt text to launch a session. Worktree isolation is the default; when the directory is not inside a Git repository with a commit, the launch becomes a shared-directory launch and asks you to type the exact canonical path first. Press Enter or Right with an empty prompt to open the selected session.
+Type anywhere to compose a prompt in the box at the bottom. The box wraps and grows as you type, and the list shrinks to make room. Left and Right move the prompt cursor while the box contains text. Press Enter with prompt text to launch a session. Worktree isolation is the default; when the directory is not inside a Git repository with a commit, the session runs in that directory instead. A directory another live session is already working in asks you to type its exact path first. Press Enter or Right with an empty prompt to open the selected session.
 
 Use Up and Down to select a row. Page Up, Page Down, Home, and End move farther. The mouse wheel moves the selection. One click selects a row, and a second click opens it.
 
@@ -104,7 +104,7 @@ The daemon runs on demand: it exits about 30 seconds after the last dashboard cl
 ## Troubleshooting
 
 - **`pi` cannot be found or executed:** put the installed executable on `PATH`, or start with `pi-agents --pi-bin /absolute/path/to/pi`. The override must be absolute.
-- **`NOT_GIT_REPOSITORY` or `UNBORN_HEAD`:** a worktree launch needs a Git repository with at least one commit. The dashboard checks the directory first and offers a shared-directory confirmation instead, so these codes mean the directory stopped being a usable repository between that check and the launch. Use `/cwd` to select another directory, or confirm the shared-directory launch.
+- **`NOT_GIT_REPOSITORY` or `UNBORN_HEAD`:** a worktree launch needs a Git repository with at least one commit. The dashboard checks the directory first and runs the session in it instead, so these codes mean the directory stopped being a usable repository between that check and the launch. Use `/cwd` to select another directory and launch again.
 - **`UNSUPPORTED_PI_CAPABILITY`:** the installed Pi does not provide an RPC command or event required by this dashboard. Use a compatible Pi executable.
 - **`STATE_ROOTS_SPLIT`:** two state roots both hold sessions. Stop the daemon in each, move the sessions you keep into one root, and remove the other. `pi-agents` will not merge them.
 - **A start message says a live daemon or worker still holds the state root:** the directory cannot be renamed while sessions are running. The dashboard uses the existing root and renames it on the first start after those sessions stop.

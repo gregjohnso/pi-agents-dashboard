@@ -555,11 +555,15 @@ export class DashboardController {
         this.composerCursor = 0;
         this.requestRender?.();
         try {
+            // A directory that cannot host a worktree runs the session in itself. The operator chose
+            // that directory and typed the task in it, so the only thing left worth a question is
+            // another live session already working there.
             const requested = submitted.isolationMode === "worktree" && !(await this.worktreeCapability(submitted.cwd)).available
                 ? { ...submitted, isolationMode: "shared_directory" }
                 : submitted;
             const preflight = await this.client.preflightLaunch(requested);
-            const prepared = prepareLaunchRequest(requested, preflight);
+            const uncontested = requested !== submitted && preflight.ownerSessionIds.length === 0;
+            const prepared = prepareLaunchRequest(requested, preflight, uncontested ? preflight.canonicalCwd : undefined);
             if (prepared.kind === "confirmation_required") {
                 this.pendingShared = { draft: requested, preflight };
                 this.confirmationText = "";
@@ -1117,18 +1121,19 @@ export class DashboardController {
             // invoked from a keystroke with `void` and anything raised past here vanished with the draft.
             failure = this.typedError(error, "LAUNCH_FAILED");
         }
-        finally {
-            // Always retire the placeholder: a throw used to leave a STARTING row that never resolved.
-            this.pendingLaunches = this.pendingLaunches.filter((entry) => entry !== pending);
-            this.rebuildList();
-            this.requestRender?.();
-        }
         if (failure === undefined) {
+            // The answer says the daemon accepted the launch, not that its row has been published, and
+            // those arrive on the subscription. Retiring the placeholder here left the operator with an
+            // empty list and an empty box, which reads exactly like a prompt that was dropped.
+            // `rebuildList` retires it against the record the daemon publishes.
             this.requestRender?.();
             return;
         }
+        this.pendingLaunches = this.pendingLaunches.filter((entry) => entry !== pending);
+        this.rebuildList();
         this.restoreDraft(request.prompt);
         this.status = { kind: "error", code: failure.code, message: failure.message };
+        this.requestRender?.();
     }
     renderOverlay(lines) {
         // A `/cwd` path being completed outranks the one command-menu row it would otherwise show.

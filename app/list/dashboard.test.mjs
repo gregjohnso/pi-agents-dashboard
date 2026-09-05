@@ -68,8 +68,10 @@ class FakeDaemonClient {
         if (this.subscribeFailure !== undefined) throw this.subscribeFailure;
         return () => { this.unsubscribed += 1; };
     }
+    /** Live sessions the daemon reports already working in the requested shared directory. */
+    sharedOwners = ["other"];
     async preflightLaunch(draft) {
-        return { canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: draft.isolationMode === "shared_directory" ? ["other"] : [] };
+        return { canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: draft.isolationMode === "shared_directory" ? this.sharedOwners : [] };
     }
     async launch(request) {
         this.requests.push(request);
@@ -1310,30 +1312,29 @@ describe("worktree capability", () => {
     it.each([
         ["a directory outside Git", () => directories.outsideGit],
         ["a repository with no commit", () => directories.unborn],
-    ])("confirms a shared directory instead of launching a worktree in %s", async (_label, select) => {
+    ])("launches in %s rather than asking for a directory the operator already chose", async (_label, select) => {
         const cwd = select();
         const client = new FakeDaemonClient([]);
+        client.sharedOwners = [];
         const dashboard = gitDashboard(client, cwd);
         await dashboard.open();
         dashboard.focusComposer();
         dashboard.setComposerPrompt("Implement it");
         await dashboard.submitComposer();
 
-        expect(client.requests).toEqual([]);
-        expect(dashboard.focus).toBe("confirmation");
-        expect(dashboard.overlay).toMatchObject({ kind: "shared_directory_confirmation", canonicalCwd: cwd });
-
-        await dashboard.confirmSharedLaunch(cwd);
+        expect(dashboard.overlay).toBeUndefined();
+        expect(dashboard.focus).toBe("list");
         expect(client.requests).toEqual([{
             prompt: "Implement it",
             cwd,
             sourceSessionId: "source",
-            isolation: { mode: "shared_directory", confirmedCwd: cwd, ownerSessionIds: ["other"] },
+            isolation: { mode: "shared_directory", confirmedCwd: cwd, ownerSessionIds: [] },
             model: { provider: "anthropic", id: "claude" },
             name: "new task",
         }]);
     });
-    it("returns the task when automatic shared-directory confirmation is cancelled", async () => {
+    // Sharing a directory with a session already working in it is the one collision worth a question.
+    it("confirms a directory another live session already works in", async () => {
         const client = new FakeDaemonClient([]);
         const dashboard = gitDashboard(client, directories.outsideGit);
         await dashboard.open();
@@ -1341,9 +1342,11 @@ describe("worktree capability", () => {
         dashboard.setComposerPrompt("Implement it");
         await dashboard.submitComposer();
 
+        expect(client.requests).toEqual([]);
         expect(dashboard.focus).toBe("confirmation");
-        dashboard.handleInput("\x1b");
+        expect(dashboard.overlay).toMatchObject({ kind: "shared_directory_confirmation", canonicalCwd: directories.outsideGit });
 
+        dashboard.handleInput("\x1b");
         expect(dashboard.focus).toBe("list");
         expect(dashboard.composerDraft.prompt).toBe("Implement it");
         expect(client.requests).toEqual([]);

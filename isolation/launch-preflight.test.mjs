@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 
 import { afterAll, beforeAll, expect, it } from "vitest";
 
-import { launchPreflight } from "./launch-preflight.mjs";
+import { launchPreflight, probeWorktreeCapability } from "./launch-preflight.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -157,4 +157,19 @@ it("does not infer shared mode when worktree preflight is outside Git", async ()
   await expect(
     launchPreflight(request(shared.outsideGit), { piConfigRoot: shared.piConfigRoot }),
   ).rejects.toMatchObject({ code: "NOT_GIT_REPOSITORY" });
+});
+
+it("reports the repository and commit a managed worktree would branch from", async () => {
+  expect(await probeWorktreeCapability(join(shared.root, "src", "nested"))).toEqual({
+    available: true,
+    repositoryRoot: shared.root,
+    baseCommit: shared.head,
+  });
+});
+
+it.each([
+  ["a directory outside Git", () => shared.outsideGit, "NOT_GIT_REPOSITORY"],
+  ["a repository with no commit", () => shared.unborn, "UNBORN_HEAD"],
+])("reports worktree isolation unavailable for %s", async (_label, cwd, code) => {
+  expect(await probeWorktreeCapability(cwd())).toMatchObject({ available: false, code });
 });

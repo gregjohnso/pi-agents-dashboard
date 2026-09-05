@@ -52,6 +52,45 @@ async function canonicalDirectory(value, name) {
 }
 
 /**
+ * Report whether a directory can host a managed worktree and what commit one would branch from.
+ * @param {string} cwd
+ * @returns {Promise<{available:true,repositoryRoot:string,baseCommit:string}|{available:false,code:string,error:IsolationError}>}
+ */
+export async function probeWorktreeCapability(cwd) {
+  let repositoryRoot;
+  try {
+    const { stdout } = await git(cwd, ["rev-parse", "--show-toplevel"]);
+    repositoryRoot = await canonicalDirectory(stdout.trim(), "Git repository root");
+  } catch (cause) {
+    if (cause instanceof IsolationError && cause.code === "INVALID_DIRECTORY") {
+      throw cause;
+    }
+    return {
+      available: false,
+      code: "NOT_GIT_REPOSITORY",
+      error: new IsolationError(
+        "NOT_GIT_REPOSITORY",
+        "Worktree isolation requires a Git repository",
+        { cause },
+      ),
+    };
+  }
+
+  try {
+    const { stdout } = await git(repositoryRoot, ["rev-parse", "--verify", "HEAD^{commit}"]);
+    return { available: true, repositoryRoot, baseCommit: stdout.trim() };
+  } catch (cause) {
+    return {
+      available: false,
+      code: "UNBORN_HEAD",
+      error: new IsolationError("UNBORN_HEAD", "Worktree isolation requires an existing commit", {
+        cause,
+      }),
+    };
+  }
+}
+
+/**
  * Canonicalize an approved launch request and derive trusted isolation metadata.
  *
  * @param {import("../shared/contracts.mjs").LaunchRequest & { piConfigRoot?: unknown }} request
@@ -96,30 +135,12 @@ export async function launchPreflight(request, options = {}) {
     throw new IsolationError("INVALID_ISOLATION_MODE", "Launch isolation mode is invalid");
   }
 
-  let repositoryRoot;
-  try {
-    const { stdout } = await git(canonicalCwd, ["rev-parse", "--show-toplevel"]);
-    repositoryRoot = await canonicalDirectory(stdout.trim(), "Git repository root");
-  } catch (cause) {
-    if (cause instanceof IsolationError && cause.code === "INVALID_DIRECTORY") {
-      throw cause;
-    }
-    throw new IsolationError(
-      "NOT_GIT_REPOSITORY",
-      "Worktree isolation requires a Git repository",
-      { cause },
-    );
+  const capability = await probeWorktreeCapability(canonicalCwd);
+  // TypeScript 5.9 narrows this union through `in`, but not through `!capability.available`.
+  if ("error" in capability) {
+    throw capability.error;
   }
-
-  let baseCommit;
-  try {
-    const { stdout } = await git(repositoryRoot, ["rev-parse", "--verify", "HEAD^{commit}"]);
-    baseCommit = stdout.trim();
-  } catch (cause) {
-    throw new IsolationError("UNBORN_HEAD", "Worktree isolation requires an existing commit", {
-      cause,
-    });
-  }
+  const { repositoryRoot, baseCommit } = capability;
 
   let sourceBranch = null;
   try {

@@ -1,10 +1,11 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { stripVTControlCharacters } from "node:util";
+import { promisify, stripVTControlCharacters } from "node:util";
 
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { DashboardController } from "./dashboard.mjs";
 import { JOBWATCH_ANSI } from "./dashboard-theme.mjs";
@@ -86,6 +87,9 @@ function controller(client, overrides = {}) {
         sourceSessionId: "source",
         launchDefaults: { cwd: "/repo", model: { provider: "anthropic", id: "claude" }, thinkingLevel: "high", name: "new task" },
         requestRender: vi.fn(),
+        // These cases launch from synthetic directories. The real Git probe runs against real
+        // repositories in "worktree capability" below.
+        worktreeCapability: async () => ({ available: true }),
         ...overrides,
     });
 }
@@ -1270,6 +1274,82 @@ describe("dashboard controller", () => {
         await second.submitComposer();
         expect(secondClient.requests[0]).toMatchObject({ sourceSessionId: "session-b", prompt: "from B" });
         expect(first.composerDraft.prompt).toBe("from A");
+    });
+});
+describe("worktree capability", () => {
+    const execFileAsync = promisify(execFile);
+    /** @type {{ parent: string, repository: string, unborn: string, outsideGit: string }} */
+    let directories;
+    /** A dashboard wired to the real Git probe, launching from `cwd`. */
+    function gitDashboard(client, cwd) {
+        return new DashboardController({
+            client,
+            openViewer,
+            clientId: "stable-client",
+            sourceSessionId: "source",
+            launchDefaults: { cwd, model: { provider: "anthropic", id: "claude" }, name: "new task" },
+            requestRender: vi.fn(),
+        });
+    }
+    beforeAll(async () => {
+        const parent = await realpath(await mkdtemp(join(tmpdir(), "dashboard-capability-")));
+        const repository = join(parent, "repo");
+        const unborn = join(parent, "unborn");
+        const outsideGit = join(parent, "outside-git");
+        await Promise.all([mkdir(repository), mkdir(unborn), mkdir(outsideGit)]);
+        const git = (cwd, ...args) => execFileAsync("git", ["-C", cwd, ...args], { encoding: "utf8", shell: false });
+        await Promise.all([git(repository, "init", "-b", "main"), git(unborn, "init", "-b", "main")]);
+        await git(repository, "config", "user.name", "Dashboard Tests");
+        await git(repository, "config", "user.email", "dashboard@example.test");
+        await writeFile(join(repository, "tracked.txt"), "base\n");
+        await git(repository, "add", "tracked.txt");
+        await git(repository, "commit", "-m", "base");
+        directories = { parent, repository, unborn, outsideGit };
+    });
+    afterAll(async () => { await rm(directories.parent, { recursive: true, force: true }); });
+    it.each([
+        ["a directory outside Git", () => directories.outsideGit],
+        ["a repository with no commit", () => directories.unborn],
+    ])("confirms a shared directory instead of launching a worktree in %s", async (_label, select) => {
+        const cwd = select();
+        const client = new FakeDaemonClient([]);
+        const dashboard = gitDashboard(client, cwd);
+        await dashboard.open();
+        dashboard.focusComposer();
+        dashboard.setComposerPrompt("Implement it");
+        await dashboard.submitComposer();
+
+        expect(client.requests).toEqual([]);
+        expect(dashboard.focus).toBe("confirmation");
+        expect(dashboard.overlay).toMatchObject({ kind: "shared_directory_confirmation", canonicalCwd: cwd });
+
+        await dashboard.confirmSharedLaunch(cwd);
+        expect(client.requests).toEqual([{
+            prompt: "Implement it",
+            cwd,
+            sourceSessionId: "source",
+            isolation: { mode: "shared_directory", confirmedCwd: cwd, ownerSessionIds: ["other"] },
+            model: { provider: "anthropic", id: "claude" },
+            name: "new task",
+        }]);
+    });
+    it("launches a worktree from a repository with a commit", async () => {
+        const client = new FakeDaemonClient([]);
+        const dashboard = gitDashboard(client, directories.repository);
+        await dashboard.open();
+        dashboard.focusComposer();
+        dashboard.setComposerPrompt("Implement it");
+        await dashboard.submitComposer();
+
+        expect(dashboard.overlay).toBeUndefined();
+        expect(client.requests).toEqual([{
+            prompt: "Implement it",
+            cwd: directories.repository,
+            sourceSessionId: "source",
+            isolation: { mode: "worktree" },
+            model: { provider: "anthropic", id: "claude" },
+            name: "new task",
+        }]);
     });
 });
 describe("mouse clicks", () => {

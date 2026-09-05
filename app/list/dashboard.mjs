@@ -16,6 +16,7 @@ import { draftChoices, parseListCommand } from "./list-commands.mjs";
 import { applyCwdCompletion, cwdArgument, suggestDirectories, } from "./path-completion.mjs";
 import { deleteBeforePromptCursor, movePromptCursor, normalizePromptCursor, } from "./prompt-cursor.mjs";
 import { createLaunchDraft, prepareLaunchRequest, } from "./launch-composer.mjs";
+import { probeWorktreeCapability } from "../../isolation/launch-preflight.mjs";
 import { VirtualSessionList } from "./virtual-session-list.mjs";
 /** A path the operator may launch into: it must exist now and be a directory. @param {string} path */
 async function existingDirectory(path) {
@@ -171,6 +172,7 @@ export class DashboardController {
     composerCursor = 0;
     launchDefaults;
     isDirectory;
+    worktreeCapability;
     suggestDirectories;
     /** The `/cwd` path the newest line types, and the last listing that completed for one. */
     cwdCompletionArgument;
@@ -202,6 +204,7 @@ export class DashboardController {
         this.stopClearGesture = new StopClearGesture({ now: options.now });
         this.launchDefaults = options.launchDefaults ?? {};
         this.isDirectory = options.isDirectory ?? existingDirectory;
+        this.worktreeCapability = options.worktreeCapability ?? probeWorktreeCapability;
         this.suggestDirectories = options.suggestDirectories ?? suggestDirectories;
         this.composerDraft = createLaunchDraft({
             ...options.launchDefaults,
@@ -552,10 +555,13 @@ export class DashboardController {
         this.composerCursor = 0;
         this.requestRender?.();
         try {
-            const preflight = await this.client.preflightLaunch(submitted);
-            const prepared = prepareLaunchRequest(submitted, preflight);
+            const requested = submitted.isolationMode === "worktree" && !(await this.worktreeCapability(submitted.cwd)).available
+                ? { ...submitted, isolationMode: "shared_directory" }
+                : submitted;
+            const preflight = await this.client.preflightLaunch(requested);
+            const prepared = prepareLaunchRequest(requested, preflight);
             if (prepared.kind === "confirmation_required") {
-                this.pendingShared = { draft: submitted, preflight };
+                this.pendingShared = { draft: requested, preflight };
                 this.confirmationText = "";
                 this.focus = "confirmation";
                 this.overlay = createSharedDirectoryOverlay(prepared.canonicalCwd, prepared.ownerSessionIds);

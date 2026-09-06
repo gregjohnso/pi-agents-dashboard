@@ -327,11 +327,19 @@ export async function runDaemonCommand(command, options = {}) {
   }
   if (command === "restart") {
     const current = await inspectEndpoint(common);
+    const replaced = current.status === "HEALTHY" ? current.publication : undefined;
     if (current.status === "HEALTHY") {
       const stopped = await runDaemonCommand("stop", { ...options, root, allowLiveWorkers: true });
       if (stopped.code !== 0) return stopped;
     } else if (current.status !== "ABSENT") return { code: current.status === "CONFLICT" ? 5 : 1, error: { code: "RESTART_REFUSED", message: "Daemon endpoint requires explicit recovery" } };
-    return runDaemonCommand("start", { ...options, root });
+    const started = await runDaemonCommand("start", { ...options, root });
+    if (started.code !== 0) return started;
+    // `start` succeeds against a daemon that is already healthy, which is how a process this restart
+    // meant to replace keeps serving every later launch under a success this command passed through.
+    if (started.result.alreadyRunning === true) {
+      return { code: 5, error: { code: "DAEMON_NOT_REPLACED", message: `Daemon ${started.result.publication?.pid} is still serving this root; restart did not replace it` } };
+    }
+    return { code: 0, result: { ...started.result, replacedPublication: replaced ?? null } };
   }
   return { code: 2, error: { code: "INVALID_DAEMON_COMMAND", message: "Expected start, status, restart, recover, or stop" } };
 }

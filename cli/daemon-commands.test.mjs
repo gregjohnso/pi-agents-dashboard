@@ -600,3 +600,65 @@ it("keeps a refused token a refused token rather than an earlier release", async
     await daemon.close();
   }
 });
+
+// A restart that finds the endpoint absent, then loses the race to a daemon that publishes itself
+// again, returned the start leg's `alreadyRunning` success. That is how a process from the previous
+// day kept serving every launch while the operator read "daemon_started" and believed the deploy.
+it("refuses when restart did not replace the running daemon", async () => {
+  const root = await stateRoot();
+  const old = { pid: 4242, startIdentity: "111222333", processGroupId: 4242, tokenPath: join(root, "daemon", "control.token") };
+  let inspections = 0;
+  const spawned = [];
+
+  const result = await runDaemonCommand("restart", {
+    root,
+    timeoutMs: 200,
+    stopPolicy: { gracefulMs: 1, terminateMs: 1 },
+    inspect: async () => old,
+    // Absent for restart's own look, healthy again by the time the start leg re-reads it.
+    inspectEndpoint: async () => {
+      inspections += 1;
+      return inspections === 1
+        ? { status: "ABSENT", canCleanup: false }
+        : { status: "HEALTHY", daemonState: "READY", publication: old };
+    },
+    spawnDaemon: (/** @type {string} */ _file, /** @type {string[]} */ argv) => { spawned.push(argv); return { once() {} }; },
+  });
+
+  expect(result).toMatchObject({ code: 5, error: { code: "DAEMON_NOT_REPLACED" } });
+  expect(result.error.message).toContain(String(old.pid));
+  expect(spawned).toEqual([]);
+});
+
+it("reports the identity it replaced when restart starts a new daemon", async () => {
+  const root = await stateRoot();
+  const old = { pid: 4242, startIdentity: "111222333", processGroupId: 4242, tokenPath: join(root, "daemon", "control.token") };
+  const live = new Map([[old.pid, old]]);
+  let publication = old;
+
+  const result = await runDaemonCommand("restart", {
+    root,
+    timeoutMs: 200,
+    stopPolicy: { gracefulMs: 1, terminateMs: 1 },
+    request: async () => ({ kind: "state", sessions: [] }),
+    inspect: async (/** @type {number} */ pid) => {
+      const identity = live.get(pid);
+      if (identity === undefined) throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+      return identity;
+    },
+    inspectEndpoint: async () => publication === undefined ? { status: "ABSENT", canCleanup: false } : { status: "HEALTHY", daemonState: "READY", publication },
+    requestGraceful: async () => { live.delete(old.pid); publication = undefined; },
+    signalProcessGroup: () => {},
+    spawnDaemon: () => {
+      const pid = 5001;
+      live.set(pid, { pid, startIdentity: "999888777", processGroupId: pid });
+      publication = { pid, startIdentity: "999888777", processGroupId: pid, tokenPath: old.tokenPath };
+      return { once() {} };
+    },
+  });
+
+  expect(result).toMatchObject({
+    code: 0,
+    result: { kind: "daemon_started", alreadyRunning: false, publication: { pid: 5001 }, replacedPublication: { pid: 4242 } },
+  });
+});

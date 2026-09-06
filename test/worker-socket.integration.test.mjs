@@ -50,7 +50,9 @@ it("exits when no daemon connects to its socket before the startup deadline the 
     "--capabilities", JSON.stringify({ reportedVersion: "injected", rpcMode: true, jsonl: true, commands: [], events: [], missingRequired: [] }),
     "--diagnostics-directory", join(root, "runs", "abandoned", "diagnostics"),
     "--worker-socket", socketPath,
-    "--startup-deadline-ms", "500",
+    // Long enough that a loaded machine cannot expire it before the worker has listened: this file
+    // shares a parallel run with tests that spawn real daemons, and 500 ms lost that race.
+    "--startup-deadline-ms", "2000",
   ], { cwd: root, detached: true, shell: false, env: { ...process.env, PI_AGENTS_WORKER_TOKEN: "abandoned-token" }, stdio: ["ignore", "ignore", "pipe"] });
   let stderr = "";
   child.stderr?.on("data", (chunk) => { stderr += chunk.toString("utf8"); });

@@ -4,7 +4,7 @@ import { stripVTControlCharacters } from "node:util";
 
 import { decodeKittyPrintable, Key, matchesKey, truncateToWidth, visibleWidth, } from "@earendil-works/pi-tui";
 import { pastedText } from "./dashboard-input.mjs";
-import { sessionNameFromPrompt } from "../../runtime/launch-resolver.mjs";
+import { sessionNameFromPrompt } from "../../runtime/session-name.mjs";
 import { SPINNER_INTERVAL_MS } from "../spinner.mjs";
 import { countDashboardSessions, selectDashboardSessions, } from "./dashboard-state.mjs";
 import { createDashboardLayout, renderColumnHeader, wrapPromptDraft, } from "./dashboard-layout.mjs";

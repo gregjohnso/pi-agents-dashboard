@@ -9,6 +9,9 @@ import { cleanupOwnedWorktree } from "../isolation/cleanup.mjs";
 import { launchPreflight } from "../isolation/launch-preflight.mjs";
 import { confirmSharedDirectory } from "../isolation/shared-directory.mjs";
 import { createWorktree } from "../isolation/worktree.mjs";
+import { sessionNameFromPrompt } from "./session-name.mjs";
+
+export { sessionNameFromPrompt };
 
 /** @param {unknown} value @param {string} name */
 function requiredId(value, name) {
@@ -22,16 +25,6 @@ function activeSharedOwnerIds(records, canonicalCwd) {
     .filter((record) => record?.ownership !== undefined && (record.isolation?.mode === "shared_directory" ? record.isolation.canonicalCwd : record.cwd) === canonicalCwd)
     .map((record) => record.sessionId)
     .sort();
-}
-
-/** Derive a short, human session name from the first line of the launch prompt. @param {string} prompt */
-export function sessionNameFromPrompt(prompt) {
-  const firstLine = prompt.split(/\r?\n/u).map((line) => line.replace(/\s+/gu, " ").trim()).find((line) => line.length > 0);
-  if (firstLine === undefined) return undefined;
-  if (firstLine.length <= 48) return firstLine;
-  const clipped = firstLine.slice(0, 48);
-  const lastSpace = clipped.lastIndexOf(" ");
-  return (lastSpace >= 24 ? clipped.slice(0, lastSpace) : clipped).trim();
 }
 
 /** @param {string} prompt */

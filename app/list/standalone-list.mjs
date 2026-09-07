@@ -6,8 +6,6 @@ import { ProcessTerminal, TuiAltScreen } from "@earendil-works/pi-tui";
 
 import { createDaemonClient } from "../daemon-client.mjs";
 import { createWheelInputTap } from "../mouse-input.mjs";
-import { createPiEditor } from "../viewer/pi-component-adapters.mjs";
-import { ViewerController } from "../viewer/viewer-controller.mjs";
 import { DashboardController } from "./dashboard.mjs";
 
 /** Run one list-to-viewer transition and restore the list after any failure. @param {any} options */
@@ -121,6 +119,12 @@ export async function createStandaloneList({ cwd, frontend }) {
   const openRealViewer = async (sessionId) => {
     if (switching || activeViewer !== undefined) return;
     switching = true;
+    // Pi's components load on the first session opened, not before the list is drawn: importing Pi's
+    // package costs seconds, and every launch and every key in the list happens without it.
+    const [{ createPiEditor }, { ViewerController }] = await Promise.all([
+      import("../viewer/pi-component-adapters.mjs"),
+      import("../viewer/viewer-controller.mjs"),
+    ]);
     await runViewerTransition({
       sessionId, client, controller,
       createViewer() {

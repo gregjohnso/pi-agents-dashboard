@@ -8,8 +8,6 @@ import { initializeRuntimePermissions } from "../runtime/permissions.mjs";
 import { inspectRuntimeActivity } from "../runtime/runtime-activity.mjs";
 import { migrateLegacyState } from "../runtime/state-migration.mjs";
 import { createStandaloneList } from "./list/standalone-list.mjs";
-import { createPiEditor } from "./viewer/pi-component-adapters.mjs";
-import { ViewerController } from "./viewer/viewer-controller.mjs";
 
 const { runDaemonCommand } = await import(new URL("../cli/daemon-commands.mjs", import.meta.url).href);
 const { loadCliClientIdentity } = await import(new URL("../cli/session-commands.mjs", import.meta.url).href);
@@ -19,8 +17,17 @@ async function exists(path) { try { await access(path); return true; } catch { r
 /** @param {any} options */
 async function defaultStartDaemon(options) { return runDaemonCommand("start", options); }
 
-/** Create a public-component full-screen viewer around the normalized client seam. */
-export function createStandaloneViewer({ sessionId, client, persistence, onReturn, terminal = new ProcessTerminal(), now }) {
+/**
+ * Create a public-component full-screen viewer around the normalized client seam.
+ *
+ * Pi's components arrive here rather than at module load: importing Pi's package costs seconds, and
+ * the list has to draw before anyone asks for a viewer.
+ */
+export async function createStandaloneViewer({ sessionId, client, persistence, onReturn, terminal = new ProcessTerminal(), now }) {
+  const [{ createPiEditor }, { ViewerController }] = await Promise.all([
+    import("./viewer/pi-component-adapters.mjs"),
+    import("./viewer/viewer-controller.mjs"),
+  ]);
   const tui = new TuiAltScreen(terminal);
   const editor = createPiEditor({ tui });
   const controller = new ViewerController({ sessionId, client, editor, persistence, onReturn, now, requestRender: () => tui.renderNow() });

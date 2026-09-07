@@ -23,10 +23,10 @@ async function defaultConnect({ root, clientId, sessionId }) {
   let viewerState;
   return {
     viewerClient,
-    createViewer() {
+    async createViewer() {
       /** @type {any} */
       let viewer;
-      viewer = createStandaloneViewer({
+      viewer = await createStandaloneViewer({
         sessionId, client: viewerClient,
         persistence: { async load() { return viewerState; }, async save(/** @type {any} */ value) { viewerState = structuredClone(value); } },
         onReturn: () => { void viewer.close(); },
@@ -56,7 +56,7 @@ export async function attachSession(sessionId, options = {}) {
   try {
     await connection.viewerClient.attach(sessionId);
     attached = true;
-    viewer = connection.createViewer();
+    viewer = await connection.createViewer();
     await viewer.open();
     await viewer.closed;
   } catch (error) {

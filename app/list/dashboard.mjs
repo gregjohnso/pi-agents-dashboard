@@ -553,18 +553,21 @@ export class DashboardController {
         // second Enter, which launches the same work twice while the daemon is still starting the first.
         this.composerDraft = { ...this.composerDraft, prompt: "" };
         this.composerCursor = 0;
+        // The row goes up on this keystroke, before Git is spawned and before the daemon is asked:
+        // those take long enough that an emptied box over an unchanged list reads as a lost prompt.
+        const pending = this.addPendingLaunch(submitted.prompt, submitted.cwd);
         this.requestRender?.();
         try {
-            // A directory that cannot host a worktree runs the session in itself. The operator chose
-            // that directory and typed the task in it, so the only thing left worth a question is
-            // another live session already working there.
+            // A directory that cannot host a worktree runs the session in itself. The operator chose it
+            // and typed the task in it, and after the first session that directory has an owner, so
+            // asking him to spell it out again would block every launch but the first.
             const requested = submitted.isolationMode === "worktree" && !(await this.worktreeCapability(submitted.cwd)).available
                 ? { ...submitted, isolationMode: "shared_directory" }
                 : submitted;
             const preflight = await this.client.preflightLaunch(requested);
-            const uncontested = requested !== submitted && preflight.ownerSessionIds.length === 0;
-            const prepared = prepareLaunchRequest(requested, preflight, uncontested ? preflight.canonicalCwd : undefined);
+            const prepared = prepareLaunchRequest(requested, preflight, requested !== submitted ? preflight.canonicalCwd : undefined);
             if (prepared.kind === "confirmation_required") {
+                this.retirePendingLaunch(pending);
                 this.pendingShared = { draft: requested, preflight };
                 this.confirmationText = "";
                 this.focus = "confirmation";
@@ -572,9 +575,11 @@ export class DashboardController {
                 return;
             }
             if (prepared.kind === "ready")
-                await this.launch(prepared.request);
+                await this.launch(prepared.request, pending);
+            else this.retirePendingLaunch(pending);
         }
         catch (error) {
+            this.retirePendingLaunch(pending);
             this.restoreDraft(prompt);
             this.setError(error, "LAUNCH_PREFLIGHT_FAILED");
         }
@@ -1103,13 +1108,25 @@ export class DashboardController {
     refreshSummaries() {
         void Promise.resolve(this.client.refreshSummaries()).catch(() => { });
     }
-    async launch(request) {
+    /** Put a STARTING row up for a launch that has not been sent yet. @param {string} prompt @param {string} cwd */
+    addPendingLaunch(prompt, cwd) {
+        const pending = { sessionId: `pending:${this.requestId()}`, prompt, cwd, createdAt: new Date(this.now()).toISOString() };
+        this.pendingLaunches = [...this.pendingLaunches, pending];
+        this.rebuildList();
+        return pending;
+    }
+    /** @param {any} pending */
+    retirePendingLaunch(pending) {
+        this.pendingLaunches = this.pendingLaunches.filter((entry) => entry !== pending);
+        this.rebuildList();
+        this.requestRender?.();
+    }
+    /** @param {any} request @param {any} [placeholder] */
+    async launch(request, placeholder) {
         // Show the list before the daemon answers: startup takes seconds and the session row arrives by subscription.
         this.focus = "list";
         this.status = { kind: "ready" };
-        const pending = { sessionId: `pending:${this.requestId()}`, prompt: request.prompt, cwd: request.cwd, createdAt: new Date(this.now()).toISOString() };
-        this.pendingLaunches = [...this.pendingLaunches, pending];
-        this.rebuildList();
+        const pending = placeholder ?? this.addPendingLaunch(request.prompt, request.cwd);
         this.requestRender?.();
         let failure;
         try {
@@ -1129,8 +1146,7 @@ export class DashboardController {
             this.requestRender?.();
             return;
         }
-        this.pendingLaunches = this.pendingLaunches.filter((entry) => entry !== pending);
-        this.rebuildList();
+        this.retirePendingLaunch(pending);
         this.restoreDraft(request.prompt);
         this.status = { kind: "error", code: failure.code, message: failure.message };
         this.requestRender?.();

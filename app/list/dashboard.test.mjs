@@ -1333,8 +1333,10 @@ describe("worktree capability", () => {
             name: "new task",
         }]);
     });
-    // Sharing a directory with a session already working in it is the one collision worth a question.
-    it("confirms a directory another live session already works in", async () => {
+    // A second session in a directory that cannot host a worktree is the normal case, not a mistake:
+    // the first launch made the directory owned, and asking for its path again blocks every launch
+    // after the first. The daemon still re-checks owners, and the row still names the directory.
+    it("launches into a directory another live session already works in", async () => {
         const client = new FakeDaemonClient([]);
         const dashboard = gitDashboard(client, directories.outsideGit);
         await dashboard.open();
@@ -1342,14 +1344,33 @@ describe("worktree capability", () => {
         dashboard.setComposerPrompt("Implement it");
         await dashboard.submitComposer();
 
+        expect(dashboard.overlay).toBeUndefined();
+        expect(client.requests).toEqual([{
+            prompt: "Implement it",
+            cwd: directories.outsideGit,
+            sourceSessionId: "source",
+            isolation: { mode: "shared_directory", confirmedCwd: directories.outsideGit, ownerSessionIds: ["other"] },
+            model: { provider: "anthropic", id: "claude" },
+            name: "new task",
+        }]);
+    });
+    // Choosing `/isolation shared` by hand still spells the directory out: that one is a decision about
+    // where to work, not a directory the operator is already standing in.
+    it("still confirms a shared directory the operator selected himself", async () => {
+        const client = new FakeDaemonClient([]);
+        const dashboard = gitDashboard(client, directories.repository);
+        await dashboard.open();
+        dashboard.focusComposer();
+        dashboard.setIsolationMode("shared_directory");
+        dashboard.setComposerPrompt("Implement it");
+        await dashboard.submitComposer();
+
         expect(client.requests).toEqual([]);
         expect(dashboard.focus).toBe("confirmation");
-        expect(dashboard.overlay).toMatchObject({ kind: "shared_directory_confirmation", canonicalCwd: directories.outsideGit });
+        expect(dashboard.overlay).toMatchObject({ kind: "shared_directory_confirmation" });
 
         dashboard.handleInput("\x1b");
-        expect(dashboard.focus).toBe("list");
         expect(dashboard.composerDraft.prompt).toBe("Implement it");
-        expect(client.requests).toEqual([]);
     });
     it("launches a worktree from a repository with a commit", async () => {
         const client = new FakeDaemonClient([]);

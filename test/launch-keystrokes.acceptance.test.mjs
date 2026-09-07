@@ -113,6 +113,30 @@ it("launches from a directory outside Git without asking anything further", asyn
   await vi.waitFor(() => expect(screen(controller)).toContain("Implement It"));
 });
 
+// Enter has to put something on screen at once. The preflight spawns Git and asks the daemon before
+// the request is built, and until the row was created up front that gap showed an empty list under
+// an emptied box: the operator cannot tell that from a prompt that was dropped.
+it("shows the launching row before the preflight answers", async () => {
+  const client = new FakeDaemonClient();
+  let releasePreflight;
+  let preflightCalled;
+  const reachedPreflight = new Promise((seen) => { preflightCalled = seen; });
+  client.preflightLaunch = (draft) => new Promise((resolve) => {
+    releasePreflight = () => resolve({ canonicalCwd: draft.cwd, isolationMode: draft.isolationMode, ownerSessionIds: [] });
+    preflightCalled();
+  });
+  const controller = dashboard(client, directories.repository);
+  await controller.open();
+
+  void type(controller, "Implement it");
+  await vi.waitFor(() => expect(screen(controller)).toContain("STARTING"));
+  expect(client.requests).toEqual([]);
+
+  await reachedPreflight;
+  releasePreflight();
+  await vi.waitFor(() => expect(client.requests).toHaveLength(1));
+});
+
 it("shows a row on screen when Enter launches from a repository with a commit", async () => {
   const client = new FakeDaemonClient();
   const controller = dashboard(client, directories.repository);

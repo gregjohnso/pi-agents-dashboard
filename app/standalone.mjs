@@ -7,7 +7,7 @@ import { resolveDashboardRoots } from "../runtime/paths.mjs";
 import { initializeRuntimePermissions } from "../runtime/permissions.mjs";
 import { inspectRuntimeActivity } from "../runtime/runtime-activity.mjs";
 import { migrateLegacyState } from "../runtime/state-migration.mjs";
-import { createStandaloneList } from "./list/standalone-list.mjs";
+import { createStandaloneList, mountStandaloneHost } from "./list/standalone-list.mjs";
 
 const { runDaemonCommand } = await import(new URL("../cli/daemon-commands.mjs", import.meta.url).href);
 const { loadCliClientIdentity } = await import(new URL("../cli/session-commands.mjs", import.meta.url).href);
@@ -31,12 +31,10 @@ export async function createStandaloneViewer({ sessionId, client, persistence, o
   const tui = new TuiAltScreen(terminal);
   const editor = createPiEditor({ tui });
   const controller = new ViewerController({ sessionId, client, editor, persistence, onReturn, now, requestRender: () => tui.renderNow() });
-  tui.addChild({
-    render(width) { return controller.render(width, terminal.rows ?? 24); },
-    handleInput(data) { controller.handleInput(data); tui.requestRender(); },
-    invalidate() {},
-  });
-  tui.setFocus(editor);
+  // The router holds focus, not Pi's editor: the viewer owns Escape, Ctrl+S, Ctrl+T and the scroll
+  // keys, and hands the editor the keys that type. Focusing the editor here sent every key straight
+  // to it, so an attached operator could neither leave the session nor reach any viewer key.
+  mountStandaloneHost({ tui, getActive: () => controller, getHeight: () => terminal.rows ?? 24 });
   let closing;
   return {
     closed: controller.closed,

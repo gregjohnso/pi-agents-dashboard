@@ -1248,9 +1248,12 @@ export async function createDaemonRuntime({
         }
         if (request.op === "get_session_commands") {
           const menu = (await context.routeCommand(request))?.result ?? {};
+          // A worker from the release that reported no thinking values leaves both empty, which the
+          // viewer reads as a session whose levels cannot be picked rather than as a level of its own.
           return {
             kind: "session_commands", sessionId: request.payload.sessionId,
             commands: menu.commands ?? [], models: menu.models ?? [], model: menu.model ?? null,
+            thinkingLevels: menu.thinkingLevels ?? [], thinkingLevel: menu.thinkingLevel ?? null,
           };
         }
         if (!SESSION_MUTATIONS.has(request.op)) throw refusal("UNSUPPORTED_OPERATION", `Unsupported daemon operation: ${request.op}`);

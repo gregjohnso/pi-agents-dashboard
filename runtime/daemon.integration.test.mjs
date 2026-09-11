@@ -650,7 +650,8 @@ it("refuses a session query and serves session toggles from the owning worker", 
   expect(await client.next()).toMatchObject({ ok: false, error: { code: "INVALID_REQUEST" } });
   client.send({ version: 1, clientId: "viewer", requestId: "steering", op: "session_command", payload: { sessionId: "query", command: "set_steering_mode", mode: "one-at-a-time" } });
   expect(await client.next()).toMatchObject({ ok: false, error: { code: "INVALID_REQUEST" } });
-  client.send({ version: 1, clientId: "viewer", requestId: "thinking", op: "session_command", payload: { sessionId: "query", command: "set_thinking_level", level: "high" } });
+  // A thinking level with no value is refused here, before any worker or Pi write.
+  client.send({ version: 1, clientId: "viewer", requestId: "thinking", op: "session_command", payload: { sessionId: "query", command: "set_thinking_level" } });
   expect(await client.next()).toMatchObject({ ok: false, error: { code: "INVALID_REQUEST" } });
 
   // The retry brake outlives the settings passthrough, and it is the only zero-argument variant left.
@@ -746,18 +747,21 @@ it("discovers slash commands and delivers one session command to the owning work
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "attached" } });
   client.send({ version: 1, clientId: "viewer", requestId: "menu-request", op: "get_session_commands", payload: { sessionId: "menu" } });
   const served = /** @type {any} */ (await client.next());
-  // A worker may still report Pi's thinking values; the daemon serves the menu without them.
-  expect(served).toMatchObject({ ok: true, result: { kind: "session_commands", sessionId: "menu", commands: menu.commands, models: menu.models, model: menu.model } });
-  for (const key of ["thinkingLevels", "thinkingLevel"]) expect(Object.hasOwn(served.result, key), key).toBe(false);
+  // The viewer's thinking picker is built from what this worker reported, so the daemon serves those
+  // two values rather than dropping them: a stripped menu leaves the operator no levels to choose.
+  expect(served).toMatchObject({ ok: true, result: { kind: "session_commands", sessionId: "menu", commands: menu.commands, models: menu.models, model: menu.model, thinkingLevels: ["off", "high"], thinkingLevel: "high" } });
   client.send({ version: 1, clientId: "viewer", requestId: "model-request", op: "session_command", payload: { sessionId: "menu", command: "set_model", model: { provider: "anthropic", id: "claude" } } });
+  expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command" } });
+  client.send({ version: 1, clientId: "viewer", requestId: "thinking-request", op: "session_command", payload: { sessionId: "menu", command: "set_thinking_level", level: "high" } });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command" } });
   client.send({ version: 1, clientId: "viewer", requestId: "rename-request", op: "session_command", payload: { sessionId: "menu", command: "set_session_name", name: "Coverage loader" } });
   expect(await client.next()).toMatchObject({ ok: true, result: { kind: "command" } });
   await vi.waitFor(async () => expect(await new RegistryStore(join(stateRoot, "sessions")).get("menu")).toMatchObject({ name: "Coverage loader" }));
   const delivered = worker.commands.filter((/** @type {any} */ command) => command.op !== "get_state");
-  expect(delivered.map((/** @type {any} */ command) => command.op)).toEqual(["get_session_commands", "session_command", "session_command"]);
+  expect(delivered.map((/** @type {any} */ command) => command.op)).toEqual(["get_session_commands", "session_command", "session_command", "session_command"]);
   expect(delivered[1].sessionCommand).toEqual({ command: "set_model", model: { provider: "anthropic", id: "claude" } });
-  expect(delivered[2].sessionCommand).toEqual({ command: "set_session_name", name: "Coverage loader" });
+  expect(delivered[2].sessionCommand).toEqual({ command: "set_thinking_level", level: "high" });
+  expect(delivered[3].sessionCommand).toEqual({ command: "set_session_name", name: "Coverage loader" });
   client.close();
 });
 // Operator-visible failure: an attachment used to be a durable claim, recorded and stored, so one

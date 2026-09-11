@@ -49,7 +49,7 @@ export const SESSION_COLORS = ["sky", "green", "amber", "rose", "cyan", "gray"];
 /** @typedef {"sky"|"green"|"amber"|"rose"|"cyan"|"gray"} SessionColor */
 
 const OPERATIONS = ["get_state", "launch", "attach", "detach", "prompt", "steer", "follow_up", "interrupt", "stop", "delete", "respawn", "ui_response", "subscribe_list_changes", "subscribe_viewer", "get_session_commands", "session_command", "get_settings", "set_settings", "refresh_summaries", "set_session_color", "get_models"];
-const SESSION_COMMANDS = ["set_model", "compact", "set_session_name", "abort_retry"];
+const SESSION_COMMANDS = ["set_model", "set_thinking_level", "compact", "set_session_name", "abort_retry"];
 const MAX_MENU_ENTRIES = 1_000;
 // Matches MAX_MODELS in runtime/pi-model-catalog.mjs, which stops reading `pi --list-models` there.
 const MAX_CATALOG_MODELS = 2_000;
@@ -257,6 +257,10 @@ export function parseClientRequest(value) {
       rejectUnknownKeys(payload, ["sessionId", "command", "model"], "session_command payload");
       return { ...base, payload: { sessionId, command, model: readModel(payload.model, "session_command payload.model") } };
     }
+    if (command === "set_thinking_level") {
+      rejectUnknownKeys(payload, ["sessionId", "command", "level"], "session_command payload");
+      return { ...base, payload: { sessionId, command, level: readIdentifier(payload, "level", "session_command payload.level") } };
+    }
     if (command === "set_session_name") {
       rejectUnknownKeys(payload, ["sessionId", "command", "name"], "session_command payload");
       const name = readText(payload, "name", "session_command payload.name");
@@ -330,10 +334,10 @@ function validateRuntimeIdentity(value, path) {
 /** @param {Record<string, any>} result */
 function validateSessionCommands(result) {
   const path = "daemon response.result";
-  // `thinkingLevels` and `thinkingLevel` left this response when the dashboard dropped its thinking
-  // control. A daemon started before that still sends both, and it outlives the frontend that talks
-  // to it, so they are accepted and ignored rather than refused: refusing them made the menu response
-  // unparseable, which killed the connection and left the viewer waiting for an answer that never came.
+  // `thinkingLevels` and `thinkingLevel` are optional because a daemon from the release that carried
+  // neither outlives the frontend that talks to it. Requiring them made the menu response
+  // unparseable there, which killed the connection and left the viewer waiting for an answer that
+  // never came. A viewer reads their absence as a session whose levels cannot be picked.
   requireKeys(result, ["kind", "sessionId", "commands", "models", "model"], ["thinkingLevels", "thinkingLevel"], path);
   readIdentifier(result, "sessionId", `${path}.sessionId`);
   for (const key of ["commands", "models"]) {
@@ -347,6 +351,13 @@ function validateSessionCommands(result) {
     for (const key of ["description", "argumentHint"]) if (Object.hasOwn(command, key) && typeof command[key] !== "string") throw new TypeError(`${path}.commands[${index}].${key} must be a string`);
   });
   result.models.forEach((/** @type {unknown} */ entry, /** @type {number} */ index) => readModel(entry, `${path}.models[${index}]`));
+  if (Object.hasOwn(result, "thinkingLevels")) {
+    if (!Array.isArray(result.thinkingLevels) || result.thinkingLevels.length > MAX_MENU_ENTRIES) throw new TypeError(`${path}.thinkingLevels must be a bounded array`);
+    result.thinkingLevels.forEach((/** @type {unknown} */ level, /** @type {number} */ index) => {
+      if (typeof level !== "string" || level.length === 0) throw new TypeError(`${path}.thinkingLevels[${index}] must be a non-empty string`);
+    });
+  }
+  if (Object.hasOwn(result, "thinkingLevel") && result.thinkingLevel !== null && (typeof result.thinkingLevel !== "string" || result.thinkingLevel.length === 0)) throw new TypeError(`${path}.thinkingLevel must be a non-empty string or null`);
   if (result.model !== null) readModel(result.model, `${path}.model`);
 }
 

@@ -37,6 +37,7 @@ const acceptedRequests = [
   ["set_session_color", { sessionId: "session", color: "amber" }],
   ["set_session_color", { sessionId: "session", color: null }],
   ["session_command", { sessionId: "session", command: "set_model", model: { provider: "anthropic", id: "claude" } }],
+  ["session_command", { sessionId: "session", command: "set_thinking_level", level: "high" }],
   ["session_command", { sessionId: "session", command: "compact", instructions: "keep decisions" }],
   ["session_command", { sessionId: "session", command: "abort_retry" }],
 ];
@@ -58,7 +59,9 @@ const rejectedRequests = [
   ["session rebinding through new_session", "session_command", { sessionId: "session", command: "new_session" }, /command/iu],
   ["session rebinding through switch_session", "session_command", { sessionId: "session", command: "switch_session", sessionPath: "/other.jsonl" }, /command/iu],
   ["session rebinding through fork", "session_command", { sessionId: "session", command: "fork", entryId: "entry" }, /command/iu],
-  ["a thinking level Pi owns", "session_command", { sessionId: "session", command: "set_thinking_level", level: "high" }, /command/iu],
+  ["a thinking level with no value", "session_command", { sessionId: "session", command: "set_thinking_level" }, /level/iu],
+  ["an empty thinking level", "session_command", { sessionId: "session", command: "set_thinking_level", level: "" }, /level/iu],
+  ["a thinking level that is not a string", "session_command", { sessionId: "session", command: "set_thinking_level", level: 3 }, /level/iu],
   ["a requested thinking level at launch", "launch", { prompt: "Run tests", cwd: "/repo", sourceSessionId: "source", isolation: { mode: "worktree" }, thinkingLevel: "high" }, /unknown/iu],
   ["automatic compaction", "session_command", { sessionId: "session", command: "set_auto_compaction", enabled: true }, /command/iu],
   ["automatic retry", "session_command", { sessionId: "session", command: "set_auto_retry", enabled: false }, /command/iu],
@@ -95,9 +98,10 @@ const ok = (result) => ({ version: 1, requestId: "request", ok: true, result });
 const acceptedResponses = [
   ["a list subscription", ok({ kind: "list_subscribed" })],
   ["session command menu", ok(menu)],
-  // A running daemon that predates the thinking-control removal still answers with these two keys.
-  // Refusing them made every viewer open against that daemon fail to parse and never answer.
-  ["session command menu from a daemon that predates the thinking-control removal", ok({ ...menu, thinkingLevels: ["off", "high"], thinkingLevel: "off" })],
+  ["session command menu carrying Pi's thinking levels", ok({ ...menu, thinkingLevels: ["off", "high"], thinkingLevel: "off" })],
+  // A daemon from the release that carried no thinking values outlives the frontend that talks to it.
+  ["session command menu with no thinking values at all", ok(menu)],
+  ["session command menu whose model reports no level yet", ok({ ...menu, thinkingLevels: ["off"], thinkingLevel: null })],
   ["summary settings", ok({ kind: "settings", summaryModel: { provider: "anthropic", id: "haiku" } })],
   ["summaries disabled", ok({ kind: "settings", summaryModel: null })],
   ["session state carrying a bounded summary", ok({ kind: "state", sessions: [sessionRecord], cursor: coverage })],
@@ -117,6 +121,10 @@ const acceptedResponses = [
 const rejectedResponses = [
   ["unknown menu field", ok({ ...menu, unknown: true }), /unknown/iu],
   ["invented menu command source", ok({ ...menu, commands: [{ name: "/x", source: "invented" }] }), /source/iu],
+  ["a thinking level list that is not a list", ok({ ...menu, thinkingLevels: "off" }), /thinkingLevels/u],
+  ["an empty thinking level in the list", ok({ ...menu, thinkingLevels: ["off", ""] }), /thinkingLevels/u],
+  ["an unbounded thinking level list", ok({ ...menu, thinkingLevels: Array.from({ length: 1_001 }, (_, index) => `level-${index}`) }), /thinkingLevels/u],
+  ["an empty current thinking level", ok({ ...menu, thinkingLevel: "" }), /thinkingLevel/u],
   ["empty session summary text", ok({ kind: "state", sessions: [{ ...sessionRecord, summary: { ...sessionRecord.summary, text: "" } }], cursor: coverage }), /summary\.text/u],
   ["a state cursor whose sequence is not canonical", ok({ kind: "state", sessions: [], cursor: { daemonEpoch: "epoch", sequence: "01" } }), /sequence/u],
   // The snapshot's coverage cursor is what makes subscribe-then-read safe, so a state result

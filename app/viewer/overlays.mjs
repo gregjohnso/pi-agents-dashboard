@@ -79,7 +79,8 @@ export class PendingUiOverlay {
 
 /** Bounded Pi SelectList picker for built-in commands that take one exact argument. */
 export class CommandSelectionOverlay {
-  constructor({ title, items, tui, respond, returnFocus = undefined, maxVisible = 8 }) {
+  /** `selected` starts the list on the value already in force, so a picker opens on today's setting. */
+  constructor({ title, items, tui, respond, returnFocus = undefined, maxVisible = 8, selected = undefined }) {
     tui.terminal ??= { rows: 24, columns: 80 };
     this.title = title;
     this.tui = tui;
@@ -88,6 +89,8 @@ export class CommandSelectionOverlay {
     this.resolved = false;
     this.border = new DynamicBorder((text) => text);
     this.control = new SelectList(items, maxVisible, getSelectListTheme());
+    const index = items.findIndex((/** @type {{value:string}} */ item) => item.value === selected);
+    if (index > 0) this.control.setSelectedIndex(index);
     this.control.onSelect = (/** @type {{value:string}} */ item) => this.resolve(item.value);
   }
   restoreFocus() {

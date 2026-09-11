@@ -59,6 +59,8 @@ The viewer shows the normalized Pi transcript and uses Pi's editor components. T
 
 Pi owns the slash prefix in the viewer. The viewer passes unknown slash-prefixed text to Pi as a prompt and offers Pi's discovered commands alongside dashboard commands. Run `/help` there for the viewer's current commands and keys.
 
+Press Ctrl+T to pick this session's thinking level from the levels Pi reports for its current model. Escape closes that picker and changes nothing. The level next to the model in the footer is the one Pi confirmed, never the one that was asked for.
+
 Press Escape while a turn is working to interrupt it. After the turn settles, press Escape again to return to the list. When Pi is idle, Escape returns immediately. Closing the dashboard does not stop Pi.
 
 ## Run commands without opening the list

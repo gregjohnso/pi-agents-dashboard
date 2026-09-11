@@ -56,7 +56,7 @@ const tarball = join(temporaryRoot, packed[0].filename);
 it("ships one allowlisted standalone tarball without lifecycle, private, or development artifacts", async () => {
   const listing = (await run("tar", ["-tf", tarball])).stdout.trim().split("\n");
   const productFiles = listing.filter((path) => !path.startsWith("package/node_modules/"));
-  expect(packed[0]).toMatchObject({ name: "pi-agents", version: "0.0.0" });
+  expect(packed[0]).toMatchObject({ name: "pi-agents", version: "0.0.1" });
   expect(listing).toContain("package/bin/pi-agents.mjs");
   expect(listing).toContain("package/README.md");
   expect(productFiles.some((path) => /(?:^|\/)(?:test|tests|__snapshots__)(?:\/|$)|\.test\.|\.integration\.test\.|runtime\/test-fixtures\.mjs$/u.test(path))).toBe(false);

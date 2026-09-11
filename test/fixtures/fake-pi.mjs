@@ -9,6 +9,10 @@ const missing = new Set((process.env.FAKE_PI_MISSING ?? "").split(",").filter(Bo
 // prompt. Unset, this fake accepts every prompt exactly as it always has.
 const streamingMode = process.env.FAKE_PI_STREAMING;
 let streaming = streamingMode === "active";
+// Pi reports thinking levels per model and refuses to be driven outside the set it reported, so a
+// dashboard that offers a level this list does not carry fails here rather than silently drifting.
+const thinkingLevels = (process.env.FAKE_PI_THINKING_LEVELS ?? "off,low,high").split(",").filter(Boolean);
+let thinkingLevel = thinkingLevels[0] ?? "off";
 const log = (entry) => {
   if (logPath) appendFileSync(logPath, `${JSON.stringify({ pid: process.pid, ...entry })}\n`, { mode: 0o600 });
 };
@@ -72,7 +76,23 @@ process.stdin.on("data", (chunk) => {
       const reportedSessionFile = process.env.FAKE_PI_RUNTIME_STATE_SESSION_PATH !== undefined && !sessionFile.includes("pi-agents-probe-")
         ? process.env.FAKE_PI_RUNTIME_STATE_SESSION_PATH
         : process.env.FAKE_PI_STATE_SESSION_PATH ?? sessionFile;
-      process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: true, data: { sessionId: "fake", sessionFile: reportedSessionFile, model: null, thinkingLevel: "off" } })}\n`);
+      process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: true, data: { sessionId: "fake", sessionFile: reportedSessionFile, model: null, thinkingLevel } })}\n`);
+      continue;
+    }
+    if (type === "get_available_thinking_levels") {
+      process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: true, data: { levels: thinkingLevels } })}\n`);
+      continue;
+    }
+    if (type === "set_thinking_level") {
+      if (!thinkingLevels.includes(command.level)) {
+        process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: false, error: `unknown thinking level: ${command.level}` })}\n`);
+        continue;
+      }
+      const changed = thinkingLevel !== command.level;
+      thinkingLevel = command.level;
+      process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: true })}\n`);
+      // Pi publishes the level it settled on, and only when it moved.
+      if (changed) process.stdout.write(`${JSON.stringify({ type: "thinking_level_changed", level: thinkingLevel })}\n`);
       continue;
     }
     if (["prompt", "follow_up", "steer"].includes(type) && typeof command.message !== "string") {

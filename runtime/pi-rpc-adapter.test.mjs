@@ -316,13 +316,14 @@ it("exposes the retry brake but no session query and no settings passthrough", a
   await adapter.close();
 });
 
-it("discovers commands and applies model and compaction changes, but no thinking change", async () => {
+it("discovers commands and applies model, thinking level, and compaction changes", async () => {
   /** @type {any[]} */
   const sent = [];
   /** @type {Record<string, any>} */
   const data = {
     get_commands: { commands: [{ name: "review", description: "Review", source: "extension" }] },
     get_available_models: { models: [{ provider: "anthropic", id: "claude" }] },
+    get_available_thinking_levels: { levels: ["off", "low", "high"] },
     set_model: { provider: "anthropic", id: "claude" },
     compact: { compacted: true },
   };
@@ -334,42 +335,79 @@ it("discovers commands and applies model and compaction changes, but no thinking
 
   await expect(adapter.getCommands()).resolves.toEqual(data.get_commands);
   await expect(adapter.getAvailableModels()).resolves.toEqual(data.get_available_models);
+  await expect(adapter.getAvailableThinkingLevels()).resolves.toEqual(data.get_available_thinking_levels);
   await expect(adapter.setModel({ provider: "anthropic", id: "claude" })).resolves.toEqual(data.set_model);
+  await expect(adapter.setThinkingLevel("high")).resolves.toBeUndefined();
   await expect(adapter.compact("keep decisions")).resolves.toEqual(data.compact);
-  for (const method of ["getAvailableThinkingLevels", "setThinkingLevel"]) expect(/** @type {any} */ (adapter)[method], method).toBeUndefined();
-  expect(sent.map(({ type }) => type)).toEqual(["get_commands", "get_available_models", "set_model", "compact"]);
-  expect(sent[2]).toMatchObject({ provider: "anthropic", modelId: "claude" });
-  expect(sent[3]).toMatchObject({ customInstructions: "keep decisions" });
+  expect(sent.map(({ type }) => type)).toEqual(["get_commands", "get_available_models", "get_available_thinking_levels", "set_model", "set_thinking_level", "compact"]);
+  expect(sent[3]).toMatchObject({ provider: "anthropic", modelId: "claude" });
+  expect(sent[4]).toMatchObject({ level: "high" });
+  expect(sent[5]).toMatchObject({ customInstructions: "keep decisions" });
   await adapter.close();
 });
 
-it("collects a session menu with no thinking values and never asks Pi for them", async () => {
-  const getAvailableThinkingLevels = vi.fn(async () => ({ levels: ["off", "high"] }));
+it("collects a session menu carrying the thinking levels Pi reported for its current model", async () => {
   const menu = await collectSessionMenu({
     getState: async () => ({ model: { provider: "anthropic", id: "claude" }, thinkingLevel: "high" }),
     getCommands: async () => ({ commands: [{ name: "review", source: "extension" }] }),
     getAvailableModels: async () => ({ models: [{ provider: "anthropic", id: "claude" }] }),
-    getAvailableThinkingLevels,
+    getAvailableThinkingLevels: async () => ({ levels: ["off", "high", "", 7] }),
   });
 
   expect(menu).toEqual({
     commands: [{ name: "/review", source: "extension" }],
     models: [{ provider: "anthropic", id: "claude" }],
     model: { provider: "anthropic", id: "claude" },
+    thinkingLevels: ["off", "high"],
+    thinkingLevel: "high",
   });
-  expect(getAvailableThinkingLevels).not.toHaveBeenCalled();
 });
 
-it("refuses a thinking level the worker no longer applies to Pi", async () => {
+// A worker whose Pi does not answer the thinking query serves the rest of the menu; the viewer reads
+// the empty list as "this session cannot pick a level" rather than waiting on a menu that never comes.
+it("collects a session menu with no thinking levels when Pi refuses the query", async () => {
+  const menu = await collectSessionMenu({
+    getState: async () => ({ model: null }),
+    getAvailableThinkingLevels: async () => { throw Object.assign(new Error("unknown command"), { code: "RPC_COMMAND_FAILED" }); },
+  });
+
+  expect(menu).toEqual({ commands: [], models: [], model: null, thinkingLevels: [], thinkingLevel: null });
+});
+
+it("applies one chosen thinking level to Pi and records the acknowledged delivery", async () => {
+  /** @type {any[]} */
+  const records = [];
+  const replay = await createWorkerReplayStore({ append: async (record) => { records.push(record); } });
+  const setThinkingLevel = vi.fn(async () => undefined);
+  const dispatcher = createWorkerCommandDispatcher({ replay, adapter: { setThinkingLevel } });
+
+  await dispatcher.deliver({ clientId: "client", requestId: "thinking", op: "session_command", sessionCommand: { command: "set_thinking_level", level: "high" } });
+
+  expect(setThinkingLevel).toHaveBeenCalledWith("high");
+  expect(records.map((record) => record.stage)).toEqual(["RECEIVED", "RPC_WRITE_STARTED", "RPC_ACKNOWLEDGED"]);
+
+  // The same identity is never written to Pi twice: a replayed request answers from the log.
+  await dispatcher.deliver({ clientId: "client", requestId: "thinking", op: "session_command", sessionCommand: { command: "set_thinking_level", level: "high" } });
+  expect(setThinkingLevel).toHaveBeenCalledTimes(1);
+});
+
+it.each([
+  ["an empty level", { command: "set_thinking_level", level: "" }],
+  ["a level that is not a string", { command: "set_thinking_level", level: 3 }],
+  ["a missing level", { command: "set_thinking_level" }],
+])("refuses %s before any Pi write", async (_name, sessionCommand) => {
   /** @type {any[]} */
   const records = [];
   const replay = await createWorkerReplayStore({ append: async (record) => { records.push(record); } });
   const setThinkingLevel = vi.fn();
-  const dispatcher = createWorkerCommandDispatcher({ replay, adapter: { setThinkingLevel } });
+  const compact = vi.fn();
+  const dispatcher = createWorkerCommandDispatcher({ replay, adapter: { setThinkingLevel, compact } });
 
-  await expect(dispatcher.deliver({ clientId: "client", requestId: "thinking", op: "session_command", sessionCommand: { command: "set_thinking_level", level: "high" } }))
+  await expect(dispatcher.deliver({ clientId: "client", requestId: "thinking", op: "session_command", sessionCommand }))
     .rejects.toMatchObject({ code: "INVALID_SESSION_COMMAND" });
   expect(setThinkingLevel).not.toHaveBeenCalled();
+  // An unusable session command is refused outright, never fallen through to compaction.
+  expect(compact).not.toHaveBeenCalled();
   expect(records.map((record) => record.stage)).toEqual(["RECEIVED", "FAILED"]);
 });
 

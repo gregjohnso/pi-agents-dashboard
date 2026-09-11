@@ -317,8 +317,12 @@ export class PiRpcAdapter {
   async getState() { return this.#request("get_state"); }
   async getCommands() { return this.#request("get_commands"); }
   async getAvailableModels() { return this.#request("get_available_models"); }
+  /** The levels Pi's current model supports; Pi answers `["off"]` for a model without reasoning. */
+  async getAvailableThinkingLevels() { return this.#request("get_available_thinking_levels"); }
   /** @param {{ provider: string, id: string }} model */
   async setModel(model) { return this.#request("set_model", { provider: model.provider, modelId: model.id }); }
+  /** @param {string} level */
+  async setThinkingLevel(level) { return this.#request("set_thinking_level", { level }); }
   /** @param {string} name */
   async setSessionName(name) { return this.#request("set_session_name", { name }); }
   /** @param {string} [instructions] */

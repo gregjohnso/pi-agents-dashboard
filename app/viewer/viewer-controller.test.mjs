@@ -406,17 +406,12 @@ describe("viewer commands", () => {
     expect(f.instance.render(80, 24).join("\n")).toContain("tool:future_tool completed expanded");
   });
 
-  it("opens steer input over the draft and toggles thinking visibility", async () => {
+  it("opens steer input over the draft", async () => {
     const f = fixture({ snapshot: {
       items: [{ kind: "assistant_message", itemId: "middle", content: [{ type: "thinking", text: "private reasoning" }, { type: "text", text: "middle" }] }],
       thinkingLevel: "high",
     } });
     await f.instance.open();
-
-    expect(f.instance.hideThinking).toBe(false);
-    f.instance.handleInput("\x14");
-    expect(f.instance.hideThinking).toBe(true);
-    expect(f.instance.render(80, 24).join("\n")).toContain("Thinking blocks: hidden");
 
     f.instance.editor.setText("composer draft");
     f.instance.handleInput("\x13");
@@ -474,8 +469,12 @@ describe("viewer rendering and navigation", () => {
       const f = fixture({ snapshot: overrides });
       await f.instance.open();
       if (name === "thinking-visible") {
-        matrix["thinking-hidden"] = f.instance.handleInput("\x14") ?? f.instance.render(width, height).map(stripVTControlCharacters);
-        f.instance.handleInput("\x14");
+        // Hidden thinking blocks are still a state this dock draws; no key reaches it, so set it here.
+        f.instance.hideThinking = true;
+        f.instance.transcript.setThinkingHidden(true);
+        matrix["thinking-hidden"] = f.instance.render(width, height).map(stripVTControlCharacters);
+        f.instance.hideThinking = false;
+        f.instance.transcript.setThinkingHidden(false);
       }
       matrix[name] = f.instance.render(width, height).map(stripVTControlCharacters);
       await f.instance.close();
@@ -878,6 +877,197 @@ describe("installed Pi behavior the pending block depends on", () => {
     const rpc = await piSource("modes/rpc/rpc-mode.js");
     expect(rpc).toContain('case "prompt": {');
     expect(rpc.slice(rpc.indexOf('case "prompt": {'), rpc.indexOf('case "steer": {'))).not.toContain("expandPromptTemplates");
+  });
+});
+
+/**
+ * Ctrl+T opens Pi's own thinking levels for this session.
+ *
+ * Operator-visible failure each test names: a key that changes nothing Pi can see, a picker that
+ * offers a level Pi does not support, a level the footer claims before Pi confirmed it, and a draft
+ * the picker eats.
+ */
+describe("thinking level picker", () => {
+  const levelMenu = (overrides = {}) => async () => ({ commands: [], models: [], model: { provider: "anthropic", id: "opus" }, color: null, thinkingLevels: ["off", "low", "high"], thinkingLevel: "low", ...overrides });
+  const screen = (/** @type {any} */ f) => stripVTControlCharacters(f.instance.render(80, 24).join("\n"));
+
+  it("lists the levels Pi reported with the current one selected, leaving thinking blocks and the draft alone", async () => {
+    const f = fixture({
+      menu: levelMenu(),
+      snapshot: { thinkingLevel: "low", items: [{ kind: "assistant_message", itemId: "reasoned", content: [{ type: "thinking", text: "private reasoning" }, { type: "text", text: "answer" }] }] },
+    });
+    await f.instance.open();
+    await f.instance.menuLoaded;
+    f.instance.editor.setText("half typed");
+    expect(screen(f)).toContain("private reasoning");
+
+    f.instance.handleInput("\x14");
+    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
+
+    const view = screen(f);
+    expect(view).toContain("Select a thinking level");
+    for (const level of ["off", "low", "high"]) expect(view).toContain(level);
+    expect(view).toContain("→ low");
+    expect(f.instance.editor.getText()).toBe("half typed");
+
+    f.instance.handleInput("\x1b");
+    expect(f.instance.selection).toBeUndefined();
+    expect(f.commands).toEqual([]);
+    expect(f.instance.editor.getText()).toBe("half typed");
+    expect(f.instance.onReturn).not.toHaveBeenCalled();
+    // The picker chooses what Pi thinks with, never what this transcript shows.
+    expect(f.instance.hideThinking).toBe(false);
+    expect(screen(f)).not.toContain("Thinking blocks: hidden");
+    expect(screen(f)).toContain("private reasoning");
+  });
+
+  it("keeps the draft and its cursor across an opened and cancelled picker", async () => {
+    const piEditor = createPiEditor({ tui: { requestRender() {}, setFocus() {} } });
+    const f = fixture({ editor: piEditor, menu: levelMenu() });
+    await f.instance.open();
+    await f.instance.menuLoaded;
+    piEditor.setText("abcd");
+    f.instance.handleInput("\x1b[D");
+
+    f.instance.handleInput("\x14");
+    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
+    f.instance.handleInput("\x1b");
+    f.instance.handleInput("X");
+
+    expect(piEditor.getText()).toBe("abcXd");
+  });
+
+  it("sends one set_thinking_level for the chosen level and follows Pi's confirmation in the footer", async () => {
+    const f = fixture({ menu: levelMenu(), snapshot: { thinkingLevel: "low", model: { provider: "anthropic", id: "opus" } } });
+    await f.instance.open();
+    await f.instance.menuLoaded;
+    expect(screen(f)).toContain("opus • low");
+
+    f.instance.handleInput("\x14");
+    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
+    f.instance.handleInput("\x1b[B");
+    f.instance.handleInput("\r");
+
+    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "session_command", payload: { sessionId: "s", command: "set_thinking_level", level: "high" } }]));
+    expect(f.instance.selection).toBeUndefined();
+    // Pi confirms the change on its own stream; nothing here claims it first.
+    expect(screen(f)).toContain("opus • low");
+    await f.emit({ version: 1, sessionId: "s", eventId: "confirmed", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "thinking_state", level: "high" } });
+    expect(screen(f)).toContain("opus • high");
+    expect(f.commands).toHaveLength(1);
+  });
+
+  it("leaves the level where it was and says why when the daemon refuses the change", async () => {
+    const f = fixture({
+      menu: levelMenu(),
+      snapshot: { thinkingLevel: "low", model: { provider: "anthropic", id: "opus" } },
+      command: async () => { throw Object.assign(new Error("No exact recovered worker owns this session"), { code: "WORKER_UNAVAILABLE", retryable: false }); },
+    });
+    await f.instance.open();
+    await f.instance.menuLoaded;
+
+    f.instance.handleInput("\x14");
+    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
+    f.instance.handleInput("\x1b[B");
+    f.instance.handleInput("\r");
+
+    await vi.waitFor(() => expect(screen(f)).toContain("WORKER_UNAVAILABLE"));
+    expect(screen(f)).toContain("opus • low");
+    expect(f.instance.closedState).toBe(false);
+  });
+
+  it("offers the levels of the model this session is on now, not the ones the last menu carried", async () => {
+    let levels = ["off", "low", "high"];
+    const f = fixture({ menu: async () => ({ commands: [], models: [], model: null, color: null, thinkingLevels: levels, thinkingLevel: "off" }) });
+    await f.instance.open();
+    await f.instance.menuLoaded;
+
+    levels = ["off", "max"];
+    f.instance.handleInput("\x14");
+    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
+
+    expect(screen(f)).toContain("max");
+    expect(screen(f)).not.toContain("low");
+  });
+
+  it.each([
+    ["a worker that reports no levels", async () => ({ commands: [], models: [], model: null, color: null, thinkingLevels: [], thinkingLevel: null })],
+    ["a worker from a release that never sent them", async () => ({ commands: [], models: [], model: null, color: null })],
+  ])("opens no picker for %s and says the levels are unavailable", async (_name, menu) => {
+    const f = fixture({ menu });
+    await f.instance.open();
+    await f.instance.menuLoaded;
+
+    f.instance.handleInput("\x14");
+
+    await vi.waitFor(() => expect(screen(f)).toContain("THINKING_LEVELS_UNAVAILABLE"));
+    expect(f.instance.selection).toBeUndefined();
+    expect(f.instance.thinkingLoading).toBe(false);
+    expect(f.commands).toEqual([]);
+  });
+
+  it("reports the menu failure once and opens no picker when the worker refuses the read", async () => {
+    const f = fixture({ menu: async () => { throw Object.assign(new Error("This session's worker predates slash commands"), { code: "UNSUPPORTED_WORKER_OPERATION" }); } });
+    await f.instance.open();
+    await f.instance.menuLoaded;
+
+    f.instance.handleInput("\x14");
+
+    await vi.waitFor(() => expect(f.instance.thinkingLoading).toBe(false));
+    expect(f.instance.selection).toBeUndefined();
+    expect(screen(f)).not.toContain("THINKING_LEVELS_UNAVAILABLE");
+    expect(f.instance.state.errors.map((/** @type {any} */ error) => error.code)).toEqual(["SESSION_COMMANDS_UNAVAILABLE", "SESSION_COMMANDS_UNAVAILABLE"]);
+  });
+
+  it("says the levels are loading and opens nothing when the viewer leaves before they arrive", async () => {
+    /** @type {() => void} */
+    let releaseLevels = () => {};
+    let menuCalls = 0;
+    const f = fixture({
+      menu: () => {
+        menuCalls += 1;
+        if (menuCalls === 1) return Promise.resolve({ commands: [], models: [], model: null, color: null, thinkingLevels: ["off", "high"], thinkingLevel: "off" });
+        return new Promise((resolve) => { releaseLevels = () => resolve({ commands: [], models: [], model: null, color: null, thinkingLevels: ["off", "high"], thinkingLevel: "off" }); });
+      },
+    });
+    await f.instance.open();
+    await f.instance.menuLoaded;
+
+    f.instance.handleInput("\x14");
+    expect(f.instance.thinkingLoading).toBe(true);
+    expect(screen(f)).toContain("Thinking levels…");
+
+    // Escape while the read is in flight cancels it: no picker afterwards, and the list is not left.
+    f.instance.handleInput("\x1b");
+    expect(f.instance.thinkingLoading).toBe(false);
+    expect(f.instance.onReturn).not.toHaveBeenCalled();
+    releaseLevels();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(f.instance.selection).toBeUndefined();
+    expect(screen(f)).not.toContain("Thinking levels…");
+  });
+
+  it("opens no picker after the viewer closed while the levels were still loading", async () => {
+    /** @type {() => void} */
+    let releaseLevels = () => {};
+    let menuCalls = 0;
+    const f = fixture({
+      menu: () => {
+        menuCalls += 1;
+        if (menuCalls === 1) return Promise.resolve({ commands: [], models: [], model: null, color: null, thinkingLevels: ["off", "high"], thinkingLevel: "off" });
+        return new Promise((resolve) => { releaseLevels = () => resolve({ commands: [], models: [], model: null, color: null, thinkingLevels: ["off", "high"], thinkingLevel: "off" }); });
+      },
+    });
+    await f.instance.open();
+    await f.instance.menuLoaded;
+    f.instance.handleInput("\x14");
+    expect(menuCalls).toBe(2);
+
+    await f.instance.close();
+    releaseLevels();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(f.instance.selection).toBeUndefined();
   });
 });
 

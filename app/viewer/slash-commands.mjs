@@ -1,7 +1,7 @@
 import { SESSION_COLORS } from "../../shared/contracts.mjs";
 
 /** @typedef {{name:string,source:string,description?:string,argumentHint?:string}} MenuCommand */
-/** @typedef {{commands:MenuCommand[],models:{provider:string,id:string}[],model:{provider:string,id:string}|null,summaryModel?:{provider:string,id:string}|null,name?:string|null,color?:string|null}} SessionMenu */
+/** @typedef {{commands:MenuCommand[],models:{provider:string,id:string}[],model:{provider:string,id:string}|null,summaryModel?:{provider:string,id:string}|null,name?:string|null,color?:string|null,thinkingLevels?:string[],thinkingLevel?:string|null}} SessionMenu */
 
 const BUILTIN_SOURCE = "builtin";
 const DEFAULT_COLOR = "default";
@@ -10,7 +10,7 @@ const DEFAULT_COLOR = "default";
 const REBIND_COMMANDS = { "/fork": "fork", "/clone": "clone", "/switch": "switch_session" };
 
 /** @type {SessionMenu} */
-export const EMPTY_SESSION_MENU = { commands: [], models: [], model: null, summaryModel: null };
+export const EMPTY_SESSION_MENU = { commands: [], models: [], model: null, summaryModel: null, thinkingLevels: [], thinkingLevel: null };
 
 /** @param {{provider:string,id:string}} model */
 function modelValue(model) {

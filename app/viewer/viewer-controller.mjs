@@ -229,7 +229,10 @@ export class ViewerController {
     const toolLine = selectedTool === undefined ? [] : [` tool:${selectedTool.name} ${selectedTool.state} ${this.transcript.expandedTools.has(selectedTool.id) ? "expanded" : "collapsed"}`];
     let errorLines = this.state.errors.slice(-1).flatMap((error) => renderSystemCard({ text: describeViewerError(error), level: "error" }, width));
     let pendingLines = this.renderPending();
-    const connectionLines = this.daemonUnreachable ? [" Daemon unreachable · reconnecting…"] : this.streamStopped ? [" Transcript stopped · Esc to the list, then reopen this session"] : [];
+    const connectionLines = [
+      ...(this.daemonUnreachable ? [" Daemon unreachable · reconnecting…"] : this.streamStopped ? [" Transcript stopped · Esc to the list, then reopen this session"] : []),
+      ...(this.thinkingLoading ? [" Thinking levels… · Esc cancels"] : []),
+    ];
     let hints = renderKeyHints(this.state, width);
     const dockRows = () => 2 + (hints === "" ? 0 : 1) + status.length + editorLines.length + inputLabel.length + toolLine.length + errorLines.length + pendingLines.length + connectionLines.length;
     if (height - dockRows() < MIN_TRANSCRIPT_ROWS) {
@@ -277,12 +280,15 @@ export class ViewerController {
       this.requestRender();
       return;
     }
+    if (this.thinkingLoading && matchesKey(data, Key.escape)) {
+      this.cancelThinkingPicker();
+      this.returnGesture.cancel();
+      return;
+    }
     if (matchesKey(data, Key.ctrl("s"))) { this.beginSteer(); return; }
     if (matchesKey(data, Key.ctrl("t"))) {
-      this.hideThinking = !this.hideThinking;
-      this.transcript.setThinkingHidden(this.hideThinking);
       this.returnGesture.cancel();
-      this.requestRender();
+      void this.openThinkingPicker();
       return;
     }
     if (this.transcript.selectedToolId !== undefined) {
@@ -361,7 +367,7 @@ export class ViewerController {
     this.requestRender();
   }
 
-  /** Load and install the session's discovered slash-command menu. */
+  /** Load and install the session's discovered slash-command menu. @returns {Promise<boolean>} whether it loaded */
   async loadMenu() {
     try {
       const menu = await this.client.sessionMenu(this.sessionId);
@@ -371,17 +377,62 @@ export class ViewerController {
         model: menu?.model ?? null,
         color: menu?.color ?? null,
         name: typeof menu?.name === "string" ? menu.name : undefined,
+        // A daemon or worker that reports neither leaves this session with no level to pick.
+        thinkingLevels: Array.isArray(menu?.thinkingLevels) ? menu.thinkingLevels : [],
+        thinkingLevel: menu?.thinkingLevel ?? null,
       };
       // The colour is stored on the session record, so adopt it on every open, not only when /color runs.
       this.sessionColor = this.menu.color ?? undefined;
+      this.editor.setAutocompleteProvider?.(new CombinedAutocompleteProvider(/** @type {any} */ (sessionSlashCommands(this.menu)), this.cwd));
+      return true;
     } catch (error) {
       this.menu = EMPTY_SESSION_MENU;
       const code = /** @type {any} */ (error)?.code;
       await this.recordError(code === "UNSUPPORTED_WORKER_OPERATION"
         ? { code: "SESSION_COMMANDS_UNAVAILABLE", message: "This session's worker predates slash commands. Stop and reopen the session to refresh them.", retryable: false }
         : { code: code ?? "SESSION_COMMANDS_UNAVAILABLE", message: error instanceof Error ? error.message : "Session commands are unavailable", retryable: false });
+      this.editor.setAutocompleteProvider?.(new CombinedAutocompleteProvider(/** @type {any} */ (sessionSlashCommands(this.menu)), this.cwd));
+      return false;
     }
-    this.editor.setAutocompleteProvider?.(new CombinedAutocompleteProvider(/** @type {any} */ (sessionSlashCommands(this.menu)), this.cwd));
+  }
+
+  /**
+   * Ctrl+T: choose what Pi thinks with, from the levels Pi reports for the model this session is on.
+   *
+   * The levels are read on every press rather than reused, because Pi answers them per model and a
+   * session that changed model has a different set. Nothing here touches the composer, the
+   * transcript, or the level the footer draws: only Pi's own confirmation moves that.
+   */
+  async openThinkingPicker() {
+    if (this.state === undefined || this.thinkingLoading) return;
+    const read = (this.thinkingRead ?? 0) + 1;
+    this.thinkingRead = read;
+    this.thinkingLoading = true;
+    void this.requestRender();
+    const loaded = await this.loadMenu();
+    // Escape, a close, or a second press while this read was in flight owns the outcome now.
+    if (this.thinkingRead !== read || this.closedState) return;
+    this.thinkingLoading = false;
+    const levels = this.menu.thinkingLevels ?? [];
+    if (!loaded) { void this.requestRender(); return; }
+    if (levels.length === 0) {
+      await this.recordError({ code: "THINKING_LEVELS_UNAVAILABLE", message: "This session reported no thinking levels. Pi reports them per model, and a worker from an older release reports none at all; stop and reopen the session to refresh it.", retryable: false });
+      return;
+    }
+    const current = this.menu.thinkingLevel ?? undefined;
+    this.showSelection({
+      title: "Select a thinking level",
+      items: levels.map((level) => ({ value: level, label: level === current ? `${level} · current` : level })),
+      selected: current,
+      onChoice: (level) => { void this.sendCommand("session_command", { command: "set_thinking_level", level }); },
+    });
+  }
+
+  /** Drop a thinking-level read the operator no longer wants, without sending anything. */
+  cancelThinkingPicker() {
+    this.thinkingRead = (this.thinkingRead ?? 0) + 1;
+    this.thinkingLoading = false;
+    void this.requestRender();
   }
 
   beginSteer() {
@@ -587,7 +638,7 @@ export class ViewerController {
       "←  return to the list",
       "↑↓  scroll the transcript while the prompt is empty, else recall prompt history",
       "Home/End  jump to the start or end · wheel scrolls",
-      "Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools · Ctrl+C interrupt",
+      "Ctrl+S steer · Ctrl+T thinking level · Ctrl+O tools · Ctrl+C interrupt",
     ];
   }
 
@@ -708,9 +759,22 @@ export class ViewerController {
     const command = picker.command ?? submitted;
     const items = picker.items(this.menu);
     if (command === undefined || items.length === 0) return false;
+    this.showSelection({ title: picker.title(submitted), items, onChoice: (value) => { void this.submitText(`${command} ${value}`); } });
+    // The submitted line is the command this picker completes, so it leaves the composer with it.
+    this.restoring = true; this.editor.setText(""); this.restoring = false;
+    this.edited = false;
+    return true;
+  }
+
+  /**
+   * Open one bounded Pi selection list over the transcript. Cancelling costs nothing: no request is
+   * sent and the composer is left exactly as the operator had it.
+   * @param {{ title: string, items: { value: string, label: string }[], selected?: string, onChoice: (value: string) => void }} options
+   */
+  showSelection({ title, items, selected, onChoice }) {
     this.selection?.dispose();
     this.selection = new CommandSelectionOverlay({
-      title: picker.title(submitted), items,
+      title, items, selected,
       tui: this.editor.tui ?? { requestRender: () => this.requestRender(), setFocus() {} },
       returnFocus: this.editor,
       respond: (/** @type {string | undefined} */ value) => {
@@ -718,13 +782,10 @@ export class ViewerController {
         this.selection = undefined;
         resolved?.dispose();
         if (value === undefined) { void this.requestRender(); return; }
-        void this.submitText(`${command} ${value}`);
+        onChoice(value);
       },
     });
-    this.restoring = true; this.editor.setText(""); this.restoring = false;
-    this.edited = false;
     void this.requestRender();
-    return true;
   }
 
   installOverlay() {

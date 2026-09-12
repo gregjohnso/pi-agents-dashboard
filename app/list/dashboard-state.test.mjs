@@ -54,10 +54,24 @@ describe("selectDashboardSessions", () => {
         const other = session("other");
         expect(selectDashboardSessions([other, target], { view: "all", search })).toEqual([target]);
     });
+    it("filters the state each row displays, not the raw task state", () => {
+        const liveReady = session("live-ready", { processState: "LIVE" });
+        const readyRecords = [
+            liveReady,
+            session("exited"),
+            session("sleeping", { processState: "SLEEPING" }),
+            session("stale", { processState: "STALE" }),
+            session("starting", { activity: { kind: "launching", summary: "Starting", updatedAt: timestamp } }),
+        ];
+        expect(selectDashboardSessions(readyRecords, { view: "all", taskStates: ["READY"] })).toEqual([liveReady]);
+        const liveWorking = session("live-working", { taskState: "WORKING", processState: "LIVE" });
+        const staleWorking = session("stale-working", { taskState: "WORKING", processState: "STALE" });
+        expect(selectDashboardSessions([liveWorking, staleWorking], { view: "all", taskStates: ["WORKING"] })).toEqual([liveWorking]);
+    });
     it("combines task-state and exact project-path filters", () => {
-        const target = session("target", { taskState: "WAITING", cwd: "/repo/a" });
-        const wrongState = session("wrong-state", { taskState: "READY", cwd: "/repo/a" });
-        const childPath = session("child", { taskState: "WAITING", cwd: "/repo/a/child" });
+        const target = session("target", { taskState: "WAITING", processState: "LIVE", cwd: "/repo/a" });
+        const wrongState = session("wrong-state", { taskState: "READY", processState: "LIVE", cwd: "/repo/a" });
+        const childPath = session("child", { taskState: "WAITING", processState: "LIVE", cwd: "/repo/a/child" });
         expect(selectDashboardSessions([wrongState, childPath, target], {
             view: "all",
             taskStates: ["WAITING"],

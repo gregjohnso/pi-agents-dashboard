@@ -88,7 +88,7 @@ export function selectDashboardSessions(sessions, query) {
         : new Set(query.projectPaths.map(canonicalPath));
     const selected = sessions.filter((session) => ((query.historyPolicy?.(session) ?? true)
         && isInView(session, query.view)
-        && (taskStates?.has(session.taskState) ?? true)
+        && (taskStates?.has(displaySessionState(session)) ?? true)
         && (processStates?.has(session.processState) ?? true)
         && (outcomes?.has(session.outcome) ?? true)
         && (activityKinds?.has(session.activity.kind) ?? true)

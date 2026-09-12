@@ -126,9 +126,10 @@ function plainText(content) {
   return content.filter((block) => ["text", "thinking"].includes(block.type)).map((block) => block.text).join("\n");
 }
 
-/** @param {any[]} content */
+/** Trim only the derived summary; `tool.result` retains the raw output. @param {any[]} content */
 function toolFailureText(content) {
-  return bound(content.filter((block) => block.type === "text").map((block) => block.text).join("\n") || "Tool failed", MAX_SUMMARY_BYTES);
+  const text = content.filter((block) => block.type === "text").map((block) => block.text).join("\n").trim();
+  return text === "" ? "Tool failed" : bound(text, MAX_SUMMARY_BYTES);
 }
 
 /** Collapse a multi-line extension message into one bounded status line. @param {unknown} value */

@@ -284,6 +284,53 @@ describe("viewer normalizer", () => {
     expect(snapshot.errors.at(-1)).toMatchObject({ code: "HISTORY_39" });
   });
 
+  it("summarizes a failed live tool whose output has surrounding whitespace without altering its result", () => {
+    const subject = normalizer();
+    subject.consumeFrame({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "bash", args: { command: "npm test" } });
+    const events = subject.consumeFrame({ type: "tool_execution_end", toolCallId: "tool-1", toolName: "bash", result: { content: [{ type: "text", text: " WARN cache miss\nexit 1\n" }] }, isError: true });
+
+    const finished = /** @type {any} */ (events.find((/** @type {any} */ event) => event.payload.kind === "tool_finished"));
+    expect(finished.payload.tool).toMatchObject({ state: "failed", error: "WARN cache miss\nexit 1" });
+    expect(finished.payload.tool.result).toEqual([{ type: "text", text: " WARN cache miss\nexit 1\n" }]);
+    const snapshot = subject.snapshot({ daemonEpoch: "epoch-1", sequence: "2", registryRevision: 1, runtime: null, taskState: "WORKING", processState: "LIVE", outcome: "NONE" });
+    expect(snapshot.tools).toEqual([expect.objectContaining({ id: "tool-1", state: "failed", error: "WARN cache miss\nexit 1" })]);
+    expect(() => parseViewerSnapshot(snapshot)).not.toThrow();
+    assertPayloads(events);
+  });
+
+  it("summarizes a failed canonical tool result and falls back when it carries no readable text", () => {
+    const subject = normalizer();
+    const failure = (/** @type {string} */ id, /** @type {any[]} */ content) => ({ type: "message", id, timestamp: AT, message: { role: "toolResult", toolCallId: id, toolName: "bash", content, isError: true } });
+    const events = [
+      ...subject.consumeHistory(failure("tool-space", [{ type: "text", text: "\n  denied  \n" }]), position(1)),
+      ...subject.consumeHistory(failure("tool-blank", [{ type: "text", text: "   \n\t " }]), position(2)),
+      ...subject.consumeHistory(failure("tool-empty", []), position(3)),
+    ];
+
+    const errors = events.filter((event) => event.payload.kind === "tool_finished").map((/** @type {any} */ event) => [event.payload.tool.id, event.payload.tool.error]);
+    expect(errors).toEqual([["tool-space", "denied"], ["tool-blank", "Tool failed"], ["tool-empty", "Tool failed"]]);
+    const snapshot = subject.snapshot({ daemonEpoch: "epoch-1", sequence: "3", registryRevision: 1, runtime: null, taskState: "READY", processState: "LIVE", outcome: "NONE" });
+    // The summary is derived; the blocks Pi produced stay exactly as they were recorded.
+    expect(snapshot.tools.map((/** @type {any} */ tool) => tool.result)).toEqual([[{ type: "text", text: "\n  denied  \n" }], [{ type: "text", text: "   \n\t " }], []]);
+    expect(() => parseViewerSnapshot(snapshot)).not.toThrow();
+    assertPayloads(events);
+  });
+
+  it("bounds a failed tool summary spread over many multi-byte blocks", () => {
+    const subject = normalizer();
+    const content = [{ type: "text", text: "  \n" }, ...Array.from({ length: 12 }, (_unused, index) => ({ type: "text", text: `${index}${"\u00e9".repeat(2_000)}` })), { type: "text", text: "   " }];
+    const events = subject.consumeFrame({ type: "tool_execution_end", toolCallId: "tool-1", toolName: "bash", result: { content }, isError: true });
+
+    const error = String(/** @type {any} */ (events.find((/** @type {any} */ event) => event.payload.kind === "tool_finished")).payload.tool.error);
+    expect(Buffer.byteLength(error)).toBeLessThanOrEqual(4_096);
+    expect(error.startsWith("0\u00e9")).toBe(true);
+    expect(error.trim()).toBe(error);
+    const snapshot = subject.snapshot({ daemonEpoch: "epoch-1", sequence: "1", registryRevision: 1, runtime: null, taskState: "WORKING", processState: "LIVE", outcome: "NONE" });
+    expect(snapshot.tools[0].result).toHaveLength(content.length);
+    expect(() => parseViewerSnapshot(snapshot)).not.toThrow();
+    assertPayloads(events);
+  });
+
   it("bounds unknown optional events and reports malformed required shapes as typed session errors", () => {
     const subject = normalizer();
     const events = subject.consumeFrame({ type: "future_pi_event", secret: "x".repeat(100_000) });

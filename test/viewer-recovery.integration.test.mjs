@@ -78,6 +78,8 @@ async function openClient(daemon, clientId) {
 async function fakeWorker({ root, maxBytes = undefined }) {
   const controller = new AbortController();
   const tail = createLiveTail(maxBytes === undefined ? {} : { maxBytes });
+  /** @type {string[]} */
+  const commands = [];
   /** @type {any} */
   let live;
   let connections = 0;
@@ -91,6 +93,11 @@ async function fakeWorker({ root, maxBytes = undefined }) {
         if (connection === undefined) return;
         live = connection;
         connections += 1;
+        connection.onMessage((/** @type {any} */ message) => {
+          if (message?.type !== "command") return;
+          commands.push(message.command.op);
+          void connection.send({ version: 1, type: "command_result", token: workerToken, id: message.id, ok: true, record: { clientId: message.command.clientId, requestId: message.command.requestId, op: message.command.op, stage: "RPC_ACKNOWLEDGED", at, result: null } });
+        });
         await connection.send({ version: 1, type: "worker_ready", token: workerToken, sessionId: "session-1", runId: "run-shared", leaseId: "lease-shared", generation: 1, worker: identity, piChild: piChildIdentity });
         if (connections > 1) await connection.send({ version: 1, type: "pi_tail", token: workerToken, sessionId: "session-1", frames: tail.frames(), dropped: tail.dropped });
         await connection.closed;
@@ -102,6 +109,8 @@ async function fakeWorker({ root, maxBytes = undefined }) {
   })();
   const worker = {
     get connections() { return connections; },
+    /** The operations this worker was asked to run, in the order its route delivered them. */
+    get commands() { return commands; },
     /** Produce one Pi frame: it joins the tail whether or not a daemon is listening. @param {any} frame */
     async frame(frame) {
       tail.record(frame);
@@ -134,6 +143,42 @@ async function waitForWorker(daemon) {
 function assistantText(items) {
   return items.filter((item) => item.kind === "assistant_message").map((item) => item.content.map((/** @type {any} */ block) => block.text).join("")).join("|");
 }
+
+/** @param {any} subscription @param {string} kind */
+async function nextPayload(subscription, kind) {
+  for (let read = 0; read < 20; read += 1) {
+    const { value } = await subscription.events.next();
+    if (value?.payload?.kind === kind) return value.payload;
+  }
+  throw new Error(`No ${kind} event arrived`);
+}
+
+// A failed bash tool prints its output verbatim, and that output can start or end with whitespace.
+// The viewer contract refuses a padded error summary, so a normalizer that forwards one closes this
+// session's worker route, and the reconnect replays the same frame into a snapshot that cannot open.
+it("keeps the worker route, command delivery, and snapshot reopen working after a padded tool failure", async () => {
+  const { root } = await liveSession();
+  const daemon = await openDaemon(root);
+  const worker = await fakeWorker({ root });
+  await daemon.ready;
+  await waitForWorker(daemon);
+  const client = await openClient(daemon, "client-tool-failure");
+  const subscription = await client.subscribeViewer("session-1");
+  await worker.frame({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "bash", args: { command: "npm test" } });
+  await worker.frame({ type: "tool_execution_end", toolCallId: "tool-1", toolName: "bash", result: { content: [{ type: "text", text: " WARN cache miss\nexit 1\n" }] }, isError: true });
+
+  expect(await nextPayload(subscription, "tool_finished")).toMatchObject({ tool: { id: "tool-1", state: "failed", error: "WARN cache miss\nexit 1" } });
+  subscription.unsubscribe();
+  expect(worker.connections).toBe(1);
+  expect(daemon.status().connectedWorkers).toContain("session-1");
+  await client.command("interrupt", { sessionId: "session-1" });
+  expect(worker.commands.at(-1)).toBe("interrupt");
+
+  const reopened = await client.subscribeViewer("session-1");
+  reopened.unsubscribe();
+  expect(reopened.snapshot.tools).toEqual([expect.objectContaining({ id: "tool-1", state: "failed", error: "WARN cache miss\nexit 1" })]);
+  await client.close();
+});
 
 it("keeps no durable viewer transcript beside Pi's own session file", async () => {
   const { root } = await liveSession();

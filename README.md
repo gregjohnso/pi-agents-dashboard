@@ -37,7 +37,7 @@ Use Up and Down to select a row. Page Up, Page Down, Home, and End move farther.
 
 Press Ctrl+X on a live session, then confirm to stop its worker and Pi process. After Stop completes, press Ctrl+X again within 500 ms and confirm to clear the dashboard record. For an already stopped session, press Ctrl+X twice within 500 ms, then confirm. Clearing a record does not delete Pi's session file or remove a worktree.
 
-Press `?` with an empty prompt for the full key reference. Ctrl+C closes the dashboard without stopping sessions.
+Press `?` with an empty prompt for the full key reference. Ctrl+C clears the prompt; a second Ctrl+C within 500 ms closes the dashboard without stopping sessions.
 
 ## Configure the next launch with list commands
 

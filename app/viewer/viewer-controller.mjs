@@ -2,6 +2,7 @@ import { stripVTControlCharacters } from "node:util";
 import { CombinedAutocompleteProvider, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 import { SESSION_COLORS } from "../../shared/contracts.mjs";
+import { ClearQuitGesture } from "../clear-quit-gesture.mjs";
 import { parseViewerEvent, parseViewerSnapshot } from "../../shared/viewer-contracts.mjs";
 import { createPiComponentAdapters } from "./pi-component-adapters.mjs";
 import { EMPTY_SESSION_MENU, parseSlashSubmission, sessionSlashCommands } from "./slash-commands.mjs";
@@ -115,7 +116,7 @@ const SELECTION_PICKERS = {
 
 /** Own one standalone normalized Pi chat subscription and the input that writes to it. */
 export class ViewerController {
-  constructor({ sessionId, client, editor, persistence, requestRender, onReturn, onDashboardAction = undefined, now = Date.now, adapters = undefined, cwd = process.cwd() }) {
+  constructor({ sessionId, client, editor, persistence, requestRender, onReturn, onQuit = undefined, onDashboardAction = undefined, now = Date.now, adapters = undefined, cwd = process.cwd() }) {
     if (!sessionId || client === undefined || editor === undefined || persistence === undefined) throw new TypeError("sessionId, client, editor, and persistence are required");
     this.sessionId = sessionId;
     this.client = client;
@@ -123,6 +124,9 @@ export class ViewerController {
     this.persistence = persistence;
     this.requestRender = requestRender ?? (() => {});
     this.onReturn = onReturn ?? (() => {});
+    // Quitting ends the frontend that hosts this viewer. An attachment is the whole frontend, so its
+    // quit and its return are the same thing; a dashboard's list is not, and it passes its own.
+    this.onQuit = onQuit ?? this.onReturn;
     this.onDashboardAction = onDashboardAction;
     this.now = now;
     this.adapters = adapters ?? createPiComponentAdapters({ tui: editor.tui ?? { mode: "fullscreen", requestRender: () => this.requestRender(), setFocus() {} } });
@@ -141,6 +145,7 @@ export class ViewerController {
     this.historyUsed = false;
     this.closedState = true;
     this.returnGesture = new ReturnGesture({ now: () => this.now(), onReturn: () => this.onReturn() });
+    this.clearQuitGesture = new ClearQuitGesture({ now: () => this.now() });
     this.editor.onSubmit = (text) => { void this.submitEditor(text); };
     this.editor.onChange = () => { if (!this.restoring) this.edited = true; };
     this.closed = new Promise((resolve) => { this.resolveClosed = resolve; });
@@ -149,6 +154,8 @@ export class ViewerController {
   async open() {
     if (!this.closedState) return;
     this.closedState = false;
+    // A quit armed before this viewer was put away cannot travel into the viewer it comes back as.
+    this.clearQuitGesture.cancel();
     try {
       const persisted = await this.persistence.load(this.sessionId);
       this.restoring = true;
@@ -266,8 +273,9 @@ export class ViewerController {
     }
     if (this.overlay !== undefined) {
       this.returnGesture.cancel();
-      if (matchesKey(data, Key.ctrl("c")) && this.state.working) {
-        void this.sendCommand("interrupt", {});
+      // A dialog holds text of its own, so Ctrl+C interrupts and quits here but clears nothing.
+      if (matchesKey(data, Key.ctrl("c"))) {
+        this.pressCtrlC({ clearsEditor: false });
         return;
       }
       this.overlay.handleInput(data);
@@ -276,6 +284,7 @@ export class ViewerController {
     }
     if (this.inputMode === "steer") {
       this.returnGesture.cancel();
+      if (matchesKey(data, Key.ctrl("c"))) { this.pressCtrlC({ clearsEditor: true }); return; }
       if (matchesKey(data, Key.escape)) this.finishSteer(); else this.editor.handleInput(data);
       this.requestRender();
       return;
@@ -351,10 +360,25 @@ export class ViewerController {
     }
     this.returnGesture.cancelForInput("other");
     if (matchesKey(data, Key.ctrl("c"))) {
-      void this.sendCommand("interrupt", {});
+      this.pressCtrlC({ clearsEditor: true });
       return;
     }
     this.editor.handleInput(data);
+    this.requestRender();
+  }
+
+  /**
+   * Pi's Ctrl+C: stop a running turn and empty the editor, and quit only when a second press lands
+   * inside the window. The press that quits sends nothing, so leaving cannot interrupt twice.
+   * @param {{ clearsEditor: boolean }} options
+   */
+  pressCtrlC({ clearsEditor }) {
+    if (this.clearQuitGesture.press() === "quit") {
+      this.onQuit();
+      return;
+    }
+    if (this.state.working) void this.sendCommand("interrupt", {});
+    if (clearsEditor) this.clearEditor();
     this.requestRender();
   }
 
@@ -638,7 +662,8 @@ export class ViewerController {
       "←  return to the list",
       "↑↓  scroll the transcript while the prompt is empty, else recall prompt history",
       "Home/End  jump to the start or end · wheel scrolls",
-      "Ctrl+S steer · Ctrl+T thinking level · Ctrl+O tools · Ctrl+C interrupt",
+      "Ctrl+S steer · Ctrl+T thinking level · Ctrl+O tools",
+      "Ctrl+C  interrupt a running turn and clear the prompt; press again within 500 ms to quit",
     ];
   }
 

@@ -16,7 +16,7 @@ const harness = createRealProcessHarness("terminal-pty");
 
 afterEach(() => harness.cleanup());
 
-it("navigates to New Session, quits with Ctrl+C, and restores the real terminal", async () => {
+it("navigates to New Session, clears the prompt with Ctrl+C, quits on a second press, and restores the real terminal", async () => {
   const temporaryRoot = await harness.stateRoot("pi-agents-pty-");
   const stateRoot = harness.daemonRoot(join(temporaryRoot, "state"));
   const transcriptPath = join(temporaryRoot, "transcript");
@@ -39,6 +39,7 @@ it("navigates to New Session, quits with Ctrl+C, and restores the real terminal"
   const pty = await harness.record("pty session leader", await inspectProcessIdentity(/** @type {number} */ (child.pid)));
   let output = Buffer.alloc(0);
   let stage = "startup";
+  const press = () => { if (child.stdin.writable) child.stdin.write("\x03"); };
   const onOutput = (chunk) => {
     output = Buffer.concat([output, Buffer.from(chunk)]);
     if (stage === "startup" && output.includes(Buffer.from("pi-agents"))) {
@@ -46,10 +47,26 @@ it("navigates to New Session, quits with Ctrl+C, and restores the real terminal"
       stage = "typing";
       child.stdin.write("x");
     } else if (stage === "typing" && output.includes(Buffer.from("❯ x"))) {
-      stage = "quit";
-      child.stdin.write("\x03");
+      // One byte per repaint, never two in a tick: a pseudo-terminal delivers a burst as one read,
+      // and two keys in one read are not a key. Nothing is typed after the press that quits either,
+      // because a byte still unread when the terminal leaves raw mode is a real SIGINT.
+      stage = "clearing";
+      press();
+    } else if (stage === "clearing") {
+      // The repaint says the press was read. Typing again proves the list is still standing and that
+      // the cleared prompt holds nothing in front of the next line.
+      stage = "retyping";
+      child.stdin.write("y");
+    } else if (stage === "retyping" && output.includes(Buffer.from("❯ y"))) {
+      stage = "arming";
+      press();
+    } else if (stage === "arming") {
+      // This repaint is the cleared prompt, so the pair lands inside the window.
+      stage = "quitting";
+      press();
     }
   };
+  child.stdin.on("error", () => {});
   child.stdout.on("data", onOutput);
   child.stderr.on("data", onOutput);
 
@@ -74,7 +91,7 @@ it("navigates to New Session, quits with Ctrl+C, and restores the real terminal"
     });
   }
 
-  expect(stage).toBe("quit");
+  expect(stage).toBe("quitting");
   expect(result).toEqual({ code: 0, signal: null });
   expect(stopped.status).toBe(0);
   expect(transcript.includes(ENTER_ALT_SCREEN)).toBe(true);
@@ -82,6 +99,8 @@ it("navigates to New Session, quits with Ctrl+C, and restores the real terminal"
   expect(transcript.includes(SHOW_CURSOR)).toBe(true);
   expect(transcript.includes(ENABLE_AUTOWRAP)).toBe(true);
   expect(transcript.includes(Buffer.from("❯ x"))).toBe(true);
+  expect(transcript.includes(Buffer.from("❯ y"))).toBe(true);
+  expect(transcript.includes(Buffer.from("❯ xy"))).toBe(false);
 
   const sttyMarker = transcript.indexOf(Buffer.from("__STTY__"));
   expect(sttyMarker).toBeGreaterThanOrEqual(0);

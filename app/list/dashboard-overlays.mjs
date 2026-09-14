@@ -81,7 +81,7 @@ export function createHelpOverlay() {
             { keys: "/cwd /isolation /name", action: "set its directory, isolation, and name" },
             { keys: "Tab", action: "complete the directory typed after /cwd" },
             { keys: "? / Ctrl+G", action: "this help" },
-            { keys: "Ctrl+C", action: "quit" },
+            { keys: "Ctrl+C", action: "clear the prompt; press again within 500 ms to quit" },
         ],
     };
 }

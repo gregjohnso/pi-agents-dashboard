@@ -231,9 +231,13 @@ it("drives list navigation, search/filter/sort/group, metadata/help, composer, c
   // Tab reaches no launch field any more, so it cannot move a cursor away from the prompt.
   f.dashboard.handleInput("\t");
   expect(f.dashboard.composerDraft.prompt).toBe("draft");
+  // Ctrl+C clears the prompt and leaves the list standing; a second press inside the window quits.
+  f.dashboard.handleInput("\x03");
+  expect(f.dashboard.composerDraft.prompt).toBe("");
+  expect(onClose).not.toHaveBeenCalled();
   f.dashboard.handleInput("\x03");
   await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith({ kind: "closed" }));
-  expect(f.dashboard.composerDraft.prompt).toBe("draft");
+  expect(f.dashboard.composerDraft.prompt).toBe("");
   expect(f.client.stop).toHaveBeenCalledTimes(1);
   expect(f.client.delete).toHaveBeenCalledTimes(1);
 });

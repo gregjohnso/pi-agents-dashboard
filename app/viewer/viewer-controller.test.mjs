@@ -98,7 +98,7 @@ function fixture(overrides = {}) {
   };
   const persistence = { async load() { return overrides.persisted; }, async save(value) { await overrides.save?.(value); saved.push(structuredClone(value)); order.push(`persist:${value.cursor?.sequence ?? "draft"}`); } };
   const dashboard = [];
-  const instance = new ViewerController({ sessionId: "s", client, editor: overrides.editor ?? editor(), persistence, requestRender: async () => { order.push("render"); }, onReturn: vi.fn(), now: () => 0, onDashboardAction: (action) => dashboard.push(action) });
+  const instance = new ViewerController({ sessionId: "s", client, editor: overrides.editor ?? editor(), persistence, requestRender: async () => { order.push("render"); }, onReturn: vi.fn(), onQuit: overrides.onQuit, now: overrides.now ?? (() => 0), onDashboardAction: (action) => dashboard.push(action) });
   // Observe the pump: `emit` and `refuseStream` settle exactly as the controller's own handling of
   // that event or failure settled, so a test never polls for work the pump has already finished.
   /** @param {string} method @returns {() => any} */
@@ -183,6 +183,69 @@ describe("viewer commands", () => {
     await vi.waitFor(() => expect(f.commands.at(-1)).toEqual({ operation: "ui_response", payload: { sessionId: "s", uiRequestId: "ui-working", response: true } }));
     expect(dispose).toHaveBeenCalledOnce();
     expect(f.instance.overlay).toBeUndefined();
+  });
+
+  it("clears the prompt on Ctrl+C without interrupting an idle session, and quits on a second press inside 500 ms", async () => {
+    let now = 1_000;
+    const onQuit = vi.fn();
+    const f = fixture({ now: () => now, onQuit });
+    await f.instance.open();
+    f.instance.editor.setText("draft");
+    f.instance.handleInput("\x03");
+    expect(f.instance.editor.getText()).toBe("");
+    expect(f.commands).toEqual([]);
+    expect(onQuit).not.toHaveBeenCalled();
+    // The window has passed, so this press clears again rather than quitting.
+    now += 500;
+    f.instance.handleInput("\x03");
+    expect(onQuit).not.toHaveBeenCalled();
+    now += 499;
+    f.instance.handleInput("\x03");
+    expect(onQuit).toHaveBeenCalledOnce();
+    // Quitting is the frontend leaving: it never returns to the list and sends the session nothing.
+    expect(f.instance.onReturn).not.toHaveBeenCalled();
+    expect(f.commands).toEqual([]);
+    await f.instance.close();
+  });
+
+  it("interrupts a working turn once and sends nothing on the press that quits", async () => {
+    const onQuit = vi.fn();
+    const f = fixture({ snapshot: { taskState: "WORKING" }, onQuit });
+    await f.instance.open();
+    f.instance.editor.setText("draft");
+    f.instance.handleInput("\x03");
+    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "interrupt", payload: { sessionId: "s" } }]));
+    expect(f.instance.editor.getText()).toBe("");
+    expect(onQuit).not.toHaveBeenCalled();
+    f.instance.handleInput("\x03");
+    expect(onQuit).toHaveBeenCalledOnce();
+    expect(f.commands).toHaveLength(1);
+    await f.instance.close();
+  });
+
+  it("clears a steer draft with Ctrl+C and stays in steer mode", async () => {
+    const f = fixture({ snapshot: { taskState: "WORKING" } });
+    await f.instance.open();
+    f.instance.handleInput("\x13");
+    for (const character of "urgent") f.instance.handleInput(character);
+    expect(f.instance.editor.getText()).toBe("urgent");
+    f.instance.handleInput("\x03");
+    expect(f.instance.editor.getText()).toBe("");
+    expect(f.instance.inputMode).toBe("steer");
+    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "interrupt", payload: { sessionId: "s" } }]));
+    await f.instance.close();
+  });
+
+  it("forgets an armed quit when the same viewer is reopened", async () => {
+    const onQuit = vi.fn();
+    const f = fixture({ onQuit });
+    await f.instance.open();
+    f.instance.handleInput("\x03");
+    await f.instance.close();
+    await f.instance.open();
+    f.instance.handleInput("\x03");
+    expect(onQuit).not.toHaveBeenCalled();
+    await f.instance.close();
   });
 
   it("discovers slash commands, applies model selection, and reloads the menu", async () => {

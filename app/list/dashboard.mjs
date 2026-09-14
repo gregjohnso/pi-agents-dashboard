@@ -3,6 +3,7 @@ import { stat } from "node:fs/promises";
 import { stripVTControlCharacters } from "node:util";
 
 import { decodeKittyPrintable, Key, matchesKey, truncateToWidth, visibleWidth, } from "@earendil-works/pi-tui";
+import { ClearQuitGesture } from "../clear-quit-gesture.mjs";
 import { pastedText } from "./dashboard-input.mjs";
 import { sessionNameFromPrompt } from "../../runtime/session-name.mjs";
 import { SPINNER_INTERVAL_MS } from "../spinner.mjs";
@@ -160,6 +161,7 @@ export class DashboardController {
     /** The read loop draining that flag, while one is running. */
     listReads;
     stopClearGesture;
+    clearQuitGesture;
     animationTimer;
     summaryRefreshTimer;
     /** Launches sent but not yet answered, shown as STARTING rows so a prompt never looks lost. */
@@ -202,6 +204,7 @@ export class DashboardController {
         this.now = options.now ?? Date.now;
         this.stopRetryLimit = options.stopRetryLimit ?? 8;
         this.stopClearGesture = new StopClearGesture({ now: options.now });
+        this.clearQuitGesture = new ClearQuitGesture({ now: options.now });
         this.launchDefaults = options.launchDefaults ?? {};
         this.isDirectory = options.isDirectory ?? existingDirectory;
         this.worktreeCapability = options.worktreeCapability ?? probeWorktreeCapability;
@@ -218,6 +221,8 @@ export class DashboardController {
         if (!this.closed)
             return;
         this.closed = false;
+        // A quit armed before this list was put away cannot travel into the list it comes back as.
+        this.clearQuitGesture.cancel();
         this.closePromise = undefined;
         this.listReads = undefined;
         const generation = ++this.openGeneration;
@@ -700,15 +705,23 @@ export class DashboardController {
         await this.openViewer(selected.sessionId);
     }
     handleInput(data) {
-        if (matchesKey(data, Key.ctrl("c"))) {
-            void this.close();
-            return;
-        }
         // Any key other than a second Ctrl+X abandons an armed clear, so the red warning cannot linger
         // and a later keystroke cannot inherit it.
         if (this.stopClearArmed && !matchesKey(data, Key.ctrl("x"))) {
             this.stopClearGesture.cancel();
             this.requestRender?.();
+        }
+        // Pi's Ctrl+C: the first press empties the prompt and leaves the list standing, and only a
+        // second press inside the window quits. Quitting is this frontend leaving: no session is
+        // stopped, cleared, or asked for anything.
+        if (matchesKey(data, Key.ctrl("c"))) {
+            if (this.clearQuitGesture.press() === "quit") {
+                void this.close();
+                return;
+            }
+            this.setComposerPrompt("");
+            this.requestRender?.();
+            return;
         }
         if (this.focus === "confirmation") {
             if (matchesKey(data, Key.escape)) {

@@ -219,20 +219,42 @@ describe("dashboard controller", () => {
         release();
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
     });
-    it("closes the list only on Ctrl+C; Left and Escape are inert", async () => {
+    it("clears the prompt on Ctrl+C and closes the list only on a second press inside 500 ms", async () => {
+        let clock = 1_000;
         const client = new FakeDaemonClient([session("a", { processState: "LIVE" })]);
         const onClose = vi.fn();
-        const dashboard = controller(client, { onClose });
+        const dashboard = controller(client, { onClose, now: () => clock });
         await dashboard.open();
         dashboard.handleInput("\x1b[D");
         dashboard.handleInput("\x1b");
+        for (const input of "draft")
+            dashboard.handleInput(input);
+        dashboard.handleInput("\x03");
+        expect(dashboard.composerDraft.prompt).toBe("");
         expect(onClose).not.toHaveBeenCalled();
         expect(client.unsubscribed).toBe(0);
+        // The window has passed, so this press clears again rather than quitting.
+        clock += 500;
+        dashboard.handleInput("\x03");
+        expect(onClose).not.toHaveBeenCalled();
+        clock += 499;
         dashboard.handleInput("\x03");
         await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith({ kind: "closed" }));
         expect(client.stop).not.toHaveBeenCalled();
         expect(client.delete).not.toHaveBeenCalled();
         expect(client.unsubscribed).toBe(1);
+    });
+    it("forgets an armed quit when the same controller is reopened", async () => {
+        const client = new FakeDaemonClient([session("a", { processState: "LIVE" })]);
+        const onClose = vi.fn();
+        const dashboard = controller(client, { onClose, now: () => 1_000 });
+        await dashboard.open();
+        dashboard.handleInput("\x03");
+        await dashboard.close();
+        await dashboard.open();
+        dashboard.handleInput("\x03");
+        expect(dashboard.closed).toBe(false);
+        expect(onClose).toHaveBeenCalledTimes(1);
     });
     it.each([
         ["an empty list", []],
@@ -344,7 +366,7 @@ describe("dashboard controller", () => {
         await dashboard.open();
         dashboard.setView("all");
         dashboard.selectSession("a");
-        for (const key of ["\x1b", "\x7f", "x"]) {
+        for (const key of ["\x1b", "\x7f", "x", "\x03"]) {
             dashboard.handleInput("\x18");
             expect(dashboard.stopClearArmed).toBe(true);
             dashboard.handleInput(key);

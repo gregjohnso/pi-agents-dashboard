@@ -101,6 +101,22 @@ export function mountStandaloneHost({ tui, getActive, getHeight, terminal }) {
   };
 }
 
+/**
+ * One frontend shutdown, however it is reached: the operator quitting from the list or from a
+ * hosted viewer, and an outer `close`, all run this once. @param {any} options
+ */
+export function createHostShutdown({ currentViewer, controller, tui, client, resolveClosed }) {
+  /** @type {Promise<void> | undefined} */
+  let closing;
+  return {
+    get started() { return closing !== undefined; },
+    run() {
+      closing ??= (async () => { await currentViewer()?.close(); await controller.close(); tui.stop(); await client.close(); resolveClosed(); })();
+      return closing;
+    },
+  };
+}
+
 /** Open the relocated list and real viewer in one package-root TUI. @param {any} options */
 export async function createStandaloneList({ cwd, frontend }) {
   const token = (await fs.readFile(join(frontend.root, "daemon", "control.token"), "utf8")).trim();
@@ -134,6 +150,8 @@ export async function createStandaloneList({ cwd, frontend }) {
           sessionId, client, editor, cwd,
           persistence: { async load() { return viewerState.get(sessionId); }, async save(value) { viewerState.set(sessionId, structuredClone(value)); } },
           requestRender: () => tui.requestRender(), onReturn: () => { void viewer.close(); },
+          // Returning hands the list back; quitting ends this whole frontend, list included.
+          onQuit: () => { void shutdown.run(); },
           onDashboardAction: (/** @type {string} */ action) => {
             pendingDashboardAction = action;
             void viewer.close();
@@ -150,7 +168,7 @@ export async function createStandaloneList({ cwd, frontend }) {
       },
       restoreListFocus() { standaloneHost.focus(); },
       onRestoreClosed() { tui.stop(); resolveClosed(); },
-      shouldRestore() { return closing === undefined; },
+      shouldRestore() { return !shutdown.started; },
     });
     switching = false;
   };
@@ -160,16 +178,13 @@ export async function createStandaloneList({ cwd, frontend }) {
     launchDefaults: { cwd }, requestRender: () => tui.requestRender(),
     onClose: () => { if (!switching && activeViewer === undefined) { tui.stop(); resolveClosed(); } },
   });
+  const shutdown = createHostShutdown({ currentViewer: () => activeViewer, controller, tui, client, resolveClosed: () => resolveClosed() });
   active = controller;
   standaloneHost = mountStandaloneHost({ tui, getActive: () => active, terminal });
   await controller.open();
   startStandaloneTui(tui);
-  let closing;
   return {
     closed,
-    close() {
-      closing ??= (async () => { await activeViewer?.close(); await controller.close(); tui.stop(); await client.close(); resolveClosed(); })();
-      return closing;
-    },
+    close() { return shutdown.run(); },
   };
 }

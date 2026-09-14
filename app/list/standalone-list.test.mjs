@@ -1,6 +1,90 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { runViewerTransition } from "./standalone-list.mjs";
+import { ViewerController } from "../viewer/viewer-controller.mjs";
+import { createHostShutdown, runViewerTransition } from "./standalone-list.mjs";
+
+const at = "2026-08-25T00:00:00Z";
+
+/** One editor double: enough of Pi's CustomEditor for the viewer to hold a draft. */
+function editor() {
+  let text = "";
+  return {
+    focused: false, onSubmit: undefined, onChange: undefined,
+    setText(value) { text = value; this.onChange?.(value); },
+    getText() { return text; },
+    addToHistory() {},
+    setAutocompleteProvider() {},
+    handleInput(data) { if (data === "\r") this.onSubmit?.(text); else if (data.length === 1 && data >= " ") { text += data; this.onChange?.(text); } },
+    render: () => [`> ${text}`],
+  };
+}
+
+/** A daemon client that answers the viewer's subscription and never publishes an event. */
+function hostClient() {
+  return {
+    commands: [],
+    attach: vi.fn(async () => {}),
+    detach: vi.fn(async () => {}),
+    close: vi.fn(async () => {}),
+    async subscribeViewer() {
+      return {
+        snapshot: {
+          version: 1, sessionId: "s", registryRevision: 1, cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "0" }, runtime: null,
+          taskState: "READY", processState: "LIVE", outcome: "NONE",
+          activity: { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "snapshot", startedAt: at },
+          model: null, thinkingLevel: null, items: [], tools: [], pendingUi: [], errors: [],
+        },
+        events: { async next() { return new Promise(() => {}); }, async return() { return { value: undefined, done: true }; } },
+        unsubscribe() {},
+      };
+    },
+    onConnectionChange() { return () => {}; },
+    async command(operation, payload) { this.commands.push({ operation, payload }); return { accepted: true }; },
+    async sessionMenu() { return { commands: [], models: [], model: null, color: null }; },
+  };
+}
+
+it("ends the whole frontend when the hosted viewer quits, instead of coming back to the list", async () => {
+  const client = hostClient();
+  const tui = { stop: vi.fn(), requestRender: vi.fn() };
+  const controller = { closed: false, close: vi.fn(async () => { controller.closed = true; }), open: vi.fn(async () => { controller.closed = false; }) };
+  const activateList = vi.fn();
+  let activeViewer;
+  let resolveClosed;
+  const closed = new Promise((resolve) => { resolveClosed = resolve; });
+  const shutdown = createHostShutdown({ currentViewer: () => activeViewer, controller, tui, client, resolveClosed: () => resolveClosed() });
+  const transition = runViewerTransition({
+    sessionId: "s", client, controller,
+    createViewer() {
+      /** @type {any} */
+      let viewer;
+      viewer = new ViewerController({
+        sessionId: "s", client, editor: editor(), now: () => 0,
+        persistence: { async load() { return undefined; }, async save() {} },
+        requestRender: () => tui.requestRender(),
+        onReturn: () => { void viewer.close(); },
+        onQuit: () => { void shutdown.run(); },
+      });
+      return viewer;
+    },
+    activateViewer(viewer) { activeViewer = viewer; },
+    activateList, restoreListFocus: vi.fn(),
+    shouldRestore: () => !shutdown.started,
+  });
+  await vi.waitFor(() => expect(activeViewer?.state).toBeDefined());
+
+  activeViewer.handleInput("\x03");
+  activeViewer.handleInput("\x03");
+
+  await closed;
+  await expect(transition).resolves.toEqual({ kind: "returned" });
+  expect(controller.open).not.toHaveBeenCalled();
+  expect(activateList).not.toHaveBeenCalled();
+  expect(tui.stop).toHaveBeenCalledOnce();
+  expect(client.close).toHaveBeenCalledOnce();
+  // Quitting is the frontend leaving: the session itself is told nothing.
+  expect(client.commands).toEqual([]);
+});
 
 it("detaches and reopens the same list when viewer construction fails", async () => {
   const constructionError = new Error("viewer construction failed");

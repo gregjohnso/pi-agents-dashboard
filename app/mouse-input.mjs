@@ -1,11 +1,13 @@
 /**
- * Wheel-event extraction for full-screen surfaces.
+ * Wheel-event extraction for the dashboard, which is the one surface pi-tui cannot deliver one to.
  *
  * pi-tui 0.84.3 offers no component mouse seam: `TuiAltScreen.handleViewportInput` parses wheel
- * bytes and returns `{ consume: true }` before any child dispatch, then scrolls its own ScrollViews,
- * which our full-screen renderers never use. So a wheel event cannot reach a component at all.
- * Reading wheel input ahead of the TUI is the only way to scroll our own surfaces. The canary tests
- * in mouse-input.test.mjs fail once pi-tui grows a real seam, so this module can be deleted then.
+ * bytes and returns `{ consume: true }` before any child dispatch, then scrolls its own ScrollViews.
+ * The list is not one of Pi's layouts and owns no scroll view, so a wheel notch over it would reach
+ * nothing; reading wheel input ahead of the TUI is the only way to move its selection. The viewer is
+ * the opposite case and this tap stands down for it (`setWheelCapture(false)`), because there every
+ * mouse byte is Pi's: its own scrolling, its text selection and its hyperlinks. The canary tests in
+ * mouse-input.test.mjs fail once pi-tui grows a real seam, so this module can be deleted then.
  */
 
 const SGR_MOUSE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])/;
@@ -99,13 +101,18 @@ export function parseWheelInput(data) {
  * byte reaches the TUI unchanged.
  *
  * The returned terminal also exposes `onWheel(listener)` so a host mounted after construction can
- * subscribe; the constructor argument is optional for that reason.
+ * subscribe; the constructor argument is optional for that reason. `setWheelCapture(false)` stands
+ * the tap down for a surface that is one of Pi's own layouts: Pi reads those mouse bytes itself, for
+ * scrolling, selection and hyperlinks, and reading them here first would take all three away.
  *
  * @param {any} terminal
  * @param {(event: { button: "wheel_up" | "wheel_down" | "left", column: number, row: number }) => void} [onWheel]
  */
 export function createWheelInputTap(terminal, onWheel) {
   let pending = "";
+  let capturing = true;
+  /** The TUI's own input callback, so bytes held mid-sequence are handed over rather than dropped. */
+  let forward;
   /** @type {ReturnType<typeof setTimeout> | undefined} */
   let flushTimer;
   const cancelFlush = () => { if (flushTimer !== undefined) { clearTimeout(flushTimer); flushTimer = undefined; } };
@@ -120,8 +127,20 @@ export function createWheelInputTap(terminal, onWheel) {
           return () => { const index = listeners.indexOf(listener); if (index >= 0) listeners.splice(index, 1); };
         };
       }
+      if (property === "setWheelCapture") {
+        return (/** @type {boolean} */ enabled) => {
+          capturing = enabled;
+          if (enabled) return;
+          cancelFlush();
+          const held = pending;
+          pending = "";
+          if (held !== "") forward?.(held);
+        };
+      }
       if (property === "start") {
         return (onInput, onResize) => target.start((data) => {
+          forward = onInput;
+          if (!capturing) { onInput(data); return; }
           cancelFlush();
           const result = parseWheelInput(pending + data);
           pending = result.pending;

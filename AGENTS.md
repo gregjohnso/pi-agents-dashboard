@@ -16,6 +16,8 @@ Record what you learn in the reference document in your own words. Do not copy A
 
 Copy it by default. Diverging needs a hard reason, meaning the alternative loses the operator's work, corrupts durable state, hides a failure from him, or Pi cannot support it. These are not reasons: it is not how we built it, it feels safer, or we already wrote the other version.
 
+Claude Code is the reference for session management, not for interaction inside a session. Which sessions exist, how they are launched, listed, stopped, cleared and attached to is Claude-style and belongs to this package. What happens inside an open session is Pi's: its keybindings including the operator's own `keybindings.json`, its editor, its transcript viewport with the keys, wheel, selection, hyperlinks and search that move it, and its dialogs. Do not invent a key, a scrolling model or a selection gesture for the viewer; bind Pi's action, or mount Pi's component. The two exceptions are the dashboard's own return-to-list gesture and the list's row navigation, which is not a Pi surface at all.
+
 Four divergences are deliberate and each has a hard reason. Our workers survive daemon absence indefinitely rather than a 60-second orphan timeout, because that timeout could end running work. Rows use structured state, never inference from terminal output or Pi's session file, because inference hides failures. `rm` forgets only the dashboard record and never touches Pi's canonical file or a worktree. The viewer reconstructs the session rather than hosting a pseudo-terminal, because Pi exposes no repaint, readiness, or detach channel.
 
 ## Read before you change anything

@@ -1,7 +1,7 @@
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 
-import { PendingUiOverlay, renderStatusIndicator } from "./overlays.mjs";
+import { CommandSelectionOverlay, PendingUiOverlay, TextPanelOverlay, renderStatusIndicator } from "./overlays.mjs";
 
 const tui = { requestRender: vi.fn(), setFocus: vi.fn(), mode: "fullscreen" };
 
@@ -57,6 +57,24 @@ describe("pending Pi UI overlays", () => {
     expect(prompt.control.focused).toBe(false);
   });
 
+  // Pi's own cancel keybinding is escape or ctrl+c, and an operator may rebind it. Hard-coding the
+  // escape byte left ctrl+c to fall through to the viewer, which quit the frontend from a dialog.
+  it.each([["Escape", "\x1b"], ["Ctrl+C", "\x03"]])("cancels every overlay on Pi's own %s", (_label, key) => {
+    const dialog = vi.fn();
+    const pending = new PendingUiOverlay({ request: { id: "s", method: "select", title: "Choose", options: ["one", "two"] }, tui, respond: dialog });
+    expect(pending.handleInput(key)).toBe(true);
+    expect(dialog).toHaveBeenCalledWith({ requestId: "s", cancelled: true });
+
+    const chosen = vi.fn();
+    const selection = new CommandSelectionOverlay({ title: "Select a model", items: [{ value: "a", label: "A" }], tui, respond: chosen });
+    selection.handleInput(key);
+    expect(chosen).toHaveBeenCalledWith(undefined);
+
+    const closed = vi.fn();
+    const panel = new TextPanelOverlay({ title: "Viewer help", rows: ["a row"], tui, respond: closed });
+    panel.handleInput(key);
+    expect(closed).toHaveBeenCalledOnce();
+  });
 });
 
 describe("Pi status indicator and system cards", () => {

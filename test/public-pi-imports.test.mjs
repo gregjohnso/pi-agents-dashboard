@@ -29,11 +29,24 @@ it("resolves and instantiates approved high-level viewer components from package
   for (const component of [input, markdown, scroll, select, settings, border, altScreen]) expect(component.render(40).every((line) => visibleWidth(line) <= 40)).toBe(true);
 });
 
+// Pi 0.84.3 exports only ".", "./rpc-entry" and "./client", so its keybinding table, user config
+// loader, legacy-name migrations and shell-free browser opener have no package-name specifier.
+// Reusing them beats restating them, and this pins the exception to two modules and one resolution
+// each: their own tests fail if Pi moves either file.
+it.each([
+  ["app/viewer/pi-keybindings.mjs", 'new URL("./core/keybindings.js"'],
+  ["app/viewer/pi-native-helpers.mjs", 'new URL("./utils/open-browser.js"'],
+])("keeps %s to one documented deep Pi import", async (path, resolution) => {
+  const source = await readFile(resolve(root, path), "utf8");
+  expect(source.match(/new URL\("\.\/[^"]+"/gu)).toEqual([resolution]);
+  expect(source).not.toMatch(/@earendil-works\/pi-(?:tui|coding-agent)\/(?:dist|src)\//u);
+});
+
 it("ships no private Pi controller, in-process session, or deep Pi import", async () => {
   const paths = [
     "app/viewer/pi-component-adapters.mjs", "app/viewer/transcript.mjs", "app/viewer/overlays.mjs",
-    "app/viewer/return-gesture.mjs", "app/viewer/viewer-controller.mjs", "app/standalone.mjs",
-    "app/list/path-completion.mjs", "app/list/dashboard.mjs",
+    "app/viewer/return-gesture.mjs", "app/viewer/viewer-controller.mjs", "app/viewer/viewer-layout.mjs", "app/standalone.mjs",
+    "app/list/path-completion.mjs", "app/list/dashboard.mjs", "app/list/standalone-list.mjs",
   ];
   const source = (await Promise.all(paths.map(async (path) => [path, await readFile(resolve(root, path), "utf8")])));
   for (const [path, text] of source) {

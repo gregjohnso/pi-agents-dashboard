@@ -1,4 +1,5 @@
 import { stripVTControlCharacters } from "node:util";
+import { keyText } from "@earendil-works/pi-coding-agent";
 import { CombinedAutocompleteProvider, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 import { SESSION_COLORS } from "../../shared/contracts.mjs";
@@ -9,6 +10,7 @@ import { EMPTY_SESSION_MENU, parseSlashSubmission, sessionSlashCommands } from "
 import { CommandSelectionOverlay, PendingUiOverlay, TextPanelOverlay, renderStatusIndicator, renderSystemCard } from "./overlays.mjs";
 import { ReturnGesture } from "./return-gesture.mjs";
 import { TranscriptModel, applyViewerEvent, createTranscriptState } from "./transcript.mjs";
+import { LinesComponent, createViewerLayout } from "./viewer-layout.mjs";
 
 function fit(line, width) {
   const clipped = truncateToWidth(line.replace(/[\r\n\u2028\u2029]/gu, " "), Math.max(0, width), "");
@@ -51,12 +53,11 @@ function framePromptBox(lines, color, width, name) {
   return [`${code}${labelled(bare)}\x1b[0m`, ...lines, `${code}${bare}\x1b[0m`];
 }
 
-// One line per wheel notch leaves acceleration to the terminal and the OS, which already translate a
-// trackpad swipe into a notch count.
-const WHEEL_SCROLL_LINES = 1;
-
 const PENDING_MESSAGE_ROWS = 3;
-const MIN_TRANSCRIPT_ROWS = 3;
+
+// Pi draws a dialog over its own transcript rather than inside it, and a dialog that captures focus
+// is what keeps the viewport keys out of it.
+const OVERLAY_OPTIONS = { anchor: "center", width: "80%", minWidth: 24, maxHeight: "70%" };
 
 /** The text blocks of one normalized user message, joined the way a submission was sent. @param {any} item */
 function userMessageText(item) {
@@ -87,16 +88,28 @@ function renderModelFooter({ model, thinkingLevel }, hideThinking, width) {
   return left + " ".repeat(Math.max(0, width - leftWidth - visibleWidth(fitted))) + fitted;
 }
 
-/** Render the widest prefix of Pi's key hints plus the dashboard's own return keys that fits. */
+/**
+ * Render the widest prefix of Pi's key hints plus the dashboard's own return keys that fits.
+ *
+ * Every key comes from Pi's own `keyText`, so an operator who rebound one is shown what he bound
+ * rather than the default this package once hard-coded.
+ */
 function renderKeyHints({ working }, width) {
+  const shared = [`${keyText("tui.altScreen.pageUp")}/${keyText("tui.altScreen.pageDown")} scroll`, `${keyText("app.message.followUp")} follow-up`, `${keyText("app.tools.expand")} tools`, `${keyText("app.thinking.toggle")} thinking`, `${keyText("app.thinking.cycle")} level`, "/ commands"];
   const segments = working
-    ? ["Esc interrupt", "← list", "↑↓ scroll", "Alt+Enter follow-up", "Ctrl+T thinking", "Ctrl+O tools", "/ commands"]
-    : ["Esc/← list", "↑↓ scroll", "Alt+Enter follow-up", "Ctrl+T thinking", "Ctrl+O tools", "/ commands"];
+    ? [`${keyText("app.interrupt")} interrupt`, "← list", ...shared]
+    : [`${keyText("app.interrupt")}/← list`, ...shared];
   for (let count = segments.length; count > 0; count -= 1) {
     const line = ` ${segments.slice(0, count).join(" · ")}`;
     if (visibleWidth(line) <= width) return line;
   }
   return "";
+}
+
+/** Whether two normalized model states name the same model, counting absent and null as one. */
+function sameModel(left, right) {
+  if (left === null || left === undefined || right === null || right === undefined) return (left ?? null) === (right ?? null);
+  return left.provider === right.provider && left.id === right.id;
 }
 
 /** @param {{ models: { provider: string, id: string }[] }} menu */
@@ -129,7 +142,10 @@ export class ViewerController {
     this.onQuit = onQuit ?? this.onReturn;
     this.onDashboardAction = onDashboardAction;
     this.now = now;
-    this.adapters = adapters ?? createPiComponentAdapters({ tui: editor.tui ?? { mode: "fullscreen", requestRender: () => this.requestRender(), setFocus() {} } });
+    // Pi's own TUI when this viewer is hosted in one. The stand-in keeps the component seams usable
+    // for a caller that renders no screen; it owns no viewport, because Pi's `ScrollView` does.
+    this.tui = editor.tui ?? { mode: "fullscreen", requestRender: () => this.requestRender(), setFocus() {} };
+    this.adapters = adapters ?? createPiComponentAdapters({ tui: this.tui });
     this.cwd = cwd;
     this.menu = EMPTY_SESSION_MENU;
     this.history = [];
@@ -145,11 +161,24 @@ export class ViewerController {
     this.closedState = true;
     this.returnGesture = new ReturnGesture({ now: () => this.now(), onReturn: () => this.onReturn() });
     this.clearQuitGesture = new ClearQuitGesture({ now: () => this.now() });
+    // Pi's keys belong to Pi's editor: it owns the action layer, resolves every one of them through
+    // the operator's own keybindings, and defers the ones a completion popup needs. Reading keys here
+    // would ignore his configuration and take Escape away from the popup.
     this.editor.onSubmit = (text) => { void this.submitText(text, "prompt"); };
+    this.editor.onEscape = () => this.pressInterrupt();
+    this.editor.onCtrlD = () => this.onQuit();
+    this.editor.onAction?.("app.clear", () => this.pressClear());
+    this.editor.onAction?.("app.thinking.toggle", () => this.toggleThinkingBlocks());
+    this.editor.onAction?.("app.thinking.cycle", () => { void this.cycleThinkingLevel(); });
+    this.editor.onAction?.("app.tools.expand", () => this.toggleToolOutput());
+    // Pi's own model selector key. It opens the picker `/model` opens, which is the one this session
+    // builds from the models its worker reported; nothing here cycles models on its own.
+    this.editor.onAction?.("app.model.select", () => { this.returnGesture.cancel(); this.openModelPicker(); });
     // Pi's own follow-up action, bound to alt+enter by the keybindings this editor was built with.
     // Both keys reach the same submission path; only the operation they name differs.
     this.editor.onAction?.("app.message.followUp", () => { void this.submitText(this.editor.getText(), "follow_up"); });
     this.editor.onChange = () => { if (!this.restoring) this.edited = true; };
+    this.installLayout();
     this.closed = new Promise((resolve) => { this.resolveClosed = resolve; });
   }
 
@@ -218,50 +247,61 @@ export class ViewerController {
     })();
   }
 
-  render(width, height) {
-    width = Math.max(0, Math.floor(width)); height = Math.max(0, Math.floor(height));
-    if (height === 0) return [];
-    if (this.state === undefined) return Array.from({ length: height }, () => fit("Loading viewer…", width));
+  /**
+   * Compose this viewer as one Pi layout: a fixed header, the whole transcript inside Pi's primary
+   * scroll view, and a fixed dock. Nothing here is clipped to a viewport, because the scroll view
+   * and the host's terminal height decide what is on screen.
+   */
+  installLayout() {
+    const layout = createViewerLayout({
+      header: new LinesComponent((width) => this.renderHeader(width)),
+      document: new LinesComponent((width) => this.transcript?.render(width) ?? []),
+      notices: new LinesComponent((width) => this.renderNotices(width)),
+      status: new LinesComponent((width) => this.renderStatus(width)),
+      editor: new LinesComponent((width) => this.renderEditor(width)),
+      footer: new LinesComponent((width) => this.renderFooter(width)),
+    });
+    this.layoutRoot = layout.root;
+    this.viewport = layout.viewport;
+  }
+
+  renderHeader(width) {
+    if (this.state === undefined) return [fit("Loading viewer…", width)];
     const header = width >= 70
       ? ` pi-agents · ${this.sessionId} · ${this.state.taskState}/${this.state.processState}`
       : width >= 50
         ? ` ${this.sessionId} · ${this.state.taskState}/${this.state.processState}`
         : ` ${this.state.taskState}/${this.state.processState}`;
-    // A stopped stream cannot report a running turn: the spinner would be drawn from the last state
-    // this viewer received, which is exactly the frozen-but-live-looking transcript this dock exists
-    // to prevent.
-    let status = renderStatusIndicator(this.state.activity, width, this.now(), { working: this.state.working && !this.streamStopped });
-    const promptLines = this.editor.render(width);
-    let editorLines = framePromptBox(promptLines, this.sessionColor, width, this.menu?.name);
-    const selectedTool = this.transcript.selectedToolId === undefined ? undefined : this.state.tools.get(this.transcript.selectedToolId);
-    const toolLine = selectedTool === undefined ? [] : [` tool:${selectedTool.name} ${selectedTool.state} ${this.transcript.expandedTools.has(selectedTool.id) ? "expanded" : "collapsed"}`];
-    let errorLines = this.state.errors.slice(-1).flatMap((error) => renderSystemCard({ text: describeViewerError(error), level: "error" }, width));
-    let pendingLines = this.renderPending();
-    const connectionLines = [
-      ...(this.daemonUnreachable ? [" Daemon unreachable · reconnecting…"] : this.streamStopped ? [" Transcript stopped · Esc to the list, then reopen this session"] : []),
-      ...(this.thinkingLoading ? [" Thinking levels… · Esc cancels"] : []),
-    ];
-    let hints = renderKeyHints(this.state, width);
-    const dockRows = () => 2 + (hints === "" ? 0 : 1) + status.length + editorLines.length + toolLine.length + errorLines.length + pendingLines.length + connectionLines.length;
-    if (height - dockRows() < MIN_TRANSCRIPT_ROWS) {
-      // Pi's dock gives up its own rows before the transcript loses any: spacers first, then the
-      // prompt frame, then the hints. Only decoration goes; every dock line with content stays.
-      status = status.slice(1); errorLines = errorLines.slice(1); pendingLines = pendingLines.slice(1);
-      if (height - dockRows() < MIN_TRANSCRIPT_ROWS) editorLines = this.editor.render(width);
-      if (height - dockRows() < MIN_TRANSCRIPT_ROWS) hints = "";
-    }
-    const transcriptHeight = Math.max(0, height - dockRows());
-    let body = this.transcript.render(width, transcriptHeight);
-    const activeOverlay = this.overlay ?? this.selection;
-    if (activeOverlay !== undefined) {
-      const overlayLines = activeOverlay.render(width).slice(0, transcriptHeight);
-      const start = Math.max(0, body.length - overlayLines.length);
-      body = [...body.slice(0, start), ...overlayLines];
-    }
-    const footer = renderModelFooter(this.state, this.hideThinking, width);
-    const lines = [header, ...body, ...connectionLines, ...errorLines, ...pendingLines, ...status, ...toolLine, ...editorLines, footer, ...(hints === "" ? [] : [hints])].map((line) => fit(line, width));
-    while (lines.length < height) lines.splice(1, 0, "");
-    return lines.slice(0, height);
+    return [fit(header, width)];
+  }
+
+  /** Connection state, the newest refusal, and what this viewer has sent and not yet seen. */
+  renderNotices(width) {
+    if (this.state === undefined) return [];
+    const connection = this.daemonUnreachable ? [" Daemon unreachable · reconnecting…"] : this.streamStopped ? [" Transcript stopped · Esc to the list, then reopen this session"] : [];
+    const errors = this.state.errors.slice(-1).flatMap((error) => renderSystemCard({ text: describeViewerError(error), level: "error" }, width));
+    return [...connection, ...errors, ...this.renderPending()].map((line) => fit(line, width));
+  }
+
+  /**
+   * A stopped stream cannot report a running turn: the spinner would be drawn from the last state
+   * this viewer received, which is exactly the frozen-but-live-looking transcript this dock exists
+   * to prevent.
+   */
+  renderStatus(width) {
+    if (this.state === undefined) return [];
+    return renderStatusIndicator(this.state.activity, width, this.now(), { working: this.state.working && !this.streamStopped }).map((line) => fit(line, width));
+  }
+
+  /** Pi's editor inside this session's frame. Its lines are left alone: they carry the cursor marker. */
+  renderEditor(width) {
+    return framePromptBox(this.editor.render(width), this.sessionColor, width, this.menu?.name);
+  }
+
+  renderFooter(width) {
+    if (this.state === undefined) return [];
+    const hints = renderKeyHints(this.state, width);
+    return [renderModelFooter(this.state, this.hideThinking, width), ...(hints === "" ? [] : [hints])].map((line) => fit(line, width));
   }
 
   handleInput(data) {
@@ -274,67 +314,18 @@ export class ViewerController {
     }
     if (this.overlay !== undefined) {
       this.returnGesture.cancel();
-      // A dialog holds text of its own, so Ctrl+C interrupts and quits here but clears nothing.
-      if (matchesKey(data, Key.ctrl("c"))) {
-        this.pressCtrlC({ clearsEditor: false });
-        return;
-      }
       this.overlay.handleInput(data);
       this.requestRender();
       return;
     }
-    if (this.thinkingLoading && matchesKey(data, Key.escape)) {
-      this.cancelThinkingPicker();
-      this.returnGesture.cancel();
-      return;
-    }
-    if (matchesKey(data, Key.ctrl("t"))) {
-      this.returnGesture.cancel();
-      void this.openThinkingPicker();
-      return;
-    }
-    if (this.transcript.selectedToolId !== undefined) {
-      if (matchesKey(data, Key.escape)) this.transcript.clearToolSelection();
-      else if (matchesKey(data, Key.up)) this.transcript.selectNextTool(-1);
-      else if (matchesKey(data, Key.down)) this.transcript.selectNextTool(1);
-      else if (matchesKey(data, Key.ctrl("o")) || matchesKey(data, Key.enter)) this.transcript.toggleSelectedTool();
-      else return;
-      this.returnGesture.cancel();
-      this.requestRender();
-      return;
-    }
-    if (matchesKey(data, Key.ctrl("o"))) { this.transcript.selectNextTool(1); this.returnGesture.cancel(); this.requestRender(); return; }
-    if (matchesKey(data, Key.home)) { this.transcript.scrollToStart(); this.returnGesture.cancel(); this.requestRender(); return; }
-    if (matchesKey(data, Key.end)) { this.transcript.scrollToEnd(); this.returnGesture.cancel(); this.requestRender(); return; }
-    if (matchesKey(data, Key.pageUp)) { this.transcript.scrollBy(-1); this.requestRender(); return; }
-    if (matchesKey(data, Key.pageDown)) { this.transcript.scrollBy(1); this.requestRender(); return; }
-    // Arrows scroll only when the editor has nothing to offer: no draft to move within and no prompt
-    // history to recall. Either one hands them back to Pi's editor, which keeps history reachable and
-    // keeps the Left double-press gesture honest about a dirty prompt.
-    if ((matchesKey(data, Key.up) || matchesKey(data, Key.down)) && this.editor.getText().length === 0 && this.history.length === 0) {
-      this.transcript.scrollBy(matchesKey(data, Key.up) ? -1 : 1);
-      this.returnGesture.cancel();
-      this.requestRender();
-      return;
-    }
+    // Pi's alternate screen reads the viewport keys off the terminal before any focused component
+    // sees them, so nothing here scrolls: PageUp/PageDown, Home/End, the wheel and search all reach
+    // the scroll view this viewer's transcript lives in.
     if (matchesKey(data, Key.up) || matchesKey(data, Key.down)) {
       this.historyUsed ||= this.history.length > 0;
       this.returnGesture.cancel();
       this.editor.handleInput(data);
       this.requestRender();
-      return;
-    }
-    if (matchesKey(data, Key.escape) && this.state.working) {
-      // Escape stops the running agent first; leaving the session needs a second Escape once it settles.
-      this.returnGesture.cancel();
-      void this.sendCommand("interrupt", {});
-      this.requestRender();
-      return;
-    }
-    if (matchesKey(data, Key.escape)) {
-      // The agent is settled: leave now. The draft is persisted, so no second press is needed.
-      this.returnGesture.cancel();
-      this.onReturn();
       return;
     }
     if (matchesKey(data, Key.left)) {
@@ -352,35 +343,63 @@ export class ViewerController {
       return;
     }
     this.returnGesture.cancelForInput("other");
-    if (matchesKey(data, Key.ctrl("c"))) {
-      this.pressCtrlC({ clearsEditor: true });
-      return;
-    }
     this.editor.handleInput(data);
     this.requestRender();
   }
 
   /**
-   * Pi's Ctrl+C: stop a running turn and empty the editor, and quit only when a second press lands
-   * inside the window. The press that quits sends nothing, so leaving cannot interrupt twice.
-   * @param {{ clearsEditor: boolean }} options
+   * Pi's `app.interrupt`, which is Escape: stop a running turn, and leave the session once it is
+   * settled. Pi's editor calls this only when no completion popup is open, so Escape still closes
+   * the popup first. The draft is persisted, so leaving needs no second press.
    */
-  pressCtrlC({ clearsEditor }) {
+  pressInterrupt() {
+    this.returnGesture.cancel();
+    if (this.state?.working) {
+      void this.sendCommand("interrupt", {});
+      this.requestRender();
+      return;
+    }
+    this.onReturn();
+  }
+
+  /**
+   * Pi's `app.clear`, which is Ctrl+C: empty the composer, and quit when a second press lands inside
+   * the window. It interrupts nothing, because Escape is Pi's interrupt: a press that only meant to
+   * abandon a half-typed line must not stop the turn that is running.
+   */
+  pressClear() {
+    this.returnGesture.cancel();
     if (this.clearQuitGesture.press() === "quit") {
       this.onQuit();
       return;
     }
-    if (this.state.working) void this.sendCommand("interrupt", {});
-    if (clearsEditor) this.clearEditor();
+    this.clearEditor();
+  }
+
+  /** Pi's `app.thinking.toggle`: show or hide thinking blocks in this transcript. No session sees it. */
+  toggleThinkingBlocks() {
+    this.returnGesture.cancel();
+    this.hideThinking = !this.hideThinking;
+    this.transcript.setThinkingHidden(this.hideThinking);
     this.requestRender();
   }
 
-  /** @param {{ button: string, column: number, row: number }} event */
-  handleMouse(event) {
-    if (this.closedState || this.state === undefined) return;
-    if (event.button === "wheel_up") this.transcript.scrollBy(-WHEEL_SCROLL_LINES);
-    else if (event.button === "wheel_down") this.transcript.scrollBy(WHEEL_SCROLL_LINES);
-    else return;
+  /**
+   * Pi's `app.model.select`: the picker a bare `/model` opens, on the key Pi binds it to.
+   *
+   * The composer is the operator's, not this picker's: he pressed a key, he did not submit a line.
+   * So nothing here writes to the editor at all, which is what keeps his draft and his cursor where
+   * he left them through the open, a cancel, and the round trip a chosen model costs.
+   */
+  openModelPicker() {
+    if (this.openSelection("MODEL_REQUIRED", undefined, { composer: "keep" })) return;
+    void this.recordError({ code: "MODEL_REQUIRED", message: "This session reported no models. Stop and reopen the session to refresh them.", retryable: false });
+  }
+
+  /** Pi's `app.tools.expand`: expand or collapse every tool's output at once. No session sees it. */
+  toggleToolOutput() {
+    this.returnGesture.cancel();
+    this.transcript.setToolsExpanded(!this.transcript.toolsExpanded);
     this.requestRender();
   }
 
@@ -414,42 +433,34 @@ export class ViewerController {
   }
 
   /**
-   * Ctrl+T: choose what Pi thinks with, from the levels Pi reports for the model this session is on.
+   * Pi's `app.thinking.cycle`, which is Shift+Tab: move to the next thinking level Pi reported for
+   * the model this session is on.
    *
-   * The levels are read on every press rather than reused, because Pi answers them per model and a
-   * session that changed model has a different set. Nothing here touches the composer, the
-   * transcript, or the level the footer draws: only Pi's own confirmation moves that.
+   * The level this counts from is the one last asked for while Pi has not confirmed it yet, so two
+   * quick presses move two steps rather than sending the same level twice; a refusal drops that
+   * memory, so the press after it counts from what Pi last confirmed. Nothing here moves the footer:
+   * only Pi's own confirmation does.
    */
-  async openThinkingPicker() {
-    if (this.state === undefined || this.thinkingLoading) return;
-    const read = (this.thinkingRead ?? 0) + 1;
-    this.thinkingRead = read;
-    this.thinkingLoading = true;
-    void this.requestRender();
-    const loaded = await this.loadMenu();
-    // Escape, a close, or a second press while this read was in flight owns the outcome now.
-    if (this.thinkingRead !== read || this.closedState) return;
-    this.thinkingLoading = false;
+  async cycleThinkingLevel() {
+    if (this.state === undefined) return;
+    // Pi reports the levels in the session menu, which is a worker round trip that starts behind the
+    // open and is normally still in flight when the first frame is drawn. A press that read the menu
+    // now would find it empty and tell the operator his session reported no levels at all, so it
+    // waits for the read already running rather than starting one of its own.
+    await this.menuLoaded;
+    if (this.closedState || this.state === undefined) return;
     const levels = this.menu.thinkingLevels ?? [];
-    if (!loaded) { void this.requestRender(); return; }
     if (levels.length === 0) {
       await this.recordError({ code: "THINKING_LEVELS_UNAVAILABLE", message: "This session reported no thinking levels. Pi reports them per model, and a worker from an older release reports none at all; stop and reopen the session to refresh it.", retryable: false });
       return;
     }
-    const current = this.menu.thinkingLevel ?? undefined;
-    this.showSelection({
-      title: "Select a thinking level",
-      items: levels.map((level) => ({ value: level, label: level === current ? `${level} · current` : level })),
-      selected: current,
-      onChoice: (level) => { void this.sendCommand("session_command", { command: "set_thinking_level", level }); },
-    });
-  }
-
-  /** Drop a thinking-level read the operator no longer wants, without sending anything. */
-  cancelThinkingPicker() {
-    this.thinkingRead = (this.thinkingRead ?? 0) + 1;
-    this.thinkingLoading = false;
-    void this.requestRender();
+    const current = this.requestedThinkingLevel ?? this.state.thinkingLevel ?? this.menu.thinkingLevel;
+    const level = levels[(levels.indexOf(/** @type {any} */ (current)) + 1) % levels.length];
+    this.requestedThinkingLevel = level;
+    // One request at a time, in press order: two levels racing would leave the session on whichever
+    // Pi happened to apply last.
+    this.thinkingCycle = (this.thinkingCycle ?? Promise.resolve(true)).then(() => this.sendCommand("session_command", { command: "set_thinking_level", level }));
+    if (!await this.thinkingCycle && this.requestedThinkingLevel === level) this.requestedThinkingLevel = undefined;
   }
 
   /**
@@ -458,9 +469,12 @@ export class ViewerController {
    * `operation` is the key the operator pressed, not a reading of this session's state: `prompt` for
    * Enter and `follow_up` for Alt+Enter. The worker turns each into the streaming behavior Pi applies
    * if a run is already going, and Pi decides that in the same step it reads its own state.
-   * @param {string} text @param {"prompt" | "follow_up"} operation
+   * `fromComposer` is false for text this viewer built from a key-opened picker rather than from the
+   * operator's own line: it is not his to record in prompt history, and the composer it never came
+   * from must be left exactly as he has it, including whatever he typed while the command was away.
+   * @param {string} text @param {"prompt" | "follow_up"} operation @param {{ fromComposer?: boolean }} [options]
    */
-  async submitText(text, operation = "prompt") {
+  async submitText(text, operation = "prompt", { fromComposer = true } = {}) {
     const prompt = text.trim();
     if (this.state === undefined || prompt.length === 0) return;
     const submission = parseSlashSubmission(prompt, this.menu);
@@ -494,8 +508,9 @@ export class ViewerController {
       await this.loadMenu();
     } else {
       const entry = this.notePending(submission.text);
-      if (!await this.sendCommand(operation, { text: submission.text })) { this.dropPending(entry); this.recoverRefusedText(prompt); return; }
+      if (!await this.sendCommand(operation, { text: submission.text })) { this.dropPending(entry); if (fromComposer) this.recoverRefusedText(prompt); return; }
     }
+    if (!fromComposer) return;
     this.history.push(prompt);
     this.editor.addToHistory?.(prompt);
     this.restoring = true; this.editor.setText(""); this.restoring = false;
@@ -606,21 +621,40 @@ export class ViewerController {
     this.requestRender();
   }
 
+  /**
+   * Put one overlay in front of the transcript through Pi's own overlay stack, which is what keeps
+   * the viewport keys and search out of a dialog that is waiting for an answer.
+   * @param {any} overlay
+   */
+  presentOverlay(overlay) {
+    const handle = this.tui.showOverlay?.(overlay, OVERLAY_OPTIONS);
+    void this.requestRender();
+    return handle;
+  }
+
+  /** @param {any} overlay @param {any} handle */
+  dismissOverlay(overlay, handle) {
+    overlay?.dispose();
+    handle?.hide();
+  }
+
   /** @param {string} title @param {string[]} rows */
   openTextPanel(title, rows) {
-    this.overlay?.dispose();
+    this.dismissOverlay(this.overlay, this.overlayHandle);
     this.overlay = new TextPanelOverlay({
       title, rows,
-      tui: this.editor.tui ?? { requestRender: () => this.requestRender(), setFocus() {} },
+      tui: this.tui,
       returnFocus: this.editor,
       respond: () => {
         const resolved = this.overlay;
+        const handle = this.overlayHandle;
         this.overlay = undefined;
-        resolved?.dispose();
+        this.overlayHandle = undefined;
+        this.dismissOverlay(resolved, handle);
         void this.requestRender();
       },
     });
-    void this.requestRender();
+    this.overlayHandle = this.presentOverlay(this.overlay);
   }
 
   helpRows() {
@@ -629,13 +663,15 @@ export class ViewerController {
         .filter((command) => command.source === "builtin")
         .map((command) => `/${command.name}${command.argumentHint === undefined ? "" : ` ${command.argumentHint}`}  ${command.description ?? ""}`.trim()),
       "",
-      "Esc  interrupt a running turn, then return to the list",
+      `${keyText("app.interrupt")}  interrupt a running turn, then return to the list`,
       "←  return to the list",
-      "↑↓  scroll the transcript while the prompt is empty, else recall prompt history",
-      "Enter  send now, steering a run already going · Alt+Enter  queue a follow-up for after it",
-      "Home/End  jump to the start or end · wheel scrolls",
-      "Ctrl+T thinking level · Ctrl+O tools",
-      "Ctrl+C  interrupt a running turn and clear the prompt; press again within 500 ms to quit",
+      "↑↓  recall prompt history",
+      `Enter  send now, steering a run already going · ${keyText("app.message.followUp")}  queue a follow-up for after it`,
+      `${keyText("tui.altScreen.pageUp")}/${keyText("tui.altScreen.pageDown")}  scroll · ${keyText("tui.altScreen.top")}/${keyText("tui.altScreen.bottom")}  start or end · wheel scrolls · ${keyText("tui.altScreen.search")}  search the transcript`,
+      "drag  select and copy · click  open a link",
+      `${keyText("app.thinking.toggle")}  hide or show thinking blocks · ${keyText("app.thinking.cycle")}  next thinking level`,
+      `${keyText("app.tools.expand")}  expand or collapse every tool's output`,
+      `${keyText("app.clear")}  clear the prompt; press again within 500 ms to quit · ${keyText("app.exit")}  quit from an empty prompt`,
     ];
   }
 
@@ -733,7 +769,22 @@ export class ViewerController {
     try {
       const event = parseViewerEvent(value);
       if (event.sessionId !== this.sessionId) throw Object.assign(new Error("Viewer event session mismatch"), { code: "VIEWER_SESSION_MISMATCH" });
+      const previousModel = this.state.model;
       this.state = applyViewerEvent(this.state, event);
+      // Pi confirmed the level this viewer asked for, so the next cycle counts from Pi's own state.
+      if (this.requestedThinkingLevel !== undefined && this.state.thinkingLevel === this.requestedThinkingLevel) this.requestedThinkingLevel = undefined;
+      // Pi reports thinking levels per model, so a model that actually changed makes the ones held
+      // here stale, and the level this viewer is still waiting on with it. Reading them again behind
+      // the event keeps a cycle from sending a level this model has no use for.
+      //
+      // Only a change reloads. Reading the menu is itself a Pi `get_state`, and the normalizer
+      // republishes every `get_state` response as another `model_state` carrying the same model, so
+      // reloading on each one is a request loop between this viewer and Pi that never settles: one
+      // acceptance run logged 11,732 Pi commands for a single session.
+      if (event.payload.kind === "model_state" && !sameModel(previousModel, this.state.model)) {
+        this.requestedThinkingLevel = undefined;
+        this.menuLoaded = this.loadMenu().then(() => this.requestRender()).catch((error) => this.fail(error));
+      }
       // An event is the only proof this viewer has that its subscription is live, so it is also what
       // restores the one reload a later refusal may spend.
       this.streamStopped = false;
@@ -749,17 +800,25 @@ export class ViewerController {
     }
   }
 
-  /** Offer one Pi selection list for a built-in command submitted without its argument. @param {string} code @param {string} [submitted] */
-  openSelection(code, submitted) {
+  /**
+   * Offer one Pi selection list for a built-in command submitted without its argument.
+   *
+   * `composer: "keep"` is for a picker a key opened rather than a submitted line: the choice is not
+   * the operator's own text, so it goes neither into his prompt history nor over his draft.
+   * @param {string} code @param {string} [submitted] @param {{ composer?: "clear" | "keep" }} [options]
+   */
+  openSelection(code, submitted, { composer = "clear" } = {}) {
     const picker = SELECTION_PICKERS[code];
     if (picker === undefined) return false;
     const command = picker.command ?? submitted;
     const items = picker.items(this.menu);
     if (command === undefined || items.length === 0) return false;
-    this.showSelection({ title: picker.title(submitted), items, onChoice: (value) => { void this.submitText(`${command} ${value}`); } });
-    // The submitted line is the command this picker completes, so it leaves the composer with it.
-    this.restoring = true; this.editor.setText(""); this.restoring = false;
-    this.edited = false;
+    this.showSelection({ title: picker.title(submitted), items, onChoice: (value) => { void this.submitText(`${command} ${value}`, "prompt", { fromComposer: composer === "clear" }); } });
+    if (composer === "clear") {
+      // The submitted line is the command this picker completes, so it leaves the composer with it.
+      this.restoring = true; this.editor.setText(""); this.restoring = false;
+      this.edited = false;
+    }
     return true;
   }
 
@@ -769,39 +828,49 @@ export class ViewerController {
    * @param {{ title: string, items: { value: string, label: string }[], selected?: string, onChoice: (value: string) => void }} options
    */
   showSelection({ title, items, selected, onChoice }) {
-    this.selection?.dispose();
+    this.dismissOverlay(this.selection, this.selectionHandle);
     this.selection = new CommandSelectionOverlay({
       title, items, selected,
-      tui: this.editor.tui ?? { requestRender: () => this.requestRender(), setFocus() {} },
+      tui: this.tui,
       returnFocus: this.editor,
       respond: (/** @type {string | undefined} */ value) => {
         const resolved = this.selection;
+        const handle = this.selectionHandle;
         this.selection = undefined;
-        resolved?.dispose();
+        this.selectionHandle = undefined;
+        this.dismissOverlay(resolved, handle);
         if (value === undefined) { void this.requestRender(); return; }
         onChoice(value);
       },
     });
-    void this.requestRender();
+    this.selectionHandle = this.presentOverlay(this.selection);
   }
 
   installOverlay() {
     const request = this.state?.pendingUi.find((candidate) => !this.respondedUi.has(candidate.id));
-    if (request === undefined) { this.overlay?.dispose(); this.overlay = undefined; return; }
-    if (this.overlay?.request.id === request.id) return;
-    this.overlay?.dispose();
+    if (request === undefined) {
+      this.dismissOverlay(this.overlay, this.overlayHandle);
+      this.overlay = undefined;
+      this.overlayHandle = undefined;
+      return;
+    }
+    if (this.overlay?.request?.id === request.id) return;
+    this.dismissOverlay(this.overlay, this.overlayHandle);
     this.overlay = new PendingUiOverlay({
       request,
-      tui: this.editor.tui ?? { requestRender: () => this.requestRender(), setFocus() {} },
+      tui: this.tui,
       returnFocus: this.editor,
       respond: (response) => {
         this.respondedUi.add(response.requestId);
         const resolved = this.overlay;
+        const handle = this.overlayHandle;
         this.overlay = undefined;
-        resolved?.dispose();
+        this.overlayHandle = undefined;
+        this.dismissOverlay(resolved, handle);
         void this.sendCommand("ui_response", { uiRequestId: response.requestId, response: response.cancelled ? null : response.value });
       },
     });
+    this.overlayHandle = this.presentOverlay(this.overlay);
   }
 
   persisted(cursor = this.state?.cursor) { return { sessionId: this.sessionId, cursor, draft: this.editor.getText(), history: [...this.history] }; }
@@ -814,10 +883,12 @@ export class ViewerController {
     try {
       if (options.persist !== false) await this.persistence.save(this.persisted());
     } finally {
-      this.overlay?.dispose();
+      this.dismissOverlay(this.overlay, this.overlayHandle);
       this.overlay = undefined;
-      this.selection?.dispose();
+      this.overlayHandle = undefined;
+      this.dismissOverlay(this.selection, this.selectionHandle);
       this.selection = undefined;
+      this.selectionHandle = undefined;
       this.resolveClosed?.();
     }
   }

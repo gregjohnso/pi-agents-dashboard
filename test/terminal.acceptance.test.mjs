@@ -1,10 +1,26 @@
 import { stripVTControlCharacters } from "node:util";
 
-import { visibleWidth } from "@earendil-works/pi-tui";
-import { expect, it, vi } from "vitest";
+import { TuiAltScreen, visibleWidth } from "@earendil-works/pi-tui";
+import { afterEach, expect, it, vi } from "vitest";
 
 import { DashboardController } from "../app/list/dashboard.mjs";
 import { ViewerController } from "../app/viewer/viewer-controller.mjs";
+import { ScreenTerminal } from "./alt-screen-harness.mjs";
+import { createPiEditorDouble } from "./pi-editor-double.mjs";
+
+// The viewer is one of Pi's own layouts, so its rows are read off a real alternate screen; the list
+// still renders itself full-screen and is read directly.
+/** @type {any[]} */
+const screens = [];
+afterEach(() => { for (const tui of screens.splice(0)) tui.stop({ preserveScreen: true }); });
+
+function viewerScreen(/** @type {any} */ controller, /** @type {number} */ width, /** @type {number} */ height) {
+  const tui = controller.tui;
+  if (tui.terminal.columns !== width || tui.terminal.rows !== height) tui.terminal.resize(width, height);
+  tui.setLayoutRoot(controller.layoutRoot);
+  tui.renderNow();
+  return [...tui.terminal.lines];
+}
 
 const timestamp = "2026-08-25T12:00:00.000Z";
 const dimensions = [[160, 40], [120, 32], [80, 24], [55, 16], [40, 10]];
@@ -102,24 +118,6 @@ function viewerSnapshot(overrides = {}) {
   };
 }
 
-function editor() {
-  let text = "";
-  return {
-    focused: false,
-    disableSubmit: false,
-    setText(value) { text = value; this.onChange?.(value); },
-    getText() { return text; },
-    addToHistory() {},
-    actions: /** @type {Record<string, () => void>} */ ({}),
-    onAction(action, handler) { this.actions[action] = handler; },
-    handleInput(data) {
-      if (data === "\r") this.onSubmit?.(text);
-      else if (data === "\x1b\r") this.actions["app.message.followUp"]?.();
-      else if (data.length === 1 && data >= " ") { text += data; this.onChange?.(text); }
-    },
-    render: () => [`> ${text}`],
-  };
-}
 
 function viewerFixture(snapshotOverrides = {}, options = {}) {
   /** @type {any} */
@@ -143,7 +141,10 @@ function viewerFixture(snapshotOverrides = {}, options = {}) {
   };
   const persistence = { async load() {}, async save() {} };
   const onReturn = options.onReturn ?? vi.fn();
-  const controller = new ViewerController({ sessionId: "viewer-session", client, editor: editor(), persistence, onReturn, requestRender: () => {}, now: options.now ?? (() => Date.parse(timestamp)) });
+  const tui = new TuiAltScreen(new ScreenTerminal(), false, undefined, { mouse: false });
+  tui.start();
+  screens.push(tui);
+  const controller = new ViewerController({ sessionId: "viewer-session", client, editor: createPiEditorDouble({ tui }), persistence, onReturn, requestRender: () => {}, now: options.now ?? (() => Date.parse(timestamp)) });
   // The controller's own pump reads these, so a test drives the same path the daemon client feeds.
   const emit = (value) => {
     const settled = new Promise((resolve, reject) => {
@@ -181,7 +182,7 @@ it.each(dimensions)("pins the complete list and viewer surfaces at %ix%i", async
   const viewer = viewerFixture();
   await viewer.controller.open();
   const listLines = list.dashboard.render(width, height);
-  const viewerLines = viewer.controller.render(width, height);
+  const viewerLines = viewerScreen(viewer.controller, width, height);
   expect(listLines).toHaveLength(height);
   expect(viewerLines).toHaveLength(height);
   expect([...listLines, ...viewerLines].every((line) => visibleWidth(line) <= width)).toBe(true);
@@ -260,16 +261,21 @@ it("drives viewer prompt/follow-up/interrupt, tools, pending UI, and read-only r
     expect(f.commands.map(({ operation }) => operation)).toEqual(["prompt", "prompt", "follow_up"]);
     expect(f.controller.editor.getText()).toBe("");
   });
+  // Escape is Pi's interrupt; Ctrl+C only clears what the operator is typing.
+  f.controller.editor.setText("abandoned");
   f.controller.handleInput("\x03");
+  expect(f.controller.editor.getText()).toBe("");
+  f.controller.handleInput("\x1b");
   await vi.waitFor(() => expect(f.commands.map(({ operation }) => operation)).toEqual(["prompt", "prompt", "follow_up", "interrupt"]));
 
   await f.emit(event(2, { kind: "pending_ui_request", request: { id: "confirm", method: "confirm", title: "Continue?" } }));
   f.controller.handleInput("y");
   await vi.waitFor(() => expect(f.commands.at(-1)?.operation).toBe("ui_response"));
   f.controller.handleInput("\x0f");
-  expect(f.controller.transcript.selectedToolId).toBe("tool");
+  expect(f.controller.transcript.toolsExpanded).toBe(true);
+  expect(stripVTControlCharacters(viewerScreen(f.controller, 80, 24).join("\n"))).toContain("needle result");
   f.controller.handleInput("\x0f");
-  expect(f.controller.transcript.expandedTools.has("tool")).toBe(true);
+  expect(f.controller.transcript.toolsExpanded).toBe(false);
   await f.controller.close();
 
   // A second viewer on the same session answers its pending request instead of watching it.
@@ -280,7 +286,7 @@ it("drives viewer prompt/follow-up/interrupt, tools, pending UI, and read-only r
   await second.controller.close();
 });
 
-it("uses context-sensitive Ctrl+C, immediate Escape, and the exact clean and 500 ms empty-dirty/history Left table", async () => {
+it("leaves on an immediate Escape and on the exact clean and 500 ms empty-dirty/history Left table", async () => {
   const cleanLeft = viewerFixture({ pendingUi: [] }, { onReturn: vi.fn() });
   await cleanLeft.controller.open();
   cleanLeft.controller.handleInput("\x1b[D");

@@ -1,12 +1,17 @@
 import { DynamicBorder, ExtensionEditorComponent, getMarkdownTheme, getSelectListTheme, initTheme } from "@earendil-works/pi-coding-agent";
-import { Input, Markdown, SelectList, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Input, Markdown, SelectList, getKeybindings, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
-import { createPiKeybindings } from "./pi-component-adapters.mjs";
 import { spinnerFrame } from "../spinner.mjs";
 
 initTheme(undefined, false);
 
 const PI_WORKING_MESSAGE = "Working...";
+
+// Pi's cancel keybinding, which is escape or ctrl+c by default and whatever the operator rebound it
+// to. Reading it here is what keeps ctrl+c inside a dialog instead of letting it reach the viewer.
+function cancels(data) {
+  return getKeybindings().matches(data, "tui.select.cancel");
+}
 
 function fit(line, width) {
   const safe = line.replace(/[\r\n\u2028\u2029]/gu, " ");
@@ -29,7 +34,7 @@ export class PendingUiOverlay {
     } else if (request.method === "editor") {
       this.control = new ExtensionEditorComponent(
         tui,
-        /** @type {any} */ (createPiKeybindings()),
+        /** @type {any} */ (getKeybindings()),
         request.title,
         request.initialValue,
         (value) => this.resolve({ requestId: request.id, value }),
@@ -60,7 +65,7 @@ export class PendingUiOverlay {
   dispose() { this.restoreFocus(); /** @type {any} */ (this.control).dispose?.(); }
   handleInput(data) {
     if (this.resolved) return true;
-    if (data === "\x1b") { this.resolve({ requestId: this.request.id, cancelled: true }); return true; }
+    if (cancels(data)) { this.resolve({ requestId: this.request.id, cancelled: true }); return true; }
     if (this.request.method === "confirm") {
       if (data === "\r" || data.toLowerCase() === "y") this.resolve({ requestId: this.request.id, value: true });
       else if (data.toLowerCase() === "n") this.resolve({ requestId: this.request.id, value: false });
@@ -109,7 +114,7 @@ export class CommandSelectionOverlay {
   /** @param {string} data */
   handleInput(data) {
     if (this.resolved) return true;
-    if (data === "\x1b") { this.resolve(undefined); return true; }
+    if (cancels(data)) { this.resolve(undefined); return true; }
     /** @type {any} */ (this.control).handleInput?.(data);
     return true;
   }
@@ -149,7 +154,7 @@ export class TextPanelOverlay {
   /** @param {string} data */
   handleInput(data) {
     if (this.resolved) return true;
-    if (data === "\x1b" || data === "\r" || data === "q") { this.resolve(); return true; }
+    if (cancels(data) || data === "\r" || data === "q") { this.resolve(); return true; }
     const maxOffset = Math.max(0, this.rows.length - this.maxVisible);
     if (data === "\x1b[A") this.offset = Math.max(0, this.offset - 1);
     else if (data === "\x1b[B") this.offset = Math.min(maxOffset, this.offset + 1);

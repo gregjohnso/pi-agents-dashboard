@@ -55,13 +55,17 @@ Shared-directory launches ask you to type the exact canonical path before launch
 
 ## Use the viewer like Pi
 
-The viewer shows the normalized Pi transcript and uses Pi's editor components. Type a prompt and press Enter. If Pi is working, it queues the text behind the running turn. Either way the line is listed as pending under the transcript until it shows up there as your message.
+The viewer shows the normalized Pi transcript and uses Pi's editor components. Enter starts a prompt when Pi is idle or steers it at the next tool boundary when Pi is working. Alt+Enter queues a follow-up until the run finishes. Submitted text is listed as pending until it appears in the transcript.
 
 Pi owns the slash prefix in the viewer. The viewer passes unknown slash-prefixed text to Pi as a prompt and offers Pi's discovered commands alongside dashboard commands. Run `/help` there for the viewer's current commands and keys.
 
-Press Ctrl+T to pick this session's thinking level from the levels Pi reports for its current model. Escape closes that picker and changes nothing. The level next to the model in the footer is the one Pi confirmed, never the one that was asked for.
+Pi also owns the transcript itself. The viewer is one of Pi's own full-screen layouts, so Page Up, Page Down, Home, End and the mouse wheel move the transcript, Ctrl+Shift+F searches all of it rather than the part on screen, dragging selects text and copies it on release, and clicking a link opens it. The prompt, status and footer stay put while the transcript moves. New output keeps following the bottom until you scroll up, and End follows it again. The arrows stay with the prompt: they move its cursor and recall prompt history.
+
+Press Ctrl+L to pick this session's model from the models its worker reported, the same picker a bare `/model` opens. Escape closes it and changes nothing, and either way your prompt is left exactly as you typed it, cursor included. Press Shift+Tab to move this session to the next thinking level Pi reports for its current model; the level next to the model in the footer is the one Pi confirmed, never the one that was asked for. Press Ctrl+T to hide or show thinking blocks in this transcript, and Ctrl+O to expand or collapse every tool's output. Neither asks the session for anything.
 
 Press Escape while a turn is working to interrupt it. After the turn settles, press Escape again to return to the list. When Pi is idle, Escape returns immediately. Closing the dashboard does not stop Pi.
+
+Two of Pi's own interactive features are not available here, because its RPC exposes no command for them: clearing the queue of messages waiting behind a running turn, and editing those queued messages. What the viewer lists as pending is its own record of what it sent, not a read of Pi's queue.
 
 ## Run commands without opening the list
 

@@ -28,76 +28,51 @@ describe("normalized transcript state", () => {
 
 });
 
-describe("line-based transcript scrolling", () => {
+// The viewport itself belongs to Pi's ScrollView now; test/native-viewport.acceptance.test.mjs drives
+// it through a real terminal. What is left here is the document that scroll view is given.
+describe("transcript document", () => {
   const tallItems = (count, rows) => Array.from({ length: count }, (_, index) => ({ kind: "system_message", itemId: `i-${index}`, text: `item ${index}`, level: "info", rows }));
   const tallAdapters = () => ({ component: vi.fn((item) => ({ render: () => Array.from({ length: item.rows }, (_, row) => `${item.itemId}:${row}`) })) });
 
-  it("scrolls one line per notch inside a single tall block", () => {
+  it("renders every line of every block, oldest first", () => {
     const state = createTranscriptState({ ...snapshot, items: tallItems(3, 10) });
     const transcript = new TranscriptModel({ state, adapters: tallAdapters() });
-    expect(transcript.render(80, 5)).toEqual(["i-2:5", "i-2:6", "i-2:7", "i-2:8", "i-2:9"]);
-    transcript.scrollBy(-1);
-    expect(transcript.render(80, 5)).toEqual(["i-2:4", "i-2:5", "i-2:6", "i-2:7", "i-2:8"]);
-    transcript.scrollBy(-4);
-    expect(transcript.render(80, 5)).toEqual(["i-2:0", "i-2:1", "i-2:2", "i-2:3", "i-2:4"]);
-    transcript.scrollBy(-1);
-    expect(transcript.render(80, 5)).toEqual(["i-1:9", "i-2:0", "i-2:1", "i-2:2", "i-2:3"]);
+    const lines = transcript.render(80);
+    expect(lines).toHaveLength(30);
+    expect(lines.at(0)).toBe("i-0:0");
+    expect(lines.at(-1)).toBe("i-2:9");
   });
 
-  it("stops at the oldest line with a full view instead of blanking one notch past the end", () => {
-    const state = createTranscriptState({ ...snapshot, items: tallItems(3, 10) });
-    const transcript = new TranscriptModel({ state, adapters: tallAdapters() });
-    transcript.setViewport(80, 5);
-    transcript.scrollBy(-10_000);
-    expect(transcript.render(80, 5)).toEqual(["i-0:0", "i-0:1", "i-0:2", "i-0:3", "i-0:4"]);
-    expect(transcript.linesFromEnd).toBe(25);
-    transcript.scrollBy(1);
-    expect(transcript.render(80, 5)).toEqual(["i-0:1", "i-0:2", "i-0:3", "i-0:4", "i-0:5"]);
-    transcript.scrollToStart();
-    expect(transcript.render(80, 5)).toEqual(["i-0:0", "i-0:1", "i-0:2", "i-0:3", "i-0:4"]);
-  });
-
-  it("holds its line while new output arrives, marks it, and follows again at the end", () => {
+  it("grows by the new block when an event appends one", () => {
     let state = createTranscriptState({ ...snapshot, items: tallItems(3, 10) });
     const transcript = new TranscriptModel({ state, adapters: tallAdapters() });
-    transcript.setViewport(80, 5);
-    transcript.scrollBy(-3);
-    const held = transcript.render(80, 5);
+    expect(transcript.render(80)).toHaveLength(30);
     state = applyViewerEvent(state, event({ kind: "system_message", itemId: "fresh", text: "fresh", level: "info" }));
     state.items.at(-1).rows = 4;
     transcript.update(state);
-    expect(transcript.newActivity).toBe(true);
-    // The marker takes the bottom row; the held lines stay put above it.
-    expect(transcript.render(80, 6)).toEqual([...held, "↓ new activity"]);
-    transcript.scrollToEnd();
-    expect(transcript.newActivity).toBe(false);
-    expect(transcript.render(80, 5)).toEqual(["i-2:9", "fresh:0", "fresh:1", "fresh:2", "fresh:3"]);
+    const lines = transcript.render(80);
+    expect(lines).toHaveLength(34);
+    expect(lines.slice(-4)).toEqual(["fresh:0", "fresh:1", "fresh:2", "fresh:3"]);
   });
 
-  it("renders each block once per scroll position and reuses unchanged blocks", () => {
+  it("renders each block once and reuses it until its item, width or options change", () => {
     const adapters = tallAdapters();
     const state = createTranscriptState({ ...snapshot, items: tallItems(40, 10) });
     const transcript = new TranscriptModel({ state, adapters });
-    transcript.render(80, 20);
-    expect(adapters.component).toHaveBeenCalledTimes(2);
-    transcript.scrollBy(-5);
-    transcript.render(80, 20);
-    expect(adapters.component).toHaveBeenCalledTimes(3);
+    transcript.render(80);
+    expect(adapters.component).toHaveBeenCalledTimes(40);
+    transcript.render(80);
+    expect(adapters.component).toHaveBeenCalledTimes(40);
+    transcript.render(60);
+    expect(adapters.component).toHaveBeenCalledTimes(80);
   });
-});
 
-describe("virtual transcript", () => {
-  it("renders only visible blocks, pauses follow mode, and marks new activity", () => {
-    const adapters = { component: vi.fn((item) => ({ render: vi.fn(() => [item.itemId ?? item.kind]) })) };
+  it("keeps every rendered line inside the width it was given", () => {
+    const adapters = { component: vi.fn((item) => ({ render: vi.fn(() => [`${item.itemId} ${"wide ".repeat(40)}`]) })) };
     const state = createTranscriptState({ ...snapshot, items: Array.from({ length: 100 }, (_, index) => ({ kind: "system_message", itemId: `i-${index}`, text: `line ${index}`, level: "info" })) });
     const transcript = new TranscriptModel({ state, adapters });
-    transcript.setViewport(80, 5);
-    transcript.scrollBy(-2);
-    transcript.update(applyViewerEvent(state, event({ kind: "system_message", itemId: "new", text: "new", level: "info" })));
-    const lines = transcript.render(80, 5);
-    expect(lines).toHaveLength(5);
-    expect(lines.map(stripVTControlCharacters).join("\n")).toContain("new activity");
-    expect(lines.every((line) => visibleWidth(line) <= 80)).toBe(true);
-    expect(adapters.component).toHaveBeenCalledTimes(8);
+    const lines = transcript.render(80);
+    expect(lines).toHaveLength(100);
+    expect(lines.every((line) => visibleWidth(stripVTControlCharacters(line)) <= 80)).toBe(true);
   });
 });

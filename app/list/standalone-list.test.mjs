@@ -1,23 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { createPiEditorDouble } from "../../test/pi-editor-double.mjs";
 import { ViewerController } from "../viewer/viewer-controller.mjs";
 import { createHostShutdown, runViewerTransition } from "./standalone-list.mjs";
 
 const at = "2026-08-25T00:00:00Z";
-
-/** One editor double: enough of Pi's CustomEditor for the viewer to hold a draft. */
-function editor() {
-  let text = "";
-  return {
-    focused: false, onSubmit: undefined, onChange: undefined,
-    setText(value) { text = value; this.onChange?.(value); },
-    getText() { return text; },
-    addToHistory() {},
-    setAutocompleteProvider() {},
-    handleInput(data) { if (data === "\r") this.onSubmit?.(text); else if (data.length === 1 && data >= " ") { text += data; this.onChange?.(text); } },
-    render: () => [`> ${text}`],
-  };
-}
 
 /** A daemon client that answers the viewer's subscription and never publishes an event. */
 function hostClient() {
@@ -59,7 +46,7 @@ it("ends the whole frontend when the hosted viewer quits, instead of coming back
       /** @type {any} */
       let viewer;
       viewer = new ViewerController({
-        sessionId: "s", client, editor: editor(), now: () => 0,
+        sessionId: "s", client, editor: createPiEditorDouble(), now: () => 0,
         persistence: { async load() { return undefined; }, async save() {} },
         requestRender: () => tui.requestRender(),
         onReturn: () => { void viewer.close(); },

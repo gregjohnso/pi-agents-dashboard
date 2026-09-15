@@ -64,142 +64,48 @@ function fit(line, width) {
   return visibleWidth(clipped) <= width ? clipped : "";
 }
 
-/** Block-virtualized chronological transcript with paused follow and activity marker state. */
+/**
+ * The complete chronological transcript as one Pi component.
+ *
+ * Nothing here clips, scrolls or follows: `render` is the whole document, and the `ScrollView` it is
+ * mounted in owns the viewport, the follow state and every key and gesture that moves them.
+ */
 export class TranscriptModel {
   constructor({ state, adapters }) {
     this.state = state;
     this.adapters = adapters;
     this.width = 80;
-    this.height = 20;
-    /** Rendered lines hidden below the bottom of the viewport; 0 is the tail. */
-    this.linesFromEnd = 0;
-    this.following = true;
-    this.newActivity = false;
     this.hideThinking = false;
-    this.selectedToolId = undefined;
-    this.expandedTools = new Set();
+    // Pi expands or collapses every tool at once rather than one under a cursor.
+    this.toolsExpanded = false;
     // Keyed by item identity, so a replaced item (a streaming answer) drops its entry on its own.
     this.renderedBlocks = new WeakMap();
-    this.anchor = undefined;
   }
-  setViewport(width, height) { this.width = Math.max(0, Math.floor(width)); this.height = Math.max(0, Math.floor(height)); }
-  update(state) {
-    const grew = state.items.length > this.state.items.length;
-    this.state = state;
-    if (grew && !this.following) this.newActivity = true;
-    if (this.following) this.linesFromEnd = 0;
-  }
+  update(state) { this.state = state; }
   setThinkingHidden(hidden) { this.hideThinking = hidden; }
-  selectNextTool(direction = 1) {
-    const toolIds = this.state.items.filter((item) => item.kind === "tool").map((item) => item.toolId);
-    if (toolIds.length === 0) { this.selectedToolId = undefined; return undefined; }
-    const current = toolIds.indexOf(this.selectedToolId);
-    const index = current < 0 ? (direction > 0 ? 0 : toolIds.length - 1) : (current + direction + toolIds.length) % toolIds.length;
-    this.selectedToolId = toolIds[index];
-    const itemIndex = this.state.items.findIndex((item) => item.kind === "tool" && item.toolId === this.selectedToolId);
-    this.following = false;
-    this.anchor = undefined;
-    this.linesFromEnd = this.linesBelow(itemIndex);
-    return this.selectedToolId;
-  }
-  toggleSelectedTool() { if (this.selectedToolId !== undefined) this.toggleTool(this.selectedToolId); }
-  clearToolSelection() { this.selectedToolId = undefined; }
-  scrollBy(lines) {
-    const step = Math.trunc(lines);
-    this.anchor = undefined;
-    if (step < 0) {
-      this.following = false;
-      this.linesFromEnd = this.clampToOldestLine(this.linesFromEnd - step);
-    } else {
-      this.linesFromEnd = Math.max(0, this.linesFromEnd - step);
-      if (this.linesFromEnd === 0) { this.following = true; this.newActivity = false; }
-    }
-  }
-  scrollToEnd() { this.linesFromEnd = 0; this.following = true; this.newActivity = false; this.anchor = undefined; }
-  scrollToStart() {
-    this.anchor = undefined;
-    this.linesFromEnd = this.clampToOldestLine(Number.MAX_SAFE_INTEGER);
-    this.following = false;
-  }
-  toggleTool(toolId) {
-    if (this.expandedTools.has(toolId)) this.expandedTools.delete(toolId); else this.expandedTools.add(toolId);
-  }
+  setToolsExpanded(expanded) { this.toolsExpanded = expanded; }
+  /** Pi's component contract: the render cache is keyed by item, width and options, so this is a no-op. */
+  invalidate() {}
   /** Rendered lines of one item, reused until the item, its tool, or the render options change. */
   blockLines(item, index) {
     const tool = item.kind === "tool" ? this.state.tools.get(item.toolId) : undefined;
     if (item.kind === "tool" && tool === undefined) return [];
-    const signature = `${this.width}|${this.hideThinking ? 1 : 0}|${this.expandedTools.has(item.toolId) ? 1 : 0}|${this.state.model?.provider ?? ""}/${this.state.model?.id ?? ""}`;
+    const signature = `${this.width}|${this.hideThinking ? 1 : 0}|${this.toolsExpanded ? 1 : 0}|${this.state.model?.provider ?? ""}/${this.state.model?.id ?? ""}`;
     const cached = this.renderedBlocks.get(item);
     let lines = cached?.signature === signature && cached.tool === tool ? cached.lines : undefined;
     if (lines === undefined) {
       const renderedItem = item.kind === "tool" ? { ...item, tool } : item;
       const component = this.adapters.component(renderedItem, { streaming: renderedItem.streaming, hideThinking: this.hideThinking, provider: this.state.model?.provider, model: this.state.model?.id });
-      if (item.kind === "tool") component.setExpanded?.(this.expandedTools.has(item.toolId));
+      if (item.kind === "tool") component.setExpanded?.(this.toolsExpanded);
       lines = component.render(this.width).map((line) => fit(line, this.width));
       this.renderedBlocks.set(item, { signature, tool, lines });
     }
-    const markers = [];
     // Pi opens every user turn but the first with a spacer above the message box.
-    if (item.kind === "user_message" && index > 0) markers.push("");
-    if (item.kind === "tool" && item.toolId === this.selectedToolId) markers.push(fit("› selected tool", this.width));
-    return markers.length === 0 ? lines : [...markers, ...lines];
+    return item.kind === "user_message" && index > 0 ? ["", ...lines] : lines;
   }
-  /** The newest rendered lines, stopping once `count` of them exist or the transcript runs out. */
-  tailLines(count) {
-    const blocks = [];
-    let lines = 0;
-    let index = this.state.items.length - 1;
-    for (; index >= 0 && lines < count; index -= 1) {
-      const block = this.blockLines(this.state.items[index], index);
-      blocks.push(block);
-      lines += block.length;
-    }
-    return { lines: blocks.reverse().flat(), exhausted: index < 0 };
-  }
-  /** Rendered lines below one item, which is where that item sits at the bottom of the viewport. */
-  linesBelow(index) {
-    let lines = 0;
-    for (let below = index + 1; below < this.state.items.length; below += 1) lines += this.blockLines(this.state.items[below], below).length;
-    return lines;
-  }
-  /**
-   * Bind a paused viewport to the item its bottom edge sits in, counted from that item's top, so
-   * output appended below it (a streaming answer growing) does not drag the reader down the page.
-   */
-  captureAnchor() {
-    let below = 0;
-    for (let index = this.state.items.length - 1; index >= 0; index -= 1) {
-      const length = this.blockLines(this.state.items[index], index).length;
-      if (below + length > this.linesFromEnd || index === 0) return { index, item: this.state.items[index], above: below + length - this.linesFromEnd };
-      below += length;
-    }
-    return undefined;
-  }
-  /** @param {{ index: number, item: any, above: number }} anchor */
-  offsetFromAnchor(anchor) {
-    const index = this.state.items[anchor.index] === anchor.item ? anchor.index : this.state.items.indexOf(anchor.item);
-    if (index < 0) return this.linesFromEnd;
-    return Math.max(0, this.linesBelow(index) + this.blockLines(this.state.items[index], index).length - anchor.above);
-  }
-  /** Never scroll past the oldest line: the top stop keeps a full viewport, never an empty one. */
-  clampToOldestLine(candidate) {
-    const rows = Math.max(0, this.height - (this.newActivity ? 1 : 0));
-    const { lines, exhausted } = this.tailLines(candidate + rows);
-    return exhausted ? Math.min(candidate, Math.max(0, lines.length - rows)) : candidate;
-  }
-  render(width = this.width, height = this.height) {
-    this.setViewport(width, height);
-    if (height === 0 || width === 0) return [];
-    const markerRows = this.newActivity ? 1 : 0;
-    const rows = Math.max(0, height - markerRows);
-    if (!this.following && this.anchor !== undefined) this.linesFromEnd = this.offsetFromAnchor(this.anchor);
-    const { lines, exhausted } = this.tailLines(this.linesFromEnd + rows);
-    if (exhausted) this.linesFromEnd = Math.min(this.linesFromEnd, Math.max(0, lines.length - rows));
-    const end = lines.length - this.linesFromEnd;
-    const visible = lines.slice(Math.max(0, end - rows), end);
-    this.anchor = this.following ? undefined : this.captureAnchor();
-    while (visible.length < rows) visible.unshift("");
-    if (this.newActivity) visible.push(fit("↓ new activity", width));
-    return visible.slice(-height);
+  render(width = this.width) {
+    this.width = Math.max(0, Math.floor(width));
+    if (this.width === 0) return [];
+    return this.state.items.flatMap((item, index) => this.blockLines(item, index));
   }
 }

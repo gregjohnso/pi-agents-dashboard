@@ -1,3 +1,5 @@
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 
 import { afterEach, expect, it, vi } from "vitest";
@@ -74,10 +76,17 @@ function fakeClient() {
 const viewers = [];
 afterEach(async () => {
   await Promise.all(viewers.splice(0).map((viewer) => viewer.close()));
+  vi.unstubAllEnvs();
 });
 
-/** One real alternate-screen viewer over a terminal this test can type into. */
+/**
+ * One real alternate-screen viewer over a terminal this test can type into.
+ *
+ * Pi reads the operator's own `keybindings.json` from `PI_CODING_AGENT_DIR`, so this points it at a
+ * directory that holds nothing: a remap of his must not decide what these keys do here.
+ */
 async function attachedViewer() {
+  vi.stubEnv("PI_CODING_AGENT_DIR", join(tmpdir(), "pi-agents-default-keybindings"));
   const terminal = new FakeTerminal();
   const onReturn = vi.fn();
   const client = fakeClient();
@@ -133,6 +142,17 @@ it("clears the prompt on the first Ctrl+C and types the next line from the start
   expect(onReturn).not.toHaveBeenCalled();
   // The session is idle, so the press that cleared the prompt asked it for nothing.
   expect(client.commands).toEqual([]);
+});
+
+// Pi exits on Ctrl+D with an empty editor; its CustomEditor swallows the key unless a handler is
+// registered, so an unbound Ctrl+D is a dead key rather than a way out of the session.
+it("leaves the attached session on Ctrl+D with an empty prompt", async () => {
+  const { onReturn, terminal } = await attachedViewer();
+  await vi.waitFor(() => expect(painted(terminal)).toContain("hello"));
+
+  terminal.input("\x04");
+
+  await vi.waitFor(() => expect(onReturn).toHaveBeenCalledTimes(1), { timeout: 2_000, interval: 20 });
 });
 
 it("leaves the attached session when a second Ctrl+C lands inside the window", async () => {

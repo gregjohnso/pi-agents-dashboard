@@ -3,21 +3,12 @@ import {
   getMarkdownTheme, initTheme,
 } from "@earendil-works/pi-coding-agent";
 import {
-  KeybindingsManager, TUI_KEYBINDINGS, truncateToWidth, visibleWidth,
+  truncateToWidth, visibleWidth,
 } from "@earendil-works/pi-tui";
 
-initTheme(undefined, false);
+import { createPiKeybindings, installPiKeybindings } from "./pi-keybindings.mjs";
 
-// Pi's own defaults for the actions this viewer binds. `app.message.followUp` keeps the keys Pi's
-// own interface uses, so the terminal encodings of alt+enter stay Pi's problem rather than this
-// package's, and an operator who knows Pi already knows this key.
-const APP_KEYBINDINGS = {
-  "app.clipboard.pasteImage": { defaultKeys: [], description: "Paste image" },
-  "app.interrupt": { defaultKeys: "ctrl+c", description: "Interrupt" },
-  "app.exit": { defaultKeys: "ctrl+d", description: "Exit" },
-  "app.editor.external": { defaultKeys: "ctrl+g", description: "Open external editor" },
-  "app.message.followUp": { defaultKeys: "alt+enter", description: "Queue follow-up message" },
-};
+initTheme(undefined, false);
 
 const PI_HIDDEN_THINKING_LABEL = "Thinking...";
 
@@ -69,16 +60,17 @@ function toolResult(tool) {
   return { content, isError: tool.state === "failed" };
 }
 
-/** Create package-root Pi/TUI keybindings for public editors and overlays. */
-export function createPiKeybindings() {
-  return new KeybindingsManager(/** @type {any} */ ({ ...TUI_KEYBINDINGS, ...APP_KEYBINDINGS }));
-}
-
-/** Create Pi's public CustomEditor with package-root keybindings and a width-safe theme. */
-export function createPiEditor({ tui }) {
+/**
+ * Create Pi's public CustomEditor on Pi's own keybindings and a width-safe theme.
+ *
+ * Installing the manager is what makes the operator's `keybindings.json` reach anything at all: Pi's
+ * editor and every pi-tui list resolve their keys from a global manager rather than one passed in.
+ * @param {{ tui: any, agentDir?: string }} options
+ */
+export function createPiEditor({ tui, agentDir = undefined }) {
   const plain = (text) => text;
   tui.terminal ??= { rows: 24, columns: 80 };
-  const keybindings = createPiKeybindings();
+  const keybindings = installPiKeybindings(createPiKeybindings(agentDir));
   const editor = new CustomEditor(tui, {
     borderColor: plain,
     selectList: { selectedPrefix: plain, selectedText: plain, description: plain, scrollInfo: plain, noMatch: plain },

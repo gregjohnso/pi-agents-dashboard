@@ -78,16 +78,50 @@ export function startStandaloneTui(tui) {
 }
 
 /**
+ * The one alternate screen a frontend paints, with Pi's own clipboard and browser behind it.
+ *
+ * `TuiAltScreen` takes these callbacks at construction and nowhere else, and this screen is built
+ * before the list's first paint, while importing Pi's package still costs seconds. So the callbacks
+ * are the seam and the helpers load behind them: nothing is imported until the operator's first copy
+ * or first hyperlink click, and by then a viewer has already loaded Pi.
+ *
+ * @param {any} terminal
+ * @param {{ copySelection?: (text: string) => Promise<boolean>, openUrl?: (url: string) => void, loadHelpers?: () => Promise<any> }} [options]
+ */
+export function createHostTui(terminal, { copySelection = undefined, openUrl = undefined, loadHelpers = () => import("../viewer/pi-native-helpers.mjs") } = {}) {
+  /** @type {Promise<{ copySelection: (text: string) => Promise<boolean>, openUrl: (url: string) => void }> | undefined} */
+  let ready;
+  // A failed import is not remembered as a failure: the next copy tries again rather than leaving the
+  // clipboard dead for the rest of the session.
+  const helpers = () => (ready ??= loadHelpers().then((module) => module.createNativeTuiHelpers({ copySelection, openUrl })).catch((error) => { ready = undefined; throw error; }));
+  return new TuiAltScreen(terminal, false, undefined, {
+    // pi-tui calls this with `void` and awaits it inside, so a rejection here is an unhandled
+    // rejection that ends the frontend over a failed copy. Answering false is what it asks for: it
+    // flashes "Copy failed" and the operator's session stays up.
+    copySelection: async (/** @type {string} */ text) => {
+      try { return await (await helpers()).copySelection(text); } catch { return false; }
+    },
+    // Pi's own opener answers nothing: a launch that fails is best-effort, and the URL is on screen.
+    openUrl: (/** @type {string} */ url) => { void helpers().then((resolved) => resolved.openUrl(url)).catch(() => {}); },
+  });
+}
+
+/**
  * Mount and focus the single input router used by the standalone list/viewer host.
  *
- * `terminal` must be the tap from createWheelInputTap; pi-tui consumes wheel bytes itself, so
- * without it the host never sees a wheel event. @param {any} options
+ * The list draws itself full-screen through this component. A viewer draws itself as one of Pi's
+ * own layouts instead, so `setLayout` hands Pi the layout root and keeps the router focused: Pi's
+ * `setLayoutRoot` moves no focus of its own.
+ *
+ * `terminal` must be the tap from createWheelInputTap. It exists for the list, which is not a Pi
+ * layout and so never receives the wheel events pi-tui keeps for its own scroll views; while a
+ * viewer is up the tap stands down and every mouse byte reaches Pi unchanged. @param {any} options
  */
 export function mountStandaloneHost({ tui, getActive, getHeight, terminal }) {
   const resolveHeight = getHeight ?? (() => tui.terminal.rows ?? 24);
   const component = {
     focused: false,
-    render(width) { return getActive().render(width, resolveHeight()); },
+    render(width) { const active = getActive(); return active.render === undefined ? [] : active.render(width, resolveHeight()); },
     handleInput(data) { getActive().handleInput(data); tui.requestRender(); },
     handleMouse(event) { getActive().handleMouse?.(event); tui.requestRender(); },
     invalidate() {},
@@ -98,6 +132,12 @@ export function mountStandaloneHost({ tui, getActive, getHeight, terminal }) {
   return {
     component,
     focus() { tui.setFocus(component); },
+    /** @param {any} layoutRoot Pi layout to show, or undefined to hand the screen back to the list. */
+    setLayout(layoutRoot) {
+      tui.setLayoutRoot?.(layoutRoot);
+      terminal?.setWheelCapture?.(layoutRoot === undefined);
+      tui.setFocus(component);
+    },
   };
 }
 
@@ -111,18 +151,20 @@ export function createHostShutdown({ currentViewer, controller, tui, client, res
   return {
     get started() { return closing !== undefined; },
     run() {
-      closing ??= (async () => { await currentViewer()?.close(); await controller.close(); tui.stop(); await client.close(); resolveClosed(); })();
+      // Pi's own fullscreen shutdown: leave the alternate screen without repainting the whole
+      // document over the operator's scrollback.
+      closing ??= (async () => { await currentViewer()?.close(); await controller.close(); tui.stop({ preserveScreen: true }); await client.close(); resolveClosed(); })();
       return closing;
     },
   };
 }
 
 /** Open the relocated list and real viewer in one package-root TUI. @param {any} options */
-export async function createStandaloneList({ cwd, frontend }) {
+export async function createStandaloneList({ cwd, frontend, terminal: hostTerminal = new ProcessTerminal(), copySelection = undefined, openUrl = undefined }) {
   const token = (await fs.readFile(join(frontend.root, "daemon", "control.token"), "utf8")).trim();
   const client = createDaemonClient({ socketPath: join(frontend.root, "daemon", "control.sock"), token, maxBytes: 1024 * 1024, clientId: frontend.clientId, attachId: frontend.attachId });
-  const terminal = createWheelInputTap(new ProcessTerminal());
-  const tui = new TuiAltScreen(terminal);
+  const terminal = createWheelInputTap(hostTerminal);
+  const tui = createHostTui(terminal, { copySelection, openUrl });
   const viewerState = new Map();
   let resolveClosed;
   let switching = false;
@@ -159,15 +201,16 @@ export async function createStandaloneList({ cwd, frontend }) {
         });
         return viewer;
       },
-      activateViewer(viewer) { activeViewer = viewer; active = viewer; standaloneHost.focus(); },
+      activateViewer(viewer) { activeViewer = viewer; active = viewer; standaloneHost.setLayout(viewer.layoutRoot); },
       activateList() {
         activeViewer = undefined;
         active = controller;
+        standaloneHost.setLayout(undefined);
         if (pendingDashboardAction === "new_session") controller.focusComposer();
         pendingDashboardAction = undefined;
       },
-      restoreListFocus() { standaloneHost.focus(); },
-      onRestoreClosed() { tui.stop(); resolveClosed(); },
+      restoreListFocus() { standaloneHost.setLayout(undefined); },
+      onRestoreClosed() { tui.stop({ preserveScreen: true }); resolveClosed(); },
       shouldRestore() { return !shutdown.started; },
     });
     switching = false;
@@ -176,7 +219,7 @@ export async function createStandaloneList({ cwd, frontend }) {
     client, openViewer: openRealViewer,
     clientId: frontend.clientId, sourceSessionId: `dashboard-${frontend.clientId}`,
     launchDefaults: { cwd }, requestRender: () => tui.requestRender(),
-    onClose: () => { if (!switching && activeViewer === undefined) { tui.stop(); resolveClosed(); } },
+    onClose: () => { if (!switching && activeViewer === undefined) { tui.stop({ preserveScreen: true }); resolveClosed(); } },
   });
   const shutdown = createHostShutdown({ currentViewer: () => activeViewer, controller, tui, client, resolveClosed: () => resolveClosed() });
   active = controller;

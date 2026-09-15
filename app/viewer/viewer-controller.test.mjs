@@ -1,11 +1,60 @@
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { stripVTControlCharacters } from "node:util";
-import { setKittyProtocolActive, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import { TuiAltScreen, setKittyProtocolActive, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createViewerNormalizer } from "../../runtime/viewer-normalizer.mjs";
+import { ScreenTerminal } from "../../test/alt-screen-harness.mjs";
+import { createPiEditorDouble } from "../../test/pi-editor-double.mjs";
 import { createPiEditor } from "./pi-component-adapters.mjs";
 import { ViewerController } from "./viewer-controller.mjs";
+
+/**
+ * Every screen assertion below reads a real alternate screen.
+ *
+ * The viewer is one of Pi's layouts now: Pi clips it to the terminal, scrolls it, and composites its
+ * dialogs over it. A test that called a viewport renderer of our own would be asserting against an
+ * implementation this package no longer has.
+ */
+/** @type {any[]} */
+const screens = [];
+afterEach(() => { for (const tui of screens.splice(0)) tui.stop({ preserveScreen: true }); });
+
+function altScreen() {
+  const tui = new TuiAltScreen(new ScreenTerminal(), false, undefined, { mouse: false });
+  tui.start();
+  screens.push(tui);
+  return tui;
+}
+
+/** Paint one viewer's layout at a terminal size and read the rows the operator would see. */
+function paintedScreen(/** @type {any} */ instance, width = 80, height = 24) {
+  const tui = instance.tui;
+  const terminal = tui.terminal;
+  if (terminal.columns !== width || terminal.rows !== height) terminal.resize(width, height);
+  tui.setLayoutRoot(instance.layoutRoot);
+  tui.renderNow();
+  // A copy: the terminal keeps painting into its own rows, and a caller comparing two frames needs
+  // the one it took to stay as it was.
+  return [...terminal.lines];
+}
+
+// No test reads the operator's own ~/.pi/agent/keybindings.json; a remap test writes its own.
+const NO_USER_BINDINGS = join(tmpdir(), "pi-agents-default-keybindings");
+/** @type {string[]} */
+const agentDirs = [];
+afterEach(async () => { await Promise.all(agentDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))); });
+async function agentDir(bindings) {
+  const dir = await mkdtemp(join(tmpdir(), "pi-agents-viewer-keys-"));
+  agentDirs.push(dir);
+  await writeFile(join(dir, "keybindings.json"), JSON.stringify(bindings));
+  return dir;
+}
+function piEditorFor(agentDirPath = NO_USER_BINDINGS) {
+  return createPiEditor({ tui: altScreen(), agentDir: agentDirPath });
+}
 
 const timestamp = "2026-08-25T00:00:00Z";
 function snapshot(overrides = {}) {
@@ -17,13 +66,12 @@ function snapshot(overrides = {}) {
   };
 }
 /**
- * Pi's `CustomEditor` reduced to what this controller uses: submission, registered app actions, and
- * typing. `app.message.followUp` is Pi's own action id, and the real editor routes alt+enter to it in
- * both terminal encodings; the tests at the end of this file pin that against the installed build.
+ * Pi's `CustomEditor` action layer, reduced to what this controller uses and dispatched in Pi's own
+ * order through Pi's own keybindings. The tests at the end of this file drive the installed editor
+ * itself, so a precedence this double got wrong still fails there.
  */
 function editor() {
-  let text = "";
-  return { focused: false, disableSubmit: false, onSubmit: undefined, onChange: undefined, autocompleteProvider: undefined, actions: {}, onAction(action, handler) { this.actions[action] = handler; }, setAutocompleteProvider(provider) { this.autocompleteProvider = provider; }, setText(value) { text = value; this.onChange?.(value); }, getText() { return text; }, addToHistory: vi.fn(), handleInput(data) { if (data === "\r") this.onSubmit?.(text); else if (data === "\x1b\r") this.actions["app.message.followUp"]?.(); else if (data.length === 1 && data >= " ") { text += data; this.onChange?.(text); } }, render: () => [`> ${text}`] };
+  return createPiEditorDouble({ addToHistory: vi.fn(), tui: altScreen() });
 }
 /**
  * One subscription's event queue, read by the controller's own pump rather than by a listener this
@@ -135,7 +183,7 @@ function fixture(overrides = {}) {
 }
 
 describe("viewer commands", () => {
-  it("sends prompt on Enter and follow_up on Alt+Enter whatever the cached turn state says, plus interrupt and one UI response", async () => {
+  it("sends prompt on Enter and follow_up on Alt+Enter whatever the cached turn state says, plus Escape's interrupt and one UI response", async () => {
     const f = fixture();
     await f.instance.open();
     f.instance.editor.setText("first"); f.instance.handleInput("\r");
@@ -146,7 +194,7 @@ describe("viewer commands", () => {
     // The session is working now, and Enter still sends `prompt`: only Pi decides what to do with it.
     f.instance.editor.setText("next"); f.instance.handleInput("\r");
     f.instance.editor.setText("urgent"); f.instance.handleInput("\x1b\r");
-    f.instance.handleInput("\x03");
+    f.instance.handleInput("\x1b");
     await vi.waitFor(() => expect(f.commands.map(({ operation }) => operation)).toEqual(["prompt", "prompt", "follow_up", "interrupt"]));
     expect(f.commands.slice(0, 3).map(({ payload }) => payload.text)).toEqual(["first", "next", "urgent"]);
     await f.emit({ version: 1, sessionId: "s", eventId: "e2", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "2" }, timestamp, payload: { kind: "pending_ui_request", request: { id: "ui-1", method: "confirm", title: "Continue?" } } });
@@ -172,18 +220,20 @@ describe("viewer commands", () => {
     const f = fixture({ snapshot: { errors: [{ code: "RPC_COMMAND_FAILED", message: "Cannot submit a prompt while compaction is in progress.", retryable: false }] } });
     await f.instance.open();
 
-    const dock = f.instance.render(100, 24).map(stripVTControlCharacters).join(" ");
+    const dock = paintedScreen(f.instance, 100, 24).map(stripVTControlCharacters).join(" ");
     expect(dock).not.toContain("RPC_COMMAND_FAILED");
     expect(dock).toContain("Pi refused this command: Cannot submit a prompt while compaction is in progress.");
     await f.instance.close();
   });
 
-  it("keeps a working pending overlay through Ctrl+C and disposes it once it responds", async () => {
+  // A dialog Pi is waiting on owns every key while it is open, including Pi's own cancel keys, so
+  // Ctrl+C answers the dialog rather than reaching past it into the viewer's own clear and quit.
+  it("keeps a working pending overlay in front of every key and disposes it once it responds", async () => {
     const f = fixture({ snapshot: { taskState: "WORKING", pendingUi: [{ id: "ui-working", method: "confirm", title: "Continue?" }] } });
     await f.instance.open();
     const overlay = f.instance.overlay;
-    f.instance.handleInput("\x03");
-    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "interrupt", payload: { sessionId: "s" } }]));
+    f.instance.handleInput("x");
+    expect(f.commands).toEqual([]);
     expect(f.instance.overlay).toBe(overlay);
 
     const dispose = vi.spyOn(overlay, "dispose");
@@ -216,18 +266,18 @@ describe("viewer commands", () => {
     await f.instance.close();
   });
 
-  it("interrupts a working turn once and sends nothing on the press that quits", async () => {
+  it("clears a working session's prompt without interrupting it and sends nothing on the press that quits", async () => {
     const onQuit = vi.fn();
     const f = fixture({ snapshot: { taskState: "WORKING" }, onQuit });
     await f.instance.open();
     f.instance.editor.setText("draft");
     f.instance.handleInput("\x03");
-    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "interrupt", payload: { sessionId: "s" } }]));
     expect(f.instance.editor.getText()).toBe("");
+    expect(f.commands).toEqual([]);
     expect(onQuit).not.toHaveBeenCalled();
     f.instance.handleInput("\x03");
     expect(onQuit).toHaveBeenCalledOnce();
-    expect(f.commands).toHaveLength(1);
+    expect(f.commands).toEqual([]);
     await f.instance.close();
   });
 
@@ -268,13 +318,13 @@ describe("viewer commands", () => {
     let releaseMenu;
     const f = fixture({ menu: () => new Promise((resolve) => { releaseMenu = () => resolve({ commands: [], models: [], model: null, color: "amber" }); }) });
     await f.instance.open();
-    expect(stripVTControlCharacters(f.instance.render(80, 12).join("\n"))).toContain("hello");
+    expect(stripVTControlCharacters(paintedScreen(f.instance, 80, 12).join("\n"))).toContain("hello");
     f.instance.handleInput("\x1b");
     expect(f.instance.onReturn).toHaveBeenCalledOnce();
 
     releaseMenu();
     await f.instance.menuLoaded;
-    expect(f.instance.render(80, 20).join("\n")).toContain("\x1b[38;2;252;211;77m");
+    expect(paintedScreen(f.instance, 80, 20).join("\n")).toContain("\x1b[38;2;252;211;77m");
   });
 
   it("records why an open failed before it closes", async () => {
@@ -294,7 +344,7 @@ describe("viewer commands", () => {
     f.instance.editor.setText("/model");
     f.instance.handleInput("\r");
     await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
-    expect(f.instance.render(80, 24).join("\n")).toContain("anthropic/claude");
+    expect(paintedScreen(f.instance, 80, 24).join("\n")).toContain("anthropic/claude");
     f.instance.handleInput("\x1b[B");
     f.instance.handleInput("\r");
     await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "session_command", payload: { sessionId: "s", command: "set_model", model: { provider: "openai", id: "gpt-5" } } }]));
@@ -303,8 +353,102 @@ describe("viewer commands", () => {
     // Only a bare command opens a picker: a mistyped argument is a rejection the operator has to fix.
     f.instance.editor.setText("/model invented/model");
     f.instance.handleInput("\r");
-    await vi.waitFor(() => expect(f.instance.render(80, 24).join("\n")).toContain("UNKNOWN_MODEL"));
+    await vi.waitFor(() => expect(paintedScreen(f.instance, 80, 24).join("\n")).toContain("UNKNOWN_MODEL"));
     expect(f.instance.selection).toBeUndefined();
+    expect(f.commands).toHaveLength(1);
+  });
+
+  // Pi opens its model selector on Ctrl+L. The same picker `/model` opens answers it here, through
+  // the installed editor rather than a double, so a key Pi's editor swallows fails.
+  it("opens the model picker on Pi's own Ctrl+L", async () => {
+    const piEditor = piEditorFor();
+    const f = fixture({ editor: piEditor, menu: async () => ({ commands: [], models: [{ provider: "anthropic", id: "claude" }, { provider: "openai", id: "gpt-5" }], model: null }) });
+    await f.instance.open();
+    await f.instance.menuLoaded;
+
+    f.instance.handleInput("\x0c");
+
+    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
+    expect(paintedScreen(f.instance, 80, 24).map(stripVTControlCharacters).join("\n")).toContain("anthropic/claude");
+    f.instance.handleInput("\x1b[B");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "session_command", payload: { sessionId: "s", command: "set_model", model: { provider: "openai", id: "gpt-5" } } }]));
+    // The key opened a picker; it typed nothing into the prompt.
+    expect(piEditor.getText()).toBe("");
+  });
+
+  /**
+   * The composer belongs to the operator, and Ctrl+L is a key rather than a submitted line.
+   *
+   * Operator-visible failure: pressing it in the middle of writing a prompt emptied the box. Every
+   * assertion below reads Pi's own editor, cursor included, because a restored draft with the cursor
+   * thrown to the end is the same lost place by a different route.
+   */
+  it("leaves the draft and the cursor exactly where they were through the Ctrl+L picker, a cancel, and a chosen model", async () => {
+    const piEditor = piEditorFor();
+    const f = fixture({ editor: piEditor, menu: async () => ({ commands: [], models: [{ provider: "anthropic", id: "claude" }, { provider: "openai", id: "gpt-5" }], model: null }) });
+    await f.instance.open();
+    await f.instance.menuLoaded;
+    for (const character of "explain this failure") f.instance.handleInput(character);
+    for (const _step of [0, 1, 2, 3, 4, 5, 6]) f.instance.handleInput("\x1b[D");
+    const draft = piEditor.getText();
+    const cursor = piEditor.getCursor();
+    expect(draft).toBe("explain this failure");
+    expect(cursor.col).toBe(draft.length - 7);
+
+    f.instance.handleInput("\x0c");
+
+    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
+    expect(piEditor.getText()).toBe(draft);
+    expect(piEditor.getCursor()).toEqual(cursor);
+
+    f.instance.handleInput("\x1b");
+
+    expect(f.instance.selection).toBeUndefined();
+    expect(piEditor.getText()).toBe(draft);
+    expect(piEditor.getCursor()).toEqual(cursor);
+
+    f.instance.handleInput("\x0c");
+    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
+    f.instance.handleInput("\x1b[B");
+    f.instance.handleInput("\r");
+
+    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "session_command", payload: { sessionId: "s", command: "set_model", model: { provider: "openai", id: "gpt-5" } } }]));
+    expect(piEditor.getText()).toBe(draft);
+    expect(piEditor.getCursor()).toEqual(cursor);
+    // The chosen model is not a line the operator wrote, so it joins neither history nor the box.
+    expect(f.instance.history).toEqual([]);
+  });
+
+  it("never writes over a draft typed while the chosen model is still being applied", async () => {
+    /** @type {() => void} */
+    let release;
+    const piEditor = piEditorFor();
+    const f = fixture({
+      editor: piEditor,
+      menu: async () => ({ commands: [], models: [{ provider: "anthropic", id: "claude" }, { provider: "openai", id: "gpt-5" }], model: null }),
+      command: () => new Promise((resolve) => { release = () => resolve(undefined); }),
+    });
+    await f.instance.open();
+    await f.instance.menuLoaded;
+    // The picker's own submission, held so this test reads the composer after it has fully settled
+    // rather than at whatever moment a poll happened to land.
+    /** @type {Promise<any>[]} */
+    const submissions = [];
+    const submitText = f.instance.submitText.bind(f.instance);
+    f.instance.submitText = (/** @type {any[]} */ ...args) => { const settled = submitText(...args); submissions.push(settled); return settled; };
+    f.instance.handleInput("\x0c");
+    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
+    f.instance.handleInput("\x1b[B");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.commands).toHaveLength(1));
+
+    // The round trip is still out; the operator keeps writing.
+    for (const character of "meanwhile") f.instance.handleInput(character);
+    release();
+    await submissions[0];
+
+    expect(piEditor.getText()).toBe("meanwhile");
     expect(f.commands).toHaveLength(1);
   });
 
@@ -325,7 +469,7 @@ describe("viewer commands", () => {
     f.instance.editor.setText("/help");
     f.instance.handleInput("\r");
     await vi.waitFor(() => expect(f.instance.overlay?.title).toBe("Viewer help"));
-    const help = f.instance.render(80, 24).join("\n");
+    const help = paintedScreen(f.instance, 80, 24).join("\n");
     expect(help).not.toContain("/stats");
     expect(help).not.toContain("/auto-compact");
     expect(help).toContain("Esc");
@@ -357,16 +501,16 @@ describe("viewer commands", () => {
     f.instance.editor.setText("/color");
     f.instance.handleInput("\r");
     await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
-    const picker = f.instance.render(80, 20).map(stripVTControlCharacters).join("\n");
+    const picker = paintedScreen(f.instance, 80, 20).map(stripVTControlCharacters).join("\n");
     expect(picker).toContain("amber");
     expect(picker).toContain("default");
     f.instance.handleInput("\x1b");
-    const plain = f.instance.render(80, 20);
+    const plain = paintedScreen(f.instance, 80, 20);
 
     f.instance.editor.setText("/color amber");
     f.instance.handleInput("\r");
     await vi.waitFor(() => expect(colored).toEqual([{ sessionId: "s", color: "amber" }]));
-    const tinted = f.instance.render(80, 20);
+    const tinted = paintedScreen(f.instance, 80, 20);
     expect(f.commands).toEqual([]);
     expect(f.instance.state.errors).toEqual([]);
     expect(tinted).not.toEqual(plain);
@@ -377,7 +521,7 @@ describe("viewer commands", () => {
     f.instance.editor.setText("/color rose");
     f.instance.handleInput("\r");
     await vi.waitFor(() => expect(f.instance.state.errors).toContainEqual(expect.objectContaining({ code: "SESSION_NOT_FOUND" })));
-    const afterFailure = f.instance.render(80, 20).join("\n");
+    const afterFailure = paintedScreen(f.instance, 80, 20).join("\n");
     expect(afterFailure).toContain("\x1b[38;2;252;211;77m");
     expect(afterFailure).not.toContain("\x1b[38;2;253;164;175m");
 
@@ -385,7 +529,7 @@ describe("viewer commands", () => {
     const reopened = fixture({ menu: async () => ({ commands: [], models: [], model: null, color: "amber" }) });
     await reopened.instance.open();
     await reopened.instance.menuLoaded;
-    expect(reopened.instance.render(80, 20).join("\n")).toContain("\x1b[38;2;252;211;77m");
+    expect(paintedScreen(reopened.instance, 80, 20).join("\n")).toContain("\x1b[38;2;252;211;77m");
   });
 
   it("names the session on the prompt's top rule", async () => {
@@ -393,7 +537,7 @@ describe("viewer commands", () => {
     const f = fixture({ editor: framed, menu: async () => ({ commands: [], models: [], model: null, color: null, name: "recurse agent investigation" }) });
     await f.instance.open();
     await f.instance.menuLoaded;
-    const plain = f.instance.render(80, 20).map(stripVTControlCharacters);
+    const plain = paintedScreen(f.instance, 80, 20).map(stripVTControlCharacters);
     const promptRow = plain.findLastIndex((line) => line.startsWith("> "));
     // The name rides the rule above the prompt, right-aligned, so the operator sees which session they type into.
     expect(plain[promptRow - 1]).toMatch(/^─+ recurse agent investigation ─$/u);
@@ -405,7 +549,7 @@ describe("viewer commands", () => {
     const f = fixture({ editor: framed, menu: async () => ({ commands: [], models: [], model: null, color: null }) });
     await f.instance.open();
     await f.instance.menuLoaded;
-    const plain = f.instance.render(80, 20).map(stripVTControlCharacters);
+    const plain = paintedScreen(f.instance, 80, 20).map(stripVTControlCharacters);
     const promptRow = plain.findLastIndex((line) => line.startsWith("> "));
     expect(plain[promptRow - 1]).toMatch(/^─+$/u);
   });
@@ -422,7 +566,7 @@ describe("viewer commands", () => {
 
     await f.emit({ version: 1, sessionId: "s", eventId: draft.eventId, cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: draft.payload });
 
-    const rendered = stripVTControlCharacters(f.instance.render(100, 24).join("\n"));
+    const rendered = stripVTControlCharacters(paintedScreen(f.instance, 100, 24).join("\n"));
     expect(rendered).toContain("Restarting this session's worker");
     expect(rendered).not.toContain("Unsupported");
   });
@@ -433,7 +577,7 @@ describe("viewer commands", () => {
     const f = fixture({ editor: framed, menu: async () => ({ commands: [], models: [], model: null, color: "amber" }) });
     await f.instance.open();
     await f.instance.menuLoaded;
-    const rendered = f.instance.render(80, 20);
+    const rendered = paintedScreen(f.instance, 80, 20);
     const plain = rendered.map(stripVTControlCharacters);
     expect(plain.filter((line) => /^─+$/u.test(line.trim()) && line.trim() !== "")).toHaveLength(2);
     const promptRow = plain.findLastIndex((line) => line.startsWith("> "));
@@ -450,18 +594,12 @@ describe("viewer commands", () => {
     f.instance.editor.setText("answer from the second viewer");
     f.instance.handleInput("\r");
     await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "prompt", payload: { sessionId: "s", text: "answer from the second viewer" } }]));
-    expect(stripVTControlCharacters(f.instance.render(55, 16).join("\n"))).not.toMatch(/OBSERVER|COMPOSER|Read-only/u);
+    expect(stripVTControlCharacters(paintedScreen(f.instance, 55, 16).join("\n"))).not.toMatch(/OBSERVER|COMPOSER|Read-only/u);
 
     f.instance.handleInput("\x0f");
-    expect(f.instance.transcript.selectedToolId).toBe("tool-a");
-    expect(f.instance.transcript.expandedTools.has("tool-a")).toBe(false);
+    expect(f.instance.transcript.toolsExpanded).toBe(true);
     f.instance.handleInput("\x0f");
-    expect(f.instance.transcript.expandedTools.has("tool-a")).toBe(true);
-    f.instance.handleInput("\x1b[B");
-    expect(f.instance.transcript.selectedToolId).toBe("tool-b");
-    expect(f.instance.render(80, 24).join("\n")).toContain("tool:future_tool completed collapsed");
-    f.instance.handleInput("\x0f");
-    expect(f.instance.render(80, 24).join("\n")).toContain("tool:future_tool completed expanded");
+    expect(f.instance.transcript.toolsExpanded).toBe(false);
   });
 
   it("queues the composer as a follow-up on Alt+Enter and leaves it empty, recallable, and on one history", async () => {
@@ -532,26 +670,25 @@ describe("viewer rendering and navigation", () => {
       const f = fixture({ snapshot: overrides });
       await f.instance.open();
       if (name === "thinking-visible") {
-        // Hidden thinking blocks are still a state this dock draws; no key reaches it, so set it here.
-        f.instance.hideThinking = true;
-        f.instance.transcript.setThinkingHidden(true);
-        matrix["thinking-hidden"] = f.instance.render(width, height).map(stripVTControlCharacters);
-        f.instance.hideThinking = false;
-        f.instance.transcript.setThinkingHidden(false);
+        // Both sides of Pi's Ctrl+T, drawn through the key itself rather than the flag behind it.
+        f.instance.handleInput("\x14");
+        matrix["thinking-hidden"] = paintedScreen(f.instance, width, height).map(stripVTControlCharacters);
+        f.instance.handleInput("\x14");
       }
-      matrix[name] = f.instance.render(width, height).map(stripVTControlCharacters);
+      matrix[name] = paintedScreen(f.instance, width, height).map(stripVTControlCharacters);
       await f.instance.close();
     }
     const streaming = fixture({ snapshot: { items: [] } });
     await streaming.instance.open();
     await streaming.emit({ version: 1, sessionId: "s", eventId: "stream", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "assistant_delta", itemId: "streaming", delta: "Streaming **markdown" } });
-    matrix.streaming = streaming.instance.render(width, height).map(stripVTControlCharacters);
+    matrix.streaming = paintedScreen(streaming.instance, width, height).map(stripVTControlCharacters);
     await streaming.instance.close();
     const paused = fixture({ snapshot: { items: Array.from({ length: 12 }, (_, index) => message("system_message", `history ${index}`)) } });
     await paused.instance.open();
-    paused.instance.transcript.scrollBy(-2);
+    paintedScreen(paused.instance, width, height);
+    paused.instance.viewport.scrollBy(-2);
     await paused.emit({ version: 1, sessionId: "s", eventId: "new", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "system_message", itemId: "new", text: "new output", level: "info" } });
-    matrix["paused-follow"] = paused.instance.render(width, height).map(stripVTControlCharacters);
+    matrix["paused-follow"] = paintedScreen(paused.instance, width, height).map(stripVTControlCharacters);
     await paused.instance.close();
     expect(matrix).toMatchSnapshot();
   });
@@ -670,7 +807,7 @@ expect(identities(f.instance)).toEqual([identity]);
 });
 
 describe("Pi interactive-mode parity", () => {
-  const view = (/** @type {any} */ f) => stripVTControlCharacters(f.instance.render(80, 24).join("\n"));
+  const view = (/** @type {any} */ f) => stripVTControlCharacters(paintedScreen(f.instance, 80, 24).join("\n"));
   const pendingRows = (/** @type {any} */ f) => view(f).split("\n").filter((line) => /Pending:/u.test(line)).map((line) => line.trim());
   const event = (/** @type {string} */ sequence, /** @type {any} */ payload) => ({ version: 1, sessionId: "s", eventId: `e${sequence}`, cursor: { daemonEpoch: "epoch", sessionId: "s", sequence }, timestamp, payload });
 
@@ -788,7 +925,7 @@ describe("daemon outage", () => {
   it("says the daemon is unreachable and rebuilds the session when it comes back", async () => {
     const f = fixture({ attach: async () => ({ kind: "attached", sessionId: "s" }) });
     await f.instance.open();
-    const view = () => stripVTControlCharacters(f.instance.render(80, 24).join("\n"));
+    const view = () => stripVTControlCharacters(paintedScreen(f.instance, 80, 24).join("\n"));
     expect(view()).not.toContain("Daemon unreachable");
 
     await f.connection({ connected: false });
@@ -813,7 +950,7 @@ describe("daemon outage", () => {
     await f.connection({ connected: true });
 
     expect(f.instance.closedState).toBe(false);
-    expect(stripVTControlCharacters(f.instance.render(80, 24).join("\n"))).toContain("SESSION_NOT_FOUND");
+    expect(stripVTControlCharacters(paintedScreen(f.instance, 80, 24).join("\n"))).toContain("SESSION_NOT_FOUND");
   });
 });
 
@@ -826,7 +963,7 @@ describe("refused viewer subscription", () => {
   it("reloads from a fresh snapshot once, then reports the refusal instead of freezing the transcript", async () => {
     const f = fixture({ snapshot: { taskState: "WORKING" } });
     await f.instance.open();
-    const view = () => stripVTControlCharacters(f.instance.render(80, 24).join("\n"));
+    const view = () => stripVTControlCharacters(paintedScreen(f.instance, 80, 24).join("\n"));
     expect(view()).toContain("Working");
 
     await f.refuseStream(overflow());
@@ -850,7 +987,7 @@ describe("refused viewer subscription", () => {
 
     await f.refuseStream(gone);
 
-    const view = stripVTControlCharacters(f.instance.render(80, 24).join("\n"));
+    const view = stripVTControlCharacters(paintedScreen(f.instance, 80, 24).join("\n"));
     expect(view).toContain("SESSION_NOT_FOUND");
     expect(view).toContain("Transcript stopped");
     expect(f.instance.closedState).toBe(false);
@@ -861,7 +998,7 @@ describe("transcript scrolling keys and wheel", () => {
   const longSnapshot = { items: Array.from({ length: 60 }, (_, index) => ({ kind: "system_message", itemId: `i-${index}`, text: `line ${index}`, level: "info" })) };
 
   it("keeps repeated Left and Right presses in a non-empty Pi editor draft", async () => {
-    const piEditor = createPiEditor({ tui: { requestRender() {} } });
+    const piEditor = piEditorFor();
     const f = fixture({ editor: piEditor });
     await f.instance.open();
     piEditor.setText("abcd");
@@ -876,53 +1013,48 @@ describe("transcript scrolling keys and wheel", () => {
     expect(f.instance.onReturn).not.toHaveBeenCalled();
   });
 
-  // Up and Down scroll only when Pi's editor has nothing to offer: no draft to move within and no
-  // history to recall. A draft or history hands them back to the editor instead.
+  // The arrows belong to Pi's editor. Nothing here scrolls on them: Pi's alternate screen binds no
+  // arrow to its viewport, so a draft's cursor and prompt history keep every one of them.
   it.each([
-    ["an empty prompt with no history", () => {}, false],
-    ["recallable prompt history", (/** @type {any} */ f) => f.instance.history.push("earlier prompt"), true],
-  ])("routes the arrows to %s", async (_label, prepare, editorKeeps) => {
-    const f = fixture({ snapshot: longSnapshot });
+    ["an empty prompt with no history", () => {}],
+    ["recallable prompt history", (/** @type {any} */ f) => f.instance.history.push("earlier prompt")],
+  ])("hands the arrows to Pi's editor with %s", async (_label, prepare) => {
+    const piEditor = piEditorFor();
+    const f = fixture({ editor: piEditor, snapshot: longSnapshot });
     await f.instance.open();
-    f.instance.render(80, 24);
     prepare(f);
+    const before = f.instance.viewport.scrollTop;
+
     f.instance.handleInput("\x1b[A");
-    expect(f.instance.transcript.following).toBe(editorKeeps);
-    expect(f.instance.transcript.linesFromEnd).toBe(editorKeeps ? 0 : 1);
     f.instance.handleInput("\x1b[B");
-    expect(f.instance.transcript.following).toBe(true);
-    expect(f.instance.transcript.linesFromEnd).toBe(0);
+
+    expect(f.instance.viewport.scrollTop).toBe(before);
+    expect(f.instance.viewport.isFollowingEnd).toBe(true);
   });
 
-  it("jumps with Home and End, scrolls on the wheel, and clears the new-activity marker at the end", async () => {
+  // Operator-visible failure this pins: a transcript that scrolled only as far as the viewer's own
+  // clipping allowed, and search that could only find what was already on screen.
+  it("gives Pi's own scroll view the whole transcript and every key that moves it", async () => {
     const f = fixture({ snapshot: longSnapshot });
     await f.instance.open();
-    const body = () => stripVTControlCharacters(f.instance.render(80, 24).join("\n"));
-    body();
+    const body = () => stripVTControlCharacters(paintedScreen(f.instance, 80, 24).join("\n"));
+    expect(body()).toContain("line 59");
+    expect(body()).not.toContain("line 0\n");
 
-    f.instance.handleMouse({ button: "wheel_up", column: 10, row: 5 });
-    expect(f.instance.transcript.following).toBe(false);
-    expect(f.instance.transcript.linesFromEnd).toBe(1);
-    f.instance.handleMouse({ button: "wheel_down", column: 10, row: 5 });
-    expect(f.instance.transcript.following).toBe(true);
-
-    // Home shows the oldest lines filling the transcript, not one message stranded on a blank screen.
-    f.instance.handleInput("\x1b[H");
-    expect(f.instance.transcript.following).toBe(false);
+    f.instance.tui.terminal.type("\x1b[H");
     const top = body();
     expect(top).toContain("line 0");
-    expect(top).toContain("line 8");
     expect(top).not.toContain("line 59");
-    await f.emit({ version: 1, sessionId: "s", eventId: "e1", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "system_message", itemId: "fresh", text: "fresh", level: "info" } });
-    expect(body()).toContain("new activity");
-    expect(body()).toContain("line 0");
+    expect(f.instance.viewport.isFollowingEnd).toBe(false);
 
-    f.instance.handleInput("\x1b[F");
-    expect(f.instance.transcript.following).toBe(true);
-    expect(f.instance.transcript.linesFromEnd).toBe(0);
-    const tail = body();
-    expect(tail).not.toContain("new activity");
-    expect(tail).toContain("fresh");
+    // Output that arrives while the reader is up the page does not drag him back down.
+    await f.emit({ version: 1, sessionId: "s", eventId: "e1", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "system_message", itemId: "fresh", text: "fresh", level: "info" } });
+    expect(body()).toContain("line 0");
+    expect(body()).not.toContain("fresh");
+
+    f.instance.tui.terminal.type("\x1b[F");
+    expect(f.instance.viewport.isFollowingEnd).toBe(true);
+    expect(body()).toContain("fresh");
   });
 
 });
@@ -953,196 +1085,317 @@ describe("installed Pi behavior the pending block depends on", () => {
 });
 
 /**
- * Ctrl+T opens Pi's own thinking levels for this session.
+ * Pi's own keys for what a transcript shows and what Pi thinks with.
  *
- * Operator-visible failure each test names: a key that changes nothing Pi can see, a picker that
- * offers a level Pi does not support, a level the footer claims before Pi confirmed it, and a draft
- * the picker eats.
+ * Operator-visible failure each test names: Ctrl+T asking the session for something instead of
+ * hiding thinking blocks, Shift+Tab sending a level the operator already left behind, a footer that
+ * claims a level Pi never confirmed, a Ctrl+C that interrupts a turn the operator only wanted to
+ * stop typing into, a Ctrl+D that does nothing, an Escape that leaves the session while a completion
+ * popup is open, and a remapped key Pi honours and this viewer ignores.
  */
-describe("thinking level picker", () => {
+describe("Pi's own thinking, tools, clear, exit and escape keys", () => {
   const levelMenu = (overrides = {}) => async () => ({ commands: [], models: [], model: { provider: "anthropic", id: "opus" }, color: null, thinkingLevels: ["off", "low", "high"], thinkingLevel: "low", ...overrides });
-  const screen = (/** @type {any} */ f) => stripVTControlCharacters(f.instance.render(80, 24).join("\n"));
+  const screen = (/** @type {any} */ f) => stripVTControlCharacters(paintedScreen(f.instance, 80, 24).join("\n"));
+  const reasoned = { kind: "assistant_message", itemId: "reasoned", content: [{ type: "thinking", text: "private reasoning" }, { type: "text", text: "answer" }] };
+  // A long result is the only way to read expansion off the screen: Pi's tool component shows the
+  // first lines of a short one either way.
+  const tool = (/** @type {string} */ id) => ({ id, name: "bash", state: "completed", arguments: { command: `run ${id}` }, result: [{ type: "text", text: Array.from({ length: 40 }, (_, line) => `${id} line ${line}`).join("\n") }], startedAt: timestamp, finishedAt: timestamp });
+  const thinkingConfirmed = (/** @type {string} */ level, /** @type {string} */ sequence) => ({ version: 1, sessionId: "s", eventId: `thinking-${sequence}`, cursor: { daemonEpoch: "epoch", sessionId: "s", sequence }, timestamp, payload: { kind: "thinking_state", level } });
 
-  it("lists the levels Pi reported with the current one selected, leaving thinking blocks and the draft alone", async () => {
-    const f = fixture({
-      menu: levelMenu(),
-      snapshot: { thinkingLevel: "low", items: [{ kind: "assistant_message", itemId: "reasoned", content: [{ type: "thinking", text: "private reasoning" }, { type: "text", text: "answer" }] }] },
-    });
+  it("hides and shows thinking blocks on Ctrl+T without asking the session for anything", async () => {
+    const f = fixture({ menu: levelMenu(), snapshot: { thinkingLevel: "low", items: [reasoned] } });
     await f.instance.open();
     await f.instance.menuLoaded;
     f.instance.editor.setText("half typed");
     expect(screen(f)).toContain("private reasoning");
 
     f.instance.handleInput("\x14");
-    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
 
-    const view = screen(f);
-    expect(view).toContain("Select a thinking level");
-    for (const level of ["off", "low", "high"]) expect(view).toContain(level);
-    expect(view).toContain("→ low");
-    expect(f.instance.editor.getText()).toBe("half typed");
-
-    f.instance.handleInput("\x1b");
-    expect(f.instance.selection).toBeUndefined();
+    expect(f.instance.hideThinking).toBe(true);
+    expect(screen(f)).not.toContain("private reasoning");
+    expect(screen(f)).toContain("Thinking blocks: hidden");
     expect(f.commands).toEqual([]);
     expect(f.instance.editor.getText()).toBe("half typed");
-    expect(f.instance.onReturn).not.toHaveBeenCalled();
-    // The picker chooses what Pi thinks with, never what this transcript shows.
-    expect(f.instance.hideThinking).toBe(false);
-    expect(screen(f)).not.toContain("Thinking blocks: hidden");
-    expect(screen(f)).toContain("private reasoning");
-  });
-
-  it("keeps the draft and its cursor across an opened and cancelled picker", async () => {
-    const piEditor = createPiEditor({ tui: { requestRender() {}, setFocus() {} } });
-    const f = fixture({ editor: piEditor, menu: levelMenu() });
-    await f.instance.open();
-    await f.instance.menuLoaded;
-    piEditor.setText("abcd");
-    f.instance.handleInput("\x1b[D");
+    expect(f.instance.selection).toBeUndefined();
 
     f.instance.handleInput("\x14");
-    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
-    f.instance.handleInput("\x1b");
-    f.instance.handleInput("X");
 
-    expect(piEditor.getText()).toBe("abcXd");
+    expect(f.instance.hideThinking).toBe(false);
+    expect(screen(f)).toContain("private reasoning");
+    expect(f.commands).toEqual([]);
   });
 
-  it("sends one set_thinking_level for the chosen level and follows Pi's confirmation in the footer", async () => {
+  it("cycles to the next level Pi reported on Shift+Tab and moves the footer only on Pi's confirmation", async () => {
     const f = fixture({ menu: levelMenu(), snapshot: { thinkingLevel: "low", model: { provider: "anthropic", id: "opus" } } });
     await f.instance.open();
     await f.instance.menuLoaded;
     expect(screen(f)).toContain("opus • low");
 
-    f.instance.handleInput("\x14");
-    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
-    f.instance.handleInput("\x1b[B");
-    f.instance.handleInput("\r");
+    f.instance.handleInput("\x1b[Z");
 
     await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "session_command", payload: { sessionId: "s", command: "set_thinking_level", level: "high" } }]));
-    expect(f.instance.selection).toBeUndefined();
-    // Pi confirms the change on its own stream; nothing here claims it first.
     expect(screen(f)).toContain("opus • low");
-    await f.emit({ version: 1, sessionId: "s", eventId: "confirmed", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "thinking_state", level: "high" } });
+
+    await f.emit(thinkingConfirmed("high", "1"));
     expect(screen(f)).toContain("opus • high");
     expect(f.commands).toHaveLength(1);
   });
 
-  it("leaves the level where it was and says why when the daemon refuses the change", async () => {
-    const f = fixture({
-      menu: levelMenu(),
-      snapshot: { thinkingLevel: "low", model: { provider: "anthropic", id: "opus" } },
-      command: async () => { throw Object.assign(new Error("No exact recovered worker owns this session"), { code: "WORKER_UNAVAILABLE", retryable: false }); },
-    });
+  it("cycles from the level it last asked for when a second press lands before Pi confirms the first", async () => {
+    const f = fixture({ menu: levelMenu(), snapshot: { thinkingLevel: "low" } });
     await f.instance.open();
     await f.instance.menuLoaded;
 
-    f.instance.handleInput("\x14");
-    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
-    f.instance.handleInput("\x1b[B");
-    f.instance.handleInput("\r");
+    f.instance.handleInput("\x1b[Z");
+    f.instance.handleInput("\x1b[Z");
 
-    await vi.waitFor(() => expect(screen(f)).toContain("WORKER_UNAVAILABLE"));
-    expect(screen(f)).toContain("opus • low");
-    expect(f.instance.closedState).toBe(false);
+    await vi.waitFor(() => expect(f.commands.map((/** @type {any} */ command) => command.payload.level)).toEqual(["high", "off"]));
+
+    // Pi's confirmation is what the next press counts from, so a level changed elsewhere is honoured.
+    await f.emit(thinkingConfirmed("off", "1"));
+    f.instance.handleInput("\x1b[Z");
+    await vi.waitFor(() => expect(f.commands.map((/** @type {any} */ command) => command.payload.level)).toEqual(["high", "off", "low"]));
   });
 
-  it("offers the levels of the model this session is on now, not the ones the last menu carried", async () => {
+  it("reads the levels again after Pi confirms a different model, because Pi reports them per model", async () => {
     let levels = ["off", "low", "high"];
-    const f = fixture({ menu: async () => ({ commands: [], models: [], model: null, color: null, thinkingLevels: levels, thinkingLevel: "off" }) });
+    const f = fixture({ menu: async () => ({ commands: [], models: [], model: { provider: "anthropic", id: "opus" }, color: null, thinkingLevels: levels, thinkingLevel: "off" }) });
     await f.instance.open();
     await f.instance.menuLoaded;
 
     levels = ["off", "max"];
-    f.instance.handleInput("\x14");
-    await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
+    await f.emit({ version: 1, sessionId: "s", eventId: "model", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "model_state", provider: "anthropic", model: "haiku" } });
+    await f.instance.menuLoaded;
+    f.instance.handleInput("\x1b[Z");
 
-    // The dock's own key hints carry the word "follow-up", so the stale level is read off the picker
-    // rather than off the whole screen.
-    const picker = stripVTControlCharacters(f.instance.selection.render(80).join("\n"));
-    expect(picker).toContain("max");
-    expect(picker).not.toContain("low");
+    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "session_command", payload: { sessionId: "s", command: "set_thinking_level", level: "max" } }]));
   });
 
   it.each([
     ["a worker that reports no levels", async () => ({ commands: [], models: [], model: null, color: null, thinkingLevels: [], thinkingLevel: null })],
     ["a worker from a release that never sent them", async () => ({ commands: [], models: [], model: null, color: null })],
-  ])("opens no picker for %s and says the levels are unavailable", async (_name, menu) => {
+  ])("sends nothing and says the levels are unavailable for %s", async (_name, menu) => {
     const f = fixture({ menu });
     await f.instance.open();
     await f.instance.menuLoaded;
 
-    f.instance.handleInput("\x14");
+    f.instance.handleInput("\x1b[Z");
 
     await vi.waitFor(() => expect(screen(f)).toContain("THINKING_LEVELS_UNAVAILABLE"));
+    expect(f.commands).toEqual([]);
     expect(f.instance.selection).toBeUndefined();
-    expect(f.instance.thinkingLoading).toBe(false);
+  });
+
+  it("expands and collapses every tool at once on Ctrl+O, leaving the arrows to prompt history", async () => {
+    const f = fixture({ snapshot: { items: [], tools: [tool("first"), tool("second")] } });
+    await f.instance.open();
+    expect(f.instance.transcript.toolsExpanded).toBe(false);
+    // Pi's own collapsed tool names the key that expands it, so the screen says which state it is in.
+    expect(screen(f)).toContain("earlier lines, ctrl+o to expand");
+
+    f.instance.handleInput("\x0f");
+
+    expect(f.instance.transcript.toolsExpanded).toBe(true);
+    expect(screen(f)).not.toContain("ctrl+o to expand");
+    expect(screen(f)).toContain("second line 39");
+    expect(f.commands).toEqual([]);
+
+    f.instance.handleInput("\x0f");
+
+    expect(f.instance.transcript.toolsExpanded).toBe(false);
+    expect(screen(f)).toContain("earlier lines, ctrl+o to expand");
+
+    // No tool cursor swallows the arrows: recallable history still answers them.
+    f.instance.history.push("earlier prompt");
+    f.instance.handleInput("\x1b[A");
+    expect(f.instance.viewport.isFollowingEnd).toBe(true);
+  });
+
+  it("clears the prompt on Ctrl+C, quits on a second press inside the window, and never interrupts", async () => {
+    let now = 0;
+    const onQuit = vi.fn();
+    const f = fixture({ snapshot: { taskState: "WORKING" }, onQuit, now: () => now });
+    await f.instance.open();
+    f.instance.editor.setText("half typed");
+
+    f.instance.handleInput("\x03");
+
+    expect(f.instance.editor.getText()).toBe("");
+    expect(f.commands).toEqual([]);
+    expect(onQuit).not.toHaveBeenCalled();
+
+    now = 499;
+    f.instance.handleInput("\x03");
+
+    expect(onQuit).toHaveBeenCalledOnce();
+    expect(f.commands).toEqual([]);
+    expect(f.instance.onReturn).not.toHaveBeenCalled();
+  });
+
+  it("keeps Escape as the only interrupt and leaves the session once the turn is settled", async () => {
+    const f = fixture({ snapshot: { taskState: "WORKING" } });
+    await f.instance.open();
+
+    f.instance.handleInput("\x1b");
+
+    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "interrupt", payload: { sessionId: "s" } }]));
+    expect(f.instance.onReturn).not.toHaveBeenCalled();
+
+    await f.emit({ version: 1, sessionId: "s", eventId: "settled", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "turn_state", working: false } });
+    f.instance.handleInput("\x1b");
+
+    expect(f.instance.onReturn).toHaveBeenCalledOnce();
+    expect(f.commands).toHaveLength(1);
+  });
+
+  it("quits the frontend on Ctrl+D with an empty prompt and deletes forward with text in it", async () => {
+    const piEditor = piEditorFor();
+    const onQuit = vi.fn();
+    const f = fixture({ editor: piEditor, onQuit });
+    await f.instance.open();
+
+    piEditor.setText("abcd");
+    f.instance.handleInput("\x1b[D");
+    f.instance.handleInput("\x04");
+    expect(piEditor.getText()).toBe("abc");
+    expect(onQuit).not.toHaveBeenCalled();
+
+    piEditor.setText("");
+    f.instance.handleInput("\x04");
+
+    expect(onQuit).toHaveBeenCalledOnce();
+    expect(f.commands).toEqual([]);
+    await f.instance.close();
+  });
+
+  it("cancels the completion popup on the first Escape and leaves the session on the next one", async () => {
+    const piEditor = piEditorFor();
+    const f = fixture({ editor: piEditor, menu: async () => ({ commands: [{ name: "/review", source: "extension" }], models: [], model: null, color: null }) });
+    await f.instance.open();
+    await f.instance.menuLoaded;
+
+    for (const character of "/mod") f.instance.handleInput(character);
+    await vi.waitFor(() => expect(piEditor.isShowingAutocomplete()).toBe(true));
+
+    f.instance.handleInput("\x1b");
+
+    expect(piEditor.isShowingAutocomplete()).toBe(false);
+    expect(f.instance.onReturn).not.toHaveBeenCalled();
+    expect(piEditor.getText()).toBe("/mod");
+
+    f.instance.handleInput("\x1b");
+
+    expect(f.instance.onReturn).toHaveBeenCalledOnce();
+    await f.instance.close();
+  });
+
+  // Pi ships its own copy of pi-tui, so its editor reads a different global keybindings manager than
+  // this package's own lists do. A remapped app action proves the editor's manager, and a remapped
+  // editor action proves the one pi-tui itself resolves from.
+  it("honours an app key and an editor key the operator remapped in Pi's own keybindings file", async () => {
+    const piEditor = piEditorFor(await agentDir({ "app.tools.expand": "ctrl+e", "tui.input.submit": "ctrl+s" }));
+    const f = fixture({ editor: piEditor, snapshot: { items: [], tools: [tool("first")] } });
+    await f.instance.open();
+
+    f.instance.handleInput("\x0f");
+    expect(f.instance.transcript.toolsExpanded).toBe(false);
+
+    f.instance.handleInput("\x05");
+    expect(f.instance.transcript.toolsExpanded).toBe(true);
+
+    for (const character of "ship it") f.instance.handleInput(character);
+    f.instance.handleInput("\r");
+    expect(f.commands).toEqual([]);
+    f.instance.handleInput("\x13");
+
+    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "prompt", payload: { sessionId: "s", text: "ship it" } }]));
+    await f.instance.close();
+  });
+});
+
+/**
+ * Reading this session's menu is itself a Pi command, so what the viewer does with its answer decides
+ * whether it ever stops asking.
+ *
+ * A menu read reaches Pi as `get_state`, and the viewer normalizer republishes every `get_state`
+ * response as a `model_state` event carrying the model it just read. A viewer that reloads its menu
+ * on each of those asks again, forever: one acceptance run logged 11,732 Pi commands for a single
+ * idle session and never sent the key the operator had pressed.
+ */
+describe("session menu reads", () => {
+  const modelMenu = (/** @type {any} */ model) => async () => ({ commands: [], models: [], model, color: null, thinkingLevels: ["off", "low", "high"], thinkingLevel: "low" });
+  const modelState = (/** @type {any} */ model, /** @type {string} */ sequence) => ({
+    version: 1, sessionId: "s", eventId: `model-${sequence}`, cursor: { daemonEpoch: "epoch", sessionId: "s", sequence }, timestamp,
+    payload: { kind: "model_state", provider: model?.provider ?? null, model: model?.id ?? null },
+  });
+
+  it.each([
+    ["a model it already had", { provider: "anthropic", id: "opus" }, { provider: "anthropic", id: "opus" }],
+    ["no model at all, twice", null, null],
+  ])("reads the menu once when the read's own echo reports %s", async (_label, snapshotModel, echoed) => {
+    let queries = 0;
+    const f = fixture({
+      snapshot: { model: snapshotModel },
+      menu: async () => { queries += 1; return modelMenu(snapshotModel)(); },
+    });
+    await f.instance.open();
+    await f.instance.menuLoaded;
+    expect(queries).toBe(1);
+
+    // Every one of these is the echo of a menu read. A viewer that answers them with another read
+    // makes each echo produce the next one.
+    await f.emit(modelState(echoed, "1"));
+    await f.emit(modelState(echoed, "2"));
+    await f.emit(modelState(echoed, "3"));
+
+    expect(queries).toBe(1);
     expect(f.commands).toEqual([]);
   });
 
-  it("reports the menu failure once and opens no picker when the worker refuses the read", async () => {
-    const f = fixture({ menu: async () => { throw Object.assign(new Error("This session's worker predates slash commands"), { code: "UNSUPPORTED_WORKER_OPERATION" }); } });
-    await f.instance.open();
-    await f.instance.menuLoaded;
-
-    f.instance.handleInput("\x14");
-
-    await vi.waitFor(() => expect(f.instance.thinkingLoading).toBe(false));
-    expect(f.instance.selection).toBeUndefined();
-    expect(screen(f)).not.toContain("THINKING_LEVELS_UNAVAILABLE");
-    expect(f.instance.state.errors.map((/** @type {any} */ error) => error.code)).toEqual(["SESSION_COMMANDS_UNAVAILABLE", "SESSION_COMMANDS_UNAVAILABLE"]);
-  });
-
-  it("says the levels are loading and opens nothing when the viewer leaves before they arrive", async () => {
-    /** @type {() => void} */
-    let releaseLevels = () => {};
-    let menuCalls = 0;
+  it("reads the menu again when the model genuinely changed, and forgets the level it was waiting on", async () => {
+    let queries = 0;
     const f = fixture({
-      menu: () => {
-        menuCalls += 1;
-        if (menuCalls === 1) return Promise.resolve({ commands: [], models: [], model: null, color: null, thinkingLevels: ["off", "high"], thinkingLevel: "off" });
-        return new Promise((resolve) => { releaseLevels = () => resolve({ commands: [], models: [], model: null, color: null, thinkingLevels: ["off", "high"], thinkingLevel: "off" }); });
-      },
+      snapshot: { model: { provider: "anthropic", id: "opus" }, thinkingLevel: "low" },
+      menu: async () => { queries += 1; return modelMenu({ provider: "anthropic", id: "opus" })(); },
     });
     await f.instance.open();
     await f.instance.menuLoaded;
+    f.instance.handleInput("\x1b[Z");
+    await vi.waitFor(() => expect(f.commands).toHaveLength(1));
+    expect(f.instance.requestedThinkingLevel).toBe("high");
 
-    f.instance.handleInput("\x14");
-    expect(f.instance.thinkingLoading).toBe(true);
-    expect(screen(f)).toContain("Thinking levels…");
+    await f.emit(modelState({ provider: "openai", id: "gpt-5" }, "1"));
 
-    // Escape while the read is in flight cancels it: no picker afterwards, and the list is not left.
-    f.instance.handleInput("\x1b");
-    expect(f.instance.thinkingLoading).toBe(false);
-    expect(f.instance.onReturn).not.toHaveBeenCalled();
-    releaseLevels();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(f.instance.selection).toBeUndefined();
-    expect(screen(f)).not.toContain("Thinking levels…");
+    await vi.waitFor(() => expect(queries).toBe(2));
+    // Pi reports levels per model, so the level asked for under the old one is no longer pending.
+    expect(f.instance.requestedThinkingLevel).toBeUndefined();
   });
 
-  it("opens no picker after the viewer closed while the levels were still loading", async () => {
+  /**
+   * The menu is a worker round trip that starts behind the open, so the first frame is painted while
+   * it is still in flight. Operator-visible failure: Shift+Tab in that window said this session
+   * reported no thinking levels and sent Pi nothing, when the levels were already on their way.
+   */
+  it("waits for the menu read already in flight when Shift+Tab lands before it answers", async () => {
     /** @type {() => void} */
-    let releaseLevels = () => {};
-    let menuCalls = 0;
+    let release;
+    const piEditor = piEditorFor();
     const f = fixture({
-      menu: () => {
-        menuCalls += 1;
-        if (menuCalls === 1) return Promise.resolve({ commands: [], models: [], model: null, color: null, thinkingLevels: ["off", "high"], thinkingLevel: "off" });
-        return new Promise((resolve) => { releaseLevels = () => resolve({ commands: [], models: [], model: null, color: null, thinkingLevels: ["off", "high"], thinkingLevel: "off" }); });
-      },
+      editor: piEditor,
+      snapshot: { model: { provider: "anthropic", id: "opus" } },
+      menu: () => new Promise((resolve) => { release = () => resolve({ commands: [], models: [], model: { provider: "anthropic", id: "opus" }, color: null, thinkingLevels: ["off", "low", "high"], thinkingLevel: "low" }); }),
     });
     await f.instance.open();
-    await f.instance.menuLoaded;
-    f.instance.handleInput("\x14");
-    expect(menuCalls).toBe(2);
+    // The dock paints before the menu answers, which is exactly the window an early press lands in.
+    expect(stripVTControlCharacters(paintedScreen(f.instance, 80, 24).join("\n"))).toContain("opus");
 
-    await f.instance.close();
-    releaseLevels();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    f.instance.handleInput("\x1b[Z");
+    expect(f.commands).toEqual([]);
+    release();
 
-    expect(f.instance.selection).toBeUndefined();
+    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "session_command", payload: { sessionId: "s", command: "set_thinking_level", level: "high" } }]));
+    expect(f.instance.state.errors).toEqual([]);
+    expect(f.commands).toHaveLength(1);
   });
 });
 
@@ -1151,11 +1404,11 @@ describe("viewer prompt", () => {
   // it is Pi's own editor rather than a hand-painted line.
   it("wraps a draft wider than the terminal instead of clipping it", async () => {
     const draft = "Add the Notion and Slack MCP servers to this session so the agent can read the release checklist";
-    const f = fixture({ editor: createPiEditor({ tui: { requestRender() {} } }) });
+    const f = fixture({ editor: piEditorFor() });
     await f.instance.open();
     f.instance.editor.setText(draft);
 
-    const lines = f.instance.render(60, 24).map(stripTerminalSequences);
+    const lines = paintedScreen(f.instance, 60, 24).map(stripTerminalSequences);
     const rules = lines.flatMap((line, index) => /^─+$/u.test(line.trim()) ? [index] : []);
     const promptRows = lines.slice(rules.at(-2) + 1, rules.at(-1));
 
@@ -1176,7 +1429,7 @@ describe("viewer prompt", () => {
 describe("submission keys through Pi's own editor", () => {
   afterEach(() => setKittyProtocolActive(false));
 
-  const nativeFixture = (overrides = {}) => fixture({ ...overrides, editor: createPiEditor({ tui: { requestRender() {}, setFocus() {} } }) });
+  const nativeFixture = (overrides = {}) => fixture({ ...overrides, editor: piEditorFor() });
 
   it.each([
     ["a legacy terminal", false, "\r", "\x1b\r"],
@@ -1255,7 +1508,7 @@ describe("submission keys through Pi's own editor", () => {
     expect(f.commands).toEqual([{ operation: "prompt", payload: { sessionId: "s", text: "check the lint first" } }]);
     expect(f.instance.state.errors.at(-1)).toMatchObject({ code: "WORKER_UPGRADE_REQUIRED" });
     expect(f.instance.history).toEqual([]);
-    expect(stripVTControlCharacters(f.instance.render(80, 24).join("\n"))).not.toContain("Pending: check the lint first");
+    expect(stripVTControlCharacters(paintedScreen(f.instance, 80, 24).join("\n"))).not.toContain("Pending: check the lint first");
     await f.instance.close();
   });
 

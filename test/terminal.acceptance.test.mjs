@@ -110,8 +110,11 @@ function editor() {
     setText(value) { text = value; this.onChange?.(value); },
     getText() { return text; },
     addToHistory() {},
+    actions: /** @type {Record<string, () => void>} */ ({}),
+    onAction(action, handler) { this.actions[action] = handler; },
     handleInput(data) {
       if (data === "\r") this.onSubmit?.(text);
+      else if (data === "\x1b\r") this.actions["app.message.followUp"]?.();
       else if (data.length === 1 && data >= " ") { text += data; this.onChange?.(text); }
     },
     render: () => [`> ${text}`],
@@ -242,7 +245,7 @@ it("drives list navigation, search/filter/sort/group, metadata/help, composer, c
   expect(f.client.delete).toHaveBeenCalledTimes(1);
 });
 
-it("drives viewer prompt/follow-up/steer/interrupt, tools, pending UI, and read-only restrictions", async () => {
+it("drives viewer prompt/follow-up/interrupt, tools, pending UI, and read-only restrictions", async () => {
   const f = viewerFixture({ pendingUi: [], errors: [], tools: [{ id: "tool", name: "bash", state: "completed", arguments: {}, result: [{ type: "text", text: "needle result" }], startedAt: timestamp, finishedAt: timestamp }] });
   await f.controller.open();
   f.controller.editor.setText("first");
@@ -251,16 +254,14 @@ it("drives viewer prompt/follow-up/steer/interrupt, tools, pending UI, and read-
   await f.emit(event(1, { kind: "turn_state", working: true }));
   f.controller.editor.setText("next");
   f.controller.handleInput("\r");
-  f.controller.editor.setText("draft");
-  f.controller.handleInput("\x13");
-  for (const input of "urgent") f.controller.handleInput(input);
-  f.controller.handleInput("\r");
+  f.controller.editor.setText("urgent");
+  f.controller.handleInput("\x1b\r");
   await vi.waitFor(() => {
-    expect(f.commands.map(({ operation }) => operation)).toEqual(["prompt", "follow_up", "steer"]);
-    expect(f.controller.inputMode).toBe("prompt");
+    expect(f.commands.map(({ operation }) => operation)).toEqual(["prompt", "prompt", "follow_up"]);
+    expect(f.controller.editor.getText()).toBe("");
   });
   f.controller.handleInput("\x03");
-  await vi.waitFor(() => expect(f.commands.map(({ operation }) => operation)).toEqual(["prompt", "follow_up", "steer", "interrupt"]));
+  await vi.waitFor(() => expect(f.commands.map(({ operation }) => operation)).toEqual(["prompt", "prompt", "follow_up", "interrupt"]));
 
   await f.emit(event(2, { kind: "pending_ui_request", request: { id: "confirm", method: "confirm", title: "Continue?" } }));
   f.controller.handleInput("y");

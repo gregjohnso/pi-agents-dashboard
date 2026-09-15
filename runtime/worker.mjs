@@ -14,6 +14,11 @@ const MAX_MENU_ENTRIES = 1_000;
 // Pi 0.84.3 refuses a prompt sent during a run with "Agent is already processing. Specify
 // streamingBehavior ('steer' or 'followUp') to queue the message."
 const PI_ALREADY_PROCESSING = /already processing/iu;
+/**
+ * What Pi is told to do with each operation's text if it arrives during a run. The operation carries
+ * the operator's key: Enter steers into the turn in progress, Alt+Enter waits for it to finish.
+ */
+const STREAMING_BEHAVIOR = { prompt: "steer", follow_up: "followUp" };
 
 /** @param {any} value @param {string} fallbackSource */
 function menuCommand(value, fallbackSource) {
@@ -70,26 +75,27 @@ function assertSessionCommand(request) {
 }
 
 /**
- * Deliver the operator's text and let Pi decide whether it starts a turn or joins the queue.
+ * Deliver the operator's text and let Pi decide whether it starts a turn or joins a queue.
  *
  * Only Pi knows whether a run is active, and it moves first: a dashboard's `working` flag comes from
- * a turn_state event that is still in flight, so a frontend that chooses between `prompt` and
- * `follow_up` from that cache is deciding on remote state it cannot see. `streamingBehavior` removes
- * the decision: Pi reads its own state and applies the behavior in the same step, so no window
- * exists in which the text can be refused. Idle Pi ignores the field and starts the turn.
+ * a turn_state event that is still in flight, so a frontend that chose between `prompt` and
+ * `follow_up` from that cache would be deciding on remote state it cannot see. `streamingBehavior`
+ * removes the decision: Pi reads its own state and applies the behavior in the same step, so no
+ * window exists in which the text can be refused. Idle Pi ignores the field and starts the turn.
  *
  * A Pi that does not read the field still refuses mid-run, and that refusal is acknowledged, meaning
- * nothing was queued. Resubmitting the same text through `follow_up` is then the recovery, so the
- * text is delivered once either way and the operator never sees the refusal.
- * @param {any} adapter @param {string | undefined} text
+ * nothing was queued. Resubmitting through the command that carries the same intent is then the
+ * recovery, so the text is delivered once, as what the operator asked for, and he never sees the
+ * refusal. Any other failure leaves the write ambiguous and is never retried.
+ * @param {any} adapter @param {string | undefined} text @param {string} behavior
  */
-async function deliverOperatorText(adapter, text) {
+async function deliverOperatorText(adapter, text, behavior) {
   try {
-    return await adapter.prompt(text, "followUp");
+    return await adapter.prompt(text, behavior);
   } catch (cause) {
-    const failure = /** @type {{ code?: unknown, message?: unknown }} */ (cause);
-    if (failure?.code !== "RPC_COMMAND_FAILED" || !PI_ALREADY_PROCESSING.test(String(failure?.message ?? ""))) throw cause;
-    return await adapter.followUp(text);
+    const failure = /** @type {{ code?: unknown, message?: unknown, acknowledged?: unknown }} */ (cause);
+    if (failure?.acknowledged !== true || failure.code !== "RPC_COMMAND_FAILED" || !PI_ALREADY_PROCESSING.test(String(failure.message ?? ""))) throw cause;
+    return behavior === "steer" ? await adapter.steer(text) : await adapter.followUp(text);
   }
 }
 
@@ -221,7 +227,7 @@ export function createWorkerCommandDispatcher({ replay, adapter }) {
       try {
         switch (command.op) {
           case "prompt":
-          case "follow_up": resultValue = await deliverOperatorText(adapter, command.text); break;
+          case "follow_up": resultValue = await deliverOperatorText(adapter, command.text, STREAMING_BEHAVIOR[command.op]); break;
           case "steer": resultValue = await adapter.steer(command.text); break;
           case "interrupt": resultValue = await adapter.abort(); break;
           case "ui_response": resultValue = await adapter.uiResponse(command.response); break;

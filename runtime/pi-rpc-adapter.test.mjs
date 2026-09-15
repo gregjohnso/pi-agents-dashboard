@@ -197,7 +197,7 @@ it("records an explicit Pi error acknowledgement before the terminal failure", a
   await adapter.close();
 });
 
-it("tells Pi what to do with text that arrives during a run, for both operations a dashboard sends", async () => {
+it("names the streaming behavior of each operation a dashboard sends, whatever that dashboard believed", async () => {
   /** @type {any[]} */
   const seen = [];
   const child = fakeRpcProcess((command, process) => {
@@ -208,20 +208,24 @@ it("tells Pi what to do with text that arrives during a run, for both operations
   const replay = await createWorkerReplayStore({ append: async () => {} });
   const dispatcher = createWorkerCommandDispatcher({ replay, adapter });
 
-  // A dashboard picks the operation from a `working` flag that is one event behind Pi. Either pick
-  // reaches Pi as one prompt carrying the behavior, so Pi's own state decides what happens to it.
+  // The operation carries the operator's key, not a guess at Pi's state: Enter steers, Alt+Enter
+  // follows up, and each reaches Pi as one prompt carrying that behavior. Both are sent here while
+  // the dashboard's own `working` flag disagrees with Pi in the two directions it can.
   await dispatcher.deliver({ clientId: "client", requestId: "believed-idle", op: "prompt", text: "push" });
   await dispatcher.deliver({ clientId: "client", requestId: "believed-working", op: "follow_up", text: "then deploy" });
 
   expect(seen.map(({ type, message, streamingBehavior }) => ({ type, message, streamingBehavior }))).toEqual([
-    { type: "prompt", message: "push", streamingBehavior: "followUp" },
+    { type: "prompt", message: "push", streamingBehavior: "steer" },
     { type: "prompt", message: "then deploy", streamingBehavior: "followUp" },
   ]);
   await dispatcher.close();
   await adapter.close();
 });
 
-it("resubmits the same text as a follow-up when Pi refuses a prompt it is already too busy to accept", async () => {
+it.each([
+  ["prompt", "steer"],
+  ["follow_up", "follow_up"],
+])("resubmits %s through Pi's own %s command when Pi refuses a prompt it is already too busy to accept", async (op, fallback) => {
   /** @type {any[]} */
   const records = [];
   /** @type {any[]} */
@@ -238,11 +242,56 @@ it("resubmits the same text as a follow-up when Pi refuses a prompt it is alread
   const replay = await createWorkerReplayStore({ append: async (record) => { records.push(record); } });
   const dispatcher = createWorkerCommandDispatcher({ replay, adapter });
 
-  await expect(dispatcher.deliver({ clientId: "client", requestId: "busy", op: "prompt", text: "push" })).resolves.toMatchObject({ stage: "RPC_ACKNOWLEDGED" });
+  await expect(dispatcher.deliver({ clientId: "client", requestId: "busy", op, text: "push" })).resolves.toMatchObject({ stage: "RPC_ACKNOWLEDGED" });
 
-  // The refusal is acknowledged, so Pi queued nothing: the text is delivered exactly once.
-  expect(seen.map(({ type, message }) => [type, message])).toEqual([["prompt", "push"], ["follow_up", "push"]]);
+  // The refusal is acknowledged, so Pi queued nothing: the text is delivered exactly once, and it
+  // keeps the operator's intent rather than turning every key into a follow-up.
+  expect(seen.map(({ type, message }) => [type, message])).toEqual([["prompt", "push"], [fallback, "push"]]);
   expect(records.map((record) => record.stage)).toEqual(["RECEIVED", "RPC_WRITE_STARTED", "RPC_ACKNOWLEDGED"]);
+  await dispatcher.close();
+  await adapter.close();
+});
+
+// Only an acknowledged "already processing" refusal proves Pi queued nothing. Every other failure
+// leaves the write ambiguous, and resubmitting there could apply the operator's text twice.
+it.each([
+  ["an unacknowledged transport failure", Object.assign(new Error("Pi did not answer prompt"), { code: "RPC_TIMEOUT" })],
+  ["a refusal that is not about a busy agent", Object.assign(new Error("Cannot submit a prompt while compaction is in progress."), { code: "RPC_COMMAND_FAILED", acknowledged: true })],
+])("sends the operator's text once and no second time after %s", async (_label, failure) => {
+  /** @type {string[]} */
+  const attempts = [];
+  const replay = await createWorkerReplayStore({ append: async () => {} });
+  const dispatcher = createWorkerCommandDispatcher({ replay, adapter: {
+    async prompt() { attempts.push("prompt"); throw failure; },
+    async steer() { attempts.push("steer"); },
+    async followUp() { attempts.push("follow_up"); },
+    getStderr() { return ""; },
+  } });
+
+  await expect(dispatcher.deliver({ clientId: "client", requestId: "ambiguous", op: "prompt", text: "push" })).rejects.toMatchObject({ code: failure.code === "RPC_TIMEOUT" ? "DELIVERY_UNKNOWN" : "RPC_COMMAND_FAILED" });
+  expect(attempts).toEqual(["prompt"]);
+  await dispatcher.close();
+});
+
+// A frontend that reconnects mid-flight resends the same command identity. Pi exposes no idempotency
+// key, so a second write would queue the operator's line twice inside one run.
+it("answers a repeated command identity from the replay log instead of enqueueing the text again", async () => {
+  /** @type {any[]} */
+  const seen = [];
+  const child = fakeRpcProcess((command, process) => {
+    seen.push(command);
+    process.stdout.write(`${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true })}\n`);
+  });
+  const adapter = await PiRpcAdapter.start({ cwd: "/tmp", sessionFile: "/tmp/fake-session.jsonl", env: {}, executable: "/installed/pi", spawnImpl: () => child });
+  const replay = await createWorkerReplayStore({ append: async () => {} });
+  const dispatcher = createWorkerCommandDispatcher({ replay, adapter });
+  const command = { clientId: "client", requestId: "one-line", op: "prompt", text: "push" };
+
+  const first = await dispatcher.deliver({ ...command });
+  const second = await dispatcher.deliver({ ...command });
+
+  expect([first, second]).toEqual([expect.objectContaining({ stage: "RPC_ACKNOWLEDGED" }), expect.objectContaining({ stage: "RPC_ACKNOWLEDGED" })]);
+  expect(seen.filter(({ type }) => type === "prompt")).toHaveLength(1);
   await dispatcher.close();
   await adapter.close();
 });

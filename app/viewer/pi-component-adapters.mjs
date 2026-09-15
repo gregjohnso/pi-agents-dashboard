@@ -8,11 +8,15 @@ import {
 
 initTheme(undefined, false);
 
+// Pi's own defaults for the actions this viewer binds. `app.message.followUp` keeps the keys Pi's
+// own interface uses, so the terminal encodings of alt+enter stay Pi's problem rather than this
+// package's, and an operator who knows Pi already knows this key.
 const APP_KEYBINDINGS = {
   "app.clipboard.pasteImage": { defaultKeys: [], description: "Paste image" },
   "app.interrupt": { defaultKeys: "ctrl+c", description: "Interrupt" },
   "app.exit": { defaultKeys: "ctrl+d", description: "Exit" },
   "app.editor.external": { defaultKeys: "ctrl+g", description: "Open external editor" },
+  "app.message.followUp": { defaultKeys: "alt+enter", description: "Queue follow-up message" },
 };
 
 const PI_HIDDEN_THINKING_LABEL = "Thinking...";

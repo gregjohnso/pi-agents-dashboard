@@ -90,8 +90,8 @@ function renderModelFooter({ model, thinkingLevel }, hideThinking, width) {
 /** Render the widest prefix of Pi's key hints plus the dashboard's own return keys that fits. */
 function renderKeyHints({ working }, width) {
   const segments = working
-    ? ["Esc interrupt", "← list", "↑↓ scroll", "Ctrl+S steer", "Ctrl+T thinking", "Ctrl+O tools", "/ commands"]
-    : ["Esc/← list", "↑↓ scroll", "Ctrl+S steer", "Ctrl+T thinking", "Ctrl+O tools", "/ commands"];
+    ? ["Esc interrupt", "← list", "↑↓ scroll", "Alt+Enter follow-up", "Ctrl+T thinking", "Ctrl+O tools", "/ commands"]
+    : ["Esc/← list", "↑↓ scroll", "Alt+Enter follow-up", "Ctrl+T thinking", "Ctrl+O tools", "/ commands"];
   for (let count = segments.length; count > 0; count -= 1) {
     const line = ` ${segments.slice(0, count).join(" · ")}`;
     if (visibleWidth(line) <= width) return line;
@@ -133,10 +133,9 @@ export class ViewerController {
     this.cwd = cwd;
     this.menu = EMPTY_SESSION_MENU;
     this.history = [];
-    /** Submissions this viewer has sent and not yet seen in the transcript. @type {{ mode: "submission" | "steer", text: string, priorMatches: number }[]} */
+    /** Submissions this viewer has sent and not yet seen in the transcript. @type {{ text: string, priorMatches: number }[]} */
     this.pending = [];
     this.respondedUi = new Set();
-    this.inputMode = "prompt";
     this.hideThinking = false;
     this.daemonUnreachable = false;
     this.streamStopped = false;
@@ -146,7 +145,10 @@ export class ViewerController {
     this.closedState = true;
     this.returnGesture = new ReturnGesture({ now: () => this.now(), onReturn: () => this.onReturn() });
     this.clearQuitGesture = new ClearQuitGesture({ now: () => this.now() });
-    this.editor.onSubmit = (text) => { void this.submitEditor(text); };
+    this.editor.onSubmit = (text) => { void this.submitText(text, "prompt"); };
+    // Pi's own follow-up action, bound to alt+enter by the keybindings this editor was built with.
+    // Both keys reach the same submission path; only the operation they name differs.
+    this.editor.onAction?.("app.message.followUp", () => { void this.submitText(this.editor.getText(), "follow_up"); });
     this.editor.onChange = () => { if (!this.restoring) this.edited = true; };
     this.closed = new Promise((resolve) => { this.resolveClosed = resolve; });
   }
@@ -231,7 +233,6 @@ export class ViewerController {
     let status = renderStatusIndicator(this.state.activity, width, this.now(), { working: this.state.working && !this.streamStopped });
     const promptLines = this.editor.render(width);
     let editorLines = framePromptBox(promptLines, this.sessionColor, width, this.menu?.name);
-    const inputLabel = this.inputMode === "steer" ? [" Steer at next supported boundary"] : this.steerStatus === undefined ? [] : [` Steer ${this.steerStatus}`];
     const selectedTool = this.transcript.selectedToolId === undefined ? undefined : this.state.tools.get(this.transcript.selectedToolId);
     const toolLine = selectedTool === undefined ? [] : [` tool:${selectedTool.name} ${selectedTool.state} ${this.transcript.expandedTools.has(selectedTool.id) ? "expanded" : "collapsed"}`];
     let errorLines = this.state.errors.slice(-1).flatMap((error) => renderSystemCard({ text: describeViewerError(error), level: "error" }, width));
@@ -241,7 +242,7 @@ export class ViewerController {
       ...(this.thinkingLoading ? [" Thinking levels… · Esc cancels"] : []),
     ];
     let hints = renderKeyHints(this.state, width);
-    const dockRows = () => 2 + (hints === "" ? 0 : 1) + status.length + editorLines.length + inputLabel.length + toolLine.length + errorLines.length + pendingLines.length + connectionLines.length;
+    const dockRows = () => 2 + (hints === "" ? 0 : 1) + status.length + editorLines.length + toolLine.length + errorLines.length + pendingLines.length + connectionLines.length;
     if (height - dockRows() < MIN_TRANSCRIPT_ROWS) {
       // Pi's dock gives up its own rows before the transcript loses any: spacers first, then the
       // prompt frame, then the hints. Only decoration goes; every dock line with content stays.
@@ -258,7 +259,7 @@ export class ViewerController {
       body = [...body.slice(0, start), ...overlayLines];
     }
     const footer = renderModelFooter(this.state, this.hideThinking, width);
-    const lines = [header, ...body, ...connectionLines, ...errorLines, ...pendingLines, ...status, ...toolLine, ...inputLabel, ...editorLines, footer, ...(hints === "" ? [] : [hints])].map((line) => fit(line, width));
+    const lines = [header, ...body, ...connectionLines, ...errorLines, ...pendingLines, ...status, ...toolLine, ...editorLines, footer, ...(hints === "" ? [] : [hints])].map((line) => fit(line, width));
     while (lines.length < height) lines.splice(1, 0, "");
     return lines.slice(0, height);
   }
@@ -282,19 +283,11 @@ export class ViewerController {
       this.requestRender();
       return;
     }
-    if (this.inputMode === "steer") {
-      this.returnGesture.cancel();
-      if (matchesKey(data, Key.ctrl("c"))) { this.pressCtrlC({ clearsEditor: true }); return; }
-      if (matchesKey(data, Key.escape)) this.finishSteer(); else this.editor.handleInput(data);
-      this.requestRender();
-      return;
-    }
     if (this.thinkingLoading && matchesKey(data, Key.escape)) {
       this.cancelThinkingPicker();
       this.returnGesture.cancel();
       return;
     }
-    if (matchesKey(data, Key.ctrl("s"))) { this.beginSteer(); return; }
     if (matchesKey(data, Key.ctrl("t"))) {
       this.returnGesture.cancel();
       void this.openThinkingPicker();
@@ -459,44 +452,15 @@ export class ViewerController {
     void this.requestRender();
   }
 
-  beginSteer() {
-    if (this.state === undefined) return;
-    this.steerRestore = this.editor.getText();
-    this.steerStatus = "composing";
-    this.inputMode = "steer";
-    this.restoring = true; this.editor.setText(""); this.restoring = false;
-    this.returnGesture.cancel();
-    this.requestRender();
-  }
-
-  finishSteer() {
-    const restore = this.steerRestore ?? "";
-    this.inputMode = "prompt";
-    this.steerRestore = undefined;
-    if (this.steerStatus === "composing") this.steerStatus = undefined;
-    this.restoring = true; this.editor.setText(restore); this.restoring = false;
-  }
-
-  async submitEditor(text) {
-    if (this.inputMode === "steer") {
-      const steer = text.trim();
-      if (steer.length === 0) return;
-      this.steerStatus = "sending";
-      try {
-        this.steerStatus = await this.submitSteer(steer) ? "queued" : "failed";
-      } catch (error) {
-        this.steerStatus = "failed";
-        throw error;
-      } finally {
-        this.finishSteer();
-        this.requestRender();
-      }
-      return;
-    }
-    await this.submitText(text);
-  }
-
-  async submitText(text) {
+  /**
+   * Submit the composer as one session command or one line of text.
+   *
+   * `operation` is the key the operator pressed, not a reading of this session's state: `prompt` for
+   * Enter and `follow_up` for Alt+Enter. The worker turns each into the streaming behavior Pi applies
+   * if a run is already going, and Pi decides that in the same step it reads its own state.
+   * @param {string} text @param {"prompt" | "follow_up"} operation
+   */
+  async submitText(text, operation = "prompt") {
     const prompt = text.trim();
     if (this.state === undefined || prompt.length === 0) return;
     const submission = parseSlashSubmission(prompt, this.menu);
@@ -529,27 +493,13 @@ export class ViewerController {
       if (!await this.sendCommand("session_command", submission.payload)) return;
       await this.loadMenu();
     } else {
-      // This flag is one turn_state event behind Pi, so it cannot decide delivery: the worker sends
-      // both operations to Pi with a streaming behavior and Pi queues or starts the turn from its
-      // own state. It is kept only for a worker predating that change, which still needs the
-      // operation name. Nothing here decides whether the text was queued or started a turn.
-      const operation = this.state.working ? "follow_up" : "prompt";
-      const entry = this.notePending("submission", submission.text);
-      if (!await this.sendCommand(operation, { text: submission.text })) { this.dropPending(entry); return; }
+      const entry = this.notePending(submission.text);
+      if (!await this.sendCommand(operation, { text: submission.text })) { this.dropPending(entry); this.recoverRefusedText(prompt); return; }
     }
     this.history.push(prompt);
     this.editor.addToHistory?.(prompt);
     this.restoring = true; this.editor.setText(""); this.restoring = false;
     this.edited = false; this.historyUsed = false;
-  }
-
-  async submitSteer(text) {
-    const steer = text.trim();
-    if (this.state === undefined || steer.length === 0) return false;
-    const entry = this.notePending("steer", steer);
-    const sent = await this.sendCommand("steer", { text: steer });
-    if (!sent) this.dropPending(entry);
-    return sent;
   }
 
   /**
@@ -563,11 +513,11 @@ export class ViewerController {
    *
    * Text starting with `/` gets no row at all: Pi expands a submitted slash before it becomes a
    * message, so it can reach the transcript changed or, as an extension command, never reach it.
-   * @param {"submission" | "steer"} mode @param {string} text
+   * @param {string} text
    */
-  notePending(mode, text) {
+  notePending(text) {
     if (text.startsWith("/")) return undefined;
-    const entry = { mode, text, priorMatches: (this.state?.items ?? []).filter((item) => item.kind === "user_message" && userMessageText(item) === text).length };
+    const entry = { text, priorMatches: (this.state?.items ?? []).filter((item) => item.kind === "user_message" && userMessageText(item) === text).length };
     this.pending.push(entry);
     void this.requestRender();
     return entry;
@@ -609,7 +559,7 @@ export class ViewerController {
   /** Draw what this viewer has sent and not yet seen, in submission order, above the status indicator. */
   renderPending() {
     if (this.pending.length === 0) return [];
-    const shown = this.pending.slice(0, PENDING_MESSAGE_ROWS).map((entry) => ` ${entry.mode === "steer" ? "Steering" : "Pending"}: ${entry.text}`);
+    const shown = this.pending.slice(0, PENDING_MESSAGE_ROWS).map((entry) => ` Pending: ${entry.text}`);
     const remaining = this.pending.length - shown.length;
     return ["", ...shown, ...(remaining > 0 ? [` … ${remaining} more pending`] : [])];
   }
@@ -624,6 +574,27 @@ export class ViewerController {
       await this.recordError({ code: typed?.code ?? "VIEWER_COMMAND_FAILED", message: error instanceof Error ? error.message : "Viewer command failed", retryable: typed?.retryable === true });
       return false;
     }
+  }
+
+  /**
+   * Put back text the session refused. Pi's editor empties itself before it calls `onSubmit`, so by
+   * the time a refusal arrives the operator's line is already off the screen and this is the only
+   * copy of it left.
+   *
+   * A composer he has typed into since is never overwritten: that line goes to prompt history, where
+   * Up recalls it, because replacing newer text is worse than losing the refusal's place. Nothing is
+   * resent; the operator decides whether to send it again.
+   * @param {string} text
+   */
+  recoverRefusedText(text) {
+    if (this.editor.getText().trim().length === 0) {
+      this.restoring = true; this.editor.setText(text); this.restoring = false;
+      this.edited = true;
+    } else {
+      this.history.push(text);
+      this.editor.addToHistory?.(text);
+    }
+    void this.requestRender();
   }
 
   /** Clear the composer after a command that never becomes a transcript message. */
@@ -661,8 +632,9 @@ export class ViewerController {
       "Esc  interrupt a running turn, then return to the list",
       "←  return to the list",
       "↑↓  scroll the transcript while the prompt is empty, else recall prompt history",
+      "Enter  send now, steering a run already going · Alt+Enter  queue a follow-up for after it",
       "Home/End  jump to the start or end · wheel scrolls",
-      "Ctrl+S steer · Ctrl+T thinking level · Ctrl+O tools",
+      "Ctrl+T thinking level · Ctrl+O tools",
       "Ctrl+C  interrupt a running turn and clear the prompt; press again within 500 ms to quit",
     ];
   }
@@ -832,7 +804,7 @@ export class ViewerController {
     });
   }
 
-  persisted(cursor = this.state?.cursor) { return { sessionId: this.sessionId, cursor, draft: this.inputMode === "steer" ? this.steerRestore ?? "" : this.editor.getText(), history: [...this.history] }; }
+  persisted(cursor = this.state?.cursor) { return { sessionId: this.sessionId, cursor, draft: this.editor.getText(), history: [...this.history] }; }
 
   async close(options = {}) {
     if (this.closedState) return;

@@ -54,6 +54,13 @@ const MAX_UPGRADE_RESPAWNS = 3;
  */
 const UNREACHABLE_WORKER_MESSAGE = "This session's worker is running but cannot be reached on its socket.";
 const UNREACHABLE_WORKER_FIX = "Stop it with `pi-agents stop <full-session-id> --revision <n> --yes`, then reopen the session to start a worker this daemon can reach.";
+/**
+ * What a worker whose release is not this one costs a submitted prompt. Such a worker delivers every
+ * prompt to Pi as a follow-up, so Enter would be queued for after the run with nothing saying so; an
+ * unrecorded release cannot be judged, and is refused for the same reason rather than guessed at.
+ */
+const PROMPT_UPGRADE_MESSAGE = "This session's worker predates native steering, so it would queue this text for after the run instead of steering it into the run.";
+const PROMPT_UPGRADE_FIX = "Send it with Alt+Enter to queue it deliberately, or wait for this session to go idle and its worker to be replaced.";
 /** This package's manifest. Its version is the release recorded for every worker this daemon spawns. */
 const PACKAGE_MANIFEST_PATH = fileURLToPath(new URL("../package.json", import.meta.url));
 const DEFAULT_STOP_POLICY = Object.freeze({ gracefulMs: 5_000, terminateMs: 5_000 });
@@ -657,6 +664,11 @@ export async function createDaemonRuntime({
         const unreachable = unreachableWorkers.get(request.payload.sessionId);
         if (route === undefined && unreachable !== undefined) throw refusal(unreachable, `${UNREACHABLE_WORKER_MESSAGE} ${UNREACHABLE_WORKER_FIX}`);
         if (route?.connection === undefined || route.metadata?.token === undefined) throw refusal("WORKER_UNAVAILABLE", "No adopted worker route owns this session");
+        // Refused rather than delivered as something else. `follow_up` means the same thing in every
+        // release and still goes through, and the worker is replaced at its next idle boundary.
+        if (request.op === "prompt" && REPLACEABLE_RELEASES.has(router.releaseStatus(request.payload.sessionId))) {
+          throw refusal("WORKER_UPGRADE_REQUIRED", `${PROMPT_UPGRADE_MESSAGE} ${PROMPT_UPGRADE_FIX}`);
+        }
         return context.sendWorkerCommand(route, context.nextCommandId(), request, fields);
       },
       /**
@@ -841,6 +853,16 @@ export async function createDaemonRuntime({
           const updated = await registry.update(current.sessionId, current.revision, { taskState: next.taskState, processState: next.processState, outcome: next.outcome, activity: next.activity, updatedAt: next.updatedAt });
           context.notifyListChanged();
         }, "reconcile_activity");
+        // A worker that was already idle when this daemon adopted it publishes no settling event, so
+        // without this its replacement waits for a turn it may never run. Only Pi saying idle opens
+        // the boundary, and every field must say so: a stored row can be stale, an absent field is
+        // not evidence, and replacing a worker that is still streaming, compacting, or holding queued
+        // text would end work the operator is waiting on. The record is re-read because the
+        // reconciliation above may have just moved it.
+        const state = result?.result;
+        if (streaming === false && state?.isCompacting === false && state?.pendingMessageCount === 0) {
+          context.scheduleUpgradeRespawn(metadata.sessionId, await registry.get(metadata.sessionId).catch(() => undefined));
+        }
       },
       /**
        * Store the model and thinking level Pi reported on reconnect. A launch already records Pi's

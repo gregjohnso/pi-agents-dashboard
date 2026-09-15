@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { stripVTControlCharacters } from "node:util";
-import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
-import { describe, expect, it, vi } from "vitest";
+import { setKittyProtocolActive, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createViewerNormalizer } from "../../runtime/viewer-normalizer.mjs";
 import { createPiEditor } from "./pi-component-adapters.mjs";
@@ -16,9 +16,14 @@ function snapshot(overrides = {}) {
     items: [{ kind: "user_message", itemId: "u", content: [{ type: "text", text: "hello" }] }], tools: [], pendingUi: [], errors: [], ...overrides,
   };
 }
+/**
+ * Pi's `CustomEditor` reduced to what this controller uses: submission, registered app actions, and
+ * typing. `app.message.followUp` is Pi's own action id, and the real editor routes alt+enter to it in
+ * both terminal encodings; the tests at the end of this file pin that against the installed build.
+ */
 function editor() {
   let text = "";
-  return { focused: false, disableSubmit: false, onSubmit: undefined, onChange: undefined, autocompleteProvider: undefined, setAutocompleteProvider(provider) { this.autocompleteProvider = provider; }, setText(value) { text = value; this.onChange?.(value); }, getText() { return text; }, addToHistory: vi.fn(), handleInput(data) { if (data === "\r") this.onSubmit?.(text); else if (data.length === 1 && data >= " ") { text += data; this.onChange?.(text); } }, render: () => [`> ${text}`] };
+  return { focused: false, disableSubmit: false, onSubmit: undefined, onChange: undefined, autocompleteProvider: undefined, actions: {}, onAction(action, handler) { this.actions[action] = handler; }, setAutocompleteProvider(provider) { this.autocompleteProvider = provider; }, setText(value) { text = value; this.onChange?.(value); }, getText() { return text; }, addToHistory: vi.fn(), handleInput(data) { if (data === "\r") this.onSubmit?.(text); else if (data === "\x1b\r") this.actions["app.message.followUp"]?.(); else if (data.length === 1 && data >= " ") { text += data; this.onChange?.(text); } }, render: () => [`> ${text}`] };
 }
 /**
  * One subscription's event queue, read by the controller's own pump rather than by a listener this
@@ -130,7 +135,7 @@ function fixture(overrides = {}) {
 }
 
 describe("viewer commands", () => {
-  it("sends prompt while idle, follow_up while working, explicit steer, interrupt, and one UI response", async () => {
+  it("sends prompt on Enter and follow_up on Alt+Enter whatever the cached turn state says, plus interrupt and one UI response", async () => {
     const f = fixture();
     await f.instance.open();
     f.instance.editor.setText("first"); f.instance.handleInput("\r");
@@ -138,9 +143,12 @@ describe("viewer commands", () => {
     const eventStart = f.order.length;
     await f.emit({ version: 1, sessionId: "s", eventId: "e1", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp, payload: { kind: "turn_state", working: true } });
     expect(f.order.slice(eventStart, eventStart + 2)).toEqual(["render", "persist:1"]);
+    // The session is working now, and Enter still sends `prompt`: only Pi decides what to do with it.
     f.instance.editor.setText("next"); f.instance.handleInput("\r");
-    f.instance.submitSteer("urgent"); f.instance.handleInput("\x03");
-    await vi.waitFor(() => expect(f.commands.map(({ operation }) => operation)).toEqual(["prompt", "follow_up", "steer", "interrupt"]));
+    f.instance.editor.setText("urgent"); f.instance.handleInput("\x1b\r");
+    f.instance.handleInput("\x03");
+    await vi.waitFor(() => expect(f.commands.map(({ operation }) => operation)).toEqual(["prompt", "prompt", "follow_up", "interrupt"]));
+    expect(f.commands.slice(0, 3).map(({ payload }) => payload.text)).toEqual(["first", "next", "urgent"]);
     await f.emit({ version: 1, sessionId: "s", eventId: "e2", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "2" }, timestamp, payload: { kind: "pending_ui_request", request: { id: "ui-1", method: "confirm", title: "Continue?" } } });
     f.instance.handleInput("y");
     await vi.waitFor(() => expect(f.commands.at(-1)).toEqual({ operation: "ui_response", payload: { sessionId: "s", uiRequestId: "ui-1", response: true } }));
@@ -220,19 +228,6 @@ describe("viewer commands", () => {
     f.instance.handleInput("\x03");
     expect(onQuit).toHaveBeenCalledOnce();
     expect(f.commands).toHaveLength(1);
-    await f.instance.close();
-  });
-
-  it("clears a steer draft with Ctrl+C and stays in steer mode", async () => {
-    const f = fixture({ snapshot: { taskState: "WORKING" } });
-    await f.instance.open();
-    f.instance.handleInput("\x13");
-    for (const character of "urgent") f.instance.handleInput(character);
-    expect(f.instance.editor.getText()).toBe("urgent");
-    f.instance.handleInput("\x03");
-    expect(f.instance.editor.getText()).toBe("");
-    expect(f.instance.inputMode).toBe("steer");
-    await vi.waitFor(() => expect(f.commands).toEqual([{ operation: "interrupt", payload: { sessionId: "s" } }]));
     await f.instance.close();
   });
 
@@ -469,34 +464,39 @@ describe("viewer commands", () => {
     expect(f.instance.render(80, 24).join("\n")).toContain("tool:future_tool completed expanded");
   });
 
-  it("opens steer input over the draft", async () => {
+  it("queues the composer as a follow-up on Alt+Enter and leaves it empty, recallable, and on one history", async () => {
     const f = fixture({ snapshot: {
       items: [{ kind: "assistant_message", itemId: "middle", content: [{ type: "thinking", text: "private reasoning" }, { type: "text", text: "middle" }] }],
       thinkingLevel: "high",
     } });
     await f.instance.open();
 
-    f.instance.editor.setText("composer draft");
-    f.instance.handleInput("\x13");
-    expect(f.instance.inputMode).toBe("steer");
-    expect(f.instance.editor.getText()).toBe("");
-    for (const input of "urgent boundary") f.instance.handleInput(input);
-    f.instance.handleInput("\r");
+    for (const input of "after you finish") f.instance.handleInput(input);
+    f.instance.handleInput("\x1b\r");
     await vi.waitFor(() => {
-      expect(f.commands.at(-1)).toEqual({ operation: "steer", payload: { sessionId: "s", text: "urgent boundary" } });
-      expect(f.instance.inputMode).toBe("prompt");
+      expect(f.commands.at(-1)).toEqual({ operation: "follow_up", payload: { sessionId: "s", text: "after you finish" } });
+      expect(f.instance.editor.getText()).toBe("");
     });
-    expect(f.instance.editor.getText()).toBe("composer draft");
-    expect(f.instance.render(80, 24).join("\n")).toContain("Steer queued");
+    expect(f.instance.history).toEqual(["after you finish"]);
+    expect(f.instance.editor.addToHistory).toHaveBeenCalledWith("after you finish");
   });
 
-  it("keeps drafts and history scoped to the exact session, including while steer input is open", async () => {
+  it("sends nothing when Alt+Enter lands on an empty composer", async () => {
+    const f = fixture();
+    await f.instance.open();
+
+    f.instance.handleInput("\x1b\r");
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(f.commands).toEqual([]);
+    expect(f.instance.history).toEqual([]);
+  });
+
+  it("keeps drafts and history scoped to the exact session", async () => {
     const f = fixture({ persisted: { sessionId: "other", draft: "leak", history: ["leak"] } });
     await f.instance.open();
     expect(f.instance.editor.getText()).toBe("");
     f.instance.editor.setText("session draft");
-    f.instance.handleInput("\x13");
-    for (const input of "temporary steer") f.instance.handleInput(input);
     await f.instance.close();
     expect(f.order).toContain("persist:0");
     expect(f.saved.at(-1)).toMatchObject({ sessionId: "s", draft: "session draft", history: [] });
@@ -671,7 +671,7 @@ expect(identities(f.instance)).toEqual([identity]);
 
 describe("Pi interactive-mode parity", () => {
   const view = (/** @type {any} */ f) => stripVTControlCharacters(f.instance.render(80, 24).join("\n"));
-  const pendingRows = (/** @type {any} */ f) => view(f).split("\n").filter((line) => /Pending:|Steering:/u.test(line)).map((line) => line.trim());
+  const pendingRows = (/** @type {any} */ f) => view(f).split("\n").filter((line) => /Pending:/u.test(line)).map((line) => line.trim());
   const event = (/** @type {string} */ sequence, /** @type {any} */ payload) => ({ version: 1, sessionId: "s", eventId: `e${sequence}`, cursor: { daemonEpoch: "epoch", sessionId: "s", sequence }, timestamp, payload });
 
   // The operator's own view of the lost-prompt fix: this frontend believes the session is idle while
@@ -687,18 +687,20 @@ describe("Pi interactive-mode parity", () => {
     await vi.waitFor(() => expect(f.commands.at(-1)?.operation).toBe("prompt"));
     expect(view(f)).toContain(" Pending: deploy it");
 
-    await f.instance.submitSteer("stop at the tests");
+    f.instance.editor.setText("stop at the tests");
+    f.instance.handleInput("\x1b\r");
+    await vi.waitFor(() => expect(f.commands).toHaveLength(2));
     f.instance.editor.setText("then tag it");
     f.instance.handleInput("\r");
     await vi.waitFor(() => expect(f.commands).toHaveLength(3));
-    expect(pendingRows(f)).toEqual(["Pending: deploy it", "Steering: stop at the tests", "Pending: then tag it"]);
+    expect(pendingRows(f)).toEqual(["Pending: deploy it", "Pending: stop at the tests", "Pending: then tag it"]);
 
     // A settled turn is not proof about text Pi has not shown yet, so it drops nothing.
     await f.emit(event("1", { kind: "turn_state", working: false }));
-    expect(pendingRows(f)).toEqual(["Pending: deploy it", "Steering: stop at the tests", "Pending: then tag it"]);
+    expect(pendingRows(f)).toEqual(["Pending: deploy it", "Pending: stop at the tests", "Pending: then tag it"]);
 
     await f.emit(event("2", { kind: "user_message", itemId: "landed", content: [{ type: "text", text: "deploy it" }] }));
-    expect(pendingRows(f)).toEqual(["Steering: stop at the tests", "Pending: then tag it"]);
+    expect(pendingRows(f)).toEqual(["Pending: stop at the tests", "Pending: then tag it"]);
   });
 
   it("keeps text the transcript already carried pending until this submission's own copy lands", async () => {
@@ -734,7 +736,7 @@ describe("Pi interactive-mode parity", () => {
 
   // Pi expands a leading slash before the text becomes a message, so this submission may reach the
   // transcript changed or never reach it at all, and no event could ever clear its row.
-  it("draws no pending row for slash text, on the prompt path and on the steer path", async () => {
+  it("draws no pending row for slash text, on Enter and on Alt+Enter", async () => {
     const f = fixture({ menu: async () => ({ commands: [{ name: "/review", source: "extension" }], models: [], model: null }) });
     await f.instance.open();
     await f.instance.menuLoaded;
@@ -744,10 +746,17 @@ describe("Pi interactive-mode parity", () => {
     await vi.waitFor(() => expect(f.commands.at(-1)).toEqual({ operation: "prompt", payload: { sessionId: "s", text: "/review the diff" } }));
     expect(pendingRows(f)).toEqual([]);
 
-    await f.instance.submitSteer("/skill:lint everything");
-    await f.instance.submitSteer("plain steering");
-    expect(f.commands.map(({ operation }) => operation)).toEqual(["prompt", "steer", "steer"]);
-    expect(pendingRows(f)).toEqual(["Steering: plain steering"]);
+    f.instance.editor.setText("/skill:lint everything");
+    f.instance.handleInput("\x1b\r");
+    await vi.waitFor(() => expect(f.commands).toHaveLength(2));
+    f.instance.editor.setText("plain follow-up");
+    f.instance.handleInput("\x1b\r");
+    await vi.waitFor(() => expect(f.commands).toHaveLength(3));
+
+    expect(f.commands.map(({ operation, payload }) => [operation, payload.text])).toEqual([
+      ["prompt", "/review the diff"], ["follow_up", "/skill:lint everything"], ["follow_up", "plain follow-up"],
+    ]);
+    expect(pendingRows(f)).toEqual(["Pending: plain follow-up"]);
   });
 
   // A pending row is this frontend's own memory, and a rebuild replaces the transcript it is matched
@@ -1049,8 +1058,11 @@ describe("thinking level picker", () => {
     f.instance.handleInput("\x14");
     await vi.waitFor(() => expect(f.instance.selection).toBeDefined());
 
-    expect(screen(f)).toContain("max");
-    expect(screen(f)).not.toContain("low");
+    // The dock's own key hints carry the word "follow-up", so the stale level is read off the picker
+    // rather than off the whole screen.
+    const picker = stripVTControlCharacters(f.instance.selection.render(80).join("\n"));
+    expect(picker).toContain("max");
+    expect(picker).not.toContain("low");
   });
 
   it.each([
@@ -1150,5 +1162,124 @@ describe("viewer prompt", () => {
     expect(promptRows.length).toBeGreaterThan(1);
     expect(promptRows.join("").replace(/\s+/gu, "")).toBe(draft.replace(/\s+/gu, ""));
     expect(lines.every((line) => visibleWidth(line) <= 60)).toBe(true);
+  });
+});
+
+/**
+ * The two submission keys, through the editor Pi ships rather than a stand-in.
+ *
+ * Nothing here parses an escape sequence: Enter is Pi's `tui.input.submit` and Alt+Enter is Pi's
+ * `app.message.followUp`, so the terminal encodings both keys arrive in are Pi's problem and stay
+ * correct when a terminal changes them. Operator-visible failure each test names: a key that sends
+ * the wrong operation, or one that sends nothing at all.
+ */
+describe("submission keys through Pi's own editor", () => {
+  afterEach(() => setKittyProtocolActive(false));
+
+  const nativeFixture = (overrides = {}) => fixture({ ...overrides, editor: createPiEditor({ tui: { requestRender() {}, setFocus() {} } }) });
+
+  it.each([
+    ["a legacy terminal", false, "\r", "\x1b\r"],
+    ["a Kitty-protocol terminal", true, "\x1b[13u", "\x1b[13;3u"],
+  ])("sends prompt on Enter and follow_up on Alt+Enter from %s", async (_label, kitty, enter, altEnter) => {
+    setKittyProtocolActive(kitty);
+    const f = nativeFixture();
+    await f.instance.open();
+
+    for (const character of "ship it") f.instance.handleInput(character);
+    f.instance.handleInput(enter);
+    await vi.waitFor(() => expect(f.commands).toHaveLength(1));
+    for (const character of "then deploy") f.instance.handleInput(character);
+    f.instance.handleInput(altEnter);
+
+    await vi.waitFor(() => expect(f.commands).toEqual([
+      { operation: "prompt", payload: { sessionId: "s", text: "ship it" } },
+      { operation: "follow_up", payload: { sessionId: "s", text: "then deploy" } },
+    ]));
+    expect(f.instance.editor.getText()).toBe("");
+    await f.instance.close();
+  });
+
+  // The dashboard's own view of the turn is at least one event behind Pi, so neither key may read it.
+  it.each([["an idle", "READY"], ["a working", "WORKING"]])("sends the same two operations from %s session", async (_label, taskState) => {
+    const f = nativeFixture({ snapshot: { taskState } });
+    await f.instance.open();
+
+    for (const character of "now") f.instance.handleInput(character);
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.commands).toHaveLength(1));
+    for (const character of "later") f.instance.handleInput(character);
+    f.instance.handleInput("\x1b\r");
+
+    await vi.waitFor(() => expect(f.commands.map(({ operation }) => operation)).toEqual(["prompt", "follow_up"]));
+    await f.instance.close();
+  });
+
+  // Pi expands skills and prompt templates on all three of its delivery paths, so a slash line is
+  // the session's text on either key; a dashboard command is this frontend's and reaches no Pi queue.
+  it("dispatches slash text as a session submission and a built-in command as a session command", async () => {
+    const f = nativeFixture({ menu: async () => ({ commands: [{ name: "/review", source: "extension" }], models: [], model: null }) });
+    await f.instance.open();
+    await f.instance.menuLoaded;
+
+    f.instance.editor.setText("/skill:lint everything");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.commands).toHaveLength(1));
+    f.instance.editor.setText("/review the diff");
+    f.instance.handleInput("\x1b\r");
+    await vi.waitFor(() => expect(f.commands).toHaveLength(2));
+    f.instance.editor.setText("/compact");
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.commands).toHaveLength(3));
+
+    expect(f.commands.map(({ operation, payload }) => [operation, payload.text ?? payload.command])).toEqual([
+      ["prompt", "/skill:lint everything"],
+      ["follow_up", "/review the diff"],
+      ["session_command", "compact"],
+    ]);
+    await f.instance.close();
+  });
+
+  // Pi's editor empties itself before it calls onSubmit, so a refusal arrives with the operator's
+  // line already off the screen. A daemon that refuses Enter because this session's worker predates
+  // native steering would otherwise have thrown his text away.
+  it("puts a refused line back in the empty composer and sends it once", async () => {
+    const refusal = Object.assign(new Error("This session's worker predates native steering."), { code: "WORKER_UPGRADE_REQUIRED", retryable: false });
+    const f = nativeFixture({ command: async () => { throw refusal; } });
+    await f.instance.open();
+
+    for (const character of "check the lint first") f.instance.handleInput(character);
+    f.instance.handleInput("\r");
+
+    await vi.waitFor(() => expect(f.instance.editor.getText()).toBe("check the lint first"));
+    expect(f.commands).toEqual([{ operation: "prompt", payload: { sessionId: "s", text: "check the lint first" } }]);
+    expect(f.instance.state.errors.at(-1)).toMatchObject({ code: "WORKER_UPGRADE_REQUIRED" });
+    expect(f.instance.history).toEqual([]);
+    expect(stripVTControlCharacters(f.instance.render(80, 24).join("\n"))).not.toContain("Pending: check the lint first");
+    await f.instance.close();
+  });
+
+  // The operator typed a new line while the refusal was in flight. Replacing it with the refused one
+  // would lose what he is typing now, so the refused line goes where Up recalls it instead.
+  it("keeps a newer draft and recalls the refused line from prompt history", async () => {
+    /** @type {(error: Error) => void} */
+    let refuse = () => {};
+    const f = nativeFixture({ command: async () => new Promise((_resolve, reject) => { refuse = reject; }) });
+    await f.instance.open();
+
+    for (const character of "check the lint first") f.instance.handleInput(character);
+    f.instance.handleInput("\r");
+    await vi.waitFor(() => expect(f.commands).toHaveLength(1));
+    for (const character of "ship it now") f.instance.handleInput(character);
+    refuse(Object.assign(new Error("This session's worker predates native steering."), { code: "WORKER_UPGRADE_REQUIRED", retryable: false }));
+
+    await vi.waitFor(() => expect(f.instance.history).toEqual(["check the lint first"]));
+    expect(f.instance.editor.getText()).toBe("ship it now");
+    expect(f.commands).toHaveLength(1);
+    // It went to Pi's own prompt history, so the composer recalls it once it is empty again.
+    f.instance.editor.setText("");
+    f.instance.handleInput("\x1b[A");
+    expect(f.instance.editor.getText()).toBe("check the lint first");
+    await f.instance.close();
   });
 });

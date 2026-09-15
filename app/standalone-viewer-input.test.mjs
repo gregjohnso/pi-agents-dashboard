@@ -8,9 +8,10 @@ import { createStandaloneViewer } from "./standalone.mjs";
  * Where terminal input goes in the viewer `pi-agents attach` opens.
  *
  * `createStandaloneViewer` focuses Pi's editor rather than the component that routes input to the
- * viewer. Operator-visible failure: every key that is not typing — Escape to leave the session,
- * Ctrl+S to steer, the scroll keys — reaches the editor instead of the session and does nothing,
- * so an attached operator cannot get out of the session or steer the run.
+ * viewer. Operator-visible failure: every key that is not typing — Escape to leave the session, the
+ * scroll keys — reaches the editor instead of the session and does nothing, so an attached operator
+ * cannot get out of the session, and Alt+Enter cannot reach the editor action that queues a
+ * follow-up.
  */
 
 const at = "2026-08-25T00:00:00Z";
@@ -102,13 +103,20 @@ it("leaves the session when the operator presses Escape", async () => {
   await vi.waitFor(() => expect(onReturn).toHaveBeenCalledTimes(1), { timeout: 2_000, interval: 20 });
 });
 
-it("arms a steer when the operator presses Ctrl+S", async () => {
-  const { terminal } = await attachedViewer();
+it("sends Enter as a prompt and Alt+Enter as a follow-up from the attached terminal", async () => {
+  const { client, terminal } = await attachedViewer();
   await vi.waitFor(() => expect(painted(terminal)).toContain("hello"));
 
-  terminal.input("\x13");
+  for (const character of "ship it") terminal.input(character);
+  terminal.input("\r");
+  await vi.waitFor(() => expect(client.commands).toHaveLength(1), { timeout: 2_000, interval: 20 });
+  for (const character of "then deploy") terminal.input(character);
+  terminal.input("\x1b\r");
 
-  await vi.waitFor(() => expect(painted(terminal)).toContain("Steer at next supported boundary"), { timeout: 2_000, interval: 20 });
+  await vi.waitFor(() => expect(client.commands).toEqual([
+    { operation: "prompt", payload: { sessionId: "s", text: "ship it" } },
+    { operation: "follow_up", payload: { sessionId: "s", text: "then deploy" } },
+  ]), { timeout: 2_000, interval: 20 });
 });
 
 it("clears the prompt on the first Ctrl+C and types the next line from the start", async () => {

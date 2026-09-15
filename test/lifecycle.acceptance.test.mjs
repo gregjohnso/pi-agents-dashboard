@@ -12,6 +12,7 @@ import { WorkerSupervisor } from "../runtime/worker-supervisor.mjs";
 import { createRealProcessHarness } from "./real-process-harness.mjs";
 
 const fakePiSource = await readFile(fileURLToPath(new URL("./fixtures/fake-pi.mjs", import.meta.url)), "utf8");
+const CURRENT_RELEASE = JSON.parse(await readFile(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")).version;
 const harness = createRealProcessHarness("lifecycle-acceptance");
 const runtimes = [];
 
@@ -116,6 +117,9 @@ it("keeps two mixed-version fake Pi children alive across frontend close and dae
     configuredPiPath: executable,
     env: { ...process.env, FAKE_PI_EVENT_AFTER_COMMAND: "prompt", FAKE_PI_LOG: log },
     startTimeoutMs: 2_000,
+    // These workers stand in for ones this release spawned, and a prompt is only delivered to a
+    // worker whose recorded release is this one.
+    cliVersion: CURRENT_RELEASE,
   });
   const handles = [];
   const managedSupervisor = {
@@ -139,7 +143,7 @@ it("keeps two mixed-version fake Pi children alive across frontend close and dae
     return { ...selected, sessionRecord, canonicalSessionFile: sessionRecord.canonicalSessionFile, cwd: root, piPath: executable };
   };
 
-  const firstRuntime = await createDaemonRuntime({ root, workerSupervisor: managedSupervisor, resolveLaunchRequest, hostProbe: async () => ({ blockers: [] }), reconnectTimeoutMs: 2_000 });
+  const firstRuntime = await createDaemonRuntime({ root, workerSupervisor: managedSupervisor, resolveLaunchRequest, hostProbe: async () => ({ blockers: [] }), reconnectTimeoutMs: 2_000, cliVersion: CURRENT_RELEASE });
   runtimes.push(firstRuntime);
   await firstRuntime.ready;
   const first = createDaemonClient({ socketPath: firstRuntime.socketPath, token: firstRuntime.token, clientId: "frontend-before", reconnect: false, maxBytes: 256 * 1024 });
@@ -180,7 +184,7 @@ it("keeps two mixed-version fake Pi children alive across frontend close and dae
     await expect(inspectProcessIdentity(handle.piChildIdentity.pid)).resolves.toEqual(handle.piChildIdentity);
   }
 
-  const secondRuntime = await createDaemonRuntime({ root, hostProbe: async () => ({ blockers: [] }), reconnectTimeoutMs: 2_000 });
+  const secondRuntime = await createDaemonRuntime({ root, hostProbe: async () => ({ blockers: [] }), reconnectTimeoutMs: 2_000, cliVersion: CURRENT_RELEASE });
   runtimes.push(secondRuntime);
   await secondRuntime.ready;
   expect(secondRuntime.daemonEpoch).toBe(firstRuntime.daemonEpoch);

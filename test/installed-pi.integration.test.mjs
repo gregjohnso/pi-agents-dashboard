@@ -238,7 +238,7 @@ it("delivers the operator's text once while Pi is already running a turn, with n
       .resolves.toMatchObject({ stage: "RPC_ACKNOWLEDGED" });
 
     expect((await piCommands(log)).filter((entry) => entry.message === "push")).toEqual([
-      expect.objectContaining({ command: "prompt", streamingBehavior: "followUp" }),
+      expect.objectContaining({ command: "prompt", streamingBehavior: "steer" }),
     ]);
   } finally {
     await stopWorker(supervisor, handle, route);
@@ -258,8 +258,8 @@ it("keeps both dashboards' text when each submits believing the same session is 
     await expect(command("dashboard-b", "and push")).resolves.toMatchObject({ stage: "RPC_ACKNOWLEDGED" });
 
     expect((await piCommands(log)).filter((entry) => ["ship it", "and push"].includes(entry.message))).toEqual([
-      expect.objectContaining({ command: "prompt", message: "ship it" }),
-      expect.objectContaining({ command: "prompt", message: "and push", streamingBehavior: "followUp" }),
+      expect.objectContaining({ command: "prompt", message: "ship it", streamingBehavior: "steer" }),
+      expect.objectContaining({ command: "prompt", message: "and push", streamingBehavior: "steer" }),
     ]);
   } finally {
     await stopWorker(supervisor, handle, route);

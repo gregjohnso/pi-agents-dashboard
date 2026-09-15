@@ -31,7 +31,7 @@ export async function createStandaloneViewer({ sessionId, client, persistence, o
   const tui = new TuiAltScreen(terminal);
   const editor = createPiEditor({ tui });
   const controller = new ViewerController({ sessionId, client, editor, persistence, onReturn, now, requestRender: () => tui.renderNow() });
-  // The router holds focus, not Pi's editor: the viewer owns Escape, Ctrl+S, Ctrl+T and the scroll
+  // The router holds focus, not Pi's editor: the viewer owns Escape, Ctrl+T and the scroll
   // keys, and hands the editor the keys that type. Focusing the editor here sent every key straight
   // to it, so an attached operator could neither leave the session nor reach any viewer key.
   mountStandaloneHost({ tui, getActive: () => controller, getHeight: () => terminal.rows ?? 24 });

@@ -26,7 +26,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "> ",
     "────────────────────────────────────────────────────────────────────────────────",
     "                                                                        no-model",
-    " Esc interrupt · ← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking",
+    " Esc interrupt · ← list · ↑↓ scroll · Alt+Enter follow-up · Ctrl+T thinking",
   ],
   "assistant": [
     " pi-agents · s · READY/LIVE",
@@ -52,7 +52,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "> ",
     "────────────────────────────────────────────────────────────────────────────────",
     "                                                                        no-model",
-    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+    " Esc/← list · ↑↓ scroll · Alt+Enter follow-up · Ctrl+T thinking · Ctrl+O tools",
   ],
   "compaction": [
     " pi-agents · s · READY/LIVE",
@@ -78,7 +78,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "> ",
     "────────────────────────────────────────────────────────────────────────────────",
     "                                                                        no-model",
-    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+    " Esc/← list · ↑↓ scroll · Alt+Enter follow-up · Ctrl+T thinking · Ctrl+O tools",
   ],
   "error": [
     " pi-agents · s · READY/LIVE",
@@ -104,7 +104,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "> ",
     "────────────────────────────────────────────────────────────────────────────────",
     "                                                                        no-model",
-    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+    " Esc/← list · ↑↓ scroll · Alt+Enter follow-up · Ctrl+T thinking · Ctrl+O tools",
   ],
   "model-thinking": [
     " pi-agents · s · READY/LIVE",
@@ -130,7 +130,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "> ",
     "────────────────────────────────────────────────────────────────────────────────",
     "                                                         (anthropic) opus • high",
-    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+    " Esc/← list · ↑↓ scroll · Alt+Enter follow-up · Ctrl+T thinking · Ctrl+O tools",
   ],
   "paused-follow": [
     " pi-agents · s · READY/LIVE",
@@ -156,7 +156,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "> ",
     "────────────────────────────────────────────────────────────────────────────────",
     "                                                                        no-model",
-    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+    " Esc/← list · ↑↓ scroll · Alt+Enter follow-up · Ctrl+T thinking · Ctrl+O tools",
   ],
   "pending-ui": [
     " pi-agents · s · WAITING/LIVE",
@@ -182,7 +182,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "> ",
     "────────────────────────────────────────────────────────────────────────────────",
     "                                                                        no-model",
-    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+    " Esc/← list · ↑↓ scroll · Alt+Enter follow-up · Ctrl+T thinking · Ctrl+O tools",
   ],
   "placeholders": [
     " pi-agents · s · READY/LIVE",
@@ -208,7 +208,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "> ",
     "────────────────────────────────────────────────────────────────────────────────",
     "                                                                        no-model",
-    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+    " Esc/← list · ↑↓ scroll · Alt+Enter follow-up · Ctrl+T thinking · Ctrl+O tools",
   ],
   "reconnect": [
     " pi-agents · s · READY/LIVE",
@@ -234,7 +234,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "> ",
     "────────────────────────────────────────────────────────────────────────────────",
     "                                                                        no-model",
-    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+    " Esc/← list · ↑↓ scroll · Alt+Enter follow-up · Ctrl+T thinking · Ctrl+O tools",
   ],
   "retry": [
     " pi-agents · s · READY/LIVE",
@@ -260,7 +260,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "> ",
     "────────────────────────────────────────────────────────────────────────────────",
     "                                                                        no-model",
-    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+    " Esc/← list · ↑↓ scroll · Alt+Enter follow-up · Ctrl+T thinking · Ctrl+O tools",
   ],
   "streaming": [
     " pi-agents · s · READY/LIVE",
@@ -286,7 +286,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "> ",
     "────────────────────────────────────────────────────────────────────────────────",
     "                                                                        no-model",
-    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+    " Esc/← list · ↑↓ scroll · Alt+Enter follow-up · Ctrl+T thinking · Ctrl+O tools",
   ],
   "thinking-hidden": [
     " pi-agents · s · READY/LIVE",
@@ -312,7 +312,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "> ",
     "────────────────────────────────────────────────────────────────────────────────",
     " Thinking blocks: hidden                                         no-model • high",
-    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+    " Esc/← list · ↑↓ scroll · Alt+Enter follow-up · Ctrl+T thinking · Ctrl+O tools",
   ],
   "thinking-visible": [
     " pi-agents · s · READY/LIVE",
@@ -338,7 +338,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "> ",
     "────────────────────────────────────────────────────────────────────────────────",
     "                                                                 no-model • high",
-    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+    " Esc/← list · ↑↓ scroll · Alt+Enter follow-up · Ctrl+T thinking · Ctrl+O tools",
   ],
   "tool-completed": [
     " pi-agents · s · READY/LIVE",
@@ -364,7 +364,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "> ",
     "────────────────────────────────────────────────────────────────────────────────",
     "                                                                        no-model",
-    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+    " Esc/← list · ↑↓ scroll · Alt+Enter follow-up · Ctrl+T thinking · Ctrl+O tools",
   ],
   "tool-failed": [
     " pi-agents · s · READY/LIVE",
@@ -390,7 +390,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "> ",
     "────────────────────────────────────────────────────────────────────────────────",
     "                                                                        no-model",
-    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+    " Esc/← list · ↑↓ scroll · Alt+Enter follow-up · Ctrl+T thinking · Ctrl+O tools",
   ],
   "tool-pending": [
     " pi-agents · s · READY/LIVE",
@@ -416,7 +416,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "> ",
     "────────────────────────────────────────────────────────────────────────────────",
     "                                                                        no-model",
-    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+    " Esc/← list · ↑↓ scroll · Alt+Enter follow-up · Ctrl+T thinking · Ctrl+O tools",
   ],
   "tool-running": [
     " pi-agents · s · READY/LIVE",
@@ -442,7 +442,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "> ",
     "────────────────────────────────────────────────────────────────────────────────",
     "                                                                        no-model",
-    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+    " Esc/← list · ↑↓ scroll · Alt+Enter follow-up · Ctrl+T thinking · Ctrl+O tools",
   ],
   "tool-streaming": [
     " pi-agents · s · READY/LIVE",
@@ -468,7 +468,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "> ",
     "────────────────────────────────────────────────────────────────────────────────",
     "                                                                        no-model",
-    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+    " Esc/← list · ↑↓ scroll · Alt+Enter follow-up · Ctrl+T thinking · Ctrl+O tools",
   ],
   "unknown": [
     " pi-agents · s · READY/LIVE",
@@ -494,7 +494,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "> ",
     "────────────────────────────────────────────────────────────────────────────────",
     "                                                                        no-model",
-    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+    " Esc/← list · ↑↓ scroll · Alt+Enter follow-up · Ctrl+T thinking · Ctrl+O tools",
   ],
   "user": [
     " pi-agents · s · READY/LIVE",
@@ -520,7 +520,7 @@ exports[`viewer rendering and navigation > snapshots the complete chat-state mat
     "> ",
     "────────────────────────────────────────────────────────────────────────────────",
     "                                                                        no-model",
-    " Esc/← list · ↑↓ scroll · Ctrl+S steer · Ctrl+T thinking · Ctrl+O tools",
+    " Esc/← list · ↑↓ scroll · Alt+Enter follow-up · Ctrl+T thinking · Ctrl+O tools",
   ],
 }
 `;

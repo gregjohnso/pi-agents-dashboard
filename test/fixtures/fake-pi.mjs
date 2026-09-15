@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 
 const logPath = process.env.FAKE_PI_LOG;
 const missing = new Set((process.env.FAKE_PI_MISSING ?? "").split(",").filter(Boolean));
@@ -9,6 +9,19 @@ const missing = new Set((process.env.FAKE_PI_MISSING ?? "").split(",").filter(Bo
 // prompt. Unset, this fake accepts every prompt exactly as it always has.
 const streamingMode = process.env.FAKE_PI_STREAMING;
 let streaming = streamingMode === "active";
+// Pi's two delivery queues, modeled rather than echoed. A steered message is delivered after the
+// running assistant turn finishes its tool calls and before the next model call; a follow-up waits
+// until the agent stops, and then starts a run of its own. FAKE_PI_QUEUE turns that on, and
+// FAKE_PI_TOOL_GATE names the file whose appearance ends the run's held tool call, so a test can put
+// its queued messages in place while the turn is provably still inside that tool.
+const queueMode = process.env.FAKE_PI_QUEUE === "1";
+const toolGate = process.env.FAKE_PI_TOOL_GATE;
+/** @type {string[]} */
+const steering = [];
+/** @type {string[]} */
+const followUps = [];
+let running = false;
+let toolsHeld = 0;
 // Pi reports thinking levels per model and refuses to be driven outside the set it reported, so a
 // dashboard that offers a level this list does not carry fails here rather than silently drifting.
 const thinkingLevels = (process.env.FAKE_PI_THINKING_LEVELS ?? "off,low,high").split(",").filter(Boolean);
@@ -44,6 +57,44 @@ if (process.env.FAKE_PI_MALFORMED === "1" || process.env.FAKE_PI_MALFORMED_SESSI
   process.stdout.write(`${JSON.stringify({ type: "probe_event", value: "x".repeat(70_000) })}\n`);
 } else if (process.env.FAKE_PI_EVENT) {
   process.stdout.write(`${JSON.stringify({ type: process.env.FAKE_PI_EVENT })}\n`);
+}
+
+const emit = (frame) => process.stdout.write(`${JSON.stringify(frame)}\n`);
+const message = (role, content) => emit({ type: "message_end", message: { role, content, timestamp: Date.now() } });
+const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+/** Hold the run inside one tool call until the test releases it, the way a real tool holds a turn. */
+async function runTool(index) {
+  const id = `tool-${index}`;
+  message("assistant", [{ type: "toolCall", id, name: "bash", arguments: { command: "lint" } }]);
+  emit({ type: "tool_execution_start", toolName: "bash", toolCallId: id });
+  log({ kind: "tool_held", toolCallId: id });
+  while (toolGate !== undefined && !existsSync(toolGate)) await sleep(20);
+  emit({ type: "message_end", message: { role: "toolResult", toolCallId: id, toolName: "bash", content: [{ type: "text", text: "lint clean" }], timestamp: Date.now() } });
+}
+
+/** One agent run: model calls separated by tool boundaries, then settle, then the next follow-up. @param {string} text @param {string} source @param {string} phase */
+async function runAgent(text, source, phase) {
+  running = true;
+  log({ kind: "delivered", source, phase, message: text });
+  message("user", [{ type: "text", text }]);
+  emit({ type: "agent_start" });
+  for (let call = 1; ; call += 1) {
+    log({ kind: "model_call", message: text });
+    // The first model call of the first run reaches for the held tool; every later call just replies.
+    if (call === 1 && toolsHeld === 0) { toolsHeld += 1; await runTool(call); }
+    else message("assistant", [{ type: "text", text: `done: ${text}` }]);
+    const steer = steering.shift();
+    if (steer === undefined) break;
+    text = steer;
+    log({ kind: "delivered", source: "steer", phase: "tool_boundary", message: text });
+    message("user", [{ type: "text", text }]);
+  }
+  emit({ type: "agent_settled" });
+  log({ kind: "settled" });
+  running = false;
+  const next = followUps.shift();
+  if (next !== undefined) await runAgent(next, "follow_up", "after_run");
 }
 
 let input = "";
@@ -97,6 +148,17 @@ process.stdin.on("data", (chunk) => {
     }
     if (["prompt", "follow_up", "steer"].includes(type) && typeof command.message !== "string") {
       process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: false, error: "message is required" })}\n`);
+      continue;
+    }
+    if (queueMode && validPrompt) {
+      const behavior = type === "steer" ? "steer" : type === "follow_up" ? "followUp" : command.streamingBehavior;
+      if (running && behavior === undefined) {
+        process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: false, error: "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message." })}\n`);
+        continue;
+      }
+      process.stdout.write(`${JSON.stringify({ id: responseId, type: "response", command: type, success: true })}\n`);
+      if (running) (behavior === "steer" ? steering : followUps).push(command.message);
+      else void runAgent(command.message, type, "start");
       continue;
     }
     if (streamingMode !== undefined && validPrompt) {

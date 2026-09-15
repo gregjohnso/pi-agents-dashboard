@@ -26,7 +26,7 @@ const STREAM_MS = option("stream-ms", "");
 
 // The viewer's own key hints; the list draws no such line. The header used to end in the access
 // role, which is what this watched for before roles were removed.
-const VIEWER_MARK = Buffer.from("Ctrl+S steer");
+const VIEWER_MARK = Buffer.from("Alt+Enter follow-up");
 const LIST_MARK = Buffer.from("pi-agents");
 const QUIET_MS = 400;
 

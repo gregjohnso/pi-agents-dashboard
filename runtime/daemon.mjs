@@ -26,7 +26,7 @@ import { createModelCatalog } from "./pi-model-catalog.mjs";
 import { WorkerSupervisor } from "./worker-supervisor.mjs";
 import { inspectWorkerTerminalCause, retireWorkerTerminalCause, workerTerminalCausePath } from "./worker-terminal-cause.mjs";
 import { loadDashboardConfig } from "../shared/config.mjs";
-import { CLIENT_PROTOCOL, parseClientRequest, piConfirmedModel } from "../shared/contracts.mjs";
+import { CLIENT_PROTOCOL, parseClientRequest, piConfirmedModel, piResponseModel } from "../shared/contracts.mjs";
 
 initializeRuntimePermissions();
 
@@ -842,7 +842,9 @@ export async function createDaemonRuntime({
         const result = await context.sendWorkerCommand(route, id, durableRequest);
         const streaming = result?.result?.isStreaming;
         // Pi is the authority on which model a session runs: a launch that names none still gets one.
-        await context.recordSessionModel(metadata, result?.result);
+        // The answer was awaited, so the route it was asked on may already have been replaced by a
+        // reconnect of the same run, which the ownership check inside cannot see.
+        await context.recordSessionModel(metadata, result?.result, () => router.isCurrentRoute(metadata, route.connection, route.routeGeneration));
         if (typeof streaming !== "boolean") return;
         const derived = streaming ? "WORKING" : "READY";
         await runSessionLifecycle(registry, metadata.sessionId, async () => {
@@ -868,15 +870,21 @@ export async function createDaemonRuntime({
        * Store the model and thinking level Pi reported on reconnect. A launch already records Pi's
        * model at readiness; this keeps a row current after a daemon restart, and it is the only writer
        * of the thinking level Pi restored for itself.
-       * @param {any} metadata @param {any} state
+       *
+       * `stillCurrent` is asked inside the lock, which is the only place it means anything: route
+       * replacement runs on this same lock, so a caller that checked before taking it can be queued
+       * behind the very replacement that invalidates it. The ownership check below cannot stand in
+       * for it, because a worker reconnecting keeps the run it already owned.
+       * @param {any} metadata @param {any} state @param {(() => boolean) | undefined} [stillCurrent]
        */
-      async recordSessionModel(metadata, state) {
+      async recordSessionModel(metadata, state, stillCurrent = undefined) {
         const model = piConfirmedModel(state);
         const thinkingLevel = state?.thinkingLevel;
         if (model === undefined && typeof thinkingLevel !== "string") return;
         await runSessionLifecycle(registry, metadata.sessionId, async () => {
           const current = await registry.get(metadata.sessionId);
           if (current === undefined || current.ownership?.runId !== metadata.runId) return;
+          if (stillCurrent !== undefined && !stillCurrent()) return;
           const sameModel = model === undefined || (current.model?.provider === model.provider && current.model?.id === model.id);
           const sameThinking = typeof thinkingLevel !== "string" || current.thinkingLevel === thinkingLevel;
           if (sameModel && sameThinking) return;
@@ -1063,6 +1071,20 @@ export async function createDaemonRuntime({
           if (viewer === undefined) throw Object.assign(new Error("Viewer recovery is still initializing"), { code: "RECOVERING", retryable: true });
           await router.runCurrentFrame(metadata, connection, routeGeneration, async () => {
             await viewer.ingest(frame.sessionId, frame.frame);
+            // Pi publishes no event when its own model changes, so the model it confirms in one of
+            // its own authoritative responses is the only live correction this row ever gets.
+            //
+            // Enqueued, never awaited: this session's worker frames run on one chain, and waiting
+            // here for the lifecycle lock parks that chain behind a stop's grace period or a
+            // respawn's relaunch, freezing the transcript and aging in-flight prompts toward
+            // DELIVERY_UNKNOWN. The lifecycle lock is enqueued synchronously inside, so two
+            // responses still write in arrival order. A correction still queued when the daemon
+            // shuts down may be abandoned: `router.close` idles frames and lifecycle concurrently.
+            const model = piResponseModel(frame.frame);
+            if (model === undefined) return;
+            void context.recordSessionModel(metadata, { model }, () => router.isCurrentRoute(metadata, connection, routeGeneration)).catch((/** @type {unknown} */ error) => {
+              recordDiagnostic({ event: "model_projection_failed", sessionId: metadata.sessionId, code: /** @type {any} */ (error)?.code ?? "MODEL_PROJECTION_FAILED", message: error instanceof Error ? error.message : "Model projection failed", at: new Date().toISOString() });
+            });
           });
           return;
         }

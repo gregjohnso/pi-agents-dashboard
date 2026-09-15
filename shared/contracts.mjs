@@ -114,6 +114,26 @@ export function piConfirmedModel(state) {
   return { provider: model.provider, id: model.id };
 }
 
+/**
+ * The model one successful Pi response frame confirms, or undefined when it confirms none.
+ *
+ * Pi 0.84.3 publishes no event when its own model changes, so these three responses are the only
+ * authoritative statements of it a live session produces: `get_state` and `cycle_model` carry the
+ * state, whose `model` is the answer, and `set_model` answers with the model itself. A refused
+ * command, a cycle that moved nothing (`data: null`), and anything whose shape does not match all
+ * report nothing rather than a guess. The same reading drives the viewer's own `model_state` event
+ * ([runtime/viewer-normalizer.mjs](../runtime/viewer-normalizer.mjs)).
+ * @param {unknown} frame @returns {{provider:string,id:string} | undefined}
+ */
+export function piResponseModel(frame) {
+  const response = /** @type {any} */ (frame);
+  if (response?.type !== "response" || response.success !== true) return undefined;
+  if (!["get_state", "set_model", "cycle_model"].includes(response.command)) return undefined;
+  const data = response.data;
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return undefined;
+  return piConfirmedModel(response.command === "set_model" ? { model: data } : data);
+}
+
 /** @param {unknown} value @param {string} path */
 function validateProcessIdentity(value, path) {
   const identity = readRecord(value, path);

@@ -731,6 +731,22 @@ export class RecoveredWorkerRouter {
     });
   }
 
+  /**
+   * Whether this frame's route is still the current one, answered rather than thrown.
+   *
+   * A frame that arrived late may still be ingested, because a duplicate viewer event costs nothing
+   * durable. It may not write the registry, and this is what a caller asks before it does.
+   * @param {any} metadata @param {any} connection @param {number} routeGeneration
+   */
+  isCurrentRoute(metadata, connection, routeGeneration) {
+    try {
+      this.#assertRoute(metadata, connection, routeGeneration);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async close() {
     this.#closing = true;
     for (const reservation of [...this.#reservations.values()]) reservation.close();

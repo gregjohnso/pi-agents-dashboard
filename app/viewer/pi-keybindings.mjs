@@ -3,6 +3,8 @@ import { pathToFileURL } from "node:url";
 
 import { setKeybindings as setOwnKeybindings } from "@earendil-works/pi-tui";
 
+import { PI_ENTRY, importPiModule, piModuleUrl } from "./pi-modules.mjs";
+
 /**
  * Pi's own keybinding table, user configuration loader and legacy-name migrations, reused rather
  * than restated.
@@ -13,9 +15,7 @@ import { setKeybindings as setOwnKeybindings } from "@earendil-works/pi-tui";
  * the keys Pi documents without anything failing. The version is pinned exactly, and
  * pi-keybindings.test.mjs fails the moment the path or the exports move.
  */
-const PI_ENTRY = import.meta.resolve("@earendil-works/pi-coding-agent");
-
-export const PI_KEYBINDINGS_MODULE = new URL("./core/keybindings.js", PI_ENTRY).href;
+export const PI_KEYBINDINGS_MODULE = piModuleUrl("keybindings");
 
 /**
  * Pi ships its own copy of pi-tui under its package, so `getKeybindings()` inside Pi's components
@@ -24,7 +24,7 @@ export const PI_KEYBINDINGS_MODULE = new URL("./core/keybindings.js", PI_ENTRY).
  */
 export const PI_TUI_MODULE = pathToFileURL(createRequire(PI_ENTRY).resolve("@earendil-works/pi-tui")).href;
 
-const { KeybindingsManager } = await import(PI_KEYBINDINGS_MODULE);
+const { KeybindingsManager } = await importPiModule("keybindings");
 const { setKeybindings: setPiKeybindings } = await import(PI_TUI_MODULE);
 
 /**

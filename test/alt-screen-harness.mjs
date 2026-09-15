@@ -23,11 +23,14 @@ export class ScreenTerminal {
     this.input = undefined;
     /** @type {(() => void) | undefined} */
     this.resized = undefined;
+    // Frames painted, which is how a test says a surface repainted on its own rather than only when
+    // something was typed at it.
+    this.frames = 0;
   }
   start(/** @type {(data: string) => void} */ onInput, /** @type {() => void} */ onResize) { this.input = onInput; this.resized = onResize; }
   stop() { this.input = undefined; }
   async drainInput() {}
-  write(/** @type {string} */ data) { this.apply(data); }
+  write(/** @type {string} */ data) { this.frames += 1; this.apply(data); }
   hideCursor() {}
   showCursor() {}
   clearLine() {}

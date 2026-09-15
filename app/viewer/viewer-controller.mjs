@@ -1,9 +1,9 @@
 import { stripVTControlCharacters } from "node:util";
-import { keyText } from "@earendil-works/pi-coding-agent";
 import { CombinedAutocompleteProvider, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 import { SESSION_COLORS } from "../../shared/contracts.mjs";
 import { ClearQuitGesture } from "../clear-quit-gesture.mjs";
+import { createSpinnerClock } from "../spinner.mjs";
 import { parseViewerEvent, parseViewerSnapshot } from "../../shared/viewer-contracts.mjs";
 import { createPiComponentAdapters } from "./pi-component-adapters.mjs";
 import { EMPTY_SESSION_MENU, parseSlashSubmission, sessionSlashCommands } from "./slash-commands.mjs";
@@ -11,6 +11,11 @@ import { CommandSelectionOverlay, PendingUiOverlay, TextPanelOverlay, renderStat
 import { ReturnGesture } from "./return-gesture.mjs";
 import { TranscriptModel, applyViewerEvent, createTranscriptState } from "./transcript.mjs";
 import { LinesComponent, createViewerLayout } from "./viewer-layout.mjs";
+import { importPiModule } from "./pi-modules.mjs";
+
+/** Pi's own key-hint formatter, which is what makes every hint read the operator's own bindings. */
+export const { keyText: PI_KEY_TEXT } = await importPiModule("keybindingHints");
+const keyText = PI_KEY_TEXT;
 
 function fit(line, width) {
   const clipped = truncateToWidth(line.replace(/[\r\n\u2028\u2029]/gu, " "), Math.max(0, width), "");
@@ -161,6 +166,9 @@ export class ViewerController {
     this.closedState = true;
     this.returnGesture = new ReturnGesture({ now: () => this.now(), onReturn: () => this.onReturn() });
     this.clearQuitGesture = new ClearQuitGesture({ now: () => this.now() });
+    // The same clock the list runs, for the same reason: the spinner frame and the elapsed counter
+    // are both read off the clock at paint time, and a thinking model publishes nothing to paint on.
+    this.animation = createSpinnerClock({ requestRender: () => this.requestRender() });
     // Pi's keys belong to Pi's editor: it owns the action layer, resolves every one of them through
     // the operator's own keybindings, and defers the ones a completion popup needs. Reading keys here
     // would ignore his configuration and take Escape away from the popup.
@@ -290,7 +298,12 @@ export class ViewerController {
    */
   renderStatus(width) {
     if (this.state === undefined) return [];
-    return renderStatusIndicator(this.state.activity, width, this.now(), { working: this.state.working && !this.streamStopped }).map((line) => fit(line, width));
+    const working = this.state.working && !this.streamStopped;
+    // Armed from the paint, the way the list arms its own: the state that starts a turn is the state
+    // that draws the first frame of it. A settled turn, a stopped stream and a closed viewer each
+    // stop it here or in `close`, so nothing repaints a session the operator is no longer watching.
+    this.animation.sync(working && !this.closedState);
+    return renderStatusIndicator(this.state.activity, width, this.now(), { working }).map((line) => fit(line, width));
   }
 
   /** Pi's editor inside this session's frame. Its lines are left alone: they carry the cursor marker. */
@@ -878,6 +891,7 @@ export class ViewerController {
   async close(options = {}) {
     if (this.closedState) return;
     this.closedState = true;
+    this.animation.stop();
     this.unsubscribe?.(); this.unsubscribe = undefined;
     this.watchConnection?.(); this.watchConnection = undefined;
     try {

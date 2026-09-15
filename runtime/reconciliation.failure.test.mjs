@@ -94,6 +94,12 @@ it("validates the authoritative Pi child and invalidates frames from replaced ro
   let mutated = false;
   await expect(router.runCurrent(oldRoute.metadata, oldConnection, oldRoute.routeGeneration, async () => { mutated = true; })).rejects.toMatchObject({ code: "STALE_WORKER_CONNECTION" });
   expect(mutated).toBe(false);
+  // A viewer frame is ingested off the lifecycle lock, so a route can be replaced while one is still
+  // being applied. `isCurrentRoute` is what a caller asks before it turns that frame into a registry
+  // write: the replaced route answers no, and the current one answers yes.
+  expect(router.isCurrentRoute(oldRoute.metadata, oldConnection, oldRoute.routeGeneration)).toBe(false);
+  const current = router.route("exact");
+  expect(router.isCurrentRoute(current.metadata, current.connection, current.routeGeneration)).toBe(true);
   await router.close();
 });
 

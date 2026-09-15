@@ -354,11 +354,13 @@ describe("dashboard controller", () => {
 
         dashboard.handleInput("\x18");
         const armed = dashboard.render(100, 24);
-        expect(armed.map(stripVTControlCharacters).some((line) => line.includes("ctrl+x to confirm"))).toBe(true);
-        expect(armed.find((line) => stripVTControlCharacters(line).includes("ctrl+x to confirm"))).toContain(JOBWATCH_ANSI.rose);
+        // The hint names the session it would remove: a filtered list can take that row off screen,
+        // and a bare "confirm" would read as though it meant whatever row the cursor is on now.
+        expect(armed.map(stripVTControlCharacters).some((line) => line.includes("ctrl+x to clear a"))).toBe(true);
+        expect(armed.find((line) => stripVTControlCharacters(line).includes("ctrl+x to clear"))).toContain(JOBWATCH_ANSI.rose);
 
         clock = 600;
-        expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("ctrl+x to confirm"))).toBe(false);
+        expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("ctrl+x to clear"))).toBe(false);
     });
     it("abandons an armed clear on any other key", async () => {
         const client = new FakeDaemonClient([session("a", { taskState: "STOPPED", processState: "EXITED" })]);

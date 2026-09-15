@@ -70,15 +70,18 @@ function dashboardFixture(sessions, overrides = {}) {
   const client = new FakeDaemonClient(sessions);
   const openViewer = overrides.openViewer ?? vi.fn(async () => {});
   const onClose = overrides.onClose ?? vi.fn();
+  // The clock this fixture hands the controller is the test's, not the machine's: the stop/clear
+  // window is 500 ms, and a loaded box can spend longer than that inside one `waitFor`.
+  const clock = { at: Date.parse(timestamp) + 12 * 60 * 60 * 1_000 };
   const dashboard = new DashboardController({
     client, openViewer, onClose,
     clientId: "terminal-client",
     requestId: () => "terminal-request",
     launchDefaults: { cwd: "/repo", model: { provider: "", id: "" }, name: "" },
     requestRender: () => {},
-    now: () => Date.parse(timestamp) + 12 * 60 * 60 * 1_000,
+    now: () => clock.at,
   });
-  return { client, dashboard, onClose, openViewer };
+  return { client, clock, dashboard, onClose, openViewer };
 }
 
 function viewerSnapshot(overrides = {}) {

@@ -176,7 +176,7 @@ function startPersistentFakeWorker(stateRoot, worker) {
       }
     }
   })().finally(() => { alive = false; });
-  const loop = { pid: worker.identity.pid, get alive() { return alive; }, get connectionCount() { return connectionCount; }, get commandCount() { return commandCount; }, get commandIds() { return [...commandIds]; }, get commands() { return [...commands]; }, async sendFrame(/** @type {any} */ frame) { await live.send({ version: 1, type: "pi_frame", token: worker.token, sessionId: worker.sessionId, frame }); }, async sendEvent(/** @type {any} */ event) { await live.send({ version: 1, type: "worker_event", token: worker.token, sessionId: worker.sessionId, event }); }, async stop() { controller.abort(); await listener?.close(); await run; } };
+  const loop = { pid: worker.identity.pid, get alive() { return alive; }, get connectionCount() { return connectionCount; }, get commandCount() { return commandCount; }, get commandIds() { return [...commandIds]; }, get commands() { return [...commands]; }, async sendFrame(/** @type {any} */ frame) { await live.send({ version: 1, type: "pi_frame", token: worker.token, sessionId: worker.sessionId, frame }); }, async sendCommandResult(/** @type {any} */ command, /** @type {any} */ result) { await live.send({ version: 1, type: "command_result", token: worker.token, id: command.id, ok: true, record: { clientId: command.command.clientId, requestId: command.command.requestId, op: command.command.op, stage: "RPC_ACKNOWLEDGED", at: new Date().toISOString(), result } }); }, async sendEvent(/** @type {any} */ event) { await live.send({ version: 1, type: "worker_event", token: worker.token, sessionId: worker.sessionId, event }); }, async stop() { controller.abort(); await listener?.close(); await run; } };
   workerLoops.push(loop);
   return loop;
 }
@@ -1139,6 +1139,291 @@ it("ingests Pi frames and keeps their order while a lifecycle operation holds th
     await lockHeld;
     frontend.close();
   }
+});
+
+/**
+ * The model label on a live session's row.
+ *
+ * Operator-visible failure: Pi was running `openai-codex/gpt-6-astra` while the row, the list and the
+ * viewer footer all said `gpt-5.6-sol`, because the model recorded at readiness was never corrected
+ * until the daemon restarted. Pi 0.84.3 publishes no event when its own model changes, so what this
+ * projects is the model Pi confirms in its own authoritative responses, which already cross this
+ * socket. A change Pi makes and never reports in one of them is still invisible.
+ */
+/**
+ * The reconnect reconciliation reads Pi's state over the same socket and records the model from it,
+ * so it crosses the same window a viewer response does: its answer can be overtaken by a reconnect
+ * of the same run before the write runs.
+ *
+ * Operator-visible failure: the same stale label as the viewer path, reached from the other caller.
+ */
+it("drops a reconciliation's model when the route it asked on was replaced before the write", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const identity = { pid: 301, startIdentity: "worker-reconcile", processGroupId: 301 };
+  const piChild = { pid: 302, startIdentity: "pi-reconcile", processGroupId: 301 };
+  const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === identity.pid ? identity : piChild;
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const now = "2026-08-25T12:00:00.000Z";
+  const sleep = (/** @type {number} */ ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+  const sol = { provider: "openai-codex", id: "gpt-5.6-sol" };
+  const astra = { provider: "openai-codex", id: "gpt-6-astra" };
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "reconcile", sessionFile: "/sessions/reconcile.jsonl", canonicalSessionFile: "/sessions/reconcile.jsonl", cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", model: sol, activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-reconcile", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-reconcile", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "reconcile", runId: "run-reconcile", leaseId: "lease-reconcile", generation: 1, identity, piChildIdentity: piChild, token: "reconcile-token", socketPath: workerSocketPath(stateRoot, "reconcile"), proto: 2, cliVersion: CURRENT_RELEASE }] })}\n`, { mode: 0o600 });
+  /** @type {any} */
+  let router;
+  const runtime = await daemonRuntime({
+    root: stateRoot, inspect, reconnectTimeoutMs: 1_000,
+    workerSupervisor: { useRouter(/** @type {any} */ supplied) { router = supplied; }, async close() {} },
+  });
+  runtimes.push(runtime);
+  // Silent, so the reconciliation's own `get_state` waits for the answer this test hands it.
+  const worker = startPersistentFakeWorker(stateRoot, { sessionId: "reconcile", runId: "run-reconcile", leaseId: "lease-reconcile", generation: 1, identity, piChildIdentity: piChild, token: "reconcile-token", silent: true });
+  await runtime.ready;
+  const frontend = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 65536 });
+  await frontend.ready;
+  await vi.waitFor(() => expect(router?.route("reconcile")).toBeDefined());
+  await vi.waitFor(() => expect(worker.commands.some((/** @type {any} */ command) => command.op === "get_state")).toBe(true), { timeout: 10_000 });
+  const askedAt = worker.commands.findIndex((/** @type {any} */ command) => command.op === "get_state");
+  const asked = { id: worker.commandIds[askedAt], command: worker.commands[askedAt] };
+  const initial = (await registry.get("reconcile"))?.revision ?? 0;
+
+  /** @type {(value?: unknown) => void} */
+  let releaseLock = () => {};
+  const held = new Promise((resolve) => { releaseLock = resolve; });
+  const lockHeld = runSessionLifecycle(registry, "reconcile", () => held);
+  await Promise.resolve();
+
+  // Pi's answer, which the daemon can only handle on the lifecycle lock this test is holding.
+  await worker.sendCommandResult(asked, { model: astra, isStreaming: true });
+  // A frame behind it on the same connection. A command result is handled on the lifecycle lock, so
+  // while this test holds that lock the connection is parked on it and this marker cannot arrive.
+  // Its absence is what proves the answer is queued, which is what puts the replacement behind it.
+  await worker.sendFrame({ type: "message_end", message: { role: "user", content: "reconcile marker", timestamp: Date.parse(now) } });
+  await sleep(500);
+  frontend.send({ version: 1, clientId: "viewer", requestId: `snapshot-${randomUUID()}`, op: "subscribe_viewer", payload: { sessionId: "reconcile" } });
+  const parked = await frontend.next();
+  expect(parked.result.snapshot.items.some((/** @type {any} */ item) => item.content?.[0]?.text === "reconcile marker")).toBe(false);
+
+  const replacement = { closed: new Promise(() => {}), close() {} };
+  const adopting = router.adopt({ version: 1, type: "worker_ready", token: "reconcile-token", sessionId: "reconcile", runId: "run-reconcile", leaseId: "lease-reconcile", generation: 1, worker: identity, piChild }, replacement);
+
+  releaseLock();
+  await lockHeld;
+  await adopting;
+  await runSessionLifecycle(registry, "reconcile", async () => {});
+
+  const after = await registry.get("reconcile");
+  expect(after).toMatchObject({ model: sol });
+  expect(after?.revision).toBe(initial);
+
+  frontend.close();
+  await worker.stop();
+});
+
+/**
+ * A route replacement and a model projection take the same lifecycle lock, so one can be queued
+ * ahead of the other.
+ *
+ * Operator-visible failure: a worker reconnects, records the model Pi is running now, and a response
+ * still in flight from the connection it replaced overwrites that row with the model from before.
+ * The ownership check inside the write cannot see it, because a reconnect of the same run keeps the
+ * same `runId`; only the route the frame arrived on tells them apart.
+ */
+it("drops a model a replaced route confirms, even when the run that owns the session is the same", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const identity = { pid: 291, startIdentity: "worker-race", processGroupId: 291 };
+  const piChild = { pid: 292, startIdentity: "pi-race", processGroupId: 291 };
+  const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === identity.pid ? identity : piChild;
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const now = "2026-08-25T12:00:00.000Z";
+  const sol = { provider: "openai-codex", id: "gpt-5.6-sol" };
+  const astra = { provider: "openai-codex", id: "gpt-6-astra" };
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "race", sessionFile: "/sessions/race.jsonl", canonicalSessionFile: "/sessions/race.jsonl", cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", model: sol, activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-race", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-race", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "race", runId: "run-race", leaseId: "lease-race", generation: 1, identity, piChildIdentity: piChild, token: "race-token", socketPath: workerSocketPath(stateRoot, "race"), proto: 2, cliVersion: CURRENT_RELEASE }] })}\n`, { mode: 0o600 });
+  /** @type {any} */
+  let router;
+  const runtime = await daemonRuntime({
+    root: stateRoot, inspect, reconnectTimeoutMs: 1_000,
+    // Recovery adopts the surviving worker on its own; this only borrows the router the daemon built,
+    // so the test can replace that route the way a reconnect of the same run does.
+    workerSupervisor: { useRouter(/** @type {any} */ supplied) { router = supplied; }, async close() {} },
+  });
+  runtimes.push(runtime);
+  const worker = startPersistentFakeWorker(stateRoot, { sessionId: "race", runId: "run-race", leaseId: "lease-race", generation: 1, identity, piChildIdentity: piChild, token: "race-token" });
+  await runtime.ready;
+  const frontend = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 65536 });
+  await frontend.ready;
+  await vi.waitFor(() => expect(worker.connectionCount).toBeGreaterThan(0));
+  await vi.waitFor(() => expect(router?.route("race")).toBeDefined());
+  const initial = (await registry.get("race"))?.revision ?? 0;
+
+  /** @type {(value?: unknown) => void} */
+  let releaseLock = () => {};
+  const held = new Promise((resolve) => { releaseLock = resolve; });
+  const lockHeld = runSessionLifecycle(registry, "race", () => held);
+  await Promise.resolve();
+
+  // The same run, reconnecting: queued on the lifecycle lock ahead of anything the old route sends.
+  const replacement = { closed: new Promise(() => {}), close() {} };
+  const adopting = router.adopt({ version: 1, type: "worker_ready", token: "race-token", sessionId: "race", runId: "run-race", leaseId: "lease-race", generation: 1, worker: identity, piChild }, replacement);
+
+  // The old route answers with the model from before, and its projection queues behind that adopt.
+  await worker.sendFrame({ type: "response", command: "get_state", success: true, data: { model: astra } });
+  await worker.sendFrame({ type: "message_end", message: { role: "user", content: "race marker", timestamp: Date.parse(now) } });
+  /** @type {any} */
+  let snapshot;
+  await vi.waitFor(async () => {
+    frontend.send({ version: 1, clientId: "viewer", requestId: `snapshot-${randomUUID()}`, op: "subscribe_viewer", payload: { sessionId: "race" } });
+    snapshot = await frontend.next();
+    expect(snapshot.result.snapshot.items.some((/** @type {any} */ item) => item.content?.[0]?.text === "race marker")).toBe(true);
+  }, { timeout: 5_000 });
+
+  releaseLock();
+  await lockHeld;
+  await adopting;
+  // Queued last on the same lock, so when it runs, anything the old route queued has already run.
+  await runSessionLifecycle(registry, "race", async () => {});
+  // Nothing queued behind the replacement may write; the row keeps the model it had.
+  const after = await registry.get("race");
+  expect(after).toMatchObject({ model: sol });
+  expect(after?.revision).toBe(initial);
+
+  frontend.close();
+  await worker.stop();
+});
+
+/**
+ * One session's worker frames run on one chain. Projecting a model must not park that chain on the
+ * lifecycle lock, which a stop's grace period or a respawn's relaunch holds for seconds.
+ *
+ * Operator-visible failure: while a session was stopping, its transcript froze and the prompts its
+ * frontend had in flight aged toward DELIVERY_UNKNOWN, because one `get_state` answer was waiting
+ * for a lock it had no reason to hold.
+ */
+it("keeps a session's worker frames flowing while a model projection waits for the lifecycle lock", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const identity = { pid: 281, startIdentity: "worker-block", processGroupId: 281 };
+  const piChild = { pid: 282, startIdentity: "pi-block", processGroupId: 281 };
+  const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === identity.pid ? identity : piChild;
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const now = "2026-08-25T12:00:00.000Z";
+  const astra = { provider: "openai-codex", id: "gpt-6-astra" };
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "block", sessionFile: "/sessions/block.jsonl", canonicalSessionFile: "/sessions/block.jsonl", cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", model: { provider: "openai-codex", id: "gpt-5.6-sol" }, activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-block", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-block", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "block", runId: "run-block", leaseId: "lease-block", generation: 1, identity, piChildIdentity: piChild, token: "block-token", socketPath: workerSocketPath(stateRoot, "block"), proto: 2, cliVersion: CURRENT_RELEASE }] })}\n`, { mode: 0o600 });
+  const runtime = await daemonRuntime({ root: stateRoot, inspect, reconnectTimeoutMs: 1_000 });
+  runtimes.push(runtime);
+  const worker = startPersistentFakeWorker(stateRoot, { sessionId: "block", runId: "run-block", leaseId: "lease-block", generation: 1, identity, piChildIdentity: piChild, token: "block-token", results: { get_session_commands: { commands: [], models: [], model: null } } });
+  await runtime.ready;
+  const frontend = connect({ socketPath: runtime.socketPath, token: runtime.token, maxBytes: 65536 });
+  await frontend.ready;
+  await vi.waitFor(() => expect(worker.connectionCount).toBeGreaterThan(0));
+
+  /** @type {unknown[]} */
+  const rejections = [];
+  const noteRejection = (/** @type {unknown} */ error) => rejections.push(error);
+  process.on("unhandledRejection", noteRejection);
+
+  /** @type {(value?: unknown) => void} */
+  let releaseLock = () => {};
+  const held = new Promise((resolve) => { releaseLock = resolve; });
+  const lockHeld = runSessionLifecycle(registry, "block", () => held);
+  await Promise.resolve();
+
+  try {
+    // A model this daemon would record, sent while nothing can take the lifecycle lock.
+    await worker.sendFrame({ type: "response", command: "get_state", success: true, data: { model: astra } });
+    await worker.sendFrame({ type: "message_end", message: { role: "user", content: "after the projection", timestamp: Date.parse(now) } });
+
+    // The transcript keeps moving: the projection waits on its own, not on this session's chain.
+    /** @type {any} */
+    let snapshot;
+    await vi.waitFor(async () => {
+      frontend.send({ version: 1, clientId: "viewer", requestId: `snapshot-${randomUUID()}`, op: "subscribe_viewer", payload: { sessionId: "block" } });
+      snapshot = await frontend.next();
+      expect(snapshot.result.snapshot.items.some((/** @type {any} */ item) => item.content?.[0]?.text === "after the projection")).toBe(true);
+    }, { timeout: 5_000 });
+
+    // A command for the same session is read off that chain too. Its result is serialized on the
+    // lifecycle lock by `runCurrent`, as it always has been, so what matters is that it survives the
+    // wait rather than being lost behind a connection nothing could read.
+    frontend.send({ version: 1, clientId: "viewer", requestId: `menu-${randomUUID()}`, op: "get_session_commands", payload: { sessionId: "block" } });
+  } finally {
+    releaseLock();
+    await lockHeld;
+    process.off("unhandledRejection", noteRejection);
+  }
+
+  /** @type {any} */
+  let answer;
+  const deadline = new Promise((resolve) => { setTimeout(() => resolve({ timedOut: true }), 10_000); });
+  for (let read = 0; read < 10; read += 1) {
+    answer = await Promise.race([frontend.next(), deadline]);
+    if (answer?.timedOut === true || answer?.ok === false || answer?.result?.kind === "session_commands") break;
+  }
+  expect(answer).toMatchObject({ ok: true, result: { kind: "session_commands", sessionId: "block" } });
+  frontend.close();
+
+  await vi.waitFor(async () => expect(await registry.get("block")).toMatchObject({ model: astra }));
+  // The projection reports its own failures; nothing it does becomes an unhandled rejection.
+  await new Promise((resolve) => { setImmediate(resolve); });
+  expect(rejections).toEqual([]);
+  await worker.stop();
+});
+
+it("records the model Pi confirms in a live response, and refuses every response that confirms none", async () => {
+  const stateRoot = await root();
+  for (const name of ["daemon", "sessions", "runs", "index"]) await mkdir(join(stateRoot, name), { mode: 0o700 });
+  const identity = { pid: 271, startIdentity: "worker-model", processGroupId: 271 };
+  const piChild = { pid: 272, startIdentity: "pi-model", processGroupId: 271 };
+  const inspect = async (/** @type {number} */ pid) => pid === process.pid ? { pid, startIdentity: "daemon", processGroupId: process.pid } : pid === identity.pid ? identity : piChild;
+  const registry = new RegistryStore(join(stateRoot, "sessions"));
+  const now = "2026-08-25T12:00:00.000Z";
+  const sol = { provider: "openai-codex", id: "gpt-5.6-sol" };
+  const astra = { provider: "openai-codex", id: "gpt-6-astra" };
+  await registry.create({ schemaVersion: 1, revision: 0, sessionId: "model", sessionFile: "/sessions/model.jsonl", canonicalSessionFile: "/sessions/model.jsonl", cwd: "/repo", taskState: "WORKING", processState: "LIVE", outcome: "NONE", model: sol, activity: { kind: "worker", summary: "running", updatedAt: now }, ownership: { kind: "managed", runId: "run-model", process: identity, acquiredAt: now, heartbeatAt: now }, latestRunId: "run-model", createdAt: now, updatedAt: now });
+  await writeFile(join(stateRoot, "daemon", "workers.json"), `${JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "model", runId: "run-model", leaseId: "lease-model", generation: 1, identity, piChildIdentity: piChild, token: "model-token", socketPath: workerSocketPath(stateRoot, "model"), proto: 2, cliVersion: CURRENT_RELEASE }] })}\n`, { mode: 0o600 });
+  const runtime = await daemonRuntime({ root: stateRoot, inspect, reconnectTimeoutMs: 1_000 });
+  runtimes.push(runtime);
+  const worker = startPersistentFakeWorker(stateRoot, { sessionId: "model", runId: "run-model", leaseId: "lease-model", generation: 1, identity, piChildIdentity: piChild, token: "model-token" });
+  await runtime.ready;
+  await vi.waitFor(() => expect(worker.connectionCount).toBeGreaterThan(0));
+
+  const initial = (await registry.get("model"))?.revision ?? 0;
+
+  // Nothing that confirms a model may move the row: a refusal, a cycle that moved nothing, a command
+  // this projection does not read, and a state that names no model. Frames are ingested in arrival
+  // order, so
+  // a write from any of these would land before the one that follows them.
+  await worker.sendFrame({ type: "response", command: "get_state", success: false, error: "refused" });
+  await worker.sendFrame({ type: "response", command: "cycle_model", success: true, data: null });
+  await worker.sendFrame({ type: "response", command: "set_thinking_level", success: true, data: astra });
+  await worker.sendFrame({ type: "response", command: "get_state", success: true, data: {} });
+
+  // Pi answers with the model it is actually running. No reconnect, no restart, no file read.
+  await worker.sendFrame({ type: "response", command: "get_state", success: true, data: { model: astra, thinkingLevel: "high" } });
+
+  await vi.waitFor(async () => expect(await registry.get("model")).toMatchObject({ model: astra }));
+  // Exactly one write: every frame before it confirmed no model and wrote nothing.
+  expect((await registry.get("model"))?.revision).toBe(initial + 1);
+  // The thinking level is not this repair's to write: it stays where its own writer left it.
+  expect((await registry.get("model"))?.thinkingLevel).toBeUndefined();
+
+  // `set_model` answers with the model itself rather than a state, and repeating it writes nothing.
+  await worker.sendFrame({ type: "response", command: "set_model", success: true, data: sol });
+  await vi.waitFor(async () => expect(await registry.get("model")).toMatchObject({ model: sol }));
+  expect((await registry.get("model"))?.revision).toBe(initial + 2);
+
+  await worker.sendFrame({ type: "response", command: "set_model", success: true, data: sol });
+  await worker.sendFrame({ type: "response", command: "get_state", success: true, data: { model: sol } });
+  await worker.sendFrame({ type: "response", command: "get_state", success: true, data: { model: astra } });
+
+  await vi.waitFor(async () => expect(await registry.get("model")).toMatchObject({ model: astra }));
+  expect((await registry.get("model"))?.revision).toBe(initial + 3);
+
+  await worker.stop();
 });
 
 it("reconnects two surviving fake workers through the concrete connector after daemon restart", async () => {

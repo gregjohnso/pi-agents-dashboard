@@ -1,20 +1,20 @@
-import { copyToClipboard } from "@earendil-works/pi-coding-agent";
+import { importPiModule, piModuleUrl } from "./pi-modules.mjs";
 
 /**
  * The two callbacks Pi's alternate screen needs to finish a copy and a hyperlink click.
  *
- * `copyToClipboard` is exported from Pi's package root. `openBrowser` is not, and Pi 0.84.3 exports
- * only `.`, `./rpc-entry` and `./client`, so it has no package-name specifier. It is reused rather
- * than rewritten on purpose: it opens a URL without ever invoking a shell, which is what keeps a
- * hyperlink out of a command line on Windows. Writing a second opener here would mean owning that
- * decision again, badly. The version is pinned exactly and pi-native-helpers.test.mjs fails the
- * moment the path or the export moves.
+ * Both are Pi's own. Neither is reachable by specifier: Pi 0.84.3 exports only `.`, `./rpc-entry`
+ * and `./client`, and the root that does re-export `copyToClipboard` costs seconds to import. They
+ * are reused rather than rewritten on purpose; `openBrowser` in particular opens a URL without ever
+ * invoking a shell, which is what keeps a hyperlink out of a command line on Windows. The version is
+ * pinned exactly and pi-native-helpers.test.mjs fails the moment a path or an export moves.
  */
-const PI_ENTRY = import.meta.resolve("@earendil-works/pi-coding-agent");
+export const PI_OPEN_BROWSER_MODULE = piModuleUrl("openBrowser");
 
-export const PI_OPEN_BROWSER_MODULE = new URL("./utils/open-browser.js", PI_ENTRY).href;
+export const PI_CLIPBOARD = await importPiModule("clipboard");
 
-const { openBrowser } = await import(PI_OPEN_BROWSER_MODULE);
+const { openBrowser } = await importPiModule("openBrowser");
+const { copyToClipboard } = PI_CLIPBOARD;
 
 /**
  * Pi's own clipboard and browser helpers, in the shape `TuiAltScreen` takes them. A caller may pass

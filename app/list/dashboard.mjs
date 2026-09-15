@@ -6,7 +6,7 @@ import { decodeKittyPrintable, Key, matchesKey, truncateToWidth, visibleWidth, }
 import { ClearQuitGesture } from "../clear-quit-gesture.mjs";
 import { pastedText } from "./dashboard-input.mjs";
 import { sessionNameFromPrompt } from "../../runtime/session-name.mjs";
-import { SPINNER_INTERVAL_MS } from "../spinner.mjs";
+import { createSpinnerClock } from "../spinner.mjs";
 import { countDashboardSessions, selectDashboardSessions, } from "./dashboard-state.mjs";
 import { createDashboardLayout, renderColumnHeader, wrapPromptDraft, } from "./dashboard-layout.mjs";
 import { JOBWATCH_ANSI, jobwatchTheme } from "./dashboard-theme.mjs";
@@ -162,7 +162,8 @@ export class DashboardController {
     listReads;
     stopClearGesture;
     clearQuitGesture;
-    animationTimer;
+    /** The shared throbber clock; the viewer runs the same one. */
+    animation;
     summaryRefreshTimer;
     /** Launches sent but not yet answered, shown as STARTING rows so a prompt never looks lost. */
     pendingLaunches = [];
@@ -201,6 +202,7 @@ export class DashboardController {
         this.onClose = options.onClose;
         this.onSessionIntent = options.onSessionIntent;
         this.requestRender = options.requestRender;
+        this.animation = createSpinnerClock({ requestRender: () => this.requestRender?.() });
         this.now = options.now ?? Date.now;
         this.stopRetryLimit = options.stopRetryLimit ?? 8;
         this.stopClearGesture = new StopClearGesture({ now: options.now });
@@ -223,6 +225,7 @@ export class DashboardController {
         this.closed = false;
         // A quit armed before this list was put away cannot travel into the list it comes back as.
         this.clearQuitGesture.cancel();
+        this.stopClearGesture.cancel();
         this.closePromise = undefined;
         this.listReads = undefined;
         const generation = ++this.openGeneration;
@@ -262,8 +265,7 @@ export class DashboardController {
         this.ensureSelectionVisible();
     }
     get stopClearArmed() {
-        const selected = this.list.selectedSessionId;
-        return selected !== undefined && this.stopClearGesture.armedFor(selected);
+        return this.stopClearGesture.armedSessionId() !== undefined;
     }
     selectSession(sessionId) {
         if (sessionId !== this.list.selectedSessionId)
@@ -608,9 +610,28 @@ export class DashboardController {
      * that is already stopped needs the same two presses, so one keystroke can never remove anything.
      */
     pressStopClear() {
-        const selected = this.selectedSession();
-        if (selected === undefined)
+        // The armed session, not the selected row: a stop takes its row out of a filtered view and the
+        // selection moves on, so a second press aimed at clearing what was just stopped would
+        // otherwise stop a neighbour. Explicit navigation still cancels the gesture.
+        // One stop at a time: while the daemon has not answered the last one, a second press repeats
+        // a press that is already running. Acting on it would send a second stop at a stale revision,
+        // and once the stopped row has left a filtered view it would land on the neighbour the
+        // selection moved to.
+        if (this.stopClearGesture.pendingSessionId() !== undefined)
             return;
+        const armed = this.stopClearGesture.armedSessionId();
+        const selected = armed === undefined
+            ? this.selectedSession()
+            : this.sessions.find((session) => session.sessionId === armed);
+        if (selected === undefined) {
+            // The armed session left this frontend's list entirely, which another frontend clearing it
+            // does. The press belongs to that session, never to whatever row the cursor is on now.
+            if (armed !== undefined) {
+                this.stopClearGesture.cancel();
+                this.requestRender?.();
+            }
+            return;
+        }
         const action = destructiveAction(selected);
         if (action === "stop") {
             void this.confirmSession({ ...createSessionConfirmation(selected), clearingStopped: false });
@@ -651,9 +672,14 @@ export class DashboardController {
         // give the list straight back; the outcome arrives as a status line and a session event.
         this.overlay = undefined;
         this.status = { kind: "pending", code: `${action.toUpperCase()}_SENT`, message: `${action} sent for ${sessionId}` };
+        // The view is the operator's. Stopping a session does not switch it, and does not drag every
+        // killed session he filtered away back under his cursor.
+        /** @type {any} */
+        let intent;
         if (action === "stop") {
-            this.setView("all");
             this.selectSession(sessionId);
+            // Registered after the selection move, because moving the selection cancels this gesture.
+            intent = this.stopClearGesture.beginStop(sessionId);
         }
         this.requestRender();
         try {
@@ -681,8 +707,9 @@ export class DashboardController {
                     await new Promise((resolve) => setTimeout(resolve, 25));
                 }
             }
-            // Arm only after the stop landed, so a single press can never remove a running session.
-            if (action === "stop") {
+            // Arm only after the stop landed, so a single press can never remove a running session,
+            // and only while this press is still the one the operator is making.
+            if (action === "stop" && this.stopClearGesture.holds(intent)) {
                 const stopped = this.sessions.find((candidate) => candidate.sessionId === sessionId);
                 if (stopped !== undefined)
                     this.armClear(stopped);
@@ -696,6 +723,10 @@ export class DashboardController {
             // where the operator reads what happened.
             this.setError(error, `${action.toUpperCase()}_FAILED`);
         }
+        // A press that armed nothing must not leave this gesture waiting on an answer it already had,
+        // which would make every later Ctrl+X a repeat of a stop that is over.
+        if (this.stopClearGesture.holds(intent))
+            this.stopClearGesture.cancel();
         this.requestRender();
     }
     async activateSelection() {
@@ -705,9 +736,9 @@ export class DashboardController {
         await this.openViewer(selected.sessionId);
     }
     handleInput(data) {
-        // Any key other than a second Ctrl+X abandons an armed clear, so the red warning cannot linger
-        // and a later keystroke cannot inherit it.
-        if (this.stopClearArmed && !matchesKey(data, Key.ctrl("x"))) {
+        // Any key other than a second Ctrl+X abandons this gesture, so the red warning cannot linger,
+        // a later keystroke cannot inherit it, and an answer still on its way arms nothing.
+        if ((this.stopClearArmed || this.stopClearGesture.pendingSessionId() !== undefined) && !matchesKey(data, Key.ctrl("x"))) {
             this.stopClearGesture.cancel();
             this.requestRender?.();
         }
@@ -954,7 +985,7 @@ export class DashboardController {
                 if (layout.dockRows >= 4) lines[promptBottom + 1] = sectionFooter(this.width, confirmingSharedLaunch);
                 // An armed clear is the one thing on this row worth interrupting for, and it expires on its own.
                 lines[formRow] = this.stopClearArmed
-                    ? paintPlainLine(" ctrl+x to confirm", this.width, jobwatchTheme.error)
+                    ? paintPlainLine(` ctrl+x to clear ${this.sessionLabel(this.stopClearGesture.armedSessionId())}`, this.width, jobwatchTheme.error)
                     : paintPlainLine(this.status.kind === "error" ? ` ${this.status.code}: ${this.status.message}  ${form}` : form, this.width, this.status.kind === "error" ? jobwatchTheme.error : jobwatchTheme.surface);
                 // Which session the list is pointing at, read last: it describes the selection, not the launch.
                 if (formRow + 1 < lines.length)
@@ -1056,6 +1087,13 @@ export class DashboardController {
     draftModelSummary() {
         const { provider, id } = this.composerDraft.model;
         return provider === "" && id === "" ? "" : ` model:${provider}/${id}`;
+    }
+    /** How a line names one session: its name, or the head of its id when it has none yet. */
+    sessionLabel(sessionId) {
+        const session = this.sessions.find((candidate) => candidate.sessionId === sessionId);
+        if (session === undefined)
+            return (sessionId ?? "").slice(0, 8);
+        return (session.name ?? "").trim() === "" ? session.sessionId.slice(0, 8) : session.name;
     }
     /** The selected session's working directory, plus any active filters. */
     contextLine() {
@@ -1243,29 +1281,23 @@ export class DashboardController {
     }
     /**
      * Keep one repaint timer alive exactly while a visible session is working. Without it the
-     * spinner frame only advances when some other event happens to redraw the list.
+     * spinner frame only advances when some other event happens to redraw the list. The viewer runs
+     * the same clock for the same reason; `createSpinnerClock` is the one owner of that timer.
      */
     syncAnimation() {
         const working = this.list.rows.some((row) => row.kind === "session" && displaySessionState(row.session) === "WORKING");
-        if (!working || this.closed || this.requestRender === undefined) {
-            this.stopAnimation();
-            return;
-        }
-        if (this.animationTimer !== undefined)
-            return;
-        this.animationTimer = setInterval(() => this.requestRender?.(), SPINNER_INTERVAL_MS);
-        this.animationTimer.unref?.();
+        this.animation.sync(working && !this.closed && this.requestRender !== undefined);
     }
     stopAnimation() {
-        if (this.animationTimer === undefined)
-            return;
-        clearInterval(this.animationTimer);
-        this.animationTimer = undefined;
+        this.animation.stop();
     }
     beginClose(initialError) {
         if (this.closePromise !== undefined)
             return this.closePromise;
         this.stopAnimation();
+        this.stopClearGesture.cancel();
+        clearTimeout(this.clearHintTimer);
+        this.clearHintTimer = undefined;
         clearTimeout(this.summaryRefreshTimer);
         this.summaryRefreshTimer = undefined;
         clearTimeout(this.cwdCompletionTimer);

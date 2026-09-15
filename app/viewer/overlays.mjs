@@ -1,7 +1,15 @@
-import { DynamicBorder, ExtensionEditorComponent, getMarkdownTheme, getSelectListTheme, initTheme } from "@earendil-works/pi-coding-agent";
 import { Input, Markdown, SelectList, getKeybindings, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
+import { importPiModule } from "./pi-modules.mjs";
 import { spinnerFrame } from "../spinner.mjs";
+
+/** Pi's own border, extension editor and theme, reached without its package root. */
+export const PI_OVERLAY_COMPONENTS = {
+  ...await importPiModule("dynamicBorder"),
+  ...await importPiModule("extensionEditor"),
+  ...await importPiModule("theme"),
+};
+const { DynamicBorder, ExtensionEditorComponent, getMarkdownTheme, getSelectListTheme, initTheme } = PI_OVERLAY_COMPONENTS;
 
 initTheme(undefined, false);
 

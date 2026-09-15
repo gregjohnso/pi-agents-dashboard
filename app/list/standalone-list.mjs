@@ -159,8 +159,14 @@ export function createHostShutdown({ currentViewer, controller, tui, client, res
   };
 }
 
+/** Pi's viewer components, which is the import that costs seconds. @type {() => Promise<any[]>} */
+const importViewerModules = () => Promise.all([
+  import("../viewer/pi-component-adapters.mjs"),
+  import("../viewer/viewer-controller.mjs"),
+]);
+
 /** Open the relocated list and real viewer in one package-root TUI. @param {any} options */
-export async function createStandaloneList({ cwd, frontend, terminal: hostTerminal = new ProcessTerminal(), copySelection = undefined, openUrl = undefined }) {
+export async function createStandaloneList({ cwd, frontend, terminal: hostTerminal = new ProcessTerminal(), copySelection = undefined, openUrl = undefined, loadViewerModules = importViewerModules }) {
   const token = (await fs.readFile(join(frontend.root, "daemon", "control.token"), "utf8")).trim();
   const client = createDaemonClient({ socketPath: join(frontend.root, "daemon", "control.sock"), token, maxBytes: 1024 * 1024, clientId: frontend.clientId, attachId: frontend.attachId });
   const terminal = createWheelInputTap(hostTerminal);
@@ -174,46 +180,67 @@ export async function createStandaloneList({ cwd, frontend, terminal: hostTermin
   let pendingDashboardAction;
   let standaloneHost;
   const closed = new Promise((resolve) => { resolveClosed = resolve; });
+  /**
+   * Pi's components load on the first session opened, not before the list is drawn: importing Pi's
+   * package costs seconds, and every launch and every key in the list happens without it.
+   *
+   * Measured, and left on the keypress deliberately: starting this import from a timer after the
+   * first frame does not remove its cost, it moves it onto whatever the operator does next. A probe
+   * that typed the instant the list appeared waited 4.4 s for its own first character, against 8-14
+   * ms with the import still on the keypress. One thread cannot hide a 4 s synchronous import.
+   * @type {Promise<any[]> | undefined}
+   */
+  let viewerModules;
+  // A rejection is not remembered, so the next Right asks again instead of answering from a failure
+  // the operator never saw.
+  const loadViewer = () => (viewerModules ??= loadViewerModules().catch((error) => { viewerModules = undefined; throw error; }));
   const openRealViewer = async (sessionId) => {
     if (switching || activeViewer !== undefined) return;
     switching = true;
-    // Pi's components load on the first session opened, not before the list is drawn: importing Pi's
-    // package costs seconds, and every launch and every key in the list happens without it.
-    const [{ createPiEditor }, { ViewerController }] = await Promise.all([
-      import("../viewer/pi-component-adapters.mjs"),
-      import("../viewer/viewer-controller.mjs"),
-    ]);
-    await runViewerTransition({
-      sessionId, client, controller,
-      createViewer() {
-        const editor = createPiEditor({ tui });
-        let viewer;
-        viewer = new ViewerController({
-          sessionId, client, editor, cwd,
-          persistence: { async load() { return viewerState.get(sessionId); }, async save(value) { viewerState.set(sessionId, structuredClone(value)); } },
-          requestRender: () => tui.requestRender(), onReturn: () => { void viewer.close(); },
-          // Returning hands the list back; quitting ends this whole frontend, list included.
-          onQuit: () => { void shutdown.run(); },
-          onDashboardAction: (/** @type {string} */ action) => {
-            pendingDashboardAction = action;
-            void viewer.close();
-          },
-        });
-        return viewer;
-      },
-      activateViewer(viewer) { activeViewer = viewer; active = viewer; standaloneHost.setLayout(viewer.layoutRoot); },
-      activateList() {
-        activeViewer = undefined;
-        active = controller;
-        standaloneHost.setLayout(undefined);
-        if (pendingDashboardAction === "new_session") controller.focusComposer();
-        pendingDashboardAction = undefined;
-      },
-      restoreListFocus() { standaloneHost.setLayout(undefined); },
-      onRestoreClosed() { tui.stop({ preserveScreen: true }); resolveClosed(); },
-      shouldRestore() { return !shutdown.started; },
-    });
-    switching = false;
+    try {
+      const [{ createPiEditor }, { ViewerController }] = await loadViewer();
+      // Closed while that load was in flight: nothing may be mounted on a screen already given up.
+      if (shutdown.started) return;
+      await runViewerTransition({
+        sessionId, client, controller,
+        createViewer() {
+          const editor = createPiEditor({ tui });
+          let viewer;
+          viewer = new ViewerController({
+            sessionId, client, editor, cwd,
+            persistence: { async load() { return viewerState.get(sessionId); }, async save(value) { viewerState.set(sessionId, structuredClone(value)); } },
+            requestRender: () => tui.requestRender(), onReturn: () => { void viewer.close(); },
+            // Returning hands the list back; quitting ends this whole frontend, list included.
+            onQuit: () => { void shutdown.run(); },
+            onDashboardAction: (/** @type {string} */ action) => {
+              pendingDashboardAction = action;
+              void viewer.close();
+            },
+          });
+          return viewer;
+        },
+        activateViewer(viewer) { activeViewer = viewer; active = viewer; standaloneHost.setLayout(viewer.layoutRoot); },
+        activateList() {
+          activeViewer = undefined;
+          active = controller;
+          standaloneHost.setLayout(undefined);
+          if (pendingDashboardAction === "new_session") controller.focusComposer();
+          pendingDashboardAction = undefined;
+        },
+        restoreListFocus() { standaloneHost.setLayout(undefined); },
+        onRestoreClosed() { tui.stop({ preserveScreen: true }); resolveClosed(); },
+        shouldRestore() { return !shutdown.started; },
+      });
+    } catch (error) {
+      // An import that failed is the operator's answer to his keypress, and the next one retries.
+      // The frame is asked for here because `setError` only writes the status: a list with nothing
+      // running repaints for nothing, so the answer would wait for a keypress that has no reason
+      // to come.
+      controller.setError?.(error, "VIEWER_OPEN_FAILED");
+      tui.requestRender();
+    } finally {
+      switching = false;
+    }
   };
   const controller = new DashboardController({
     client, openViewer: openRealViewer,

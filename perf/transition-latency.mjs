@@ -1,5 +1,13 @@
 // Keypress-to-frame latency and byte volume for the list <-> viewer transition, under a real PTY.
 // Usage: node perf/transition-latency.mjs [--base <dir>] [--sessions N] [--items N] [--repeats N] [--label name] [--stream-ms N]
+//
+// The gestures are the operator's own: Right opens the selected session, Left returns to the list.
+// Three things about the previous version measured nothing after the native viewer layout landed,
+// and each is asserted against rather than assumed here:
+//   - `Alt+Enter follow-up` is no longer painted; the hints line is Pi's own lowercase key text.
+//   - `pi-agents` appears in the viewer's own header, so it could not tell a return from an entry.
+//   - Home is `tui.altScreen.top` now, so it scrolls the viewport instead of selecting the first row.
+// Every session is given the same transcript depth, so no row selection is needed at all.
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -21,13 +29,19 @@ const ITEMS = Number(option("items", "60"));
 const REPEATS = Number(option("repeats", "7"));
 const LABEL = option("label", "run");
 const PHASE_LOG = option("phase-log", "");
+// `immediate` adds the operator who does not wait: one keystroke and one Right sent the moment the
+// list first paints, which is when it is still paying for Pi's own components on that keypress.
+const MODE = option("mode", "settled");
 // Frames every STREAM_MS from every fake Pi, so the transition competes with its own session's ingest.
 const STREAM_MS = option("stream-ms", "");
 
-// The viewer's own key hints; the list draws no such line. The header used to end in the access
-// role, which is what this watched for before roles were removed.
-const VIEWER_MARK = Buffer.from("Alt+Enter follow-up");
-const LIST_MARK = Buffer.from("pi-agents");
+// One mark each, and neither can appear on the other surface: the hints line is the viewer's own and
+// the list draws no such line, and the session panel's border title is the list's own. `checkMarks`
+// fails the run if either ever shows up on the wrong screen.
+const VIEWER_MARK = Buffer.from("alt+enter follow-up");
+const LIST_MARK = Buffer.from("\u256d\u2500 Sessions");
+const RIGHT = "\x1b[C";
+const LEFT = "\x1b[D";
 const QUIET_MS = 400;
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
@@ -44,7 +58,9 @@ async function main() {
     TERM: "xterm-256color",
     COLUMNS: "120",
     LINES: "40",
-    ...(PHASE_LOG === "" ? {} : { PI_AGENTS_PERF_LOG: PHASE_LOG, PI_AGENTS_DAEMON_PERF_LOG: `${PHASE_LOG}.daemon` }),
+    // The frontend's own stage marks for one transition: attached, list-closed, viewer-open,
+    // viewer-closed, list-reopened, each in milliseconds from the keypress that started it.
+    ...(PHASE_LOG === "" ? {} : { PI_AGENTS_UI_TIMING: PHASE_LOG }),
     ...(STREAM_MS === "" ? {} : { FAKE_PI_STREAM_MS: STREAM_MS }),
   };
 
@@ -63,15 +79,17 @@ async function main() {
     if (!launched.ok) throw new Error(`launch failed: ${JSON.stringify(launched.error)}`);
     sessionIds.push(launched.result.sessionId);
   }
-  // One deep transcript, so the session the measurement opens carries a realistic item count.
-  const deep = sessionIds[0];
-  const attached = await request("attach", { sessionId: deep, activate: true });
-  if (!attached.ok) throw new Error(`attach failed: ${JSON.stringify(attached.error)}`);
-  for (let index = 0; index < ITEMS; index += 1) {
-    const sent = await request("follow_up", { sessionId: deep, text: `perf item ${index}` });
-    if (!sent.ok) throw new Error(`follow_up failed: ${JSON.stringify(sent.error)}`);
+  // Every session carries the same transcript depth, so whichever row the list selects on its own is
+  // the one this opens and the sample does not depend on a sort order or on a selection keystroke.
+  for (const sessionId of sessionIds) {
+    const attached = await request("attach", { sessionId, activate: true });
+    if (!attached.ok) throw new Error(`attach failed: ${JSON.stringify(attached.error)}`);
+    for (let index = 0; index < ITEMS; index += 1) {
+      const sent = await request("follow_up", { sessionId, text: `perf item ${index}` });
+      if (!sent.ok) throw new Error(`follow_up failed: ${JSON.stringify(sent.error)}`);
+    }
+    await request("detach", { sessionId });
   }
-  await request("detach", { sessionId: deep });
   await client.close();
 
   const transcriptPath = join(root, "transcript");
@@ -111,13 +129,37 @@ async function main() {
     }
   }
 
-  const results = { label: LABEL, keystroke: [], enter: [], back: [] };
+  /** Fail loudly if a mark ever appears on the surface it is supposed to tell apart. @param {Buffer} absent */
+  function checkMarks(from, absent, surface) {
+    if (buffer.indexOf(absent, from) !== -1) throw new Error(`${absent} appeared on the ${surface} screen; this measurement cannot tell the two surfaces apart`);
+  }
+
+  const results = { label: LABEL, mode: MODE, keystroke: [], right: [], left: [], immediate: undefined, firstPaintMs: undefined };
+  const spawnedAt = Date.now();
   try {
     await waitFor(LIST_MARK, 0, 0, 120_000);
-    await quiesce();
-    // Home selects the first row, which owns the deep transcript.
-    child.stdin.write("\x1b[H");
-    await sleep(300);
+    results.firstPaintMs = Date.now() - spawnedAt;
+
+    if (MODE === "immediate") {
+      // Nothing is quiesced and nothing is waited for: this is the cost the operator pays when he
+      // does not pause after the list appears.
+      let from = buffer.length;
+      let bytesFrom = bytes;
+      child.stdin.write("z");
+      const warmupKeystroke = await waitFor(Buffer.from("❯ z"), from, bytesFrom, 60_000);
+      child.stdin.write("\x7f");
+      from = buffer.length;
+      bytesFrom = bytes;
+      child.stdin.write(RIGHT);
+      const entered = await waitFor(VIEWER_MARK, from, bytesFrom, 120_000);
+      checkMarks(from, LIST_MARK, "viewer");
+      await quiesce();
+      from = buffer.length;
+      bytesFrom = bytes;
+      child.stdin.write(LEFT);
+      const returned = await waitFor(LIST_MARK, from, bytesFrom, 60_000);
+      results.immediate = { keystrokeMs: warmupKeystroke.ms, rightMs: entered.ms, leftMs: returned.ms };
+    }
     await quiesce();
 
     // Floor: one printable key echoed into the list composer, same pseudo-terminal path.
@@ -133,36 +175,27 @@ async function main() {
       await quiesce();
     }
 
+    // The first cycle of a process pays the viewer's dynamic imports; the rest do not. They are
+    // reported apart because they are different questions, and averaging them hides both.
     for (let repeat = 0; repeat < REPEATS; repeat += 1) {
-      // Home re-selects the deep row and flushes anything the input tap is still holding.
-      child.stdin.write("\x1b[H");
-      await sleep(250);
-      await quiesce();
-      let from = buffer.length;
+      const listFrom = buffer.length;
       let bytesFrom = bytes;
       let startedAt = Date.now();
-      child.stdin.write("\r");
-      const enter = await waitFor(VIEWER_MARK, from, bytesFrom);
+      child.stdin.write(RIGHT);
+      const entered = await waitFor(VIEWER_MARK, listFrom, bytesFrom);
+      checkMarks(listFrom, LIST_MARK, "viewer");
       await quiesce();
-      results.enter.push({ ms: enter.ms, bytes: enter.bytes, settledMs: Date.now() - startedAt, settledBytes: bytes - bytesFrom });
+      results.right.push({ cold: repeat === 0, ms: entered.ms, bytes: entered.bytes, settledMs: Date.now() - startedAt, settledBytes: bytes - bytesFrom });
 
-      from = buffer.length;
+      const viewerFrom = buffer.length;
       bytesFrom = bytes;
       startedAt = Date.now();
-      child.stdin.write("\x1b");
-      // A dead first Escape is the symptom under test: after 2 s the operator presses again.
-      let presses = 1;
-      let back;
-      try {
-        back = await waitFor(LIST_MARK, from, bytesFrom, 2_000);
-      } catch {
-        presses = 2;
-        child.stdin.write("\x1b");
-        await waitFor(LIST_MARK, from, bytesFrom, 20_000);
-        back = { ms: Date.now() - startedAt, bytes: bytes - bytesFrom };
-      }
+      // One Left, because this frontend never typed into the prompt: that is the clean-left gesture.
+      child.stdin.write(LEFT);
+      const returned = await waitFor(LIST_MARK, viewerFrom, bytesFrom);
+      checkMarks(viewerFrom, VIEWER_MARK, "list");
       await quiesce();
-      results.back.push({ ms: back.ms, bytes: back.bytes, presses, settledMs: Date.now() - startedAt, settledBytes: bytes - bytesFrom });
+      results.left.push({ cold: repeat === 0, ms: returned.ms, bytes: returned.bytes, settledMs: Date.now() - startedAt, settledBytes: bytes - bytesFrom });
     }
 
     child.stdin.write("\x03");
@@ -175,20 +208,34 @@ async function main() {
   }
 
   const summarize = (samples) => {
+    if (samples.length === 0) return { n: 0 };
     const pick = (key) => [...samples].map((sample) => sample[key]).sort((left, right) => left - right);
     const median = (values) => values[Math.floor(values.length / 2)];
     const ms = pick("ms");
     return {
       n: samples.length, msMedian: median(ms), msMin: ms[0], msMax: ms[ms.length - 1],
-      presses: samples.map((sample) => sample.presses).filter((value) => value !== undefined),
       bytesMedian: median(pick("bytes")),
       settledMsMedian: median(pick("settledMs")), settledBytesMedian: median(pick("settledBytes")),
     };
   };
+  const cold = (samples) => summarize(samples.filter((sample) => sample.cold));
+  const warm = (samples) => summarize(samples.filter((sample) => !sample.cold));
+  const stages = PHASE_LOG === "" ? undefined : await readFile(PHASE_LOG, "utf8").then((text) => {
+    const byStage = {};
+    for (const line of text.trim().split("\n").filter(Boolean)) {
+      const [, stage, elapsed] = line.split(" ");
+      (byStage[stage] ??= []).push(Number.parseInt(elapsed, 10));
+    }
+    return byStage;
+  }).catch(() => undefined);
   console.log(JSON.stringify({
     label: LABEL, base: BASE, sessions: SESSIONS, items: ITEMS, streamMs: STREAM_MS,
     loadavg: (await readFile("/proc/loadavg", "utf8")).trim(),
-    keystroke: summarize(results.keystroke), enter: summarize(results.enter), back: summarize(results.back), raw: results,
+    mode: MODE, firstPaintMs: results.firstPaintMs, immediate: results.immediate,
+    keystroke: summarize(results.keystroke),
+    rightCold: cold(results.right), rightWarm: warm(results.right),
+    leftCold: cold(results.left), leftWarm: warm(results.left),
+    stages, raw: results,
   }, undefined, 2));
   // A daemon that is still unlinking its own files can lose a race with this cleanup.
   await rm(root, { recursive: true, force: true }).catch(async () => { await sleep(2_000); await rm(root, { recursive: true, force: true }).catch(() => {}); });

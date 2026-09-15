@@ -1,12 +1,25 @@
 import {
-  AssistantMessageComponent, CustomEditor, ToolExecutionComponent, UserMessageComponent,
-  getMarkdownTheme, initTheme,
-} from "@earendil-works/pi-coding-agent";
-import {
   truncateToWidth, visibleWidth,
 } from "@earendil-works/pi-tui";
 
 import { createPiKeybindings, installPiKeybindings } from "./pi-keybindings.mjs";
+import { importPiModule } from "./pi-modules.mjs";
+
+/**
+ * Pi's own message, tool and editor components, reached one file at a time.
+ *
+ * Its package root re-exports these from the same files, so these are the same classes; what the
+ * root adds is Pi's agent entry point, its SDK and every provider, none of which a transcript draws
+ * with. The identity is pinned in test/viewer-import-surface.test.mjs.
+ */
+export const PI_VIEWER_COMPONENTS = {
+  ...await importPiModule("assistantMessage"),
+  ...await importPiModule("userMessage"),
+  ...await importPiModule("toolExecution"),
+  ...await importPiModule("customEditor"),
+  ...await importPiModule("theme"),
+};
+const { AssistantMessageComponent, CustomEditor, ToolExecutionComponent, UserMessageComponent, getMarkdownTheme, initTheme } = PI_VIEWER_COMPONENTS;
 
 initTheme(undefined, false);
 

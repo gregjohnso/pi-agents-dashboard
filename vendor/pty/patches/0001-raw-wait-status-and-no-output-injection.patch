@@ -1,0 +1,188 @@
+diff --git a/index.d.ts b/index.d.ts
+index a52c3bd..7715b30 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -37,7 +37,7 @@ export interface PtyOptions {
+   apparmorProfile?: string;
+   interactive?: boolean;
+   sandbox?: SandboxOptions;
+-  onExit: (err: null | Error, exitCode: number) => void;
++  onExit: (err: null | Error, rawWaitStatus: number) => void;
+ }
+ /** A size struct to pass to resize. */
+ export interface Size {
+@@ -46,7 +46,6 @@ export interface Size {
+ }
+ export const MAX_U16_VALUE: number;
+ export const MIN_U16_VALUE: number;
+-export declare function getSyntheticEofSequence(): Buffer;
+ /** Resize the terminal. */
+ export declare function ptyResize(fd: number, size: Size): void;
+ /**
+@@ -68,6 +67,11 @@ export declare class Pty {
+    * once (it will error the second time). The caller is responsible for closing the file
+    * descriptor.
+    */
++  /**
++   * The raw wait(2) status of this process, or null while its exit has not been reaped.
++   * Non-blocking and signal-free: it reads the state of the thread that owns the single wait(2).
++   */
++  rawWaitStatus(): number | null;
+   takeControllerFd(): c_int;
+   /**
+    * Closes the owned file descriptor for the PTY controller. The Nodejs side must call this
+diff --git a/src/lib.rs b/src/lib.rs
+index 90cb7da..2148401 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -5,10 +5,13 @@ use std::io::{Error, Write};
+ use std::os::fd::{AsRawFd, OwnedFd};
+ use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
+ use std::os::unix::process::CommandExt;
++use std::os::unix::process::ExitStatusExt;
+ use std::process::{Command, Stdio};
++use std::sync::atomic::{AtomicI64, Ordering};
++use std::sync::Arc;
+ use std::thread;
+ 
+-use napi::bindgen_prelude::{Buffer, JsFunction};
++use napi::bindgen_prelude::JsFunction;
+ use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
+ use napi::Status::GenericFailure;
+ use napi::{self, Env};
+@@ -31,8 +34,13 @@ struct Pty {
+   user_fd: Option<OwnedFd>,
+   /// The pid of the forked process.
+   pub pid: u32,
++  /// The raw `wait(2)` status the reaping thread stored, or `NOT_REAPED` while it has not returned.
++  exit_status: Arc<AtomicI64>,
+ }
+ 
++/// No `wait(2)` status can be this value, so it is the one sentinel for "not reaped yet".
++const NOT_REAPED: i64 = i64::MIN;
++
+ #[napi(string_enum)]
+ pub enum Operation {
+   Modify,
+@@ -72,7 +80,7 @@ struct PtyOptions {
+   pub apparmor_profile: Option<String>,
+   pub interactive: Option<bool>,
+   pub sandbox: Option<SandboxOptions>,
+-  #[napi(ts_type = "(err: null | Error, exitCode: number) => void")]
++  #[napi(ts_type = "(err: null | Error, rawWaitStatus: number) => void")]
+   pub on_exit: JsFunction,
+ }
+ 
+@@ -88,13 +96,6 @@ pub const MAX_U16_VALUE: u16 = u16::MAX;
+ #[napi]
+ pub const MIN_U16_VALUE: u16 = u16::MIN;
+ 
+-const SYNTHETIC_EOF: &[u8] = b"\x1B]7878\x1B\\";
+-
+-#[napi]
+-pub fn get_synthetic_eof_sequence() -> Buffer {
+-  SYNTHETIC_EOF.into()
+-}
+-
+ fn cast_to_napi_error(err: Errno) -> napi::Error {
+   napi::Error::new(GenericFailure, err)
+ }
+@@ -308,24 +309,21 @@ impl Pty {
+       .on_exit
+       .create_threadsafe_function(0, |ctx| ctx.env.create_int32(ctx.value).map(|v| vec![v]))?;
+ 
++    let exit_status = Arc::new(AtomicI64::new(NOT_REAPED));
++    let reaped_status = Arc::clone(&exit_status);
++
+     thread::spawn(move || {
+       let wait_result = child.wait();
+ 
+-      // by this point, child has closed its copy of the user_fd
+-      // lets inject our synthetic EOF OSC into the user_fd
+-      // its ok to ignore the result here as we have a timeout on the nodejs side to handle if this write fails
+-      let _ = write_syn_eof_to_fd(raw_user_fd);
+-
+       match wait_result {
+         Ok(status) => {
+-          if status.success() {
+-            ts_on_exit.call(Ok(0), ThreadsafeFunctionCallMode::Blocking);
+-          } else {
+-            ts_on_exit.call(
+-              Ok(status.code().unwrap_or(-1)),
+-              ThreadsafeFunctionCallMode::Blocking,
+-            );
+-          }
++          // The raw wait(2) status, not an exit code. A normal exit, a terminating signal and a
++          // core dump are three different facts, and reporting only code().unwrap_or(-1) erased
++          // two of them irrecoverably. The store happens before the callback, so a synchronous
++          // reader can never observe an already reaped child as still running.
++          let raw = status.into_raw();
++          reaped_status.store(raw as i64, Ordering::SeqCst);
++          ts_on_exit.call(Ok(raw), ThreadsafeFunctionCallMode::Blocking);
+         }
+         Err(err) => {
+           ts_on_exit.call(
+@@ -346,6 +344,7 @@ impl Pty {
+       controller_fd: Some(controller_fd),
+       user_fd: Some(user_fd),
+       pid,
++      exit_status,
+     })
+   }
+ 
+@@ -365,6 +364,19 @@ impl Pty {
+     }
+   }
+ 
++  /// The raw wait(2) status of this process, or null while its exit has not been reaped.
++  ///
++  /// Non-blocking and signal-free. It reads the state of the thread that owns the single wait(2)
++  /// for this child, so it answers before the exit callback reaches JavaScript and it never waits.
++  #[napi]
++  #[allow(dead_code)]
++  pub fn raw_wait_status(&self) -> Option<i32> {
++    match self.exit_status.load(Ordering::SeqCst) {
++      NOT_REAPED => None,
++      raw => Some(raw as i32),
++    }
++  }
++
+   /// Closes the owned file descriptor for the PTY controller. The Nodejs side must call this
+   /// when it is done with the file descriptor to avoid leaking FDs.
+   #[napi]
+@@ -467,35 +479,3 @@ fn set_nonblocking(fd: i32) -> Result<(), napi::Error> {
+   }
+   Ok(())
+ }
+-
+-fn write_syn_eof_to_fd(fd: libc::c_int) -> std::io::Result<()> {
+-  let mut remaining = SYNTHETIC_EOF;
+-  while !remaining.is_empty() {
+-    match unsafe {
+-      libc::write(
+-        fd,
+-        remaining.as_ptr() as *const libc::c_void,
+-        remaining.len(),
+-      )
+-    } {
+-      -1 => {
+-        let err = std::io::Error::last_os_error();
+-        if err.kind() == std::io::ErrorKind::Interrupted {
+-          continue;
+-        }
+-
+-        return Err(err);
+-      }
+-      0 => {
+-        return Err(std::io::Error::new(
+-          std::io::ErrorKind::WriteZero,
+-          "write returned 0",
+-        ));
+-      }
+-      n => {
+-        remaining = &remaining[n as usize..];
+-      }
+-    }
+-  }
+-  Ok(())
+-}

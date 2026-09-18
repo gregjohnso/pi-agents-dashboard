@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { access, mkdtemp, mkdir, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { afterAll, expect, it } from "vitest";
@@ -61,6 +61,10 @@ it("ships one allowlisted standalone tarball without lifecycle, private, or deve
   expect(packed[0]).toMatchObject({ name: "pi-agents", version: "0.0.2" });
   expect(listing).toContain("package/bin/pi-agents.mjs");
   expect(listing).toContain("package/README.md");
+  // The owner pseudo-terminal is one module and one committed native artifact. Shipping the module without
+  // the artifact would fail at the first launch on an operator's machine, not here.
+  expect(listing).toContain("package/runtime/pty-mechanism.mjs");
+  expect(listing).toContain("package/vendor/pty/pi-agents-owner-pty-linux-x64-gnu.node");
   expect(productFiles.some((path) => /(?:^|\/)(?:test|tests|__snapshots__)(?:\/|$)|\.test\.|\.integration\.test\.|runtime\/test-fixtures\.mjs$/u.test(path))).toBe(false);
   expect(productFiles.some((path) => /(?:^|\/)(?:\.superpowers|\.vscode|\.cache|diagnostics|sessions|worktrees)(?:\/|$)/u.test(path))).toBe(false);
   expect(productFiles.some((path) => /(?:^|\/)(?:extensions|ui)(?:\/|$)/u.test(path))).toBe(false);
@@ -72,6 +76,10 @@ it("ships one allowlisted standalone tarball without lifecycle, private, or deve
   const manifest = JSON.parse(manifestText);
   expect(manifest.bin).toEqual({ "pi-agents": "./bin/pi-agents.mjs" });
   expect(manifest.pi).toBeUndefined();
+  // The owner-local management extension is allowlisted before it exists, because the release that adds it
+  // must not also have to change what ships.
+  expect(manifest.files).toContain("extension/*.mjs");
+  expect(manifest.files).toContain("vendor/pty/*.node");
   for (const lifecycle of ["preinstall", "install", "postinstall", "prepare", "prepublish", "prepack", "postpack"]) {
     expect(manifest.scripts?.[lifecycle]).toBeUndefined();
   }
@@ -95,4 +103,25 @@ it("starts package-relative code from a local install, a global install, and off
   expect(npxResult.stdout).toContain("pi-agents attach <full-session-id>");
   expect(localResult.stdout).toContain("pi-agents logs [<full-session-id>]");
   await Promise.all([local, global, offlineNpx].map(({ state }) => expect(access(state)).rejects.toMatchObject({ code: "ENOENT" })));
+}, 120_000);
+
+it("opens a real owner pseudo-terminal from an installed tarball, with no network fetch and no build step", async () => {
+  const installed = await journey("mechanism");
+  // Offline, scripts ignored, and a PATH holding only node and sh: an install that needed a compiler or a
+  // download for the native artifact cannot pass here.
+  await run(npm, ["install", "--global", "--prefix", installed.prefix, "--ignore-scripts", tarball], installed);
+  const mechanism = pathToFileURL(join(installed.prefix, "lib", "node_modules", "pi-agents", "runtime", "pty-mechanism.mjs")).href;
+  const probe = `
+    const { openOwnerPty } = await import(${JSON.stringify(mechanism)});
+    const handle = await openOwnerPty({ command: "/bin/sh", args: ["-c", "read line; exit 7"], env: { PATH: "/usr/bin:/bin" }, cwd: "/" });
+    const owner = handle.owner;
+    handle.write(new Uint8Array([0x0a]));
+    const exit = await handle.wait();
+    await handle.close();
+    process.stdout.write(JSON.stringify({ sessionLeader: owner.sessionId === owner.pid && owner.processGroupId === owner.pid, exit }));
+  `;
+
+  const result = await run(process.execPath, ["--input-type=module", "-e", probe], installed);
+
+  expect(JSON.parse(result.stdout)).toEqual({ sessionLeader: true, exit: { status: 1792, code: 7, signal: null, coreDumped: false } });
 }, 120_000);

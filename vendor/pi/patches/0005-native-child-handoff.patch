@@ -1,0 +1,622 @@
+diff --git a/packages/coding-agent/src/core/native-child-handoff.ts b/packages/coding-agent/src/core/native-child-handoff.ts
+new file mode 100644
+index 0000000..e750103
+--- /dev/null
++++ b/packages/coding-agent/src/core/native-child-handoff.ts
+@@ -0,0 +1,118 @@
++/**
++ * Seam G: the one child-terminal handoff Pi already recognizes.
++ *
++ * Pi's external editor takes this terminal for the length of an edit. Locally that is already modelled:
++ * seam E marks a recognized release, so a cold presentation refuses instead of painting over the child. A
++ * host that feeds Pi labelled bytes needs two more things around it — a boundary after which none of its
++ * clients' bytes enter Pi's parser, and a paired announcement of the transition.
++ *
++ * This module is that bracket and nothing else. It spawns nothing, parses nothing and knows nothing about
++ * editors: the caller supplies the child to run and the four terminal operations. With no registered host,
++ * or a host that has not opted into this build's seam G version, it runs exactly the sequence Pi ran before.
++ *
++ * Arbitrary extension children are still not covered, and a phase listener returning is local notification,
++ * never a host's acknowledgement that it changed its input route.
++ */
++
++import {
++	isChildTerminalHandoffActive,
++	type NativeInputDrainLease,
++	nextChildTerminalPhaseId,
++	notifyChildTerminalPhase,
++	type Terminal,
++} from "@earendil-works/pi-tui";
++
++/**
++ * One recognized handoff site. `T` is whatever the child produces; this module never inspects it.
++ *
++ * `stop` and `restore` are Pi's own renderer operations, in the caller's vocabulary: `restore` is the
++ * restoration *attempt*, and a throw from it means Pi did not get its terminal back cleanly.
++ */
++export type ChildTerminalHandoffSite<T> = {
++	/** The terminal the child inherits. Its drain is what makes a managed handoff possible. */
++	terminal: Terminal;
++	/** Seam E's recognized release, read live: a second managed handoff is refused while one is active. */
++	isReleased(): boolean;
++	release(): void;
++	reclaim(): void;
++	stop(): void;
++	restore(): void;
++	runChild(): Promise<T>;
++	applyResult(result: T): void;
++};
++
++export type ChildTerminalHandoffReport =
++	/** The child ran with no drain and no phase bracket: this is Pi's pinned path. */
++	| { entered: true; managed: false }
++	/** The child ran inside the drain and the announced bracket. */
++	| { entered: true; managed: true; childPhaseId: string; drainedThrough: number; outcome: "returned" }
++	/** A recognized release was already active: nothing was drained, announced, stopped or spawned. */
++	| { entered: false; refusal: "already-released" };
++
++function drainOf(terminal: Terminal): (() => Promise<NativeInputDrainLease>) | undefined {
++	const drain = terminal.drainNativeInput;
++	return typeof drain === "function" ? () => drain.call(terminal) : undefined;
++}
++
++/**
++ * Run one recognized child-terminal handoff.
++ *
++ * Managed order: drain to a boundary, mark seam E's recognized release, announce `entering`, stop the
++ * renderer, run the child. Then, in an outermost finalizer chain: attempt restoration, clear the release
++ * only after that attempt, announce exactly one matching `left`, and reopen admission last, so a listener,
++ * spawn, child, stop, start or render failure cannot strand the gate closed. A failed restoration reports
++ * `failed`: Pi never advertises a return it could not restore itself from.
++ *
++ * The child's own failure still propagates to the caller, exactly as it does in the pinned path.
++ */
++export async function bracketRecognizedChildTerminal<T>(
++	site: ChildTerminalHandoffSite<T>,
++): Promise<ChildTerminalHandoffReport> {
++	const drain = drainOf(site.terminal);
++	if (!isChildTerminalHandoffActive() || !drain) {
++		site.release();
++		site.stop();
++		try {
++			site.applyResult(await site.runChild());
++		} finally {
++			site.reclaim();
++			site.restore();
++		}
++		return { entered: true, managed: false };
++	}
++
++	if (site.isReleased()) return { entered: false, refusal: "already-released" };
++
++	// Awaited before anything is announced or spawned: the child starts only once every byte admitted
++	// before the barrier has been through Pi's parser and every response authorization has settled.
++	const lease = await drain();
++	site.release();
++	const childPhaseId = nextChildTerminalPhaseId();
++	let outcome: "returned" | "failed" = "failed";
++	try {
++		notifyChildTerminalPhase({
++			phase: "entering",
++			childPhaseId,
++			reason: "external-editor",
++			drainedThrough: lease.drainedThrough,
++		});
++		site.stop();
++		site.applyResult(await site.runChild());
++		outcome = "returned";
++	} finally {
++		try {
++			try {
++				site.restore();
++			} catch (error) {
++				outcome = "failed";
++				throw error;
++			} finally {
++				site.reclaim();
++				notifyChildTerminalPhase({ phase: "left", childPhaseId, reason: "external-editor", outcome });
++			}
++		} finally {
++			lease.reopen();
++		}
++	}
++	return { entered: true, managed: true, childPhaseId, drainedThrough: lease.drainedThrough, outcome: "returned" };
++}
+diff --git a/packages/coding-agent/src/index.ts b/packages/coding-agent/src/index.ts
+index b4a9b0f..2c589e5 100644
+--- a/packages/coding-agent/src/index.ts
++++ b/packages/coding-agent/src/index.ts
+@@ -232,6 +232,14 @@ export {
+ 	startNativeBootstrapChannel,
+ 	stopNativeBootstrapChannel,
+ } from "./core/native-bootstrap.ts";
++// Seam G: Pi's own bracket around the one child-terminal handoff it recognizes. A host subscribes with
++// `onChildTerminalPhase` from `@earendil-works/pi-tui`; this export exists so the bracket's real sequencing
++// is exercised through the installed package rather than through a copy of it.
++export {
++	bracketRecognizedChildTerminal,
++	type ChildTerminalHandoffReport,
++	type ChildTerminalHandoffSite,
++} from "./core/native-child-handoff.ts";
+ // Native presentation and readiness (seam E). A managed host consumes these; unmanaged Pi never calls them.
+ export {
+ 	type AttachmentEpoch,
+diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index 8e28e4a..2e4c448 100644
+--- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -84,6 +84,7 @@ import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/
+ import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
+ import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
+ import { createCompactionSummaryMessage } from "../../core/messages.ts";
++import { bracketRecognizedChildTerminal } from "../../core/native-child-handoff.ts";
+ import {
+ 	type NativePresentationProvider,
+ 	recordNativeReadiness,
+@@ -4613,23 +4614,26 @@ export class InteractiveMode {
+ 	private async handleOpenExternalEditor(): Promise<void> {
+ 		const editorCmd = this.settingsManager.getExternalEditorCommand();
+ 		const content = this.editor.getExpandedText?.() ?? this.editor.getText();
+-		// The child inherits this terminal. Mark the release before the renderer stops, so no presentation
+-		// can land in the window between the two.
+-		this.releaseTerminal("child", "external-editor");
+-		this.ui.stop();
+-		try {
+-			const result = await editInExternalEditor({
+-				command: editorCmd,
+-				content,
+-			});
+-			if (result.status === "complete") {
+-				this.editor.setText(result.content);
+-			}
+-		} finally {
+-			this.reclaimTerminal();
+-			this.ui.start();
+-			this.ui.requestRender(true);
+-		}
++		// Seam G brackets this recognized handoff. With no registered host, or a host that has not opted into
++		// this build's seam G version, the bracket runs Pi's pinned order: mark the release before the renderer
++		// stops, so no presentation can land in the window between the two, and restore in a finally.
++		await bracketRecognizedChildTerminal({
++			terminal: this.ui.terminal,
++			isReleased: () => this.terminalRelease !== undefined,
++			release: () => this.releaseTerminal("child", "external-editor"),
++			reclaim: () => this.reclaimTerminal(),
++			stop: () => this.ui.stop(),
++			restore: () => {
++				this.ui.start();
++				this.ui.requestRender(true);
++			},
++			runChild: () => editInExternalEditor({ command: editorCmd, content }),
++			applyResult: (result) => {
++				if (result.status === "complete") {
++					this.editor.setText(result.content);
++				}
++			},
++		});
+ 	}
+ 
+ 	// =========================================================================
+diff --git a/packages/tui/src/index.ts b/packages/tui/src/index.ts
+index 18ab400..7ed55b9 100644
+--- a/packages/tui/src/index.ts
++++ b/packages/tui/src/index.ts
+@@ -44,21 +44,29 @@ export {
+ } from "./components/v-stack.ts";
+ // Editor component interface (for custom editors)
+ export type { EditorComponent } from "./editor-component.ts";
+-// Native attachment seams B, C and F: labelled ingress, return authorization, terminal profile
++// Native attachment seams B, C, F and G: labelled ingress, return authorization, terminal profile, and the
++// versioned child-terminal handoff opt-in
+ export {
+ 	type AttachmentEpoch,
+ 	authorizeTerminalResponse,
++	type ChildTerminalHandoffOptIn,
++	type ChildTerminalPhase,
+ 	declaresReturnKey,
+ 	getNativeAttachmentHost,
+ 	getVirtualTerminalProfile,
++	isChildTerminalHandoffActive,
+ 	type NativeAttachmentHost,
+ 	type NativeAttachmentRegistration,
+ 	type NativeInputProvenance,
+ 	type NativeReturnRequest,
++	nextChildTerminalPhaseId,
++	notifyChildTerminalPhase,
++	onChildTerminalPhase,
+ 	registerNativeAttachmentHost,
+ 	type ReturnAuthorization,
+ 	type ReturnDisposition,
+ 	settleTerminalResponseAuthorizations,
++	SUPPORTED_CHILD_TERMINAL_HANDOFF_VERSION,
+ 	type TerminalResponseApplication,
+ 	type TerminalResponseKind,
+ 	type VirtualTerminalProfile,
+@@ -114,7 +122,15 @@ export {
+ 	type StdinSequenceOrigin,
+ } from "./stdin-buffer.ts";
+ // Terminal interface and implementations
+-export { type NativeInputDispatch, ProcessTerminal, type Terminal } from "./terminal.ts";
++export {
++	type NativeInputDispatch,
++	type NativeInputDispatchResult,
++	NativeInputDrainError,
++	type NativeInputDrainErrorCode,
++	type NativeInputDrainLease,
++	ProcessTerminal,
++	type Terminal,
++} from "./terminal.ts";
+ // Terminal colors
+ export {
+ 	parseOsc11BackgroundColor,
+diff --git a/packages/tui/src/native-attachment.ts b/packages/tui/src/native-attachment.ts
+index ade233d..47a4259 100644
+--- a/packages/tui/src/native-attachment.ts
++++ b/packages/tui/src/native-attachment.ts
+@@ -1,10 +1,12 @@
+ /**
+- * Native attachment seams B, C and F.
++ * Native attachment seams B, C, F and G.
+  *
+  * A host process can own the terminal that Pi renders into and let more than one authenticated client
+  * type into it. That needs three things Pi alone cannot supply: which client a byte span came from,
+  * whether a return key belongs to the focused component or to the host, and whether a terminal response
+- * from an unauthenticated byte stream may change Pi's negotiated capability state.
++ * from an unauthenticated byte stream may change Pi's negotiated capability state. Seam G adds a fourth,
++ * for the one handoff Pi already recognizes: an explicit, versioned opt-in under which Pi announces that a
++ * child process has the terminal, after its labelled admission is closed and drained.
+  *
+  * This module is interfaces and one process-wide registration. It holds no attachment registry, no
+  * ownership policy and no session state: Pi never learns who is attached, only which epoch a byte span
+@@ -100,10 +102,43 @@ export function declaresReturnKey(component: unknown, sequence: string): "owns"
+ 	return declare.call(component, sequence) === "free" ? "free" : "owns";
+ }
+ 
++/**
++ * The seam G opt-in version this build speaks.
++ *
++ * A host registered against seams B, C and F alone must not be opted into seam G by that registration: it
++ * has no drain, no reopen and no phase listener, so closing labelled admission for a handoff would strand
++ * its clients. The opt-in is therefore explicit and versioned, and a version this build does not speak is
++ * refused at registration rather than assumed compatible.
++ */
++export const SUPPORTED_CHILD_TERMINAL_HANDOFF_VERSION = 1;
++
++/** A host's explicit seam G opt-in. Absent means the host is not opted in, which is the default. */
++export type ChildTerminalHandoffOptIn = { version: number };
++
++/**
++ * One recognized child-terminal handoff, announced locally and synchronously.
++ *
++ * `entering` says only that Pi closed and drained its own labelled admission and that seam E's recognized
++ * release is active. It is not an acknowledgement that an out-of-process host changed its input route, and
++ * a listener returning is not delivery. `left` is emitted exactly once per `entering`, carrying the same
++ * `childPhaseId`, and `returned` is used only for a child that completed and a restoration attempt that did
++ * not throw.
++ */
++export type ChildTerminalPhase =
++	| { phase: "entering"; childPhaseId: string; reason: "external-editor"; drainedThrough: number }
++	| { phase: "left"; childPhaseId: string; reason: "external-editor"; outcome: "returned" | "failed" };
++
+ export interface NativeAttachmentHost {
+ 	/** Launch-fixed; the first registration decides it and a later differing profile is refused. */
+ 	profile: VirtualTerminalProfile;
+ 
++	/**
++	 * Seam G opt-in, additive and versioned. Absent means this host was built against seams B, C and F
++	 * alone: Pi keeps its pinned external-editor path, never closes labelled admission for a handoff, and
++	 * announces no child-terminal phase.
++	 */
++	childTerminalHandoff?: ChildTerminalHandoffOptIn;
++
+ 	/**
+ 	 * Evaluated synchronously inside the native input turn, after focus and overlay resolution. Called
+ 	 * only for a single-origin return that the focused component has declared free.
+@@ -157,6 +192,16 @@ type NativeAttachmentState = {
+ 	highestEpochByAttachment: Map<string, number>;
+ 	/** Every in-flight response authorization, whatever started it. `dispatchNativeInput` drains this. */
+ 	pendingAuthorizations: Set<Promise<void>>;
++	/**
++	 * Seam G's phase listeners and its phase counter.
++	 *
++	 * Both are optional and created on first use, so a container that a copy of this module without seam G
++	 * created is still usable and `NATIVE_ATTACHMENT_STATE_VERSION` stays 1. That is the additive rule: a
++	 * field an older copy simply never reads costs no version, and only a change that would make an older
++	 * copy read this container **wrongly** bumps the version.
++	 */
++	childTerminalPhaseListeners?: Set<(phase: ChildTerminalPhase) => void>;
++	childTerminalPhaseCounter?: number;
+ };
+ 
+ function isUsableState(candidate: unknown): candidate is NativeAttachmentState {
+@@ -227,6 +272,61 @@ export function isSupersededAttachmentEpoch(attachmentEpoch: AttachmentEpoch | n
+ 	return seen !== undefined && attachmentEpoch.epoch < seen;
+ }
+ 
++function childTerminalPhaseListeners(): Set<(phase: ChildTerminalPhase) => void> {
++	const state = nativeAttachmentState();
++	state.childTerminalPhaseListeners ??= new Set<(phase: ChildTerminalPhase) => void>();
++	return state.childTerminalPhaseListeners;
++}
++
++/**
++ * True only while a registered host has explicitly opted into this build's seam G version. A registration
++ * that predates seam G, and no registration at all, both answer false and keep Pi's pinned behavior.
++ */
++export function isChildTerminalHandoffActive(): boolean {
++	const host = nativeAttachmentState().host;
++	return host?.childTerminalHandoff?.version === SUPPORTED_CHILD_TERMINAL_HANDOFF_VERSION;
++}
++
++/**
++ * Subscribe to recognized child-terminal phases. Listeners run in registration order, synchronously with
++ * the local ownership transition; the returned unsubscribe is idempotent.
++ */
++export function onChildTerminalPhase(listener: (phase: ChildTerminalPhase) => void): () => void {
++	const listeners = childTerminalPhaseListeners();
++	listeners.add(listener);
++	return () => {
++		listeners.delete(listener);
++	};
++}
++
++/**
++ * Announce one phase, synchronously, to the listeners registered when the announcement starts.
++ *
++ * A listener that throws is reported as a process warning — this package has no logger of its own — and the
++ * remaining listeners still run: a listener may not suppress the paired event, the native editor path or the
++ * reopening of admission. Return values and promises are ignored, so a listener's completion is local
++ * notification and never host-route acknowledgement.
++ */
++export function notifyChildTerminalPhase(phase: ChildTerminalPhase): void {
++	for (const listener of [...childTerminalPhaseListeners()]) {
++		try {
++			listener(phase);
++		} catch (error) {
++			process.emitWarning(
++				`a child-terminal phase listener threw on ${phase.phase} ${phase.childPhaseId}: ${String(error)}`,
++			);
++		}
++	}
++}
++
++/** One monotonic id per handoff, unique for this process: the counter lives on the process container. */
++export function nextChildTerminalPhaseId(): string {
++	const state = nativeAttachmentState();
++	const next = (state.childTerminalPhaseCounter ?? 0) + 1;
++	state.childTerminalPhaseCounter = next;
++	return `child-phase-${next}`;
++}
++
+ function withTimeout<T>(decision: Promise<T>): Promise<T> {
+ 	return new Promise<T>((resolve, reject) => {
+ 		const timer = setTimeout(() => {
+@@ -311,6 +411,14 @@ function sameProfile(a: VirtualTerminalProfile, b: VirtualTerminalProfile): bool
+  */
+ export function registerNativeAttachmentHost(host: NativeAttachmentHost): NativeAttachmentRegistration {
+ 	const state = nativeAttachmentState();
++	const optIn = host.childTerminalHandoff;
++	if (optIn !== undefined && optIn.version !== SUPPORTED_CHILD_TERMINAL_HANDOFF_VERSION) {
++		throw new Error(
++			`this host declares child-terminal handoff version ${String(optIn.version)} and this copy of ` +
++				`@earendil-works/pi-tui speaks version ${SUPPORTED_CHILD_TERMINAL_HANDOFF_VERSION}. Seam G is refused ` +
++				`rather than assumed compatible; register without childTerminalHandoff to run on seams B, C and F alone.`,
++		);
++	}
+ 	if (state.launchProfile && !sameProfile(state.launchProfile, host.profile)) {
+ 		throw new Error(
+ 			`the virtual terminal profile is fixed at launch (${state.launchProfile.profileId}); ` +
+diff --git a/packages/tui/src/stdin-buffer.ts b/packages/tui/src/stdin-buffer.ts
+index 282842c..013d94e 100644
+--- a/packages/tui/src/stdin-buffer.ts
++++ b/packages/tui/src/stdin-buffer.ts
+@@ -586,6 +586,25 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
+ 		return sequences;
+ 	}
+ 
++	/**
++	 * Seam G: run the incomplete-sequence hold now instead of after its timer.
++	 *
++	 * Exactly what the timer callback does — the same `flush()`, the same emission path, the same origin
++	 * ledger — so a sequence released this way is indistinguishable from one the 50 ms (or escape) window
++	 * released, and nothing is fabricated, reclassified or dropped. Returns the number of characters emitted,
++	 * so a caller can report that the hold was empty. An unterminated bracketed paste is not one of the holds
++	 * this releases: it stays buffered, exactly as it does today.
++	 */
++	flushHeldSequenceNow(): number {
++		const flushed = this.flush();
++		let emitted = 0;
++		for (const sequence of flushed) {
++			this.emitDataSequence(sequence, this.bufferOrigins.take(sequence.length));
++			emitted += sequence.length;
++		}
++		return emitted;
++	}
++
+ 	clear(): void {
+ 		if (this.timeout) {
+ 			clearTimeout(this.timeout);
+diff --git a/packages/tui/src/terminal.ts b/packages/tui/src/terminal.ts
+index f1e6e98..8257c3a 100644
+--- a/packages/tui/src/terminal.ts
++++ b/packages/tui/src/terminal.ts
+@@ -97,6 +97,42 @@ export type NativeInputDispatch = {
+ 	binding: { generation: number };
+ };
+ 
++/**
++ * Whether one labelled dispatch was admitted into the ordered native path, and if not, why.
++ *
++ * `consumedThrough` is reported either way, so a rejected sender learns the boundary it must resume from.
++ * Rejected bytes are neither copied into Pi's queues nor counted: they stay the sender's to deliver.
++ */
++export type NativeInputDispatchResult =
++	| { admitted: true; consumedThrough: number }
++	| {
++			admitted: false;
++			consumedThrough: number;
++			reason: "stale-binding" | "superseded-attachment" | "handoff-closed";
++	  };
++
++/**
++ * One closed-admission lease, returned when a drain has completed. `reopen` is synchronous and idempotent,
++ * and only this lease can reopen the gate it closed, so a stale or duplicated call is a no-op.
++ */
++export type NativeInputDrainLease = {
++	readonly drainedThrough: number;
++	reopen(): void;
++};
++
++/** Why a drain was refused, as a named code rather than a message a caller has to match on. */
++export type NativeInputDrainErrorCode = "NATIVE_INPUT_DRAIN_ACTIVE" | "NATIVE_INPUT_NOT_STARTED";
++
++export class NativeInputDrainError extends Error {
++	readonly code: NativeInputDrainErrorCode;
++
++	constructor(code: NativeInputDrainErrorCode, message: string) {
++		super(message);
++		this.name = "NativeInputDrainError";
++		this.code = code;
++	}
++}
++
+ /**
+  * Minimal terminal interface for TUI
+  */
+@@ -108,7 +144,13 @@ export interface Terminal {
+ 	 * Seam B: admit labelled bytes from one client attachment into the ordered native input path.
+ 	 * Present only on a terminal a host owns; ordinary stdin needs no dispatch.
+ 	 */
+-	dispatchNativeInput?(input: NativeInputDispatch): Promise<{ consumedThrough: number }>;
++	dispatchNativeInput?(input: NativeInputDispatch): Promise<NativeInputDispatchResult>;
++
++	/**
++	 * Seam G: close labelled admission, force the native holds in dependency order, and settle every
++	 * response authorization those bytes started, before a child process is given this terminal.
++	 */
++	drainNativeInput?(): Promise<NativeInputDrainLease>;
+ 
+ 	// Stop the terminal and restore state
+ 	stop(): void;
+@@ -201,6 +243,12 @@ export class ProcessTerminal implements Terminal {
+ 	private consumedThrough = 0;
+ 	private bindingGeneration = 0;
+ 	private dispatchChain: Promise<void> = Promise.resolve();
++	/**
++	 * Seam G's admission gate. Routing state only: it is never a second terminal owner, and seam E's
++	 * recognized release stays the one state that says who holds the terminal.
++	 */
++	private admission: "open" | "draining" = "open";
++	private drainLease: NativeInputDrainLease | undefined;
+ 	/**
+ 	 * One ordered byte queue for every attachment, not one decoder each.
+ 	 *
+@@ -344,10 +392,11 @@ export class ProcessTerminal implements Terminal {
+ 	 * Dispatches are serialized, so the ordered native path sees byte spans in submission order and the
+ 	 * returned `consumedThrough` is monotonic. It counts bytes accepted into that path, and the promise
+ 	 * resolves only once every response authorization those bytes started has settled — that is the
+-	 * boundary seam G's drain refers to. A byte span that arrives on a stale binding generation or a
+-	 * superseded attachment epoch is admitted nowhere and leaves `consumedThrough` unchanged.
++	 * boundary seam G's drain refers to. A byte span that arrives on a stale binding generation, a
++	 * superseded attachment epoch, or after a seam G drain closed admission is admitted nowhere, leaves
++	 * `consumedThrough` unchanged, and says which of the three it was.
+ 	 */
+-	async dispatchNativeInput(input: NativeInputDispatch): Promise<{ consumedThrough: number }> {
++	async dispatchNativeInput(input: NativeInputDispatch): Promise<NativeInputDispatchResult> {
+ 		// Admission runs synchronously, before this dispatch waits for its turn. A reconnect has to be
+ 		// visible to a response authorization that is *already* awaiting a host decision: if the epoch were
+ 		// only noted inside the turn, it would sit behind that pending decision and the only thing left to
+@@ -355,11 +404,16 @@ export class ProcessTerminal implements Terminal {
+ 		if (!this.stdinBuffer) {
+ 			throw new Error("dispatchNativeInput requires a started terminal");
+ 		}
++		// The drain closes the gate synchronously, so this check alone decides which side of the barrier a
++		// dispatch is on: no byte span is ever split across it.
++		if (this.admission !== "open") {
++			return { admitted: false, consumedThrough: this.consumedThrough, reason: "handoff-closed" };
++		}
+ 		if (input.binding.generation < this.bindingGeneration) {
+-			return { consumedThrough: this.consumedThrough };
++			return { admitted: false, consumedThrough: this.consumedThrough, reason: "stale-binding" };
+ 		}
+ 		if (isSupersededAttachmentEpoch(input.attachmentEpoch)) {
+-			return { consumedThrough: this.consumedThrough };
++			return { admitted: false, consumedThrough: this.consumedThrough, reason: "superseded-attachment" };
+ 		}
+ 		const { attachmentId, epoch } = input.attachmentEpoch;
+ 		const generation = input.binding.generation;
+@@ -411,12 +465,73 @@ export class ProcessTerminal implements Terminal {
+ 				this.stdinBuffer?.processWithOrigins(decoded.text, decoded.origins);
+ 			}
+ 			await settleTerminalResponseAuthorizations();
+-			return { consumedThrough };
++			return { admitted: true, consumedThrough };
+ 		} finally {
+ 			releaseTurn();
+ 		}
+ 	}
+ 
++	/**
++	 * Seam G: close labelled admission, force every native hold, and settle response authorization, so a
++	 * child process that is about to inherit this terminal cannot receive a client's half-parsed gesture.
++	 *
++	 * Admission closes synchronously, before the first await, and the returned lease's `drainedThrough` is
++	 * the accepted-byte counter at exactly that barrier. The drain itself takes one turn on the existing
++	 * dispatch chain, so it waits for the dispatches admitted before the barrier and for nothing else: it
++	 * never waits on asynchronous work that the currently dispatched key started, which is what makes it
++	 * safe to call from an input handler.
++	 *
++	 * The three forced holds run in dependency order, because each can populate the next: the incomplete
++	 * UTF-8 tail decodes into `StdinBuffer`, whose held sequence can classify as a split response fragment.
++	 * Each uses the path its timer would have used, so nothing is fabricated, discarded or reclassified.
++	 */
++	async drainNativeInput(): Promise<NativeInputDrainLease> {
++		if (!this.stdinBuffer) {
++			throw new NativeInputDrainError(
++				"NATIVE_INPUT_NOT_STARTED",
++				"drainNativeInput requires a started terminal",
++			);
++		}
++		if (this.admission !== "open") {
++			throw new NativeInputDrainError(
++				"NATIVE_INPUT_DRAIN_ACTIVE",
++				"labelled admission is already closed by an active drain; reopen that lease before draining again",
++			);
++		}
++		this.admission = "draining";
++		const drainedThrough = this.consumedThrough;
++
++		const previous = this.dispatchChain;
++		let releaseTurn: () => void = () => {};
++		this.dispatchChain = new Promise<void>((resolve) => {
++			releaseTurn = resolve;
++		});
++		try {
++			await previous;
++			this.flushIncompleteInputBytes();
++			this.stdinBuffer.flushHeldSequenceNow();
++			this.flushKeyboardProtocolNegotiationBufferAsInput();
++			await settleTerminalResponseAuthorizations();
++		} catch (error) {
++			// No lease exists yet, so nothing else could reopen the gate this call closed.
++			this.admission = "open";
++			throw error;
++		} finally {
++			releaseTurn();
++		}
++
++		const lease: NativeInputDrainLease = {
++			drainedThrough,
++			reopen: () => {
++				if (this.drainLease !== lease) return;
++				this.drainLease = undefined;
++				this.admission = "open";
++			},
++		};
++		this.drainLease = lease;
++		return lease;
++	}
++
+ 	/**
+ 	 * Decode the queued bytes as they stand, truncated codepoint included, and hand them on. Node turns
+ 	 * the unfinished tail into U+FFFD, which is the honest outcome: those bytes were a real gesture from a

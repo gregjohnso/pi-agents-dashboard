@@ -14,7 +14,9 @@ import {
 const identity = { initialRowId: "row-1", runId: "run-1", ownerPid: 4321, ownerStartIdentity: "18446744073709551615", hostId: "host-1", bootId: "b6f1e3c2-0000-4000-8000-000000000001" };
 const hostBinding = { currentRowId: "row-2", canonicalFile: "/sessions/2026-09-17-a.jsonl", device: "2049", inode: "918273", generation: 3 };
 const nativeBinding = { canonicalFile: "/sessions/2026-09-17-a.jsonl", generation: 3 };
-const digest = "a".repeat(64);
+const attachmentBytes = new Uint8Array([1, 2, 3]);
+// The actual SHA-256 of those three bytes, written out so the fixture does not borrow the validator's own digest.
+const digest = "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81";
 const envelope = { submissionId: "sub-1", ownerRunId: "run-1", binding: nativeBinding, source: "native-editor", intent: "prompt", originalText: "  ship it  ", behavior: "idle", draftRevision: 7 };
 const operation = { operationId: "op-1", operation: "fork", currentBinding: nativeBinding, resolvedTarget: { canonicalFile: "/sessions/2026-09-17-b.jsonl" } };
 
@@ -42,8 +44,11 @@ it("validates the minimal seam A binding separately from host registry metadata"
   expect(parseNativeSubmitBinding({ canonicalFile: undefined, generation: 0 })).toEqual({ canonicalFile: undefined, generation: 0 });
   expect(parseNativeSubmitBinding({ ...nativeBinding })).toEqual(nativeBinding);
   for (const extra of [{ currentRowId: "row-2" }, { device: "2049" }, { inode: "918273" }]) expect(() => parseNativeSubmitBinding({ ...nativeBinding, ...extra }), `binding with ${Object.keys(extra)[0]}`).toThrow(/unknown/iu);
+  // A disposed owner is rebound to undefined, which advances the generation: that state is reachable and valid.
+  expect(parseNativeSubmitBinding({ canonicalFile: undefined, generation: 4 })).toEqual({ canonicalFile: undefined, generation: 4 });
   expect(() => parseNativeSubmitBinding({ generation: 0 })).toThrow(/canonicalFile/u);
-  expect(() => parseNativeSubmitBinding({ canonicalFile: undefined, generation: 2 })).toThrow(/generation/u);
+  expect(() => parseNativeSubmitBinding({ canonicalFile: undefined, generation: -1 })).toThrow(/generation/u);
+  expect(() => parseNativeSubmitBinding({ canonicalFile: undefined, generation: 1.5 })).toThrow(/generation/u);
   expect(() => parseNativeSubmitBinding({ canonicalFile: "sessions/a.jsonl", generation: 1 })).toThrow(/canonicalFile/u);
 });
 
@@ -60,7 +65,7 @@ it("issues strictly increasing attachment epochs and refuses an unusable or exha
 
 it("accepts a submission envelope with content-addressed attachments and refuses a described count", () => {
   expect(parseSubmissionEnvelope({ ...envelope })).toEqual(envelope);
-  const attachments = [{ kind: "image", mediaType: "image/png", byteLength: 3, sha256: digest, bytes: new Uint8Array([1, 2, 3]) }];
+  const attachments = [{ kind: "image", mediaType: "image/png", byteLength: 3, sha256: digest, bytes: attachmentBytes }];
   expect(parseSubmissionEnvelope({ ...envelope, attachments, parentSubmissionId: "sub-0" }).attachments).toEqual(attachments);
   expect(parseSubmissionEnvelope({ ...envelope, originalText: "" }).originalText).toBe("");
   for (const key of ["originalText", "draftRevision", "binding", "source", "intent", "behavior"]) {
@@ -70,8 +75,11 @@ it("accepts a submission envelope with content-addressed attachments and refuses
   }
   expect(() => parseSubmissionEnvelope({ ...envelope, attachments: 1 })).toThrow(/attachments/u);
   expect(() => parseSubmissionEnvelope({ ...envelope, attachments: [{ kind: "image", mediaType: "image/png" }] })).toThrow(/byteLength/u);
-  expect(() => parseSubmissionEnvelope({ ...envelope, attachments: [{ kind: "image", mediaType: "image/png", byteLength: 3, sha256: "A".repeat(64) }] })).toThrow(/sha256/u);
+  expect(() => parseSubmissionEnvelope({ ...envelope, attachments: [{ kind: "image", mediaType: "image/png", byteLength: 3, sha256: "A".repeat(64), bytes: attachmentBytes }] })).toThrow(/sha256/u);
+  expect(() => parseSubmissionEnvelope({ ...envelope, attachments: [{ kind: "image", mediaType: "image/png", byteLength: 3, sha256: digest }] })).toThrow(/bytes/u);
+  expect(() => parseSubmissionEnvelope({ ...envelope, attachments: [{ ...attachments[0], sha256: "a".repeat(64) }] })).toThrow(/sha256/u);
   expect(() => parseSubmissionEnvelope({ ...envelope, attachments: [{ ...attachments[0], bytes: new Uint8Array([1]) }] })).toThrow(/bytes/u);
+  expect(() => parseSubmissionEnvelope({ ...envelope, attachments: [{ ...attachments[0], bytes: [1, 2, 3] }] })).toThrow(/bytes/u);
   expect(() => parseSubmissionEnvelope({ ...envelope, source: "dashboard" })).toThrow(/source/u);
   expect(() => parseSubmissionEnvelope({ ...envelope, intent: "compact" })).toThrow(/intent/u);
   expect(() => parseSubmissionEnvelope({ ...envelope, attachmentOrigin: { attachmentId: "attachment-1", epoch: 1 } })).toThrow(/unknown/iu);
@@ -94,4 +102,15 @@ it("reports only the seam versions an owner genuinely reported", () => {
   expect(readSeamVersions({ A: 1, D: 2 })).toEqual({ A: 1, D: 2 });
   expect(readSeamVersions({ A: 1, B: 0, C: -1, D: 1.5, E: "1", F: null, Z: 9 })).toEqual({ A: 1 });
   expect(() => readSeamVersions("A=1")).toThrow(/seam versions/u);
+});
+
+it("does not report a seam version inherited from Object.prototype as one the owner reported", () => {
+  Object.defineProperty(Object.prototype, "A", { value: 9, configurable: true, writable: true });
+  try {
+    expect(readSeamVersions({})).toEqual({});
+    expect(readSeamVersions({ D: 2 })).toEqual({ D: 2 });
+    expect(readSeamVersions({ A: 1 })).toEqual({ A: 1 });
+  } finally {
+    Reflect.deleteProperty(Object.prototype, "A");
+  }
 });

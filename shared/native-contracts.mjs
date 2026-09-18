@@ -23,13 +23,15 @@
  * opaque identifier this project only ever compares for equality.
  */
 
+import { createHash } from "node:crypto";
+
 /** @typedef {{initialRowId:string,runId:string,ownerPid:number,ownerStartIdentity:string,hostId:string,bootId:string}} OwnerRunIdentity */
 /** @typedef {{currentRowId:string,canonicalFile:string,device:string,inode:string,generation:number}} CanonicalBinding */
 /** @typedef {{canonicalFile:string|undefined,generation:number}} NativeSubmitBinding */
 /** @typedef {{attachmentId:string,epoch:number}} AttachmentEpoch */
 /** @typedef {"native-editor"|"native-followup"|"native-steer"|"compaction-queue"|"builtin-command"|"extension-command"|"startup-prompt"|"extension-api"} SubmissionSource */
 /** @typedef {"prompt"|"steer"|"follow_up"|"command"} SubmissionIntent */
-/** @typedef {{kind:"image"|"file",mediaType:string,byteLength:number,sha256:string,bytes?:Uint8Array}} SubmissionAttachment */
+/** @typedef {{kind:"image"|"file",mediaType:string,byteLength:number,sha256:string,bytes:Uint8Array}} SubmissionAttachment */
 /** @typedef {{submissionId:string,ownerRunId:string,binding:NativeSubmitBinding,source:SubmissionSource,intent:SubmissionIntent,originalText:string,attachments?:SubmissionAttachment[],behavior:"idle"|"streaming",draftRevision:number,parentSubmissionId?:string}} SubmissionEnvelope */
 /** @typedef {"startup"|"new"|"fork"|"resume"|"import"|"rename"|"delete"} CanonicalOperationKind */
 /** @typedef {{operationId:string,operation:CanonicalOperationKind,currentBinding:NativeSubmitBinding,resolvedTarget:{canonicalFile:string}}} CanonicalOperation */
@@ -117,8 +119,9 @@ export function parseCanonicalBinding(value) {
 /**
  * The minimal binding Pi publishes at seams A and D, and the only binding a native callback carries.
  *
- * `canonicalFile` is present and `undefined` before the owner's first save; that state is generation 0,
- * because the first bind to a file is itself an increment.
+ * `canonicalFile` is present and `undefined` whenever no owner session is bound — before the first save,
+ * and again after a bound owner is disposed. The generation advances on every change of the canonical
+ * value, so an undefined file at a positive generation is a state the fixed implementation reaches.
  * @param {unknown} value @returns {NativeSubmitBinding}
  */
 export function parseNativeSubmitBinding(value) {
@@ -126,7 +129,6 @@ export function parseNativeSubmitBinding(value) {
   exact(binding, ["canonicalFile", "generation"], [], "native submit binding");
   if (binding.canonicalFile !== undefined) canonicalFilePath(binding.canonicalFile, "native submit binding.canonicalFile");
   counter(binding.generation, "native submit binding.generation", 0);
-  if (binding.canonicalFile === undefined && binding.generation !== 0) throw new TypeError("native submit binding.generation must be 0 until a canonical file is bound");
   return /** @type {NativeSubmitBinding} */ (binding);
 }
 
@@ -155,28 +157,32 @@ export function nextAttachmentEpoch(attachmentId, previous) {
   return { attachmentId, epoch: current.epoch + 1 };
 }
 
-/** @param {unknown} value @param {string} path @returns {SubmissionAttachment} */
+/**
+ * One attachment as seam A carries it: the actual bytes plus descriptors that describe those bytes.
+ *
+ * The digest is recomputed rather than trusted. A descriptor whose `sha256` names other content would let
+ * a host persist one blob under another blob's address, which is the one thing content addressing is for.
+ * @param {unknown} value @param {string} path @returns {SubmissionAttachment}
+ */
 function submissionAttachment(value, path) {
   const attachment = record(value, path);
-  exact(attachment, ["kind", "mediaType", "byteLength", "sha256"], ["bytes"], path);
+  exact(attachment, ["kind", "mediaType", "byteLength", "sha256", "bytes"], [], path);
   enumeration(attachment.kind, ["image", "file"], `${path}.kind`);
   identifier(attachment.mediaType, `${path}.mediaType`);
   counter(attachment.byteLength, `${path}.byteLength`, 0);
   contentDigest(attachment.sha256, `${path}.sha256`);
-  if (Object.hasOwn(attachment, "bytes")) {
-    if (!(attachment.bytes instanceof Uint8Array)) throw new TypeError(`${path}.bytes must be a Uint8Array`);
-    if (attachment.bytes.byteLength !== attachment.byteLength) throw new TypeError(`${path}.bytes length does not match ${path}.byteLength`);
-  }
+  if (!(attachment.bytes instanceof Uint8Array)) throw new TypeError(`${path}.bytes must be a Uint8Array`);
+  if (attachment.bytes.byteLength !== attachment.byteLength) throw new TypeError(`${path}.bytes length does not match ${path}.byteLength`);
+  if (createHash("sha256").update(attachment.bytes).digest("hex") !== attachment.sha256) throw new TypeError(`${path}.sha256 is not the digest of ${path}.bytes`);
   return /** @type {SubmissionAttachment} */ (attachment);
 }
 
 /**
  * One native submission, as seam A hands it to the host before any semantic mutation.
  *
- * An attachment is content-addressed: a count or a descriptor without `sha256` and `byteLength` is
- * refused, because the host must be able to name and persist the blob it authorized. `bytes` is optional
- * only in the sense that a host reading back its own record no longer carries the buffer; Pi supplies it.
- * `originalText` may be empty or untrimmed — it is the text before every transform, which is the point.
+ * An attachment is content-addressed: a count, or a descriptor without the bytes it addresses, is refused,
+ * because the host must be able to persist the very blob it authorized. `originalText` may be empty or
+ * untrimmed — it is the text before every transform, which is the point.
  * @param {unknown} value @returns {SubmissionEnvelope}
  */
 export function parseSubmissionEnvelope(value) {
@@ -222,7 +228,8 @@ export function parseCanonicalOperation(value) {
  *
  * This is the one reader here that filters instead of refusing: the table is a foreign report forwarded
  * verbatim, so an unknown seam name or an unusable value is dropped rather than turned into a failure of
- * the owner that reported it. An absent table is no report at all, which is `{}`.
+ * the owner that reported it. An absent table is no report at all, which is `{}`. A name the table only
+ * inherits was never reported, so an own key is required before the value is read.
  * @param {unknown} reported @returns {Record<string, number>}
  */
 export function readSeamVersions(reported) {
@@ -230,6 +237,10 @@ export function readSeamVersions(reported) {
   const table = record(reported, "seam versions");
   /** @type {Record<string, number>} */
   const versions = {};
-  for (const name of SEAM_NAMES) if (Number.isSafeInteger(table[name]) && table[name] > 0) versions[name] = table[name];
+  for (const name of SEAM_NAMES) {
+    if (!Object.hasOwn(table, name)) continue;
+    const version = table[name];
+    if (Number.isSafeInteger(version) && version > 0) versions[name] = version;
+  }
   return versions;
 }

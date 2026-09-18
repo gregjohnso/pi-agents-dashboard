@@ -1,0 +1,22 @@
+{
+  "manifestVersion": 1,
+  "name": "driver-acceptance-negative",
+  "description": "Deliberately red cases that prove the driver's own failure rules. Both entries are expected to FAIL; this manifest is the driver's acceptance evidence, never part of a suite step. Its probes are *.experiment.mjs, so no default suite ever collects them.",
+  "cases": [
+    {
+      "id": "deliberate-failure",
+      "kind": "test",
+      "config": "vitest.experiment.config.ts",
+      "file": "test/slurm/deliberate-failure.experiment.mjs",
+      "command": ["npx", "--no-install", "vitest", "run", "--config", "vitest.experiment.config.ts", "test/slurm/deliberate-failure.experiment.mjs", "--no-cache"]
+    },
+    {
+      "id": "default-config-collects-no-probe",
+      "kind": "test",
+      "config": "vitest.config.ts",
+      "file": "test/slurm/collection-probe.experiment.mjs",
+      "passWithNoTests": true,
+      "command": ["npx", "--no-install", "vitest", "run", "--config", "vitest.config.ts", "test/slurm/collection-probe.experiment.mjs", "--no-cache", "--passWithNoTests"]
+    }
+  ]
+}

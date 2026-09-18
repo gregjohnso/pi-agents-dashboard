@@ -1,0 +1,33 @@
+{
+  "manifestVersion": 1,
+  "name": "repository-suite",
+  "description": "The repository checks this milestone runs on a worker: one hand-authored entry per independently reviewable case. Every path is repository-relative and every command is rebuilt and compared by the driver before submission.",
+  "cases": [
+    {
+      "id": "unit-process-ledger",
+      "kind": "test",
+      "config": "vitest.config.ts",
+      "file": "test/process-ledger.test.mjs",
+      "command": ["npx", "--no-install", "vitest", "run", "--config", "vitest.config.ts", "test/process-ledger.test.mjs", "--no-cache"]
+    },
+    {
+      "id": "experiment-collection-probe",
+      "kind": "test",
+      "config": "vitest.experiment.config.ts",
+      "file": "test/slurm/collection-probe.experiment.mjs",
+      "command": ["npx", "--no-install", "vitest", "run", "--config", "vitest.experiment.config.ts", "test/slurm/collection-probe.experiment.mjs", "--no-cache"]
+    },
+    {
+      "id": "typecheck",
+      "kind": "typecheck",
+      "task": "typecheck",
+      "command": ["typecheck"]
+    },
+    {
+      "id": "package",
+      "kind": "package",
+      "task": "pack-check",
+      "command": ["pack-check"]
+    }
+  ]
+}

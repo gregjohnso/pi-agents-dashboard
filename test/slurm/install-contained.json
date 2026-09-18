@@ -1,0 +1,13 @@
+{
+  "manifestVersion": 1,
+  "name": "contained-install",
+  "description": "The driver's install-kind acceptance. One exact pin is installed into the case's own disposable install root, never into the repository's node_modules; the artifact rule then verifies that exact version. assertion-error@2.0.1 is already in package-lock.json, so the pin is a version this repository already resolves.",
+  "cases": [
+    {
+      "id": "contained-install",
+      "kind": "install",
+      "packages": ["assertion-error@2.0.1"],
+      "command": ["npm", "install", "--prefix", "{caseDirectory}/install-root", "--no-audit", "--no-fund", "--save-exact", "--omit=dev", "assertion-error@2.0.1"]
+    }
+  ]
+}

@@ -7,23 +7,28 @@
  * can be pointed at the unpatched pinned 0.84.3 install to record behavioral RED against the real native
  * pipeline.
  *
- * `PI_NATIVE_ARTIFACTS_MANIFEST` names that manifest. It is required rather than defaulted to a path inside
- * the repository, because a manifest holds absolute paths into one machine's disposable build output: a
- * committed copy would point every later run at a stale build. Without the variable these cases say which
- * manifest they need instead of silently driving whatever was left behind.
+ * `PI_NATIVE_ARTIFACTS_MANIFEST` names that manifest, and nothing else does. There is no path these cases
+ * guess, because a manifest holds absolute paths into one machine's disposable build output: a leftover copy
+ * would point every later run at a stale build. Without the variable these cases say which manifest they
+ * need instead of silently driving whatever was left behind, and with an unusable one they fail rather than
+ * skip.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 
-const HERE = path.dirname(new URL(import.meta.url).pathname);
-const LEGACY_MANIFEST = path.join(HERE, "artifacts-manifest.json");
-
-/** The manifest this run drives: `PI_NATIVE_ARTIFACTS_MANIFEST`, or a local uncommitted one. */
+/** The manifest this run drives. There is no default path: an unset or empty selection throws. */
 export function artifactsManifestPath() {
 	const selected = process.env.PI_NATIVE_ARTIFACTS_MANIFEST;
-	return selected ? path.resolve(selected) : LEGACY_MANIFEST;
+	if (selected === undefined || selected.trim().length === 0) {
+		throw new Error(
+			"PI_NATIVE_ARTIFACTS_MANIFEST names the artifacts manifest these cases drive, and it is unset or " +
+				"empty. There is no default: build the cohort, write a manifest with " +
+				"test/fixtures/native-ingress/write-artifacts-manifest.mjs, and name it.",
+		);
+	}
+	return path.resolve(selected);
 }
 
 export function loadArtifactsManifest() {
@@ -60,9 +65,9 @@ export async function importBuiltTui() {
 	return { tui, manifest, packageVersion: pkg.version };
 }
 
-/** True when a built cohort is selected for this run, either by the variable or by a local manifest. */
+/** True when this run names a cohort at all. Only an absent variable counts as no selection. */
 export function artifactsManifestSelected() {
-	return Boolean(process.env.PI_NATIVE_ARTIFACTS_MANIFEST) || existsSync(LEGACY_MANIFEST);
+	return process.env.PI_NATIVE_ARTIFACTS_MANIFEST !== undefined;
 }
 
 /**

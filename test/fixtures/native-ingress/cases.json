@@ -1,7 +1,7 @@
 {
   "manifestVersion": 1,
   "name": "native-ingress-lane",
-  "description": "Input lane (seams B/C/F) cases. Both test files drive the built native pipeline named by test/fixtures/native-ingress/artifacts-manifest.json, so the same two cases record behavioral RED against the unpatched pinned 0.84.3 install and GREEN against the patched cohort. Typecheck and package are the repository's own checks against the patched worktree.",
+  "description": "Input lane (seams B/C/F) cases. Both test files drive the built native pipeline named by PI_NATIVE_ARTIFACTS_MANIFEST, so the same two cases record behavioral RED against the unpatched pinned 0.84.3 install and GREEN against the patched cohort. Typecheck and package are the repository's own checks against the patched worktree.",
   "cases": [
     {
       "id": "native-ingress",

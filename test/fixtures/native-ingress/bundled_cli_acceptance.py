@@ -10,8 +10,8 @@ It drives the already-built cohort named by the artifacts manifest and never bui
 anything. Inputs, all resolved from this file's own repository or from the environment, so nothing is
 machine-local here:
 
-  PI_NATIVE_ARTIFACTS_MANIFEST  the manifest written by `write-artifacts-manifest.mjs` (defaults to the
-                                uncommitted `artifacts-manifest.json` beside this file)
+  PI_NATIVE_ARTIFACTS_MANIFEST  the manifest written by `write-artifacts-manifest.mjs`; required, with no
+                                default, so a leftover manifest can never drive an older build
   PI_NATIVE_NODE                the Node binary the cases run (defaults to `node` on PATH, and the measured
                                 version is recorded in every case record)
   --attempt-root <directory>    where the evidence for this attempt is written; it must not already exist
@@ -53,8 +53,6 @@ import submitit
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 PRELOAD = REPOSITORY / "test/fixtures/native-ingress/bundled-cli-host-preload.mjs"
-DEFAULT_MANIFEST = REPOSITORY / "test/fixtures/native-ingress/artifacts-manifest.json"
-MANIFEST = Path(os.environ.get("PI_NATIVE_ARTIFACTS_MANIFEST") or DEFAULT_MANIFEST)
 NODE = Path(os.environ.get("PI_NATIVE_NODE") or shutil.which("node") or "node")
 
 sys.path.insert(0, str(REPOSITORY / "test/slurm"))
@@ -76,6 +74,31 @@ CASES = [
     {"id": "descendant-cleanup-control", "kind": "cleanup-control"},
 ]
 SURVIVOR_LIFETIME_SECONDS = 600
+
+
+def load_artifacts_manifest() -> tuple[Path, dict]:
+    """The cohort this run drives, from `PI_NATIVE_ARTIFACTS_MANIFEST` alone. There is no default path.
+
+    A manifest holds absolute paths into one machine's disposable build output, so a guessed one would drive
+    whatever build was left behind. An unset variable, and an empty, unreadable or malformed selection, all
+    fail here — before anything is submitted.
+    """
+    selected = os.environ.get("PI_NATIVE_ARTIFACTS_MANIFEST", "")
+    if not selected.strip():
+        raise SystemExit(
+            "PI_NATIVE_ARTIFACTS_MANIFEST names the artifacts manifest this driver drives, and it is unset or "
+            "empty. There is no default: build the cohort, write a manifest with "
+            "test/fixtures/native-ingress/write-artifacts-manifest.mjs, and name it."
+        )
+    path = Path(selected).resolve()
+    try:
+        manifest = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"{path} is not a usable artifacts manifest: {error}") from error
+    root = manifest.get("tuiPackageRoot")
+    if not isinstance(root, str) or not root:
+        raise SystemExit(f'{path} is missing a usable "tuiPackageRoot"')
+    return path, manifest
 
 
 def fsync_json(path: Path, payload: dict) -> None:
@@ -495,7 +518,7 @@ def main() -> int:
     parser.add_argument("--label", default="bundled-cli", help="name recorded in the SLURM job names")
     parsed = parser.parse_args()
 
-    manifest = json.loads(MANIFEST.read_text())
+    manifest_path, manifest = load_artifacts_manifest()
     tui_package_root = Path(manifest["tuiPackageRoot"])
     consumer_root = manifest.get("consumerRoot") or str(tui_package_root.parents[2])
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -517,7 +540,7 @@ def main() -> int:
     intent = {
         "purpose": "bundled CLI acceptance with full PTY retention, terminal accounting and descendant cleanup",
         "attemptRoot": str(attempt),
-        "artifactsManifestFile": str(MANIFEST),
+        "artifactsManifestFile": str(manifest_path),
         "artifactsManifest": manifest,
         "nodeBinary": str(NODE),
         "consumerRoot": consumer_root,

@@ -148,6 +148,26 @@ both be satisfied by one installed tree, so a repeated package name fails valida
 and the artifact rule checks each pin against the installed version individually rather than accepting a
 name that matched some declared pin.
 
+## The routine suite and the pinned-build qualification gate
+
+`vitest.config.ts` collects every `*.test.{ts,mjs}` **except**
+`vendor/pi/pinned-source-build.integration.test.mjs`, and `vitest.qualification.config.ts` collects exactly
+that one file. The split is about the feedback loop, not about coverage: measured on worker `3744358`, that
+single case took 198.9s of a 207.2s full run, because it prepares the locked upstream commit, builds the Pi
+cohort and installs a fresh consumer on every run.
+
+```bash
+# routine suite, everything but the build gate
+env -u PIXI_PROJECT_MANIFEST pixi run --manifest-path <repo>/pixi.toml --frozen -- npx --no-install vitest run --no-cache
+
+# the build gate, opt in, on a worker; it skips anywhere else because the case requires SLURM_JOB_ID
+env -u PIXI_PROJECT_MANIFEST pixi run --manifest-path <repo>/pixi.toml --frozen -- npm run test:qualification
+```
+
+A change under `vendor/pi` has to pass the gate; it is not part of the ordinary loop. The gate's config is
+not in this driver's approved-config allowlist, so it runs under `srun` like the full suite does, with
+`PI_FOUNDATION_OUTPUT_ROOT` set to a durable disposable root so the build it makes stays attributable.
+
 ## Expected-red probes
 
 `*.experiment.mjs` files are collected only by `vitest.experiment.config.ts`, which differs from

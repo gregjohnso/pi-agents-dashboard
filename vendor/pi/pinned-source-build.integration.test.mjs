@@ -3,7 +3,10 @@
 // test the installed bundled CLI, the public exports and which TUI the installed coding-agent resolves.
 //
 // This case fetches from the network and takes minutes, so it is an `*.integration.test.mjs` (outside
-// `npm run test:unit`) and it refuses to run anywhere but a Slurm worker: the milestone forbids builds
+// `npm run test:unit`), `vitest.config.ts` excludes it from the routine suite, and it is collected only by
+// `vitest.qualification.config.ts` — `npm run test:qualification`. Measured on worker 3744358 it was 198.9s
+// of a 207.2s full run on its own, which is why the ordinary loop opts out and a `vendor/pi` change opts in.
+// It refuses to run anywhere but a Slurm worker: the milestone forbids builds
 // and installs on the head node. Its output root is `PI_FOUNDATION_OUTPUT_ROOT`, or `TMPDIR`, which the
 // repository's Slurm driver points at the case directory; either way it must be outside the repository,
 // because a live upstream tree inside it would be collectable by the default Vitest suite.

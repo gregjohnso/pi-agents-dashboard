@@ -1998,6 +1998,20 @@ async function adoptedCrashWorker(sessionId) {
   return { stateRoot, registry, runtime, loop, identity, piChild, exitPiChild() { piChildLive = false; } };
 }
 
+// Operator-visible failure: a worker from a build before the durable terminal cause sends the same
+// authenticated crash frame and publishes no file. Refusing that frame drops the route and leaves the
+// row reading LIVE with a dead Pi until the next daemon start.
+it("records a Pi child crash from an adopted worker that publishes no durable cause", async () => {
+  const live = await adoptedCrashWorker("legacy");
+
+  live.exitPiChild();
+  await live.loop.sendEvent({ type: "PI_CHILD_CRASHED", at: "2026-08-25T12:01:00.000Z", summary: "Pi exited unexpectedly (SIGSEGV)" });
+
+  await vi.waitFor(async () => expect(await live.registry.get("legacy")).toMatchObject({ taskState: "FAILED", processState: "EXITED", activity: { kind: "process_error", summary: "Pi exited unexpectedly (SIGSEGV)" } }), { timeout: 5_000, interval: 25 });
+  expect(live.loop.connectionCount).toBe(1);
+  expect(live.loop.alive).toBe(true);
+});
+
 // Operator-visible failure: a forged or stale run file must not attribute a crash to a different Pi
 // child. A cause record that exists and does not validate stays refused, absent one or not.
 it("refuses a Pi child crash whose durable cause names another Pi child", async () => {

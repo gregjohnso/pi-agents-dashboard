@@ -1,0 +1,3056 @@
+diff --git a/packages/coding-agent/src/core/extensions/loader.ts b/packages/coding-agent/src/core/extensions/loader.ts
+index 36df2da21611720001660e5107eb531c6101faed..7f4939418412e3a595e093bc5eced878cc7ea66a 100644
+--- a/packages/coding-agent/src/core/extensions/loader.ts
++++ b/packages/coding-agent/src/core/extensions/loader.ts
+@@ -28,6 +28,14 @@ import * as _bundledPiCodingAgent from "../../index.ts";
+ import { resolvePath } from "../../utils/paths.ts";
+ import { createEventBus, type EventBus } from "../event-bus.ts";
+ import type { ExecOptions } from "../exec.ts";
++import {
++	nativeReadinessSnapshot,
++	onNativeReadiness,
++	presentTerminal,
++	type PresentTerminalRequest,
++	type PresentTerminalResult,
++	type ReadinessRecord,
++} from "../native-presentation.ts";
+ import { execCommand } from "../exec.ts";
+ import { readPiManifest } from "../pi-manifest.ts";
+ import { createSyntheticSourceInfo } from "../source-info.ts";
+@@ -456,6 +464,25 @@ function createExtensionAPI(
+ 				return unsubscribe;
+ 			},
+ 		},
++
++		// Native presentation and readiness (seam E). Process-wide facts about the native UI, not per
++		// extension state, so they delegate straight to the core ledger and provider.
++		onNativeReadiness(listener: (readiness: ReadinessRecord) => void): () => void {
++			assertActive();
++			const unsubscribe = onNativeReadiness(listener);
++			if (state === "loading") loadingUnsubscribers.push(unsubscribe);
++			return unsubscribe;
++		},
++
++		nativeReadinessSnapshot(): { reached: ReadinessRecord[] } {
++			assertActive();
++			return nativeReadinessSnapshot();
++		},
++
++		presentTerminal(request: PresentTerminalRequest): Promise<PresentTerminalResult> {
++			assertActive();
++			return presentTerminal(request);
++		},
+ 	} as ExtensionAPI;
+ 
+ 	return {
+diff --git a/packages/coding-agent/src/core/extensions/types.ts b/packages/coding-agent/src/core/extensions/types.ts
+index bade46419510aba601991b4be2a7790b52694d0b..90c2cfd41074f863a9b0e7dc969d9e4c17228833 100644
+--- a/packages/coding-agent/src/core/extensions/types.ts
++++ b/packages/coding-agent/src/core/extensions/types.ts
+@@ -55,6 +55,11 @@ import type { KeybindingsManager } from "../keybindings.ts";
+ import type { CustomMessage } from "../messages.ts";
+ import type { ModelRegistry } from "../model-registry.ts";
+ import type { ScopedModel } from "../model-resolver.ts";
++import type {
++	PresentTerminalRequest,
++	PresentTerminalResult,
++	ReadinessRecord,
++} from "../native-presentation.ts";
+ import type {
+ 	BranchSummaryEntry,
+ 	CompactionEntry,
+@@ -1278,6 +1283,28 @@ export interface ExtensionAPI {
+ 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): void;
+ 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): void;
+ 
++	// =========================================================================
++	// Native presentation and readiness (seam E)
++	// =========================================================================
++
++	/**
++	 * Subscribe to native readiness phases recorded from now on. Returns an unsubscribe.
++	 *
++	 * An extension registers during `session_start`, which is after the TUI mounted, so it will not receive
++	 * `native-mounted` as an event. Read {@link nativeReadinessSnapshot} for the phases already reached.
++	 */
++	onNativeReadiness(listener: (readiness: ReadinessRecord) => void): () => void;
++
++	/** The readiness phases already reached, for a registrant that arrived after them. */
++	nativeReadinessSnapshot(): { reached: ReadinessRecord[] };
++
++	/**
++	 * Bring one attachment's terminal up to the current native UI and return a receipt naming the complete
++	 * frame that was handed to the terminal. Refuses, without painting, while a recognised handoff or
++	 * suspension holds the terminal.
++	 */
++	presentTerminal(request: PresentTerminalRequest): Promise<PresentTerminalResult>;
++
+ 	// =========================================================================
+ 	// Tool Registration
+ 	// =========================================================================
+diff --git a/packages/coding-agent/src/core/native-bootstrap.ts b/packages/coding-agent/src/core/native-bootstrap.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e86bbfbccdc07ac05cb26117f24ed3dfea5f0c87
+--- /dev/null
++++ b/packages/coding-agent/src/core/native-bootstrap.ts
+@@ -0,0 +1,481 @@
++/**
++ * Seam E core bootstrap: the launch-time readiness sideband, opened before any extension is loaded.
++ *
++ * The snapshot route in `native-presentation.ts` answers a *registrant* that arrives late. It cannot answer
++ * a host at all when an arbitrary extension's `session_start` handler never resolves, because the
++ * management extension behind it never registers. Extensions are not a supported bootstrap route for a
++ * launch-time fact.
++ *
++ * This channel is opened by `main()` before extension modules are loaded, before the TUI mounts and before
++ * any `session_start` handler exists. The host creates a unix-domain listener, passes its path in
++ * `PI_NATIVE_BOOTSTRAP_SOCKET`, and launches Pi; Pi connects out and streams readiness records as they are
++ * recorded. Nothing an extension does can hide or delay them.
++ *
++ * The channel carries exactly two things: readiness records, and presentation requests for the terminal Pi
++ * already owns. It is not a session manager, not a transport for input, and not an RPC surface: those are
++ * other seams' work and are deliberately absent.
++ *
++ * Failure is reported, never thrown. A host that is not listening, a stale socket path or a closed peer
++ * leaves Pi running exactly as an unmanaged Pi runs; {@link nativeBootstrapStatus} names what happened.
++ *
++ * The inbound side is bounded and fail-closed. A command is one newline-terminated JSON object of at most
++ * {@link NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES} bytes, carrying `protocol: 1` and exactly the fields
++ * {@link NativeBootstrapCommand} names; anything else is answered with one `error` frame and acted on in no
++ * other way. Input that never terminates a frame within the bound, or a frame larger than it, closes the
++ * channel instead of growing a retained string. The bound is measured on the **raw** frame the peer sent,
++ * newline and whitespace included, before anything is trimmed, normalized or parsed: padding a command out
++ * with whitespace must not buy a peer bytes Pi promised not to accept. A breach closes admission before the
++ * refusal is flushed, so neither a frame already buffered behind the breach nor one arriving on a later data
++ * event can reach `presentTerminal`. Nothing crossing this boundary is cast: each field is validated and
++ * copied, so a host cannot reach `presentTerminal` with a value it did not declare.
++ */
++
++import * as net from "node:net";
++import {
++	NATIVE_PRESENTATION_CAPABILITY,
++	nativeReadiness,
++	nativeReadinessSnapshot,
++	presentTerminal,
++	type PresentTerminalRequest,
++	type PresentTerminalResult,
++	type ReadinessRecord,
++} from "./native-presentation.ts";
++
++/** The environment variable a host sets to the path of the unix-domain listener it already created. */
++export const NATIVE_BOOTSTRAP_SOCKET_ENV = "PI_NATIVE_BOOTSTRAP_SOCKET";
++
++export const NATIVE_BOOTSTRAP_PROTOCOL = 1;
++
++/**
++ * The largest inbound command frame this channel accepts, in bytes, newline included.
++ *
++ * A presentation request is a few hundred bytes. The bound exists so a peer cannot make Pi retain an
++ * unbounded string: input that passes it without terminating a frame is refused and the channel closes.
++ */
++export const NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES = 8192;
++
++/** Bounds on the two host-supplied identifiers Pi echoes back. */
++const MAX_REQUEST_ID_LENGTH = 200;
++const MAX_ATTACHMENT_ID_LENGTH = 200;
++
++/** Pi to host. */
++export type NativeBootstrapFrame =
++	/** Sent once, immediately on connection, before anything else. */
++	| {
++			type: "native-bootstrap";
++			protocol: typeof NATIVE_BOOTSTRAP_PROTOCOL;
++			pid: number;
++			capability: typeof NATIVE_PRESENTATION_CAPABILITY;
++			/** Phases already reached when the channel opened. Empty at launch, non-empty on a late open. */
++			reached: ReadinessRecord[];
++	  }
++	/** One per phase, as it is recorded. */
++	| { type: "native-readiness"; protocol: typeof NATIVE_BOOTSTRAP_PROTOCOL; readiness: ReadinessRecord }
++	| {
++			type: "presentation-result";
++			protocol: typeof NATIVE_BOOTSTRAP_PROTOCOL;
++			requestId: string;
++			result: PresentTerminalResult;
++	  }
++	/**
++	 * One refusal, for one inbound frame Pi did not act on: unparseable, not an object, another protocol
++	 * version, an unsupported command, a field that is missing or not the declared type, a frame past the
++	 * byte bound, or a presentation that threw. `requestId` is echoed when the host supplied a usable one.
++	 */
++	| { type: "error"; protocol: typeof NATIVE_BOOTSTRAP_PROTOCOL; requestId: string | undefined; error: string };
++
++/**
++ * Host to Pi. The only command. `requestId` is the host's own correlation id and is echoed on the reply.
++ *
++ * `protocol` is required inbound as well as outbound: a host built against a later channel must be refused
++ * by version rather than partially understood by field.
++ */
++export type NativeBootstrapCommand = {
++	type: "present";
++	protocol: typeof NATIVE_BOOTSTRAP_PROTOCOL;
++	requestId: string;
++} & PresentTerminalRequest;
++
++export type NativeBootstrapState = "unconfigured" | "connecting" | "open" | "closed" | "failed";
++
++export type NativeBootstrapStatus = {
++	state: NativeBootstrapState;
++	socketPath: string | undefined;
++	/** Frames Pi has handed to the socket, so a test or a host can tell silence from a lost connection. */
++	framesSent: number;
++	lastError: string | undefined;
++};
++
++/**
++ * The channel lives on the process, for the same reason the ledger does: the bundled CLI inlines its
++ * dependencies, so a second copy of this module must find the channel that is already open rather than open a
++ * second socket and report `unconfigured`. Same rules — a version on the record, reuse instead of reset, and a
++ * clear refusal when an existing record is one this build cannot speak to.
++ */
++const NATIVE_BOOTSTRAP_STATE = Symbol.for("@earendil-works/pi-coding-agent/native-bootstrap-state");
++export const NATIVE_BOOTSTRAP_STATE_VERSION = 1;
++
++type NativeBootstrapChannel = {
++	version: number;
++	socket: net.Socket | undefined;
++	unsubscribe: (() => void) | undefined;
++	state: NativeBootstrapState;
++	socketPath: string | undefined;
++	framesSent: number;
++	lastError: string | undefined;
++	inbound: string;
++	/** The hello is the first frame on the socket. Nothing else is written before it. */
++	helloSent: boolean;
++	/** Readiness recorded before the hello. Delivered after it, and only what the hello did not carry. */
++	pendingReadiness: ReadinessRecord[];
++	/** Every readiness `sequence` already written or carried in the hello, so no record is sent twice. */
++	deliveredReadiness: Set<number>;
++};
++
++function isUsableChannel(candidate: unknown): candidate is NativeBootstrapChannel {
++	const record = candidate as Partial<NativeBootstrapChannel> | undefined;
++	return (
++		record?.version === NATIVE_BOOTSTRAP_STATE_VERSION &&
++		typeof record.state === "string" &&
++		typeof record.framesSent === "number" &&
++		typeof record.inbound === "string" &&
++		typeof record.helloSent === "boolean" &&
++		Array.isArray(record.pendingReadiness) &&
++		record.deliveredReadiness instanceof Set
++	);
++}
++
++function channel(): NativeBootstrapChannel {
++	const carrier = globalThis as Record<PropertyKey, unknown>;
++	const existing = carrier[NATIVE_BOOTSTRAP_STATE];
++	if (existing !== undefined) {
++		if (!isUsableChannel(existing)) {
++			const found = (existing as { version?: unknown })?.version;
++			throw new Error(
++				`native bootstrap state version ${String(found)} is already on this process and this build speaks ` +
++					`version ${NATIVE_BOOTSTRAP_STATE_VERSION}. Two incompatible Pi builds are loaded in one process; ` +
++					`load one, or upgrade the older one. The existing channel is left open and untouched.`,
++			);
++		}
++		return existing;
++	}
++	const created: NativeBootstrapChannel = {
++		version: NATIVE_BOOTSTRAP_STATE_VERSION,
++		socket: undefined,
++		unsubscribe: undefined,
++		state: "unconfigured",
++		socketPath: undefined,
++		framesSent: 0,
++		lastError: undefined,
++		inbound: "",
++		helloSent: false,
++		pendingReadiness: [],
++		deliveredReadiness: new Set(),
++	};
++	carrier[NATIVE_BOOTSTRAP_STATE] = created;
++	return created;
++}
++
++/** Write one frame. The hello goes through this directly; everything else goes through {@link send}. */
++function writeFrame(frame: NativeBootstrapFrame): void {
++	const open = channel();
++	if (!open.socket || open.socket.destroyed) return;
++	// Ordered by the socket itself. `write` returning false means the kernel buffer is full and the bytes
++	// were still accepted, so nothing is resent.
++	open.socket.write(`${JSON.stringify(frame)}\n`);
++	open.framesSent += 1;
++}
++
++/**
++ * Every frame except the hello.
++ *
++ * A socket accepts writes while it is still connecting, so readiness recorded between
++ * {@link startNativeBootstrapChannel} and the connection would otherwise reach the host *before* the hello
++ * that is supposed to open the stream. Such a record waits here instead and is delivered once, after the
++ * hello, if the hello's own snapshot did not already carry it. Frames that only exist as an answer to an
++ * inbound command cannot arrive this early, and are dropped rather than queued.
++ */
++function send(frame: NativeBootstrapFrame): void {
++	const open = channel();
++	if (!open.helloSent) {
++		if (frame.type === "native-readiness") open.pendingReadiness.push(frame.readiness);
++		return;
++	}
++	if (frame.type === "native-readiness") {
++		if (open.deliveredReadiness.has(frame.readiness.sequence)) return;
++		open.deliveredReadiness.add(frame.readiness.sequence);
++	}
++	writeFrame(frame);
++}
++
++function errorFrame(requestId: string | undefined, error: string): NativeBootstrapFrame {
++	return { type: "error", protocol: NATIVE_BOOTSTRAP_PROTOCOL, requestId, error };
++}
++
++function describe(value: unknown): string {
++	if (value === null) return "null";
++	if (Array.isArray(value)) return "array";
++	if (value instanceof Error) return value.message;
++	if (typeof value === "object") return "object";
++	return JSON.stringify(value) ?? typeof value;
++}
++
++/** Why a frame was refused, and the request id to echo when the host supplied a usable one. */
++type CommandRejection = { refused: string; requestId: string | undefined };
++
++function boundedString(value: unknown, limit: number): string | undefined {
++	return typeof value === "string" && value.length > 0 && value.length <= limit ? value : undefined;
++}
++
++/** A count or revision: finite, integral, not negative. `NaN`, `Infinity` and `1.5` are none of those. */
++function boundedInteger(value: unknown): number | undefined {
++	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
++}
++
++/**
++ * Validate one inbound frame and copy the fields it declares.
++ *
++ * Nothing is cast: the returned command carries only validated values, so no host-supplied shape reaches
++ * `presentTerminal`. `protocol` is checked before `type`, because a frame from another version of this
++ * channel must be refused by version rather than by the field names this version happens to know.
++ */
++function validateCommand(value: unknown): NativeBootstrapCommand | CommandRejection {
++	if (typeof value !== "object" || value === null || Array.isArray(value)) {
++		return { refused: `command must be a JSON object, received ${describe(value)}`, requestId: undefined };
++	}
++	const frame = value as Record<string, unknown>;
++	// Echoed only when the host's own correlation id is a usable bounded string.
++	const requestId = boundedString(frame.requestId, MAX_REQUEST_ID_LENGTH);
++	if (frame.protocol !== NATIVE_BOOTSTRAP_PROTOCOL) {
++		return {
++			refused: `unsupported protocol ${describe(frame.protocol)}; this channel speaks protocol ${NATIVE_BOOTSTRAP_PROTOCOL}`,
++			requestId,
++		};
++	}
++	if (frame.type !== "present") {
++		return { refused: `unsupported command: ${describe(frame.type)}`, requestId };
++	}
++	if (requestId === undefined) {
++		return {
++			refused: `requestId must be a string of 1 to ${MAX_REQUEST_ID_LENGTH} characters`,
++			requestId: undefined,
++		};
++	}
++	const epoch = frame.attachmentEpoch;
++	if (typeof epoch !== "object" || epoch === null || Array.isArray(epoch)) {
++		return { refused: `attachmentEpoch must be an object, received ${describe(epoch)}`, requestId };
++	}
++	const attachment = epoch as Record<string, unknown>;
++	const attachmentId = boundedString(attachment.attachmentId, MAX_ATTACHMENT_ID_LENGTH);
++	const epochNumber = boundedInteger(attachment.epoch);
++	if (attachmentId === undefined || epochNumber === undefined) {
++		return {
++			refused: `attachmentEpoch needs an attachmentId of 1 to ${MAX_ATTACHMENT_ID_LENGTH} characters and a whole epoch, received ${describe(attachment.attachmentId)} and ${describe(attachment.epoch)}`,
++			requestId,
++		};
++	}
++	const geometryRevision = boundedInteger(frame.geometryRevision);
++	if (geometryRevision === undefined) {
++		return { refused: `geometryRevision must be a whole number, received ${describe(frame.geometryRevision)}`, requestId };
++	}
++	if (typeof frame.coldTerminal !== "boolean") {
++		return { refused: `coldTerminal must be a boolean, received ${describe(frame.coldTerminal)}`, requestId };
++	}
++	return {
++		type: "present",
++		protocol: NATIVE_BOOTSTRAP_PROTOCOL,
++		requestId,
++		attachmentEpoch: { attachmentId, epoch: epochNumber },
++		geometryRevision,
++		coldTerminal: frame.coldTerminal,
++	};
++}
++
++async function handleCommand(line: string): Promise<void> {
++	let parsed: unknown;
++	try {
++		parsed = JSON.parse(line);
++	} catch (error) {
++		send(errorFrame(undefined, `unparseable command: ${error instanceof Error ? error.message : String(error)}`));
++		return;
++	}
++	const command = validateCommand(parsed);
++	if ("refused" in command) {
++		send(errorFrame(command.requestId, command.refused));
++		return;
++	}
++	let result: PresentTerminalResult;
++	try {
++		result = await presentTerminal({
++			attachmentEpoch: command.attachmentEpoch,
++			geometryRevision: command.geometryRevision,
++			coldTerminal: command.coldTerminal,
++		});
++	} catch (error) {
++		// A renderer or a host-registered provider can throw. The host asked, so the host is told, and the
++		// channel stays open: a failed presentation is not a reason to drop readiness reporting.
++		send(errorFrame(command.requestId, `presentation failed: ${describe(error)}`));
++		return;
++	}
++	send({ type: "presentation-result", protocol: NATIVE_BOOTSTRAP_PROTOCOL, requestId: command.requestId, result });
++}
++
++/**
++ * Fail closed: shut admission, then name the breach on the socket and close it.
++ *
++ * Admission closes **first**, and on the socket itself, not only on this record. A `data` listener is already
++ * registered and may be called again before the FIN is seen; clearing the record alone would leave it free to
++ * parse the next frame and call `presentTerminal` after the breach. Reads are paused, the listener is removed
++ * and the socket stops being this channel's, so {@link readCommands} refuses anything that still arrives on
++ * it. The refusal is written while the socket is still ours, so the last thing this channel does is answer.
++ */
++function refuseAndClose(message: string): void {
++	const open = channel();
++	const socket = open.socket;
++	socket?.pause();
++	socket?.removeAllListeners("data");
++	send(errorFrame(undefined, message));
++	open.lastError = message;
++	open.unsubscribe?.();
++	open.unsubscribe = undefined;
++	open.inbound = "";
++	// `end` flushes the error frame and then sends FIN; `destroy` could discard it.
++	socket?.end();
++	open.socket = undefined;
++	open.state = "closed";
++}
++
++/**
++ * Read whatever arrived on `source`, which must still be this channel's socket.
++ *
++ * The identity check is the admission gate: a breach sets `open.socket` to `undefined`, so a `data` event
++ * that was already in flight on the closed socket — or one from a socket a previous channel left behind —
++ * buffers nothing, parses nothing and reaches no provider.
++ */
++function readCommands(source: net.Socket, chunk: string): void {
++	const open = channel();
++	if (open.socket !== source) return;
++	open.inbound += chunk;
++	for (;;) {
++		if (open.socket !== source) return;
++		const newline = open.inbound.indexOf("\n");
++		if (newline === -1) {
++			if (Buffer.byteLength(open.inbound) > NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES) {
++				refuseAndClose(
++					`command exceeded ${NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES} bytes with no newline; the channel is closed`,
++				);
++			}
++			return;
++		}
++		// The raw frame the peer sent, newline included, measured before anything is trimmed or parsed: the
++		// bound is on what crossed the socket, not on what survives normalization. Whitespace padding a large
++		// command down under the bound is exactly the bypass this order closes.
++		const frame = open.inbound.slice(0, newline + 1);
++		const frameBytes = Buffer.byteLength(frame);
++		open.inbound = open.inbound.slice(newline + 1);
++		if (frameBytes > NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES) {
++			refuseAndClose(
++				`command of ${frameBytes} bytes exceeds the ${NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES} byte bound; the channel is closed`,
++			);
++			return;
++		}
++		const line = frame.trim();
++		if (!line) continue;
++		// Never discarded: a rejection here is the host's answer, not a silent unhandled rejection.
++		handleCommand(line).catch((error: unknown) => {
++			send(errorFrame(undefined, `command handling failed: ${describe(error)}`));
++		});
++	}
++}
++
++/**
++ * Open the sideband if the host configured one. Idempotent, and safe to call before anything else exists.
++ *
++ * Called from `main()` before extensions are loaded. The subscription is installed before the connection is
++ * attempted, so no phase recorded during the connect can be missed; the hello is still the first frame on
++ * the socket, and a phase recorded before it is carried in the hello's snapshot rather than written ahead
++ * of it.
++ */
++export function startNativeBootstrapChannel(): NativeBootstrapStatus {
++	const open = channel();
++	// Reused, never reset: a second copy of this module finds the channel that is already open.
++	if (open.socket) return nativeBootstrapStatus();
++	open.framesSent = 0;
++	open.lastError = undefined;
++	open.helloSent = false;
++	open.pendingReadiness = [];
++	open.deliveredReadiness = new Set();
++	open.inbound = "";
++	const configured = process.env[NATIVE_BOOTSTRAP_SOCKET_ENV];
++	if (!configured) {
++		open.state = "unconfigured";
++		open.socketPath = undefined;
++		return nativeBootstrapStatus();
++	}
++	open.socketPath = configured;
++	open.state = "connecting";
++	// Subscribed before connecting, so there is no window in which a phase is recorded and no one is
++	// listening. Records that arrive before the hello queue in `send` and are delivered after it, once.
++	open.unsubscribe = nativeReadiness().subscribe((readiness) => {
++		send({ type: "native-readiness", protocol: NATIVE_BOOTSTRAP_PROTOCOL, readiness });
++	});
++	const connection = net.connect(configured);
++	open.socket = connection;
++	// A sideband must not keep Pi alive, and must not crash it either.
++	connection.unref();
++	connection.setEncoding("utf8");
++	connection.on("connect", () => {
++		open.state = "open";
++		const reached = nativeReadinessSnapshot().reached;
++		// The hello, first, before any readiness frame.
++		writeFrame({
++			type: "native-bootstrap",
++			protocol: NATIVE_BOOTSTRAP_PROTOCOL,
++			pid: process.pid,
++			capability: NATIVE_PRESENTATION_CAPABILITY,
++			reached,
++		});
++		open.helloSent = true;
++		// Whatever the snapshot carried is delivered; it is not repeated as an event.
++		for (const entry of reached) open.deliveredReadiness.add(entry.sequence);
++		const queued = open.pendingReadiness;
++		open.pendingReadiness = [];
++		for (const readiness of queued) {
++			send({ type: "native-readiness", protocol: NATIVE_BOOTSTRAP_PROTOCOL, readiness });
++		}
++	});
++	connection.on("data", (chunk: Buffer | string) => {
++		readCommands(connection, typeof chunk === "string" ? chunk : chunk.toString("utf8"));
++	});
++	connection.on("error", (error: Error) => {
++		open.state = "failed";
++		open.lastError = error.message;
++	});
++	connection.on("close", () => {
++		if (open.state !== "failed") open.state = "closed";
++	});
++	return nativeBootstrapStatus();
++}
++
++export function stopNativeBootstrapChannel(): void {
++	const open = channel();
++	open.unsubscribe?.();
++	open.unsubscribe = undefined;
++	open.socket?.destroy();
++	open.socket = undefined;
++	open.inbound = "";
++	open.helloSent = false;
++	open.pendingReadiness = [];
++	open.deliveredReadiness = new Set();
++	if (open.state !== "failed") open.state = open.socketPath ? "closed" : "unconfigured";
++}
++
++export function nativeBootstrapStatus(): NativeBootstrapStatus {
++	const open = channel();
++	return {
++		state: open.state,
++		socketPath: open.socketPath,
++		framesSent: open.framesSent,
++		lastError: open.lastError,
++	};
++}
+diff --git a/packages/coding-agent/src/core/native-presentation.ts b/packages/coding-agent/src/core/native-presentation.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..218fd7474879e6af46911ba3c4a5a1fc25431772
+--- /dev/null
++++ b/packages/coding-agent/src/core/native-presentation.ts
+@@ -0,0 +1,368 @@
++/**
++ * Seam E: cold presentation and readiness, for a host that owns the terminal Pi runs on.
++ *
++ * Two facts a host cannot get from any 0.84.3 surface live here.
++ *
++ * **Presentation.** A terminal that attaches after startup is cold: it has none of the modes Pi emitted
++ * and none of the image state Pi believes it uploaded. `presentTerminal` reasserts what the renderer owns,
++ * drops the per-terminal image transmission cache, renders one complete frame, and returns a nonce naming
++ * that frame and the geometry it was built at. The nonce means *handed to the terminal*: the bytes were
++ * written to the terminal Pi holds. It is not a client display acknowledgement — proving a client
++ * displayed a frame requires the client to echo the nonce back over the host's own transport, which is
++ * the host's work and is deliberately not modelled here.
++ *
++ * **Readiness.** `native-mounted`, `initialized` and `first-paint` are three separate facts, in no fixed
++ * relation to each other beyond `native-mounted` preceding the rest. Output and input flow from
++ * `native-mounted`, which is why nothing here waits for `initialized`: a blocking `session_start` dialog
++ * needs an attached terminal to answer it. A registrant that arrives after a phase reads it from
++ * {@link nativeReadinessSnapshot} instead of waiting for an event that will not come again.
++ *
++ * The snapshot answers a late *registrant*. It cannot answer a host whose management extension is queued
++ * behind an arbitrary `session_start` handler that never resolves, so the launch-time route is the core
++ * bootstrap sideband in `native-bootstrap.ts`, opened by `main()` before any extension is loaded.
++ *
++ * Nothing in this module holds ledger state, ownership policy, attachment policy or session management.
++ * Those stay in the host.
++ */
++
++import type { PresentationOutcome, PresentationRequest } from "@earendil-works/pi-tui";
++
++/** One attachment's identity and epoch. An epoch strictly increases and is never reused. */
++export type AttachmentEpoch = { attachmentId: string; epoch: number };
++
++/** The host's own geometry revision. Pi echoes it back; only the host can order its own revisions. */
++export type GeometryRevision = number;
++
++export type Readiness =
++	/** The TUI has started. Startup input and output flow from here, before extensions are loaded. */
++	| { phase: "native-mounted" }
++	/** `init()` resolved: extensions loaded and any blocking startup dialog answered. */
++	| { phase: "initialized" }
++	/** One complete frame has been handed to the terminal. */
++	| { phase: "first-paint"; presentationNonce: string };
++
++export type ReadinessPhase = Readiness["phase"];
++
++/** A recorded phase. `sequence` orders phases without implying which phase precedes which. */
++export type ReadinessRecord = Readiness & { sequence: number; atMs: number };
++
++export type PresentTerminalRequest = {
++	attachmentEpoch: AttachmentEpoch;
++	geometryRevision: GeometryRevision;
++	coldTerminal: boolean;
++};
++
++/** Why Pi presented nothing. Each value names a real state; none of them fakes a repaint. */
++export type PresentationRefusal =
++	/** A recognised handoff has given the terminal to a child process. */
++	| "child-owns-terminal"
++	/** A recognised suspension has given the terminal back to the shell. */
++	| "suspended"
++	/** No renderer has mounted yet, or the renderer has stopped. */
++	| "no-native-renderer"
++	/** The active renderer hands the terminal incremental fragments and mints no complete-frame receipt. */
++	| "no-complete-frame-support";
++
++export type PresentTerminalResult =
++	| {
++			presented: true;
++			terminalOwner: "pi";
++			presentationNonce: string;
++			frame: { frameId: string; sequence: number; columns: number; rows: number; byteLength: number };
++			/** The revision the host asked for, echoed. Compare it with `frame.columns`/`frame.rows`. */
++			geometryRevision: GeometryRevision;
++			attachmentEpoch: AttachmentEpoch;
++			cold: boolean;
++			coldReassertion: ColdPresentationReassertion | undefined;
++	  }
++	| {
++			presented: false;
++			/**
++			 * `child` for a recognised handoff to a child process; `suspended` when the shell has the
++			 * terminal; `pi` when Pi holds it but the active renderer cannot produce a complete frame.
++			 *
++			 * Deliberately wider than the design document's `'pi' | 'child'`: that pair cannot express the
++			 * recognised Ctrl+Z suspension, in which neither Pi nor a child owns the terminal.
++			 */
++			terminalOwner: "pi" | "child" | "suspended" | "none";
++			presentationNonce: null;
++			refusal: PresentationRefusal;
++			/** A child-owned terminal's current state cannot be acknowledged from inside Pi. */
++			childAcknowledgement: "unavailable" | "not-applicable";
++			reason: string;
++			attachmentEpoch: AttachmentEpoch;
++			geometryRevision: GeometryRevision;
++	  };
++
++/** What a cold presentation reasserted, re-exported in the host's own vocabulary. */
++export type ColdPresentationReassertion = {
++	terminalModesReemitted: string[];
++	rendererModesReemitted: string[];
++	/**
++	 * The negotiated Kitty keyboard flags Pi reasserted for the cold terminal, or undefined when the
++	 * protocol is not active. Reasserted with the set-flags form, so the terminal's mode stack is untouched
++	 * and the host owes nothing here.
++	 */
++	kittyKeyboardFlagsReemitted: number | undefined;
++	colorSchemeNotifications: boolean;
++	imageProtocol: "kitty" | "iterm2" | null;
++	invalidatedImageIds: number[];
++};
++
++/** Why Pi is not currently the terminal's owner, when it is not. */
++export type TerminalRelease = {
++	owner: "child" | "suspended";
++	/** A recognised release site. Arbitrary extension children are not covered; seam G is. */
++	reason: "external-editor" | "suspend";
++	sinceMs: number;
++};
++
++/** The renderer-facing half of seam E. `InteractiveMode` registers one while it holds a renderer. */
++export interface NativePresentationProvider {
++	present(request: PresentationRequest): PresentationOutcome;
++	/** Undefined while Pi holds the terminal. */
++	release(): TerminalRelease | undefined;
++}
++
++/**
++ * The readiness ledger.
++ *
++ * A phase is recorded once. Subscribers are notified of phases recorded after they subscribe; everything
++ * already reached is read from {@link snapshot}, so a late registrant never waits for a missed event and
++ * never receives a phase twice.
++ */
++export class NativeReadinessLedger {
++	private reached: ReadinessRecord[] = [];
++	private listeners = new Set<(record: ReadinessRecord) => void>();
++	private sequence = 0;
++
++	record(readiness: Readiness): ReadinessRecord | undefined {
++		if (this.reached.some((entry) => entry.phase === readiness.phase)) return undefined;
++		const entry = { ...readiness, sequence: ++this.sequence, atMs: Date.now() } as ReadinessRecord;
++		this.reached.push(entry);
++		for (const listener of this.listeners) listener(entry);
++		return entry;
++	}
++
++	snapshot(): { reached: ReadinessRecord[] } {
++		return { reached: [...this.reached] };
++	}
++
++	reachedPhase(phase: ReadinessPhase): ReadinessRecord | undefined {
++		return this.reached.find((entry) => entry.phase === phase);
++	}
++
++	subscribe(listener: (record: ReadinessRecord) => void): () => void {
++		this.listeners.add(listener);
++		return () => {
++			this.listeners.delete(listener);
++		};
++	}
++}
++
++/**
++ * Seam E's readiness ledger and presentation provider live on the process, not on this module.
++ *
++ * The bundled CLI inlines its dependencies, so a supported caller that imports the installed public module
++ * while the agent is running from the bundle holds a **different copy of this module**. A module-scoped
++ * singleton would give that caller an empty ledger and no provider, and it would report both as if that were
++ * the truth. One process hosts one native UI, so one record describes it, reached through a registered symbol
++ * that every copy resolves to the same way.
++ *
++ * Rules, in order: the record carries its own `version`; an existing record is **reused**, never reset, so a
++ * later import cannot discard phases already reached; and a record this build cannot speak to is **refused**
++ * with both versions named, rather than silently shadowed by a second ledger.
++ *
++ * This is seam E's own state under seam E's own key. It is not shared with, and says nothing about, any other
++ * lane's process state.
++ */
++const NATIVE_PRESENTATION_STATE = Symbol.for("@earendil-works/pi-coding-agent/native-presentation-state");
++export const NATIVE_PRESENTATION_STATE_VERSION = 1;
++
++type NativePresentationState = {
++	version: number;
++	ledger: NativeReadinessLedger;
++	provider: NativePresentationProvider | undefined;
++};
++
++/** Structural, not `instanceof`: the other copy's class object is not this copy's class object. */
++function isUsableState(candidate: unknown): candidate is NativePresentationState {
++	const state = candidate as Partial<NativePresentationState> | undefined;
++	const ledger = state?.ledger as Partial<NativeReadinessLedger> | undefined;
++	return (
++		state?.version === NATIVE_PRESENTATION_STATE_VERSION &&
++		typeof ledger?.record === "function" &&
++		typeof ledger?.snapshot === "function" &&
++		typeof ledger?.subscribe === "function" &&
++		typeof ledger?.reachedPhase === "function"
++	);
++}
++
++function nativePresentationState(): NativePresentationState {
++	const carrier = globalThis as Record<PropertyKey, unknown>;
++	const existing = carrier[NATIVE_PRESENTATION_STATE];
++	if (existing !== undefined) {
++		if (!isUsableState(existing)) {
++			const found = (existing as { version?: unknown })?.version;
++			throw new Error(
++				`native presentation state version ${String(found)} is already on this process and this build ` +
++					`speaks version ${NATIVE_PRESENTATION_STATE_VERSION}. Two incompatible Pi builds are loaded in one ` +
++					`process; load one, or upgrade the older one. Nothing was reset: the existing state is left alone.`,
++			);
++		}
++		return existing;
++	}
++	const created: NativePresentationState = {
++		version: NATIVE_PRESENTATION_STATE_VERSION,
++		ledger: new NativeReadinessLedger(),
++		provider: undefined,
++	};
++	carrier[NATIVE_PRESENTATION_STATE] = created;
++	return created;
++}
++
++/** The process-wide ledger. One Pi process hosts one native UI, so one ledger describes it. */
++export function nativeReadiness(): NativeReadinessLedger {
++	return nativePresentationState().ledger;
++}
++
++export function recordNativeReadiness(readiness: Readiness): ReadinessRecord | undefined {
++	return nativePresentationState().ledger.record(readiness);
++}
++
++/**
++ * Subscribe to readiness phases recorded from now on, and read {@link nativeReadinessSnapshot} for the
++ * phases already reached. Returns an unsubscribe.
++ */
++export function onNativeReadiness(listener: (record: ReadinessRecord) => void): () => void {
++	return nativePresentationState().ledger.subscribe(listener);
++}
++
++export function nativeReadinessSnapshot(): { reached: ReadinessRecord[] } {
++	return nativePresentationState().ledger.snapshot();
++}
++
++export function setNativePresentationProvider(next: NativePresentationProvider | undefined): void {
++	nativePresentationState().provider = next;
++}
++
++function describeReassertion(
++	outcome: Extract<PresentationOutcome, { presented: true }>,
++): ColdPresentationReassertion | undefined {
++	const cold = outcome.receipt.cold;
++	if (!cold) return undefined;
++	return {
++		terminalModesReemitted: cold.terminalModes?.reemitted ?? [],
++		rendererModesReemitted: cold.rendererModes,
++		kittyKeyboardFlagsReemitted: cold.terminalModes?.kittyKeyboard?.reemitted
++			? cold.terminalModes.kittyKeyboard.flags
++			: undefined,
++		colorSchemeNotifications: cold.colorSchemeNotifications,
++		imageProtocol: cold.imageProtocol,
++		invalidatedImageIds: cold.invalidatedImageIds,
++	};
++}
++
++/**
++ * Bring one attachment's terminal up to the current native UI.
++ *
++ * Asynchronous because the design document's signature is, and because a host calls it across its own
++ * transport. The work itself is synchronous: the frame is rendered and handed over before this resolves,
++ * so the returned nonce always names a frame that already exists.
++ */
++export async function presentTerminal(request: PresentTerminalRequest): Promise<PresentTerminalResult> {
++	const active = nativePresentationState().provider;
++	if (!active) {
++		return {
++			presented: false,
++			terminalOwner: "none",
++			presentationNonce: null,
++			refusal: "no-native-renderer",
++			childAcknowledgement: "not-applicable",
++			reason: "no native renderer has registered a presentation provider",
++			attachmentEpoch: request.attachmentEpoch,
++			geometryRevision: request.geometryRevision,
++		};
++	}
++
++	const release = active.release();
++	if (release) {
++		return {
++			presented: false,
++			terminalOwner: release.owner,
++			presentationNonce: null,
++			refusal: release.owner === "child" ? "child-owns-terminal" : "suspended",
++			childAcknowledgement: release.owner === "child" ? "unavailable" : "not-applicable",
++			reason: `Pi released the terminal at a recognised ${release.reason} handoff; it is not painted over, and a child-owned screen cannot be reconstructed from inside Pi`,
++			attachmentEpoch: request.attachmentEpoch,
++			geometryRevision: request.geometryRevision,
++		};
++	}
++
++	const outcome = active.present({
++		requestId: `${request.attachmentEpoch.attachmentId}:${request.attachmentEpoch.epoch}:${request.geometryRevision}`,
++		coldTerminal: request.coldTerminal,
++	});
++	if (!outcome.presented) {
++		return {
++			presented: false,
++			terminalOwner: outcome.reason === "no-complete-frame-support" ? "pi" : "none",
++			presentationNonce: null,
++			refusal: outcome.reason === "no-complete-frame-support" ? "no-complete-frame-support" : "no-native-renderer",
++			childAcknowledgement: "not-applicable",
++			reason: `the active renderer presented nothing: ${outcome.reason}`,
++			attachmentEpoch: request.attachmentEpoch,
++			geometryRevision: request.geometryRevision,
++		};
++	}
++
++	return {
++		presented: true,
++		terminalOwner: "pi",
++		presentationNonce: outcome.receipt.frameId,
++		frame: {
++			frameId: outcome.receipt.frameId,
++			sequence: outcome.receipt.sequence,
++			columns: outcome.receipt.columns,
++			rows: outcome.receipt.rows,
++			byteLength: outcome.receipt.byteLength,
++		},
++		geometryRevision: request.geometryRevision,
++		attachmentEpoch: request.attachmentEpoch,
++		cold: request.coldTerminal,
++		coldReassertion: describeReassertion(outcome),
++	};
++}
++
++/**
++ * What this build actually delivers. A host reads it instead of inferring capability from a version.
++ *
++ * Only seam E is listed. A build carrying this declaration says nothing about seams A, B, C, D, F or G,
++ * and nothing about gate 5.
++ */
++export const NATIVE_PRESENTATION_CAPABILITY = {
++	seam: "E",
++	version: 1,
++	delivers: [
++		"cold presentation that reasserts renderer-owned and terminal-owned modes, including the negotiated Kitty keyboard flags, and invalidates the Kitty transmission cache",
++		"a presentation receipt naming the complete frame handed to the terminal and the geometry it was built at, for the fullscreen and the main-screen renderer",
++		"native-mounted, initialized and first-paint readiness records with a snapshot for late registrants",
++		"a launch-time core bootstrap sideband that reports readiness before any extension is loaded",
++		"a refusal, never a repaint, while a recognised handoff or suspension holds the terminal",
++	],
++	notDelivered: [
++		"seam A durable submission barrier",
++		"seam B labelled ingress",
++		"seam C return authorization",
++		"seam D canonical admission",
++		"seam F terminal profile and response authorization",
++		"seam G child-terminal phase announcements and ordered input drain",
++		"gate 5 child-terminal parity: a child-owned screen is reported unavailable, never reconstructed",
++		"presentation receipts for a third-party TuiBase subclass, which is refused by capability preflight before any byte is written",
++		"client display acknowledgement, which the host proves by echoing the nonce",
++	],
++} as const;
++
++export function nativePresentationCapability(): typeof NATIVE_PRESENTATION_CAPABILITY {
++	return NATIVE_PRESENTATION_CAPABILITY;
++}
+diff --git a/packages/coding-agent/src/index.ts b/packages/coding-agent/src/index.ts
+index 210b84010d2b3c12baea1f08bcb52cccdce4a791..c71ccc5581c2002910e17bccf50402d4384c4eff 100644
+--- a/packages/coding-agent/src/index.ts
++++ b/packages/coding-agent/src/index.ts
+@@ -194,6 +194,44 @@ export type {
+ 	ResolvedPaths,
+ 	ResolvedResource,
+ } from "./core/package-manager.ts";
++// Seam E core bootstrap: the launch-time readiness sideband, opened before any extension is loaded.
++export {
++	NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES,
++	NATIVE_BOOTSTRAP_PROTOCOL,
++	NATIVE_BOOTSTRAP_SOCKET_ENV,
++	NATIVE_BOOTSTRAP_STATE_VERSION,
++	type NativeBootstrapCommand,
++	type NativeBootstrapFrame,
++	type NativeBootstrapState,
++	type NativeBootstrapStatus,
++	nativeBootstrapStatus,
++	startNativeBootstrapChannel,
++	stopNativeBootstrapChannel,
++} from "./core/native-bootstrap.ts";
++// Native presentation and readiness (seam E). A managed host consumes these; unmanaged Pi never calls them.
++export {
++	type AttachmentEpoch,
++	type ColdPresentationReassertion,
++	type GeometryRevision,
++	NATIVE_PRESENTATION_CAPABILITY,
++	nativePresentationCapability,
++	NATIVE_PRESENTATION_STATE_VERSION,
++	type NativePresentationProvider,
++	nativeReadiness,
++	NativeReadinessLedger,
++	nativeReadinessSnapshot,
++	onNativeReadiness,
++	presentTerminal,
++	type PresentationRefusal,
++	type PresentTerminalRequest,
++	type PresentTerminalResult,
++	type Readiness,
++	type ReadinessPhase,
++	type ReadinessRecord,
++	recordNativeReadiness,
++	setNativePresentationProvider,
++	type TerminalRelease,
++} from "./core/native-presentation.ts";
+ export { DefaultPackageManager } from "./core/package-manager.ts";
+ export type { ResourceCollision, ResourceDiagnostic, ResourceLoader } from "./core/resource-loader.ts";
+ export { DefaultResourceLoader, loadProjectContextFiles } from "./core/resource-loader.ts";
+diff --git a/packages/coding-agent/src/main.ts b/packages/coding-agent/src/main.ts
+index 23b4d42e2e3d1657d3c5ce55c83f763d90e23086..7b2b4d2aebf0c56c7b60feca7f62a6eabc2071a9 100644
+--- a/packages/coding-agent/src/main.ts
++++ b/packages/coding-agent/src/main.ts
+@@ -46,6 +46,7 @@ import type { InlineExtension } from "./core/extensions/types.ts";
+ import { applyHttpProxySettings, configureHttpDispatcher } from "./core/http-dispatcher.ts";
+ import { resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.ts";
+ import { ModelRuntime } from "./core/model-runtime.ts";
++import { startNativeBootstrapChannel } from "./core/native-bootstrap.ts";
+ import { restoreStdout, takeOverStdout } from "./core/output-guard.ts";
+ import { type AppMode, resolveProjectTrusted } from "./core/project-trust.ts";
+ import type { CreateAgentSessionOptions } from "./core/sdk.ts";
+@@ -581,6 +582,11 @@ export async function main(args: string[], options?: MainOptions) {
+ 	applyHttpProxySettings(bootstrapSettingsManager.getGlobalSettings().httpProxy);
+ 	configureHttpDispatcher();
+ 
++	// Seam E core bootstrap. Opened here, before any extension module is loaded and before the TUI mounts,
++	// so a host learns `native-mounted` even when an arbitrary `session_start` handler never resolves. It is
++	// a no-op when no host configured `PI_NATIVE_BOOTSTRAP_SOCKET`.
++	startNativeBootstrapChannel();
++
+ 	if (await handlePackageCommand(args, { extensionFactories })) {
+ 		const exitCode = process.exitCode ?? 0;
+ 		if (process.platform === "win32" && exitCode === 0 && args[0] === "update") {
+diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index acf96ae2f7761be83026fdf6d8a92bb466ee93bf..590883672decd372b716782f765003a67792c40e 100644
+--- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -31,6 +31,7 @@ import {
+ 	fuzzyFilter,
+ 	getCapabilities,
+ 	hyperlink,
++	isNativePresentationTui,
+ 	Markdown,
+ 	matchesKey,
+ 	ProcessTerminal,
+@@ -83,6 +84,12 @@ import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/
+ import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
+ import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
+ import { createCompactionSummaryMessage } from "../../core/messages.ts";
++import {
++	type NativePresentationProvider,
++	recordNativeReadiness,
++	setNativePresentationProvider,
++	type TerminalRelease,
++} from "../../core/native-presentation.ts";
+ import {
+ 	defaultModelPerProvider,
+ 	findExactModelReferenceMatch,
+@@ -421,6 +428,9 @@ export class InteractiveMode {
+ 	private runtimeHost: AgentSessionRuntime;
+ 	private renderer: TuiMainScreen | TuiAltScreen;
+ 	private ui: TUI;
++	/** Set while a recognised handoff has given the terminal away. Undefined while Pi holds it. */
++	private terminalRelease: TerminalRelease | undefined;
++	private firstPaintUnsubscribe: (() => void) | undefined;
+ 	private mainScreenRenderState: TuiMainScreenRenderState | undefined;
+ 	private loadedResourcesContainer: Container;
+ 	private chatContainer: Container;
+@@ -829,6 +839,9 @@ export class InteractiveMode {
+ 	}
+ 
+ 	private stopInteractiveTui(fullscreenExitOutput: FullscreenExitOutput): void {
++		this.firstPaintUnsubscribe?.();
++		this.firstPaintUnsubscribe = undefined;
++		setNativePresentationProvider(undefined);
+ 		if (this.renderer.mode === "fullscreen" && fullscreenExitOutput === "transcript") {
+ 			while (this.renderer.hasOverlayEntries) this.renderer.hideOverlay();
+ 			this.switchTuiMode("regular", false, false);
+@@ -947,8 +960,17 @@ export class InteractiveMode {
+ 		this.defaultEditor.onSubmit = (text) => this.handleStartupSubmit(text);
+ 		this.ui.setFocus(this.editor);
+ 
++		// Seam E: the receipt for the first complete frame has to be observed from before the renderer starts,
++		// and the presentation provider has to exist before any extension can await, so both are registered
++		// here rather than after initialization.
++		this.observeFirstPaint();
++		setNativePresentationProvider(this.createNativePresentationProvider());
++
+ 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
+ 		this.ui.start();
++		// Startup input and output flow from here. Recorded before extensions load, so an arbitrary
++		// session_start handler that never resolves cannot hide or delay the mount.
++		recordNativeReadiness({ phase: "native-mounted" });
+ 		this.isInitialized = true;
+ 
+ 		await this.themeController.applyFromSettings();
+@@ -1057,6 +1079,44 @@ export class InteractiveMode {
+ 			this.ui.invalidate();
+ 			this.ui.requestRender();
+ 		});
++		// Extensions are loaded and any blocking startup dialog has been answered. Distinct from the mount
++		// and from the first frame: nothing above waited for this, and nothing below assumes an order.
++		recordNativeReadiness({ phase: "initialized" });
++	}
++
++	/** Record `first-paint` from the first complete frame the renderer hands to the terminal. */
++	private observeFirstPaint(): void {
++		const renderer = this.renderer;
++		if (!isNativePresentationTui(renderer)) return;
++		this.firstPaintUnsubscribe = renderer.onFrameHandedToTerminal((receipt) => {
++			this.firstPaintUnsubscribe?.();
++			this.firstPaintUnsubscribe = undefined;
++			recordNativeReadiness({ phase: "first-paint", presentationNonce: receipt.frameId });
++		});
++	}
++
++	/**
++	 * Seam E's renderer half. It reads `this.renderer` on every call, so a renderer swap between TUI modes
++	 * needs no re-registration, and it refuses while a recognised handoff holds the terminal.
++	 */
++	private createNativePresentationProvider(): NativePresentationProvider {
++		return {
++			present: (request) => {
++				const renderer = this.renderer;
++				if (!isNativePresentationTui(renderer)) return { presented: false, reason: "no-complete-frame-support" };
++				return renderer.presentNow(request);
++			},
++			release: () => this.terminalRelease,
++		};
++	}
++
++	/** A recognised handoff: the terminal is not Pi's until {@link reclaimTerminal}. */
++	private releaseTerminal(owner: TerminalRelease["owner"], reason: TerminalRelease["reason"]): void {
++		this.terminalRelease = { owner, reason, sinceMs: Date.now() };
++	}
++
++	private reclaimTerminal(): void {
++		this.terminalRelease = undefined;
+ 	}
+ 
+ 	/**
+@@ -4075,11 +4135,14 @@ export class InteractiveMode {
+ 		process.once("SIGCONT", () => {
+ 			clearInterval(suspendKeepAlive);
+ 			process.removeListener("SIGINT", ignoreSigint);
++			this.reclaimTerminal();
+ 			this.ui.start();
+ 			this.ui.requestRender(true);
+ 		});
+ 
+ 		try {
++			// The shell takes the terminal back for the duration of the stop.
++			this.releaseTerminal("suspended", "suspend");
+ 			// Stop the TUI (restore terminal to normal mode)
+ 			this.ui.stop();
+ 
+@@ -4088,6 +4151,7 @@ export class InteractiveMode {
+ 		} catch (error) {
+ 			clearInterval(suspendKeepAlive);
+ 			process.removeListener("SIGINT", ignoreSigint);
++			this.reclaimTerminal();
+ 			throw error;
+ 		}
+ 	}
+@@ -4216,6 +4280,9 @@ export class InteractiveMode {
+ 	private async handleOpenExternalEditor(): Promise<void> {
+ 		const editorCmd = this.settingsManager.getExternalEditorCommand();
+ 		const content = this.editor.getExpandedText?.() ?? this.editor.getText();
++		// The child inherits this terminal. Mark the release before the renderer stops, so no presentation
++		// can land in the window between the two.
++		this.releaseTerminal("child", "external-editor");
+ 		this.ui.stop();
+ 		try {
+ 			const result = await editInExternalEditor({
+@@ -4226,6 +4293,7 @@ export class InteractiveMode {
+ 				this.editor.setText(result.content);
+ 			}
+ 		} finally {
++			this.reclaimTerminal();
+ 			this.ui.start();
+ 			this.ui.requestRender(true);
+ 		}
+diff --git a/packages/coding-agent/test/native-presentation.test.ts b/packages/coding-agent/test/native-presentation.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..22f93491429e1e8492d4d98753f9e5f3d40ef48a
+--- /dev/null
++++ b/packages/coding-agent/test/native-presentation.test.ts
+@@ -0,0 +1,860 @@
++import { mkdtemp, rm } from "node:fs/promises";
++import * as net from "node:net";
++import { join } from "node:path";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import {
++	nativeBootstrapStatus,
++	NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES,
++	NATIVE_BOOTSTRAP_PROTOCOL,
++	NATIVE_BOOTSTRAP_SOCKET_ENV,
++	startNativeBootstrapChannel,
++	stopNativeBootstrapChannel,
++} from "../src/core/native-bootstrap.ts";
++import {
++	NATIVE_PRESENTATION_CAPABILITY,
++	NATIVE_PRESENTATION_STATE_VERSION,
++	nativeReadiness,
++	NativeReadinessLedger,
++	nativeReadinessSnapshot,
++	onNativeReadiness,
++	presentTerminal,
++	recordNativeReadiness,
++	setNativePresentationProvider,
++} from "../src/core/native-presentation.ts";
++import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
++
++const attachment = { attachmentId: "attach-1", epoch: 3 };
++
++/** This copy's view of the process-wide ledger. */
++function nativeReadinessLedgerUnderTest() {
++	return nativeReadiness();
++}
++
++function fakeReceipt(overrides: Partial<{ frameId: string; sequence: number }> = {}) {
++	return {
++		frameId: overrides.frameId ?? "frame-1",
++		sequence: overrides.sequence ?? 1,
++		requestId: undefined,
++		columns: 120,
++		rows: 40,
++		byteLength: 512,
++		cold: {
++			terminalModes: {
++				reemitted: ["bracketed-paste", "kitty-keyboard-flags"],
++				kittyKeyboard: { flags: 7, reemitted: true, mechanism: "set-flags" as const },
++				modifyOtherKeys: false,
++				title: "pi",
++				progress: false,
++			},
++			rendererModes: ["alt-screen", "autowrap-off"],
++			colorSchemeNotifications: false,
++			imageProtocol: "kitty" as const,
++			invalidatedImageIds: [7],
++		},
++	};
++}
++
++describe("native readiness ledger", () => {
++	it("keeps the three phases distinct and records each one once", () => {
++		const ledger = new NativeReadinessLedger();
++		expect(ledger.record({ phase: "native-mounted" })?.sequence).toBe(1);
++		expect(ledger.record({ phase: "first-paint", presentationNonce: "frame-1" })?.sequence).toBe(2);
++		expect(ledger.record({ phase: "initialized" })?.sequence).toBe(3);
++		expect(ledger.record({ phase: "native-mounted" })).toBeUndefined();
++
++		const reached = ledger.snapshot().reached;
++		expect(reached.map((entry) => entry.phase)).toEqual(["native-mounted", "first-paint", "initialized"]);
++		expect(reached.filter((entry) => "presentationNonce" in entry)).toHaveLength(1);
++	});
++
++	it("gives a late registrant the already-reached phases without replaying events", () => {
++		const ledger = new NativeReadinessLedger();
++		ledger.record({ phase: "native-mounted" });
++		ledger.record({ phase: "first-paint", presentationNonce: "frame-1" });
++
++		const events: string[] = [];
++		ledger.subscribe((entry) => events.push(entry.phase));
++		expect(events).toEqual([]);
++		expect(ledger.snapshot().reached.map((entry) => entry.phase)).toEqual(["native-mounted", "first-paint"]);
++
++		ledger.record({ phase: "initialized" });
++		expect(events).toEqual(["initialized"]);
++	});
++
++	it("delivers a phase to an observer that registered before it", () => {
++		const ledger = new NativeReadinessLedger();
++		const events: string[] = [];
++		const unsubscribe = ledger.subscribe((entry) => events.push(entry.phase));
++		ledger.record({ phase: "native-mounted" });
++		unsubscribe();
++		ledger.record({ phase: "initialized" });
++		expect(events).toEqual(["native-mounted"]);
++	});
++});
++
++describe("presentTerminal", () => {
++	it("refuses without a registered renderer and paints nothing", async () => {
++		setNativePresentationProvider(undefined);
++		const result = await presentTerminal({ attachmentEpoch: attachment, geometryRevision: 4, coldTerminal: true });
++		expect(result.presented).toBe(false);
++		if (result.presented) throw new Error("unreachable");
++		expect(result.refusal).toBe("no-native-renderer");
++		expect(result.presentationNonce).toBeNull();
++	});
++
++	it("returns the frame's own nonce, geometry and cold reassertion", async () => {
++		const present = vi.fn(() => ({ presented: true as const, receipt: fakeReceipt() }));
++		setNativePresentationProvider({ present, release: () => undefined });
++		try {
++			const result = await presentTerminal({
++				attachmentEpoch: attachment,
++				geometryRevision: 9,
++				coldTerminal: true,
++			});
++			expect(present).toHaveBeenCalledWith({ requestId: "attach-1:3:9", coldTerminal: true });
++			expect(result.presented).toBe(true);
++			if (!result.presented) throw new Error("unreachable");
++			expect(result.presentationNonce).toBe("frame-1");
++			expect(result.frame).toEqual({
++				frameId: "frame-1",
++				sequence: 1,
++				columns: 120,
++				rows: 40,
++				byteLength: 512,
++			});
++			expect(result.geometryRevision).toBe(9);
++			expect(result.coldReassertion).toEqual({
++				terminalModesReemitted: ["bracketed-paste", "kitty-keyboard-flags"],
++				rendererModesReemitted: ["alt-screen", "autowrap-off"],
++				kittyKeyboardFlagsReemitted: 7,
++				colorSchemeNotifications: false,
++				imageProtocol: "kitty",
++				invalidatedImageIds: [7],
++			});
++		} finally {
++			setNativePresentationProvider(undefined);
++		}
++	});
++
++	it("does not paint over a child-owned terminal and reports the acknowledgement as unavailable", async () => {
++		const present = vi.fn(() => ({ presented: true as const, receipt: fakeReceipt() }));
++		setNativePresentationProvider({
++			present,
++			release: () => ({ owner: "child" as const, reason: "external-editor" as const, sinceMs: 1 }),
++		});
++		try {
++			const result = await presentTerminal({
++				attachmentEpoch: attachment,
++				geometryRevision: 1,
++				coldTerminal: true,
++			});
++			expect(present).not.toHaveBeenCalled();
++			expect(result.presented).toBe(false);
++			if (result.presented) throw new Error("unreachable");
++			expect(result.terminalOwner).toBe("child");
++			expect(result.refusal).toBe("child-owns-terminal");
++			expect(result.childAcknowledgement).toBe("unavailable");
++			expect(result.presentationNonce).toBeNull();
++		} finally {
++			setNativePresentationProvider(undefined);
++		}
++	});
++
++	it("reports a recognised suspension separately from a child handoff", async () => {
++		setNativePresentationProvider({
++			present: () => ({ presented: true as const, receipt: fakeReceipt() }),
++			release: () => ({ owner: "suspended" as const, reason: "suspend" as const, sinceMs: 1 }),
++		});
++		try {
++			const result = await presentTerminal({
++				attachmentEpoch: attachment,
++				geometryRevision: 1,
++				coldTerminal: false,
++			});
++			expect(result.presented).toBe(false);
++			if (result.presented) throw new Error("unreachable");
++			expect(result.terminalOwner).toBe("suspended");
++			expect(result.refusal).toBe("suspended");
++			expect(result.childAcknowledgement).toBe("not-applicable");
++		} finally {
++			setNativePresentationProvider(undefined);
++		}
++	});
++
++	it("reports a renderer that cannot produce a complete frame instead of claiming one", async () => {
++		setNativePresentationProvider({
++			present: () => ({ presented: false as const, reason: "no-complete-frame-support" as const }),
++			release: () => undefined,
++		});
++		try {
++			const result = await presentTerminal({
++				attachmentEpoch: attachment,
++				geometryRevision: 1,
++				coldTerminal: true,
++			});
++			expect(result.presented).toBe(false);
++			if (result.presented) throw new Error("unreachable");
++			expect(result.terminalOwner).toBe("pi");
++			expect(result.refusal).toBe("no-complete-frame-support");
++		} finally {
++			setNativePresentationProvider(undefined);
++		}
++	});
++});
++
++describe("declared capability", () => {
++	it("advertises seam E only and names the limits it does not deliver", () => {
++		expect(NATIVE_PRESENTATION_CAPABILITY.seam).toBe("E");
++		const notDelivered = NATIVE_PRESENTATION_CAPABILITY.notDelivered.join(" ");
++		for (const seam of ["seam A", "seam B", "seam C", "seam D", "seam F", "seam G", "gate 5"]) {
++			expect(notDelivered).toContain(seam);
++		}
++		expect(NATIVE_PRESENTATION_CAPABILITY.delivers.join(" ")).not.toContain("gate 5");
++	});
++});
++
++type ReadinessInitContext = {
++	renderer: unknown;
++	ui: { start: () => void; setFocus: (component: unknown) => void };
++	firstPaintUnsubscribe: (() => void) | undefined;
++	terminalRelease: unknown;
++};
++
++type InteractiveModePrivate = {
++	observeFirstPaint(this: ReadinessInitContext): void;
++	createNativePresentationProvider(this: ReadinessInitContext): {
++		present: (request: { requestId: string; coldTerminal: boolean }) => unknown;
++		release: () => unknown;
++	};
++	releaseTerminal(this: ReadinessInitContext, owner: string, reason: string): void;
++	reclaimTerminal(this: ReadinessInitContext): void;
++};
++
++const interactiveModePrototype = InteractiveMode.prototype as unknown as InteractiveModePrivate;
++
++describe("InteractiveMode presentation wiring", () => {
++	it("records first-paint from the first frame the renderer hands to the terminal, once", () => {
++		const listeners: Array<(receipt: ReturnType<typeof fakeReceipt>) => void> = [];
++		const context: ReadinessInitContext = {
++			renderer: {
++				[Symbol.for("@earendil-works/pi-tui/native-presentation")]: true,
++				onFrameHandedToTerminal: (listener: (receipt: ReturnType<typeof fakeReceipt>) => void) => {
++					listeners.push(listener);
++					return () => {
++						listeners.length = 0;
++					};
++				},
++			},
++			ui: { start: () => {}, setFocus: () => {} },
++			firstPaintUnsubscribe: undefined,
++			terminalRelease: undefined,
++		};
++
++		const observed: string[] = [];
++		const unsubscribe = onNativeReadiness((entry) => observed.push(entry.phase));
++		try {
++			interactiveModePrototype.observeFirstPaint.call(context);
++			expect(listeners).toHaveLength(1);
++			const listener = listeners[0];
++			listener({ ...fakeReceipt({ frameId: "first-frame" }) });
++			// The unsubscribe fired, so the fixture's list is empty: a later frame is not a second first-paint.
++			expect(listeners).toHaveLength(0);
++			listener({ ...fakeReceipt({ frameId: "second-frame", sequence: 2 }) });
++
++			const firstPaint = nativeReadinessSnapshot().reached.find((entry) => entry.phase === "first-paint");
++			expect(firstPaint && "presentationNonce" in firstPaint ? firstPaint.presentationNonce : undefined).toBe(
++				"first-frame",
++			);
++			expect(context.firstPaintUnsubscribe).toBeUndefined();
++			expect(observed.filter((phase) => phase === "first-paint")).toHaveLength(1);
++		} finally {
++			unsubscribe();
++		}
++	});
++
++	it("keeps the provider reading the current renderer and refuses while the terminal is released", () => {
++		const presentNow = vi.fn(() => ({ presented: true as const, receipt: fakeReceipt() }));
++		const context: ReadinessInitContext = {
++			renderer: {
++				[Symbol.for("@earendil-works/pi-tui/native-presentation")]: true,
++				presentNow,
++			},
++			ui: { start: () => {}, setFocus: () => {} },
++			firstPaintUnsubscribe: undefined,
++			terminalRelease: undefined,
++		};
++		const provider = interactiveModePrototype.createNativePresentationProvider.call(context);
++
++		expect(provider.release()).toBeUndefined();
++		provider.present({ requestId: "r", coldTerminal: true });
++		expect(presentNow).toHaveBeenCalledWith({ requestId: "r", coldTerminal: true });
++
++		interactiveModePrototype.releaseTerminal.call(context, "child", "external-editor");
++		expect(provider.release()).toMatchObject({ owner: "child", reason: "external-editor" });
++		interactiveModePrototype.reclaimTerminal.call(context);
++		expect(provider.release()).toBeUndefined();
++	});
++
++	it("reports no complete-frame support for a renderer without the presentation brand", () => {
++		const context: ReadinessInitContext = {
++			renderer: { presentNow: () => ({ presented: true }) },
++			ui: { start: () => {}, setFocus: () => {} },
++			firstPaintUnsubscribe: undefined,
++			terminalRelease: undefined,
++		};
++		const provider = interactiveModePrototype.createNativePresentationProvider.call(context);
++		expect(provider.present({ requestId: "r", coldTerminal: true })).toEqual({
++			presented: false,
++			reason: "no-complete-frame-support",
++		});
++	});
++});
++
++describe("core bootstrap sideband", () => {
++	/**
++	 * One host-side listener. Every wait resolves from a frame or rejects on its own bound; nothing polls.
++	 *
++	 * The socket lives in a short directory of its own rather than under `TMPDIR`. Measured on worker 3739922:
++	 * in this same process, binding a 179-byte path under a run's `TMPDIR` succeeded while a 184-byte one on
++	 * the same filesystem failed with `EADDRINUSE` on a path that did not exist, and a 39-byte path under the
++	 * machine's own `/tmp` succeeded. A socket is a transport, not an output, so it is created here and removed
++	 * with the listener.
++	 */
++	async function hostListener() {
++		const directory = await mkdtemp("/tmp/pi-native-bootstrap-");
++		const socketPath = join(directory, "s");
++		const frames: Record<string, any>[] = [];
++		let waiting: ((frame: Record<string, any>) => void) | undefined;
++		let peer: net.Socket | undefined;
++		let buffered = "";
++		// `allowHalfOpen` keeps this peer writable after Pi's own FIN, which is what makes a post-breach write
++		// observable at all: Pi refuses the frame, half-closes, and the case still sends one more command to
++		// prove nothing reads it. A default server would auto-end here and the command would never leave.
++		const server = net.createServer({ allowHalfOpen: true }, (connection) => {
++			peer = connection;
++			connection.setEncoding("utf8");
++			connection.on("error", () => {});
++			connection.on("data", (chunk: string) => {
++				buffered += chunk;
++				let newline = buffered.indexOf("\n");
++				while (newline !== -1) {
++					const line = buffered.slice(0, newline);
++					buffered = buffered.slice(newline + 1);
++					if (line.trim()) {
++						const frame = JSON.parse(line) as Record<string, any>;
++						frames.push(frame);
++						waiting?.(frame);
++						waiting = undefined;
++					}
++					newline = buffered.indexOf("\n");
++				}
++			});
++		});
++		await new Promise<void>((resolve) => server.listen(socketPath, () => resolve()));
++		return {
++			socketPath,
++			frames,
++			/**
++			 * The next frame, or a rejection naming what never came. The bound belongs here rather than in the
++			 * runner's own timeout, so a channel that answers nothing says so instead of timing the case out.
++			 */
++			next: (label = "a frame", timeoutMs = 10_000) =>
++				new Promise<Record<string, any>>((resolve, reject) => {
++					const timer = setTimeout(() => {
++						waiting = undefined;
++						reject(new Error(`${label} never arrived within ${timeoutMs}ms; frames so far: ${JSON.stringify(frames)}`));
++					}, timeoutMs);
++					waiting = (frame) => {
++						clearTimeout(timer);
++						resolve(frame);
++					};
++				}),
++			send: (command: unknown) => peer?.write(`${JSON.stringify(command)}\n`),
++			/** Bytes exactly as given: a frame bound and a parse refusal are not reachable through `send`. */
++			sendRaw: (bytes: string) => peer?.write(bytes),
++			async close() {
++				peer?.destroy();
++				await new Promise<void>((resolve) => server.close(() => resolve()));
++				await rm(directory, { recursive: true, force: true });
++			},
++		};
++	}
++
++	/** The listener of the case in flight, closed by the teardown below whatever the case did. */
++	let openHost: Awaited<ReturnType<typeof hostListener>> | undefined;
++
++	async function openListener() {
++		openHost = await hostListener();
++		process.env[NATIVE_BOOTSTRAP_SOCKET_ENV] = openHost.socketPath;
++		return openHost;
++	}
++
++	// A case that fails on its own bound never reaches a `finally` of its own, and a channel left open would be
++	// adopted by the next case, which then reports the previous case's failure instead of its own behaviour.
++	afterEach(async () => {
++		setNativePresentationProvider(undefined);
++		stopNativeBootstrapChannel();
++		delete process.env[NATIVE_BOOTSTRAP_SOCKET_ENV];
++		await openHost?.close();
++		openHost = undefined;
++	});
++
++	/**
++	 * A process readiness record no earlier case has touched, in the shape this build's own record declares.
++	 *
++	 * Ordering is a property of the phases this channel opens over, so the case has to own them. The record is
++	 * the documented one — the exported ledger class and the exported version — and the real record is put back
++	 * afterwards.
++	 */
++	async function withOwnProcessLedger(body: () => Promise<void>): Promise<void> {
++		const key = Symbol.for("@earendil-works/pi-coding-agent/native-presentation-state");
++		const carrier = globalThis as Record<PropertyKey, unknown>;
++		const real = carrier[key];
++		carrier[key] = {
++			version: NATIVE_PRESENTATION_STATE_VERSION,
++			ledger: new NativeReadinessLedger(),
++			provider: undefined,
++		};
++		try {
++			await body();
++		} finally {
++			carrier[key] = real;
++		}
++	}
++
++	it("reports readiness to a host listener with no extension involved, and answers a presentation request", async () => {
++		const host = await openListener();
++		const hello = host.next("the hello");
++		expect(startNativeBootstrapChannel().state).toBe("connecting");
++		const helloFrame = await hello;
++		expect(helloFrame.type).toBe("native-bootstrap");
++		expect(helloFrame.protocol).toBe(NATIVE_BOOTSTRAP_PROTOCOL);
++		expect(helloFrame.pid).toBe(process.pid);
++		expect(helloFrame.capability.seam).toBe("E");
++		expect(nativeBootstrapStatus().state).toBe("open");
++
++		const mounted = host.next("the native-mounted record");
++		recordNativeReadiness({ phase: "native-mounted" });
++		const mountedFrame = await mounted;
++		expect(mountedFrame.type).toBe("native-readiness");
++		expect(mountedFrame.readiness.phase).toBe("native-mounted");
++		expect(mountedFrame.readiness.sequence).toBeGreaterThan(0);
++
++		const presented = host.next("the presentation result");
++		setNativePresentationProvider({
++			present: () => ({ presented: true as const, receipt: fakeReceipt({ frameId: "sideband-frame" }) }),
++			release: () => undefined,
++		});
++		host.send({
++			type: "present",
++			protocol: NATIVE_BOOTSTRAP_PROTOCOL,
++			requestId: "host-request-1",
++			attachmentEpoch: { attachmentId: "attach-sideband", epoch: 1 },
++			geometryRevision: 11,
++			coldTerminal: true,
++		});
++		const presentedFrame = await presented;
++		expect(presentedFrame.type).toBe("presentation-result");
++		expect(presentedFrame.requestId).toBe("host-request-1");
++		expect(presentedFrame.result.presented).toBe(true);
++		expect(presentedFrame.result.presentationNonce).toBe("sideband-frame");
++		expect(presentedFrame.result.geometryRevision).toBe(11);
++	});
++
++	it("names an unsupported command instead of acting on it", async () => {
++		const host = await openListener();
++		const hello = host.next("the hello");
++		startNativeBootstrapChannel();
++		await hello;
++		const refused = host.next("the refusal");
++		host.send({ type: "prompt", protocol: NATIVE_BOOTSTRAP_PROTOCOL, requestId: "host-request-2" });
++		const refusedFrame = await refused;
++		expect(refusedFrame.type).toBe("error");
++		expect(refusedFrame.requestId).toBe("host-request-2");
++		expect(refusedFrame.error).toContain("unsupported command");
++	});
++
++	it("refuses a frame that is not an object, without a rejection nobody reads, and keeps answering", async () => {
++		const host = await openListener();
++		const present = vi.fn(() => ({ presented: true as const, receipt: fakeReceipt({ frameId: "after-null" }) }));
++		const hello = host.next("the hello");
++		startNativeBootstrapChannel();
++		await hello;
++		setNativePresentationProvider({ present, release: () => undefined });
++
++		// Valid JSON, and not a command. Reading `requestId` off it throws, which is exactly what used to
++		// become a discarded promise rejection instead of an answer.
++		const refused = host.next("the refusal for a null frame");
++		host.sendRaw("null\n");
++		const refusedFrame = await refused;
++		expect(refusedFrame.type).toBe("error");
++		expect(refusedFrame.requestId).toBeUndefined();
++		expect(refusedFrame.error).toContain("must be a JSON object");
++		expect(refusedFrame.error).toContain("null");
++		expect(present).not.toHaveBeenCalled();
++
++		// The channel is still the same channel: one bad frame is refused, not fatal.
++		const presented = host.next("the presentation result after the refusal");
++		host.send({
++			type: "present",
++			protocol: NATIVE_BOOTSTRAP_PROTOCOL,
++			requestId: "after-null",
++			attachmentEpoch: { attachmentId: "attach-null", epoch: 2 },
++			geometryRevision: 4,
++			coldTerminal: false,
++		});
++		const presentedFrame = await presented;
++		expect(presentedFrame.type).toBe("presentation-result");
++		expect(presentedFrame.result.presentationNonce).toBe("after-null");
++		expect(nativeBootstrapStatus().state).toBe("open");
++	});
++
++	it("refuses a command from another protocol version and names both versions", async () => {
++		const host = await openListener();
++		const present = vi.fn(() => ({ presented: true as const, receipt: fakeReceipt() }));
++		const hello = host.next("the hello");
++		startNativeBootstrapChannel();
++		await hello;
++		setNativePresentationProvider({ present, release: () => undefined });
++		const refused = host.next("the protocol refusal");
++		host.send({
++			type: "present",
++			protocol: 2,
++			requestId: "host-future-1",
++			attachmentEpoch: { attachmentId: "attach-future", epoch: 1 },
++			geometryRevision: 1,
++			coldTerminal: true,
++		});
++		const refusedFrame = await refused;
++		expect(refusedFrame.type).toBe("error");
++		expect(refusedFrame.requestId).toBe("host-future-1");
++		expect(refusedFrame.error).toContain("unsupported protocol 2");
++		expect(refusedFrame.error).toContain(`protocol ${NATIVE_BOOTSTRAP_PROTOCOL}`);
++		// A version this build does not speak reaches no presentation at all.
++		expect(present).not.toHaveBeenCalled();
++	});
++
++	const malformedRequests = [
++		{
++			label: "a missing attachment epoch",
++			fields: { attachmentEpoch: null, geometryRevision: 1, coldTerminal: true } as Record<string, unknown>,
++			names: "attachmentEpoch",
++		},
++		{
++			label: "a fractional epoch",
++			fields: { attachmentEpoch: { attachmentId: "a", epoch: 1.5 }, geometryRevision: 1, coldTerminal: true },
++			names: "attachmentEpoch",
++		},
++		{
++			label: "a geometry revision that is not a number",
++			fields: { attachmentEpoch: { attachmentId: "a", epoch: 1 }, geometryRevision: "3", coldTerminal: true },
++			names: "geometryRevision",
++		},
++		{
++			label: "a cold flag that is not a boolean",
++			fields: { attachmentEpoch: { attachmentId: "a", epoch: 1 }, geometryRevision: 3, coldTerminal: "yes" },
++			names: "coldTerminal",
++		},
++	];
++
++	for (const { label, fields, names } of malformedRequests) {
++		it(`refuses a present request with ${label} and presents nothing`, async () => {
++			const host = await openListener();
++			const present = vi.fn(() => ({ presented: true as const, receipt: fakeReceipt() }));
++			const hello = host.next("the hello");
++			startNativeBootstrapChannel();
++			await hello;
++			setNativePresentationProvider({ present, release: () => undefined });
++			const refused = host.next(`the refusal for ${label}`);
++			host.send({ type: "present", protocol: NATIVE_BOOTSTRAP_PROTOCOL, requestId: "host-shape-1", ...fields });
++			const refusedFrame = await refused;
++			expect(refusedFrame.type).toBe("error");
++			expect(refusedFrame.requestId).toBe("host-shape-1");
++			expect(refusedFrame.error).toContain(names);
++			expect(present).not.toHaveBeenCalled();
++		});
++	}
++
++	it("answers a presentation that threw with one error frame and stays open", async () => {
++		const host = await openListener();
++		const hello = host.next("the hello");
++		startNativeBootstrapChannel();
++		await hello;
++		setNativePresentationProvider({
++			present: () => {
++				throw new Error("the renderer failed mid-frame");
++			},
++			release: () => undefined,
++		});
++		const refused = host.next("the refusal for a throwing provider");
++		host.send({
++			type: "present",
++			protocol: NATIVE_BOOTSTRAP_PROTOCOL,
++			requestId: "host-throwing-1",
++			attachmentEpoch: { attachmentId: "attach-throwing", epoch: 1 },
++			geometryRevision: 2,
++			coldTerminal: true,
++		});
++		const refusedFrame = await refused;
++		expect(refusedFrame.type).toBe("error");
++		expect(refusedFrame.requestId).toBe("host-throwing-1");
++		expect(refusedFrame.error).toContain("presentation failed");
++		expect(refusedFrame.error).toContain("the renderer failed mid-frame");
++		expect(nativeBootstrapStatus().state).toBe("open");
++	});
++
++	it("closes the channel instead of retaining input that never ends a frame", async () => {
++		const host = await openListener();
++		const hello = host.next("the hello");
++		startNativeBootstrapChannel();
++		await hello;
++		const refused = host.next("the refusal for unbounded input");
++		// 64 KiB and no newline: past any bound this channel could reasonably declare.
++		host.sendRaw(`{"type":"present","requestId":"${"x".repeat(64 * 1024)}`);
++		const refusedFrame = await refused;
++		expect(refusedFrame.type).toBe("error");
++		expect(refusedFrame.error).toMatch(/exceed/);
++		expect(refusedFrame.error).toContain("channel is closed");
++		expect(nativeBootstrapStatus().state).toBe("closed");
++		expect(nativeBootstrapStatus().lastError).toMatch(/exceed/);
++	});
++
++	/**
++	 * One valid `present` command, padded to exactly `rawBytes` including its newline.
++	 *
++	 * `"inside"` pads between the JSON tokens, where `trim()` cannot reach it, so the frame's own text is what
++	 * the bound measures. `"trailing"` pads after the object, which `trim()` does remove: that is the shape
++	 * that used to buy a peer bytes the bound had already refused.
++	 */
++	function paddedCommand(requestId: string, rawBytes: number, where: "inside" | "trailing"): string {
++		const json = JSON.stringify({
++			type: "present",
++			protocol: NATIVE_BOOTSTRAP_PROTOCOL,
++			requestId,
++			attachmentEpoch: { attachmentId: "attach-bound", epoch: 1 },
++			geometryRevision: 5,
++			coldTerminal: true,
++		});
++		const padding = rawBytes - Buffer.byteLength(json) - 1;
++		if (padding < 0) throw new Error(`a ${rawBytes} byte frame cannot carry this command`);
++		const spaces = " ".repeat(padding);
++		return where === "inside" ? `${json.slice(0, -1)}${spaces}}\n` : `${json}${spaces}\n`;
++	}
++
++	function commandAfterBreach(requestId: string, geometryRevision: number) {
++		return {
++			type: "present",
++			protocol: NATIVE_BOOTSTRAP_PROTOCOL,
++			requestId,
++			attachmentEpoch: { attachmentId: "attach-after-breach", epoch: 2 },
++			geometryRevision,
++			coldTerminal: false,
++		};
++	}
++
++	it("measures the bound on the raw frame, so whitespace padding buys a peer no bytes", async () => {
++		const host = await openListener();
++		const present = vi.fn(() => ({ presented: true as const, receipt: fakeReceipt() }));
++		const hello = host.next("the hello");
++		startNativeBootstrapChannel();
++		await hello;
++		setNativePresentationProvider({ present, release: () => undefined });
++		const refused = host.next("the refusal for a whitespace-padded oversized frame");
++		// A few hundred bytes of command, padded past the bound with whitespace `trim()` removes entirely.
++		const frame = paddedCommand("host-padded-1", NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES + 512, "trailing");
++		expect(Buffer.byteLength(frame)).toBe(NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES + 512);
++		expect(Buffer.byteLength(frame.trim())).toBeLessThan(NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES);
++		host.sendRaw(frame);
++		const refusedFrame = await refused;
++		expect(refusedFrame.type).toBe("error");
++		expect(refusedFrame.error).toContain(`${NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES} byte bound`);
++		expect(refusedFrame.error).toContain("channel is closed");
++		// The point of the bound: a frame past it reaches no provider, however small its trimmed text is.
++		expect(present).not.toHaveBeenCalled();
++		expect(nativeBootstrapStatus().state).toBe("closed");
++		expect(nativeBootstrapStatus().lastError).toMatch(/exceeds/);
++	});
++
++	it("accepts a frame of exactly the bound, newline included", async () => {
++		const host = await openListener();
++		const hello = host.next("the hello");
++		startNativeBootstrapChannel();
++		await hello;
++		setNativePresentationProvider({
++			present: () => ({ presented: true as const, receipt: fakeReceipt({ frameId: "at-the-bound" }) }),
++			release: () => undefined,
++		});
++		const presented = host.next("the presentation result for a frame at the bound");
++		const frame = paddedCommand("host-bound-exact", NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES, "inside");
++		expect(Buffer.byteLength(frame)).toBe(NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES);
++		host.sendRaw(frame);
++		const presentedFrame = await presented;
++		expect(presentedFrame.type).toBe("presentation-result");
++		expect(presentedFrame.requestId).toBe("host-bound-exact");
++		expect(presentedFrame.result.presentationNonce).toBe("at-the-bound");
++		expect(nativeBootstrapStatus().state).toBe("open");
++	});
++
++	it("refuses a frame one byte past the bound, counting the newline the bound includes", async () => {
++		const host = await openListener();
++		const present = vi.fn(() => ({ presented: true as const, receipt: fakeReceipt() }));
++		const hello = host.next("the hello");
++		startNativeBootstrapChannel();
++		await hello;
++		setNativePresentationProvider({ present, release: () => undefined });
++		const refused = host.next("the refusal for a frame one byte past the bound");
++		const frame = paddedCommand("host-bound-over", NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES + 1, "inside");
++		// Its own text is exactly the bound. Only the newline the bound counts puts this frame past it.
++		expect(Buffer.byteLength(frame.trim())).toBe(NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES);
++		expect(Buffer.byteLength(frame)).toBe(NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES + 1);
++		host.sendRaw(frame);
++		const refusedFrame = await refused;
++		expect(refusedFrame.type).toBe("error");
++		expect(refusedFrame.error).toContain(`${NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES + 1} bytes`);
++		expect(refusedFrame.error).toContain("channel is closed");
++		expect(present).not.toHaveBeenCalled();
++		expect(nativeBootstrapStatus().state).toBe("closed");
++	});
++
++	it("stops reading at a breach, so a frame already buffered behind it reaches no provider", async () => {
++		const host = await openListener();
++		const present = vi.fn(() => ({ presented: true as const, receipt: fakeReceipt() }));
++		const hello = host.next("the hello");
++		startNativeBootstrapChannel();
++		await hello;
++		setNativePresentationProvider({ present, release: () => undefined });
++		const refused = host.next("the refusal for the oversized frame");
++		// One write: the breach, and a perfectly valid command behind it in the same chunk.
++		host.sendRaw(
++			paddedCommand("host-breach-1", NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES + 512, "inside") +
++				`${JSON.stringify(commandAfterBreach("host-after-breach-1", 6))}\n`,
++		);
++		expect((await refused).type).toBe("error");
++		await expect(host.next("a presentation result after the breach", 1_000)).rejects.toThrow(/never arrived/);
++		expect(present).not.toHaveBeenCalled();
++		expect(nativeBootstrapStatus().state).toBe("closed");
++	});
++
++	it("stops reading at a breach, so a later data event reaches no provider", async () => {
++		const host = await openListener();
++		const present = vi.fn(() => ({ presented: true as const, receipt: fakeReceipt() }));
++		const hello = host.next("the hello");
++		startNativeBootstrapChannel();
++		await hello;
++		setNativePresentationProvider({ present, release: () => undefined });
++		const refused = host.next("the refusal for the oversized frame");
++		host.sendRaw(paddedCommand("host-breach-2", NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES + 512, "inside"));
++		expect((await refused).type).toBe("error");
++
++		// A second write, after the refusal was answered: a `data` event on a channel that already closed
++		// admission. The host peer is `allowHalfOpen`, so these bytes really do leave and really do arrive.
++		host.send(commandAfterBreach("host-after-breach-2", 7));
++		await expect(host.next("a presentation result after the breach", 1_000)).rejects.toThrow(/never arrived/);
++		// The provider is the discriminator, not the silence: a channel that kept parsing would have called it
++		// and then dropped the answer, because the socket it would have replied on is already gone.
++		expect(present).not.toHaveBeenCalled();
++		expect(nativeBootstrapStatus().state).toBe("closed");
++	});
++
++	it("writes the hello first and carries readiness recorded before the connection, once", async () => {
++		await withOwnProcessLedger(async () => {
++			const host = await openListener();
++			// Reached before the channel exists at all.
++			recordNativeReadiness({ phase: "native-mounted" });
++			const hello = host.next("the hello");
++			expect(startNativeBootstrapChannel().state).toBe("connecting");
++			// Reached while the socket is still connecting: a queued write must not overtake the hello.
++			recordNativeReadiness({ phase: "first-paint", presentationNonce: "pre-connect-frame" });
++
++			const helloFrame = await hello;
++			expect(host.frames[0].type).toBe("native-bootstrap");
++			expect(helloFrame.reached.map((entry: { phase: string }) => entry.phase)).toEqual([
++				"native-mounted",
++				"first-paint",
++			]);
++
++			// A phase recorded after the hello still arrives as its own record: the subscription has no gap.
++			const initialized = host.next("the initialized record");
++			recordNativeReadiness({ phase: "initialized" });
++			const initializedFrame = await initialized;
++			expect(initializedFrame.readiness.phase).toBe("initialized");
++
++			// Nothing the hello carried is repeated as an event, and nothing is lost.
++			const events = host.frames
++				.filter((frame) => frame.type === "native-readiness")
++				.map((frame) => frame.readiness.phase);
++			expect(events).toEqual(["initialized"]);
++			const delivered = [...helloFrame.reached.map((entry: { phase: string }) => entry.phase), ...events];
++			expect(delivered).toEqual(["native-mounted", "first-paint", "initialized"]);
++		});
++	});
++
++	it("stays unconfigured, and silent, when no host asked for a sideband", () => {
++		delete process.env[NATIVE_BOOTSTRAP_SOCKET_ENV];
++		expect(startNativeBootstrapChannel()).toEqual({
++			state: "unconfigured",
++			socketPath: undefined,
++			framesSent: 0,
++			lastError: undefined,
++		});
++	});
++});
++
++describe("process-global seam E state", () => {
++	/**
++	 * The bundled CLI inlines its dependencies, so a supported in-process caller can hold a different copy of
++	 * these modules than the agent is running. A second module instance is loaded here by query suffix, which
++	 * is a real second instance with its own module scope.
++	 */
++	it("is reached by a second module instance instead of starting a second empty ledger", async () => {
++		const second = await import("../src/core/native-presentation.ts?instance=2");
++		expect(second.nativeReadiness()).toBe(nativeReadinessLedgerUnderTest());
++		expect(second.NATIVE_PRESENTATION_STATE_VERSION).toBe(1);
++
++		// Recorded through this copy, read through the other one, and not reset by the later import.
++		const before = second.nativeReadinessSnapshot().reached.length;
++		recordNativeReadiness({ phase: "first-paint", presentationNonce: "cross-instance-frame" });
++		const reached = second.nativeReadinessSnapshot().reached;
++		expect(reached.length).toBeGreaterThanOrEqual(before);
++		expect(reached.map((entry: { phase: string }) => entry.phase)).toContain("first-paint");
++
++		// The provider crosses the same boundary, which is what a pre-TUI caller registers.
++		second.setNativePresentationProvider({
++			present: () => ({ presented: true as const, receipt: fakeReceipt({ frameId: "cross-instance" }) }),
++			release: () => undefined,
++		});
++		try {
++			const result = await presentTerminal({ attachmentEpoch: attachment, geometryRevision: 2, coldTerminal: false });
++			expect(result.presented).toBe(true);
++			if (!result.presented) throw new Error("unreachable");
++			expect(result.presentationNonce).toBe("cross-instance");
++		} finally {
++			setNativePresentationProvider(undefined);
++		}
++	});
++
++	it("refuses an incompatible existing record instead of shadowing it with a second ledger", async () => {
++		const key = Symbol.for("@earendil-works/pi-coding-agent/native-presentation-state");
++		const carrier = globalThis as Record<PropertyKey, unknown>;
++		const real = carrier[key];
++		carrier[key] = { version: 99 };
++		try {
++			const third = await import("../src/core/native-presentation.ts?instance=3");
++			expect(() => third.nativeReadinessSnapshot()).toThrow(/version 99 is already on this process/);
++			// Nothing was reset: the record this build refused is still the one on the process.
++			expect((carrier[key] as { version: number }).version).toBe(99);
++		} finally {
++			carrier[key] = real;
++		}
++	});
++});
++
++describe("unmanaged compatibility", () => {
++	it("presents nothing and records nothing until a host asks", async () => {
++		setNativePresentationProvider(undefined);
++		const before = nativeReadinessSnapshot().reached.length;
++		const result = await presentTerminal({ attachmentEpoch: attachment, geometryRevision: 1, coldTerminal: false });
++		expect(result.presented).toBe(false);
++		expect(nativeReadinessSnapshot().reached.length).toBe(before);
++	});
++});
+diff --git a/packages/tui/src/index.ts b/packages/tui/src/index.ts
+index 0d5a4a1093ba8bbbd971e417af244823afa06ea4..55d3d652b4d338dc3ad17e7c3e0cbf8d212c9303 100644
+--- a/packages/tui/src/index.ts
++++ b/packages/tui/src/index.ts
+@@ -74,6 +74,18 @@ export {
+ } from "./keys.ts";
+ // LaTeX rendering
+ export { type RenderLatexOptions, renderLatex } from "./latex.ts";
++// Native presentation of a terminal that missed startup (seam E)
++export {
++	type ColdReassertion,
++	isNativePresentationTui,
++	NATIVE_PRESENTATION_TUI,
++	type NativePresentationTui,
++	type PresentationFrameReceipt,
++	type PresentationOutcome,
++	type PresentationRequest,
++	type PresentationUnavailableReason,
++	type ReassertedTerminalModes,
++} from "./native-presentation.ts";
+ // Input buffering for batch splitting
+ export { StdinBuffer, type StdinBufferEventMap, type StdinBufferOptions } from "./stdin-buffer.ts";
+ // Terminal interface and implementations
+diff --git a/packages/tui/src/native-presentation.ts b/packages/tui/src/native-presentation.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..01e7631b6efd3345dc8a90bdba6008f2f1a9c158
+--- /dev/null
++++ b/packages/tui/src/native-presentation.ts
+@@ -0,0 +1,128 @@
++/**
++ * Native presentation: bringing a terminal that missed startup up to the current native UI.
++ *
++ * A terminal that attaches after Pi started has none of the modes Pi emitted at startup and none of the
++ * terminal-specific image state Pi believes it already uploaded. Forcing a render replays neither:
++ * `resetRenderState()` clears the text screen and layout but leaves the Kitty transmission cache intact,
++ * so the next frame emits a placement for an image the cold terminal never received.
++ *
++ * This module names the three things only the renderer can supply:
++ *
++ * 1. reasserting the renderer-owned and terminal-owned modes without resetting draft, focus, overlays,
++ *    selection, search or scrolling — which is why this is not `stop()` followed by `start()`;
++ * 2. dropping the per-terminal image transmission cache so the next frame retransmits the payloads;
++ * 3. a receipt naming the complete frame the renderer actually handed to the terminal, and the geometry
++ *    it was built at.
++ *
++ * The receipt is minted after the frame bytes are handed to {@link Terminal.write}. That is a local
++ * handoff, not a client display acknowledgement: proving a client displayed the frame requires the client
++ * to echo the receipt back, which is the host's work and is deliberately not modelled here.
++ *
++ * A receipt is minted for a **complete** frame only. Both native renderers also write incremental frames —
++ * changed rows in the fullscreen renderer, changed lines in the main-screen renderer — and those are not
++ * something a presentation nonce may name, so they mint nothing.
++ */
++
++import type { ImageProtocol } from "./terminal-image.ts";
++
++/**
++ * Terminal-owned modes reasserted for a cold terminal.
++ *
++ * Only idempotent modes are re-emitted. The Kitty keyboard protocol is reasserted with the set-flags form
++ * (`CSI = flags ; 1 u`), which rewrites the flags of the current stack entry, and never with the push form
++ * (`CSI > flags u`), which would leave the stack unbalanced against the single pop at shutdown.
++ */
++export interface ReassertedTerminalModes {
++	/** Idempotent mode sequences actually written, named rather than quoted. */
++	reemitted: string[];
++	/**
++	 * The negotiated Kitty keyboard flags and how they were reasserted.
++	 *
++	 * `mechanism: "set-flags"` is `CSI = flags ; 1 u`: it sets the flags of the entry already on the
++	 * terminal's stack, so a terminal that received the startup push ends in the same state and a terminal
++	 * that missed it now has the negotiated flags. Undefined when the protocol is not active.
++	 */
++	kittyKeyboard: { flags: number; reemitted: boolean; mechanism: "set-flags" } | undefined;
++	modifyOtherKeys: boolean;
++	title: string | undefined;
++	progress: boolean;
++}
++
++/** What a cold presentation reasserted. Absent from a warm presentation's receipt. */
++export interface ColdReassertion {
++	/** Undefined when the active {@link Terminal} implementation owns no negotiated mode state. */
++	terminalModes: ReassertedTerminalModes | undefined;
++	/** Renderer-owned modes re-emitted, named. Empty for a renderer that owns none. */
++	rendererModes: string[];
++	colorSchemeNotifications: boolean;
++	imageProtocol: ImageProtocol;
++	/**
++	 * Image ids whose cached transmission was dropped, so the next frame retransmits them in full.
++	 *
++	 * Empty for a renderer that keeps no per-terminal transmission cache: the main-screen renderer carries
++	 * each image's transmission inline in the line it draws, so a redrawn frame retransmits by itself.
++	 */
++	invalidatedImageIds: number[];
++}
++
++/** The complete frame the renderer handed to the terminal. */
++export interface PresentationFrameReceipt {
++	/** Identifies this frame. A presentation acknowledgement carries it back. */
++	frameId: string;
++	/** Monotonic per renderer instance, so a stale acknowledgement is recognisable. */
++	sequence: number;
++	/** The presentation request this frame answers, or undefined for an ordinary render. */
++	requestId: string | undefined;
++	/** The geometry the frame was built at, not the geometry at acknowledgement time. */
++	columns: number;
++	rows: number;
++	/** UTF-8 bytes handed to {@link Terminal.write}, counted with `Buffer.byteLength`. */
++	byteLength: number;
++	cold: ColdReassertion | undefined;
++}
++
++export interface PresentationRequest {
++	requestId: string;
++	coldTerminal: boolean;
++}
++
++export type PresentationUnavailableReason =
++	/** The renderer is stopped. Nothing is painted over whatever now owns the terminal. */
++	| "renderer-stopped"
++	/** The renderer started but has released the screen. */
++	| "screen-released"
++	/**
++	 * This renderer mints no complete-frame receipt. Reported by the capability preflight, before any
++	 * mode byte or render is written, so a refusal never leaves half a presentation behind.
++	 */
++	| "no-complete-frame-support";
++
++export type PresentationOutcome =
++	| { presented: true; receipt: PresentationFrameReceipt }
++	| { presented: false; reason: PresentationUnavailableReason };
++
++export const NATIVE_PRESENTATION_TUI = Symbol.for("@earendil-works/pi-tui/native-presentation");
++
++/**
++ * A renderer that can present to a cold terminal and report frame receipts.
++ *
++ * The symbol brand follows the same optional-capability shape as `ViewportTUI`, so the public `TUI`
++ * interface keeps its 0.84.3 member list and a third-party `TUI` implementation still compiles. Only a
++ * renderer that actually hands complete frames over carries the brand: `TuiBase` supplies the methods but
++ * is not branded, so a third-party subclass is reported as unsupported instead of being asked to present.
++ */
++export interface NativePresentationTui {
++	readonly [NATIVE_PRESENTATION_TUI]: true;
++	/**
++	 * Reassert cold state when asked, render one complete frame synchronously, and return the receipt for
++	 * the frame that was handed to the terminal. Never merely schedules a render.
++	 */
++	presentNow(request: PresentationRequest): PresentationOutcome;
++	onFrameHandedToTerminal(listener: (receipt: PresentationFrameReceipt) => void): () => void;
++	lastFrameReceipt(): PresentationFrameReceipt | undefined;
++}
++
++export function isNativePresentationTui(candidate: unknown): candidate is NativePresentationTui {
++	if (candidate === null || (typeof candidate !== "object" && typeof candidate !== "function")) return false;
++	return (candidate as Record<PropertyKey, unknown>)[NATIVE_PRESENTATION_TUI] === true;
++}
+diff --git a/packages/tui/src/terminal.ts b/packages/tui/src/terminal.ts
+index f858bf9f25240b764c0bfcf81c6aedbae316f4b0..3cade5664373db6b8a4d1a926d35b1106b9cd497 100644
+--- a/packages/tui/src/terminal.ts
++++ b/packages/tui/src/terminal.ts
+@@ -4,6 +4,7 @@ import * as path from "node:path";
+ import { setKittyProtocolActive } from "./keys.ts";
+ import { isNativeModifierPressed } from "./native-modifiers.ts";
+ import { getNativeModuleCandidates } from "./native-module-path.ts";
++import type { ReassertedTerminalModes } from "./native-presentation.ts";
+ import { StdinBuffer } from "./stdin-buffer.ts";
+ 
+ const cjsRequire = createRequire(import.meta.url);
+@@ -15,6 +16,10 @@ const NATIVE_SHIFT_ENTER_SEQUENCE = "\x1b[13;2u";
+ const DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS = 7;
+ const KEYBOARD_PROTOCOL_RESPONSE_FRAGMENT_TIMEOUT_MS = 150;
+ const KITTY_KEYBOARD_PROTOCOL_QUERY = `\x1b[>${DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS}u\x1b[?u\x1b[c`;
++// `CSI = flags ; 1 u` sets the flags of the entry already on the terminal's keyboard stack. Unlike the
++// `CSI > flags u` push used during negotiation, re-emitting it leaves that stack balanced against the single
++// pop at shutdown, which is what makes it safe to reassert for a terminal that attached after startup.
++const KITTY_KEYBOARD_SET_FLAGS_SEQUENCE = `\x1b[=${DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS};1u`;
+ 
+ export type KeyboardProtocolNegotiationSequence =
+ 	| { type: "kitty-flags"; flags: number }
+@@ -99,6 +104,16 @@ export interface Terminal {
+ 
+ 	// Progress indicator (OSC 9;4)
+ 	setProgress(active: boolean): void;
++
++	/**
++	 * Re-emit the modes this terminal already negotiated, for a terminal that missed startup, and report
++	 * what was re-emitted.
++	 *
++	 * Optional: a Terminal that owns no negotiated mode state omits it. An implementation must never issue
++	 * a capability query here — a late query reaches a negotiation path that already completed — and must
++	 * never re-push a mode stack that is popped once at shutdown.
++	 */
++	reassertNegotiatedModes?(): ReassertedTerminalModes;
+ }
+ 
+ const DEFAULT_ESCAPE_TIMEOUT_MS = 10;
+@@ -135,6 +150,7 @@ export class ProcessTerminal implements Terminal {
+ 	private stdinBuffer?: StdinBuffer;
+ 	private stdinDataHandler?: (data: string) => void;
+ 	private progressInterval?: ReturnType<typeof setInterval>;
++	private lastTitle?: string;
+ 	private writeLogPath = (() => {
+ 		const env = process.env.PI_TUI_WRITE_LOG || "";
+ 		if (!env) return "";
+@@ -525,9 +541,56 @@ export class ProcessTerminal implements Terminal {
+ 
+ 	setTitle(title: string): void {
+ 		// OSC 0;title BEL - set terminal window title
++		this.lastTitle = title;
+ 		process.stdout.write(`\x1b]0;${title}\x07`);
+ 	}
+ 
++	/**
++	 * Re-emit the modes a cold terminal missed, and report what was re-emitted.
++	 *
++	 * Bracketed paste, `modifyOtherKeys`, the window title and the progress indicator are idempotent: the
++	 * terminal ends in the same state whether it receives them once or twice. The Kitty keyboard protocol
++	 * is reasserted in its set-flags form, `CSI = flags ; 1 u`, which rewrites the flags of the entry
++	 * already on the terminal's stack; the push form `CSI > flags u` is never re-emitted, because
++	 * {@link stop} pops exactly once and a second push would leave that stack unbalanced. A terminal that
++	 * received the startup push therefore ends in the same state, and a terminal that missed it now has the
++	 * negotiated flags.
++	 *
++	 * No query is issued: the negotiation this reasserts already happened, and a second `CSI ? u` or DA
++	 * would reach a completed negotiation path.
++	 */
++	reassertNegotiatedModes(): ReassertedTerminalModes {
++		const reemitted: string[] = [];
++		process.stdout.write("\x1b[?2004h");
++		reemitted.push("bracketed-paste");
++		if (this._kittyProtocolActive) {
++			process.stdout.write(KITTY_KEYBOARD_SET_FLAGS_SEQUENCE);
++			reemitted.push("kitty-keyboard-flags");
++		}
++		if (!this._kittyProtocolActive && this._modifyOtherKeysActive) {
++			process.stdout.write("\x1b[>4;2m");
++			reemitted.push("modify-other-keys");
++		}
++		if (this.lastTitle !== undefined) {
++			process.stdout.write(`\x1b]0;${this.lastTitle}\x07`);
++			reemitted.push("title");
++		}
++		const progress = this.progressInterval !== undefined;
++		if (progress) {
++			process.stdout.write(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
++			reemitted.push("progress");
++		}
++		return {
++			reemitted,
++			kittyKeyboard: this._kittyProtocolActive
++				? { flags: DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS, reemitted: true, mechanism: "set-flags" as const }
++				: undefined,
++			modifyOtherKeys: this._modifyOtherKeysActive,
++			title: this.lastTitle,
++			progress,
++		};
++	}
++
+ 	setProgress(active: boolean): void {
+ 		if (active) {
+ 			// OSC 9;4;3 - indeterminate progress
+diff --git a/packages/tui/src/tui-alt-screen.ts b/packages/tui/src/tui-alt-screen.ts
+index 855fa0f710cfcf7eea79c9b80d0549321798367a..be0f6df32eddcfa0cbce1f302aa6a5294ded5c0a 100644
+--- a/packages/tui/src/tui-alt-screen.ts
++++ b/packages/tui/src/tui-alt-screen.ts
+@@ -16,6 +16,12 @@ import {
+ 	renderLayoutFrame,
+ 	type ScrollbarGeometry,
+ } from "./layout.ts";
++import {
++	type ColdReassertion,
++	NATIVE_PRESENTATION_TUI,
++	type NativePresentationTui,
++	type PresentationUnavailableReason,
++} from "./native-presentation.ts";
+ import type { Terminal } from "./terminal.ts";
+ import {
+ 	deleteAllKittyImages,
+@@ -161,9 +167,10 @@ export interface TuiAltScreenOptions {
+ }
+ 
+ /** Alternate-screen TUI with a scrollable, application-owned viewport. */
+-export class TuiAltScreen extends TuiBase implements ViewportTUI {
++export class TuiAltScreen extends TuiBase implements ViewportTUI, NativePresentationTui {
+ 	readonly mode = "fullscreen" as const;
+ 	readonly [VIEWPORT_TUI] = true as const;
++	readonly [NATIVE_PRESENTATION_TUI] = true as const;
+ 	private previousScreen: string[] = [];
+ 	private lastDocument: string[] = [];
+ 	private previousScreenWidth = 0;
+@@ -275,20 +282,59 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
+ 		this.pressedUrl = undefined;
+ 		this.selectionDragged = false;
+ 		this.resetRenderState();
++		this.terminal.write(
++			`${ENTER_ALT_SCREEN}${DISABLE_AUTOWRAP}${this.mouseEnabled ? this.mouseTrackingSequence() : ""}\x1b[2J\x1b[H\x1b[?25l`,
++		);
++	}
++
++	/**
++	 * Mouse tracking for this environment. Multiplexers can lag when every pointer movement is forwarded;
++	 * button-motion tracking preserves clicks, wheel events, selections and scrollbar dragging.
++	 */
++	private mouseTrackingSequence(): string {
+ 		const term = process.env.TERM?.toLowerCase() ?? "";
+-		// Multiplexers can lag when every pointer movement is forwarded. Button-motion
+-		// tracking preserves clicks, wheel events, selections, and scrollbar dragging.
+-		const mouseSequence =
+-			process.env.TMUX !== undefined ||
++		return process.env.TMUX !== undefined ||
+ 			process.env.ZELLIJ !== undefined ||
+ 			process.env.STY !== undefined ||
+ 			term.startsWith("tmux") ||
+ 			term.startsWith("screen")
+-				? ENABLE_BUTTON_MOTION_MOUSE
+-				: ENABLE_ALL_MOTION_MOUSE;
++			? ENABLE_BUTTON_MOTION_MOUSE
++			: ENABLE_ALL_MOTION_MOUSE;
++	}
++
++	/** Every full redraw is one complete frame, written in one `write`, so this renderer mints receipts. */
++	protected override completeFramePresentation(): PresentationUnavailableReason | undefined {
++		return undefined;
++	}
++
++	protected override screenReleasedReason(): PresentationUnavailableReason | undefined {
++		return this.altScreenActive ? undefined : "screen-released";
++	}
++
++	/**
++	 * Reassert what a cold terminal missed, and nothing else.
++	 *
++	 * The alt-screen entry, autowrap and mouse modes are the same idempotent set-modes
++	 * {@link beforeTerminalStart} emits, without its clear, its selection reset, its search close or its
++	 * `lastDocument` reset — a presentation must leave draft, focus, overlays, selection, search and scroll
++	 * position exactly as they are.
++	 *
++	 * Clearing `uploadedKittyImages` is the part no caller outside this class can do. `resetRenderState()`
++	 * empties the text screen but keeps that cache, so `prepareKittyScreen` would emit a placement for an
++	 * image the cold terminal never received. Dropping it makes the forced frame retransmit every visible
++	 * image in full.
++	 */
++	protected override reassertPresentation(): ColdReassertion {
++		const base = super.reassertPresentation();
++		const invalidatedImageIds = [...this.uploadedKittyImages.keys()];
++		this.uploadedKittyImages.clear();
++		const rendererModes = ["alt-screen", "autowrap-off"];
++		if (this.mouseEnabled) rendererModes.push("mouse-tracking");
++		rendererModes.push("cursor-hidden");
+ 		this.terminal.write(
+-			`${ENTER_ALT_SCREEN}${DISABLE_AUTOWRAP}${this.mouseEnabled ? mouseSequence : ""}\x1b[2J\x1b[H\x1b[?25l`,
++			`${ENTER_ALT_SCREEN}${DISABLE_AUTOWRAP}${this.mouseEnabled ? this.mouseTrackingSequence() : ""}\x1b[?25l`,
+ 		);
++		return { ...base, rendererModes, imageProtocol: this.imageProtocol, invalidatedImageIds };
+ 	}
+ 
+ 	protected override beforeTerminalStop(_options: TuiStopOptions): void {
+@@ -1316,5 +1362,10 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
+ 		this.previousScreenWidth = width;
+ 		this.previousScreenHeight = height;
+ 		this.currentLayout = nextLayout;
++		// Only a full redraw is a complete frame. An incremental frame writes the changed rows alone, so it
++		// is not something a presentation receipt may name.
++		if (fullRedraw) {
++			this.notifyFrameHandedToTerminal({ columns: width, rows: height, byteLength: Buffer.byteLength(buffer) });
++		}
+ 	}
+ }
+diff --git a/packages/tui/src/tui-main-screen.ts b/packages/tui/src/tui-main-screen.ts
+index bb2d6785d0d6c08177a287f02f7852ccf4ca6506..4798c3c9ed68a67fd3f6c3172e22cd38dd5bd7af 100644
+--- a/packages/tui/src/tui-main-screen.ts
++++ b/packages/tui/src/tui-main-screen.ts
+@@ -1,6 +1,12 @@
+ import * as fs from "node:fs";
+ import * as path from "node:path";
+-import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
++import {
++	type ColdReassertion,
++	NATIVE_PRESENTATION_TUI,
++	type NativePresentationTui,
++	type PresentationUnavailableReason,
++} from "./native-presentation.ts";
++import { deleteKittyImage, getCapabilities, isImageLine } from "./terminal-image.ts";
+ import { type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
+ import { visibleWidth } from "./utils.ts";
+ 
+@@ -54,8 +60,9 @@ export interface TuiMainScreenRenderState {
+ }
+ 
+ /** TUI implementation that renders into the terminal's main screen and scrollback. */
+-export class TuiMainScreen extends TuiBase implements TUI {
++export class TuiMainScreen extends TuiBase implements TUI, NativePresentationTui {
+ 	readonly mode = "regular" as const;
++	readonly [NATIVE_PRESENTATION_TUI] = true as const;
+ 	private previousLines: string[] = [];
+ 	private previousKittyImageIds = new Set<number>();
+ 	private previousWidth = 0;
+@@ -88,6 +95,31 @@ export class TuiMainScreen extends TuiBase implements TUI {
+ 		this.previousViewportTop = state.previousViewportTop;
+ 	}
+ 
++	/**
++	 * A forced render on the main screen is a full redraw: `resetRenderState` drops the diff state, so
++	 * `doRender` takes its `fullRender` path and writes the whole current UI in one `write`. That is the
++	 * complete frame a presentation receipt names.
++	 */
++	protected override completeFramePresentation(): PresentationUnavailableReason | undefined {
++		return undefined;
++	}
++
++	/**
++	 * Reassert what a cold terminal missed.
++	 *
++	 * This renderer owns no modes of its own — no alternate screen, no autowrap change, no mouse tracking —
++	 * so the terminal-owned modes are the whole of it, and there is no per-terminal image transmission cache
++	 * to invalidate: every visible image's transmission is carried inline in the line this renderer draws,
++	 * so the forced frame retransmits by itself. The protocol is still reported, so a host is not told that
++	 * images are unsupported.
++	 *
++	 * The forced frame clears the screen and the scrollback, exactly as a stock `requestRender(true)` on
++	 * this renderer already does. Neither preserves scrollback a warm client had.
++	 */
++	protected override reassertPresentation(): ColdReassertion {
++		return { ...super.reassertPresentation(), imageProtocol: getCapabilities().images };
++	}
++
+ 	protected override resetRenderState(): void {
+ 		this.previousLines = [];
+ 		this.previousWidth = -1;
+@@ -248,6 +280,9 @@ export class TuiMainScreen extends TuiBase implements TUI {
+ 			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+ 			this.previousWidth = width;
+ 			this.previousHeight = height;
++			// One complete frame, handed over in the single `write` above. The incremental paths below write
++			// fragments and mint nothing.
++			this.notifyFrameHandedToTerminal({ columns: width, rows: height, byteLength: Buffer.byteLength(buffer) });
+ 		};
+ 
+ 		const debugRedraw = process.env.PI_DEBUG_REDRAW === "1";
+diff --git a/packages/tui/src/tui.ts b/packages/tui/src/tui.ts
+index 5172a9a142c582f8d8ad9c8c85772f1b093cc5a7..337e15171ac86e6a0379ba2e2fcc7c1ef62875dc 100644
+--- a/packages/tui/src/tui.ts
++++ b/packages/tui/src/tui.ts
+@@ -2,10 +2,18 @@
+  * Minimal TUI implementation with differential rendering
+  */
+ 
++import { randomUUID } from "node:crypto";
+ import * as os from "node:os";
+ import * as path from "node:path";
+ import { performance } from "node:perf_hooks";
+ import { isKeyRelease, matchesKey } from "./keys.ts";
++import {
++	type ColdReassertion,
++	type PresentationFrameReceipt,
++	type PresentationOutcome,
++	type PresentationRequest,
++	type PresentationUnavailableReason,
++} from "./native-presentation.ts";
+ import type { Terminal } from "./terminal.ts";
+ import {
+ 	isOsc11BackgroundColorResponse,
+@@ -331,6 +339,10 @@ export function isViewportTUI(tui: TUI): tui is ViewportTUI {
+ export abstract class TuiBase extends Container implements TUI {
+ 	abstract readonly mode: TuiMode;
+ 	public terminal: Terminal;
++	private frameListeners = new Set<(receipt: PresentationFrameReceipt) => void>();
++	private frameSequence = 0;
++	private lastFrame: PresentationFrameReceipt | undefined;
++	private pendingPresentation: { requestId: string; cold: ColdReassertion | undefined } | undefined;
+ 	private focusedComponent: Component | null = null;
+ 	private inputListeners = new Set<TuiInputListener>();
+ 
+@@ -371,6 +383,102 @@ export abstract class TuiBase extends Container implements TUI {
+ 
+ 	protected abstract doRender(): void;
+ 
++	/**
++	 * Bring a cold terminal up to the current native UI and return the receipt for the frame that was
++	 * handed to it.
++	 *
++	 * Synchronous by construction: the receipt has to name the frame this request produced, so the render
++	 * is forced here rather than requested. A renderer that is stopped or has released the screen presents
++	 * nothing, because whatever now owns the terminal must not be painted over.
++	 */
++	presentNow(request: PresentationRequest): PresentationOutcome {
++		if (this.stopped) return { presented: false, reason: "renderer-stopped" };
++		// Capability preflight, before any byte is written: a renderer that mints no complete-frame receipt
++		// must refuse without emitting mode bytes or half a render.
++		const unsupported = this.completeFramePresentation();
++		if (unsupported) return { presented: false, reason: unsupported };
++		const released = this.screenReleasedReason();
++		if (released) return { presented: false, reason: released };
++
++		const cold = request.coldTerminal ? this.reassertPresentation() : undefined;
++		const before = this.lastFrame;
++		this.pendingPresentation = { requestId: request.requestId, cold };
++		try {
++			this.renderNow(true);
++		} finally {
++			this.pendingPresentation = undefined;
++		}
++		const receipt = this.lastFrame;
++		if (!receipt || receipt === before || receipt.requestId !== request.requestId) {
++			return { presented: false, reason: "no-complete-frame-support" };
++		}
++		return { presented: true, receipt };
++	}
++
++	onFrameHandedToTerminal(listener: (receipt: PresentationFrameReceipt) => void): () => void {
++		this.frameListeners.add(listener);
++		return () => {
++			this.frameListeners.delete(listener);
++		};
++	}
++
++	lastFrameReceipt(): PresentationFrameReceipt | undefined {
++		return this.lastFrame;
++	}
++
++	/**
++	 * Whether this renderer hands complete frames to the terminal, and why not when it does not.
++	 *
++	 * `TuiBase` owns no render loop, so it answers "no". Each native renderer that mints a receipt in its
++	 * own `doRender` overrides this and carries the `NATIVE_PRESENTATION_TUI` brand, so a third-party
++	 * subclass is refused by preflight instead of being half-presented.
++	 */
++	protected completeFramePresentation(): PresentationUnavailableReason | undefined {
++		return "no-complete-frame-support";
++	}
++
++	/** A started renderer that is not currently holding the screen names why. */
++	protected screenReleasedReason(): PresentationUnavailableReason | undefined {
++		return undefined;
++	}
++
++	/**
++	 * Re-emit the modes a cold terminal missed. Deliberately not `beforeTerminalStart()`: that also clears
++	 * selection, search, click state and the last document, which a presentation must never touch.
++	 */
++	protected reassertPresentation(): ColdReassertion {
++		const terminalModes = this.terminal.reassertNegotiatedModes?.();
++		if (this.terminalColorSchemeNotificationsEnabled) this.terminal.write("\x1b[?2031h");
++		return {
++			terminalModes,
++			rendererModes: [],
++			colorSchemeNotifications: this.terminalColorSchemeNotificationsEnabled,
++			imageProtocol: null,
++			invalidatedImageIds: [],
++		};
++	}
++
++	/**
++	 * Called by a renderer that has just handed one complete frame to the terminal.
++	 *
++	 * The bytes are already written when this runs, and the boolean `process.stdout.write` returns is
++	 * deliberately not consulted anywhere: `false` means the sink is above its high-water mark and has
++	 * still accepted the bytes, so treating it as a failure would duplicate output.
++	 */
++	protected notifyFrameHandedToTerminal(frame: { columns: number; rows: number; byteLength: number }): void {
++		const receipt: PresentationFrameReceipt = {
++			frameId: randomUUID(),
++			sequence: ++this.frameSequence,
++			requestId: this.pendingPresentation?.requestId,
++			columns: frame.columns,
++			rows: frame.rows,
++			byteLength: frame.byteLength,
++			cold: this.pendingPresentation?.cold,
++		};
++		this.lastFrame = receipt;
++		for (const listener of this.frameListeners) listener(receipt);
++	}
++
+ 	protected resetRenderState(): void {}
+ 
+ 	protected beforeTerminalStart(): void {}
+diff --git a/packages/tui/test/native-presentation.test.ts b/packages/tui/test/native-presentation.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..595cd70bfbc6fc2c5087eea98e7e2f3f4e06db5a
+--- /dev/null
++++ b/packages/tui/test/native-presentation.test.ts
+@@ -0,0 +1,370 @@
++import assert from "node:assert";
++import { spawnSync } from "node:child_process";
++import { mkdtempSync, readFileSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import path from "node:path";
++import { after, describe, it } from "node:test";
++import { HStack } from "../src/components/h-stack.ts";
++import { Image } from "../src/components/image.ts";
++import { Text } from "../src/components/text.ts";
++import { VStack } from "../src/components/v-stack.ts";
++import { isNativePresentationTui } from "../src/native-presentation.ts";
++import { resetCapabilitiesCache, setCapabilities } from "../src/terminal-image.ts";
++import { TuiAltScreen } from "../src/tui-alt-screen.ts";
++import { TuiMainScreen } from "../src/tui-main-screen.ts";
++import { TuiBase } from "../src/tui.ts";
++import { VirtualTerminal } from "./virtual-terminal.ts";
++
++class RecordingTerminal extends VirtualTerminal {
++	readonly writes: string[] = [];
++
++	override write(data: string): void {
++		this.writes.push(data);
++		super.write(data);
++	}
++
++	since(index: number): string {
++		return this.writes.slice(index).join("");
++	}
++}
++
++const ENTER_ALT_SCREEN = "\x1b[?1049h";
++const DISABLE_AUTOWRAP = "\x1b[?7l";
++
++/**
++ * A referenced timer for the length of the run.
++ *
++ * `VirtualTerminal.waitForRender()` resolves from the emulator's own write-drain callback. With nothing
++ * else referenced, Node drains the loop, exits zero, and the runner prints a truncated report in which the
++ * awaiting case simply never appears — a silent pass. Holding one timer makes a stalled await a visible
++ * hang instead of a missing case.
++ */
++const keepEventLoopReferenced = setInterval(() => {}, 1_000);
++after(() => clearInterval(keepEventLoopReferenced));
++
++class ModeTrackingTerminal extends RecordingTerminal {
++	reassertCalls = 0;
++
++	override reassertNegotiatedModes() {
++		this.reassertCalls += 1;
++		this.write("\x1b[?2004h");
++		this.write("\x1b[=7;1u");
++		return {
++			reemitted: ["bracketed-paste", "kitty-keyboard-flags"],
++			kittyKeyboard: { flags: 7, reemitted: true, mechanism: "set-flags" as const },
++			modifyOtherKeys: false,
++			title: "pi",
++			progress: false,
++		};
++	}
++}
++
++describe("native presentation (seam E)", () => {
++	it("brands the alt-screen renderer and reports the frame it handed to the terminal", async () => {
++		const terminal = new RecordingTerminal(20, 4);
++		const tui = new TuiAltScreen(terminal);
++		tui.addChild(new Text("hello", 0, 0));
++		tui.start();
++		await terminal.waitForRender();
++
++		assert.strictEqual(isNativePresentationTui(tui), true);
++		const first = tui.lastFrameReceipt();
++		assert.ok(first, "the started renderer has handed at least one frame to the terminal");
++		assert.strictEqual(first.columns, 20);
++		assert.strictEqual(first.rows, 4);
++		assert.strictEqual(first.requestId, undefined);
++		assert.strictEqual(first.cold, undefined);
++		assert.ok(first.byteLength > 0);
++
++		tui.stop();
++	});
++
++	it("mints a nonce only for a frame that reached the terminal, and never for a scheduled render", async () => {
++		const terminal = new RecordingTerminal(20, 4);
++		const tui = new TuiAltScreen(terminal);
++		// A multibyte frame, so a UTF-16 code-unit count and a UTF-8 byte count cannot be confused.
++		tui.addChild(new Text("héllo — ünïcode", 0, 0));
++		tui.start();
++		await terminal.waitForRender();
++
++		const received: string[] = [];
++		const unsubscribe = tui.onFrameHandedToTerminal((receipt) => received.push(receipt.frameId));
++
++		tui.requestRender();
++		assert.deepStrictEqual(received, [], "requesting a render hands nothing to the terminal yet");
++
++		const before = terminal.writes.length;
++		const outcome = tui.presentNow({ requestId: "attach-1:1:7", coldTerminal: true });
++		assert.strictEqual(outcome.presented, true);
++		if (!outcome.presented) throw new Error("unreachable");
++		assert.strictEqual(outcome.receipt.requestId, "attach-1:1:7");
++		assert.deepStrictEqual(received, [outcome.receipt.frameId]);
++		assert.ok(terminal.since(before).length > 0, "the frame bytes were written before the nonce existed");
++		assert.strictEqual(tui.lastFrameReceipt()?.frameId, outcome.receipt.frameId);
++
++		const frame = terminal.writes.slice(before).find((data) => data.includes("\x1b[?2026h"));
++		assert.ok(frame, "one synchronized-output frame was written");
++		assert.strictEqual(outcome.receipt.byteLength, Buffer.byteLength(frame), "the receipt counts UTF-8 bytes");
++		assert.ok(Buffer.byteLength(frame) > frame.length, "the frame really does hold multibyte text");
++
++		unsubscribe();
++		tui.stop();
++	});
++
++	it("reasserts the modes a cold terminal missed, and asserts none of them on a warm presentation", async () => {
++		const terminal = new ModeTrackingTerminal(20, 4);
++		const tui = new TuiAltScreen(terminal);
++		tui.addChild(new Text("hello", 0, 0));
++		tui.start();
++		await terminal.waitForRender();
++
++		const beforeCold = terminal.writes.length;
++		const cold = tui.presentNow({ requestId: "cold", coldTerminal: true });
++		const coldBytes = terminal.since(beforeCold);
++		assert.strictEqual(cold.presented, true);
++		if (!cold.presented) throw new Error("unreachable");
++		assert.ok(coldBytes.includes(ENTER_ALT_SCREEN), "alt-screen entry is reasserted");
++		assert.ok(coldBytes.includes(DISABLE_AUTOWRAP), "autowrap stays disabled");
++		assert.ok(coldBytes.includes("\x1b[?1006h"), "mouse tracking is reasserted");
++		assert.ok(coldBytes.includes("\x1b[?2004h"), "the terminal reasserted bracketed paste");
++		assert.strictEqual(terminal.reassertCalls, 1);
++		assert.deepStrictEqual(cold.receipt.cold?.rendererModes, [
++			"alt-screen",
++			"autowrap-off",
++			"mouse-tracking",
++			"cursor-hidden",
++		]);
++		assert.deepStrictEqual(cold.receipt.cold?.terminalModes?.kittyKeyboard, {
++			flags: 7,
++			reemitted: true,
++			mechanism: "set-flags",
++		});
++
++		const beforeWarm = terminal.writes.length;
++		const warm = tui.presentNow({ requestId: "warm", coldTerminal: false });
++		const warmBytes = terminal.since(beforeWarm);
++		assert.strictEqual(warm.presented, true);
++		if (!warm.presented) throw new Error("unreachable");
++		assert.strictEqual(warm.receipt.cold, undefined);
++		assert.ok(!warmBytes.includes(ENTER_ALT_SCREEN), "a warm presentation does not re-enter the alt screen");
++		assert.strictEqual(terminal.reassertCalls, 1, "a warm presentation asks the terminal for nothing");
++
++		tui.stop();
++	});
++
++	it("issues no capability query while reasserting, so a completed negotiation is not reopened", async () => {
++		const terminal = new ModeTrackingTerminal(20, 4);
++		const tui = new TuiAltScreen(terminal);
++		tui.addChild(new Text("hello", 0, 0));
++		tui.start();
++		await terminal.waitForRender();
++
++		const before = terminal.writes.length;
++		tui.presentNow({ requestId: "cold", coldTerminal: true });
++		const bytes = terminal.since(before);
++		assert.ok(!bytes.includes("\x1b[c"), "no device attributes query");
++		assert.ok(!bytes.includes("\x1b[?u"), "no Kitty keyboard capability query");
++		assert.ok(!bytes.includes("\x1b[16t"), "no cell size query");
++		assert.ok(!bytes.includes("\x1b]11;?"), "no background colour query");
++		assert.ok(!bytes.includes("\x1b[>7u"), "the Kitty keyboard stack is not pushed a second time");
++
++		tui.stop();
++	});
++
++	it("retransmits Kitty images for a cold terminal and reuses placements for a warm one", async () => {
++		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
++		try {
++			const terminal = new RecordingTerminal(20, 6);
++			const tui = new TuiAltScreen(terminal);
++			const label = new Text("left", 0, 0);
++			const image = new Image(
++				"A".repeat(8192),
++				"image/png",
++				{ fallbackColor: (value) => value },
++				{},
++				{ widthPx: 100, heightPx: 100 },
++			);
++			tui.setLayoutRoot(
++				new VStack([
++					{ component: new Text("header", 0, 0), basis: "auto" },
++					{
++						component: new HStack([
++							{ component: label, basis: 10 },
++							{ component: image, basis: 10 },
++						]),
++						basis: 4,
++					},
++				]),
++			);
++			tui.start();
++			await terminal.waitForRender();
++			assert.ok(terminal.writes.join("").includes("\x1b_Ga=T"), "the first frame transmits the image");
++
++			const beforeWarm = terminal.writes.length;
++			const warm = tui.presentNow({ requestId: "warm", coldTerminal: false });
++			const warmBytes = terminal.since(beforeWarm);
++			assert.strictEqual(warm.presented, true);
++			if (!warm.presented) throw new Error("unreachable");
++			assert.ok(!warmBytes.includes("\x1b_Ga=T"), "a warm presentation does not retransmit a cached image");
++			assert.ok(warmBytes.includes("\x1b_Ga=p"), "a warm presentation reuses the placement");
++
++			const beforeCold = terminal.writes.length;
++			const cold = tui.presentNow({ requestId: "cold", coldTerminal: true });
++			const coldBytes = terminal.since(beforeCold);
++			assert.strictEqual(cold.presented, true);
++			if (!cold.presented) throw new Error("unreachable");
++			assert.ok(coldBytes.includes("\x1b_Ga=T"), "a cold presentation retransmits the image payload");
++			assert.deepStrictEqual(cold.receipt.cold?.imageProtocol, "kitty");
++			assert.ok(
++				(cold.receipt.cold?.invalidatedImageIds.length ?? 0) > 0,
++				"the invalidated transmission cache is reported",
++			);
++
++			tui.stop();
++		} finally {
++			resetCapabilitiesCache();
++		}
++	});
++
++	it("leaves focus, an overlay, the scroll position and search untouched", async () => {
++		const terminal = new RecordingTerminal(24, 5);
++		const tui = new TuiAltScreen(terminal);
++		const focusTarget = {
++			focused: false,
++			keys: [] as string[],
++			handleInput(data: string) {
++				this.keys.push(data);
++			},
++			render: () => ["editor draft"],
++			invalidate: () => {},
++		};
++		tui.addChild(new Text(Array.from({ length: 40 }, (_, index) => `line ${index + 1}`).join("\n"), 0, 0));
++		tui.addChild(focusTarget);
++		tui.start();
++		await terminal.waitForRender();
++
++		tui.setFocus(focusTarget);
++		// Non-capturing so focus stays where the operator put it: the case is that a presentation changes
++		// neither the focused component nor the overlay stack.
++		const overlay = tui.showOverlay(
++			{ render: () => ["overlay body"], invalidate: () => {} },
++			{ anchor: "center", nonCapturing: true },
++		);
++		tui.scrollToTop();
++		await terminal.waitForRender();
++		const focusBefore = tui.getFocusedComponent();
++		const scrollTop = tui.viewportTop;
++		const following = tui.isFollowingOutput;
++
++		const outcome = tui.presentNow({ requestId: "cold", coldTerminal: true });
++		assert.strictEqual(outcome.presented, true);
++		assert.strictEqual(tui.getFocusedComponent(), focusBefore, "focus survives a cold presentation");
++		assert.strictEqual(focusBefore, focusTarget);
++		assert.strictEqual(tui.hasOverlay(), true, "the overlay survives");
++		assert.strictEqual(tui.viewportTop, scrollTop, "the scroll position survives");
++		assert.strictEqual(tui.isFollowingOutput, following);
++		assert.ok(
++			terminal.getViewport().some((line) => line.includes("overlay body")),
++			"the presented frame is the current native UI, not a replayed buffer",
++		);
++
++		overlay.hide();
++		tui.stop();
++	});
++
++	it("presents nothing once the renderer has released the terminal", async () => {
++		const terminal = new RecordingTerminal(20, 4);
++		const tui = new TuiAltScreen(terminal);
++		tui.addChild(new Text("hello", 0, 0));
++		tui.start();
++		await terminal.waitForRender();
++		tui.stop();
++
++		const before = terminal.writes.length;
++		const outcome = tui.presentNow({ requestId: "cold", coldTerminal: true });
++		assert.deepStrictEqual(outcome, { presented: false, reason: "renderer-stopped" });
++		assert.strictEqual(terminal.since(before), "", "a stopped renderer writes nothing");
++	});
++
++	it("presents a complete frame from the main-screen renderer and mints its receipt", () => {
++		const terminal = new ModeTrackingTerminal(24, 6);
++		const tui = new TuiMainScreen(terminal);
++		tui.addChild(new Text("current ui", 0, 0));
++		tui.start();
++		// Rendered synchronously rather than through the emulator's flush: this case is about what the
++		// renderer hands over, and the main screen's first frame is already a complete one.
++		tui.renderNow();
++		assert.ok(tui.lastFrameReceipt(), "the first main-screen frame is complete and minted a receipt");
++
++		assert.strictEqual(isNativePresentationTui(tui), true, "the main-screen renderer carries the brand");
++		const before = terminal.writes.length;
++		const outcome = tui.presentNow({ requestId: "main:1:1", coldTerminal: true });
++		assert.strictEqual(outcome.presented, true);
++		if (!outcome.presented) throw new Error("unreachable");
++		assert.strictEqual(outcome.receipt.requestId, "main:1:1");
++		assert.strictEqual(outcome.receipt.columns, 24);
++		assert.strictEqual(outcome.receipt.rows, 6);
++		assert.strictEqual(terminal.reassertCalls, 1, "the terminal's own modes are reasserted for a cold client");
++		const frames = terminal.writes.slice(before).filter((data) => data.includes("\x1b[?2026h"));
++		assert.strictEqual(frames.length, 1, "one complete frame, not a stream of fragments");
++		assert.strictEqual(outcome.receipt.byteLength, Buffer.byteLength(frames[0]!));
++		assert.ok(frames[0]!.includes("current ui"), "the frame carries the current native UI");
++		// The main screen owns no modes of its own: no alt screen, no autowrap change, no mouse tracking.
++		assert.deepStrictEqual(outcome.receipt.cold?.rendererModes, []);
++		assert.deepStrictEqual(outcome.receipt.cold?.invalidatedImageIds, []);
++		assert.strictEqual(tui.lastFrameReceipt()?.frameId, outcome.receipt.frameId);
++
++		tui.stop();
++	});
++
++	it("refuses a renderer with no complete-frame handoff before it writes anything", () => {
++		/** A third-party renderer that only ever hands over fragments, as a host might implement. */
++		class FragmentTui extends TuiBase {
++			readonly mode = "regular" as const;
++			protected doRender(): void {
++				this.terminal.write("fragment");
++			}
++		}
++		const terminal = new RecordingTerminal(20, 4);
++		const tui = new FragmentTui(terminal);
++		tui.addChild(new Text("hello", 0, 0));
++		tui.start();
++
++		assert.strictEqual(isNativePresentationTui(tui), false, "an unbranded renderer is never asked to present");
++		const before = terminal.writes.length;
++		const outcome = tui.presentNow({ requestId: "cold", coldTerminal: true });
++		assert.deepStrictEqual(outcome, { presented: false, reason: "no-complete-frame-support" });
++		assert.strictEqual(terminal.since(before), "", "the capability preflight ran before any byte was written");
++		assert.strictEqual(tui.lastFrameReceipt(), undefined);
++
++		tui.stop();
++	});
++
++	it("hands one copy of a real ProcessTerminal frame over when the sink reports backpressure, and sets the negotiated Kitty keyboard flags without a second push", () => {
++		// In its own process: see test/process-terminal-backpressure.ts for why.
++		const directory = mkdtempSync(path.join(tmpdir(), "process-terminal-backpressure-"));
++		const resultPath = path.join(directory, "observed.json");
++		const run = spawnSync(process.execPath, ["test/process-terminal-backpressure.ts", resultPath], {
++			cwd: process.cwd(),
++			encoding: "utf8",
++		});
++		assert.strictEqual(run.status, 0, `${run.stdout}\n${run.stderr}`);
++		const observed = JSON.parse(readFileSync(resultPath, "utf8"));
++
++		assert.strictEqual(observed.kittyProtocolActive, true, "the negotiation this reasserts actually happened");
++		assert.strictEqual(observed.presented, true);
++		assert.strictEqual(observed.frameByteLengths.length, 1, "backpressure is not a reason to write the frame twice");
++		assert.strictEqual(observed.receipt.byteLength, observed.frameByteLengths[0]);
++		assert.ok(
++			observed.bytes.includes("\x1b[=7;1u"),
++			"the negotiated Kitty keyboard flags are set for the cold client",
++		);
++		assert.ok(!observed.bytes.includes("\x1b[>7u"), "the keyboard stack is not pushed a second time");
++		assert.deepStrictEqual(observed.receipt.cold.terminalModes.kittyKeyboard, {
++			flags: 7,
++			reemitted: true,
++			mechanism: "set-flags",
++		});
++		rmSync(directory, { recursive: true, force: true });
++	});
++});
+diff --git a/packages/tui/test/process-terminal-backpressure.ts b/packages/tui/test/process-terminal-backpressure.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..d9fc05f9417e3a9efd94646afe323605114248f1
+--- /dev/null
++++ b/packages/tui/test/process-terminal-backpressure.ts
+@@ -0,0 +1,58 @@
++/**
++ * One cold presentation against a real `ProcessTerminal` whose stdout reports backpressure.
++ *
++ * Run as its own process, not as a case inside the test runner: the only way to observe what
++ * `ProcessTerminal` hands to `process.stdout` is to replace `process.stdout.write`, and a replacement that
++ * returns `false` without ever emitting `drain` stalls the runner's own reporter stream. A child process
++ * has no reporter to stall, so the observation is exact and the suite stays readable.
++ *
++ * Writes its observations as JSON to the path given as the first argument. The terminal negotiates the
++ * Kitty keyboard protocol through its real startup path, by answering the query on stdin.
++ */
++
++import { writeFileSync } from "node:fs";
++import { Text } from "../src/components/text.ts";
++import { ProcessTerminal } from "../src/terminal.ts";
++import { TuiAltScreen } from "../src/tui-alt-screen.ts";
++
++const outputPath = process.argv[2];
++if (!outputPath) throw new Error("usage: process-terminal-backpressure.ts <output json path>");
++
++const chunks: string[] = [];
++const stdout = process.stdout as unknown as { write: unknown };
++// A sink above its high-water mark has accepted the bytes and still returns false. Nothing in Pi reads that
++// boolean, so one presentation must produce exactly one copy of the frame.
++stdout.write = (chunk: string | Uint8Array) => {
++	chunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
++	return false;
++};
++
++const terminal = new ProcessTerminal();
++const tui = new TuiAltScreen(terminal);
++tui.addChild(new Text("current ui", 0, 0));
++tui.start();
++// The real negotiation path: the terminal answers the startup query with its Kitty keyboard flags.
++process.stdin.emit("data", "\x1b[?7u");
++
++setTimeout(() => {
++	// Read before the presentation, because `stop()` clears the negotiated state on the way out.
++	const kittyProtocolActive = terminal.kittyProtocolActive;
++	const before = chunks.length;
++	const outcome = tui.presentNow({ requestId: "process:1:1", coldTerminal: true });
++	const emitted = chunks.slice(before);
++	tui.stop();
++	writeFileSync(
++		outputPath,
++		JSON.stringify({
++			kittyProtocolActive,
++			presented: outcome.presented,
++			receipt: outcome.presented ? outcome.receipt : undefined,
++			frameByteLengths: emitted
++				.filter((data) => data.includes("\x1b[?2026h"))
++				.map((data) => Buffer.byteLength(data)),
++			bytes: emitted.join(""),
++		}),
++	);
++	// Stdin was resumed by the terminal's own start path, so the loop would otherwise stay open.
++	process.exit(0);
++}, 100);

@@ -13,13 +13,15 @@ import {
 	decodeWithStockBuffer,
 	dispatch,
 	dispatchRaw,
-	importBuiltTui,
+	importBuiltTuiIfSelected,
 	loadArtifactsManifest,
 	newAttachmentNamespace,
 	startCapturingTerminal,
 } from "./fixtures/native-ingress/built-pipeline.mjs";
 
-const { tui, manifest, packageVersion } = await importBuiltTui();
+const { selected, tui, manifest, packageVersion } = await importBuiltTuiIfSelected();
+// No cohort selected means the default repository suite is running; these cases need a built artifact.
+const describeCohort = selected ? describe : describe.skip;
 
 let harness;
 
@@ -73,7 +75,7 @@ function registerHost(overrides = {}) {
  * behavioral RED for seam B: against the unpatched pinned build the sequences parse correctly and the
  * attribution is simply absent.
  */
-describe(`native parsing carries provenance (${manifest.mode})`, () => {
+describeCohort(`native parsing carries provenance (${manifest.mode})`, () => {
 	// b1-same-origin-fragments, reached through public StdinBuffer parsing
 	it("reports the origin of a sequence reassembled from two fragments of one attachment", () => {
 		const a = attachment("client-a", 3);
@@ -178,7 +180,7 @@ describe(`native parsing carries provenance (${manifest.mode})`, () => {
 	});
 });
 
-describe(`built pi-tui ${packageVersion} (${manifest.mode})`, () => {
+describeCohort(`built pi-tui ${packageVersion} (${manifest.mode})`, () => {
 	it("names the artifact it is driving, and the Node runtime running the case", () => {
 		const loaded = loadArtifactsManifest();
 		expect(loaded.tuiVersion).toBe("0.84.3");

@@ -1,37 +1,51 @@
 /**
  * Resolve the built native pipeline these tests drive, and drive it.
  *
- * The tests never import pi-tui from a checkout: they import the package root named by
- * `artifacts-manifest.json`, which a SLURM build job writes after producing and installing the packed
- * cohort. One immutable artifact therefore feeds every case here, and the same files can be pointed at
- * the unpatched pinned 0.84.3 install to record behavioral RED against the real native pipeline.
+ * The tests never import pi-tui from a checkout: they import the package root named by an artifacts
+ * manifest, which `write-artifacts-manifest.mjs` produces from a build's own `build-manifest.json` and the
+ * consumer that build installed. One immutable artifact therefore feeds every case here, and the same files
+ * can be pointed at the unpatched pinned 0.84.3 install to record behavioral RED against the real native
+ * pipeline.
+ *
+ * `PI_NATIVE_ARTIFACTS_MANIFEST` names that manifest. It is required rather than defaulted to a path inside
+ * the repository, because a manifest holds absolute paths into one machine's disposable build output: a
+ * committed copy would point every later run at a stale build. Without the variable these cases say which
+ * manifest they need instead of silently driving whatever was left behind.
  */
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
-const MANIFEST = path.join(HERE, "artifacts-manifest.json");
+const LEGACY_MANIFEST = path.join(HERE, "artifacts-manifest.json");
+
+/** The manifest this run drives: `PI_NATIVE_ARTIFACTS_MANIFEST`, or a local uncommitted one. */
+export function artifactsManifestPath() {
+	const selected = process.env.PI_NATIVE_ARTIFACTS_MANIFEST;
+	return selected ? path.resolve(selected) : LEGACY_MANIFEST;
+}
 
 export function loadArtifactsManifest() {
+	const manifestPath = artifactsManifestPath();
 	let raw;
 	try {
-		raw = readFileSync(MANIFEST, "utf8");
+		raw = readFileSync(manifestPath, "utf8");
 	} catch (error) {
 		throw new Error(
-			`${MANIFEST} is missing. These cases drive a built artifact, not the checkout; run the lane's ` +
-				`build job first. Underlying error: ${error.message}`,
+			`${manifestPath} is missing. These cases drive a built artifact, not the checkout. Build the cohort, ` +
+				`write a manifest with test/fixtures/native-ingress/write-artifacts-manifest.mjs, and name it in ` +
+				`PI_NATIVE_ARTIFACTS_MANIFEST. Underlying error: ${error.message}`,
 		);
 	}
 	const manifest = JSON.parse(raw);
 	for (const field of ["mode", "tuiPackageRoot", "tuiVersion"]) {
 		if (typeof manifest[field] !== "string" || manifest[field].length === 0) {
-			throw new Error(`${MANIFEST} is missing a usable "${field}"`);
+			throw new Error(`${manifestPath} is missing a usable "${field}"`);
 		}
 	}
 	if (manifest.mode !== "patched" && manifest.mode !== "baseline") {
-		throw new Error(`${MANIFEST} mode must be "patched" or "baseline", not ${manifest.mode}`);
+		throw new Error(`${manifestPath} mode must be "patched" or "baseline", not ${manifest.mode}`);
 	}
 	return manifest;
 }
@@ -44,6 +58,25 @@ export async function importBuiltTui() {
 	const entry = require.resolve(manifest.tuiPackageRoot);
 	const tui = await import(`file://${entry}`);
 	return { tui, manifest, packageVersion: pkg.version };
+}
+
+/** True when a built cohort is selected for this run, either by the variable or by a local manifest. */
+export function artifactsManifestSelected() {
+	return Boolean(process.env.PI_NATIVE_ARTIFACTS_MANIFEST) || existsSync(LEGACY_MANIFEST);
+}
+
+/**
+ * The built cohort, or an unselected marker.
+ *
+ * The default repository suite runs with no cohort selected, and these cases cannot be run against a
+ * checkout, so they skip rather than fail — the same rule the seam A and seam E suites follow. A selected
+ * cohort still fails loudly when it is missing or malformed: only the absence of any selection skips.
+ */
+export async function importBuiltTuiIfSelected() {
+	if (!artifactsManifestSelected()) {
+		return { selected: false, tui: undefined, manifest: { mode: "unselected" }, packageVersion: "unselected" };
+	}
+	return { selected: true, ...(await importBuiltTui()) };
 }
 
 /**

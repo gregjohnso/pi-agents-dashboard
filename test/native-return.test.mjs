@@ -9,12 +9,14 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	attachment,
 	dispatch,
-	importBuiltTui,
+	importBuiltTuiIfSelected,
 	newAttachmentNamespace,
 	startCapturingTerminal,
 } from "./fixtures/native-ingress/built-pipeline.mjs";
 
-const { tui, manifest, packageVersion } = await importBuiltTui();
+const { selected, tui, manifest, packageVersion } = await importBuiltTuiIfSelected();
+// No cohort selected means the default repository suite is running; these cases need a built artifact.
+const describeCohort = selected ? describe : describe.skip;
 
 const RETURN_PROFILE = {
 	profileId: "return-lane-profile",
@@ -85,7 +87,7 @@ function mount({ component, authorizeReturn }) {
 	return { calls, harness, screen };
 }
 
-describe(`built pi-tui ${packageVersion} return authorization (${manifest.mode})`, () => {
+describeCohort(`built pi-tui ${packageVersion} return authorization (${manifest.mode})`, () => {
 	/**
 	 * Seam C's precondition, stated with API that exists in both builds: the return key must reach the
 	 * focused component through the real ordered input turn, and it must arrive with the provenance a

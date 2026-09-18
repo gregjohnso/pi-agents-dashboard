@@ -3,10 +3,18 @@
 Read this before you write a Pi source patch or consume a built artifact. `vendor/pi/README.md` is the
 maintenance procedure; this file is the contract.
 
-**Nothing native ships yet.** The patch series is empty, so today's artifacts are baseline, unmodified
-upstream Pi 0.84.3. A green build is not an A-G capability, and `build-manifest.json.capability` says so
-in the artifact itself. The build is also a **hybrid** — pinned source plus one pinned release-generated
-data input — which section 6 describes in full.
+**Seam A is implemented but NOT qualified; nothing else is delivered at all.** The series carries one patch,
+`0001-seam-a-native-submission-barrier.patch`, so today's artifacts are **patched** upstream Pi 0.84.3
+that expose the native submission barrier and nothing more. Seams B-G are absent. The build is also a
+**hybrid** - pinned source plus one pinned release-generated data input - which section 6 describes in
+full.
+
+Section 8 is the seam A contract: the public API, its managed activation, the envelope, the fence and the
+receipts a consumer can rely on. Section 8.6 states the draft behaviour the default editor implements, and
+section 8.6b states the selected **compatibility-first** custom-editor policy, the limitation that policy
+accepts, and the one operator-visible notice that states the limitation instead of hiding it. What is still
+missing is qualification work, not a policy: the public binding/API freeze and combined integration. That is
+why these artifacts are not cleared for dependency activation.
 
 ## 1. The pin
 
@@ -132,3 +140,264 @@ surface. If a patch needs newer model data, pin the new data explicitly in the l
 - No publication, no registry push, no upstream contact.
 - Byte reproducibility is not claimed from a single build. Compare two independent builds' artifact
   digests if you need that claim.
+
+## 8. Seam A: the native submission barrier
+
+This is the whole delivered interface. A later seam implementer consumes exactly what is written here.
+
+### 8.1 Activation
+
+Two public entry points, both opt-in. Until one is called, every native submission path behaves exactly
+as unmodified Pi does.
+
+```ts
+// embedding / SDK: before the session is created
+import { setNativeSubmissionHost } from "@earendil-works/pi-coding-agent";
+setNativeSubmissionHost(host);          // pass undefined to return to unmanaged behaviour
+
+// from a Pi extension, which is how a process launched as the bundled CLI is managed
+export default (pi) => { pi.setNativeSubmissionHost(host); };
+```
+
+**The barrier instance and its grant objects are deliberately not exported.** Forwarding state is opaque
+and barrier-owned, so a caller cannot mint a grant, assert that a submission was already dispatched, or
+redeem a grant for content it was not authorized for. A host implements `NativeSubmitHost` and activates
+it; everything else belongs to Pi.
+
+### 8.2 What the host implements
+
+```ts
+interface NativeSubmitHost {
+  ownerRunId: string;
+  beforeNativeSubmit(e: SubmissionEnvelope): Promise<NativeSubmitAuthorization>;
+  recordEffectivePayload(p: EffectivePayloadRecord): Promise<EffectivePayloadReceipt>;
+  nativeSubmitOutcome(o: NativeSubmitOutcome): void;
+}
+```
+
+**Submission identity is owner-lifetime, not host-object-lifetime.** A management extension is
+re-registered on every resource reload, and `AgentSession.reload` rebuilds extensions while submissions
+accepted before the reload are still queued and still owe a drain. Re-registering a host with the **same**
+`ownerRunId` therefore keeps every record and handoff and only swaps the callable host. A different
+`ownerRunId`, or deactivation with `undefined`, drops the previous owner's records, so a stale handoff can
+never be redeemed against a host that did not authorize it and missing managed authorization stays
+fail-closed.
+
+`SubmissionEnvelope` carries `submissionId`, `ownerRunId`, `binding {canonicalFile, generation}`,
+`source`, `intent`, `originalText`, optional `attachments`, `behavior`, `draftRevision` and optional
+`parentSubmissionId`. `attachmentOrigin` is deliberately absent: input provenance is seam B and optional
+here, and inferring it from a last-input variable is forbidden.
+
+**`originalText` is the operator's untouched text.** For the native editor that is the raw draft with
+paste markers intact and nothing trimmed; the trimmed, paste-expanded text Pi will act on is reported
+separately as an effective payload with `expandedFrom: "transform"`. Nothing downstream overwrites
+`originalText`: a forwarded submission is redeemed against the exact text it was granted for.
+
+**Attachments carry the bytes, not only a descriptor.** Pi's native attachment representation is
+`ImageContent { type: "image"; data: base64; mimeType }`. Each envelope attachment is
+`{ kind: "image", mediaType: mimeType, byteLength, sha256, bytes: Uint8Array }`, where `bytes` is the
+decoded payload and `byteLength`/`sha256` describe those bytes rather than the base64 text. Pi keeps no
+copy and stores nothing: blob persistence is the host's, and a blob the host cannot store is a refusal
+(`PERSISTENCE_FAILED`), never a dropped image.
+
+`NativeSubmitAuthorization` is `{ authorized: true; fence }` or `{ authorized: false; code; reason }` with
+`code` in `PERSISTENCE_FAILED | PERSISTENCE_UNCERTAIN | STALE_BINDING | DUPLICATE_SUBMISSION | REFUSED`. A
+refusal, a thrown handler, a rejected promise, a missing decision, or a fence whose `submissionId`,
+`ownerRunId`, `bindingGeneration` or `nonce` does not match the envelope all dispatch nothing.
+
+### 8.3 The fence, and why it is atomic
+
+`SubmissionFence = { submissionId, ownerRunId, bindingGeneration, nonce }`, one use. Pi validates and
+consumes it in the same **synchronous** region as the first native mutation or command dispatch:
+
+- `dispatch(mutate)` is synchronous and `mutate` must be synchronous. Fence validation, consumption and
+  the mutation therefore occur in one uninterrupted turn of the event loop.
+- The canonical binding is **observed**, not committed: the barrier reads the owner's active session
+  through an **internal** supplier registered by `AgentSession`, and the generation advances only when the
+  owner's own canonical file changes. This supplier is seam-A fence coordination and nothing more: it is
+  not exported, it is not a frozen binding-commit API, and it supplies no admission, reservation or commit
+  contract. Seam D remains unresolved and unassigned, and this must not be cited as readiness for it. A temporary `SessionManager` opened to rename, import or list some other session
+  is not the owner's session and cannot move the binding. The observation is repeated inside the critical
+  section, so a rebind between grant and mutation is refused with `STALE_BINDING` and mutates nothing.
+- Because the section is synchronous, it is never held across an extension handler, a child submission or
+  a model turn. A `dispatch` re-entered from inside a mutation throws rather than deadlocking.
+
+A second `dispatch` of the same grant returns `DUPLICATE_SUBMISSION` and mutates nothing.
+
+### 8.4 Receipts
+
+`nativeSubmitOutcome` reports at most once per submission:
+
+| `appliedAs` | Meaning |
+| --- | --- |
+| `applied` | the submission's messages were handed to the agent |
+| `queued` | **terminal acceptance for this submission**, not model completion. Its later drain keeps the same id |
+| `handled` | a command dispatched, or the advisory `input` hook suppressed the turn |
+| `discarded` | the grant was abandoned before any mutation |
+| `refused` + `code` + `beforeMutation: true` | a stale or reused fence. No mutation happened |
+| `drain-failed` + `reason` + `afterAcceptance: true` | a drain or payload record failed **after** acceptance. Reported once, never as a clean pre-mutation refusal, and it never rewrites the queue receipt |
+
+`recordEffectivePayload` is a **receipt, never a grant**, with `expandedFrom` in
+`transform | template | skill | queue-drain`. **Every drain records exactly one `queue-drain` receipt**,
+whether or not expansion changed the text: the receipt is what tells the host which text was actually sent
+for an already-accepted submission, so an unchanged drain owes it just as much as an expanded one. Each label names what actually changed the text: a
+template-only expansion is `template`, a skill expansion is `skill`, the native editor's trim and paste
+expansion is `transform`, and a queue drain is `queue-drain`. A record taken before any mutation that the
+host cannot accept refuses the submission; a record that fails after acceptance is `drain-failed`.
+
+### 8.5 Covered entry points and forwarding
+
+| `source` | Insertion point |
+| --- | --- |
+| `native-editor` | `Editor.submitGate` in `packages/tui`, before the editor destroys the draft; then `defaultEditor.onSubmit` |
+| `builtin-command` | `defaultEditor.onSubmit`, fence consumed immediately before the built-in branch acts, including `!bash` |
+| `extension-command` | `AgentSession._tryExecuteExtensionCommand`, the real command boundary: the grant travels there with the fence **unconsumed**, so the binding is rechecked where the command actually dispatches, and the retained draft is committed by that consumption |
+| `compaction-queue` | `InteractiveMode.queueCompactionMessage`, with the push into `compactionQueuedMessages`. Classified by `isCompacting`, so a submission queued during compaction is never mislabelled a native-editor prompt |
+| `native-steer` / `native-followup` | `AgentSession.steer` / `followUp`, before template and skill expansion |
+| `startup-prompt` | the interactive startup prompt and print mode's initial messages |
+| `extension-api` | any other `AgentSession.prompt` call, which is the default label |
+
+When one native entry point hands a submission to another, it passes `PromptOptions.nativeSubmit`:
+
+| Field | Meaning |
+| --- | --- |
+| `source` | label this call for the barrier, which authorizes here |
+| `handoff` | the barrier's opaque token, **one-use**. The barrier resolves it to its own recorded stage: `GRANTED` means this call consumes the fence at its own mutation, `DISPATCH_STARTED` means the fence is already consumed and this call is the one continuation that submission owes, which may only record and report |
+| `originalText` | the untouched text the grant was taken for, so a handoff cannot be redeemed for substituted content |
+| `drain` | this call is the drain of an already-accepted queued submission: same id, a `queue-drain` receipt, no new grant and no new fence |
+
+A `handoff` that is present but is not a live barrier-issued token refuses; it never falls back to a fresh
+authorization. A `drain` without a handoff is an error.
+
+**A handoff redeems exactly once.** Every native flow spends one redemption: the post-queue continuation of
+an idle editor push, the drain of a compaction queue entry, or the forwarding call that consumes the fence
+itself. The second redemption of the same token is refused `DUPLICATE_SUBMISSION` and reported as a
+pre-mutation `refused` outcome, whether the first one consumed the fence or continued an accepted
+submission. `PromptOptions.nativeSubmit` is public, so this does not depend on callers never replaying a
+token: a replayed handoff runs neither an extension command handler nor an ordinary agent prompt. Because
+the redemption is spent synchronously, before the redeeming call does any work, two overlapping redemptions
+of one handoff resolve the same way — exactly one proceeds and the other is refused while the first is still
+awaiting its own boundary.
+
+### 8.6 Draft preservation: retain, then commit
+
+The default editor never destroys a draft on authorization alone. `Editor.submitGate` runs before any
+clearing, and authorization is only permission to *attempt* the submission: the native mutation can still
+be refused by a stale or duplicate fence afterwards. So the order is **retain, submit, then commit**:
+
+```ts
+// on the editor (optional on EditorComponent, implemented by the default Editor)
+submitGate?: (s: { text: string; originalText: string; draftRevision: number }) => boolean | Promise<boolean>;
+commitSubmittedDraft?(revision: number): boolean;
+```
+
+1. The gate is asked, and is given the untouched draft plus the effective text.
+2. On a grant the editor calls `onSubmit` and **keeps the whole draft** — text, paste markers and their
+   bodies, cursor, scroll offset and undo history.
+3. The host performs its native mutation under the fence. Only once that mutation has committed does it
+   call `commitSubmittedDraft(revision)`, which clears that draft and only that draft.
+
+For an **idle extension command** the mutation to commit at is `AgentSession`'s command dispatch, not the
+editor's own queue push: the grant is queued with its fence unconsumed, and the retained draft is destroyed
+by that consumption, in the same turn as it. A rebind or a duplicate between the push and the command
+therefore refuses with the complete draft still on screen. The commit responsibility travels with the
+grant, so exactly one boundary owns it per submission. It runs only after a **successful** mutation: a
+fence spent by a mutation that then threw commits no draft, and the next dispatch of that submission is a
+duplicate that leaves the draft intact. Pi hands each grant to exactly one holder, so the boundary that
+consumes the fence is always the boundary the draft was queued for.
+
+Consequences a host can rely on:
+
+- A refusal at authorization **or at the fence** (`STALE_BINDING`, `DUPLICATE_SUBMISSION`) leaves the
+  complete draft in place. Nothing is reconstructed from the submitted text, because nothing was lost.
+- `commitSubmittedDraft` is revision-bound: if the operator typed while the submission was in flight the
+  revision no longer matches, the call returns `false` and the newer draft is never overwritten. The
+  authorized text is still submitted.
+- An idle Alt+Enter commits against the revision **the gesture submitted**, captured before authorization
+  was awaited, so an edit made while the host was still deciding is never destroyed.
+- An unmanaged editor is unchanged: with no gate set, `submitValue` clears and submits synchronously
+  exactly as before.
+- A commit that **throws** cannot un-accept a dispatched submission, so the submission stays accepted and
+  the failure is reported through the channel the registering entry point owns:
+  `NativeSubmitAccepted.afterDispatch(commit, reportFailure)` takes that channel as a required argument, and
+  the default editor's is the same error line every refused submission uses
+  (`The submitted draft could not be cleared: …`). It is not discarded. The only remaining silence is a
+  `reportFailure` that itself throws, which leaves no channel at all; that is caught so the accepted
+  dispatch still stands, and nothing is retried.
+
+### 8.6b Custom editors: compatibility-first draft preservation
+
+`EditorComponent.submitGate`, `draftRevision` and `commitSubmittedDraft` are **optional**, and they stay
+optional. An arbitrary custom editor from an extension may ignore all three, clear its own private state
+before calling `onSubmit`, submit on a gesture other than Enter, or invoke an asynchronous callback. Pi
+cannot infer those semantics from the outside.
+
+The selected policy is **compatibility-first**: an existing custom editor remains usable in a managed
+session without adopting the hooks, and Pi claims no universal draft preservation. What an editor gets on a
+submission that is refused before any mutation:
+
+| Editor | Draft after the refusal |
+| --- | --- |
+| the default editor | the complete draft — text, paste markers and their bodies, cursor, scroll offset, undo history — is still there, as section 8.6 describes |
+| a custom editor that implements the hooks correctly | the same: `submitGate` retains, the fence decides, and `commitSubmittedDraft(revision)` clears only the revision that was submitted |
+| a custom editor that clears itself before calling `onSubmit` | best effort only: the **submitted text** may be put back, and only while that editor is still empty |
+
+That third row is the concession, and it is a real one. `reportRefusedSubmission` restores the submitted
+text only when the editor's `getText()` is still empty, so a draft the operator typed after the component
+cleared itself is never overwritten: newer typing always wins over an older restoration. Nothing else is
+recovered. Paste objects and their bodies, undo history, cursor and scroll offset and any other
+extension-private state belong to the component; Pi neither reads nor reconstructs them. Saving the
+submitted string is not a third route to full preservation, and intercepting Enter is not one either,
+because such an editor may submit through another gesture or an asynchronous callback.
+
+A custom editor clearing its own UI is **not** a native submission mutation. The component's own state is
+the extension's business; the queue push and the command dispatch are Pi's, and they stay behind the fence
+whatever the editor did to its own screen first.
+
+What compatibility-first does **not** relax:
+
+- **Dispatch stays fail-closed.** No unauthorized submission reaches the agent, and every queue mutation
+  and command dispatch is still fenced and one-use, refused on a stale or reused fence. Keeping an older
+  editor usable is not permission to dispatch unauthorized work.
+- **The default editor's retain-submit-commit order is unchanged**, and so is revision-bound commit.
+- **No editor is wrapped, replaced, disabled or required to change**, and no extension is asked to adopt a
+  mandatory prepare/commit protocol.
+
+The limitation must be explicit rather than hidden behind a universal claim, so a managed host must treat a
+custom editor that implements neither `submitGate` nor `commitSubmittedDraft` as
+**draft-preservation-unavailable, and say so**. In the interactive mode Pi now says it itself: when a managed
+session's installed editor component declares neither hook, `InteractiveMode` writes one warning through the
+session's existing notification channel — the same `showWarning` line an extension's own warning notices use
+— at that session's first managed submission:
+
+> Draft preservation is unavailable in this managed session: the active editor implements neither submitGate
+> nor commitSubmittedDraft, so a refused submission can only put the submitted text back, and only while
+> that editor is still empty.
+
+What that notice is, exactly:
+
+- **Read from the component's own public optional members**, `submitGate` and `commitSubmittedDraft`, at the
+  `setEditorComponent` lifecycle point and before Pi wires its own gate into a custom editor. No private
+  component state is inspected, and nothing is inferred from rendered text.
+- **Once per installed component**, at the first managed submission, not once per submission, and never in an
+  unmanaged session. Installing another component re-evaluates it; restoring the default editor clears it.
+- **A statement, not a mechanism.** No wrapper, no capability framework, no indicator widget, no
+  default-editor warning, no hook made mandatory, and no editor wrapped, replaced or disabled. An editor that
+  declares either hook is never called draft-preservation-unavailable, and an unknown or noncooperating
+  component is never advertised as preserving drafts.
+
+Verification against a real legacy component ships with the patch:
+`packages/coding-agent/test/native-submission-barrier.test.ts` drives an `EditorComponent` that implements no
+optional hook, clears itself before calling `onSubmit` and can deliver that call from its own timer, through
+the real `setCustomEditorComponent` path — an allowed submission, a refusal, the text-only recovery, newer
+typing winning over that recovery, and one notice across two submissions. The public binding/API freeze and
+combined integration are the remaining seam A qualification work, which is why the top of this file still
+says seam A is implemented but not qualified.
+
+### 8.7 What seam A does not do
+
+No durable ledger, no blob storage, no ownership or attachment policy, no canonical admission, no
+reservation, no session management. It reconstructs no extension-private editor state, and it never
+reimplements, wraps, replaces or disables a custom editor. The binding is observed, never admitted: this is
+not seam D and it admits, reserves and refuses nothing. The advisory `input` event keeps its existing catch-and-continue
+contract and is unchanged.

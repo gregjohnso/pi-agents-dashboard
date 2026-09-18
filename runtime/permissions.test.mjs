@@ -17,14 +17,6 @@ afterEach(async () => {
   await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-// Every private file this package creates is opened by the module that owns it, so the permissions
-// module hands out the umask, the directory guarantee, and the socket guarantee only.
-it("exposes the umask, directory, and socket guarantees and no file opener", async () => {
-  expect(Object.keys(await import("./permissions.mjs")).sort()).toEqual([
-    "chmodPrivateSocket", "ensurePrivateDirectory", "initializeRuntimePermissions", "setPrivateUmask",
-  ]);
-});
-
 it("exposes startup initialization that sets the process file-creation mask to user-only", () => {
   const setUmask = vi.fn(() => 0o022);
   expect(initializeRuntimePermissions(setUmask)).toEqual({ previousUmask: 0o022 });

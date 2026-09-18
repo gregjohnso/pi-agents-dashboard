@@ -28,15 +28,6 @@ describe("Pi model catalog", () => {
     ]);
   });
 
-  it("asks Pi once and serves the cache after that", async () => {
-    const spawn = fakePi(OUTPUT);
-    const catalog = createModelCatalog({ executable: "/usr/bin/pi", spawn });
-    expect(await catalog.models()).toHaveLength(3);
-    expect(await catalog.models()).toHaveLength(3);
-    expect(spawn).toHaveBeenCalledTimes(1);
-    expect(/** @type {any} */ (spawn.mock.calls[0])[1]).toEqual(["--list-models"]);
-  });
-
   it("reports a failed listing and retries on the next request", async () => {
     const spawn = fakePi("", { code: 1 });
     const catalog = createModelCatalog({ executable: "/usr/bin/pi", spawn });

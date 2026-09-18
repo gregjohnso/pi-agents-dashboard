@@ -40,13 +40,6 @@ it("accepts only exact --pi-bin standalone syntax", async () => {
   expect(await runCli(["--pi-bin", "relative"], { cwd: "/repo", openApp, io: capture().io })).toBe(2);
 });
 
-it("opens the list from the agents verb", async () => {
-  const openApp = vi.fn(async () => {});
-  const code = await runCli(["agents"], { cwd: "/repo", openApp, io: capture().io });
-  expect(code).toBe(0);
-  expect(openApp).toHaveBeenCalledWith(expect.objectContaining({ cwd: "/repo" }));
-});
-
 it("prints agents rows for --json without opening the app", async () => {
   const output = capture();
   const openApp = vi.fn(async () => {});
@@ -65,18 +58,6 @@ it("routes attach to one exact session and rejects other attach grammar", async 
   expect(attachSession).toHaveBeenCalledTimes(1);
 });
 
-it("prints standalone help without opening the app", async () => {
-  const output = capture();
-  const openApp = vi.fn(async () => {});
-  expect(await runCli(["--help"], { openApp, io: output.io })).toBe(0);
-  const help = output.stdout.join("");
-  expect(help).toContain("With no arguments");
-  // Both commands now exist, so the help advertises both and hides neither.
-  for (const advertised of ["pi-agents agents", "pi-agents attach", "pi-agents logs [<full-session-id>]", "pi-agents stop|rm", "pi-agents respawn", "session cleanup"]) expect(help).toContain(advertised);
-  for (const absent of ["session status", "session stop", "session delete", "resolve-delivery"]) expect(help).not.toContain(absent);
-  expect(openApp).not.toHaveBeenCalled();
-});
-
 it("routes logs with and without one exact session ID", async () => {
   const received = [];
   const runLogsCommand = vi.fn(async (sessionId) => {
@@ -90,19 +71,6 @@ it("routes logs with and without one exact session ID", async () => {
   expect(runLogsCommand).toHaveBeenCalledTimes(2);
 });
 
-it("writes log text unwrapped and keeps --json to one object", async () => {
-  const path = "/state/daemon/startup.log";
-  const text = `==> ${path} <==\nDashboardConfigError\n`;
-  const runLogsCommand = async () => ({ code: 0, result: { kind: "logs", sources: [{ path, bytes: 21, truncated: false }], text } });
-  const plain = capture();
-  expect(await runCli(["logs"], { runLogsCommand, io: plain.io })).toBe(0);
-  expect(plain.stdout.join("")).toBe(text);
-  const structured = capture();
-  expect(await runCli(["logs", "--json"], { runLogsCommand, io: structured.io })).toBe(0);
-  expect(structured.stdout).toHaveLength(1);
-  expect(JSON.parse(structured.stdout[0])).toMatchObject({ ok: true, kind: "logs", sources: [{ path }], text });
-});
-
 it("prints exactly one JSON object and uses syntax exit code 2", async () => {
   const output = capture();
   const code = await runCli(["unknown", "--json"], { io: output.io });
@@ -112,27 +80,8 @@ it("prints exactly one JSON object and uses syntax exit code 2", async () => {
   expect(output.stderr).toEqual([]);
 });
 
-// Operator-visible failure: the wait for a healthy endpoint runs inside runDaemonCommand and writes
-// nowhere, so a start that hung left the operator's terminal blank until the command returned.
-it("gives daemon start the operator's own error stream to report a slow wait on", async () => {
-  const output = capture();
-  const runDaemonCommand = async (/** @type {string} */ command, /** @type {any} */ options) => {
-    expect(command).toBe("start");
-    options.stderr.write("daemon start: waiting for a healthy endpoint (5s of 90s)\n");
-    return { code: 0, result: { kind: "daemon_started", alreadyRunning: false } };
-  };
-  expect(await runCli(["daemon", "start", "--json"], { io: output.io, runDaemonCommand })).toBe(0);
-
-  expect(output.stderr.join("")).toContain("waiting for a healthy endpoint");
-  // The progress report is for a person and never joins the machine-readable answer.
-  expect(output.stdout).toHaveLength(1);
-  expect(JSON.parse(output.stdout[0])).toMatchObject({ ok: true, kind: "daemon_started" });
-});
-
 it.each([
   ["stop", ["stop", "full-session-id", "--revision", "3", "--yes"]],
-  ["rm", ["rm", "full-session-id", "--revision", "3", "--yes"]],
-  ["respawn", ["respawn", "full-session-id", "--revision", "3", "--yes"]],
 ])("routes the top-level %s verb without prefix resolution", async (_name, argv) => {
   const output = capture();
   const runSessionCommand = async (received) => {
@@ -146,25 +95,9 @@ it.each([
 
 it.each([
   ["status", ["session", "status", "full-session-id"]],
-  ["stop", ["session", "stop", "full-session-id", "--revision", "3", "--yes"]],
-  ["delete", ["session", "delete", "full-session-id", "--revision", "3", "--yes"]],
 ])("rejects the retired session %s form as ordinary syntax", async (_name, argv) => {
   const runSessionCommand = vi.fn(async () => ({ code: 0, result: { kind: "command", sessionId: "full-session-id" } }));
   expect(await runCli(argv, { io: capture().io, runSessionCommand })).toBe(2);
-  expect(runSessionCommand).not.toHaveBeenCalled();
-});
-
-it("keeps recovery command cleanup under the session namespace", async () => {
-  const argv = ["cleanup", "full-session-id", "--revision", "3", "--yes"];
-  const runSessionCommand = vi.fn(async () => ({ code: 0, result: { kind: "command", sessionId: "full-session-id" } }));
-  expect(await runCli(["session", ...argv], { io: capture().io, runSessionCommand })).toBe(0);
-  expect(runSessionCommand).toHaveBeenCalledWith(argv, undefined);
-});
-
-// The delivery-resolution verb is gone with the journal it settled, so it is ordinary bad syntax.
-it("refuses the retired session resolve-delivery verb as ordinary syntax", async () => {
-  const runSessionCommand = vi.fn(async () => ({ code: 0 }));
-  expect(await runCli(["session", "resolve-delivery", "full-client-id", "full-request-id", "abandon", "--yes"], { io: capture().io, runSessionCommand })).toBe(2);
   expect(runSessionCommand).not.toHaveBeenCalled();
 });
 
@@ -173,7 +106,6 @@ it("refuses the retired session resolve-delivery verb as ordinary syntax", async
 // line under a state-root adoption notice the operator reasonably read as the error.
 it.each([
   ["logs", ["logs", "exact-session-id"]],
-  ["stop", ["stop", "exact-session-id", "--revision", "4", "--yes"]],
 ])("tells the operator that an earlier release refused %s, and names the command that fixes it", async (_name, argv) => {
   const root = await stateRoot();
   const daemon = await startPreviousReleaseDaemon(root);

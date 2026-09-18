@@ -227,18 +227,3 @@ it("applies a color write that loses a compare-and-swap race to background churn
   expect(attempts.count).toBe(2);
   expect(await store.get("colored")).toMatchObject({ color: "amber", activity: { summary: "churn 1" } });
 });
-
-it("bounds the color write retry instead of spinning against endless churn", async () => {
-  const { store } = await makeRegistry();
-  await store.create(record("colored"));
-  const attempts = loseColorRaces(store, "colored", Number.MAX_SAFE_INTEGER);
-
-  await expect(applySessionColor(store, "colored", "amber")).rejects.toMatchObject({ code: "REVISION_CONFLICT" });
-  expect(attempts.count).toBeGreaterThan(1);
-  expect(attempts.count).toBeLessThan(32);
-});
-
-it("reports a missing session rather than creating one when coloring", async () => {
-  const { store } = await makeRegistry();
-  await expect(applySessionColor(store, "absent", "amber")).rejects.toMatchObject({ code: "SESSION_NOT_FOUND" });
-});

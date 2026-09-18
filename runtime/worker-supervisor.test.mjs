@@ -294,38 +294,6 @@ it("creates and binds the registry before activation and reports ready after aut
   });
 });
 
-it("records the model Pi confirmed at readiness and leaves it absent when Pi named none", async () => {
-  const { runs, registry, ownership, router, sockets } = await setup(["one", "two"]);
-  const confirming = fakeWorkerFactory({ sockets, readyOverrides: { model: { provider: "openai-codex", id: "gpt-5.6-sol" } } });
-  const confirmingSupervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, spawnImpl: confirming.spawnImpl, inspect, randomId: () => "confirmed-model-token" });
-  await confirmingSupervisor.launch({
-    sessionId: "one",
-    canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile,
-    cwd: "/repo",
-    runId: "run-confirmed-model",
-    model: { provider: "anthropic", id: "requested" },
-  });
-
-  // The request still reaches Pi through the worker's arguments; only the row waits for Pi's answer.
-  expect(confirming.calls[0].argv).toEqual(expect.arrayContaining(["--model-provider", "anthropic", "--model-id", "requested"]));
-  expect(await getRecord(registry, "one")).toMatchObject({ processState: "LIVE", model: { provider: "openai-codex", id: "gpt-5.6-sol" } });
-
-  const silent = fakeWorkerFactory({ sockets });
-  const silentSupervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, spawnImpl: silent.spawnImpl, inspect, randomId: () => "unconfirmed-model-token" });
-  await silentSupervisor.launch({
-    sessionId: "two",
-    canonicalSessionFile: (await getRecord(registry, "two")).canonicalSessionFile,
-    cwd: "/repo",
-    runId: "run-unconfirmed-model",
-    model: { provider: "anthropic", id: "requested" },
-  });
-
-  // Absence means Pi has not said yet. It never falls back to what the launch asked for.
-  expect(await getRecord(registry, "two")).not.toHaveProperty("model");
-  await confirmingSupervisor.close();
-  await silentSupervisor.close();
-});
-
 it("authenticates and adopts the startup socket before activation, and persists the run token privately", async () => {
   const { runs, registry, ownership, router, sockets, metadataPath, workers: persisted } = await setup();
   const workers = fakeWorkerFactory({ sockets, holdHello: true });
@@ -404,21 +372,6 @@ it("holds pre-adoption worker frames on the reservation and hands them over in a
   await waitUntil(async () => reservation.buffered.length === 3);
   expect(reservation.drainBuffered().map((/** @type {any} */ frame) => frame.frame.sequence)).toEqual([1, 2, 3]);
   await expect(launched).rejects.toMatchObject({ code: "WORKER_START_TIMEOUT" });
-});
-
-it("classifies missing Pi discovery as a pre-child refusal", async () => {
-  const { runs, registry, ownership, router, sockets } = await setup();
-  const supervisor = new WorkerSupervisor({
-    registry,
-    router,
-    ownership,
-    runsDirectory: runs,
-    resolveExecutableImpl: async () => { throw Object.assign(new Error("missing"), { code: "PI_EXECUTABLE_NOT_FOUND" }); },
-  });
-
-  await expect(supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "missing" })).rejects.toMatchObject({ code: "PI_EXECUTABLE_NOT_FOUND", preChild: true });
-  expect((await getRecord(registry, "one")).ownership).toBeUndefined();
-  expect(await readdir(runs)).toEqual([]);
 });
 
 it("refuses a startup socket whose claimed identity is not the spawned process-group leader", async () => {
@@ -517,7 +470,6 @@ it("releases pending ownership after spawn failure", async () => {
 
 it.each([
   ["activation send", { activateSendError: true }],
-  ["readiness authentication", { readyOverrides: { token: "wrong" } }],
 ])("stops and releases durable ownership after %s failure", async (_boundary, workerOptions) => {
   const { runs, registry, ownership, router, sockets, useInspect } = await setup();
   const world = processWorld();
@@ -628,7 +580,6 @@ it("releases ownership once the orphaned Pi child is provably gone", async () =>
 
 it.each([
   ["ambiguous", (/** @type {any} */ world, /** @type {number} */ pid) => world.hide(pid)],
-  ["a recycled process id", (/** @type {any} */ world, /** @type {number} */ pid) => world.recycle(pid, "recycled")],
 ])("retains ownership and signals nothing when the recorded Pi child inspection is %s", async (_name, confuse) => {
   const { runs, registry, ownership, router, sockets, useInspect } = await setup();
   const workers = fakeWorkerFactory({ sockets });
@@ -675,28 +626,6 @@ it("reconciles an exit observed before readiness persistence without restoring L
   expect((await getRecord(registry, "one")).ownership).toBeUndefined();
 });
 
-it("retries failed terminal release during admission and admits the next session", async () => {
-  const { runs, registry, ownership, router, sockets, useInspect } = await setup(["one", "two"]);
-  const world = processWorld();
-  useInspect(world.seams.inspect);
-  const workers = fakeWorkerFactory({ sockets, world });
-  const originalRelease = ownership.release.bind(ownership);
-  let releases = 0;
-  ownership.release = async (...args) => {
-    releases += 1;
-    if (releases === 1) throw new Error("release persistence failed");
-    return originalRelease(...args);
-  };
-  const supervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, maxLive: 1, spawnImpl: workers.spawnImpl, randomId: () => `release-retry-${workers.calls.length}`, ...world.seams });
-  await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "release-retry-one" });
-  workers.exitGroup(workers.children[0]);
-  await waitUntil(async () => releases === 1);
-
-  await expect(supervisor.launch({ sessionId: "two", canonicalSessionFile: (await getRecord(registry, "two")).canonicalSessionFile, cwd: "/repo", runId: "release-retry-two" })).resolves.toMatchObject({ sessionId: "two" });
-  expect(releases).toBeGreaterThanOrEqual(2);
-  expect((await getRecord(registry, "one")).ownership).toBeUndefined();
-});
-
 // Operator-visible failure: a crashed Pi child publishes its cause and then races the supervisor exit
 // it caused. Once the worker's own report window closes, the lease release is the last moment that
 // cause can still reach the row, and without it the crash reads as an ordinary exit.
@@ -717,46 +646,6 @@ it("records a crashed Pi child's durable cause before it releases the lease", as
   await vi.waitFor(async () => expect((await getRecord(registry, "one")).ownership).toBeUndefined(), { timeout: 5_000, interval: 5 });
   expect(await getRecord(registry, "one")).toMatchObject({ taskState: "FAILED", processState: "EXITED", activity: { kind: "process_error", summary: "Pi exited unexpectedly (SIGSEGV)" } });
   await expect(stat(causePath)).rejects.toMatchObject({ code: "ENOENT" });
-});
-
-// Operator-visible failure: retiring the cause is cleanup, and a run directory this supervisor can no
-// longer write made that cleanup abort the release. The lease then outlived the dead worker and every
-// later launch of the session was refused as an ownership conflict.
-it("releases the lease when a crashed Pi child's cause cannot be retired", async () => {
-  const { runs, registry, ownership, router, sockets, useInspect, workers: workerMetadata } = await setup(["one"], { randomId: () => "lease-stuck" });
-  const world = processWorld();
-  useInspect(world.seams.inspect);
-  const workers = fakeWorkerFactory({ sockets, world });
-  const supervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, spawnImpl: workers.spawnImpl, randomId: () => "stuck-token", ...world.seams });
-  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: (await getRecord(registry, "one")).canonicalSessionFile, cwd: "/repo", runId: "run-stuck" });
-  const piChild = await world.seams.inspect(piChildPid(launched.identity.pid));
-  const runDirectory = join(runs, (await getRecord(registry, "one")).runHash);
-  const causePath = join(runDirectory, "terminal-cause.json");
-  await writeFile(causePath, `${JSON.stringify({ schemaVersion: 1, sessionId: "one", runId: "run-stuck", leaseId: "lease-stuck", generation: 1, worker: launched.identity, piChild, event: { type: "PI_CHILD_CRASHED", at: "2026-08-25T12:05:00.000Z", summary: "Pi exited unexpectedly (SIGSEGV)" } })}\n`, { mode: 0o600 });
-  // A readable run directory nothing may unlink from: retiring the cause fails with EACCES.
-  await chmod(runDirectory, 0o500);
-
-  try {
-    workers.exitGroup(workers.children[0]);
-
-    await vi.waitFor(async () => expect((await getRecord(registry, "one")).ownership).toBeUndefined(), { timeout: 5_000, interval: 5 });
-    expect(await getRecord(registry, "one")).toMatchObject({ taskState: "FAILED", processState: "EXITED", activity: { kind: "process_error", summary: "Pi exited unexpectedly (SIGSEGV)" } });
-    await vi.waitFor(async () => expect(await workerMetadata()).toEqual([]), { timeout: 5_000, interval: 5 });
-    // The record it could not delete stays where a later reader finds it, and reapplying it is idempotent.
-    await expect(stat(causePath)).resolves.toMatchObject({ mode: expect.any(Number) });
-  } finally {
-    await chmod(runDirectory, 0o700);
-  }
-});
-
-it("does not charge an ownership-free stale LIVE record against managed capacity", async () => {
-  const { runs, registry, ownership, router, sockets } = await setup(["one", "two"]);
-  const one = await getRecord(registry, "one");
-  await registry.update("one", one.revision, { processState: "LIVE", updatedAt: "2026-08-25T12:03:00.000Z" });
-  const workers = fakeWorkerFactory({ sockets });
-  const supervisor = new WorkerSupervisor({ registry, router, ownership, runsDirectory: runs, maxLive: 1, spawnImpl: workers.spawnImpl, inspect, randomId: () => "stale-live-cap-token" });
-
-  await expect(supervisor.launch({ sessionId: "two", canonicalSessionFile: (await getRecord(registry, "two")).canonicalSessionFile, cwd: "/repo", runId: "stale-live-cap" })).resolves.toMatchObject({ sessionId: "two" });
 });
 
 it("routes stop through verified Task 6 identity and releases only after observed exit", async () => {

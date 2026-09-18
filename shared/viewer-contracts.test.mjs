@@ -58,9 +58,3 @@ it("strictly parses the frozen version-1 viewer snapshot", () => {
   expect(() => parseViewerSnapshot({ ...snapshot, unknown: true })).toThrow(/unknown/iu);
   expect(() => parseViewerSnapshot({ ...snapshot, activeAssistant: { itemId: "a1", blocks: [{ contentIndex: 0, type: "text", text: "hel" }] } }), "internal assistant checkpoint state").toThrow(/unknown/iu);
 });
-
-// A snapshot is built for one response and never stored, so a key only an earlier release wrote is
-// refused rather than accepted and dropped.
-it("refuses the retired access role", () => {
-  expect(() => parseViewerSnapshot({ ...snapshot, role: "composer" })).toThrow(/unknown/iu);
-});

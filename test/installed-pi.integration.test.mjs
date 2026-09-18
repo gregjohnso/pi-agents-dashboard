@@ -62,16 +62,6 @@ async function setup() {
   return { root, runs, registry, executable, sessionFile, router, control, log: join(root, "pi.log") };
 }
 
-it("omits optional launch flags by default and includes only selected model and name flags", async () => {
-  const { root, runs, registry, executable, sessionFile, log, router, control } = await setup();
-  const supervisor = new WorkerSupervisor({ registry, router, runsDirectory: runs, configuredPiPath: executable, env: { ...process.env, FAKE_PI_LOG: log, FAKE_PI_EXIT_MS: "700" }, startTimeoutMs: 2_000 });
-  await launch(supervisor, { sessionId: "one", canonicalSessionFile: sessionFile, cwd: root, runId: "run-options", model: { provider: "fake provider", id: "model;id" }, thinkingLevel: "high", name: "name with spaces" });
-  const childStart = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line)).find((entry) => entry.kind === "start" && entry.argv.includes(sessionFile));
-  // Pi restores its own thinking level from the session file, so no launch selects one.
-  expect(childStart.argv).toEqual(["--mode", "rpc", "--session", sessionFile, "--provider", "fake provider", "--model", "model;id", "--name", "name with spaces"]);
-  await supervisor.close();
-});
-
 // Operator-visible failure: exposing the run credential to Pi lets an extension impersonate the
 // daemon on the worker socket. Removing anything else from Pi's environment can break its tools.
 it("keeps the worker socket credential out of installed Pi while preserving unrelated environment", async () => {

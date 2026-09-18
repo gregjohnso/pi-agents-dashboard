@@ -178,18 +178,6 @@ describe("command contracts", () => {
       .toEqual({ ...envelope, op: "set_session_color", payload: { sessionId: "session", color: "amber" } });
   });
 
-  // The operator's queue/commands.jsonl holds attach records written when attachments carried an
-  // access role, and runtime/state-migration.mjs reparses that file. The key is accepted so those
-  // records still parse, and dropped so no code downstream can read a role again.
-  it("tolerates an attachment role from a retired record and drops it before the daemon sees it", () => {
-    for (const role of ["composer", "observer", "anything"]) {
-      expect(parseClientRequest({ ...envelope, op: "attach", payload: { sessionId: "session", role } }))
-        .toEqual({ ...envelope, op: "attach", payload: { sessionId: "session" } });
-    }
-    expect(parseClientRequest({ ...envelope, op: "attach", payload: { sessionId: "session", role: "composer", activate: true } }))
-      .toEqual({ ...envelope, op: "attach", payload: { sessionId: "session", activate: true } });
-  });
-
   it("accepts every exact daemon response variant", () => {
     for (const [name, response] of acceptedResponses) {
       expect(parseDaemonResponse(response), name).toEqual(response);

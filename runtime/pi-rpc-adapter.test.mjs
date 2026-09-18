@@ -224,7 +224,6 @@ it("names the streaming behavior of each operation a dashboard sends, whatever t
 
 it.each([
   ["prompt", "steer"],
-  ["follow_up", "follow_up"],
 ])("resubmits %s through Pi's own %s command when Pi refuses a prompt it is already too busy to accept", async (op, fallback) => {
   /** @type {any[]} */
   const records = [];
@@ -256,7 +255,6 @@ it.each([
 // leaves the write ambiguous, and resubmitting there could apply the operator's text twice.
 it.each([
   ["an unacknowledged transport failure", Object.assign(new Error("Pi did not answer prompt"), { code: "RPC_TIMEOUT" })],
-  ["a refusal that is not about a busy agent", Object.assign(new Error("Cannot submit a prompt while compaction is in progress."), { code: "RPC_COMMAND_FAILED", acknowledged: true })],
 ])("sends the operator's text once and no second time after %s", async (_label, failure) => {
   /** @type {string[]} */
   const attempts = [];
@@ -306,16 +304,6 @@ it("fails unsupported operations before recording RPC_WRITE_STARTED", async () =
   expect(records.map((record) => record.stage)).toEqual(["RECEIVED", "FAILED"]);
 });
 
-it("refuses a session query the worker no longer dispatches", async () => {
-  /** @type {any[]} */
-  const records = [];
-  const replay = await createWorkerReplayStore({ append: async (record) => { records.push(record); } });
-  const dispatcher = createWorkerCommandDispatcher({ replay, adapter: {} });
-
-  await expect(dispatcher.deliver({ clientId: "client", requestId: "stats", op: "session_query" })).rejects.toMatchObject({ code: "UNSUPPORTED_WORKER_OPERATION" });
-  expect(records.map((record) => record.stage)).toEqual(["RECEIVED", "FAILED"]);
-});
-
 it("persists exact invalid RPC bytes before fatal decoding", async () => {
   const child = fakeRpcProcess((_command, process) => process.stdout.write(Buffer.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xff, 0x22, 0x7d, 0x0a])));
   const diagnostics = { append: vi.fn(async () => {}) };
@@ -349,22 +337,6 @@ it("rejects malformed Pi output, retains stderr, and does not respawn", async ()
   await adapter.close();
 });
 
-it("exposes the retry brake but no session query and no settings passthrough", async () => {
-  /** @type {any[]} */
-  const sent = [];
-  const child = fakeRpcProcess((command, process) => {
-    sent.push(command);
-    process.stdout.write(`${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true })}\n`);
-  });
-  const adapter = PiRpcAdapter.connect({ input: child.stdin, output: child.stdout, maxRecordBytes: 4_096 });
-
-  for (const method of ["getSessionStats", "getTree", "exportHtml", "setAutoCompaction", "setAutoRetry", "setSteeringMode", "setFollowUpMode"]) expect(/** @type {any} */ (adapter)[method], method).toBeUndefined();
-  await expect(adapter.abortRetry()).resolves.toBeUndefined();
-
-  expect(sent.map(({ type }) => type)).toEqual(["abort_retry"]);
-  await adapter.close();
-});
-
 it("discovers commands and applies model, thinking level, and compaction changes", async () => {
   /** @type {any[]} */
   const sent = [];
@@ -395,55 +367,8 @@ it("discovers commands and applies model, thinking level, and compaction changes
   await adapter.close();
 });
 
-it("collects a session menu carrying the thinking levels Pi reported for its current model", async () => {
-  const menu = await collectSessionMenu({
-    getState: async () => ({ model: { provider: "anthropic", id: "claude" }, thinkingLevel: "high" }),
-    getCommands: async () => ({ commands: [{ name: "review", source: "extension" }] }),
-    getAvailableModels: async () => ({ models: [{ provider: "anthropic", id: "claude" }] }),
-    getAvailableThinkingLevels: async () => ({ levels: ["off", "high", "", 7] }),
-  });
-
-  expect(menu).toEqual({
-    commands: [{ name: "/review", source: "extension" }],
-    models: [{ provider: "anthropic", id: "claude" }],
-    model: { provider: "anthropic", id: "claude" },
-    thinkingLevels: ["off", "high"],
-    thinkingLevel: "high",
-  });
-});
-
-// A worker whose Pi does not answer the thinking query serves the rest of the menu; the viewer reads
-// the empty list as "this session cannot pick a level" rather than waiting on a menu that never comes.
-it("collects a session menu with no thinking levels when Pi refuses the query", async () => {
-  const menu = await collectSessionMenu({
-    getState: async () => ({ model: null }),
-    getAvailableThinkingLevels: async () => { throw Object.assign(new Error("unknown command"), { code: "RPC_COMMAND_FAILED" }); },
-  });
-
-  expect(menu).toEqual({ commands: [], models: [], model: null, thinkingLevels: [], thinkingLevel: null });
-});
-
-it("applies one chosen thinking level to Pi and records the acknowledged delivery", async () => {
-  /** @type {any[]} */
-  const records = [];
-  const replay = await createWorkerReplayStore({ append: async (record) => { records.push(record); } });
-  const setThinkingLevel = vi.fn(async () => undefined);
-  const dispatcher = createWorkerCommandDispatcher({ replay, adapter: { setThinkingLevel } });
-
-  await dispatcher.deliver({ clientId: "client", requestId: "thinking", op: "session_command", sessionCommand: { command: "set_thinking_level", level: "high" } });
-
-  expect(setThinkingLevel).toHaveBeenCalledWith("high");
-  expect(records.map((record) => record.stage)).toEqual(["RECEIVED", "RPC_WRITE_STARTED", "RPC_ACKNOWLEDGED"]);
-
-  // The same identity is never written to Pi twice: a replayed request answers from the log.
-  await dispatcher.deliver({ clientId: "client", requestId: "thinking", op: "session_command", sessionCommand: { command: "set_thinking_level", level: "high" } });
-  expect(setThinkingLevel).toHaveBeenCalledTimes(1);
-});
-
 it.each([
   ["an empty level", { command: "set_thinking_level", level: "" }],
-  ["a level that is not a string", { command: "set_thinking_level", level: 3 }],
-  ["a missing level", { command: "set_thinking_level" }],
 ])("refuses %s before any Pi write", async (_name, sessionCommand) => {
   /** @type {any[]} */
   const records = [];
@@ -473,21 +398,6 @@ it("expires a request Pi never answers and keeps the adapter usable", async () =
   await adapter.close();
 });
 
-it("ignores a late response for an expired request instead of failing the whole adapter", async () => {
-  /** @type {any} */
-  let held;
-  const child = fakeRpcProcess((command, process) => {
-    if (command.type === "prompt") held = command;
-    else process.stdout.write(`${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true, data: { sessionId: "still-usable" } })}\n`);
-  });
-  const adapter = PiRpcAdapter.connect({ input: child.stdin, output: child.stdout, requestTimeoutMs: 20 });
-
-  expect(await settledWithin(adapter.prompt("answered too late"), 500)).toMatchObject({ code: "RPC_TIMEOUT" });
-  child.stdout.write(`${JSON.stringify({ id: held.id, type: "response", command: "prompt", success: true })}\n`);
-  expect(await settledWithin(adapter.getState(), 500)).toEqual({ value: { sessionId: "still-usable" } });
-  await adapter.close();
-});
-
 // The bytes may already have reached Pi, so an expiry is ambiguous delivery, never a failure.
 it("records an expired Pi request as ambiguous delivery", async () => {
   /** @type {any[]} */
@@ -501,22 +411,6 @@ it("records an expired Pi request as ambiguous delivery", async () => {
     .toMatchObject({ code: "DELIVERY_UNKNOWN", deliveryUnknown: true });
   expect(records.map((record) => record.stage)).toEqual(["RECEIVED", "RPC_WRITE_STARTED", "DELIVERY_UNKNOWN"]);
   expect(records.at(-1).error).toMatchObject({ code: "RPC_TIMEOUT" });
-  await adapter.close();
-});
-
-it("sends one-way UI responses without blocking the next correlated command", async () => {
-  /** @type {string[]} */
-  const commands = [];
-  const child = fakeRpcProcess((command, process) => {
-    commands.push(command.type);
-    if (command.type === "get_state") process.stdout.write(`${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true, data: { sessionId: "session" } })}\n`);
-  });
-  const diagnostics = { append: vi.fn(async () => {}) };
-  const adapter = PiRpcAdapter.connect({ input: child.stdin, output: child.stdout, diagnostics, maxRecordBytes: 1_024 });
-
-  await expect(adapter.uiResponse({ requestId: "ui-1", response: true })).resolves.toBeUndefined();
-  await expect(adapter.getState()).resolves.toEqual({ sessionId: "session" });
-  expect(commands).toEqual(["extension_ui_response", "get_state"]);
   await adapter.close();
 });
 

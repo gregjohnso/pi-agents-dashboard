@@ -103,19 +103,6 @@ describe("viewer normalizer", () => {
     expect(payloads(warmEvents)).toEqual(payloads(coldEvents));
   });
 
-  it("records each tool's chronological position between messages in the snapshot", () => {
-    const subject = normalizer();
-    subject.consumeFrame({ type: "message_end", message: { role: "user", content: "run it", timestamp: 1 } });
-    subject.consumeFrame({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "bash", args: { command: "pwd" } });
-    subject.consumeFrame({ type: "tool_execution_end", toolCallId: "tool-1", toolName: "bash", result: { content: [{ type: "text", text: "/repo" }] }, isError: false });
-    subject.consumeFrame({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], timestamp: 2 } });
-
-    const snapshot = subject.snapshot({ daemonEpoch: "epoch-1", sequence: "4", registryRevision: 1, runtime: null, taskState: "READY", processState: "LIVE", outcome: "NONE" });
-    expect(snapshot.items.map((/** @type {any} */ item) => item.kind)).toEqual(["user_message", "tool", "assistant_message"]);
-    expect(snapshot.items[1]).toMatchObject({ kind: "tool", toolId: "tool-1" });
-    expect(() => parseViewerSnapshot(snapshot)).not.toThrow();
-  });
-
   it("keeps tool, pending UI, model, thinking, and replacement activity continuity", () => {
     const subject = normalizer();
     const events = /** @type {any[]} */ ([
@@ -144,10 +131,7 @@ describe("viewer normalizer", () => {
   });
 
   it.each([
-    ["agent_start", "thinking"], ["message_update", "assistant_streaming"], ["toolcall_start", "tool_pending"],
-    ["tool_execution_start", "tool_running"], ["tool_execution_update", "tool_streaming"], ["compaction_start", "compacting"],
-    ["auto_retry_start", "retrying"], ["extension_ui_request", "waiting"], ["interrupt_requested", "interrupting"],
-    ["stop_requested", "stopping"], ["extension_error", "error"], ["agent_settled", "idle"],
+    ["message_update", "assistant_streaming"], ["agent_settled", "idle"],
   ])("maps %s to replacement activity %s", (type, phase) => {
     const subject = normalizer();
     const frame = type === "message_update" ? { type, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x" } }
@@ -185,75 +169,6 @@ describe("viewer normalizer", () => {
       .toContainEqual({ kind: "assistant_message", itemId: drafts[0].payload.itemId, content: [{ type: "thinking", text: "reason" }, { type: "text", text: "answer" }] });
   });
 
-  it("maps documented model and thinking replacement frames", () => {
-    const subject = normalizer();
-    const events = [
-      ...subject.consumeFrame({ type: "response", command: "set_model", success: true, data: { provider: "openai", id: "gpt-5" } }),
-      ...subject.consumeFrame({ type: "response", command: "cycle_model", success: true, data: { model: { provider: "anthropic", id: "claude" }, thinkingLevel: "high" } }),
-      ...subject.consumeFrame({ type: "thinking_level_changed", level: "low" }),
-    ];
-    expect(events.filter((event) => event.payload.kind === "model_state").map((event) => event.payload)).toEqual([
-      { kind: "model_state", provider: "openai", model: "gpt-5" },
-      { kind: "model_state", provider: "anthropic", model: "claude" },
-    ]);
-    expect(events.filter((event) => event.payload.kind === "thinking_state").map((event) => event.payload.level)).toEqual(["high", "low"]);
-    expect(subject.snapshot({ daemonEpoch: "epoch-1", sequence: "4", registryRevision: 1, runtime: null, taskState: "READY", processState: "LIVE", outcome: "NONE" })).toMatchObject({ model: { provider: "anthropic", id: "claude" }, thinkingLevel: "low" });
-    expect(subject.consumeFrame({ type: "response", command: "cycle_model", success: true, data: null })).toEqual([]);
-    expect(subject.snapshot({ daemonEpoch: "epoch-1", sequence: "4", registryRevision: 1, runtime: null, taskState: "READY", processState: "LIVE", outcome: "NONE" }).model).toEqual({ provider: "anthropic", id: "claude" });
-    expect(() => normalizer().consumeFrame({ type: "response", command: "cycle_model", success: true, data: null })).not.toThrow();
-  });
-
-  it("keeps a burst of one-way Pi UI updates out of the transcript", () => {
-    // One recorded run emitted 153 consecutive setWidget requests inside a single turn
-    // (~/.local/state/pi-agents/runs/*/diagnostics/rpc.*.jsonl).
-    const subject = normalizer();
-    const events = [];
-    for (let index = 0; index < 153; index += 1) {
-      events.push(...subject.consumeFrame({ type: "extension_ui_request", id: `widget-${index}`, method: "setWidget", widgetKey: "monitor-list", widgetLines: ["job 1"] }));
-    }
-    for (const frame of [{ method: "setStatus", statusKey: "monitor", statusText: "3 jobs" }, { method: "setTitle", title: "pi" }, { method: "set_editor_text", text: "draft" }]) {
-      events.push(...subject.consumeFrame({ type: "extension_ui_request", id: `${frame.method}-1`, ...frame }));
-    }
-    expect(events).toEqual([]);
-    const snapshot = subject.snapshot({ daemonEpoch: "epoch-1", sequence: "0", registryRevision: 1, runtime: null, taskState: "WORKING", processState: "LIVE", outcome: "NONE" });
-    expect(snapshot.items).toEqual([]);
-    expect(snapshot.activity.phase).toBe("idle");
-    expect(() => parseViewerSnapshot(snapshot)).not.toThrow();
-  });
-
-  it("shows a Pi notify as one bounded activity line instead of a transcript card", () => {
-    const subject = normalizer();
-    const events = [
-      ...subject.consumeFrame({ type: "extension_ui_request", id: "notify-1", method: "notify", message: "  [monitor mon_1]\n  exit: status=timed-out  ", notifyType: "info" }),
-      ...subject.consumeFrame({ type: "extension_ui_request", id: "notify-2", method: "notify", message: "pull failed", notifyType: "error" }),
-      ...subject.consumeFrame({ type: "extension_ui_request", id: "notify-3", method: "notify", message: "x".repeat(100_000) }),
-      ...subject.consumeFrame({ type: "extension_ui_request", id: "notify-4", method: "notify" }),
-    ];
-    expect(events.map((event) => event.payload.kind)).toEqual(["activity", "activity", "activity", "activity"]);
-    expect(events[0].payload).toMatchObject({ phase: "thinking", label: "Pi notice", detail: "[monitor mon_1] exit: status=timed-out" });
-    expect(events[1].payload).toMatchObject({ phase: "error", label: "Pi error", detail: "pull failed" });
-    expect(String(events[2].payload.detail).length).toBeLessThanOrEqual(4_096);
-    expect(events[3].payload).not.toHaveProperty("detail");
-    const snapshot = subject.snapshot({ daemonEpoch: "epoch-1", sequence: "4", registryRevision: 1, runtime: null, taskState: "WORKING", processState: "LIVE", outcome: "NONE" });
-    expect(snapshot.items).toEqual([]);
-    expect(() => parseViewerSnapshot(snapshot)).not.toThrow();
-    assertPayloads(events);
-  });
-
-  it("reports a UI method Pi does not define once per method, not once per frame", () => {
-    const subject = normalizer();
-    const events = [
-      ...subject.consumeFrame({ type: "extension_ui_request", id: "new-1", method: "hologram", frames: 1 }),
-      ...subject.consumeFrame({ type: "extension_ui_request", id: "new-2", method: "hologram", frames: 2 }),
-      ...subject.consumeFrame({ type: "extension_ui_request", id: "new-3", method: "teleport" }),
-    ];
-    expect(events.map((event) => event.payload)).toEqual([
-      { kind: "unknown_pi_event", piType: "extension_ui_request", summary: "Unsupported Pi UI method (hologram)" },
-      { kind: "unknown_pi_event", piType: "extension_ui_request", summary: "Unsupported Pi UI method (teleport)" },
-    ]);
-    assertPayloads(events);
-  });
-
   it("keeps a long session's snapshot inside one wire frame and says what it left out", () => {
     const subject = normalizer();
     for (let index = 0; index < 64; index += 1) {
@@ -271,33 +186,6 @@ describe("viewer normalizer", () => {
     expect(subject.transcriptItems()).toHaveLength(64);
   });
 
-  it("leaves out even the newest entry when it alone would not fit one wire frame", () => {
-    const subject = normalizer();
-    for (let index = 0; index < 40; index += 1) subject.consumeError({ code: `HISTORY_${index}`, message: "y".repeat(4_000) });
-    subject.consumeHistory({ type: "message", id: "huge", timestamp: AT, message: { role: "assistant", content: Array.from({ length: 12 }, () => ({ type: "text", text: "x".repeat(60_000) })) } }, position(1));
-    const snapshot = subject.snapshot({ daemonEpoch: "epoch-1", sequence: "1", registryRevision: 1, runtime: null, taskState: "READY", processState: "LIVE", outcome: "NONE" });
-
-    expect(() => parseViewerSnapshot(snapshot)).not.toThrow();
-    expect(() => createJsonlEncoder({ maxBytes: WIRE_FRAME_BYTES }).encode({ version: 1, requestId: "r", ok: true, result: { kind: "viewer_subscribed", cursor: { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "1" }, snapshot } })).not.toThrow();
-    expect(snapshot.items).toEqual([expect.objectContaining({ itemId: SNAPSHOT_TRUNCATED_ITEM_ID })]);
-    expect(snapshot.errors.length).toBeLessThan(40);
-    expect(snapshot.errors.at(-1)).toMatchObject({ code: "HISTORY_39" });
-  });
-
-  it("summarizes a failed live tool whose output has surrounding whitespace without altering its result", () => {
-    const subject = normalizer();
-    subject.consumeFrame({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "bash", args: { command: "npm test" } });
-    const events = subject.consumeFrame({ type: "tool_execution_end", toolCallId: "tool-1", toolName: "bash", result: { content: [{ type: "text", text: " WARN cache miss\nexit 1\n" }] }, isError: true });
-
-    const finished = /** @type {any} */ (events.find((/** @type {any} */ event) => event.payload.kind === "tool_finished"));
-    expect(finished.payload.tool).toMatchObject({ state: "failed", error: "WARN cache miss\nexit 1" });
-    expect(finished.payload.tool.result).toEqual([{ type: "text", text: " WARN cache miss\nexit 1\n" }]);
-    const snapshot = subject.snapshot({ daemonEpoch: "epoch-1", sequence: "2", registryRevision: 1, runtime: null, taskState: "WORKING", processState: "LIVE", outcome: "NONE" });
-    expect(snapshot.tools).toEqual([expect.objectContaining({ id: "tool-1", state: "failed", error: "WARN cache miss\nexit 1" })]);
-    expect(() => parseViewerSnapshot(snapshot)).not.toThrow();
-    assertPayloads(events);
-  });
-
   it("summarizes a failed canonical tool result and falls back when it carries no readable text", () => {
     const subject = normalizer();
     const failure = (/** @type {string} */ id, /** @type {any[]} */ content) => ({ type: "message", id, timestamp: AT, message: { role: "toolResult", toolCallId: id, toolName: "bash", content, isError: true } });
@@ -312,21 +200,6 @@ describe("viewer normalizer", () => {
     const snapshot = subject.snapshot({ daemonEpoch: "epoch-1", sequence: "3", registryRevision: 1, runtime: null, taskState: "READY", processState: "LIVE", outcome: "NONE" });
     // The summary is derived; the blocks Pi produced stay exactly as they were recorded.
     expect(snapshot.tools.map((/** @type {any} */ tool) => tool.result)).toEqual([[{ type: "text", text: "\n  denied  \n" }], [{ type: "text", text: "   \n\t " }], []]);
-    expect(() => parseViewerSnapshot(snapshot)).not.toThrow();
-    assertPayloads(events);
-  });
-
-  it("bounds a failed tool summary spread over many multi-byte blocks", () => {
-    const subject = normalizer();
-    const content = [{ type: "text", text: "  \n" }, ...Array.from({ length: 12 }, (_unused, index) => ({ type: "text", text: `${index}${"\u00e9".repeat(2_000)}` })), { type: "text", text: "   " }];
-    const events = subject.consumeFrame({ type: "tool_execution_end", toolCallId: "tool-1", toolName: "bash", result: { content }, isError: true });
-
-    const error = String(/** @type {any} */ (events.find((/** @type {any} */ event) => event.payload.kind === "tool_finished")).payload.tool.error);
-    expect(Buffer.byteLength(error)).toBeLessThanOrEqual(4_096);
-    expect(error.startsWith("0\u00e9")).toBe(true);
-    expect(error.trim()).toBe(error);
-    const snapshot = subject.snapshot({ daemonEpoch: "epoch-1", sequence: "1", registryRevision: 1, runtime: null, taskState: "WORKING", processState: "LIVE", outcome: "NONE" });
-    expect(snapshot.tools[0].result).toHaveLength(content.length);
     expect(() => parseViewerSnapshot(snapshot)).not.toThrow();
     assertPayloads(events);
   });

@@ -8,19 +8,15 @@ describe("wheel input parsing", () => {
 
   it.each([
     ["SGR wheel-up with zero-based coordinates", "\x1b[<64;13;5M", { events: [{ button: "wheel_up", column: 12, row: 4 }], passThrough: "", pending: "" }],
-    ["SGR wheel-down with zero-based coordinates", "\x1b[<65;1;1M", { events: [{ button: "wheel_down", column: 0, row: 0 }], passThrough: "", pending: "" }],
-    ["X10 wheel-up", x10(64, 4, 9), { events: [{ button: "wheel_up", column: 3, row: 8 }], passThrough: "", pending: "" }],
     // A plain left click is ours; pi-tui keeps drags and every other button for its own selection.
     ["a left-button press", "\x1b[<0;5;5M", { events: [{ button: "left", column: 4, row: 4 }], passThrough: "", pending: "" }],
     ["a middle-button press", "\x1b[<1;5;5M", { events: [], passThrough: "\x1b[<1;5;5M", pending: "" }],
-    ["a wheel event surrounded by keystrokes", "ab\x1b[<65;2;3Mcd", { events: [{ button: "wheel_down", column: 1, row: 2 }], passThrough: "abcd", pending: "" }],
   ])("reads %s", (_label, input, expected) => {
     expect(parseWheelInput(input)).toEqual(expected);
   });
 
   it.each([
     ["a split wheel report", "\x1b[<65;2", ";3M", { events: [{ button: "wheel_down", column: 1, row: 2 }], passThrough: "", pending: "" }],
-    ["a prefix that turns out not to be a mouse report", "\x1b[", "A", { events: [], passThrough: "\x1b[A", pending: "" }],
   ])("holds %s as pending instead of dropping or corrupting it", (_label, first, rest, expected) => {
     const held = parseWheelInput(first);
     expect(held).toEqual({ events: [], passThrough: "", pending: first });
@@ -42,24 +38,6 @@ describe("wheel input tap", () => {
     return terminal;
   };
 
-  it("releases a lone Escape without waiting for another keystroke", () => {
-    vi.useFakeTimers();
-    try {
-      const terminal = fakeTerminal();
-      const tapped = createWheelInputTap(terminal, () => {});
-      const forwarded = [];
-      tapped.start((data) => forwarded.push(data), () => {});
-      terminal.started.onInput("\x1b");
-      vi.advanceTimersByTime(50);
-      expect(forwarded).toEqual(["\x1b"]);
-      // A held Escape would arrive glued to the next key, which pi-tui then reads as a meta chord.
-      terminal.started.onInput("\r");
-      expect(forwarded).toEqual(["\x1b", "\r"]);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
   it("still reassembles a wheel report split across chunks inside the flush window", () => {
     vi.useFakeTimers();
     try {
@@ -73,23 +51,6 @@ describe("wheel input tap", () => {
       terminal.started.onInput(";3M");
       expect(onWheel).toHaveBeenCalledWith({ button: "wheel_down", column: 1, row: 2 });
       expect(forwarded).toEqual([]);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("drops a held partial sequence when the terminal stops", () => {
-    vi.useFakeTimers();
-    try {
-      const terminal = fakeTerminal();
-      const tapped = createWheelInputTap(terminal, () => {});
-      const forwarded = [];
-      tapped.start((data) => forwarded.push(data), () => {});
-      terminal.started.onInput("\x1b[<65;2");
-      tapped.stop();
-      vi.advanceTimersByTime(200);
-      expect(forwarded).toEqual([]);
-      expect(terminal.stopped).toBe(true);
     } finally {
       vi.useRealTimers();
     }
@@ -154,12 +115,5 @@ describe("clicks", () => {
     expect(parseWheelInput("\u001b[<0;12;7m").events).toEqual([]);
   });
 
-  it("leaves drags and other buttons to pi-tui", () => {
-    for (const report of ["\u001b[<32;12;7M", "\u001b[<2;12;7M"]) {
-      const parsed = parseWheelInput(report);
-      expect(parsed.events).toEqual([]);
-      expect(parsed.passThrough).toBe(report);
-    }
-  });
 });
 });

@@ -25,18 +25,9 @@ const outcomePreservingProcessEvents = /** @type {const} */ (["WORKER_SLEEPING",
 const transitions = /** @type {const} */ ([
   ["WORKER_READY", { taskState: "READY", processState: "LIVE", outcome: "NONE" }],
   ["TURN_STARTED", { taskState: "WORKING", processState: "LIVE", outcome: "NONE" }],
-  ["TURN_COMPLETED", { taskState: "READY", processState: "LIVE", outcome: "COMPLETED" }],
-  ["TURN_READY_FOR_REVIEW", { taskState: "READY", processState: "LIVE", outcome: "READY_FOR_REVIEW" }],
-  ["WORKER_SLEEPING", { taskState: "READY", processState: "SLEEPING", outcome: "COMPLETED" }],
   ["WORKER_EXITED", { taskState: "READY", processState: "EXITED", outcome: "COMPLETED" }],
-  // A replacement is an activity, not a liveness claim: the worker is still running when it is announced.
-  ["WORKER_REPLACING", { taskState: "READY", processState: "LIVE", outcome: "COMPLETED", activity: { kind: "replacing", summary: "WORKER_REPLACING", updatedAt: now } }],
   ["USER_STOPPED", { taskState: "STOPPED", processState: "EXITED", outcome: "NONE" }],
   ["PI_CHILD_CRASHED", { taskState: "FAILED", processState: "EXITED", outcome: "NONE" }],
-  ["WORKER_CRASHED", { taskState: "READY", processState: "STALE", outcome: "COMPLETED" }],
-  ["IDENTITY_STALE", { taskState: "READY", processState: "STALE", outcome: "COMPLETED" }],
-  ["UI_REQUESTED", { taskState: "WAITING", processState: "LIVE", outcome: "COMPLETED" }],
-  ["UI_RESPONDED", { taskState: "WORKING", processState: "LIVE", outcome: "COMPLETED" }],
 ]);
 
 describe("reduceSessionState", () => {

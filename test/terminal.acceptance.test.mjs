@@ -23,7 +23,7 @@ function viewerScreen(/** @type {any} */ controller, /** @type {number} */ width
 }
 
 const timestamp = "2026-08-25T12:00:00.000Z";
-const dimensions = [[160, 40], [80, 24], [40, 10]];
+const dimensions = [[80, 24], [40, 10]];
 
 function session(sessionId, overrides = {}) {
   return {

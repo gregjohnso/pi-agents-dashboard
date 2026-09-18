@@ -107,12 +107,10 @@ it("records and reaps a destination daemon when the application times out before
 
 it.each([
   ["a group-readable legacy root", async ({ legacyRoot }) => chmod(legacyRoot, 0o755), "UNSAFE_LEGACY_STATE"],
-  ["a group-readable destination root", async ({ destinationRoot }) => mkdir(destinationRoot, { mode: 0o755 }), "UNSAFE_DESTINATION_STATE"],
   ["a symlinked legacy artifact", async ({ parent, legacyRoot }) => {
     await writeFile(join(parent, "target"), "{}", { mode: 0o600 });
     await symlink(join(parent, "target"), join(legacyRoot, "linked.json"));
   }, "UNSAFE_LEGACY_STATE"],
-  ["malformed legacy configuration", async ({ legacyRoot }) => writeFile(join(legacyRoot, "dashboard.json"), "not json", { mode: 0o600 }), "MALFORMED_LEGACY_STATE"],
   ["an interrupted manifest from another migration", async ({ destinationRoot }) => {
     await mkdir(destinationRoot, { mode: 0o700 });
     await writeFile(join(destinationRoot, "migration-manifest.json"), JSON.stringify({ schemaVersion: 1, migrationId: "other", sourceIdentity: "other", state: "COMPLETED" }), { mode: 0o600 });

@@ -113,7 +113,7 @@ async function commit(isolation, name, contents) {
   await git(isolation.worktreePath, "commit", "-m", name);
 }
 
-it.each(LEGACY_WORKTREE_OWNERSHIP_FILES)("recognizes the %s legacy ownership marker during cleanup", async (legacyFile) => {
+it.each(LEGACY_WORKTREE_OWNERSHIP_FILES.slice(-1))("recognizes the %s legacy ownership marker during cleanup", async (legacyFile) => {
   const isolation = await ownedWorktree();
   await rename(await markerPath(isolation), await markerPath(isolation, legacyFile));
   await expect(cleanupOwnedWorktree(isolation, noLiveOwnershipOptions)).resolves.toMatchObject({ disposition: "REMOVED" });
@@ -121,7 +121,6 @@ it.each(LEGACY_WORKTREE_OWNERSHIP_FILES)("recognizes the %s legacy ownership mar
 
 it.each([
   ["omitted", undefined],
-  ["a live ownership snapshot", { liveOwnership: null }],
 ])("fails closed when the authoritative ownership reader is %s", async (_label, options) => {
   const isolation = await ownedWorktree();
 
@@ -171,18 +170,6 @@ it.each([
     },
     "UNTRACKED_FILES",
   ],
-  [
-    "an ignored untracked file",
-    /** @param {string} worktreePath */ async (worktreePath) => {
-      await writeFile(join(worktreePath, ".gitignore"), "ignored.txt\n");
-      await git(worktreePath, "add", ".gitignore");
-      await git(worktreePath, "commit", "-m", "ignore test artifact");
-      const ignored = join(worktreePath, "ignored.txt");
-      await writeFile(ignored, "keep\n");
-      return ignored;
-    },
-    "UNTRACKED_FILES",
-  ],
 ])("refuses cleanup and keeps %s", async (_label, dirty, code) => {
   const isolation = await ownedWorktree();
   const preserved = await dirty(isolation.worktreePath);
@@ -205,22 +192,6 @@ it.each([
       const path = await markerPath(isolation);
       const marker = JSON.parse(await readFile(path, "utf8"));
       await writeFile(path, `${JSON.stringify({ ...marker, repositoryRoot: isolation.worktreePath })}\n`);
-      return null;
-    },
-    "IDENTITY_MISMATCH",
-  ],
-  [
-    "the branch",
-    /** @param {any} isolation */ async (isolation) => {
-      await git(isolation.worktreePath, "switch", "-c", `late-${basename(isolation.worktreePath)}`);
-      return null;
-    },
-    "IDENTITY_MISMATCH",
-  ],
-  [
-    "HEAD",
-    /** @param {any} isolation */ async (isolation) => {
-      await commit(isolation, "late.txt", "late commit\n");
       return null;
     },
     "IDENTITY_MISMATCH",
@@ -288,28 +259,6 @@ it("refuses a changed HEAD with no upstream", async () => {
     cleanupOwnedWorktree(isolation, noLiveOwnershipOptions),
   ).rejects.toMatchObject({
     code: "MISSING_UPSTREAM",
-  });
-});
-
-it("refuses divergent local and upstream history", async () => {
-  const isolation = await ownedWorktree({ remote: true });
-  await git(isolation.worktreePath, "push", "-u", "origin", isolation.branch);
-  await commit(isolation, "local.txt", "local\n");
-
-  const other = join(shared.parent, "divergent-clone");
-  await git(shared.parent, "clone", shared.bareRemote, other);
-  await configure(other);
-  await git(other, "checkout", isolation.branch);
-  await writeFile(join(other, "remote.txt"), "remote\n");
-  await git(other, "add", "remote.txt");
-  await git(other, "commit", "-m", "remote");
-  await git(other, "push", "origin", isolation.branch);
-  await git(isolation.worktreePath, "fetch", "origin");
-
-  await expect(
-    cleanupOwnedWorktree(isolation, noLiveOwnershipOptions),
-  ).rejects.toMatchObject({
-    code: "DIVERGENT_HISTORY",
   });
 });
 

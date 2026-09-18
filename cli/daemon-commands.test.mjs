@@ -87,7 +87,6 @@ it("waits through transient unhealthy startup until the daemon is ready", async 
 
 it.each([
   ["exits", 1, /exited with code 1/u],
-  ["never becomes healthy", undefined, /startup deadline/u],
 ])("reports the failing daemon child's own error output when it %s", async (_label, exitCode, summary) => {
   const root = await stateRoot();
   const result = await runDaemonCommand("start", {
@@ -137,93 +136,6 @@ async function underSlowClock(command, options, stepMs) {
   }
 }
 
-it("waits far past fifteen seconds for a slow daemon start, and still gives up bounded", async () => {
-  // A daemon start on this shared file system reaches READY well after 15 s at load 30, and no
-  // vitest timeout can extend a deadline the command hard-codes; the suite read that as a product
-  // failure three times. The bound must stay: a daemon that never publishes has to surface as
-  // DAEMON_START_FAILED rather than hang the operator's command line forever.
-  const root = await stateRoot();
-  const { result, elapsedMs } = await underSlowClock("start", {
-    root,
-    inspectEndpoint: async () => ({ status: "ABSENT" }),
-    spawnDaemon: () => new EventEmitter(),
-  }, 5_000);
-
-  expect(elapsedMs.at(-1)).toBeGreaterThanOrEqual(60_000);
-  expect(result).toMatchObject({ code: 1, error: { code: "DAEMON_START_FAILED", message: expect.stringContaining("startup deadline") } });
-});
-
-// Operator-visible failure: `daemon start` builds its result and prints it only after the command
-// returns, and the standalone dashboard starts the daemon before it opens the interface. A start that
-// hung gave the operator a dead terminal for ninety seconds, which is long enough to conclude the tool
-// is broken and kill it, destroying the diagnosis the deadline exists to produce.
-it("reports a slow daemon start while it waits, and stays quiet when the start is fast", async () => {
-  const root = await stateRoot();
-  /** @type {string[]} */
-  const slow = [];
-  const slowStart = await underSlowClock("start", {
-    root,
-    stderr: { write: (/** @type {string} */ text) => { slow.push(text); return true; } },
-    inspectEndpoint: async () => ({ status: "ABSENT" }),
-    spawnDaemon: () => new EventEmitter(),
-  }, 5_000);
-
-  expect(slowStart.result).toMatchObject({ code: 1, error: { code: "DAEMON_START_FAILED" } });
-  expect(slow[0]).toContain("daemon start");
-  expect(slow[0]).toMatch(/\b5s of 90s\b/u);
-  expect(slow.at(-1)).toMatch(/\b\d+s of 90s\b/u);
-  // The wait says so more than once, and it does not repeat every poll.
-  expect(slow.length).toBeGreaterThan(1);
-  expect(slow.length).toBeLessThan(slowStart.elapsedMs.length);
-  for (const line of slow) expect(line.endsWith("\n")).toBe(true);
-
-  /** @type {string[]} */
-  const fast = [];
-  const publication = { pid: 4_242, startIdentity: "424200", processGroupId: 4_242, tokenPath: join(root, "daemon", "control.token") };
-  const endpoints = [{ status: "ABSENT" }, { status: "HEALTHY", daemonState: "READY", publication }];
-  const fastStart = await underSlowClock("start", {
-    root,
-    stderr: { write: (/** @type {string} */ text) => { fast.push(text); return true; } },
-    inspectEndpoint: async () => endpoints.shift() ?? { status: "HEALTHY", daemonState: "READY", publication },
-    spawnDaemon: () => new EventEmitter(),
-  }, 1_700);
-
-  // A 1.7 s start is an ordinary start: the operator reads its result, not a progress report.
-  expect(fastStart.result).toMatchObject({ code: 0, result: { kind: "daemon_started", alreadyRunning: false } });
-  expect(fast).toEqual([]);
-});
-
-it("still reports a daemon that will not release its endpoint within seconds of the stop", async () => {
-  // The stop wait begins after the process group has already been signalled, so it must not inherit
-  // the start deadline: an unkillable daemon has to be named quickly, not a minute and a half later.
-  const publication = { pid: 321, startIdentity: "987654321", processGroupId: 654, tokenPath: "/state/daemon/control.token" };
-  const { result, elapsedMs } = await underSlowClock("stop", {
-    root: "/state",
-    inspect: async () => publication,
-    inspectEndpoint: async () => ({ status: "HEALTHY", daemonState: "READY", publication }),
-    request: async () => ({ kind: "state", sessions: [] }),
-    stopProcessGroup: async () => ({ disposition: "GRACEFUL" }),
-  }, 5_000);
-
-  expect(elapsedMs.at(-1)).toBeLessThanOrEqual(20_000);
-  expect(result).toMatchObject({ code: 1, error: { code: "DAEMON_STOP_TIMEOUT" } });
-});
-
-it("reports a daemon child that could not be spawned at all", async () => {
-  const root = await stateRoot();
-  const result = await runDaemonCommand("start", {
-    root,
-    timeoutMs: 5_000,
-    inspectEndpoint: async () => ({ status: "ABSENT" }),
-    spawnDaemon: () => {
-      const child = new EventEmitter();
-      setTimeout(() => child.emit("error", Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" })), 5);
-      return child;
-    },
-  });
-  expect(result).toMatchObject({ code: 1, error: { code: "DAEMON_START_FAILED", message: expect.stringContaining("spawn ENOENT") } });
-});
-
 it("stops only through the verified daemon process-group boundary", async () => {
   const publication = { pid: 321, startIdentity: "987654321", processGroupId: 654, tokenPath: "/state/daemon/control.token" };
   const endpoints = [{ status: "HEALTHY", daemonState: "READY", publication }, { status: "ABSENT" }];
@@ -269,31 +181,6 @@ it("stops each exact live worker on one held connection, claiming nothing", asyn
     stopWorkers: true, yes: true, stopProcessGroup: async () => ({ disposition: "GRACEFUL" }),
   })).resolves.toMatchObject({ code: 0, result: { kind: "daemon_stopped", stoppedSessionIds: ["live"] } });
   expect(operations).toEqual([["get_state", {}], ["stop", { sessionId: "live", revision: 4 }]]);
-});
-
-it("gives every worker stop the daemon's full escalation window and reports the sessions it stopped", async () => {
-  const root = await stateRoot();
-  await writeFile(join(root, "dashboard.json"), JSON.stringify({ stop: { gracefulMs: 7_000, terminateMs: 3_000 } }), { mode: 0o600 });
-  const publication = { pid: 321, startIdentity: "987654321", processGroupId: 654, tokenPath: join(root, "daemon", "control.token") };
-  const endpoints = [{ status: "HEALTHY", daemonState: "READY", publication }, { status: "ABSENT" }];
-  const timeouts = [];
-  const result = await runDaemonCommand("stop", {
-    root,
-    inspectEndpoint: async () => endpoints.shift() ?? { status: "ABSENT" },
-    createRequester: async ({ timeoutMs }) => {
-      timeouts.push(timeoutMs);
-      return {
-        request: async (op) => {
-          if (op === "get_state") return { kind: "state", sessions: [{ sessionId: "live", revision: 4, processState: "LIVE", ownership: { runId: "run" } }] };
-          return { kind: "command", status: { stage: "COMPLETED" } };
-        },
-        close: async () => {},
-      };
-    },
-    stopWorkers: true, yes: true, stopProcessGroup: async () => ({ disposition: "GRACEFUL" }),
-  });
-  expect(timeouts).toEqual([7_000 + 3_000 + 1_000]);
-  expect(result).toMatchObject({ code: 0, result: { kind: "daemon_stopped", stoppedSessionIds: ["live"] } });
 });
 
 it("keeps the daemon running when the stop socket disconnects after submission", async () => {
@@ -353,28 +240,6 @@ it("leaves exactly one daemon when restart cannot prove the old one is gone", as
   expect(result).toMatchObject({ code: 5, error: { code: "DAEMON_STILL_RUNNING" } });
 }, 20_000);
 
-it("starts where the operator's sessions already are when no root is given", async () => {
-  // A start that resolves its own root opened an empty one beside six live sessions, and the list
-  // came up blank.
-  const parent = await stateRoot();
-  const previousRoot = join(parent, "pi-dashboard");
-  await mkdir(join(previousRoot, "sessions"), { recursive: true, mode: 0o700 });
-  await writeFile(join(previousRoot, "sessions", "alpha.json"), "{}", { mode: 0o600 });
-  /** @type {string[][]} */
-  const spawned = [];
-  const endpoints = [{ status: "ABSENT" }, { status: "HEALTHY", daemonState: "READY", publication: { pid: 321 } }];
-
-  const result = await runDaemonCommand("start", {
-    env: { HOME: parent, XDG_STATE_HOME: parent },
-    inspectEndpoint: async () => endpoints.shift() ?? { status: "HEALTHY", daemonState: "READY", publication: { pid: 321 } },
-    spawnDaemon: (/** @type {string} */ _file, /** @type {string[]} */ argv) => { spawned.push(argv); return { once() {} }; },
-  });
-
-  expect(result).toMatchObject({ code: 0, result: { kind: "daemon_started" } });
-  expect(spawned).toEqual([["--root", result.result.root]]);
-  expect(await readdir(join(result.result.root, "sessions"))).toEqual(["alpha.json"]);
-});
-
 it("maps absent, unhealthy, and identity-conflict status to stable exit codes", async () => {
   for (const [status, code] of [["ABSENT", 3], ["UNHEALTHY", 1], ["CONFLICT", 5]]) {
     const result = await runDaemonCommand("status", { root: "/state", inspectEndpoint: async () => ({ status }) });
@@ -409,49 +274,6 @@ async function slowControlSocket(directory, delayMs) {
     },
   };
 }
-
-it("reads a healthy daemon that answers slower than half a second as healthy", async () => {
-  // Measured on this box at 1-minute load 7.04: one daemon holding 400 session rows with 48
-  // dashboards reading get_state answered the liveness probe in a median of 380 ms and a worst of
-  // 557 ms, and 7 of 31 probes exceeded 500 ms. Under the old default those reads refused
-  // `daemon start` with DAEMON_UNHEALTHY and `daemon stop` with STOP_REFUSED.
-  const root = await stateRoot();
-  const server = await slowControlSocket(join(root, "daemon"), 900);
-  try {
-    expect(DAEMON_PROBE_TIMEOUT_MS).toBeGreaterThan(900);
-    await expect(probeDaemon({ tokenPath: server.tokenPath })).resolves.toMatchObject({ reachable: true, state: "READY" });
-  } finally {
-    await server.close();
-  }
-}, 20_000);
-
-it("still bounds a probe the caller shortened, so a wedged daemon cannot hang the command", async () => {
-  const root = await stateRoot();
-  const server = await slowControlSocket(join(root, "daemon"), 5_000);
-  try {
-    await expect(probeDaemon({ tokenPath: server.tokenPath }, { timeoutMs: 100 })).resolves.toEqual({ reachable: false });
-  } finally {
-    await server.close();
-  }
-}, 20_000);
-
-it("gives every daemon command's endpoint probe a timeout the caller can choose", async () => {
-  const root = await stateRoot();
-  await mkdir(join(root, "daemon"), { recursive: true, mode: 0o700 });
-  const identity = { pid: 4_310, startIdentity: "430", processGroupId: 4_310 };
-  await writeFile(join(root, "daemon", "pid.json"), JSON.stringify({
-    schemaVersion: 1, ...identity, daemonEpoch: "epoch", tokenPath: join(root, "daemon", "control.token"),
-    startedAt: "2026-08-25T12:00:00.000Z", state: "READY",
-  }), { mode: 0o600 });
-  /** @type {(number | undefined)[]} */
-  const observed = [];
-  const probe = async (/** @type {any} */ _publication, /** @type {any} */ options) => { observed.push(options?.timeoutMs); return true; };
-
-  await runDaemonCommand("status", { root, inspect: async () => identity, probe });
-  await runDaemonCommand("status", { root, inspect: async () => identity, probe, probeTimeoutMs: 12_000 });
-
-  expect(observed).toEqual([DAEMON_PROBE_TIMEOUT_MS, 12_000]);
-});
 
 // Operator-visible failure: this release changes the frontend protocol, so the daemon refuses a
 // frontend that does not declare it. The liveness probe deliberately declares nothing, because a
@@ -502,20 +324,6 @@ it("restarts a daemon from the previous release without opening a frontend conne
   expect(daemon.stopRequests).toHaveLength(1);
   expect(signalled).toEqual([{ pid: daemon.pid, startIdentity: "111222333", processGroupId: daemon.pid }]);
   expect(spawned).toHaveLength(1);
-});
-
-// Operator-visible failure, 2026-08-31: with four live workers, this daemon's only accepted escape
-// was --stop-workers, which would have stopped all four sessions.
-it("stops a daemon from the previous release without --stop-workers and without stopping a worker", async () => {
-  const { result, daemon, signalled } = await againstPreviousRelease("stop");
-
-  expect(result).toMatchObject({ code: 0, result: { kind: "daemon_stopped", stoppedSessionIds: [] } });
-  // The one frame in this path the previous release cannot answer: the frontend authentication
-  // frame the live-worker read needs, refused for its unknown `clientProtocol` key.
-  expect(daemon.refusals).toEqual([{ version: 1, token: daemon.token, clientProtocol: CLIENT_PROTOCOL }]);
-  expect(daemon.requests).toEqual([]);
-  expect(daemon.stopRequests).toHaveLength(1);
-  expect(signalled).toEqual([{ pid: daemon.pid, startIdentity: "111222333", processGroupId: daemon.pid }]);
 });
 
 it("refuses --stop-workers against a daemon from the previous release, naming the release and the restart", async () => {

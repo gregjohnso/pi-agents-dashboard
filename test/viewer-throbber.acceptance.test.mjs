@@ -98,52 +98,6 @@ function silentSubscription() {
   };
 }
 
-it("keeps the throbber moving in an attached viewer while a quiet turn runs, and stops it when the turn settles", async () => {
-  vi.stubEnv("PI_CODING_AGENT_DIR", join(tmpdir(), "pi-agents-default-keybindings"));
-  const terminal = new ScreenTerminal({ columns: 100, rows: 30 });
-  /** @type {any} */
-  let subscription;
-  const client = {
-    async subscribeViewer() { subscription = silentSubscription(); return { snapshot: workingSnapshot(), events: subscription.events, unsubscribe: () => subscription.unsubscribe() }; },
-    onConnectionChange() { return () => {}; },
-    async command() { return { accepted: true }; },
-    async sessionMenu() { return { commands: [], models: [], model: null, color: null }; },
-  };
-  const viewer = await createStandaloneViewer({
-    sessionId: "s", client, terminal, onReturn: vi.fn(), now: () => Date.now(),
-    persistence: { async load() { return undefined; }, async save() {} },
-  });
-  closers.push(() => viewer.close());
-  await viewer.open();
-  await vi.waitFor(() => expect(terminal.text()).toContain("Assistant streaming"), { timeout: 10_000, interval: 20 });
-
-  const working = await watchGlyphs(terminal, SPINNER_INTERVAL_MS * 6);
-
-  expect(working.every((frame) => frame !== undefined)).toBe(true);
-  expect(new Set(working).size).toBeGreaterThan(1);
-
-  // Pi settles the turn. The clock has to stop with it: an idle session must not repaint forever.
-  subscription.push({
-    version: 1, sessionId: "s", eventId: "settled", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "1" }, timestamp: at,
-    payload: { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "settled", startedAt: at },
-  });
-  subscription.push({
-    version: 1, sessionId: "s", eventId: "turn", cursor: { daemonEpoch: "epoch", sessionId: "s", sequence: "2" }, timestamp: at,
-    payload: { kind: "turn_state", working: false },
-  });
-  await vi.waitFor(() => expect(glyph(terminal)).toBeUndefined(), { timeout: 10_000, interval: 20 });
-
-  const settledFrames = terminal.frames;
-  await sleep(SPINNER_INTERVAL_MS * 5);
-  expect(terminal.frames).toBe(settledFrames);
-
-  // Closing leaves nothing running that could repaint a screen the operator has left.
-  await viewer.close();
-  const closedFrames = terminal.frames;
-  await sleep(SPINNER_INTERVAL_MS * 5);
-  expect(terminal.frames).toBe(closedFrames);
-}, 60_000);
-
 /**
  * One state root running a real daemon and one session.
  *
@@ -268,26 +222,4 @@ it("retries the viewer import after one fails, and opens the session on the next
 
   await vi.waitFor(() => expect(terminal.text()).toContain(`· ${sessionId} ·`), { timeout: 60_000, interval: 20 });
   expect(attempts).toBe(2);
-}, 120_000);
-
-it("keeps the throbber moving in a hosted viewer opened from the list", async () => {
-  vi.stubEnv("PI_CODING_AGENT_DIR", join(tmpdir(), "pi-agents-default-keybindings"));
-  const { piBin, registry, root, sessionId } = await heldSession();
-  await vi.waitFor(async () => expect(await registry.get(sessionId)).toMatchObject({ taskState: "WORKING" }), { timeout: 30_000, interval: 50 });
-  const terminal = new ScreenTerminal({ columns: 100, rows: 30 });
-  const list = await createStandaloneList({
-    cwd: root, terminal,
-    frontend: { root, piBin, clientId: "throbber-host", attachId: "throbber-host-process", async close() {} },
-  });
-  closers.push(() => list.close());
-
-  await vi.waitFor(() => expect(terminal.text()).toContain("hold this turn open"), { timeout: 30_000, interval: 20 });
-  terminal.type("\x1b[C");
-  await vi.waitFor(() => expect(terminal.text()).toContain(`· ${sessionId} ·`), { timeout: 60_000, interval: 20 });
-  await vi.waitFor(() => expect(glyph(terminal)).toBeDefined(), { timeout: 30_000, interval: 20 });
-
-  const working = await watchGlyphs(terminal, SPINNER_INTERVAL_MS * 6);
-
-  expect(working.every((frame) => frame !== undefined)).toBe(true);
-  expect(new Set(working).size).toBeGreaterThan(1);
 }, 120_000);

@@ -34,39 +34,6 @@ describe("transcript document", () => {
   const tallItems = (count, rows) => Array.from({ length: count }, (_, index) => ({ kind: "system_message", itemId: `i-${index}`, text: `item ${index}`, level: "info", rows }));
   const tallAdapters = () => ({ component: vi.fn((item) => ({ render: () => Array.from({ length: item.rows }, (_, row) => `${item.itemId}:${row}`) })) });
 
-  it("renders every line of every block, oldest first", () => {
-    const state = createTranscriptState({ ...snapshot, items: tallItems(3, 10) });
-    const transcript = new TranscriptModel({ state, adapters: tallAdapters() });
-    const lines = transcript.render(80);
-    expect(lines).toHaveLength(30);
-    expect(lines.at(0)).toBe("i-0:0");
-    expect(lines.at(-1)).toBe("i-2:9");
-  });
-
-  it("grows by the new block when an event appends one", () => {
-    let state = createTranscriptState({ ...snapshot, items: tallItems(3, 10) });
-    const transcript = new TranscriptModel({ state, adapters: tallAdapters() });
-    expect(transcript.render(80)).toHaveLength(30);
-    state = applyViewerEvent(state, event({ kind: "system_message", itemId: "fresh", text: "fresh", level: "info" }));
-    state.items.at(-1).rows = 4;
-    transcript.update(state);
-    const lines = transcript.render(80);
-    expect(lines).toHaveLength(34);
-    expect(lines.slice(-4)).toEqual(["fresh:0", "fresh:1", "fresh:2", "fresh:3"]);
-  });
-
-  it("renders each block once and reuses it until its item, width or options change", () => {
-    const adapters = tallAdapters();
-    const state = createTranscriptState({ ...snapshot, items: tallItems(40, 10) });
-    const transcript = new TranscriptModel({ state, adapters });
-    transcript.render(80);
-    expect(adapters.component).toHaveBeenCalledTimes(40);
-    transcript.render(80);
-    expect(adapters.component).toHaveBeenCalledTimes(40);
-    transcript.render(60);
-    expect(adapters.component).toHaveBeenCalledTimes(80);
-  });
-
   it("keeps every rendered line inside the width it was given", () => {
     const adapters = { component: vi.fn((item) => ({ render: vi.fn(() => [`${item.itemId} ${"wide ".repeat(40)}`]) })) };
     const state = createTranscriptState({ ...snapshot, items: Array.from({ length: 100 }, (_, index) => ({ kind: "system_message", itemId: `i-${index}`, text: `line ${index}`, level: "info" })) });

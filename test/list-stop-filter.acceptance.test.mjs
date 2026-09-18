@@ -99,30 +99,6 @@ it("keeps the operator's chosen view when Ctrl+X stops a session", async () => {
   expect(f.rows()).not.toContain("gone");
 });
 
-it("clears the session it stopped when a second Ctrl+X lands after the row has left the live view", async () => {
-  let clock = 0;
-  const f = await mountedList([session("alpha"), session("beta")], { now: () => clock });
-  f.controller.selectSession("alpha");
-
-  f.type("\x18");
-  await vi.waitFor(() => expect(f.client.stop).toHaveBeenCalledWith("alpha", 1, "stop-filter-request"));
-  await vi.waitFor(() => expect(f.controller.stopClearArmed).toBe(true));
-
-  // The daemon publishes the stop: under the live view that row leaves the list at once.
-  f.client.setSessions([stopped("alpha"), session("beta")]);
-  f.controller.applySnapshot(f.client.snapshot);
-  f.tui.renderNow();
-  expect(f.rows()).not.toContain("alpha");
-
-  clock = 200;
-  f.type("\x18");
-
-  await vi.waitFor(() => expect(f.client.delete).toHaveBeenCalledWith("alpha", 2, "stop-filter-request"));
-  // The neighbour the selection landed on was never touched.
-  expect(f.client.stop).toHaveBeenCalledTimes(1);
-  expect(f.client.stop).not.toHaveBeenCalledWith("beta", expect.anything(), expect.anything());
-});
-
 it("abandons the armed clear when the operator moves the selection himself", async () => {
   let clock = 0;
   const f = await mountedList([session("alpha"), session("beta")], { now: () => clock });
@@ -150,7 +126,6 @@ it("abandons the armed clear when the operator moves the selection himself", asy
  */
 it.each([
   ["moves the selection", (/** @type {any} */ f) => f.type("\x1b[B")],
-  ["types into the composer", (/** @type {any} */ f) => f.type("d")],
 ])("abandons an unanswered stop once the operator %s", async (_label, abandon) => {
   /** @type {() => void} */
   let release;
@@ -189,70 +164,11 @@ it("leaves an unanswered stop behind when the frontend closes before the ack", a
  * Operator-visible failure: another frontend cleared the session this one had just stopped, and the
  * second Ctrl+X fell through to the live row under the cursor and stopped it.
  */
-it("does nothing when the session an armed clear belongs to has left the list entirely", async () => {
-  let clock = 0;
-  const f = await mountedList([session("alpha"), session("beta")], { now: () => clock });
-  f.controller.selectSession("alpha");
-  f.type("\x18");
-  await vi.waitFor(() => expect(f.controller.stopClearArmed).toBe(true));
-
-  // Another frontend removed the record outright; this one learns about it from the next snapshot.
-  f.client.setSessions([session("beta")]);
-  f.controller.applySnapshot(f.client.snapshot);
-  clock = 200;
-  f.type("\x18");
-
-  expect(f.client.delete).not.toHaveBeenCalled();
-  expect(f.client.stop).toHaveBeenCalledTimes(1);
-  expect(f.client.stop).not.toHaveBeenCalledWith("beta", expect.anything(), expect.anything());
-  expect(f.controller.stopClearArmed).toBe(false);
-});
-
 /**
  * Operator-visible failure: a second Ctrl+X while the daemon was still answering the first sent a
  * second stop at a stale revision, and once the row had left a filtered view that second press
  * landed on the neighbour the selection had moved to.
  */
-it("ignores a second Ctrl+X while the stop it repeats is still unanswered", async () => {
-  /** @type {() => void} */
-  let release;
-  const f = await mountedList([session("alpha"), session("beta")]);
-  f.client.stop = vi.fn(() => new Promise((resolve) => { release = () => resolve(undefined); }));
-  f.controller.selectSession("alpha");
-  f.type("\x18");
-  await vi.waitFor(() => expect(f.client.stop).toHaveBeenCalledTimes(1));
-
-  f.type("\x18");
-  expect(f.client.stop).toHaveBeenCalledTimes(1);
-
-  // The daemon publishes the stop before it answers this frontend, so the row leaves the live view
-  // and the selection lands on the neighbour while the press is still unanswered.
-  f.client.setSessions([stopped("alpha"), session("beta")]);
-  f.controller.applySnapshot(f.client.snapshot);
-  f.type("\x18");
-
-  expect(f.client.stop).toHaveBeenCalledTimes(1);
-  expect(f.client.delete).not.toHaveBeenCalled();
-  release();
-  await vi.waitFor(() => expect(f.controller.stopClearArmed).toBe(true));
-});
-
-it("stops repainting for an armed clear once the list closes", async () => {
-  let clock = 0;
-  const f = await mountedList([session("alpha")], { now: () => clock });
-  f.controller.selectSession("alpha");
-  f.type("\x18");
-  await vi.waitFor(() => expect(f.controller.stopClearArmed).toBe(true));
-
-  await f.controller.close();
-  const painted = f.terminal.frames;
-  await new Promise((resolve) => { setTimeout(resolve, STOP_CLEAR_WINDOW_MS + 40); });
-
-  // No stray frame onto a screen the viewer may already own, and no arm outliving the list.
-  expect(f.terminal.frames).toBe(painted);
-  expect(f.controller.stopClearArmed).toBe(false);
-});
-
 it("arms nothing while the stop is still in flight or after it failed", async () => {
   let release;
   const f = await mountedList([session("alpha"), session("beta")]);

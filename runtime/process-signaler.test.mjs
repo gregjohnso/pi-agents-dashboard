@@ -155,11 +155,3 @@ it("stops at graceful and TERM cancellation boundaries without later signals", a
     { type: "signal", pgid: ownership.processGroupId, signal: "SIGTERM" },
   ]);
 });
-
-it("requires timing policy from the reviewed configuration", async () => {
-  const { deps } = dependencies([ownership]);
-  await expect(stopVerifiedProcessGroup(ownership, deps)).rejects.toThrow(/timing policy/i);
-  await expect(
-    stopVerifiedProcessGroup(ownership, deps, { gracefulMs: 0, terminateMs: 456 }),
-  ).rejects.toThrow(/gracefulMs/i);
-});

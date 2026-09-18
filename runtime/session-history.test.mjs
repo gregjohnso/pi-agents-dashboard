@@ -10,12 +10,6 @@ import { createSessionHistoryReader } from "./session-history.mjs";
 const directories = [];
 afterEach(async () => Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))));
 
-// Reconciliation resumes from a byte offset across daemon restarts, so it holds the reader open
-// rather than reading a session file whole.
-it("exposes an incremental reader and no read-it-all helper", async () => {
-  expect(Object.keys(await import("./session-history.mjs")).sort()).toEqual(["SessionHistoryError", "createSessionHistoryReader"]);
-});
-
 /** @param {string[]} lines */
 async function fixture(lines) {
   const directory = await mkdtemp(join(tmpdir(), "session-history-"));

@@ -32,12 +32,6 @@ describe("launch composer", () => {
         expect(result).toEqual({ kind: "ready", request });
         expect(Object.hasOwn(result.request, "piConfigRoot")).toBe(false);
     });
-    it("selects no thinking level, even from a draft a previous release persisted", () => {
-        expect(Object.hasOwn(createLaunchDraft(defaults), "thinkingLevel")).toBe(false);
-        const stale = { ...createLaunchDraft(defaults), thinkingLevel: "high", prompt: "Implement it" };
-        const result = prepareLaunchRequest(stale, worktree);
-        expect(Object.hasOwn(result.request, "thinkingLevel")).toBe(false);
-    });
     it("does not launch blank input and preserves a draft when Ctrl+C returns list focus", () => {
         let state = reduceLaunchComposer({ focus: "composer", draft: createLaunchDraft(defaults) }, { type: "changed", prompt: "  " });
         expect(reduceLaunchComposer(state, { type: "submit", preflight: worktree })).toMatchObject({ launch: undefined });

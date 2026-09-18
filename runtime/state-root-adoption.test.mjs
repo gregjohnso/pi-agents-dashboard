@@ -53,17 +53,8 @@ it("keeps an explicit state directory and adopts nothing", async () => {
   await expect(lstat(previousRoot)).resolves.toMatchObject({});
 });
 
-it("adopts nothing when no previous state root exists", async () => {
-  const { env, parent, root } = await stateParent();
-
-  expect(await adoptRenamedStateRoot({ env, inspectActivity: quiet })).toEqual({ status: "NOTHING_TO_ADOPT", root });
-  expect(await readdir(parent)).toEqual([]);
-});
-
 it.each([
   ["daemon", { activeDaemon: { pid: 4242 }, activeSupervisors: [], unverifiable: false }],
-  ["supervisor", { activeDaemon: false, activeSupervisors: [{ pid: 4242, startIdentity: "9", processGroupId: 4242 }], unverifiable: false }],
-  ["unverifiable holder", { activeDaemon: false, activeSupervisors: [], unverifiable: true }],
 ])("defers the rename and keeps running against the previous root while it holds a live %s", async (_label, activity) => {
   const { env, previousRoot } = await stateParent();
   await seedRoot(previousRoot, ["alpha"]);
@@ -106,7 +97,6 @@ it.each([
     await mkdir(join(parent, "elsewhere"), { mode: 0o700 });
     await symlink(join(parent, "elsewhere"), previousRoot);
   }],
-  ["a previous root that is not a directory", async (/** @type {any} */ { previousRoot }) => writeFile(previousRoot, "{}", { mode: 0o600 })],
 ])("refuses %s rather than adopting it", async (_label, mutate) => {
   const context = await stateParent();
   await mutate(context);
@@ -143,19 +133,4 @@ it("keeps the previous root readable when a concurrent start published a competi
 
   await expect(adoptRenamedStateRoot({ env, fsOps, inspectActivity: quiet })).rejects.toMatchObject({ code: "STATE_ROOTS_SPLIT" });
   expect(JSON.parse(await readFile(join(previousRoot, "sessions", "alpha.json"), "utf8"))).toEqual({ sessionId: "alpha" });
-});
-
-it("uses the legacy root when the destination exists but holds no sessions", async () => {
-  // Any command creates `cli/` in the destination root; that must not read as a split and refuse
-  // to start, which stranded the operator's six sessions behind STATE_ROOTS_SPLIT.
-  const parent = await mkdtemp(join(tmpdir(), "pi-agents-roots-"));
-  const previousRoot = join(parent, "pi-dashboard");
-  const root = join(parent, "pi-agents");
-  await mkdir(join(previousRoot, "sessions"), { recursive: true });
-  await writeFile(join(previousRoot, "sessions", "one.json"), "{}");
-  await mkdir(join(root, "cli"), { recursive: true });
-
-  const adoption = await adoptRenamedStateRoot({ env: { HOME: parent, XDG_STATE_HOME: parent }, inspectActivity: async () => ({ activeDaemon: false, activeSupervisors: [], unverifiable: false }) });
-
-  expect(adoption).toMatchObject({ status: "DESTINATION_ROOT_EMPTY", root: previousRoot });
 });

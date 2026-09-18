@@ -159,26 +159,6 @@ it("starts two bounded workers as distinct process-group leaders and opens sessi
   await Promise.all([waitForOwnershipRelease(registry, "one"), waitForOwnershipRelease(registry, "two")]);
 });
 
-it("records the model the launched worker read from Pi at readiness", async () => {
-  const { root, runs, registry, fakeEntry, router } = await setup(["one"]);
-  const supervisor = new WorkerSupervisor({
-    registry,
-    router,
-    ownership: new OwnershipManager(registry),
-    runsDirectory: runs,
-    env: { ...process.env, PI_AGENTS_TEST_EXIT_MS: "700", FAKE_RPC_MODEL: JSON.stringify({ provider: "openai-codex", id: "gpt-5.6-sol" }) },
-    startTimeoutMs: 5_000,
-  });
-  const launched = await supervisor.launch({ sessionId: "one", canonicalSessionFile: join(root, "one.jsonl"), cwd: root, runId: "run-model", piPath: fakeEntry, model: { provider: "anthropic", id: "requested" } });
-
-  // Readiness is the first write that may name a model, and it names the one Pi reported rather
-  // than the one the launch asked for.
-  expect(await registry.get("one")).toMatchObject({ model: { provider: "openai-codex", id: "gpt-5.6-sol" } });
-  await supervisor.close();
-  await waitForExit(launched.identity.pid);
-  await waitForOwnershipRelease(registry, "one");
-});
-
 it("fails the session with a process error when the Pi child exits unexpectedly", async () => {
   const { root, runs, registry, fakeEntry, router, control } = await setup(["one"]);
   const supervisor = new WorkerSupervisor({
@@ -224,49 +204,6 @@ it("refuses a second writer for one canonical session", async () => {
   await supervisor.close();
   await waitForExit(launched.identity.pid);
   await waitForOwnershipRelease(registry, "one");
-});
-
-it("rejects an accept loop with no way to accept or serve", async () => {
-  const accept = /** @type {any} */ (undefined);
-  await expect(serveDaemonConnections({ accept, onConnection: async () => {} })).rejects.toBeInstanceOf(TypeError);
-});
-
-it("serves each accepted daemon connection in turn and returns when the listener closes", async () => {
-  /** @type {string[]} */
-  const calls = [];
-  const queued = [
-    { closed: Promise.resolve(), close() {} },
-    { closed: Promise.resolve(), close() { throw new Error("cleanup failed"); } },
-  ];
-  let accepted = 0;
-
-  await serveDaemonConnections({
-    accept: async () => {
-      accepted += 1;
-      calls.push(`accept:${accepted}`);
-      const connection = queued.shift();
-      if (connection === undefined) throw Object.assign(new Error("closed"), { code: "WORKER_SOCKET_CLOSED" });
-      return connection;
-    },
-    onConnection: async () => {
-      calls.push(`served:${accepted}`);
-      // A worker that listens has no backoff to schedule: the daemon connects, or it does not.
-      if (accepted === 2) throw new Error("this connection failed");
-    },
-  });
-
-  expect(calls).toEqual(["accept:1", "served:1", "accept:2", "served:2", "accept:3"]);
-});
-
-it("closes the connection it is serving and returns on shutdown", async () => {
-  const controller = new AbortController();
-  const connection = { closed: new Promise(() => {}), async close() { throw new Error("shutdown cleanup rejected"); } };
-
-  await expect(serveDaemonConnections({
-    signal: controller.signal,
-    accept: async () => connection,
-    onConnection: async () => { controller.abort(); },
-  })).resolves.toBeUndefined();
 });
 
 

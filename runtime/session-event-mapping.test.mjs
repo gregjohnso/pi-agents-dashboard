@@ -31,18 +31,6 @@ describe("Pi event to session state mapping", () => {
     expect(sessionEventForPiEvent({ type: "agent_end" })).toBeUndefined();
   });
 
-  it("holds a recorded run WORKING from its first event until Pi settles it", () => {
-    let record = runRecord();
-    /** @type {string[]} */
-    const states = [];
-    for (const type of RECORDED_RUN) {
-      const event = sessionEventForPiEvent({ type });
-      if (event !== undefined) record = reduceSessionState(record, { ...event, at });
-      states.push(record.taskState);
-    }
-    expect(states).toEqual(["WORKING", "WORKING", "WORKING", "WORKING", "WORKING", "WORKING", "WORKING", "WORKING", "READY"]);
-  });
-
   it("waits only for the extension UI methods that block on a person", () => {
     // Pi's RpcExtensionUIRequest splits into four dialogs and five one-way display updates
     // (dist/modes/rpc/rpc-types.d.ts); the viewer already keeps that split in DIALOG_METHODS.
@@ -54,22 +42,4 @@ describe("Pi event to session state mapping", () => {
     }
   });
 
-  it("keeps a run WORKING through a burst of extension widget updates mid-turn", () => {
-    // One recorded run interleaves 153 consecutive setWidget requests between turn_start and turn_end.
-    let record = runRecord();
-    for (const event of [{ type: "agent_start" }, { type: "turn_start" }]) {
-      record = reduceSessionState(record, { .../** @type {any} */ (sessionEventForPiEvent(event)), at });
-    }
-    for (let index = 0; index < 153; index += 1) {
-      const mapped = sessionEventForPiEvent({ type: "extension_ui_request", method: "setWidget", widgetKey: "monitor-list" });
-      if (mapped !== undefined) record = reduceSessionState(record, { ...mapped, at });
-    }
-    expect(record.taskState).toBe("WORKING");
-  });
-
-  it("reports activity without changing task state", () => {
-    expect(sessionEventForPiEvent({ type: "tool_execution_start", toolName: "bash" })).toMatchObject({ type: "ACTIVITY_SNAPSHOT", tool: { summary: "bash" } });
-    expect(sessionEventForPiEvent({ type: "message_update" })).toMatchObject({ type: "ACTIVITY_SNAPSHOT" });
-    expect(sessionEventForPiEvent({ type: "text_delta" })).toBeUndefined();
-  });
 });

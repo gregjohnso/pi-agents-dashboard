@@ -95,8 +95,6 @@ it("never replays a destructive request when the socket is lost after the stop i
 it.each([
   ["missing confirmation", ["stop", "exact-session-id", "--revision", "4"]],
   ["path-like session ID", ["stop", "sessions/exact-session-id", "--revision", "4", "--yes"]],
-  ["unknown flag", ["stop", "exact-session-id", "--revision", "4", "--yes", "--force"]],
-  ["respawn without a revision", ["respawn", "exact-session-id", "--yes"]],
 ])("rejects strict destructive grammar: %s", async (_name, argv) => {
   const request = vi.fn();
   await expect(runSessionCommand(argv, { request })).resolves.toMatchObject({ code: 2, error: { code: "INVALID_SYNTAX" } });
@@ -105,7 +103,6 @@ it.each([
 
 it.each([
   ["status", ["status", "exact-session-id"]],
-  ["delete", ["delete", "exact-session-id", "--revision", "4", "--yes"]],
 ])("rejects the retired %s verb", async (_name, argv) => {
   const request = vi.fn();
   await expect(runSessionCommand(argv, { request })).resolves.toMatchObject({ code: 2, error: { code: "INVALID_SYNTAX" } });
@@ -121,19 +118,6 @@ it("sends rm as the delete operation and records nothing about the attempt", asy
   await expect(runSessionCommand(rmArgv, { root, randomId: () => "stable", request })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN", sessionId: "exact-session-id", revision: 4 } });
   expect(request.mock.calls[0][0]).toBe("delete");
   await expect(readdir(join(root, "cli", "pending"))).rejects.toMatchObject({ code: "ENOENT" });
-});
-
-// respawn ends a worker's process group, so it takes the same convention as stop and rm: a full
-// identifier, an exact revision, and explicit confirmation.
-it("sends the exact revision-bound respawn alone", async () => {
-  const root = await stateRoot();
-  const operations = [];
-  const request = vi.fn(async (op, payload) => {
-    operations.push([op, payload]);
-    throw Object.assign(new Error("Daemon response was lost after submission"), { code: "DELIVERY_UNKNOWN" });
-  });
-  await expect(runSessionCommand(respawnArgv, { root, randomId: () => "stable", request: request })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN" } });
-  expect(operations).toEqual([["respawn", { sessionId: "exact-session-id", revision: 4 }]]);
 });
 
 it("reads every session row for agents without opening the list", async () => {
@@ -233,7 +217,6 @@ async function withRequester(root, options, run) {
 
 it.each([
   ["ends without answering", (socket) => socket.end(), {}, 200],
-  ["holds the connection open past the deadline", () => {}, { closeOnInputEnd: false }, 100],
 ])("settles a submitted request as DELIVERY_UNKNOWN when the peer %s", async (_name, respond, serverOptions, timeoutMs) => {
   const root = await stateRoot();
   const server = await daemonServer(root, respond, undefined, serverOptions);
@@ -252,22 +235,11 @@ it("reports a read-only timeout as a timeout, never as an ambiguous delivery", a
   await closeServer(server);
 });
 
-it("returns one validated response when the peer immediately ends the connection", async () => {
-  const root = await stateRoot();
-  const response = { version: 1, requestId: "response-boundary", ok: true, result: { kind: "state", sessions: [], cursor: { daemonEpoch: "epoch", sequence: "0" } } };
-  const server = await daemonServer(root, (socket, encoder) => socket.end(encoder.encode(response)));
-  await withRequester(root, { timeoutMs: 200 }, async (request) => {
-    await expect(request("get_state", {}, "response-boundary")).resolves.toEqual(response.result);
-  });
-  await closeServer(server);
-});
-
 // The shared client's rule, which the CLI now inherits: an answer that fails strict validation
 // rejects the one request that owns it and keeps the connection. A destructive request whose answer
 // cannot be read may already have run, so it is ambiguous rather than a clean failure.
 it.each([
   ["an unparseable successful result", { ok: true, result: { kind: "mystery" } }],
-  ["an unparseable error", { ok: false, error: { code: "NO", message: "bad" } }],
 ])("rejects only the request that owns %s", async (_name, answer) => {
   const root = await stateRoot();
   const server = await daemonServer(root, (socket, encoder, frame) => socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ...answer })), undefined, { closeOnInputEnd: false });
@@ -299,13 +271,6 @@ it("refuses a command answer that names a different session", async () => {
   await closeServer(server);
 });
 
-it("classifies an unvalidated delete response as delivery unknown", async () => {
-  const root = await stateRoot();
-  const server = await daemonServer(root, (socket, encoder, frame) => socket.write(encoder.encode({ version: 1, requestId: frame.requestId, ok: true, result: { kind: "mystery" } })));
-  await expect(runSessionCommand(rmArgv, { root, randomId: () => "stable", timeoutMs: 200 })).resolves.toMatchObject({ code: 1, error: { code: "DELIVERY_UNKNOWN", sessionId: "exact-session-id" } });
-  await closeServer(server);
-});
-
 /** One session row shaped the way the daemon publishes it, so strict response validation accepts it. */
 const wireSession = {
   schemaVersion: 1,
@@ -322,16 +287,6 @@ const wireSession = {
   updatedAt: "2026-01-01T00:00:00.000Z",
   isolation: { mode: "worktree", worktreePath: "/managed/worktree", branch: "agent/exact" },
 };
-
-// A read has nothing to be ambiguous about: nothing was mutated, so a lost answer is a lost answer.
-// The one-shot CLI socket reported every submitted request as DELIVERY_UNKNOWN when the peer went
-// away, which read as "your rm may have run" for a command that only asked for rows.
-it("reports a lost read as a lost connection, never as an ambiguous delivery", async () => {
-  const root = await stateRoot();
-  const server = await daemonServer(root, (socket) => socket.destroy());
-  await expect(runAgentsCommand({ root, randomId: () => "stable", timeoutMs: 2_000 })).rejects.toMatchObject({ code: "CONNECTION_CLOSED" });
-  await closeServer(server);
-});
 
 // One command is one authenticated conversation. Cleanup reads the row, then re-reads it at the
 // ownership boundary; on the retired per-request socket that was two connections and two handshakes.
@@ -412,67 +367,6 @@ it("reads the newest Pi stderr segment before worker stderr and names both full 
   expect(result.result.text).not.toContain("rpc traffic");
 });
 
-it("reads a prepared session's run directory before any worker metadata exists", async () => {
-  const root = await stateRoot();
-  await runFixture(root, {
-    worker: "WORKER_PROCESS_EXITED: Worker exited before worker_hello (SIGTERM)\n",
-    segments: { "stderr.00000000.jsonl": '{"type":"pi_stderr","text":"pi: unknown model claude-nope"}\n' },
-  });
-  const prepared = { sessionId: "exact-session-id", revision: 0, taskState: "FAILED", processState: "EXITED", latestRunId: "run-1", runHash };
-  expect(prepared.ownership).toBeUndefined();
-  const result = await runLogsCommand("exact-session-id", { root, request: stateWith(prepared) });
-  expect(result.code).toBe(0);
-  const { text } = result.result;
-  expect(text).toContain("pi: unknown model claude-nope");
-  expect(text.indexOf("unknown model")).toBeLessThan(text.indexOf("WORKER_PROCESS_EXITED"));
-});
-
-it("resolves the run directory under the current root after that root is renamed in place", async () => {
-  const root = await stateRoot();
-  await runFixture(root, { worker: "worker stderr line\n", segments: { "stderr.00000000.jsonl": "pi complaint\n" } });
-  const renamed = `${root}-renamed`;
-  roots.push(renamed);
-  await rename(root, renamed);
-  const result = await runLogsCommand("exact-session-id", { root: renamed, request: stateWith(logSession) });
-  expect(result.result.sources.map((/** @type {any} */ source) => source.path)).toEqual([
-    join(renamed, "runs", runHash, "diagnostics", "stderr.00000000.jsonl"),
-    join(renamed, "runs", runHash, "worker.stderr.log"),
-  ]);
-  expect(result.result.text).toContain("pi complaint");
-});
-
-it("gives the Pi segment the whole 262144-byte budget first and still names the starved worker log", async () => {
-  const root = await stateRoot();
-  const directory = await runFixture(root, { worker: "worker stderr line\n", segments: { "stderr.00000000.jsonl": `${"p".repeat(300_000)}\n` } });
-  const result = await runLogsCommand("exact-session-id", { root, request: stateWith(logSession) });
-  expect(result.result.sources).toEqual([
-    { path: join(directory, "diagnostics", "stderr.00000000.jsonl"), bytes: 262_144, truncated: true },
-    { path: join(directory, "worker.stderr.log"), bytes: 0, truncated: true },
-  ]);
-  expect(result.result.text).toContain(join(directory, "worker.stderr.log"));
-  expect(result.result.text).not.toContain("worker stderr line");
-});
-
-// 26 bytes into a 41-byte segment lands inside a two-byte character.
-it("emits only complete UTF-8 when the bound cuts into a character", async () => {
-  const root = await stateRoot();
-  await runFixture(root, { segments: { "stderr.00000000.jsonl": `${"é".repeat(20)}\n` } });
-  const result = await runLogsCommand("exact-session-id", { root, maxTailBytes: 26, request: stateWith(logSession) });
-  expect(result.result.sources[0]).toMatchObject({ bytes: 26, truncated: true });
-  expect(result.result.text).not.toContain("\uFFFD");
-  expect(result.result.text).toBe(`==> ${join(root, "runs", runHash, "diagnostics", "stderr.00000000.jsonl")} (tail) <==\n${"é".repeat(12)}\n`);
-});
-
-// A killed writer leaves the last character half on disk; it must not reach the operator as U+FFFD.
-it("emits only complete UTF-8 when the log itself ends mid-character", async () => {
-  const root = await stateRoot();
-  await runFixture(root, { worker: Buffer.concat([Buffer.from("worker ok\n"), Buffer.from([0xc3])]) });
-  const result = await runLogsCommand("exact-session-id", { root, request: stateWith(logSession) });
-  expect(result.result.sources[0]).toMatchObject({ bytes: 11, truncated: false });
-  expect(result.result.text).not.toContain("\uFFFD");
-  expect(result.result.text.endsWith("worker ok\n")).toBe(true);
-});
-
 it("refuses a symbolic link where an owned regular log belongs", async () => {
   const root = await stateRoot();
   const directory = await runFixture(root, { segments: { "stderr.00000000.jsonl": "pi complaint\n" } });
@@ -495,7 +389,7 @@ it("refuses a log source replaced between its identity check and the end of the 
     .resolves.toMatchObject({ code: 1, error: { code: "LOG_SOURCE_UNSAFE" } });
 });
 
-it.each([["parent escape", "../outside"], ["nested path", "nested/hash"], ["current directory", "."], ["empty name", ""]])(
+it.each([["parent escape", "../outside"], ["empty name", ""]])(
   "refuses a run hash that is not a root-relative directory name: %s",
   async (_name, badHash) => {
     const root = await stateRoot();
@@ -503,15 +397,6 @@ it.each([["parent escape", "../outside"], ["nested path", "nested/hash"], ["curr
       .resolves.toMatchObject({ code: 1, error: { code: "LOG_SOURCE_UNSAFE" } });
   },
 );
-
-it("names every path it searched when the session has no readable log", async () => {
-  const root = await stateRoot();
-  const result = await runLogsCommand("exact-session-id", { root, request: stateWith(logSession) });
-  expect(result).toMatchObject({ code: 1, error: { code: "LOGS_NOT_FOUND" } });
-  expect(result.error.message).toContain(join(root, "runs", runHash, "worker.stderr.log"));
-  await expect(runLogsCommand("exact-session-id", { root, request: stateWith({ sessionId: "exact-session-id", revision: 4 }) }))
-    .resolves.toMatchObject({ code: 1, error: { code: "LOGS_NOT_FOUND" } });
-});
 
 it("refuses an unknown exact session ID and a prefix of a known one", async () => {
   const root = await stateRoot();

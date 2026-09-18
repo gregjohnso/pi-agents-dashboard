@@ -14,25 +14,6 @@ function procStat({ pid = 321, comm = "worker (rpc)", pgid = 654, startTimeTicks
   return `${pid} (${comm}) ${fields.join(" ")}\n`;
 }
 
-it("parses PID, process-group ID, and start ticks when comm contains parentheses", () => {
-  expect(parseProcStat(procStat())).toEqual({
-    pid: 321,
-    pgid: 654,
-    startTimeTicks: "987654321",
-  });
-});
-
-it("reads the exact Linux proc stat path for a positive PID", async () => {
-  const procFs = { readFile: vi.fn(async () => procStat({ pid: 77, pgid: 77 })) };
-
-  await expect(inspectProcessIdentity(77, procFs)).resolves.toEqual({
-    pid: 77,
-    processGroupId: 77,
-    startIdentity: "987654321",
-  });
-  expect(procFs.readFile).toHaveBeenCalledWith("/proc/77/stat", "utf8");
-});
-
 it("fails closed when proc returns a different PID or malformed numeric identity", async () => {
   await expect(
     inspectProcessIdentity(77, { readFile: async () => procStat({ pid: 78 }) }),

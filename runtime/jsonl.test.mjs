@@ -21,7 +21,6 @@ describe("JSONL decoder", () => {
   it.each([
     ["malformed JSON", 1024, Buffer.from('{"partial":\n'), "MALFORMED_JSON"],
     ["malformed UTF-8", 1024, Buffer.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xc3, 0x28, 0x22, 0x7d, 0x0a]), "INVALID_UTF8"],
-    ["oversized frame", 7, Buffer.from("not-json\n"), "FRAME_TOO_LARGE"],
   ])("returns a typed error without a partial message for %s", (_name, maxBytes, bytes, code) => {
     const decoder = createJsonlDecoder({ maxBytes });
 

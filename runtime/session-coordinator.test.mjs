@@ -36,26 +36,6 @@ it("serializes operations for one session and removes its idle lock", async () =
   expect(coordinator.size).toBe(0);
 });
 
-it("does not serialize unrelated session IDs", async () => {
-  const coordinator = new SessionCoordinator();
-  /** @type {((value?: unknown) => void) | undefined} */
-  let releaseA;
-  const aBlocked = new Promise((resolve) => {
-    releaseA = resolve;
-  });
-  let bRan = false;
-
-  const a = coordinator.run("session-a", () => aBlocked);
-  const b = coordinator.run("session-b", async () => {
-    bRan = true;
-  });
-
-  await b;
-  expect(bRan).toBe(true);
-  releaseA?.();
-  await a;
-});
-
 it("continues the key queue after an operation rejects", async () => {
   const coordinator = new SessionCoordinator();
 

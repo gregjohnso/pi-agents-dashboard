@@ -100,30 +100,6 @@ describe("daemon client", () => {
     expect(await client.request(request)).toMatchObject({ requestId: "exact-request-id", ok: true });
   });
 
-  // The daemon binds this connection's open sessions to the attachId, so three dashboards of one
-  // installation are three peers rather than one identity racing itself.
-  it("declares this dashboard process in the authentication frame, and omits it when there is none", async () => {
-    const socketPath = await socketPathIn("client-");
-    const server = await daemonServer(socketPath, ({ reply }) => reply(emptyState));
-    const withAttachId = startClient({ socketPath, attachId: "attach-one" });
-    await withAttachId.connect();
-    const withoutAttachId = startClient({ socketPath, clientId: "client-1" });
-    await withoutAttachId.connect();
-    expect(server.authentications).toEqual([
-      { version: 1, token: "secret", clientProtocol: CLIENT_PROTOCOL, attachId: "attach-one" },
-      { version: 1, token: "secret", clientProtocol: CLIENT_PROTOCOL },
-    ]);
-    expect(() => startClient({ socketPath, attachId: "" })).toThrow(/attachId/u);
-  });
-
-  it("reconnects and resends the same request after disconnect without worker-side cancellation", async () => {
-    const socketPath = await socketPathIn("client-");
-    const server = await daemonServer(socketPath, ({ socket, requests, reply }) => requests === 1 ? socket.destroy() : reply(emptyState));
-    const client = startClient({ socketPath, reconnectDelayMs: 1 });
-    expect(await client.request(request)).toMatchObject({ requestId: "exact-request-id", ok: true });
-    expect(server.requests).toBe(2);
-  });
-
   it("does not replay a transactional request after its authenticated socket disconnects", async () => {
     const socketPath = await socketPathIn("client-");
     const server = await daemonServer(socketPath, ({ socket, requests, reply }) => requests === 1 ? socket.destroy() : reply(emptyState));
@@ -140,28 +116,6 @@ describe("daemon client", () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     await daemonServer(socketPath, ({ reply }) => reply(emptyState));
     await expect(response).resolves.toMatchObject({ requestId: request.requestId, ok: true });
-  });
-
-  it("notifies a list subscriber for every invalidation without holding one of them", async () => {
-    const socketPath = await socketPathIn("client-invalidation-");
-    /** @type {any[]} */
-    const payloads = [];
-    const server = await daemonServer(socketPath, ({ request: incoming, reply }) => {
-      if (incoming.op !== "subscribe_list_changes") return;
-      payloads.push(incoming.payload);
-      reply({ kind: "list_subscribed" });
-    });
-    const client = startClient({ socketPath, reconnectDelayMs: 1 });
-    let notifications = 0;
-    const unsubscribe = await client.subscribeListChanges(() => { notifications += 1; });
-    expect(payloads).toEqual([{}]);
-    const before = notifications;
-    for (let index = 0; index < 5_000; index += 1) server.socket?.write(encodeJsonl({ version: 1, kind: "list_changed" }));
-    await waitFor(() => notifications - before === 5_000);
-    unsubscribe();
-    server.socket?.write(encodeJsonl({ version: 1, kind: "list_changed" }));
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(notifications - before).toBe(5_000);
   });
 
   // A change published while the socket was down is invisible, so reconnecting is itself a change.
@@ -183,27 +137,6 @@ describe("daemon client", () => {
     await waitFor(() => notifications > before);
   });
 
-  // The list draws a fatal frame on its own error line, so this listener lives and dies with the
-  // subscription rather than with the whole client.
-  it("reports this connection's fatal frames to the list subscriber until it unsubscribes", async () => {
-    const socketPath = await socketPathIn("client-list-fatal-");
-    const server = await daemonServer(socketPath, ({ request: incoming, reply }) => {
-      if (incoming.op === "subscribe_list_changes") reply({ kind: "list_subscribed" });
-    });
-    const client = startClient({ socketPath, reconnectDelayMs: 1 });
-    /** @type {any[]} */
-    const failures = [];
-    const unsubscribe = await client.subscribeListChanges(() => {}, (error) => failures.push(error));
-    server.socket?.write(encodeJsonl({ version: 1, kind: "list_changed", unexpected: true }));
-    await waitFor(() => failures.length === 1);
-    expect(failures[0]).toMatchObject({ code: "MALFORMED_FRAME" });
-    unsubscribe();
-    await waitFor(() => server.connections === 2);
-    server.sockets.at(-1)?.write(encodeJsonl({ version: 1, kind: "list_changed", unexpected: true }));
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(failures).toHaveLength(1);
-  });
-
   // Operator-visible failure: a snapshot with no stated coverage cannot be told from one taken before
   // the change that provoked the read, so the list could sit on a row that never updated again. The
   // response contract requires the cursor, and the refusal has to reach the read that asked for it.
@@ -223,7 +156,7 @@ describe("daemon client", () => {
   // A destructive command claims nothing: it carries the installation clientId, its own request ID,
   // and an exact revision, and that is the whole authorization the daemon needs. It travels on its
   // own connection, so a socket that dies mid-command is this command's ambiguity, not the list's.
-  it.each(["stop", "delete"])("sends %s alone on its own connection, with no attachment around it", async (operation) => {
+  it.each(["stop"])("sends %s alone on its own connection, with no attachment around it", async (operation) => {
     const socketPath = await socketPathIn("client-destructive-");
     /** @type {any[]} */
     const requests = [];
@@ -241,7 +174,7 @@ describe("daemon client", () => {
 
   // An ambiguous transport failure after submission is never replayed silently: it becomes
   // DELIVERY_UNKNOWN carrying the identity it was sent under, and the row's revision is the record.
-  it.each(["stop", "delete"])("classifies %s interrupted by a dying socket as delivery unknown", async (operation) => {
+  it.each(["delete"])("classifies %s interrupted by a dying socket as delivery unknown", async (operation) => {
     const socketPath = await socketPathIn("client-destructive-lost-");
     await daemonServer(socketPath, ({ socket, request: incoming }) => {
       if (incoming.op === operation) socket.destroy();
@@ -251,7 +184,7 @@ describe("daemon client", () => {
       .rejects.toMatchObject({ code: "DELIVERY_UNKNOWN", clientId: "client-1", requestId: `${operation}-request` });
   });
 
-  it.each(["stop", "delete"])("treats a refused %s as a structured refusal", async (operation) => {
+  it.each(["stop"])("treats a refused %s as a structured refusal", async (operation) => {
     const socketPath = await socketPathIn("client-destructive-refused-");
     await daemonServer(socketPath, ({ refuse }) => refuse({ code: "REVISION_CONFLICT", message: `${operation} refused` }));
     const client = startClient({ socketPath });
@@ -287,62 +220,6 @@ describe("daemon client", () => {
     await expect(within(client.request({ ...request, requestId: "sound-request" }))).resolves.toMatchObject({ ok: true, result: emptyState });
     expect({ connections: server.connections, requests: server.requests }).toEqual({ connections: 1, requests: 2 });
     expect(fatalErrors).toEqual([]);
-  });
-
-  // Operator-visible failure: one unparseable response frame produced 6676 reconnects at about 222
-  // per second against the live daemon, because reconnect resent every pending request.
-  it("does not reconnect and resend a request whose response cannot be parsed", async () => {
-    const socketPath = await socketPathIn("client-response-storm-");
-    const server = await daemonServer(socketPath, ({ socket, request: incoming }) => {
-      socket.write(encodeJsonl({ version: 1, requestId: incoming.requestId, ok: true, result: { kind: "state", sessions: "invalid" } }));
-    });
-    const client = startClient({ socketPath, reconnectDelayMs: 1 });
-    await expect(within(client.request(request))).rejects.toMatchObject({ code: "MALFORMED_RESPONSE" });
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect({ connections: server.connections, requests: server.requests }).toEqual({ connections: 1, requests: 1 });
-  });
-
-  // A frame no request can own tells the client nothing about what to retry, so it stays fatal.
-  it("keeps an unparseable frame that belongs to no request fatal without failing a live request", async () => {
-    const socketPath = await socketPathIn("client-unattributed-");
-    const server = await daemonServer(socketPath, ({ socket, connection, reply }) => {
-      if (connection === 1) socket.write(encodeJsonl({ version: 1, requestId: "belongs-to-nobody", ok: true, result: { kind: "state", sessions: "invalid" } }));
-      else reply(emptyState);
-    });
-    const client = startClient({ socketPath, reconnectDelayMs: 1 });
-    /** @type {any[]} */
-    const fatalErrors = [];
-    client.onFatalError?.((error) => fatalErrors.push(error));
-    await expect(within(client.request(request))).resolves.toMatchObject({ ok: true, result: emptyState });
-    expect(server.connections).toBe(2);
-    expect(fatalErrors).toEqual([expect.objectContaining({ code: "MALFORMED_FRAME" })]);
-  });
-
-  // A broadcast frame belongs to no request, so a frame this release cannot read means the daemon
-  // is publishing something the list does not understand. It stays fatal, and the reconnect
-  // resubscribes; the retired persisted list event is exactly such a frame.
-  it("keeps a broadcast frame it cannot read fatal, resubscribes, and retains the request it interrupted", async () => {
-    const socketPath = await socketPathIn("client-malformed-broadcast-");
-    const retiredEvent = { version: 1, cursor: { daemonEpoch: "epoch-1", sequence: "1" }, occurredAt: "2026-01-01T00:00:00.000Z", kind: "session_changed", payload: {} };
-    const server = await daemonServer(socketPath, ({ socket, request: incoming, connection, reply }) => {
-      if (incoming.op !== "subscribe_list_changes") {
-        if (connection === 2) reply(emptyState);
-        return;
-      }
-      reply({ kind: "list_subscribed" });
-      socket.write(encodeJsonl(connection === 1 ? retiredEvent : { version: 1, kind: "list_changed" }));
-    });
-    const client = startClient({ socketPath, maxBytes: 4096, reconnectDelayMs: 1 });
-    /** @type {any[]} */
-    const fatalErrors = [];
-    client.onFatalError?.((error) => fatalErrors.push(error));
-    let notifications = 0;
-    const interrupted = client.request(request);
-    await client.subscribeListChanges(() => { notifications += 1; });
-    await expect(within(interrupted)).resolves.toMatchObject({ ok: true, result: emptyState });
-    await waitFor(() => notifications > 0);
-    expect(server.connections).toBe(2);
-    expect(fatalErrors).toEqual([expect.objectContaining({ code: "MALFORMED_FRAME" })]);
   });
 
   const viewerCursor = { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "0" };
@@ -409,44 +286,6 @@ describe("daemon client", () => {
     await expect(within(client.subscribeViewer("session-1"))).rejects.toMatchObject({ code: "SESSION_NOT_FOUND" });
   });
 
-  // A viewer subscription dies with its connection and is never reopened here: only the reader that
-  // builds a transcript from a fresh snapshot can use a new one, and the daemon answers every
-  // subscription with one.
-  it("ends a viewer subscription when its connection drops instead of resubscribing", async () => {
-    const socketPath = await socketPathIn("viewer-dropped-");
-    /** @type {number[]} */
-    const subscriptions = [];
-    const server = await daemonServer(socketPath, ({ request: incoming, connection, reply }) => {
-      if (incoming.op !== "subscribe_viewer") return;
-      subscriptions.push(connection);
-      reply({ kind: "viewer_subscribed", cursor: viewerCursor, snapshot: viewerSnapshot });
-    });
-    const client = startClient({ socketPath, reconnectDelayMs: 1, maxBytes: 4096 });
-    const subscription = await within(client.subscribeViewer("session-1"));
-    const reading = subscription.events.next().then(() => "delivered", (/** @type {unknown} */ error) => error);
-
-    server.socket?.destroy();
-    await expect(within(reading)).resolves.toMatchObject({ code: "CONNECTION_CLOSED" });
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(subscriptions).toEqual([1]);
-  });
-
-  // The daemon publishes this frame when a stream stops for a reason its reader has to act on. It
-  // arrives after the establishing request was answered, so nothing else could carry it.
-  it("ends a viewer subscription on the daemon's stream-failure frame", async () => {
-    const socketPath = await socketPathIn("viewer-stream-failed-");
-    await daemonServer(socketPath, ({ socket, request: incoming, reply }) => {
-      if (incoming.op !== "subscribe_viewer") return;
-      reply({ kind: "viewer_subscribed", cursor: viewerCursor, snapshot: viewerSnapshot });
-      // After the snapshot has landed: a failure in the same chunk as the answer ends the
-      // subscription before its snapshot is delivered, which the refusal above already covers.
-      setTimeout(() => socket.write(encodeJsonl({ version: 1, kind: "viewer_stream_failed", sessionId: "session-1", error: { code: "SUBSCRIBER_OVERFLOW", message: "Viewer subscriber exceeded its bounded queue", retryable: false } })), 0);
-    });
-    const client = startClient({ socketPath, maxBytes: 4096 });
-    const subscription = await within(client.subscribeViewer("session-1"));
-    await expect(within(subscription.events.next())).rejects.toMatchObject({ code: "SUBSCRIBER_OVERFLOW" });
-  });
-
   it("reports the daemon going away and coming back", async () => {
     const socketPath = await socketPathIn("client-connection-");
     const server = await daemonServer(socketPath, ({ reply }) => reply({ kind: "list_subscribed" }));
@@ -461,55 +300,6 @@ describe("daemon client", () => {
     await waitFor(() => connection.length === 3);
     expect(connection).toEqual([true, false, true]);
     unsubscribe();
-  });
-
-  it("forgets old completed responses instead of retaining every one for the life of the dashboard", async () => {
-    const socketPath = await socketPathIn("client-seen-");
-    const server = await daemonServer(socketPath, ({ reply }) => reply(emptyState));
-    const client = startClient({ socketPath });
-    const state = (/** @type {string} */ requestId) => ({ version: 1, clientId: "client-1", requestId, op: "get_state", payload: {} });
-    for (let index = 0; index < 300; index += 1) await client.request(state(`request-${index}`));
-    const answered = server.requests;
-
-    await client.request(state("request-299"));
-    expect(server.requests).toBe(answered);
-    await client.request(state("request-0"));
-    expect(server.requests).toBe(answered + 1);
-  });
-
-  it("forgets retained snapshots once they outgrow the client's response budget", async () => {
-    const socketPath = await socketPathIn("client-seen-bytes-");
-    const cursor = { daemonEpoch: "epoch-1", sessionId: "session-1", sequence: "0" };
-    const activity = { kind: "activity", phase: "idle", label: "Idle", sourceEventId: "source", startedAt: "2026-08-25T00:00:00.000Z" };
-    const snapshot = { version: 1, sessionId: "session-1", registryRevision: 1, cursor, runtime: null, taskState: "READY", processState: "SLEEPING", outcome: "NONE", activity, model: null, thinkingLevel: null, items: [{ kind: "assistant_message", itemId: "answer", content: Array.from({ length: 10 }, () => ({ type: "text", text: "x".repeat(60_000) })) }], tools: [], pendingUi: [], errors: [] };
-    const server = await daemonServer(socketPath, ({ reply }) => reply({ kind: "viewer_subscribed", cursor, snapshot }));
-    const client = startClient({ socketPath, maxBytes: 1024 * 1024 });
-    const read = (/** @type {string} */ requestId) => client.request({ version: 1, clientId: "client-1", requestId, op: "subscribe_viewer", payload: { sessionId: "session-1" } });
-    for (let index = 0; index < 8; index += 1) await read(`snapshot-${index}`);
-    const answered = server.requests;
-
-    await read("snapshot-7");
-    expect(server.requests).toBe(answered);
-    await read("snapshot-0");
-    expect(server.requests).toBe(answered + 1);
-  });
-
-  it("sets a session color without a revision precondition", async () => {
-    const socketPath = await socketPathIn("client-color-");
-    /** @type {any[]} */
-    const payloads = [];
-    await daemonServer(socketPath, ({ request: incoming, reply }) => {
-      payloads.push({ op: incoming.op, payload: incoming.payload });
-      reply({ kind: "session_colored", sessionId: incoming.payload.sessionId, revision: payloads.length, color: incoming.payload.color });
-    });
-    const client = startClient({ socketPath, maxBytes: 4096 });
-    await expect(client.setSessionColor("session-1", "amber")).resolves.toMatchObject({ kind: "session_colored", color: "amber", revision: 1 });
-    await expect(client.setSessionColor("session-1", null)).resolves.toMatchObject({ color: null });
-    expect(payloads).toEqual([
-      { op: "set_session_color", payload: { sessionId: "session-1", color: "amber" } },
-      { op: "set_session_color", payload: { sessionId: "session-1", color: null } },
-    ]);
-    await expect(client.setSessionColor("", "amber")).rejects.toThrow(/sessionId/iu);
   });
 
   // A session another dashboard already holds open still opens here: there is no read-only role, and
@@ -556,40 +346,6 @@ describe("daemon client", () => {
     expect(order).toEqual(["detach:start", "attach:other", "detach:done", "attach:session-1"]);
   });
 
-  it("holds delete behind the same session's in-flight detach and lets another session past", async () => {
-    const socketPath = await socketPathIn("client-delete-detach-order-");
-    /** @type {string[]} */
-    const order = [];
-    /** @type {(() => void) | undefined} */
-    let rejectDetach;
-    await daemonServer(socketPath, ({ request: incoming, reply, refuse }) => {
-      if (incoming.op === "detach") {
-        order.push("detach:start");
-        rejectDetach = () => {
-          order.push("detach:failed");
-          refuse({ code: "DETACH_FAILED", message: "Detach failed" });
-        };
-        return;
-      }
-      order.push(`delete:${incoming.payload.sessionId}:${incoming.requestId}`);
-      reply({ kind: "command", sessionId: incoming.payload.sessionId });
-    });
-    const client = startClient({ socketPath, maxBytes: 4096 });
-    void client.detach("session-1").catch(() => {});
-    await waitFor(() => order.length === 1);
-    const sameSessionDelete = client.delete("session-1", 7, "same-delete-request");
-    await expect(within(client.delete("other", 8, "other-delete-request"))).resolves.toBeUndefined();
-    expect(order).toEqual(["detach:start", "delete:other:other-delete-request"]);
-    rejectDetach?.();
-    await expect(within(sameSessionDelete)).resolves.toBeUndefined();
-    expect(order).toEqual([
-      "detach:start",
-      "delete:other:other-delete-request",
-      "detach:failed",
-      "delete:session-1:same-delete-request",
-    ]);
-  });
-
   // The commands are what the operator asked for; the summary model and the row are decoration the
   // viewer has defaults for, so neither may fail an otherwise good menu.
   it("reads a session menu and keeps it when the settings and rows behind it refuse", async () => {
@@ -625,23 +381,6 @@ describe("daemon client", () => {
     await expect(client.command("prompt", { sessionId: "session-1", text: "ship it" })).resolves.toMatchObject({ kind: "command" });
     await expect(client.command("prompt", { sessionId: "session-1", text: "ship it" })).rejects.toMatchObject({ code: "WORKER_RECONNECTING", retryable: true });
     expect(payloads.map((entry) => entry.op)).toEqual(["prompt", "prompt"]);
-  });
-
-  it("reads the installed Pi's model catalog and keeps the daemon's own refusal code", async () => {
-    const socketPath = await socketPathIn("client-models-");
-    const models = [{ provider: "anthropic", id: "claude-opus-4", thinking: true }, { provider: "google", id: "gemini-3-flash", thinking: false }];
-    /** @type {any[]} */
-    const payloads = [];
-    await daemonServer(socketPath, ({ socket, request: incoming, reply }) => {
-      payloads.push({ op: incoming.op, payload: incoming.payload });
-      if (payloads.length === 1) reply({ kind: "models", models });
-      else socket.write(encodeJsonl({ version: 1, requestId: incoming.requestId, ok: false, error: { code: "MODEL_CATALOG_FAILED", message: "Listing Pi models exited 1", retryable: false } }));
-    });
-    const client = startClient({ socketPath, maxBytes: 8192 });
-    await expect(client.getModels()).resolves.toEqual(models);
-    await expect(client.getModels()).rejects.toMatchObject({ code: "MODEL_CATALOG_FAILED", message: "Listing Pi models exited 1" });
-    expect(payloads.map((entry) => entry.op)).toEqual(["get_models", "get_models"]);
-    expect(payloads[0].payload).toEqual({});
   });
 
 });

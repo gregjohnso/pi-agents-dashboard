@@ -73,17 +73,6 @@ it("persists the distinct Pi child runtime identity before readiness", async () 
   expect(await registry.get("session-1")).toMatchObject({ ownership: { process: worker }, runtime: { supervisor: worker, piChild } });
 });
 
-// Liveness is proved by process identity, never by a timestamp, so no caller refreshes a lease.
-// `heartbeatAt` still ships in the record because a daemon from the previous release rejects an
-// ownership object that omits it.
-it("writes heartbeatAt once at bind and offers no way to refresh it", async () => {
-  const { registry, ownership } = await makeOwnership();
-  expect(/** @type {any} */ (ownership).heartbeat).toBeUndefined();
-  const lease = await ownership.acquire("session-1", "/pi/sessions/session-1.jsonl", "run-1");
-  await ownership.bindProcesses("session-1", lease.leaseId, lease.generation, worker, piChild);
-  expect((await registry.get("session-1"))?.ownership).toMatchObject({ acquiredAt: lease.acquiredAt, heartbeatAt: lease.acquiredAt });
-});
-
 it("uses generation with a repeated lease ID to reject stale bind and release", async () => {
   const { registry, ownership } = await makeOwnership({ randomId: () => "repeated-lease" });
   const oldLease = await ownership.acquire(

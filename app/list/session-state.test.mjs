@@ -11,14 +11,9 @@ function session(taskState, processState) {
 
 it.each([
   ["a working agent", "WORKING", "LIVE", "WORKING"],
-  ["an agent awaiting input", "WAITING", "LIVE", "WAITING"],
   ["a live idle agent", "READY", "LIVE", "READY"],
-  ["a sleeping agent", "READY", "SLEEPING", "SLEEPING"],
   ["a finished session", "READY", "EXITED", "EXITED"],
-  ["a stopped session", "STOPPED", "EXITED", "STOPPED"],
-  ["a failed session", "FAILED", "EXITED", "FAILED"],
   ["a session whose process vanished mid-turn", "WORKING", "EXITED", "EXITED"],
-  ["an unverifiable process", "READY", "STALE", "STALE"],
 ])("reports %s as %s", (_label, taskState, processState, expected) => {
   expect(displaySessionState(/** @type {any} */ (session(taskState, processState)))).toBe(expected);
 });

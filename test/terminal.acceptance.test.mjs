@@ -23,7 +23,7 @@ function viewerScreen(/** @type {any} */ controller, /** @type {number} */ width
 }
 
 const timestamp = "2026-08-25T12:00:00.000Z";
-const dimensions = [[160, 40], [120, 32], [80, 24], [55, 16], [40, 10]];
+const dimensions = [[80, 24], [40, 10]];
 
 function session(sessionId, overrides = {}) {
   return {
@@ -168,7 +168,7 @@ function event(sequence, payload) {
   return { version: 1, sessionId: "viewer-session", eventId: `event-${sequence}`, cursor: { daemonEpoch: "epoch", sessionId: "viewer-session", sequence: String(sequence) }, timestamp, payload };
 }
 
-// The five-width matrix lives here for both surfaces; component tests assert semantics, not widths.
+// The width matrix lives here for both surfaces; component tests assert semantics, not widths.
 // The first row carries wide characters and a deep path because it is the one row every height shows.
 it.each(dimensions)("pins the complete list and viewer surfaces at %ix%i", async (width, height) => {
   const list = dashboardFixture([

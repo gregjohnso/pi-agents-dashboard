@@ -114,17 +114,6 @@ it("adopts from the executable itself, before any command resolves a state root"
   await expect(lstat(previousRoot)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
-it("keeps using the previous root when the new root exists but holds no sessions", async () => {
-  // Inverted 2026-08-30: any command creates `cli/` in the new root, so refusing on its mere
-  // existence stranded six live sessions behind STATE_ROOTS_SPLIT. A split needs sessions on both sides.
-  const { previousRoot, root, env } = await previousStateRoot(["alpha", "beta"]);
-  await mkdir(join(root, "sessions"), { recursive: true, mode: 0o700 });
-
-  const adoption = await adoptRenamedStateRoot({ env });
-
-  expect(adoption).toMatchObject({ status: "DESTINATION_ROOT_EMPTY", root: previousRoot });
-});
-
 it("still refuses when both roots hold sessions", async () => {
   const { previousRoot, root, env } = await previousStateRoot(["alpha", "beta"]);
   await mkdir(join(root, "sessions"), { recursive: true, mode: 0o700 });

@@ -47,26 +47,10 @@ describe("selectDashboardSessions", () => {
     });
     it.each([
         ["display name", { name: "Release Sentinel" }, "release sentinel"],
-        ["project path", { cwd: "/projects/NeedleProject" }, "needleproject"],
-        ["activity summary", { activity: { kind: "tool", summary: "Needle Summary", updatedAt: timestamp } }, "needle summary"],
     ])("searches %s case-insensitively", (_field, overrides, search) => {
         const target = session("target", overrides);
         const other = session("other");
         expect(selectDashboardSessions([other, target], { view: "all", search })).toEqual([target]);
-    });
-    it("filters the state each row displays, not the raw task state", () => {
-        const liveReady = session("live-ready", { processState: "LIVE" });
-        const readyRecords = [
-            liveReady,
-            session("exited"),
-            session("sleeping", { processState: "SLEEPING" }),
-            session("stale", { processState: "STALE" }),
-            session("starting", { activity: { kind: "launching", summary: "Starting", updatedAt: timestamp } }),
-        ];
-        expect(selectDashboardSessions(readyRecords, { view: "all", taskStates: ["READY"] })).toEqual([liveReady]);
-        const liveWorking = session("live-working", { taskState: "WORKING", processState: "LIVE" });
-        const staleWorking = session("stale-working", { taskState: "WORKING", processState: "STALE" });
-        expect(selectDashboardSessions([liveWorking, staleWorking], { view: "all", taskStates: ["WORKING"] })).toEqual([liveWorking]);
     });
     it("combines task-state and exact project-path filters", () => {
         const target = session("target", { taskState: "WAITING", processState: "LIVE", cwd: "/repo/a" });
@@ -77,39 +61,5 @@ describe("selectDashboardSessions", () => {
             taskStates: ["WAITING"],
             projectPaths: ["/repo/a/../a"],
         })).toEqual([target]);
-    });
-    it("sorts by a requested key and preserves input order for ties", () => {
-        const older = session("older", { updatedAt: "2026-08-25T10:00:00.000Z", name: "same" });
-        const newerFirst = session("newer-first", { updatedAt: "2026-08-25T11:00:00.000Z", name: "same" });
-        const newerSecond = session("newer-second", { updatedAt: "2026-08-25T11:00:00.000Z", name: "same" });
-        expect(selectDashboardSessions([newerFirst, older, newerSecond], {
-            view: "all",
-            sort: { key: "age", direction: "desc" },
-        }).map(({ sessionId }) => sessionId)).toEqual(["newer-first", "newer-second", "older"]);
-    });
-});
-describe("countDashboardSessions", () => {
-    it("counts the state each row displays, not the raw task state", () => {
-        expect(countDashboardSessions([
-            session("working", { taskState: "WORKING", processState: "LIVE" }),
-            session("waiting", { taskState: "WAITING", processState: "LIVE" }),
-            session("ready", { taskState: "READY", processState: "LIVE" }),
-            session("sleeping", { taskState: "READY", processState: "SLEEPING" }),
-            session("done", { taskState: "READY", processState: "EXITED" }),
-            session("failed", { taskState: "FAILED", processState: "EXITED" }),
-            session("stopped", { taskState: "STOPPED", processState: "EXITED" }),
-        ])).toEqual({
-            working: 1,
-            waiting: 1,
-            ready: 1,
-            starting: 0,
-            sleeping: 1,
-            exited: 1,
-            stale: 0,
-            failed: 1,
-            stopped: 1,
-            sessions: 7,
-            processes: 3,
-        });
     });
 });

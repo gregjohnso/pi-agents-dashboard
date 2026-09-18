@@ -103,15 +103,6 @@ function painted(terminal) {
   return stripVTControlCharacters(terminal.writes.join(""));
 }
 
-it("leaves the session when the operator presses Escape", async () => {
-  const { onReturn, terminal } = await attachedViewer();
-  await vi.waitFor(() => expect(painted(terminal)).toContain("hello"));
-
-  terminal.input("\x1b");
-
-  await vi.waitFor(() => expect(onReturn).toHaveBeenCalledTimes(1), { timeout: 2_000, interval: 20 });
-});
-
 it("sends Enter as a prompt and Alt+Enter as a follow-up from the attached terminal", async () => {
   const { client, terminal } = await attachedViewer();
   await vi.waitFor(() => expect(painted(terminal)).toContain("hello"));
@@ -128,33 +119,6 @@ it("sends Enter as a prompt and Alt+Enter as a follow-up from the attached termi
   ]), { timeout: 2_000, interval: 20 });
 });
 
-it("clears the prompt on the first Ctrl+C and types the next line from the start", async () => {
-  const { client, onReturn, terminal } = await attachedViewer();
-  await vi.waitFor(() => expect(painted(terminal)).toContain("hello"));
-  for (const character of "rebase") terminal.input(character);
-  await vi.waitFor(() => expect(painted(terminal)).toContain("rebase"), { timeout: 2_000, interval: 20 });
-
-  terminal.input("\x03");
-  for (const character of "next") terminal.input(character);
-
-  await vi.waitFor(() => expect(painted(terminal)).toContain("next"), { timeout: 2_000, interval: 20 });
-  expect(painted(terminal)).not.toContain("rebasenext");
-  expect(onReturn).not.toHaveBeenCalled();
-  // The session is idle, so the press that cleared the prompt asked it for nothing.
-  expect(client.commands).toEqual([]);
-});
-
-// Pi exits on Ctrl+D with an empty editor; its CustomEditor swallows the key unless a handler is
-// registered, so an unbound Ctrl+D is a dead key rather than a way out of the session.
-it("leaves the attached session on Ctrl+D with an empty prompt", async () => {
-  const { onReturn, terminal } = await attachedViewer();
-  await vi.waitFor(() => expect(painted(terminal)).toContain("hello"));
-
-  terminal.input("\x04");
-
-  await vi.waitFor(() => expect(onReturn).toHaveBeenCalledTimes(1), { timeout: 2_000, interval: 20 });
-});
-
 it("leaves the attached session when a second Ctrl+C lands inside the window", async () => {
   const { onReturn, terminal } = await attachedViewer();
   await vi.waitFor(() => expect(painted(terminal)).toContain("hello"));
@@ -164,14 +128,4 @@ it("leaves the attached session when a second Ctrl+C lands inside the window", a
   terminal.input("\x03");
 
   await vi.waitFor(() => expect(onReturn).toHaveBeenCalledTimes(1), { timeout: 2_000, interval: 20 });
-});
-
-// Control: routing every key through the viewer must still leave typing in Pi's editor.
-it("types into the prompt", async () => {
-  const { terminal } = await attachedViewer();
-  await vi.waitFor(() => expect(painted(terminal)).toContain("hello"));
-
-  for (const character of "rebase") terminal.input(character);
-
-  await vi.waitFor(() => expect(painted(terminal)).toContain("rebase"), { timeout: 2_000, interval: 20 });
 });

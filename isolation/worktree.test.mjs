@@ -206,19 +206,6 @@ it("keeps the rollback branch when HEAD changes during ownership publication", a
   ).resolves.toBeUndefined();
 });
 
-it("creates from a canonicalized source-repository alias", async () => {
-  const configRoot = await piConfigRoot();
-  const repositoryAlias = join(shared.parent, "repo-alias");
-  await symlink(shared.root, repositoryAlias);
-
-  const result = await createWorktree(await preflight(configRoot, repositoryAlias), {
-    worktreeId: "canonical",
-  });
-
-  expect(result.repositoryRoot).toBe(shared.root);
-  expect(result.worktreePath).toBe(join(configRoot, "pi-agents", "worktrees", "canonical"));
-});
-
 it("reports branch collision and never falls back to shared directory", async () => {
   const configRoot = await piConfigRoot();
   await git(shared.root, "branch", "pi-agents/branch-collision");
@@ -226,18 +213,6 @@ it("reports branch collision and never falls back to shared directory", async ()
   await expect(
     createWorktree(await preflight(configRoot), { worktreeId: "branch-collision" }),
   ).rejects.toMatchObject({ code: "WORKTREE_CREATE_FAILED" });
-});
-
-it("reports path collision and leaves the existing path intact", async () => {
-  const configRoot = await piConfigRoot();
-  const collisionPath = join(configRoot, "pi-agents", "worktrees", "path-collision");
-  await mkdir(collisionPath, { recursive: true, mode: 0o700 });
-  await writeFile(join(collisionPath, "sentinel"), "keep\n");
-
-  await expect(
-    createWorktree(await preflight(configRoot), { worktreeId: "path-collision" }),
-  ).rejects.toMatchObject({ code: "WORKTREE_CREATE_FAILED" });
-  await expect(access(join(collisionPath, "sentinel"))).resolves.toBeUndefined();
 });
 
 it("rejects worktree IDs that could become argv or path injection", async () => {

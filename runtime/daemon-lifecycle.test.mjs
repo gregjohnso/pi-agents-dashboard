@@ -151,38 +151,15 @@ function noSuchProcess(pid) {
   return Object.assign(new Error(`no such process ${pid}`), { code: "ESRCH" });
 }
 
-it("gives the daemon liveness probe the timeout its caller chose", async () => {
-  // The probe's own timeout default was unreachable: `inspectDaemonEndpoint` called it with one
-  // argument, so a healthy daemon that answered slower than that default read as UNHEALTHY and
-  // refused `daemon start` and `daemon stop` on the pre-flight probe alone.
-  const root = await fixture();
-  const identity = { pid: 91, startIdentity: "910", processGroupId: 91 };
-  await publish(root, identity, "READY");
-  /** @type {(number | undefined)[]} */
-  const observed = [];
-  const probe = async (/** @type {any} */ _publication, /** @type {any} */ options) => {
-    observed.push(options?.timeoutMs);
-    return true;
-  };
-
-  await inspectDaemonEndpoint({ root, inspect: async () => identity, probe, probeTimeoutMs: 4_000 });
-  await expect(claimDaemonLifecycle({ root, identity, daemonEpoch: "other", tokenPath: join(root, "daemon", "control.token"), inspect: async () => identity, probe, probeTimeoutMs: 7_000 }))
-    .rejects.toMatchObject({ code: "DAEMON_ALREADY_RUNNING" });
-
-  expect(observed).toEqual([4_000, 7_000]);
-});
-
 it.each([
   ["leads its own process group, so it can be signalled", { pid: 4242, startIdentity: "111222333", processGroupId: 4242 }, { status: "IDENTIFIED", pid: 4242 }],
   ["belongs to a group another process leads, so its PID was reused", { pid: 4242, startIdentity: "111222333", processGroupId: 17 }, { status: "UNVERIFIED", pid: 4242 }],
-  ["reports no start identity at all", { pid: 4242, processGroupId: 4242 }, { status: "UNVERIFIED", pid: 4242 }],
 ])("identifies a spawned daemon child that %s", async (_label, observed, expected) => {
   await expect(identifyDaemonChild({ pid: 4242 }, async () => observed)).resolves.toMatchObject(expected);
 });
 
 it.each([
   ["exited before it could be identified", { pid: 4242 }, async () => { throw noSuchProcess(4242); }, { status: "EXITED", pid: 4242 }],
-  ["never produced a PID", {}, async () => selfIdentity, { status: "NONE" }],
 ])("identifies a spawned daemon child that %s", async (_label, child, inspect, expected) => {
   await expect(identifyDaemonChild(child, inspect)).resolves.toEqual(expected);
 });

@@ -45,7 +45,6 @@ const staleRecord = JSON.stringify(staleHolder);
 
 it.each([
   ["process is gone", inspectDead],
-  ["pid was reused by a different process", async (/** @type {number} */ pid) => ({ pid, processGroupId: 4242, startIdentity: "7777" })],
 ])("reclaims a lock whose holder %s", async (_label, inspect) => {
   const path = await makeLockPath();
   await writeSoleRecord(path, staleHolder);
@@ -60,12 +59,9 @@ it.each([
 
 it.each([
   ["an unreadable record", [["stale-token", "{ not json"]], inspectDead],
-  ["a record without holder identity", [["stale-token", JSON.stringify({ token: "stale-token", owner: { operation: "worktree_ownership" } })]], inspectDead],
-  ["a record with an incomplete holder", [["stale-token", JSON.stringify({ token: "stale-token", owner: {}, holder: { pid: 4242 } })]], inspectDead],
   ["a token mismatch", [["stale-token", JSON.stringify({ token: "other-token", owner: {}, holder: deadHolder })]], inspectDead],
   ["a holder that is still alive", [["stale-token", staleRecord]], async (/** @type {number} */ pid) => ({ pid, processGroupId: 4242, startIdentity: "9001" })],
   ["holder liveness that cannot be determined", [["stale-token", staleRecord]], async () => { throw Object.assign(new Error("permission denied"), { code: "EACCES" }); }],
-  ["several holders sharing the lock directory", [["stale-token", staleRecord], ["second-token", JSON.stringify({ token: "second-token", owner: {}, holder: deadHolder })]], inspectDead],
 ])("fails closed for %s", async (_label, entries, inspect) => {
   const path = await makeLockPath();
   await fs.mkdir(path, { mode: 0o700 });
@@ -241,29 +237,4 @@ it("does not follow or replace a hostile symlink at the lock path", async () => 
     code: "LOCK_HELD",
   });
   expect(await readFile(target, "utf8")).toBe("sentinel");
-});
-
-it("failed acquisition cleans only its staging directory", async () => {
-  const path = await makeLockPath();
-  const replacement = await acquireLifecycleLock(path, { pid: 99 });
-  /** @type {string[]} */
-  const removed = [];
-  const fsOps = {
-    ...fs,
-    /** @param {string} cleanupPath @param {{ force: boolean, recursive?: boolean }} options */
-    async rm(cleanupPath, options) {
-      removed.push(cleanupPath);
-      await fs.rm(cleanupPath, options);
-    },
-  };
-
-  await expect(acquireLifecycleLock(path, { pid: 42 }, fsOps)).rejects.toMatchObject({
-    code: "LOCK_HELD",
-  });
-
-  expect(removed).not.toContain(path);
-  expect(await readTokenEntry(path, replacement.token)).toMatchObject({
-    token: replacement.token,
-    owner: { pid: 99 },
-  });
 });

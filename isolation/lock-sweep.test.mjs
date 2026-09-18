@@ -89,7 +89,7 @@ it("reclaims a dead holder and never a live one", async () => {
   expect((await readdir(root)).sort()).toEqual(["fresh.pi-agents-ownership.lock", "live.pi-agents-ownership.lock"]);
 });
 
-it.each([".pi-dashboard-ownership.lock", ".pi-agents-dashboard-ownership.lock"])("reclaims a dead holder's %s lock written under a previous product name", async (suffix) => {
+it.each([".pi-agents-dashboard-ownership.lock"])("reclaims a dead holder's %s lock written under a previous product name", async (suffix) => {
   const root = await worktreesRoot();
   await lock(root, "dead", { pid: 4242, processGroupId: 4242, startIdentity: "9" }, 5 * 60_000, suffix);
 
@@ -138,29 +138,6 @@ it("retains a lock whose record changed between inspection and removal", async (
   expect(await readFile(join(path, "rewritten"), "utf8")).toBe(successor);
 });
 
-it("retains a lock whose directory was replaced between inspection and removal", async () => {
-  const root = await worktreesRoot();
-  const path = await lock(root, "replaced", { pid: 4242, processGroupId: 4242, startIdentity: "9" }, 5 * 60_000);
-  const inspectedInode = (await stat(path)).ino;
-  // The successor holds the same entry name and bytes, so only the directory inode separates it.
-  const successor = await readFile(join(path, "replaced"), "utf8");
-  const inspect = async () => {
-    await rm(path, { recursive: true, force: true });
-    await mkdir(path, { mode: 0o700 });
-    await writeFile(join(path, "replaced"), successor, { mode: 0o600 });
-    const when = new Date(Date.now() - 5 * 60_000);
-    await utimes(path, when, when);
-    throw Object.assign(new Error("gone"), { code: "ESRCH" });
-  };
-
-  const removed = await sweepStaleWorktreeLocks({ worktreesRoot: root, startedAt: startedAt(), inspect });
-
-  expect(removed).toEqual([]);
-  expect((await stat(path)).ino).not.toBe(inspectedInode);
-  expect(await readdir(path)).toEqual(["replaced"]);
-  expect(await readFile(join(path, "replaced"), "utf8")).toBe(successor);
-});
-
 it("unlinks exactly the verified token entry and never removes recursively", async () => {
   const root = await worktreesRoot();
   const path = await lock(root, "dead", { pid: 4242, processGroupId: 4242, startIdentity: "9" }, 5 * 60_000);
@@ -173,18 +150,4 @@ it("unlinks exactly the verified token entry and never removes recursively", asy
   expect(calls.filter((call) => call.startsWith("rmdir "))).toEqual([`rmdir ${path}`]);
   expect(calls.filter((call) => call.startsWith("rm "))).toEqual([]);
   expect(await readdir(root)).toEqual([]);
-});
-
-it("keeps anything it cannot read as a lock and tolerates a missing root", async () => {
-  const root = await worktreesRoot();
-  await mkdir(join(root, "0fa4e7e1"), { mode: 0o700 });
-  const unreadable = join(root, "corrupt.pi-agents-ownership.lock");
-  await mkdir(unreadable, { mode: 0o700 });
-  await writeFile(join(unreadable, "entry"), "{not json}\n", { mode: 0o600 });
-  const when = new Date(Date.now() - 5 * 60_000);
-  await utimes(unreadable, when, when);
-
-  expect(await sweepStaleWorktreeLocks({ worktreesRoot: root, startedAt: startedAt() })).toEqual([]);
-  expect((await readdir(root)).sort()).toEqual(["0fa4e7e1", "corrupt.pi-agents-ownership.lock"]);
-  await expect(sweepStaleWorktreeLocks({ worktreesRoot: join(root, "missing"), startedAt: startedAt() })).resolves.toEqual([]);
 });

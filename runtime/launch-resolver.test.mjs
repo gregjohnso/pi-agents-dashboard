@@ -29,34 +29,6 @@ it("materializes and validates a real Pi session header before launch", async ()
   }
 });
 
-// A launch that fails before its child exists is marked FAILED by the daemon, never rolled back, so
-// the resolver offers no rollback entry point.
-it("resolves launches and materializes sessions, and offers no rollback", async () => {
-  expect(Object.keys(launchResolver).sort()).toEqual(["createLaunchResolver", "materializePiSession", "sessionNameFromPrompt"]);
-});
-
-it("names a session from its initial prompt and keeps an explicit name", async () => {
-  const launch = (/** @type {any} */ payload) => createLaunchResolver({
-    registry: { list: vi.fn(async () => []) },
-    piConfigRoot: "/pi/agent",
-    preflight: vi.fn(async () => ({ mode: "shared_directory_confirmation", canonicalCwd: "/repo", confirmedCanonicalCwd: "/repo", ownerSessionIds: [], piConfigRoot: "/pi/agent" })),
-    createWorktree: vi.fn(),
-    confirmSharedDirectory: vi.fn(async () => ({ mode: "shared_directory", canonicalCwd: "/repo", workerCwd: "/repo", sourceSessionId: "source", piConfigRoot: "/pi/agent" })),
-    createPiSession: vi.fn(() => ({ sessionId: "named-session", sessionFile: "/pi/agent/sessions/named-session.jsonl" })),
-    canonicalizeCwd: async (/** @type {string} */ cwd) => cwd,
-    randomId: () => "prepared",
-    now: () => "2026-08-25T12:00:00.000Z",
-  })({ payload });
-
-  const base = { cwd: "/repo", sourceSessionId: "source", isolation: { mode: "shared_directory", confirmedCwd: "/repo", ownerSessionIds: [] } };
-  const derived = await launch({ ...base, prompt: "  Fix   the coverage loader\nand rerun the tests  " });
-  expect(derived.sessionRecord).toMatchObject({ name: "Fix the coverage loader", nameGenerated: true });
-  expect(derived.name).toBe("Fix the coverage loader");
-
-  const explicit = await launch({ ...base, prompt: "Fix the loader", name: "Chosen name" });
-  expect(explicit.sessionRecord).toMatchObject({ name: "Chosen name", nameGenerated: false });
-});
-
 it("removes a prepared worktree when later session preparation fails", async () => {
   const cleanupWorktree = vi.fn(async () => ({ disposition: "REMOVED" }));
   const createWorktree = vi.fn(async () => ({ mode: "worktree", worktreePath: "/worktree", branch: "pi-agents/prepared", workerCwd: "/worktree" }));

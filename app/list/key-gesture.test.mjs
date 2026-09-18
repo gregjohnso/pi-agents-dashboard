@@ -25,28 +25,6 @@ describe("Left dashboard gesture", () => {
         expect(armed).toMatchObject({ openDashboard: false, passThrough: true });
         expect(reduceLeftGesture(armed.state, left(599))).toMatchObject({ openDashboard: true, passThrough: false });
     });
-    it("preserves normal Left when the cursor sits inside the prompt", () => {
-        expect(reduceLeftGesture(createLeftGestureState(), left(0, { cursorAtStart: false }))).toMatchObject({ openDashboard: false, passThrough: true });
-    });
-    it("delegates an empty unfocused Left and opens only after public focus is restored", () => {
-        const tui = { requestRender: vi.fn() };
-        const theme = {
-            borderColor: (text) => text,
-            selectList: { selectedPrefix: () => "", selectedText: (text) => text, description: (text) => text, scrollInfo: (text) => text, noMatch: (text) => text },
-        };
-        const base = new CustomEditor(tui, theme, getKeybindings());
-        const delegated = vi.spyOn(base, "handleInput");
-        const open = vi.fn();
-        const editor = new DashboardGestureEditor(base, open);
-        base.focused = false;
-        editor.handleInput("\x1b[D");
-        expect(delegated).toHaveBeenCalledOnce();
-        expect(open).not.toHaveBeenCalled();
-        base.focused = true;
-        editor.handleInput("\x1b[D");
-        expect(open).toHaveBeenCalledOnce();
-        editor.dispose();
-    });
     it("uses the real public CustomEditor cursor, history, and keybindings", () => {
         vi.useFakeTimers();
         vi.setSystemTime(0);

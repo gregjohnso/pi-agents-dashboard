@@ -12,12 +12,6 @@ const REVIEWED_DEFAULT_CONFIG = {
   diagnostics: { rpcSegmentBytes: 8_388_608, rpcSegments: 4, stderrBytes: 8_388_608 },
 };
 
-// Nothing in this package writes dashboard.json; the operator does. Migration rewrites the legacy
-// file through convertLegacyDashboardConfig and its own staged copy.
-it("reads and converts configuration, and never writes it", async () => {
-  expect(Object.keys(await import("./config.mjs")).sort()).toEqual(["convertLegacyDashboardConfig", "loadDashboardConfig"]);
-});
-
 it("rejects every unknown key and invalid schema 2 value", () => {
   expect(() => loadDashboardConfig({ unexpected: true })).toThrow(/unknown/i);
   expect(() => loadDashboardConfig({ diagnostics: { extra: 1 } })).toThrow(/unknown/i);

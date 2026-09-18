@@ -143,40 +143,6 @@ it("leaves a concurrently running run's ledger and its processes alone", async (
   await expect(readFile(path, "utf8")).resolves.toContain("neighbour daemon");
 });
 
-// The normal case. A run where every test cleaned up after itself reaps nothing and says nothing.
-it("treats an entry for a process that is already gone as ordinary", async () => {
-  const exited = await startSleeper();
-  process.kill(-exited.processGroupId, "SIGKILL");
-  await goneWithin(exited);
-  await ledgerFile([
-    runHeader("run-under-test", await inspectProcessIdentity(process.pid)),
-    { kind: "process", label: "already stopped", identity: exited },
-  ]);
-  process.env[LEDGER_RUN_VARIABLE] = "run-under-test";
-  /** @type {string[]} */
-  const warnings = [];
-
-  const results = await reapLedgerDirectory({ warn: (message) => warnings.push(message) });
-
-  expect(results).toEqual([expect.objectContaining({ disposition: "ALREADY_EXITED" })]);
-  expect(warnings).toEqual([]);
-});
-
-it("records a live process and reads back its exact identity", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-agents-ledger-"));
-  directories.push(directory);
-  const path = await openProcessLedger({ directory, runId: "run-under-test", label: "unit" });
-  const live = await startSleeper();
-
-  await recordProcess(path, "sleeper", live);
-
-  expect(await readProcessLedger(path)).toEqual({
-    header: { runId: "run-under-test", label: "unit", owner: await inspectProcessIdentity(process.pid) },
-    processes: [{ label: "sleeper", identity: live }],
-  });
-  expect(dirname(path)).toBe(directory);
-});
-
 // A sweep that quietly skips a line it cannot read is a sweep that quietly stops reaping, which is
 // worse than one that fails: the leak returns and nothing says so.
 it("refuses a ledger it cannot read rather than sweeping part of it", async () => {

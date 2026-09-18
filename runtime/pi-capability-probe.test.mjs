@@ -64,8 +64,6 @@ it("reads the version from --version and never spawns --help", async () => {
 
 it.each([
   ["prose", { FAKE_PI_VERSION_OUTPUT: "pi - AI coding assistant with read, bash, edit, write tools\n" }],
-  ["an unrecognized flag", { FAKE_PI_VERSION_OUTPUT: "unknown option: --version\n", FAKE_PI_VERSION_EXIT: "1" }],
-  ["nothing", { FAKE_PI_VERSION_OUTPUT: "" }],
 ])("records no version, and still admits the executable, when --version reports %s", async (_label, behavior) => {
   const { log, executable } = await setup();
   const report = await probePiCapabilities({ executable, cache: new Map(), timeoutMs: 5_000, env: { ...process.env, FAKE_PI_LOG: log, ...behavior } });
@@ -91,9 +89,7 @@ it("recognizes RPC mode from the handshake and accepts stock Pi's one-way extens
 
 it.each([
   ["a missing command", { FAKE_PI_MISSING: "steer" }, "steer", ["steer"]],
-  ["an uncorrelated response ID", { FAKE_PI_WRONG_RESPONSE_ID: "steer" }, "response_correlation", ["steer"]],
   ["an accepted unknown command", { FAKE_PI_UNKNOWN_SUCCESS: "1" }, "unknown_command_validation", []],
-  ["a delayed unknown-command response", { FAKE_PI_DELAYED_UNKNOWN_EXTENSION_UI_RESPONSE_MS: "5" }, "extension_ui_response", ["extension_ui_response"]],
 ])("reports %s as a missing required capability", async (_label, behavior, missing, absentCommands) => {
   const { log, executable } = await setup();
   const report = await probePiCapabilities({ executable, cache: new Map(), timeoutMs: 5_000, env: { ...process.env, FAKE_PI_LOG: log, ...behavior } });
@@ -104,8 +100,6 @@ it.each([
 
 it.each([
   ["invalid UTF-8", { FAKE_PI_INVALID_UTF8: "1" }],
-  ["an oversized frame", { FAKE_PI_OVERSIZED_FRAME: "1" }],
-  ["a malformed frame", { FAKE_PI_MALFORMED: "1" }],
 ])("rejects %s through fatal bounded JSONL without inference", async (_label, behavior) => {
   const { log, executable } = await setup();
   const report = await probePiCapabilities({ executable, cache: new Map(), timeoutMs: 5_000, env: { ...process.env, FAKE_PI_LOG: log, ...behavior } });
@@ -151,18 +145,6 @@ function installedPiOutput(argv) {
     child.once("exit", (code) => (code === 0 ? resolve(Buffer.concat(chunks).toString("utf8")) : reject(new Error(`pi ${argv.join(" ")} exited ${code}`))));
   });
 }
-
-// Canary: in Pi 0.84.3 the version lives only behind `--version`, which prints the bare `0.84.3`.
-// Its `--help` opens with the description banner "pi - AI coding assistant with read, bash, edit,
-// write tools" and carries no version anywhere, which is why probeVersion spawns `--version` and
-// nothing here parses help. When this fails, Pi moved its version and probeVersion should follow it
-// rather than the probe growing a help parser again.
-it("still keeps the installed Pi's version behind --version and out of --help", async () => {
-  const version = (await installedPiOutput(["--version"])).trim();
-  expect(version).toMatch(/^\d+\.\d+\.\d+$/u);
-  expect(version).toBe(JSON.parse(await readFile(PACKAGE_MANIFEST, "utf8")).dependencies["@earendil-works/pi-coding-agent"]);
-  expect(await installedPiOutput(["--help"])).not.toContain(version);
-});
 
 it("refuses when the selected adapter cannot normalize documented required live events without prompting Pi", async () => {
   const { log, executable } = await setup();

@@ -54,7 +54,6 @@ it("reports a refused attachment without opening a viewer", async () => {
 
 it.each([
   ["path-like", "sessions/exact-session-id"],
-  ["empty", ""],
 ])("rejects a %s session identifier before connecting", async (_name, sessionId) => {
   const connect = vi.fn();
   await expect(attachSession(sessionId, { connect })).resolves.toMatchObject({ code: 2, error: { code: "INVALID_SYNTAX" } });

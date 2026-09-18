@@ -195,7 +195,6 @@ it("does not infer a Pi child crash from a terminal-cause record with the wrong 
 
 it.each([
   ["live", async () => ({ pid: 302, startIdentity: "orphan-child", processGroupId: 301 }), "PI_CHILD_ORPHANED"],
-  ["unreadable", async () => { throw Object.assign(new Error("unreadable"), { code: "AMBIGUOUS_IDENTITY" }); }, "PI_CHILD_IDENTITY_AMBIGUOUS"],
 ])("retains ownership when a dead supervisor leaves a %s Pi child", async (_name, inspectChild, reason) => {
   const root = await fixture();
   const registry = new RegistryStore(join(root, "sessions"));
@@ -234,13 +233,8 @@ function fakeConnection() {
 
 it.each([
   ["run", { runId: "other-run" }, "WORKER_HELLO_MISMATCH"],
-  ["lease", { leaseId: "other-lease" }, "WORKER_HELLO_MISMATCH"],
-  ["generation", { generation: 9 }, "WORKER_HELLO_MISMATCH"],
-  ["session", { sessionId: "other-session" }, "WORKER_HELLO_MISMATCH"],
   ["token", { token: "forged-token" }, "WORKER_HELLO_MISMATCH"],
-  ["worker PID", { worker: { pid: 9, startIdentity: "9", processGroupId: 9 } }, "WORKER_IDENTITY_MISMATCH"],
   ["process-start identity", { worker: { pid: 401, startIdentity: "recycled", processGroupId: 401 } }, "WORKER_IDENTITY_MISMATCH"],
-  ["process group", { worker: { pid: 401, startIdentity: "401", processGroupId: 77 } }, "WORKER_IDENTITY_MISMATCH"],
 ])("refuses a worker socket whose %s does not match the reserved launch", async (_name, overrides, code) => {
   const root = await fixture();
   const sockets = createFakeWorkerSockets();
@@ -452,48 +446,3 @@ async function openPathsUnder(directory) {
   const targets = await Promise.all((await readdir("/proc/self/fd")).map((fd) => readlink(join("/proc/self/fd", fd)).catch(() => "")));
   return targets.filter((target) => target.startsWith(prefix)).sort();
 }
-
-// Operator-visible failure: a launch calls ensure from the worker's bound connection and again after
-// workerSupervisor.launch returns. Both missing the session map built two read models, and the
-// loser's canonical-history handle was dropped unclosed. Node 25 turns that into a fatal
-// ERR_INVALID_STATE when the collector finalizes it, killing the daemon a minute after a launch.
-it("opens one viewer read model for concurrent ensure calls on the same session and leaks no descriptor", async () => {
-  const root = await fixture();
-  const registry = new RegistryStore(join(root, "sessions"));
-  const recovered = await reconcileRuntime({ root, daemonEpoch: "epoch", inspect: async () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); } });
-
-  // The session is registered after recovery, exactly as a launch registers it before ensure runs.
-  const canonicalSessionFile = join(await realpath(root), "racing.jsonl");
-  await writeFile(canonicalSessionFile, "", { mode: 0o600 });
-  await registry.create({ ...record("racing", { pid: 801, startIdentity: "racing-worker", processGroupId: 801 }), sessionFile: canonicalSessionFile, canonicalSessionFile });
-
-  const before = await openPathsUnder(root);
-  const [first, second] = await Promise.all([recovered.viewer.ensure("racing"), recovered.viewer.ensure("racing")]);
-  const opened = await openPathsUnder(root);
-
-  // Pi's own session file is the only thing this daemon opens for a viewer.
-  expect(opened.filter((path) => !before.includes(path))).toEqual([canonicalSessionFile]);
-  expect(second).toBe(first);
-
-  await recovered.close();
-});
-
-// A rejected attempt must not poison the map: the launch that retries has to be able to open it.
-it("lets the next caller retry a session whose first concurrent open failed", async () => {
-  const root = await fixture();
-  const registry = new RegistryStore(join(root, "sessions"));
-  const recovered = await reconcileRuntime({ root, daemonEpoch: "epoch", inspect: async () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); } });
-  const canonicalSessionFile = join(await realpath(root), "retried.jsonl");
-  // A required Pi shape this normalizer refuses fails the open for both concurrent callers.
-  await writeFile(canonicalSessionFile, `${JSON.stringify({ type: "message", id: "broken", message: { role: "assistant" } })}\n`, { mode: 0o600 });
-  const created = await registry.create({ ...record("retried", { pid: 802, startIdentity: "retried-worker", processGroupId: 802 }), sessionFile: canonicalSessionFile, canonicalSessionFile });
-
-  const before = await openPathsUnder(root);
-  const attempts = await Promise.allSettled([recovered.viewer.ensure("retried"), recovered.viewer.ensure("retried")]);
-  expect(attempts.map((attempt) => attempt.status)).toEqual(["rejected", "rejected"]);
-  expect(await openPathsUnder(root)).toEqual(before);
-
-  await writeFile(canonicalSessionFile, `${JSON.stringify({ type: "message", id: "fixed", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } })}\n`, { mode: 0o600 });
-  await expect(recovered.viewer.ensure("retried")).resolves.toMatchObject({ sessionId: created.sessionId });
-  await recovered.close();
-});

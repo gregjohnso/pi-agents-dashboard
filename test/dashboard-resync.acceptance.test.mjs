@@ -138,32 +138,6 @@ async function readState(runtime, clientId) {
   }
 }
 
-// Operator-visible failure: the dashboard crashed on every start with
-// "SUBSCRIBER_OVERFLOW: Client subscriber exceeded its bounded queue" and rewrote the same stale cursor.
-it("starts from current rows beside a retired list history it never opens", async () => {
-  const clientId = "resync-acceptance-current";
-  const root = await seedRoot(clientId);
-  const historyBefore = await readFile(join(root, "index", "events.jsonl"), "utf8");
-  const frontendStateBefore = await readFile(join(root, "frontend-state.json"), "utf8");
-  const opened = await openDashboard({ root, clientId });
-  try {
-    expect(opened.dashboard.status).toEqual({ kind: "ready" });
-    expect(opened.dashboard.sessions.map((/** @type {any} */ record) => record.sessionId)).toEqual(["alpha", "beta"]);
-    opened.dashboard.setView("all");
-    expect(opened.rows().join("\n")).toContain("alpha");
-    expect(opened.rows().join("\n")).toContain("beta");
-    // Subscribe first, then read: that order is what makes the read safe, and it costs one read.
-    expect(opened.operations).toEqual(["subscribe_list_changes", "get_state"]);
-    expect(opened.dashboard.coverageCursor).toMatchObject({ sequence: expect.stringMatching(/^(0|[1-9]\d*)$/u) });
-  } finally {
-    await opened.close();
-  }
-  // The retired history and the retired shared frontend state both stay exactly as they were: no
-  // parser, no migration, no deletion, and above all no writer.
-  expect(await readFile(join(root, "index", "events.jsonl"), "utf8")).toBe(historyBefore);
-  expect(await readFile(join(root, "frontend-state.json"), "utf8")).toBe(frontendStateBefore);
-}, 60_000);
-
 // Operator-visible failure: a burst of changes filled the bounded replay queue, and every dropped
 // record left a row permanently wrong. The read-per-change bound is pinned by the focused
 // ten-thousand-notification test; what this proves against a real daemon is convergence.

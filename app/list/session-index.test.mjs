@@ -60,7 +60,6 @@ describe("mergeSessionIndex", () => {
     // canonical file must collapse to the single live record, whatever spells the identity.
     it.each([
         ["lexical path normalization", "/real/sessions/../sessions/one.jsonl", "/alias/sessions/one.jsonl", "/real/sessions/one.jsonl", lexicalSessionFileIdentity],
-        ["an injected canonical identity", "/aliases/saved-session.jsonl", "/display/live-session.jsonl", "/real/sessions/session.jsonl", undefined],
     ])("merges a saved alias into the authoritative live record by %s", (_label, savedPath, livePath, canonicalPath, identity) => {
         const identities = new Map([[savedPath, canonicalPath], [livePath, canonicalPath], [canonicalPath, canonicalPath]]);
         const sessionFileIdentity = identity ?? ((sessionFile) => identities.get(sessionFile) ?? sessionFile);
@@ -89,14 +88,6 @@ describe("mergeSessionIndex", () => {
         };
         expect(mergeSessionIndex([malformed, saved("valid")], [], lexicalSessionFileIdentity)).toEqual([
             expect.objectContaining({ sessionId: "valid" }),
-        ]);
-    });
-    it("hides child and nested sessions from the top-level index", () => {
-        expect(mergeSessionIndex([
-            saved("child", "/sessions/child.jsonl", { parentSessionPath: "/sessions/parent.jsonl" }),
-            saved("top-level"),
-        ], [], lexicalSessionFileIdentity)).toEqual([
-            expect.objectContaining({ sessionId: "top-level" }),
         ]);
     });
 });

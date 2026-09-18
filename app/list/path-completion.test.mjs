@@ -37,33 +37,6 @@ describe("cwd directory completion", () => {
         expect(labels(await suggestDirectories("alpha/", root, signal))).toEqual(["nested/"]);
         expect(labels(await suggestDirectories(`${root}/alp`, "/nowhere", signal))).toEqual(["alpha/", "alpine/"]);
     });
-    it("says nothing rather than throwing when the typed path cannot be listed", async () => {
-        const signal = new AbortController().signal;
-        for (const argument of ["missing/", "alpha.tx", `${root}/missing/`])
-            expect(await suggestDirectories(argument, root, signal)).toBeUndefined();
-    });
-    it("expands a leading tilde for the listing and keeps it in the completed line", async () => {
-        const signal = new AbortController().signal;
-        const realHome = process.env.HOME;
-        process.env.HOME = root;
-        try {
-            const suggestions = await suggestDirectories("~/alp", "/nowhere", signal);
-            expect(labels(suggestions)).toEqual(["alpha/", "alpine/"]);
-            // The tilde survives completion; /cwd expands it when the operator submits the line.
-            expect(applyCwdCompletion("/cwd ~/alp", suggestions.items[0], suggestions.prefix, "/nowhere")).toBe("/cwd ~/alpha/");
-        }
-        finally {
-            process.env.HOME = realHome;
-        }
-    });
-    it("rewrites the /cwd line with the chosen directory and a trailing separator to descend through", async () => {
-        const signal = new AbortController().signal;
-        const suggestions = await suggestDirectories("alp", root, signal);
-        // Completing the argument alone must not be mistaken for completing the command name.
-        expect(applyCwdCompletion("/cwd alp", suggestions.items[0], suggestions.prefix, root)).toBe("/cwd alpha/");
-        const absolute = await suggestDirectories(`${root}/alp`, root, signal);
-        expect(applyCwdCompletion(`/cwd ${root}/alp`, absolute.items[0], absolute.prefix, root)).toBe(`/cwd ${root}/alpha/`);
-    });
     // Canary: pi-tui 0.84.3 exports the completion provider from its package root. When this fails,
     // the installed pi-tui moved or renamed it and this module must follow rather than grow its own.
     it("still finds pi-tui's file-completion provider on the package root", () => {

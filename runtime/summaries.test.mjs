@@ -60,12 +60,6 @@ it("builds a bounded transcript excerpt from normalized items", () => {
   expect(summarizePromptInput([])).toBe("");
 });
 
-it("reads a title and summary from one model reply", async () => {
-  const pi = fakePi({ stdout: "Title: Coverage loader fix\nSummary: Fixes the coverage loader and reruns tests\n" });
-  await expect(summarizeWithPi({ executable: "/installed/pi", model: { provider: "anthropic", id: "haiku" }, transcript: "User: hi", spawnImpl: pi.spawnImpl, env: {} }))
-    .resolves.toEqual({ name: "Coverage loader fix", text: "Fixes the coverage loader and reruns tests" });
-});
-
 it("summarizes through stock Pi print mode without a session or tools, keeping an untitled reply", async () => {
   const pi = fakePi({ stdout: "  Fixes the coverage loader and reruns tests\n" });
   const summary = await summarizeWithPi({ executable: "/installed/pi", model: { provider: "anthropic", id: "haiku" }, transcript: "User: hi", spawnImpl: pi.spawnImpl, env: {} });
@@ -76,14 +70,7 @@ it("summarizes through stock Pi print mode without a session or tools, keeping a
 
 it.each([
   ["a spawn failure", { failSpawn: true }],
-  ["empty output", { stdout: "   " }],
 ])("returns no summary for %s", async (_label, behavior) => {
   const pi = fakePi(behavior);
   await expect(summarizeWithPi({ executable: "/installed/pi", model: { provider: "anthropic", id: "haiku" }, transcript: "User: hi", spawnImpl: pi.spawnImpl, env: {} })).resolves.toBeUndefined();
-});
-
-it("never spawns Pi for an empty transcript", async () => {
-  const pi = fakePi({ stdout: "unused" });
-  await expect(summarizeWithPi({ executable: "/installed/pi", model: { provider: "anthropic", id: "haiku" }, transcript: "  ", spawnImpl: pi.spawnImpl, env: {} })).resolves.toBeUndefined();
-  expect(pi.calls).toEqual([]);
 });

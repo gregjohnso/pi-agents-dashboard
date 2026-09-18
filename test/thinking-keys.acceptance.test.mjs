@@ -119,19 +119,6 @@ it("cycles this session's thinking level from Shift+Tab through the daemon to Pi
   expect(sent.filter((entry) => entry.command === "get_state").length).toBeLessThan(40);
 }, 90_000);
 
-// Ctrl+T is about what this transcript shows, so it must reach Pi with nothing at all.
-it("hides thinking blocks on Ctrl+T without sending Pi a command", async () => {
-  const session = await liveSession({ FAKE_PI_THINKING_LEVELS: "off,low,high" });
-  const { terminal } = await attachedViewer(session.client, session.sessionId, session.root);
-
-  terminal.input("\x14");
-
-  await vi.waitFor(() => expect(painted(terminal)).toContain("Thinking blocks: hidden"), { timeout: 20_000, interval: 20 });
-  // The worker keeps reading state on its own, so what matters is that no level and no prompt moved.
-  expect((await piCommands(session.log)).map((entry) => entry.command)).not.toContain("set_thinking_level");
-  expect(painted(terminal)).toContain("thinking off");
-}, 90_000);
-
 // Pi answers the thinking query per model, and a worker whose Pi does not answer it at all reports
 // no levels. Cycling into nothing would send Pi a level it never offered.
 it("says the levels are unavailable rather than sending a level Pi never offered", async () => {

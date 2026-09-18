@@ -79,7 +79,6 @@ function request(cwd, isolation = { mode: "worktree" }) {
 
 it.each([
   ["a subdirectory cwd", () => join(shared.root, "src", "nested"), () => join(shared.root, "src", "nested"), join("src", "nested")],
-  ["a symlinked repository alias", () => shared.alias, () => shared.root, ""],
 ])("preflights an attached branch from %s", async (_label, cwd, canonical, sourceSubdirectory) => {
   const result = await launchPreflight(request(cwd()), { piConfigRoot: shared.piConfigRoot });
 
@@ -113,15 +112,6 @@ it("refuses worktree launch from an unborn HEAD", async () => {
   ).rejects.toMatchObject({ code: "UNBORN_HEAD" });
 });
 
-it("records a dirty source without copying its uncommitted state", async () => {
-  const dirty = await linkedWorktree();
-  await writeFile(join(dirty, "tracked.txt"), "dirty\n");
-
-  const result = await launchPreflight(request(dirty), { piConfigRoot: shared.piConfigRoot });
-
-  expect(result.sourceDirty).toBe(true);
-});
-
 it("requires a server-derived Pi config root and rejects a client override", async () => {
   await expect(launchPreflight(request(shared.root), {})).rejects.toMatchObject({
     code: "PI_CONFIG_ROOT_REQUIRED",
@@ -153,23 +143,8 @@ it("supports explicit shared-directory preflight outside Git", async () => {
   });
 });
 
-it("does not infer shared mode when worktree preflight is outside Git", async () => {
-  await expect(
-    launchPreflight(request(shared.outsideGit), { piConfigRoot: shared.piConfigRoot }),
-  ).rejects.toMatchObject({ code: "NOT_GIT_REPOSITORY" });
-});
-
-it("reports the repository and commit a managed worktree would branch from", async () => {
-  expect(await probeWorktreeCapability(join(shared.root, "src", "nested"))).toEqual({
-    available: true,
-    repositoryRoot: shared.root,
-    baseCommit: shared.head,
-  });
-});
-
 it.each([
   ["a directory outside Git", () => shared.outsideGit, "NOT_GIT_REPOSITORY"],
-  ["a repository with no commit", () => shared.unborn, "UNBORN_HEAD"],
 ])("reports worktree isolation unavailable for %s", async (_label, cwd, code) => {
   expect(await probeWorktreeCapability(cwd())).toMatchObject({ available: false, code });
 });

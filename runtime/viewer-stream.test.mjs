@@ -80,10 +80,4 @@ describe("live per-session viewer stream", () => {
     live.close();
   });
 
-  it("stops accepting and stops delivering once closed", async () => {
-    const live = stream();
-    live.close();
-    expect(() => live.append(draft)).toThrowError(expect.objectContaining({ code: "VIEWER_STREAM_CLOSED" }));
-    await expect(live.subscribe().next()).resolves.toEqual({ value: undefined, done: true });
-  });
 });

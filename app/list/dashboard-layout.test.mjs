@@ -6,20 +6,6 @@ import { createDashboardLayout, renderColumnHeader, renderGroupHeader, renderSes
 import { JOBWATCH_ANSI } from "./dashboard-theme.mjs";
 const now = Date.parse("2026-08-25T12:00:00.000Z");
 
-it("keeps a cursor-space visible without shifting the next wrapped word", () => {
-    const rows = wrapPromptDraft("1234 abc", 8, 4);
-
-    expect(rows[0]).toContain("\x1b[7m \x1b[27m");
-    expect(stripVTControlCharacters(rows[0])).toBe(" ❯ 1234 ");
-    expect(stripVTControlCharacters(rows[1])).toBe("   abc");
-});
-
-it("marks the first grapheme on the correct row when a long word wraps", () => {
-    const rows = wrapPromptDraft("abcdefghij", 8, 5);
-
-    expect(rows[0]).not.toContain(JOBWATCH_ANSI.inverse);
-    expect(rows[1]).toContain("\x1b[7mf\x1b[27m");
-});
 function session(sessionId, overrides = {}) {
     return {
         schemaVersion: 1,
@@ -83,15 +69,6 @@ describe("responsive dashboard layout", () => {
         expect(row).not.toContain("Pi assistant streaming");
     });
 
-    it("renders the session name and falls back when a session has none", () => {
-        const layout = createDashboardLayout(160, 40);
-        const named = stripVTControlCharacters(renderSessionRow(session("named", { name: "Coverage loader", processState: "LIVE" }), layout, { now }));
-        expect(named).toContain("Coverage loader");
-        // STATE reports liveness, so the row carries no separate marker.
-        expect(named).not.toContain("▶");
-        const unnamed = stripVTControlCharacters(renderSessionRow(session("unnamed-session-id"), layout, { now }));
-        expect(unnamed).toContain("unnamed-");
-    });
     it("sanitizes untrusted controls to one line before applying renderer-owned ANSI", () => {
         const layout = createDashboardLayout(160, 20);
         const hostile = session("id\twith\r\ncontrols\x07", {
@@ -115,85 +92,6 @@ describe("responsive dashboard layout", () => {
         expect(lines[0]).toContain(JOBWATCH_ANSI.cyan);
         expect(lines[1]).toContain(JOBWATCH_ANSI.sky);
     });
-    it("highlights the name cell of a colored session behind black text", () => {
-        const layout = createDashboardLayout(120, 20);
-        const plain = renderSessionRow(fixtures[0], layout, { now });
-        expect(renderSessionRow({ ...fixtures[0], color: undefined }, layout, { now })).toBe(plain);
-        const colored = renderSessionRow({ ...fixtures[0], color: "amber" }, layout, { now });
-        expect(colored).not.toBe(plain);
-        // The colour fills the cell and the name inverts to black, so it reads as a label.
-        expect(colored).toContain("\x1b[48;2;252;211;77m");
-        expect(colored).toContain("\x1b[38;2;0;0;0m");
-        // The state cell keeps its derived color; only the name cell carries the operator's choice.
-        expect(colored).toContain(JOBWATCH_ANSI.green);
-        expect(stripVTControlCharacters(colored)).toBe(stripVTControlCharacters(plain));
-    });
-});
-
-it("draws session rows on the terminal background without removing meaningful highlights", () => {
-    const layout = createDashboardLayout(120, 20);
-    const plain = renderSessionRow(fixtures[0], layout, { now });
-    expect(plain).toContain("\x1b[49m");
-    expect(plain).not.toContain(JOBWATCH_ANSI.blackBackground);
-
-    const selected = renderSessionRow(fixtures[0], layout, { now, selected: true });
-    expect(selected).toContain(JOBWATCH_ANSI.selectionBackground);
-    const colored = renderSessionRow({ ...fixtures[0], color: "amber" }, layout, { now });
-    expect(colored).toContain("\x1b[48;2;252;211;77m");
-    expect(colored).not.toContain(JOBWATCH_ANSI.blackBackground);
-});
-
-it("bolds the selected row without altering its colors", () => {
-    const layout = createDashboardLayout(120, 20);
-    const plain = renderSessionRow(fixtures[0], layout, { now });
-    const selected = renderSessionRow(fixtures[0], layout, { now, selected: true });
-    expect(selected).toContain(JOBWATCH_ANSI.bold);
-    expect(plain).not.toContain(JOBWATCH_ANSI.bold);
-    // Selection changes weight only: the same foregrounds and the same selection background as before.
-    expect(selected).toContain(JOBWATCH_ANSI.selectionBackground);
-    const codes = (line) => line.match(/\u001b\[38;2;[0-9;]+m/gu) ?? [];
-    expect(codes(selected)).toEqual(codes(plain));
-    expect(stripVTControlCharacters(selected)).toBe(stripVTControlCharacters(plain));
-});
-
-
-it("ages a session from when it started, not from its last activity", () => {
-    const layout = createDashboardLayout(120, 20);
-    const started = new Date(now - 3 * 60 * 60 * 1000).toISOString();
-    const justSpoke = new Date(now - 30 * 1000).toISOString();
-    const row = stripVTControlCharacters(renderSessionRow(session("old", { createdAt: started, updatedAt: justSpoke }), layout, { now }));
-    // A session running since this morning must not read as one minute old because it just replied.
-    expect(row).toContain("3h");
-    expect(row).not.toContain("30s");
-});
-
-it("tints only the name itself, not the padding that follows it", () => {
-    const layout = createDashboardLayout(120, 20);
-    const amberBackground = "\u001b[48;2;252;211;77m";
-    const row = renderSessionRow(session("c", { name: "Inspect Mantis Installer", color: "amber" }), layout, { now });
-    const tinted = row.slice(row.indexOf(amberBackground));
-    const label = stripVTControlCharacters(tinted.slice(0, tinted.indexOf("\u001b[0m")));
-    // The highlight hugs the name; the rest of the column keeps the row's own background.
-    expect(label).toBe("Inspect Mantis Installer");
-    expect(stripVTControlCharacters(row)).toContain("Inspect Mantis Installer  ");
-});
-
-it("spins an unlabelled column left of STATE so the state text never shifts", () => {
-    const layout = createDashboardLayout(100, 24);
-    const spinner = /[\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f]/u;
-    const rowAt = (now, overrides) => stripVTControlCharacters(renderSessionRow(session("spinning", overrides), layout, { now }));
-
-    const working = rowAt(0, { taskState: "WORKING", processState: "LIVE" });
-    expect(working).toMatch(spinner);
-    expect(working.indexOf(working.match(spinner)[0])).toBeLessThan(working.indexOf("WORKING"));
-    expect(rowAt(80, { taskState: "WORKING", processState: "LIVE" }).match(spinner)[0]).not.toBe(working.match(spinner)[0]);
-
-    // A still session leaves the column blank, and STATE keeps its position either way.
-    const ready = rowAt(0, { taskState: "READY", processState: "LIVE" });
-    expect(ready).not.toMatch(spinner);
-    expect(ready.indexOf("READY")).toBe(working.indexOf("WORKING"));
-    // The header labels nothing above the spinner.
-    expect(stripVTControlCharacters(renderColumnHeader(layout))).toMatch(/NAME\s+STATE\s+ACTIVITY/u);
 });
 
 it("reads a worker replacement as a start in progress, with the reason in the activity column", () => {

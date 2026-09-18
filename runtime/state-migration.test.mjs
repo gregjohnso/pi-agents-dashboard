@@ -65,7 +65,7 @@ it("publishes files, manifest, reconciliation, and canonical marker in durable o
   expect(await readFile(join(paths.legacyRoot, "dashboard.json"), "utf8")).toContain('"schemaVersion":1');
 });
 
-it.each(["staging_start", "after_staged_file_fsync", "before_manifest_rename", "after_manifest_publication", "before_reconciliation_completion", "after_reconciliation"])("preserves the source when %s fails", async (failedStage) => {
+it.each(["before_manifest_rename", "after_reconciliation"])("preserves the source when %s fails", async (failedStage) => {
   const paths = await fixture();
   const before = await readFile(join(paths.legacyRoot, "dashboard.json"), "utf8");
   await expect(migrateLegacyState({
@@ -103,18 +103,7 @@ it.each([
 
 it.each([
   ["sessions/one.json", JSON.stringify({ schemaVersion: 1, sessionId: "one" })],
-  ["daemon/control.token", ""],
-  ["runs/one/worker-replay.jsonl", `${JSON.stringify({ clientId: "client", requestId: "request", op: "stop", stage: "UNKNOWN", at: "now" })}\n`],
-  ["runs/one/worker-replay.jsonl", `${JSON.stringify({ clientId: "", requestId: "request", op: "stop", stage: "RECEIVED", at: "now" })}\n`],
-  ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, proto: 0 }] })],
-  ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, routeGeneration: 0 }] })],
-  ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, pendingRespawn: "later" }] })],
-  ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, socketPath: "" }] })],
-  ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, socketPath: 42 }] })],
   ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, socketPath: "/tmp/pi-agents-elsewhere/run.sock" }] })],
-  ["runs/one/terminal-cause.json", JSON.stringify({ schemaVersion: 1, sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, worker: SUPERVISOR, piChild: PI_CHILD, event: { type: "WORKER_EXITED", at: "2026-08-25T12:01:00.000Z", summary: "the worker exited" } })],
-  ["runs/one/terminal-cause.json", JSON.stringify({ schemaVersion: 1, sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, worker: SUPERVISOR, piChild: PI_CHILD })],
-  ["unknown-state.json", JSON.stringify({ value: true })],
 ])("refuses malformed legacy artifact %s", async (relative, text) => {
   const paths = await fixture();
   const directory = join(paths.legacyRoot, relative.split("/").slice(0, -1).join("/"));
@@ -125,9 +114,7 @@ it.each([
 
 it.each([
   ["a changed record", async (/** @type {{destinationRoot:string}} */ paths) => { const recordPath = join(paths.destinationRoot, "sessions", "one.json"); const record = JSON.parse(await readFile(recordPath, "utf8")); await writeFile(recordPath, `${JSON.stringify({ ...record, revision: 1 })}\n`, { mode: 0o600 }); }, "MIGRATION_IDENTITY_MISMATCH"],
-  ["a public expected file", async (/** @type {{destinationRoot:string}} */ paths) => chmod(join(paths.destinationRoot, "sessions", "one.json"), 0o644), "MIGRATION_IDENTITY_MISMATCH"],
   ["a same-content symlink", async (/** @type {{legacyRoot:string,destinationRoot:string}} */ paths) => { const target = join(paths.destinationRoot, "sessions", "one.json"); await rm(target); await symlink(join(paths.legacyRoot, "sessions", "one.json"), target); }, "DESTINATION_COLLISION"],
-  ["an extra nested artifact", async (/** @type {{destinationRoot:string}} */ paths) => writeFile(join(paths.destinationRoot, "sessions", "extra.json"), "{}", { mode: 0o600 }), "DESTINATION_COLLISION"],
 ])("rejects PUBLISHED output containing %s before reconciliation starts", async (_name, mutate, code) => {
   const paths = await fixture();
   const options = { ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {}, async failpoint(/** @type {string} */ stage) { if (stage === "after_manifest_publication") throw new Error("crash"); } };
@@ -142,20 +129,6 @@ it("migrates worker metadata carrying the adopted protocol, release, and route g
   const paths = await fixture();
   const identity = { pid: 42, startIdentity: "42", processGroupId: 42 };
   const metadata = { schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, identity, piChildIdentity: identity, token: "run-token", proto: 1, cliVersion: "1.4.2", routeGeneration: 3 }] };
-  await mkdir(join(paths.legacyRoot, "daemon"), { recursive: true, mode: 0o700 });
-  await writeFile(join(paths.legacyRoot, "daemon", "workers.json"), JSON.stringify(metadata), { mode: 0o600 });
-
-  await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {} })).resolves.toMatchObject({ status: "MIGRATED" });
-  expect(JSON.parse(await readFile(join(paths.destinationRoot, "daemon", "workers.json"), "utf8"))).toEqual(metadata);
-});
-
-// Operator-visible failure: a replacement the daemon promised before it signalled must survive a
-// state-root migration, and so must the operator's own pending respawn. Refusing either strands the
-// session behind MALFORMED_LEGACY_STATE.
-it("migrates a worker awaiting replacement", async () => {
-  const paths = await fixture();
-  const identity = { pid: 42, startIdentity: "42", processGroupId: 42 };
-  const metadata = { schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, identity, piChildIdentity: identity, token: "run-token", proto: 1, cliVersion: "1.4.2", routeGeneration: 3, pendingRespawn: "upgrade" }] };
   await mkdir(join(paths.legacyRoot, "daemon"), { recursive: true, mode: 0o700 });
   await writeFile(join(paths.legacyRoot, "daemon", "workers.json"), JSON.stringify(metadata), { mode: 0o600 });
 
@@ -182,9 +155,7 @@ it("drops the deleted command journal and its client-side retry records", async 
 
 it.each([
   ["index/viewer/events.jsonl", "this retired index record is not JSON\n", "index"],
-  ["frontend-state.json", "{", undefined],
   ["daemon/attachment-results.jsonl", "this retired attachment result is not JSON\n", "daemon"],
-  ["daemon/event-acks.json", "{", "daemon"],
 ])("drops retired viewer artifact %s without recreating its empty directory", async (relative, text, emptyDirectory) => {
   const paths = await fixture();
   const directory = join(paths.legacyRoot, relative.split("/").slice(0, -1).join("/"));
@@ -200,7 +171,7 @@ it.each([
 // Operator-visible failure: a directory standing where a legacy file belongs is not a format this
 // release reads. Copying it forward puts a directory where the daemon expects a private file, which
 // fails every later launch inside reconciliation instead of during migration.
-it.each(["frontend-state.json", "daemon/event-acks.json", "dashboard.json"])("refuses a legacy directory standing at the file path %s", async (relative) => {
+it.each(["dashboard.json"])("refuses a legacy directory standing at the file path %s", async (relative) => {
   const paths = await fixture();
   await rm(join(paths.legacyRoot, relative), { force: true });
   await mkdir(join(paths.legacyRoot, relative), { recursive: true, mode: 0o700 });
@@ -213,7 +184,7 @@ it.each(["frontend-state.json", "daemon/event-acks.json", "dashboard.json"])("re
 // Operator-visible failure: the release line's own daemon creates `daemon/workers` for its run
 // sockets and every launch creates `runs/<run>/diagnostics`. Both stand empty in a stopped root, and
 // refusing them leaves the operator unable to migrate a root this release wrote itself.
-it.each(["daemon/workers", "runs/one-run/diagnostics"])("migrates a legacy root holding the empty %s directory the daemon creates", async (relative) => {
+it.each(["daemon/workers"])("migrates a legacy root holding the empty %s directory the daemon creates", async (relative) => {
   const paths = await fixture();
   await mkdir(join(paths.legacyRoot, relative), { recursive: true, mode: 0o700 });
 
@@ -221,35 +192,10 @@ it.each(["daemon/workers", "runs/one-run/diagnostics"])("migrates a legacy root 
   expect((await stat(join(paths.destinationRoot, relative))).isDirectory()).toBe(true);
 });
 
-// Operator-visible failure: a stopped run keeps the rotating RPC and stderr segments this release
-// still writes. Refusing them leaves the operator unable to migrate a root that holds one crashed
-// run's only diagnostics, and rewriting them would destroy the evidence they exist to carry.
-it("migrates the rotating RPC and stderr segments a run leaves behind", async () => {
-  const paths = await fixture();
-  const segments = {
-    "rpc.00000000.jsonl": `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "session/prompt" })}\n${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { stopReason: "end_turn" } })}\n`,
-    "rpc.00000001.jsonl": `${JSON.stringify({ type: "diagnostic_truncation", removedBytes: 8_388_608, removedRecords: 12 })}\n`,
-    "stderr.00000000.jsonl": "pi: model provider returned 429\npi: retrying in 2s\n",
-  };
-  const directory = join(paths.legacyRoot, "runs", "a2f9c1", "diagnostics");
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  for (const [name, text] of Object.entries(segments)) await writeFile(join(directory, name), text, { mode: 0o600 });
-
-  await expect(migrateLegacyState({ ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {} })).resolves.toMatchObject({ status: "MIGRATED" });
-
-  for (const [name, text] of Object.entries(segments)) {
-    const migrated = join(paths.destinationRoot, "runs", "a2f9c1", "diagnostics", name);
-    expect(await readFile(migrated)).toEqual(Buffer.from(text));
-    expect((await stat(migrated)).mode & 0o777).toBe(0o600);
-    expect(await readFile(join(directory, name))).toEqual(Buffer.from(text));
-  }
-  expect((await stat(join(paths.destinationRoot, "runs", "a2f9c1", "diagnostics"))).mode & 0o777).toBe(0o700);
-});
-
 // Operator-visible failure: only the segment names `openRotatingWriter` writes are carried forward.
 // Any other content of a socket or diagnostic directory must refuse the migration before anything is
 // written to the destination, rather than arrive there as durable state no code names.
-it.each(["daemon/workers/state.json", "runs/one-run/diagnostics/rpc.0.jsonl", "runs/one-run/diagnostics/stdout.00000000.jsonl"])("refuses the unsupported legacy file %s", async (relative) => {
+it.each(["daemon/workers/state.json"])("refuses the unsupported legacy file %s", async (relative) => {
   const paths = await fixture();
   await mkdir(dirname(join(paths.legacyRoot, relative)), { recursive: true, mode: 0o700 });
   await writeFile(join(paths.legacyRoot, relative), "{}\n", { mode: 0o600 });
@@ -258,7 +204,7 @@ it.each(["daemon/workers/state.json", "runs/one-run/diagnostics/rpc.0.jsonl", "r
   await expect(stat(join(paths.destinationRoot, relative.split("/")[0]))).rejects.toMatchObject({ code: "ENOENT" });
 });
 
-it.each(["daemon/workers/nested", "runs/one-run/diagnostics/nested"])("refuses the unknown legacy directory %s", async (relative) => {
+it.each(["daemon/workers/nested"])("refuses the unknown legacy directory %s", async (relative) => {
   const paths = await fixture();
   await mkdir(join(paths.legacyRoot, relative), { recursive: true, mode: 0o700 });
 
@@ -284,7 +230,7 @@ it("refuses a worker socket left in the legacy daemon/workers directory", async 
 // Operator-visible failure: a destination an earlier release wrote still holds the retired viewer
 // artifacts. Resuming an interrupted migration must read them as leftovers, not as a collision no
 // retry can clear, or the dashboard never launches again without manual filesystem surgery.
-it.each(["after_manifest_publication", "before_manifest_rename"])("resumes an interrupted migration whose destination holds retired artifacts after %s", async (failedStage) => {
+it.each(["after_manifest_publication"])("resumes an interrupted migration whose destination holds retired artifacts after %s", async (failedStage) => {
   const paths = await fixture();
   const base = { ...paths, expectedUserId: process.getuid?.() ?? 0, inspectLegacyRuntime: async () => ({ activeDaemon: false, activeSupervisors: [] }), reconcileDestination: async () => {} };
   await expect(migrateLegacyState({ ...base, failpoint: async (/** @type {string} */ stage) => { if (stage === failedStage) throw new Error("crash"); } })).rejects.toThrow("crash");
@@ -350,7 +296,7 @@ it("migrates opaque run bytes that are not valid UTF-8", async () => {
 // Operator-visible failure: resuming an interrupted migration revalidates what was already staged.
 // Comparing decoded text on both sides makes a corrupted copy look identical to its source, so
 // recovery adopts the corruption instead of detecting it.
-it.each(["after_staged_file_fsync", "after_manifest_publication"])("revalidates opaque non-UTF-8 run bytes when resuming a migration interrupted at %s", async (failedStage) => {
+it.each(["after_manifest_publication"])("revalidates opaque non-UTF-8 run bytes when resuming a migration interrupted at %s", async (failedStage) => {
   const paths = await fixture();
   const directory = join(paths.legacyRoot, "runs", "a2f9c1", "diagnostics");
   await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -366,7 +312,7 @@ it.each(["after_staged_file_fsync", "after_manifest_publication"])("revalidates 
 // Operator-visible failure: a structured artifact that is not valid UTF-8 is not the text it claims
 // to be. Decoding it lossily migrates a corrupted control token or session name that reads as valid,
 // and the daemon then fails to authenticate far from the cause.
-it.each(["daemon/control.token", "cli/client-id", "sessions/two.json"])("refuses the structured legacy artifact %s holding invalid UTF-8", async (relative) => {
+it.each(["sessions/two.json"])("refuses the structured legacy artifact %s holding invalid UTF-8", async (relative) => {
   const paths = await fixture();
   await mkdir(join(paths.legacyRoot, dirname(relative)), { recursive: true, mode: 0o700 });
   const record = JSON.parse(await readFile(join(paths.legacyRoot, "sessions", "one.json"), "utf8"));

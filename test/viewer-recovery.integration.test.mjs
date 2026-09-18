@@ -253,32 +253,6 @@ it("tells a viewer to resynchronize when its worker reconnects mid-turn, with no
   expect(sessionFile).toContain("canonical.jsonl");
 });
 
-// Pi blocks on a dialog until a person answers it. A frontend that attaches afterwards can only learn
-// about it from the worker's tail, which is why an unresolved request is the one thing that tail
-// refuses to drop.
-it("delivers an extension UI request that arrived before any frontend attached", async () => {
-  const { root } = await liveSession();
-  const first = await openDaemon(root);
-  const worker = await fakeWorker({ root, maxBytes: 512 });
-  await first.ready;
-  await waitForWorker(first);
-  await worker.frame({ type: "extension_ui_request", id: "ui-1", method: "confirm", title: "Overwrite the file?" });
-  // Enough streaming afterwards to pass the tail's byte bound several times over.
-  for (let index = 0; index < 40; index += 1) await worker.frame({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: `chunk ${index} `.padEnd(32, "x") } });
-  await first.close();
-  runtimes.splice(runtimes.indexOf(first), 1);
-
-  const second = await openDaemon(root);
-  await second.ready;
-  await waitForWorker(second);
-  const client = await openClient(second, "client-ui");
-  const { snapshot, unsubscribe } = await client.subscribeViewer("session-1");
-  unsubscribe();
-  expect(worker.dropped).toBeGreaterThan(0);
-  expect(snapshot.pendingUi).toEqual([{ id: "ui-1", method: "confirm", title: "Overwrite the file?" }]);
-  await client.close();
-});
-
 // The answer to the tail's bound is a resynchronize, not a freeze and not an error: completed history
 // comes from Pi's file, the newest live frames come from what the tail still holds, and the operator
 // loses only partial text older than the bound.

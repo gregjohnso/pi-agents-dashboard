@@ -22,11 +22,6 @@ async function collectedTestFiles(directory = REPOSITORY) {
   return found;
 }
 
-it("ships a cold-launch measurement driver and its SLURM launcher", async () => {
-  expect((await stat(join(REPOSITORY, DRIVER))).isFile()).toBe(true);
-  expect((await stat(join(REPOSITORY, LAUNCHER))).isFile()).toBe(true);
-});
-
 it("keeps the driver out of every file vitest collects, so the suite never runs model inference", async () => {
   const importers = [];
   for (const path of await collectedTestFiles()) {

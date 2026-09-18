@@ -1,0 +1,6 @@
+{
+  "name": "pi-foundation-fixture-root",
+  "version": "0.0.1",
+  "private": true,
+  "workspaces": ["packages/*"]
+}

@@ -1,0 +1,11 @@
+diff --git a/packages/widget/src/index.mjs b/packages/widget/src/index.mjs
+index 155f1bc..273978b 100644
+--- a/packages/widget/src/index.mjs
++++ b/packages/widget/src/index.mjs
+@@ -3,5 +3,5 @@ export function describeWidget() {
+ }
+ 
+ export function nativeMarker() {
+-  return "pi-agents native marker";
++  return "pi-agents native marker v2";
+ }

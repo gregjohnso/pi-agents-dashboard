@@ -1,0 +1,9 @@
+diff --git a/packages/widget/src/index.mjs b/packages/widget/src/index.mjs
+index 4b46aae..2bb951b 100644
+--- a/packages/widget/src/index.mjs
++++ b/packages/widget/src/index.mjs
+@@ -1,3 +1,3 @@
+ export function describeWidget() {
+-  return "a widget from a different upstream revision";
++  return "a widget from a patched different revision";
+ }

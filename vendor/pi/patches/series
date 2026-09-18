@@ -1,0 +1,10 @@
+# Ordered source patch series applied to the pinned upstream Pi tree, one filename per line.
+#
+# Order is this file's order and nothing else. Blank lines and `#` comments are ignored; a patch file
+# in this directory that no line names is drift and fails preparation. Names must look like
+# `NNNN-short-description.patch`.
+#
+# EMPTY ON PURPOSE. This foundation ships the pinned build, not a native capability: artifacts built
+# from an empty series are baseline/unmodified upstream Pi 0.84.3 and advertise no new interface. The
+# A-G native seams are a later part of Task 7 and arrive here as ordered source patches, each with its
+# own regression test. Do not add a cosmetic edit to make this list non-empty.

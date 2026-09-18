@@ -1,0 +1,10 @@
+{
+  "name": "@pi-foundation-fixture/widget",
+  "version": "1.2.3",
+  "type": "module",
+  "main": "dist/index.mjs",
+  "files": ["dist"],
+  "scripts": {
+    "build": "node ./build.mjs"
+  }
+}

@@ -1,0 +1,9 @@
+diff --git a/packages/widget/src/native-seam.mjs b/packages/widget/src/native-seam.mjs
+new file mode 100644
+index 0000000..1db110e
+--- /dev/null
++++ b/packages/widget/src/native-seam.mjs
+@@ -0,0 +1,3 @@
++export function nativeSeam() {
++  return "pi-agents native seam";
++}

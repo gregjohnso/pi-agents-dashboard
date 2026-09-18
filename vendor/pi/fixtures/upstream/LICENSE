@@ -1,0 +1,4 @@
+MIT License
+
+Fixture license text. Stands in for the pinned upstream notice so the tests exercise a real
+locked-file digest instead of a placeholder.

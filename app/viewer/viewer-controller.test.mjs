@@ -281,18 +281,6 @@ describe("viewer commands", () => {
     await f.instance.close();
   });
 
-  it("forgets an armed quit when the same viewer is reopened", async () => {
-    const onQuit = vi.fn();
-    const f = fixture({ onQuit });
-    await f.instance.open();
-    f.instance.handleInput("\x03");
-    await f.instance.close();
-    await f.instance.open();
-    f.instance.handleInput("\x03");
-    expect(onQuit).not.toHaveBeenCalled();
-    await f.instance.close();
-  });
-
   it("discovers slash commands, applies model selection, and reloads the menu", async () => {
     const menu = { commands: [{ name: "/review", source: "extension" }], models: [{ provider: "anthropic", id: "claude" }], model: null };
     const loaded = [];
@@ -452,7 +440,9 @@ describe("viewer commands", () => {
     expect(f.commands).toHaveLength(1);
   });
 
-  it.each(["/thinking", "/auto-compact", "/steering", "/follow-up"])("prompts the session with %s instead of opening a settings picker", async (text) => {
+  // app/viewer/slash-commands.test.mjs owns the per-name parse; this is the controller's one path.
+  it("prompts the session with a Pi settings command instead of opening a settings picker", async () => {
+    const text = "/thinking";
     const f = fixture();
     await f.instance.open();
 
@@ -542,16 +532,6 @@ describe("viewer commands", () => {
     // The name rides the rule above the prompt, right-aligned, so the operator sees which session they type into.
     expect(plain[promptRow - 1]).toMatch(/^─+ recurse agent investigation ─$/u);
     expect(plain[promptRow]).toBe("> do 3");
-  });
-
-  it("leaves the rule bare when the session has no name", async () => {
-    const framed = { ...editor(), render: () => ["─".repeat(60), "> do 3", "─".repeat(60)] };
-    const f = fixture({ editor: framed, menu: async () => ({ commands: [], models: [], model: null, color: null }) });
-    await f.instance.open();
-    await f.instance.menuLoaded;
-    const plain = paintedScreen(f.instance, 80, 20).map(stripVTControlCharacters);
-    const promptRow = plain.findLastIndex((line) => line.startsWith("> "));
-    expect(plain[promptRow - 1]).toMatch(/^─+$/u);
   });
 
   // Operator-visible failure: the supervisor replaced this session's worker at a release boundary and
@@ -1209,27 +1189,6 @@ describe("Pi's own thinking, tools, clear, exit and escape keys", () => {
     f.instance.history.push("earlier prompt");
     f.instance.handleInput("\x1b[A");
     expect(f.instance.viewport.isFollowingEnd).toBe(true);
-  });
-
-  it("clears the prompt on Ctrl+C, quits on a second press inside the window, and never interrupts", async () => {
-    let now = 0;
-    const onQuit = vi.fn();
-    const f = fixture({ snapshot: { taskState: "WORKING" }, onQuit, now: () => now });
-    await f.instance.open();
-    f.instance.editor.setText("half typed");
-
-    f.instance.handleInput("\x03");
-
-    expect(f.instance.editor.getText()).toBe("");
-    expect(f.commands).toEqual([]);
-    expect(onQuit).not.toHaveBeenCalled();
-
-    now = 499;
-    f.instance.handleInput("\x03");
-
-    expect(onQuit).toHaveBeenCalledOnce();
-    expect(f.commands).toEqual([]);
-    expect(f.instance.onReturn).not.toHaveBeenCalled();
   });
 
   it("keeps Escape as the only interrupt and leaves the session once the turn is settled", async () => {

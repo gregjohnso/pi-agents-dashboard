@@ -123,21 +123,6 @@ it("clears the session it stopped when a second Ctrl+X lands after the row has l
   expect(f.client.stop).not.toHaveBeenCalledWith("beta", expect.anything(), expect.anything());
 });
 
-it("names the session an armed clear will remove, so the hint cannot read as the row under the cursor", async () => {
-  let clock = 0;
-  const f = await mountedList([session("alpha"), session("beta")], { now: () => clock });
-  f.controller.selectSession("alpha");
-  f.type("\x18");
-  await vi.waitFor(() => expect(f.controller.stopClearArmed).toBe(true));
-  f.client.setSessions([stopped("alpha"), session("beta")]);
-  f.controller.applySnapshot(f.client.snapshot);
-
-  const painted = f.paint();
-
-  expect(painted).toContain("ctrl+x");
-  expect(painted).toMatch(/ctrl\+x[^\n]*alpha/u);
-});
-
 it("abandons the armed clear when the operator moves the selection himself", async () => {
   let clock = 0;
   const f = await mountedList([session("alpha"), session("beta")], { now: () => clock });

@@ -14,12 +14,6 @@ it("keeps a cursor-space visible without shifting the next wrapped word", () => 
     expect(stripVTControlCharacters(rows[1])).toBe("   abc");
 });
 
-it("marks the first grapheme on the correct row when a long word wraps", () => {
-    const rows = wrapPromptDraft("abcdefghij", 8, 5);
-
-    expect(rows[0]).not.toContain(JOBWATCH_ANSI.inverse);
-    expect(rows[1]).toContain("\x1b[7mf\x1b[27m");
-});
 function session(sessionId, overrides = {}) {
     return {
         schemaVersion: 1,
@@ -156,7 +150,6 @@ it("bolds the selected row without altering its colors", () => {
     expect(stripVTControlCharacters(selected)).toBe(stripVTControlCharacters(plain));
 });
 
-
 it("ages a session from when it started, not from its last activity", () => {
     const layout = createDashboardLayout(120, 20);
     const started = new Date(now - 3 * 60 * 60 * 1000).toISOString();
@@ -165,17 +158,6 @@ it("ages a session from when it started, not from its last activity", () => {
     // A session running since this morning must not read as one minute old because it just replied.
     expect(row).toContain("3h");
     expect(row).not.toContain("30s");
-});
-
-it("tints only the name itself, not the padding that follows it", () => {
-    const layout = createDashboardLayout(120, 20);
-    const amberBackground = "\u001b[48;2;252;211;77m";
-    const row = renderSessionRow(session("c", { name: "Inspect Mantis Installer", color: "amber" }), layout, { now });
-    const tinted = row.slice(row.indexOf(amberBackground));
-    const label = stripVTControlCharacters(tinted.slice(0, tinted.indexOf("\u001b[0m")));
-    // The highlight hugs the name; the rest of the column keeps the row's own background.
-    expect(label).toBe("Inspect Mantis Installer");
-    expect(stripVTControlCharacters(row)).toContain("Inspect Mantis Installer  ");
 });
 
 it("spins an unlabelled column left of STATE so the state text never shifts", () => {

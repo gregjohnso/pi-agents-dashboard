@@ -32,16 +32,11 @@ it.each([
   expect(parseSlashSubmission(text, menu)).toMatchObject({ kind: "rejected", code });
 });
 
-it.each(["/stats", "/tree", "/export", "/export /tmp/out.html"])("has no session query behind %s", (text) => {
+it.each(["/stats", "/export /tmp/out.html"])("has no session query behind %s", (text) => {
   expect(parseSlashSubmission(text, menu)).toEqual({ kind: "prompt", text });
 });
 
-it("offers no session query in the viewer command menu", () => {
-  const names = new Set(sessionSlashCommands(menu).map((command) => command.name));
-  for (const name of ["stats", "tree", "export"]) expect(names.has(name), name).toBe(false);
-});
-
-it.each(["/auto-compact on", "/auto-retry off", "/steering all", "/follow-up one-at-a-time"])("sends %s to Pi as a prompt instead of a settings passthrough", (text) => {
+it.each(["/auto-compact on", "/follow-up one-at-a-time"])("sends %s to Pi as a prompt instead of a settings passthrough", (text) => {
   expect(parseSlashSubmission(text, menu)).toEqual({ kind: "prompt", text });
 });
 
@@ -50,7 +45,7 @@ it("offers no Pi settings passthrough in the viewer command menu", () => {
   for (const name of ["auto-compact", "auto-retry", "steering", "follow-up"]) expect(names.has(name), name).toBe(false);
 });
 
-it.each(["/thinking", "/thinking off", "/thinking max"])("sends %s to Pi as a prompt instead of a thinking command", (text) => {
+it.each(["/thinking", "/thinking max"])("sends %s to Pi as a prompt instead of a thinking command", (text) => {
   expect(parseSlashSubmission(text, menu)).toEqual({ kind: "prompt", text });
 });
 

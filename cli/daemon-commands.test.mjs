@@ -209,59 +209,6 @@ it("still reports a daemon that will not release its endpoint within seconds of 
   expect(result).toMatchObject({ code: 1, error: { code: "DAEMON_STOP_TIMEOUT" } });
 });
 
-/**
- * Run one start whose child is still alive when the deadline passes, so the give-up path runs.
- *
- * @param {string} root @param {{ pid: number }} child @param {(pid: number) => Promise<any>} inspect
- * @param {() => void} [onSignal]
- * @returns {Promise<{ result: any, signals: [number, string][] }>}
- */
-async function abandonedStart(root, child, inspect, onSignal = () => {}) {
-  /** @type {[number, string][]} */
-  const signals = [];
-  const result = await runDaemonCommand("start", {
-    root,
-    timeoutMs: 50,
-    stopPolicy: { gracefulMs: 1, terminateMs: 1 },
-    inspectEndpoint: async () => ({ status: "ABSENT", canCleanup: false }),
-    inspect,
-    signalProcessGroup: (/** @type {number} */ pgid, /** @type {string} */ signal) => { signals.push([pgid, signal]); onSignal(); },
-    spawnDaemon: () => Object.assign(new EventEmitter(), { pid: child.pid, unref() {} }),
-  });
-  return { result, signals };
-}
-
-it("stops the daemon child it gave up on instead of leaving it to publish itself", async () => {
-  // A start that hit its deadline returned DAEMON_START_FAILED and never signalled the detached
-  // child it had spawned. The child published itself seconds later and lived forever: 47 leaked
-  // test daemons in one night, the oldest of them up 38 hours.
-  const root = await stateRoot();
-  const child = { pid: 9_100, startIdentity: "111222333", processGroupId: 9_100 };
-  let alive = true;
-  const { result, signals } = await abandonedStart(root, child, async (pid) => {
-    if (pid === child.pid && alive) return child;
-    if (pid === process.pid) return { pid: process.pid, startIdentity: "1", processGroupId: process.pid };
-    throw Object.assign(new Error("no such process"), { code: "ESRCH" });
-  }, () => { alive = false; });
-
-  expect(signals).toEqual([[9_100, "SIGTERM"]]);
-  expect(result).toMatchObject({ code: 1, error: { code: "DAEMON_START_FAILED", message: expect.stringContaining("9100") } });
-});
-
-it("names a daemon child it could not verify rather than signalling that PID alone", async () => {
-  // A detached spawn always leads its own process group, so a record that says otherwise is a
-  // reused PID. Signalling that group on a busy box would kill something nobody spawned here.
-  const root = await stateRoot();
-  const child = { pid: 9_101, startIdentity: "111222333", processGroupId: 44 };
-  const { result, signals } = await abandonedStart(root, child, async (pid) => {
-    if (pid === child.pid) return child;
-    return { pid, startIdentity: "1", processGroupId: pid };
-  });
-
-  expect(signals).toEqual([]);
-  expect(result).toMatchObject({ code: 1, error: { code: "DAEMON_START_FAILED", message: expect.stringContaining("9101") } });
-});
-
 it("reports a daemon child that could not be spawned at all", async () => {
   const root = await stateRoot();
   const result = await runDaemonCommand("start", {

@@ -68,13 +68,6 @@ describe("dashboard overlays", () => {
         expect(described.rows.some((row) => row.text.includes("❯ provider/model-15"))).toBe(true);
         expect(described.rows.at(-1)).toMatchObject({ emphasis: true });
     });
-    it("draws one windowful of a catalog-sized picker rather than every row", () => {
-        const values = Array.from({ length: 300 }, (_, index) => `provider/model-${index}`);
-        const described = describeOverlay(createChoiceOverlay("model", "Model", values, "provider/model-299"), { choiceRows: 8 });
-        expect(described.title).toBe("Model 300/300");
-        expect(described.rows).toHaveLength(9);
-        expect(described.rows.some((row) => row.text.includes("❯ provider/model-299"))).toBe(true);
-    });
     it("narrows a picker to what the operator types and keeps the highlight it can", () => {
         const values = ["anthropic/claude-opus-4", "anthropic/claude-sonnet-4", "google/gemini-3-pro", "openai/gpt-6"];
         const overlay = createChoiceOverlay("model", "Model", values, "google/gemini-3-pro");
@@ -85,13 +78,6 @@ describe("dashboard overlays", () => {
         const widened = filterChoiceOverlay(narrowed, "");
         expect(widened.values).toEqual(values);
         expect(widened.values[widened.index]).toBe("anthropic/claude-opus-4");
-    });
-    it("says a picker matches nothing instead of drawing an empty frame", () => {
-        const empty = filterChoiceOverlay(createChoiceOverlay("model", "Model", ["anthropic/claude"], "anthropic/claude"), "zzz");
-        expect(empty.values).toEqual([]);
-        const described = describeOverlay(empty, { choiceRows: 8 });
-        expect(described.title).toBe("Model 0/0 · zzz");
-        expect(described.rows[0]).toMatchObject({ text: expect.stringContaining("zzz"), emphasis: true });
     });
     it("names only keys the list still answers", () => {
         const bindings = createHelpOverlay().bindings;

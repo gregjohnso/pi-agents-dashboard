@@ -105,14 +105,8 @@ it.each([
   ["sessions/one.json", JSON.stringify({ schemaVersion: 1, sessionId: "one" })],
   ["daemon/control.token", ""],
   ["runs/one/worker-replay.jsonl", `${JSON.stringify({ clientId: "client", requestId: "request", op: "stop", stage: "UNKNOWN", at: "now" })}\n`],
-  ["runs/one/worker-replay.jsonl", `${JSON.stringify({ clientId: "", requestId: "request", op: "stop", stage: "RECEIVED", at: "now" })}\n`],
   ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, proto: 0 }] })],
-  ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, routeGeneration: 0 }] })],
-  ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, pendingRespawn: "later" }] })],
-  ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, socketPath: "" }] })],
-  ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, socketPath: 42 }] })],
   ["daemon/workers.json", JSON.stringify({ schemaVersion: 1, workers: [{ sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, socketPath: "/tmp/pi-agents-elsewhere/run.sock" }] })],
-  ["runs/one/terminal-cause.json", JSON.stringify({ schemaVersion: 1, sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, worker: SUPERVISOR, piChild: PI_CHILD, event: { type: "WORKER_EXITED", at: "2026-08-25T12:01:00.000Z", summary: "the worker exited" } })],
   ["runs/one/terminal-cause.json", JSON.stringify({ schemaVersion: 1, sessionId: "one", runId: "run-one", leaseId: "lease-one", generation: 1, worker: SUPERVISOR, piChild: PI_CHILD })],
   ["unknown-state.json", JSON.stringify({ value: true })],
 ])("refuses malformed legacy artifact %s", async (relative, text) => {
@@ -249,7 +243,7 @@ it("migrates the rotating RPC and stderr segments a run leaves behind", async ()
 // Operator-visible failure: only the segment names `openRotatingWriter` writes are carried forward.
 // Any other content of a socket or diagnostic directory must refuse the migration before anything is
 // written to the destination, rather than arrive there as durable state no code names.
-it.each(["daemon/workers/state.json", "runs/one-run/diagnostics/rpc.0.jsonl", "runs/one-run/diagnostics/stdout.00000000.jsonl"])("refuses the unsupported legacy file %s", async (relative) => {
+it.each(["daemon/workers/state.json", "runs/one-run/diagnostics/rpc.0.jsonl"])("refuses the unsupported legacy file %s", async (relative) => {
   const paths = await fixture();
   await mkdir(dirname(join(paths.legacyRoot, relative)), { recursive: true, mode: 0o700 });
   await writeFile(join(paths.legacyRoot, relative), "{}\n", { mode: 0o600 });

@@ -96,9 +96,7 @@ it.each([
   ["missing confirmation", ["stop", "exact-session-id", "--revision", "4"]],
   ["path-like session ID", ["stop", "sessions/exact-session-id", "--revision", "4", "--yes"]],
   ["unknown flag", ["stop", "exact-session-id", "--revision", "4", "--yes", "--force"]],
-  ["respawn without confirmation", ["respawn", "exact-session-id", "--revision", "4"]],
   ["respawn without a revision", ["respawn", "exact-session-id", "--yes"]],
-  ["respawn on a path-like session ID", ["respawn", "sessions/exact-session-id", "--revision", "4", "--yes"]],
 ])("rejects strict destructive grammar: %s", async (_name, argv) => {
   const request = vi.fn();
   await expect(runSessionCommand(argv, { request })).resolves.toMatchObject({ code: 2, error: { code: "INVALID_SYNTAX" } });

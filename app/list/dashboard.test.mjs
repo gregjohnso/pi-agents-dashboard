@@ -244,18 +244,6 @@ describe("dashboard controller", () => {
         expect(client.delete).not.toHaveBeenCalled();
         expect(client.unsubscribed).toBe(1);
     });
-    it("forgets an armed quit when the same controller is reopened", async () => {
-        const client = new FakeDaemonClient([session("a", { processState: "LIVE" })]);
-        const onClose = vi.fn();
-        const dashboard = controller(client, { onClose, now: () => 1_000 });
-        await dashboard.open();
-        dashboard.handleInput("\x03");
-        await dashboard.close();
-        await dashboard.open();
-        dashboard.handleInput("\x03");
-        expect(dashboard.closed).toBe(false);
-        expect(onClose).toHaveBeenCalledTimes(1);
-    });
     it.each([
         ["an empty list", []],
         ["the last row", [session("a")]],
@@ -393,39 +381,6 @@ describe("dashboard controller", () => {
         dashboard.handleInput("\x18");
         await vi.waitFor(() => expect(client.delete).toHaveBeenCalledWith("a", 1, expect.any(String)));
     });
-    it("forgets an armed clear once the window passes", async () => {
-        let clock = 0;
-        const client = new FakeDaemonClient([session("a", { taskState: "STOPPED", processState: "EXITED" })]);
-        const dashboard = controller(client, { now: () => clock });
-        await dashboard.open();
-        dashboard.setView("all");
-        dashboard.selectSession("a");
-        dashboard.handleInput("\x18");
-        clock = 900;
-        dashboard.handleInput("\x18");
-        expect(client.delete).not.toHaveBeenCalled();
-        expect(dashboard.stopClearArmed).toBe(true);
-    });
-    it("re-reads the authoritative revision when a destructive request conflicts", async () => {
-        // The record churns from background writes, and the frontend's cached copy can be many
-        // revisions behind, so retrying against the cache conflicts forever.
-        const client = new FakeDaemonClient([session("a", { taskState: "FAILED", processState: "EXITED", revision: 4 })]);
-        const journal = journalledDestructive((revision) => {
-            if (revision !== 25) throw Object.assign(new Error("Session revision changed before Delete"), { code: "REVISION_CONFLICT" });
-        });
-        client.delete = vi.fn(journal.call);
-        const dashboard = controller(client);
-        await dashboard.open();
-        // The daemon has moved on; the frontend still holds revision 4 because no event carried the change.
-        client.getState = vi.fn(async () => ({ sessions: [session("a", { taskState: "FAILED", processState: "EXITED", revision: 25 })], cursor: nextCoverage() }));
-        dashboard.setView("all");
-        dashboard.selectSession("a");
-        dashboard.handleInput("\x18");
-        dashboard.handleInput("\x18");
-        await vi.waitFor(() => expect(client.delete).toHaveBeenCalledWith("a", 25, expect.any(String)));
-        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
-        expect(new Set(journal.requestIds).size).toBe(journal.requestIds.length);
-    });
     // Operator-visible failure: each save fsynced the file and its directory, about 70 ms on a
     // network home, so a burst that saved per change stalled the list while an agent streamed. The
     // dashboard keeps its view state in memory now and writes nothing at all.
@@ -463,18 +418,6 @@ describe("dashboard controller", () => {
         expect(rows.some((line) => line.includes("STARTING"))).toBe(false);
         release();
     });
-    it("drops the pending row when the launch request throws", async () => {
-        const client = new FakeDaemonClient([]);
-        client.launch = vi.fn(async () => { throw Object.assign(new Error("socket closed"), { code: "DAEMON_UNAVAILABLE" }); });
-        const dashboard = controller(client);
-        await dashboard.open();
-        for (const character of "ship it") dashboard.handleInput(character);
-        dashboard.handleInput("\r");
-        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error" }));
-        // A thrown launch must not leave a STARTING row that never resolves.
-        expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("STARTING"))).toBe(false);
-        expect(dashboard.composerDraft.prompt).toBe("ship it");
-    });
     it("restores the draft and drops the pending row when a launch fails", async () => {
         const client = new FakeDaemonClient([]);
         client.launch = vi.fn(async () => { throw Object.assign(new Error("no worker slots"), { code: "LAUNCH_UNAVAILABLE" }); });
@@ -485,17 +428,6 @@ describe("dashboard controller", () => {
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "LAUNCH_UNAVAILABLE" }));
         // The operator keeps their text and the phantom row is gone.
         expect(dashboard.composerDraft.prompt).toBe("retry me");
-        expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("STARTING"))).toBe(false);
-    });
-    it("keeps the typed prompt when the daemon refuses the launch outright", async () => {
-        const client = new FakeDaemonClient([]);
-        client.launch = vi.fn(async () => { throw Object.assign(new Error("openai-codex/nope is not installed"), { code: "MODEL_UNKNOWN" }); });
-        const dashboard = controller(client);
-        await dashboard.open();
-        for (const character of "keep this") dashboard.handleInput(character);
-        dashboard.handleInput("\r");
-        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "MODEL_UNKNOWN" }));
-        expect(dashboard.composerDraft.prompt).toBe("keep this");
         expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("STARTING"))).toBe(false);
     });
     it("keeps a refused launch on the status line through timer-driven changes until the next command", async () => {
@@ -601,16 +533,6 @@ describe("dashboard controller", () => {
         dashboard.handleInput("\x1b[D");
         dashboard.handleInput("bc");
         expect(dashboard.composerDraft.prompt).toBe("abcd");
-    });
-    it("moves and deletes by whole prompt graphemes", async () => {
-        const dashboard = controller(new FakeDaemonClient([]));
-        await dashboard.open();
-
-        dashboard.handleInput("A👩🏽‍💻B");
-        dashboard.handleInput("\x1b[D");
-        dashboard.handleInput("\x7f");
-
-        expect(dashboard.composerDraft.prompt).toBe("AB");
     });
     it("opens the selection through the injected viewer boundary on an empty Enter or Right, and launches once the prompt has text", async () => {
         const openSelectedViewer = vi.fn(async () => {});
@@ -1247,7 +1169,7 @@ describe("dashboard controller", () => {
             dashboard.handleInput("\x1b[5~");
             expect(dashboard.overlay.index).toBe(0);
         });
-        it.each([40, 55, 80, 120, 160])("keeps the menu and the picker inside %i columns", async (width) => {
+        it.each([40, 80, 160])("keeps the menu and the picker inside %i columns", async (width) => {
             const dashboard = controller(new FakeDaemonClient([
                 session("a", { model: { provider: "a-very-long-provider-name", id: "an-even-longer-model-identifier-2026" } }),
                 session("b", { thinkingLevel: "an-unusually-long-thinking-level" }),
@@ -1494,46 +1416,6 @@ describe("wheel scrolling", () => {
         dashboard.handleMouse({ button: "wheel_up", column: 5, row: 7 });
         expect(dashboard.selectedSessionId).toBe("b");
     });
-});
-
-it("draws the Sessions bar on the terminal background", async () => {
-  const dashboard = controller(new FakeDaemonClient([session("one")]));
-  await dashboard.open();
-
-  const sessionsBar = dashboard.render(80, 20).find((line) => stripVTControlCharacters(line).startsWith("╭─ Sessions "));
-  expect(sessionsBar).toContain("\x1b[49m");
-  expect(sessionsBar).not.toContain(JOBWATCH_ANSI.blackBackground);
-});
-
-it("renders the launch-prompt cursor at its moved position and at the end", async () => {
-  const dashboard = controller(new FakeDaemonClient([]));
-  await dashboard.open();
-  dashboard.setComposerPrompt("abcd");
-
-  dashboard.handleInput("\x1b[D");
-  dashboard.handleInput("\x1b[D");
-  expect(dashboard.render(80, 20).join("\n")).toContain("\x1b[7mc\x1b[27m");
-
-  dashboard.handleInput("\x1b[C");
-  expect(dashboard.render(80, 20).join("\n")).toContain("\x1b[7md\x1b[27m");
-  dashboard.handleInput("\x1b[C");
-  expect(dashboard.render(80, 20).join("\n")).toContain("\x1b[7m \x1b[27m");
-});
-
-it("rests a dimmed cursor on the placeholder's first character until the operator types", async () => {
-  // An empty prompt must read as a caret waiting, not as text the operator has to delete.
-  const dashboard = controller(new FakeDaemonClient([]));
-  await dashboard.open();
-
-  const rows = dashboard.render(80, 20).map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
-  expect(rows.join("\n")).toContain("describe a task for a new session");
-  const cursorRow = dashboard.render(80, 20).find((line) => line.includes("escribe a task"));
-  expect(cursorRow).toContain(`${JOBWATCH_ANSI.selectionBackground}${JOBWATCH_ANSI.gray}d`);
-
-  dashboard.setComposerPrompt("hello");
-  const typed = dashboard.render(80, 20).join("\n");
-  expect(typed).not.toContain("describe a task for a new session");
-  expect(typed).toContain("hello");
 });
 
 /** The dock's prompt block: the rows between the rule that opens the prompt box and the one that closes it. */

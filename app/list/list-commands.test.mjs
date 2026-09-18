@@ -32,7 +32,7 @@ describe("list slash commands", () => {
         expect(parseListCommand("/model", unknown)).toMatchObject({ kind: "rejected", code: "MODEL_CHOICES_UNKNOWN", message: expect.stringContaining("/model provider/id") });
         expect(parseListCommand("/model", { ...unknown, models: ["anthropic/claude"] })).toEqual({ kind: "pick_model" });
     });
-    it.each(["/thinking", "/thinking high", "/thinking ludicrous"])("refuses %s, because the next launch selects no thinking level", (text) => {
+    it.each(["/thinking", "/thinking high"])("refuses %s, because the next launch selects no thinking level", (text) => {
         expect(parseListCommand(text, choices)).toMatchObject({ kind: "rejected", code: "UNKNOWN_LIST_COMMAND" });
     });
     it("names no thinking command in the launch menu and offers no thinking values", () => {

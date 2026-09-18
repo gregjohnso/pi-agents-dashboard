@@ -13,6 +13,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
 	artifactsManifestSelected,
+	bytes,
 	importBuiltTuiIfSelected,
 	loadArtifactsManifest,
 } from "../native-ingress/built-pipeline.mjs";
@@ -63,15 +64,30 @@ export function deferred() {
  *
  * `terminal` is supplied by the case: a real `ProcessTerminal` when the point is that admission really
  * closes and reopens, and a recording double when the point is a failure the real terminal cannot be asked
- * to produce.
+ * to produce. `onStop` and `onRestore` are the renderer operations a case wants really performed — a case
+ * about the production path passes the real `terminal.stop()` and a real restart, because `TUI.stop()` stops
+ * this terminal and destroys its `StdinBuffer`.
+ *
+ * `applyResult` classifies exactly as Pi's own adapter does: `editInExternalEditor` *resolves*
+ * `{ status: "failed" }` for a spawn error, a signal or a nonzero exit, and only a complete edit applies
+ * content and counts as a return.
  */
-export function recordingSite({ terminal, child, restoreThrows = false, released = false } = {}) {
+export function recordingSite({
+	terminal,
+	child,
+	restoreThrows = false,
+	released = false,
+	onStop,
+	onRestore,
+} = {}) {
 	const order = [];
 	const applied = [];
+	const editorText = [];
 	let isReleased = released;
 	return {
 		order,
 		applied,
+		editorText,
 		site: {
 			terminal,
 			isReleased: () => isReleased,
@@ -83,10 +99,14 @@ export function recordingSite({ terminal, child, restoreThrows = false, released
 				isReleased = false;
 				order.push("reclaim");
 			},
-			stop: () => order.push("stop"),
+			stop: () => {
+				order.push("stop");
+				onStop?.();
+			},
 			restore: () => {
 				order.push("restore");
 				if (restoreThrows) throw new Error("restore failed");
+				onRestore?.();
 			},
 			runChild: async () => {
 				order.push("child");
@@ -95,7 +115,40 @@ export function recordingSite({ terminal, child, restoreThrows = false, released
 			applyResult: (result) => {
 				order.push("applyResult");
 				applied.push(result);
+				if (result.status !== "complete") return "failed";
+				editorText.push(result.content);
+				return "returned";
 			},
+		},
+	};
+}
+
+/**
+ * A host sender that keeps what Pi refused.
+ *
+ * A rejected labelled span is neither queued nor counted, so its bytes stay the sender's to deliver once.
+ * This models that obligation and nothing more: every verdict is recorded, the bytes of each rejected span
+ * are retained in arrival order, and `deliverRetainedTo` hands them to the route the case supplies exactly
+ * once. That route stands in for the physical child's own input; it proves the retention and single-delivery
+ * contract, and it is not a cross-process host implementation of the transition.
+ */
+export function retainingSender({ terminal, origin, generation = 1 }) {
+	const verdicts = [];
+	const retained = [];
+	return {
+		verdicts,
+		retained,
+		send(text) {
+			return terminal
+				.dispatchNativeInput({ attachmentEpoch: origin, bytes: bytes(text), binding: { generation } })
+				.then((result) => {
+					verdicts.push({ text, ...result });
+					if (!result.admitted) retained.push(text);
+					return result;
+				});
+		},
+		deliverRetainedTo(route) {
+			for (const text of retained.splice(0)) route.push(text);
 		},
 	};
 }

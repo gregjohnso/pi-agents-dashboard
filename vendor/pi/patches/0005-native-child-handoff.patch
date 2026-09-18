@@ -1,9 +1,9 @@
 diff --git a/packages/coding-agent/src/core/native-child-handoff.ts b/packages/coding-agent/src/core/native-child-handoff.ts
 new file mode 100644
-index 0000000..e750103
+index 0000000..4a37ec4
 --- /dev/null
 +++ b/packages/coding-agent/src/core/native-child-handoff.ts
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,126 @@
 +/**
 + * Seam G: the one child-terminal handoff Pi already recognizes.
 + *
@@ -44,14 +44,20 @@ index 0000000..e750103
 +	stop(): void;
 +	restore(): void;
 +	runChild(): Promise<T>;
-+	applyResult(result: T): void;
++	/**
++	 * Apply the child's result and say what it was. This module never inspects `T`, so the site is the only
++	 * thing that knows whether a *resolved* result is a success: Pi's external editor resolves
++	 * `{ status: "failed" }` for a spawn error, a signal or a nonzero exit rather than rejecting, and a site
++	 * that applied nothing must report `failed` instead of letting the bracket announce a return.
++	 */
++	applyResult(result: T): "returned" | "failed";
 +};
 +
 +export type ChildTerminalHandoffReport =
 +	/** The child ran with no drain and no phase bracket: this is Pi's pinned path. */
 +	| { entered: true; managed: false }
 +	/** The child ran inside the drain and the announced bracket. */
-+	| { entered: true; managed: true; childPhaseId: string; drainedThrough: number; outcome: "returned" }
++	| { entered: true; managed: true; childPhaseId: string; drainedThrough: number; outcome: "returned" | "failed" }
 +	/** A recognized release was already active: nothing was drained, announced, stopped or spawned. */
 +	| { entered: false; refusal: "already-released" };
 +
@@ -66,8 +72,11 @@ index 0000000..e750103
 + * Managed order: drain to a boundary, mark seam E's recognized release, announce `entering`, stop the
 + * renderer, run the child. Then, in an outermost finalizer chain: attempt restoration, clear the release
 + * only after that attempt, announce exactly one matching `left`, and reopen admission last, so a listener,
-+ * spawn, child, stop, start or render failure cannot strand the gate closed. A failed restoration reports
-+ * `failed`: Pi never advertises a return it could not restore itself from.
++ * spawn, child, stop, start or render failure cannot strand the gate closed.
++ *
++ * `outcome` is the site's own classification of the resolved result, downgraded to `failed` when restoration
++ * throws. A child that resolved a failure and a return Pi could not restore itself from are both `failed`:
++ * Pi never advertises a return that did not happen.
 + *
 + * The child's own failure still propagates to the caller, exactly as it does in the pinned path.
 + */
@@ -103,8 +112,7 @@ index 0000000..e750103
 +			drainedThrough: lease.drainedThrough,
 +		});
 +		site.stop();
-+		site.applyResult(await site.runChild());
-+		outcome = "returned";
++		outcome = site.applyResult(await site.runChild());
 +	} finally {
 +		try {
 +			try {
@@ -120,7 +128,7 @@ index 0000000..e750103
 +			lease.reopen();
 +		}
 +	}
-+	return { entered: true, managed: true, childPhaseId, drainedThrough: lease.drainedThrough, outcome: "returned" };
++	return { entered: true, managed: true, childPhaseId, drainedThrough: lease.drainedThrough, outcome };
 +}
 diff --git a/packages/coding-agent/src/index.ts b/packages/coding-agent/src/index.ts
 index b4a9b0f..2c589e5 100644
@@ -142,7 +150,7 @@ index b4a9b0f..2c589e5 100644
  export {
  	type AttachmentEpoch,
 diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
-index 8e28e4a..2e4c448 100644
+index 8e28e4a..9868ffd 100644
 --- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
 +++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
 @@ -84,6 +84,7 @@ import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/
@@ -153,7 +161,7 @@ index 8e28e4a..2e4c448 100644
  import {
  	type NativePresentationProvider,
  	recordNativeReadiness,
-@@ -4613,23 +4614,26 @@ export class InteractiveMode {
+@@ -4613,23 +4614,29 @@ export class InteractiveMode {
  	private async handleOpenExternalEditor(): Promise<void> {
  		const editorCmd = this.settingsManager.getExternalEditorCommand();
  		const content = this.editor.getExpandedText?.() ?? this.editor.getText();
@@ -167,13 +175,6 @@ index 8e28e4a..2e4c448 100644
 -				content,
 -			});
 -			if (result.status === "complete") {
--				this.editor.setText(result.content);
--			}
--		} finally {
--			this.reclaimTerminal();
--			this.ui.start();
--			this.ui.requestRender(true);
--		}
 +		// Seam G brackets this recognized handoff. With no registered host, or a host that has not opted into
 +		// this build's seam G version, the bracket runs Pi's pinned order: mark the release before the renderer
 +		// stops, so no presentation can land in the window between the two, and restore in a finally.
@@ -189,9 +190,18 @@ index 8e28e4a..2e4c448 100644
 +			},
 +			runChild: () => editInExternalEditor({ command: editorCmd, content }),
 +			applyResult: (result) => {
-+				if (result.status === "complete") {
-+					this.editor.setText(result.content);
-+				}
++				// `editInExternalEditor` resolves `{ status: "failed" }` for a spawn error, a signal or a nonzero
++				// exit, so a resolved result is not by itself a return: only a complete edit is applied and
++				// announced as one.
++				if (result.status !== "complete") return "failed";
+ 				this.editor.setText(result.content);
+-			}
+-		} finally {
+-			this.reclaimTerminal();
+-			this.ui.start();
+-			this.ui.requestRender(true);
+-		}
++				return "returned";
 +			},
 +		});
  	}
@@ -437,7 +447,7 @@ index 282842c..013d94e 100644
  		if (this.timeout) {
  			clearTimeout(this.timeout);
 diff --git a/packages/tui/src/terminal.ts b/packages/tui/src/terminal.ts
-index f1e6e98..8257c3a 100644
+index f1e6e98..9621d1f 100644
 --- a/packages/tui/src/terminal.ts
 +++ b/packages/tui/src/terminal.ts
 @@ -97,6 +97,42 @@ export type NativeInputDispatch = {
@@ -511,7 +521,7 @@ index f1e6e98..8257c3a 100644
  	/**
  	 * One ordered byte queue for every attachment, not one decoder each.
  	 *
-@@ -344,10 +392,11 @@ export class ProcessTerminal implements Terminal {
+@@ -344,22 +392,30 @@ export class ProcessTerminal implements Terminal {
  	 * Dispatches are serialized, so the ordered native path sees byte spans in submission order and the
  	 * returned `consumedThrough` is monotonic. It counts bytes accepted into that path, and the promise
  	 * resolves only once every response authorization those bytes started has settled — that is the
@@ -526,15 +536,17 @@ index f1e6e98..8257c3a 100644
  		// Admission runs synchronously, before this dispatch waits for its turn. A reconnect has to be
  		// visible to a response authorization that is *already* awaiting a host decision: if the epoch were
  		// only noted inside the turn, it would sit behind that pending decision and the only thing left to
-@@ -355,11 +404,16 @@ export class ProcessTerminal implements Terminal {
- 		if (!this.stdinBuffer) {
- 			throw new Error("dispatchNativeInput requires a started terminal");
- 		}
+ 		// refuse a stale reply would be the 1000 ms bound.
 +		// The drain closes the gate synchronously, so this check alone decides which side of the barrier a
-+		// dispatch is on: no byte span is ever split across it.
++		// dispatch is on: no byte span is ever split across it. It is answered before the started-terminal
++		// requirement, because the recognized handoff stops this terminal while the gate is closed: a host
++		// dispatching then must learn `handoff-closed` and keep its bytes, not read a lifecycle error.
 +		if (this.admission !== "open") {
 +			return { admitted: false, consumedThrough: this.consumedThrough, reason: "handoff-closed" };
 +		}
+ 		if (!this.stdinBuffer) {
+ 			throw new Error("dispatchNativeInput requires a started terminal");
+ 		}
  		if (input.binding.generation < this.bindingGeneration) {
 -			return { consumedThrough: this.consumedThrough };
 +			return { admitted: false, consumedThrough: this.consumedThrough, reason: "stale-binding" };
@@ -545,7 +557,7 @@ index f1e6e98..8257c3a 100644
  		}
  		const { attachmentId, epoch } = input.attachmentEpoch;
  		const generation = input.binding.generation;
-@@ -411,12 +465,73 @@ export class ProcessTerminal implements Terminal {
+@@ -411,12 +467,75 @@ export class ProcessTerminal implements Terminal {
  				this.stdinBuffer?.processWithOrigins(decoded.text, decoded.origins);
  			}
  			await settleTerminalResponseAuthorizations();
@@ -571,16 +583,18 @@ index f1e6e98..8257c3a 100644
 +	 * Each uses the path its timer would have used, so nothing is fabricated, discarded or reclassified.
 +	 */
 +	async drainNativeInput(): Promise<NativeInputDrainLease> {
-+		if (!this.stdinBuffer) {
-+			throw new NativeInputDrainError(
-+				"NATIVE_INPUT_NOT_STARTED",
-+				"drainNativeInput requires a started terminal",
-+			);
-+		}
++		// Also answered before the started-terminal requirement: the handoff stops this terminal for the child,
++		// so a second drain during that child is an active drain, not an unstarted terminal.
 +		if (this.admission !== "open") {
 +			throw new NativeInputDrainError(
 +				"NATIVE_INPUT_DRAIN_ACTIVE",
 +				"labelled admission is already closed by an active drain; reopen that lease before draining again",
++			);
++		}
++		if (!this.stdinBuffer) {
++			throw new NativeInputDrainError(
++				"NATIVE_INPUT_NOT_STARTED",
++				"drainNativeInput requires a started terminal",
 +			);
 +		}
 +		this.admission = "draining";

@@ -23,6 +23,7 @@ import {
 	drainableTerminalDouble,
 	importBuiltHandoffIfSelected,
 	recordingSite,
+	retainingSender,
 } from "./fixtures/native-child-handoff/built-handoff.mjs";
 
 const { selected, tui, codingAgent, manifest } = await importBuiltHandoffIfSelected();
@@ -64,6 +65,11 @@ function recordPhases() {
 	const phases = [];
 	unsubscribes.push(tui.onChildTerminalPhase((phase) => phases.push(phase)));
 	return phases;
+}
+
+/** Restart the real terminal the way `TUI.start()` does, keeping the case's capture of forwarded input. */
+function restartCapture() {
+	harness.terminal.start((data, provenance) => harness.delivered.push({ data, provenance }), () => {});
 }
 
 beforeEach(() => {
@@ -270,9 +276,15 @@ describeCohort(`seam G child handoff against the ${manifest.mode} cohort`, () =>
 		await dispatch(harness.terminal, client, "a");
 
 		const duringChild = [];
-		const { site, order, applied } = recordingSite({
+		const { site, order, applied, editorText } = recordingSite({
 			terminal: harness.terminal,
+			// The renderer operations Pi really performs: `TUI.stop()` stops this terminal and `TUI.start()`
+			// builds it a new `StdinBuffer`, so the child sees the production state and not a recorded string.
+			onStop: () => harness.terminal.stop(),
+			onRestore: () => restartCapture(),
 			child: async () => {
+				// The stop really happened: local stdin reaches nothing while the child owns the terminal.
+				harness.feedStdin("z");
 				duringChild.push(await dispatch(harness.terminal, client, "b"));
 				return { status: "complete", content: "edited" };
 			},
@@ -282,13 +294,90 @@ describeCohort(`seam G child handoff against the ${manifest.mode} cohort`, () =>
 		expect(report).toMatchObject({ entered: true, managed: true, outcome: "returned" });
 		expect(order).toEqual(["release", "stop", "child", "applyResult", "restore", "reclaim"]);
 		expect(applied).toEqual([{ status: "complete", content: "edited" }]);
-		expect(duringChild[0].reason).toBe("handoff-closed");
+		expect(editorText).toEqual(["edited"]);
+		expect(duringChild[0]).toEqual({ admitted: false, consumedThrough: 1, reason: "handoff-closed" });
 		expect(phases).toEqual([
 			{ phase: "entering", childPhaseId: report.childPhaseId, reason: "external-editor", drainedThrough: 1 },
 			{ phase: "left", childPhaseId: report.childPhaseId, reason: "external-editor", outcome: "returned" },
 		]);
-		// Admission reopened last, so the host may dispatch again.
+		// Admission reopened last, so the host may dispatch again, and nothing the child's window refused or
+		// local stdin produced entered Pi.
 		expect((await dispatch(harness.terminal, client, "c")).admitted).toBe(true);
+		expect(harness.delivered.map((entry) => entry.data)).toEqual(["a", "c"]);
+	});
+
+	it("announces a resolved editor failure as failed and applies none of its content", async () => {
+		registerHost();
+		const phases = recordPhases();
+		harness = startCapturingTerminal(tui);
+		const client = attachment("client-a");
+		await dispatch(harness.terminal, client, "a");
+
+		// `editInExternalEditor` *resolves* this for a spawn error, a signal and a nonzero exit alike: it does
+		// not reject, so a bracket that called every resolved child a return would announce all three wrongly.
+		const { site, order, applied, editorText } = recordingSite({
+			terminal: harness.terminal,
+			onStop: () => harness.terminal.stop(),
+			onRestore: () => restartCapture(),
+			child: async () => ({ status: "failed" }),
+		});
+		const report = await codingAgent.bracketRecognizedChildTerminal(site);
+
+		expect(report).toMatchObject({ entered: true, managed: true, outcome: "failed" });
+		expect(order).toEqual(["release", "stop", "child", "applyResult", "restore", "reclaim"]);
+		expect(applied).toEqual([{ status: "failed" }]);
+		expect(editorText).toEqual([]);
+		expect(phases.map((phase) => [phase.phase, phase.outcome])).toEqual([
+			["entering", undefined],
+			["left", "failed"],
+		]);
+		expect((await dispatch(harness.terminal, client, "c")).admitted).toBe(true);
+	});
+
+	it("answers the closed gate while the real child owns the stopped terminal, and the sender keeps its bytes", async () => {
+		registerHost();
+		harness = startCapturingTerminal(tui);
+		const client = attachment("client-a");
+		await dispatch(harness.terminal, client, "a");
+
+		const sender = retainingSender({ terminal: harness.terminal, origin: client });
+		/** The child's own input route. Only the host writes here, and only what Pi refused. */
+		const childRoute = [];
+		let observedInsideChild;
+		let observedAfterReopen;
+		let duplicateDrain;
+		const { site } = recordingSite({
+			terminal: harness.terminal,
+			onStop: () => harness.terminal.stop(),
+			onRestore: () => restartCapture(),
+			child: async () => {
+				observedInsideChild = await sender.send("b");
+				// Dispatched now, observed only after the bracket reopened admission: a host that reads its own
+				// verdicts late must still be told these bytes never entered Pi.
+				observedAfterReopen = sender.send("d");
+				duplicateDrain = await harness.terminal.drainNativeInput().then(
+					() => "a second drain resolved",
+					(error) => error,
+				);
+				return { status: "complete", content: "edited" };
+			},
+		});
+		const report = await codingAgent.bracketRecognizedChildTerminal(site);
+
+		expect(report).toMatchObject({ entered: true, managed: true, outcome: "returned" });
+		expect(observedInsideChild).toEqual({ admitted: false, consumedThrough: 1, reason: "handoff-closed" });
+		// The stopped terminal is a closed gate, not an unstarted one: the drain code stays the drain code.
+		expect(duplicateDrain).toMatchObject({ code: "NATIVE_INPUT_DRAIN_ACTIVE" });
+		expect(await observedAfterReopen).toEqual({ admitted: false, consumedThrough: 1, reason: "handoff-closed" });
+
+		// Refused bytes reached no Pi queue and no counter, and the host delivers each exactly once to the
+		// child's own route: a second delivery attempt has nothing left to send.
+		sender.deliverRetainedTo(childRoute);
+		sender.deliverRetainedTo(childRoute);
+		expect(childRoute).toEqual(["b", "d"]);
+		expect(sender.retained).toEqual([]);
+		expect(await dispatch(harness.terminal, client, "c")).toEqual({ admitted: true, consumedThrough: 2 });
+		expect(harness.delivered.map((entry) => entry.data)).toEqual(["a", "c"]);
 	});
 
 	it("reports failed and reopens admission when the child rejects or restoration throws", async () => {

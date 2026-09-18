@@ -3,8 +3,8 @@
 This is the public contract of the one source patch this node owns,
 `vendor/pi/patches/0005-native-child-handoff.patch`. In this branch's series it is applied fourth, directly
 after `0003-native-presentation-readiness.patch`, and the file in `patches/series` is the diff taken at exactly
-that position: sha256 `d787fda99d28a7c865116bc599cdfd8fe0840ef2fe2775c062e868f29fc36a16`, prepared tree
-`b9a3f2bf656c68ee5ad686a1fa272827c5513528` (build job `3745133`, upstream commit
+that position: sha256 `18138c0612bf244e3cddb0d9f759b875c6786f1836a84bd082be72071b44bcaa`, prepared tree
+`807c3338386c0c6264edea49dd26c33b3523ce2e` (build job `3746359`, upstream commit
 `bfb004d4418ff05c6f909eaaab856cbe75c1fde0`). It depends on seams B/C/F (0002) and E (0003) and does not
 commute with them. The number leaves `0004` free for the independent canonical-admission sibling: this branch
 does not carry that patch and nothing here depends on it.
@@ -85,6 +85,11 @@ snapshots the accepted-byte counter there. A dispatch whose synchronous admissio
 before the barrier; one whose admission starts afterwards is wholly rejected with `handoff-closed`. No byte
 span is split across the barrier.
 
+The closed gate is answered **before** the started-terminal requirement, because the handoff really stops this
+terminal: `TUI.stop()` calls `ProcessTerminal.stop()`, which destroys the `StdinBuffer`. A host that dispatches
+while the child owns the terminal therefore reads `{ admitted: false, reason: "handoff-closed" }` — the verdict
+it can act on — and not a lifecycle error about an unstarted terminal.
+
 - `consumedThrough` counts labelled bytes **admitted** into the ordered native path, monotonically, across
   attachments. Ordinary local stdin, rejected dispatches and every forced flush count nothing. Each admitted
   dispatch reports the boundary fixed at its own admission.
@@ -118,11 +123,13 @@ run. The drain never waits on the promise returned by the child-entry operation.
 
 ## The lease
 
-One drain at a time. A second call rejects with `NATIVE_INPUT_DRAIN_ACTIVE` before changing any state; a
-terminal that was never started rejects with `NATIVE_INPUT_NOT_STARTED`; any failure before the lease exists
-reopens admission internally. After success only that lease can reopen the gate, `reopen()` is synchronous and
-idempotent, and a stale or duplicated call is a no-op — including a stale lease's call after a later drain
-closed the gate again.
+One drain at a time. A second call rejects with `NATIVE_INPUT_DRAIN_ACTIVE` before changing any state, and that
+code is decided before the started-terminal check for the same reason the dispatch gate is: a second drain
+while the child owns the stopped terminal is an active drain, not an unstarted terminal. A terminal that was
+never started, with admission open, rejects with `NATIVE_INPUT_NOT_STARTED`; any failure before the lease
+exists reopens admission internally. After success only that lease can reopen the gate, `reopen()` is
+synchronous and idempotent, and a stale or duplicated call is a no-op — including a stale lease's call after a
+later drain closed the gate again.
 
 The gate is routing state only. It never becomes a second terminal owner: seam E's existing `terminalRelease`
 remains the one recognized ownership state, and `presentTerminal` still refuses through it.
@@ -140,9 +147,13 @@ admission closed, and there is at most one `entering` and one `left` per phase i
 recognized release is active is refused before another drain, event or spawn, and does not disturb the first
 lifecycle. The child's own failure still propagates to the caller, exactly as it did before.
 
-`outcome: "returned"` means the editor completed **and** Pi's restoration attempt did not throw. A failed
-restoration reports `failed`: Pi does not advertise a return it could not restore itself from, and seam E's
-readiness and refusal semantics are unchanged.
+`outcome: "returned"` means the site reported that it applied a completed child result **and** Pi's restoration
+attempt did not throw. The site classifies its own resolved result, because this module never inspects it:
+`applyResult` returns `"returned"` or `"failed"`. That matters for the real child, because
+`editInExternalEditor` **resolves** `{ status: "failed" }` for a spawn error, a signal or a nonzero exit rather
+than rejecting — those are announced as `failed`, apply no content, and are not a return. A failed restoration
+is also `failed`: Pi does not advertise a return it could not restore itself from, and seam E's readiness and
+refusal semantics are unchanged. A child that rejects propagates to the caller and is announced `failed` too.
 
 Not opted in, or a terminal with no `drainNativeInput`: the bracket runs Pi's pinned order — release, stop,
 child, reclaim, restore — with no drain, no lease and no announcement.
@@ -156,7 +167,9 @@ child, reclaim, restore — with no drain, no lease and no announcement.
 - **A listener that throws** is reported as a Node process warning — this package has no logger of its own —
   and the remaining listeners, the paired event, the native editor path and the reopen all still run.
 - **Transition buffering on `left`** belongs to the later host transport work. It is not asserted by this
-  synchronous callback API, and nothing here silently drops or replays bytes to simulate it.
+  synchronous callback API, and nothing here silently drops or replays bytes to simulate it. The suite proves
+  only the sender-side obligation — that refused bytes stay the sender's and are delivered once — against a
+  fake child route in one process; no cross-process host route is implemented or claimed.
 - **Gate 5 remains mandatory and unproved.** Arbitrary and unannounced children, same-process-group children,
   late attachment to a child's current screen, shared input, both renderers and actual Kitty graphics in a
   compatible Kitty environment all need separate product evidence. Foreground process group is corroboration

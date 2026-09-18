@@ -4,7 +4,11 @@
 # in this directory that no line names is drift and fails preparation. Names must look like
 # `NNNN-short-description.patch`.
 #
-# EMPTY ON PURPOSE. This foundation ships the pinned build, not a native capability: artifacts built
-# from an empty series are baseline/unmodified upstream Pi 0.84.3 and advertise no new interface. The
-# A-G native seams are a later part of Task 7 and arrive here as ordered source patches, each with its
-# own regression test. Do not add a cosmetic edit to make this list non-empty.
+# These three patches do not commute: 0002 and 0003 both change `packages/tui/src/{terminal,tui,index}.ts`
+# and 0001 and 0003 both change `packages/coding-agent/src/{index.ts,core/extensions/*,modes/interactive/
+# interactive-mode.ts}`. 0002 and 0003 are the serialized forms regenerated against this order, so
+# preparation applies them with no fuzz and no three-way fallback. Reordering this list breaks the
+# preparation; regenerate the later patches instead.
+0001-seam-a-native-submission-barrier.patch
+0002-native-ingress-return-profile.patch
+0003-native-presentation-readiness.patch

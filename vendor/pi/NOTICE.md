@@ -36,9 +36,27 @@ covers the pinned monorepo's own license only.
 
 ## Modifications
 
-The patch series in [`patches/series`](patches/series) is **empty**. Artifacts produced from this lock
-today are therefore baseline, unmodified upstream Pi 0.84.3, and `build-manifest.json` labels them as
-such (`capability: "none: baseline upstream artifacts"`).
+[`patches/series`](patches/series) applies **three** ordered source patches, in this order:
+
+| Patch | Purpose | Regression test |
+| --- | --- | --- |
+| `0001-seam-a-native-submission-barrier.patch` | Seam A: an opt-in native submission barrier. A managed host registered through `setNativeSubmissionHost` (or `pi.setNativeSubmissionHost` from an extension) authorizes every native submission before Pi's first semantic mutation for it and consumes a one-use binding fence with that mutation. With no host registered every entry point behaves exactly as unmodified Pi does. | `packages/coding-agent/test/native-submission-barrier.test.ts` in the patch, and `test/native-submit-barrier.test.mjs` in this repository against the built artifact |
+| `0002-native-ingress-return-profile.patch` | Seams B, C and F: labelled native ingress through `ProcessTerminal.dispatchNativeInput`, return-key authorization for a component that declares the key free, and a launch-fixed virtual terminal profile, all behind `registerNativeAttachmentHost`. With no host registered, input provenance is `null` and negotiation is unmanaged Pi's own. | `test/native-ingress.test.mjs` and `test/native-return.test.mjs` in this repository against the built artifact |
+| `0003-native-presentation-readiness.patch` | Seam E: cold presentation (`presentTerminal`) and the readiness record (`onNativeReadiness`, `nativeReadinessSnapshot`) plus the core bootstrap sideband, all opt-in. Until a host presents or subscribes, every changed path behaves as unmodified 0.84.3 does. | `test/native-presentation.test.mjs` in this repository against the built artifact |
+
+Artifacts produced from this lock are therefore **patched**, not baseline, and
+`build-manifest.json.artifactLabel` says so. The delivered interface is **A, B, C, E and F only**: seams D
+and G are not in this series and are not present in the artifacts. A green build is not evidence of any
+other capability, and none of the composed seams is qualified for activation: seam D's public
+binding-commit API, seam G's drain and arbitrary-child terminal parity remain unwritten.
+
+Changed upstream paths: `packages/coding-agent/src/core/{native-submission,native-presentation,native-bootstrap}.ts`
+and `packages/tui/src/{native-attachment,native-presentation}.ts` (added),
+`packages/coding-agent/src/{index.ts,main.ts,core/agent-session.ts,core/extensions/{types,loader}.ts,modes/print-mode.ts,modes/interactive/interactive-mode.ts}`,
+and `packages/tui/src/{index,terminal,tui,tui-alt-screen,tui-main-screen,stdin-buffer,editor-component,components/editor}.ts`.
+No dependency, lockfile, generated file or `dist` output is touched, and the bundled CLI is rebuilt by the
+pipeline. The patches do not commute; `INTERFACE.md` section 9 records the order, the digests and the
+prepared-tree hash each position produces.
 
 ## Second upstream input: release-generated data
 
@@ -64,5 +82,4 @@ the published packages is claimed from it. `upstream-lock.json` carries the same
 This substitutes a pinned copy of upstream's own generated data for a live network fetch; it changes no
 source file and no behaviour.
 
-When a patch is added, it is listed here with its purpose and its regression test, and the artifact label
-changes from baseline to patched.
+When another patch is added, it is listed here with its purpose and its regression test.

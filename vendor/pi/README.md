@@ -7,9 +7,16 @@ directory.
 
 Business logic stays in pi-agents. A patch here supplies a native interface and nothing else.
 
-**Today the patch series is empty.** Artifacts built from this lock are baseline, unmodified upstream Pi
-0.84.3 and advertise no new capability. `build-manifest.json` says so in its own `capability` field. Do
-not read a working build as evidence of a native feature.
+**The series carries three patches today: seam A, seams B/C/F and seam E.** Artifacts built from this lock
+are **patched**, not baseline, and they carry those five seams and nothing else. Seams D and G are not in
+this series and are not present in the artifacts. `build-manifest.json.artifactLabel` records the patched
+state; do not read a working build as evidence of any capability the series does not deliver.
+
+**None of it is qualified for activation.** The composed seams are implemented and tested against a built
+cohort, but seam D's public canonical admission/binding-commit API, seam G's drain and arbitrary-child
+terminal parity (Gate 5) do not exist. `INTERFACE.md` section 9 records the composed order and what the
+composition still does not deliver. Do not activate the root dependency and do not describe native
+attachment as shipped.
 
 **This is a hybrid build, not a source-only reconstruction.** One input comes from a published upstream
 release artifact rather than from the pinned commit: the generated model data in

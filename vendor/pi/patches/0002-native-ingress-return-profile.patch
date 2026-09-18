@@ -1,5 +1,5 @@
 diff --git a/packages/tui/src/editor-component.ts b/packages/tui/src/editor-component.ts
-index 5956450..b063b68 100644
+index b9e0a748537df33014c21649ff12022adf6e9c9e..52853634f49bdd07f26afcccd3bc0f95e815dbf7 100644
 --- a/packages/tui/src/editor-component.ts
 +++ b/packages/tui/src/editor-component.ts
 @@ -1,4 +1,5 @@
@@ -22,7 +22,7 @@ index 5956450..b063b68 100644
  	// Callbacks (required)
  	// =========================================================================
 diff --git a/packages/tui/src/index.ts b/packages/tui/src/index.ts
-index 0d5a4a1..d9fa1bd 100644
+index 0d5a4a1093ba8bbbd971e417af244823afa06ea4..d9fa1bd4a7603f3caa661bcb3e8aca5d06f45db5 100644
 --- a/packages/tui/src/index.ts
 +++ b/packages/tui/src/index.ts
 @@ -44,6 +44,25 @@ export {
@@ -71,7 +71,7 @@ index 0d5a4a1..d9fa1bd 100644
  	parseOsc11BackgroundColor,
 diff --git a/packages/tui/src/native-attachment.ts b/packages/tui/src/native-attachment.ts
 new file mode 100644
-index 0000000..ade233d
+index 0000000000000000000000000000000000000000..ade233d43113540f02396eb54e432be0b99c4b1f
 --- /dev/null
 +++ b/packages/tui/src/native-attachment.ts
 @@ -0,0 +1,341 @@
@@ -417,7 +417,7 @@ index 0000000..ade233d
 +	return nativeAttachmentState().launchProfile;
 +}
 diff --git a/packages/tui/src/stdin-buffer.ts b/packages/tui/src/stdin-buffer.ts
-index cc10c61..282842c 100644
+index cc10c61a55196eb90d9da3e1858e48cab27e925f..282842cbed8147031ca7ddb826311428f732264b 100644
 --- a/packages/tui/src/stdin-buffer.ts
 +++ b/packages/tui/src/stdin-buffer.ts
 @@ -18,6 +18,7 @@
@@ -792,7 +792,7 @@ index cc10c61..282842c 100644
  
  	getBuffer(): string {
 diff --git a/packages/tui/src/terminal.ts b/packages/tui/src/terminal.ts
-index f858bf9..e57bd83 100644
+index f858bf9f25240b764c0bfcf81c6aedbae316f4b0..e57bd83b67ff802599662e6b013cc6e668aa2567 100644
 --- a/packages/tui/src/terminal.ts
 +++ b/packages/tui/src/terminal.ts
 @@ -2,9 +2,19 @@ import * as fs from "node:fs";
@@ -1250,7 +1250,7 @@ index f858bf9..e57bd83 100644
  		// Remove event handlers
  		if (this.stdinDataHandler) {
 diff --git a/packages/tui/src/tui.ts b/packages/tui/src/tui.ts
-index 5172a9a..0db21a2 100644
+index 5172a9a142c582f8d8ad9c8c85772f1b093cc5a7..0db21a2adf9407f14e4f4716b0e688cb9df2886c 100644
 --- a/packages/tui/src/tui.ts
 +++ b/packages/tui/src/tui.ts
 @@ -6,6 +6,14 @@ import * as os from "node:os";

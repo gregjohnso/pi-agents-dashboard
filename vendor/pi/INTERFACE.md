@@ -3,18 +3,29 @@
 Read this before you write a Pi source patch or consume a built artifact. `vendor/pi/README.md` is the
 maintenance procedure; this file is the contract.
 
-**Seam A is implemented but NOT qualified; nothing else is delivered at all.** The series carries one patch,
-`0001-seam-a-native-submission-barrier.patch`, so today's artifacts are **patched** upstream Pi 0.84.3
-that expose the native submission barrier and nothing more. Seams B-G are absent. The build is also a
-**hybrid** - pinned source plus one pinned release-generated data input - which section 6 describes in
-full.
+**Seams A, B, C, E and F are implemented and composed but NOT qualified; seams D and G are absent.** The
+series carries three ordered patches, so today's artifacts are **patched** upstream Pi 0.84.3 that expose
+the native submission barrier, labelled ingress with return authorization and the terminal profile, and
+cold presentation with readiness — and nothing else. The build is also a **hybrid** - pinned source plus
+one pinned release-generated data input - which section 6 describes in full.
 
 Section 8 is the seam A contract: the public API, its managed activation, the envelope, the fence and the
 receipts a consumer can rely on. Section 8.6 states the draft behaviour the default editor implements, and
 section 8.6b states the selected **compatibility-first** custom-editor policy, the limitation that policy
-accepts, and the one operator-visible notice that states the limitation instead of hiding it. What is still
-missing is qualification work, not a policy: the public binding/API freeze and combined integration. That is
-why these artifacts are not cleared for dependency activation.
+accepts, and the one operator-visible notice that states the limitation instead of hiding it. Section 9 is
+the composition: which document owns which seam, what the serialized series is, and what the composition
+itself does not deliver. What is still missing is qualification work, not a policy: the public binding/API
+freeze for seam D, seam G's drain, and whole-product qualification. That is why these artifacts are not
+cleared for dependency activation.
+
+The seam contracts live in three documents, and none of them supersedes another:
+
+| Seam | Contract document | Ordered patch |
+| --- | --- | --- |
+| A — native submission barrier | section 8 of this file | `0001-seam-a-native-submission-barrier.patch` |
+| B, C, F — labelled ingress, return authorization, terminal profile | [`docs/native-input-interface.md`](../../docs/native-input-interface.md) | `0002-native-ingress-return-profile.patch` |
+| E — cold presentation and readiness | [`INTERFACE-seam-e-presentation.md`](INTERFACE-seam-e-presentation.md) | `0003-native-presentation-readiness.patch` |
+| D, G | not written: unassigned and unimplemented | none |
 
 ## 1. The pin
 
@@ -401,3 +412,40 @@ reservation, no session management. It reconstructs no extension-private editor 
 reimplements, wraps, replaces or disables a custom editor. The binding is observed, never admitted: this is
 not seam D and it admits, reserves and refuses nothing. The advisory `input` event keeps its existing catch-and-continue
 contract and is unchanged.
+
+## 9. The composed series
+
+The three patches were written against the same pinned tree by three separate lanes, and they do **not**
+commute: `packages/tui/src/{terminal,tui,index}.ts` are changed by both 0002 and 0003, and
+`packages/coding-agent/src/{index.ts,core/extensions/{types,loader}.ts,modes/interactive/interactive-mode.ts}`
+by both 0001 and 0003. `patches/series` is therefore the only order these files apply in, and 0002 and 0003
+are the **serialized** forms regenerated in that order rather than the lanes' original diffs.
+
+| Position | Patch | sha256 | Prepared tree after it |
+| --- | --- | --- | --- |
+| 1 | `0001-seam-a-native-submission-barrier.patch` | `c2d0a7c73bae0359357f012d95954dd9bcb645af7ca13d805623192c7d9542a7` (unchanged from the seam A lane) | `4a175953509e7a38bfbaefd0aa55f01b6168a980` |
+| 2 | `0002-native-ingress-return-profile.patch` | `9376635ebb4aa87d77354fe19c53cf70562aa37ba64f9e5513e0e2ed7ea7db1e` (serialized; the lane's own diff was `1db62cf6355d371d910a947d771a6c81efff5f4996a7a7d5b3796a5d251ae816`) | `8c21a5d8e326a44719ad53d5c6ba183db9925731` |
+| 3 | `0003-native-presentation-readiness.patch` | `cf7f5ccca6358612f17bb65583f17934fb795b9935c921efe0fbaba1737bdfb9` (serialized; the lane's own diff was `8a483bf73c9b6d6d44cea44eae2289386946e545f1b6fa2b8bd6a5fd88542868`) | `9c40d805754c6cbc5dd161ec4e1c6880b1bc1ef4` |
+
+Applying each lane's patch alone to the pin still reproduces that lane's own tree
+(`4a175953509e7a38bfbaefd0aa55f01b6168a980` for A, `657974161957889b737195121078666ced55192d` for B/C/F,
+`88e61de9062ba65ddde592d96b7afa24473b0b67` for E), which is what makes the serialized forms comparable to
+the reviewed lanes rather than a rewrite. Serializing changed no lane's behaviour: every conflicting hunk
+git could not merge was an import block, and both sides' imports are kept verbatim in
+`packages/tui/src/{terminal,tui}.ts`. No identifier, frame field, environment variable or exported name was
+renamed by the composition.
+
+Regenerating a later patch is the maintenance procedure, not reordering the series: apply the series up to
+position *n − 1* in a disposable tree, apply the lane's own diff on top, resolve, and re-take the diff from
+position *n − 1*. `prepare.mjs` then applies the whole series with no fuzz, no `-3` and no skip, and the
+prepared tree must equal the tree recorded above.
+
+### 9.1 What the composition itself does not deliver
+
+- **No seam D and no seam G.** There is still no public canonical admission, reservation or binding-commit
+  API, and no `drainedThrough`. Composing A with B/C/F did not create one, and nothing here may be cited as
+  a D or G interface freeze.
+- **No owner bootstrap and no arbitrary-child terminal parity (Gate 5).** Managed behaviour stays inert
+  until an owner process registers a host; with nothing registered every seam is the pinned baseline.
+- **No dependency activation.** The root `package.json` still installs the released Pi; these artifacts are
+  built, tested and left in a disposable directory.

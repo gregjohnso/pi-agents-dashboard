@@ -1,5 +1,5 @@
 diff --git a/packages/coding-agent/src/core/extensions/loader.ts b/packages/coding-agent/src/core/extensions/loader.ts
-index 36df2da21611720001660e5107eb531c6101faed..7f4939418412e3a595e093bc5eced878cc7ea66a 100644
+index 0e738eb081aa85e0b23046598782431d7f004914..91816f916a02cdb27f6e5d634c8919f21863520d 100644
 --- a/packages/coding-agent/src/core/extensions/loader.ts
 +++ b/packages/coding-agent/src/core/extensions/loader.ts
 @@ -28,6 +28,14 @@ import * as _bundledPiCodingAgent from "../../index.ts";
@@ -16,8 +16,8 @@ index 36df2da21611720001660e5107eb531c6101faed..7f4939418412e3a595e093bc5eced878
 +} from "../native-presentation.ts";
  import { execCommand } from "../exec.ts";
  import { readPiManifest } from "../pi-manifest.ts";
- import { createSyntheticSourceInfo } from "../source-info.ts";
-@@ -456,6 +464,25 @@ function createExtensionAPI(
+ import { type NativeSubmitHost, setNativeSubmissionHost } from "../native-submission.ts";
+@@ -462,6 +470,25 @@ function createExtensionAPI(
  				return unsubscribe;
  			},
  		},
@@ -44,7 +44,7 @@ index 36df2da21611720001660e5107eb531c6101faed..7f4939418412e3a595e093bc5eced878
  
  	return {
 diff --git a/packages/coding-agent/src/core/extensions/types.ts b/packages/coding-agent/src/core/extensions/types.ts
-index bade46419510aba601991b4be2a7790b52694d0b..90c2cfd41074f863a9b0e7dc969d9e4c17228833 100644
+index 86e97f25e9181e8a84df521b48407f477a224707..6b82fb22a69e7777fdfda22df29b54cbc1bf5085 100644
 --- a/packages/coding-agent/src/core/extensions/types.ts
 +++ b/packages/coding-agent/src/core/extensions/types.ts
 @@ -55,6 +55,11 @@ import type { KeybindingsManager } from "../keybindings.ts";
@@ -59,7 +59,7 @@ index bade46419510aba601991b4be2a7790b52694d0b..90c2cfd41074f863a9b0e7dc969d9e4c
  import type {
  	BranchSummaryEntry,
  	CompactionEntry,
-@@ -1278,6 +1283,28 @@ export interface ExtensionAPI {
+@@ -1279,6 +1284,28 @@ export interface ExtensionAPI {
  	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): void;
  	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): void;
  
@@ -950,10 +950,10 @@ index 0000000000000000000000000000000000000000..218fd7474879e6af46911ba3c4a5a1fc
 +	return NATIVE_PRESENTATION_CAPABILITY;
 +}
 diff --git a/packages/coding-agent/src/index.ts b/packages/coding-agent/src/index.ts
-index 210b84010d2b3c12baea1f08bcb52cccdce4a791..c71ccc5581c2002910e17bccf50402d4384c4eff 100644
+index dd5910bf4ea8dfe22b03287441dbbc188790f2f2..b4a9b0f6b290bd12340ef172f2cdd6f3706d877a 100644
 --- a/packages/coding-agent/src/index.ts
 +++ b/packages/coding-agent/src/index.ts
-@@ -194,6 +194,44 @@ export type {
+@@ -218,6 +218,44 @@ export type {
  	ResolvedPaths,
  	ResolvedResource,
  } from "./core/package-manager.ts";
@@ -1023,7 +1023,7 @@ index 23b4d42e2e3d1657d3c5ce55c83f763d90e23086..7b2b4d2aebf0c56c7b60feca7f62a6ea
  		const exitCode = process.exitCode ?? 0;
  		if (process.platform === "win32" && exitCode === 0 && args[0] === "update") {
 diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
-index acf96ae2f7761be83026fdf6d8a92bb466ee93bf..590883672decd372b716782f765003a67792c40e 100644
+index 9d088135abb711d9d019472ff4b1c71e22775f22..8e28e4a976efbccfa5849b38b0af870cf8c512fe 100644
 --- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
 +++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
 @@ -31,6 +31,7 @@ import {
@@ -1047,7 +1047,7 @@ index acf96ae2f7761be83026fdf6d8a92bb466ee93bf..590883672decd372b716782f765003a6
  import {
  	defaultModelPerProvider,
  	findExactModelReferenceMatch,
-@@ -421,6 +428,9 @@ export class InteractiveMode {
+@@ -439,6 +446,9 @@ export class InteractiveMode {
  	private runtimeHost: AgentSessionRuntime;
  	private renderer: TuiMainScreen | TuiAltScreen;
  	private ui: TUI;
@@ -1057,7 +1057,7 @@ index acf96ae2f7761be83026fdf6d8a92bb466ee93bf..590883672decd372b716782f765003a6
  	private mainScreenRenderState: TuiMainScreenRenderState | undefined;
  	private loadedResourcesContainer: Container;
  	private chatContainer: Container;
-@@ -829,6 +839,9 @@ export class InteractiveMode {
+@@ -860,6 +870,9 @@ export class InteractiveMode {
  	}
  
  	private stopInteractiveTui(fullscreenExitOutput: FullscreenExitOutput): void {
@@ -1067,7 +1067,7 @@ index acf96ae2f7761be83026fdf6d8a92bb466ee93bf..590883672decd372b716782f765003a6
  		if (this.renderer.mode === "fullscreen" && fullscreenExitOutput === "transcript") {
  			while (this.renderer.hasOverlayEntries) this.renderer.hideOverlay();
  			this.switchTuiMode("regular", false, false);
-@@ -947,8 +960,17 @@ export class InteractiveMode {
+@@ -978,8 +991,17 @@ export class InteractiveMode {
  		this.defaultEditor.onSubmit = (text) => this.handleStartupSubmit(text);
  		this.ui.setFocus(this.editor);
  
@@ -1085,7 +1085,7 @@ index acf96ae2f7761be83026fdf6d8a92bb466ee93bf..590883672decd372b716782f765003a6
  		this.isInitialized = true;
  
  		await this.themeController.applyFromSettings();
-@@ -1057,6 +1079,44 @@ export class InteractiveMode {
+@@ -1088,6 +1110,44 @@ export class InteractiveMode {
  			this.ui.invalidate();
  			this.ui.requestRender();
  		});
@@ -1130,7 +1130,7 @@ index acf96ae2f7761be83026fdf6d8a92bb466ee93bf..590883672decd372b716782f765003a6
  	}
  
  	/**
-@@ -4075,11 +4135,14 @@ export class InteractiveMode {
+@@ -4371,11 +4431,14 @@ export class InteractiveMode {
  		process.once("SIGCONT", () => {
  			clearInterval(suspendKeepAlive);
  			process.removeListener("SIGINT", ignoreSigint);
@@ -1145,7 +1145,7 @@ index acf96ae2f7761be83026fdf6d8a92bb466ee93bf..590883672decd372b716782f765003a6
  			// Stop the TUI (restore terminal to normal mode)
  			this.ui.stop();
  
-@@ -4088,6 +4151,7 @@ export class InteractiveMode {
+@@ -4384,6 +4447,7 @@ export class InteractiveMode {
  		} catch (error) {
  			clearInterval(suspendKeepAlive);
  			process.removeListener("SIGINT", ignoreSigint);
@@ -1153,7 +1153,7 @@ index acf96ae2f7761be83026fdf6d8a92bb466ee93bf..590883672decd372b716782f765003a6
  			throw error;
  		}
  	}
-@@ -4216,6 +4280,9 @@ export class InteractiveMode {
+@@ -4549,6 +4613,9 @@ export class InteractiveMode {
  	private async handleOpenExternalEditor(): Promise<void> {
  		const editorCmd = this.settingsManager.getExternalEditorCommand();
  		const content = this.editor.getExpandedText?.() ?? this.editor.getText();
@@ -1163,7 +1163,7 @@ index acf96ae2f7761be83026fdf6d8a92bb466ee93bf..590883672decd372b716782f765003a6
  		this.ui.stop();
  		try {
  			const result = await editInExternalEditor({
-@@ -4226,6 +4293,7 @@ export class InteractiveMode {
+@@ -4559,6 +4626,7 @@ export class InteractiveMode {
  				this.editor.setText(result.content);
  			}
  		} finally {
@@ -2038,10 +2038,10 @@ index 0000000000000000000000000000000000000000..22f93491429e1e8492d4d98753f9e5f3
 +	});
 +});
 diff --git a/packages/tui/src/index.ts b/packages/tui/src/index.ts
-index 0d5a4a1093ba8bbbd971e417af244823afa06ea4..55d3d652b4d338dc3ad17e7c3e0cbf8d212c9303 100644
+index d9fa1bd4a7603f3caa661bcb3e8aca5d06f45db5..18ab400082572799768b36c6991c9232a323ca53 100644
 --- a/packages/tui/src/index.ts
 +++ b/packages/tui/src/index.ts
-@@ -74,6 +74,18 @@ export {
+@@ -93,6 +93,18 @@ export {
  } from "./keys.ts";
  // LaTeX rendering
  export { type RenderLatexOptions, renderLatex } from "./latex.ts";
@@ -2058,8 +2058,8 @@ index 0d5a4a1093ba8bbbd971e417af244823afa06ea4..55d3d652b4d338dc3ad17e7c3e0cbf8d
 +	type ReassertedTerminalModes,
 +} from "./native-presentation.ts";
  // Input buffering for batch splitting
- export { StdinBuffer, type StdinBufferEventMap, type StdinBufferOptions } from "./stdin-buffer.ts";
- // Terminal interface and implementations
+ export {
+ 	OriginLedger,
 diff --git a/packages/tui/src/native-presentation.ts b/packages/tui/src/native-presentation.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..01e7631b6efd3345dc8a90bdba6008f2f1a9c158
@@ -2195,20 +2195,20 @@ index 0000000000000000000000000000000000000000..01e7631b6efd3345dc8a90bdba6008f2
 +	return (candidate as Record<PropertyKey, unknown>)[NATIVE_PRESENTATION_TUI] === true;
 +}
 diff --git a/packages/tui/src/terminal.ts b/packages/tui/src/terminal.ts
-index f858bf9f25240b764c0bfcf81c6aedbae316f4b0..3cade5664373db6b8a4d1a926d35b1106b9cd497 100644
+index e57bd83b67ff802599662e6b013cc6e668aa2567..f1e6e98df36f6f2e7ad78a50fb62bbcbbb6729d4 100644
 --- a/packages/tui/src/terminal.ts
 +++ b/packages/tui/src/terminal.ts
-@@ -4,6 +4,7 @@ import * as path from "node:path";
- import { setKittyProtocolActive } from "./keys.ts";
+@@ -14,6 +14,7 @@ import {
+ } from "./native-attachment.ts";
  import { isNativeModifierPressed } from "./native-modifiers.ts";
  import { getNativeModuleCandidates } from "./native-module-path.ts";
 +import type { ReassertedTerminalModes } from "./native-presentation.ts";
- import { StdinBuffer } from "./stdin-buffer.ts";
+ import { OriginLedger, StdinBuffer, type StdinSequenceOrigin } from "./stdin-buffer.ts";
  
  const cjsRequire = createRequire(import.meta.url);
-@@ -15,6 +16,10 @@ const NATIVE_SHIFT_ENTER_SEQUENCE = "\x1b[13;2u";
- const DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS = 7;
- const KEYBOARD_PROTOCOL_RESPONSE_FRAGMENT_TIMEOUT_MS = 150;
+@@ -37,6 +38,10 @@ function utf8CodepointLength(leadByte: number): number {
+ 	return 1; // continuation or invalid lead: consume one byte and let Node produce U+FFFD
+ }
  const KITTY_KEYBOARD_PROTOCOL_QUERY = `\x1b[>${DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS}u\x1b[?u\x1b[c`;
 +// `CSI = flags ; 1 u` sets the flags of the entry already on the terminal's keyboard stack. Unlike the
 +// `CSI > flags u` push used during negotiation, re-emitting it leaves that stack balanced against the single
@@ -2217,7 +2217,7 @@ index f858bf9f25240b764c0bfcf81c6aedbae316f4b0..3cade5664373db6b8a4d1a926d35b110
  
  export type KeyboardProtocolNegotiationSequence =
  	| { type: "kitty-flags"; flags: number }
-@@ -99,6 +104,16 @@ export interface Terminal {
+@@ -143,6 +148,16 @@ export interface Terminal {
  
  	// Progress indicator (OSC 9;4)
  	setProgress(active: boolean): void;
@@ -2234,15 +2234,15 @@ index f858bf9f25240b764c0bfcf81c6aedbae316f4b0..3cade5664373db6b8a4d1a926d35b110
  }
  
  const DEFAULT_ESCAPE_TIMEOUT_MS = 10;
-@@ -135,6 +150,7 @@ export class ProcessTerminal implements Terminal {
- 	private stdinBuffer?: StdinBuffer;
- 	private stdinDataHandler?: (data: string) => void;
+@@ -204,6 +219,7 @@ export class ProcessTerminal implements Terminal {
+ 	/** Who the queued incomplete bytes belong to, so a transition can be detected. */
+ 	private pendingInputOwner: { attachmentId: string; epoch: number; generation: number } | undefined;
  	private progressInterval?: ReturnType<typeof setInterval>;
 +	private lastTitle?: string;
  	private writeLogPath = (() => {
  		const env = process.env.PI_TUI_WRITE_LOG || "";
  		if (!env) return "";
-@@ -525,9 +541,56 @@ export class ProcessTerminal implements Terminal {
+@@ -787,9 +803,56 @@ export class ProcessTerminal implements Terminal {
  
  	setTitle(title: string): void {
  		// OSC 0;title BEL - set terminal window title
@@ -2478,10 +2478,10 @@ index bb2d6785d0d6c08177a287f02f7852ccf4ca6506..4798c3c9ed68a67fd3f6c3172e22cd38
  
  		const debugRedraw = process.env.PI_DEBUG_REDRAW === "1";
 diff --git a/packages/tui/src/tui.ts b/packages/tui/src/tui.ts
-index 5172a9a142c582f8d8ad9c8c85772f1b093cc5a7..337e15171ac86e6a0379ba2e2fcc7c1ef62875dc 100644
+index 0db21a2adf9407f14e4f4716b0e688cb9df2886c..d7c9e61977b796b65846741b194e7eb54297b0ce 100644
 --- a/packages/tui/src/tui.ts
 +++ b/packages/tui/src/tui.ts
-@@ -2,10 +2,18 @@
+@@ -2,6 +2,7 @@
   * Minimal TUI implementation with differential rendering
   */
  
@@ -2489,7 +2489,10 @@ index 5172a9a142c582f8d8ad9c8c85772f1b093cc5a7..337e15171ac86e6a0379ba2e2fcc7c1e
  import * as os from "node:os";
  import * as path from "node:path";
  import { performance } from "node:perf_hooks";
- import { isKeyRelease, matchesKey } from "./keys.ts";
+@@ -14,6 +15,13 @@ import {
+ 	type NativeInputProvenance,
+ 	type ReturnAuthorization,
+ } from "./native-attachment.ts";
 +import {
 +	type ColdReassertion,
 +	type PresentationFrameReceipt,
@@ -2500,7 +2503,7 @@ index 5172a9a142c582f8d8ad9c8c85772f1b093cc5a7..337e15171ac86e6a0379ba2e2fcc7c1e
  import type { Terminal } from "./terminal.ts";
  import {
  	isOsc11BackgroundColorResponse,
-@@ -331,6 +339,10 @@ export function isViewportTUI(tui: TUI): tui is ViewportTUI {
+@@ -339,6 +347,10 @@ export function isViewportTUI(tui: TUI): tui is ViewportTUI {
  export abstract class TuiBase extends Container implements TUI {
  	abstract readonly mode: TuiMode;
  	public terminal: Terminal;
@@ -2510,8 +2513,8 @@ index 5172a9a142c582f8d8ad9c8c85772f1b093cc5a7..337e15171ac86e6a0379ba2e2fcc7c1e
 +	private pendingPresentation: { requestId: string; cold: ColdReassertion | undefined } | undefined;
  	private focusedComponent: Component | null = null;
  	private inputListeners = new Set<TuiInputListener>();
- 
-@@ -371,6 +383,102 @@ export abstract class TuiBase extends Container implements TUI {
+ 	/** Increments on every cell-size query, so a report for a superseded query is detectable. */
+@@ -381,6 +393,102 @@ export abstract class TuiBase extends Container implements TUI {
  
  	protected abstract doRender(): void;
  

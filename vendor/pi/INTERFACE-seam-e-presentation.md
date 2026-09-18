@@ -1,16 +1,22 @@
 # vendor/pi seam E interface: native cold presentation and readiness
 
 This is the public contract of the one source patch this node owns,
-`vendor/pi/patches/0003-native-presentation-readiness.patch` (sha256
-`8a483bf73c9b6d6d44cea44eae2289386946e545f1b6fa2b8bd6a5fd88542868`, patched tree
-`88e61de9062ba65ddde592d96b7afa24473b0b67`). `test/native-presentation.test.mjs` is the acceptance suite that
-drives it through an installed artifact.
+`vendor/pi/patches/0003-native-presentation-readiness.patch`. In the composed series that patch is applied
+third, after seam A and seam B/C/F, and the file in `patches/series` is the **serialized** diff taken at that
+position: sha256 `cf7f5ccca6358612f17bb65583f17934fb795b9935c921efe0fbaba1737bdfb9`, prepared tree
+`9c40d805754c6cbc5dd161ec4e1c6880b1bc1ef4`. This lane's own diff against the bare pin was sha256
+`8a483bf73c9b6d6d44cea44eae2289386946e545f1b6fa2b8bd6a5fd88542868` with patched tree
+`88e61de9062ba65ddde592d96b7afa24473b0b67`, and applying it alone to the pin still reproduces that tree.
+Serialization kept every symbol in this contract: the only hunks git could not merge were import blocks in
+`packages/tui/src/{terminal,tui}.ts`, and both lanes' imports are retained.
+`test/native-presentation.test.mjs` is the acceptance suite that drives it through an installed artifact.
 
 It is a section of `vendor/pi/INTERFACE.md` — the vendor pin, build and patch-rule contract — which another
-node owns; the section numbers below are that document's, kept so review citations still resolve. Read that
-file for the pin, what you run, what you get, the package cohort and the rules a patch must satisfy. Nothing
-here restates them, and nothing here claims any seam other than E: seams A, B, C, D, F and G are other
-patches, and this one does not claim to commute with them.
+node owns; the section numbers below are that document's, kept so review citations still resolve. That
+file's section 9 records the composed order, the patch digests and the prepared-tree hashes. Read it for the
+pin, what you run, what you get, the package cohort and the rules a patch must satisfy. Nothing here
+restates them, and nothing here claims any seam other than E: seams A, B, C, D, F and G are other patches,
+and this one does not claim to commute with them.
 
 ## 8. Seam E: cold presentation and readiness
 

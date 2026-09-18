@@ -3,7 +3,10 @@
 The public contract of the input lane of native attachment, seams **B**, **C** and **F**. It is delivered as
 one ordered source patch on the pinned Pi tree, `vendor/pi/patches/0002-native-ingress-return-profile.patch`,
 and its cases are `test/native-ingress.test.mjs` and `test/native-return.test.mjs`. Those cases drive the
-**built** package named by `test/fixtures/native-ingress/artifacts-manifest.json`, never a checkout.
+**built** package named by the artifacts manifest in `PI_NATIVE_ARTIFACTS_MANIFEST`, which
+`test/fixtures/native-ingress/write-artifacts-manifest.mjs` produces from a build's own
+`build-manifest.json` and the consumer that build installed — never a checkout, and never a committed
+pointer at some earlier machine's build.
 
 This document records the contract an integrator may rely on. Seams A, D, E and G are other lanes: an
 artifact built from this patch advertises B/C/F and nothing else, and Gate 5 (child terminal parity) is
@@ -107,16 +110,21 @@ withheld only for an exact claim: a throw, a malformed result, or a `detachOrigi
 monotonically, and each dispatch reports the boundary fixed when **it** was admitted. A resolved dispatch
 means: parsed, dispatched, and no pending capability decision.
 
-Two limits an integrator must carry into seam G:
+Three holds an integrator must carry into seam G:
 
 1. Bytes held as an incomplete UTF-8 codepoint count as accepted. They cannot be overtaken and are flushed
    at any attachment, epoch or generation transition, but until then they are not parsed.
-2. A split keyboard-protocol response is held for up to 150 ms by upstream's fragment window, and
-   `StdinBuffer` holds an incomplete sequence for up to 50 ms. Neither wait is awaited by
-   `dispatchNativeInput`.
+2. A split keyboard-protocol response is held for up to 150 ms by upstream's fragment window, and that wait
+   is not awaited by `dispatchNativeInput`.
+3. `StdinBuffer` holds an incomplete sequence for up to 50 ms, and that wait is not awaited either.
 
-Seam G's `drainedThrough` must therefore be this counter **plus** an explicit flush of those two waits. This
-lane implements no child spawning, no handoff and no arbitrary-child parity.
+Seam G's `drainedThrough` is therefore **not** this counter: it must be `consumedThrough` **plus an explicit
+flush of all three holds** — the incomplete-UTF-8-codepoint hold, the 150 ms split-response fragment window
+and `StdinBuffer`'s 50 ms incomplete-sequence window. A drain that flushes only the two timer windows still
+leaves an unparsed codepoint behind, and a drain that flushes only the codepoint hold still leaves a held
+sequence behind. None of the three flushes exists yet: this lane implements no child spawning, no handoff and
+no arbitrary-child parity, and the composed checkpoint that serializes this patch does not implement them
+either.
 
 ## What this lane does not deliver
 
@@ -132,3 +140,13 @@ lane implements no child spawning, no handoff and no arbitrary-child parity.
   changes the `handleTerminalInput` signature, the `terminal.start` callback type,
   `consumeCellSizeResponse`, `StdinBuffer.process` and the `StdinBuffer` event tuple. Rebase in series
   order and re-run both case files; do not apply with fuzz.
+
+## Serialized form in the composed series
+
+`vendor/pi/patches/series` now applies this lane second, after seam A and before seam E, and the patch file
+in that series is the **serialized** diff taken at that position: sha256
+`9376635ebb4aa87d77354fe19c53cf70562aa37ba64f9e5513e0e2ed7ea7db1e`, where this lane's own diff against the
+bare pin was `1db62cf6355d371d910a947d771a6c81efff5f4996a7a7d5b3796a5d251ae816`. Nothing in the public
+surface above changed: serializing resolved one import-block overlap in `packages/tui/src/terminal.ts`, and
+both lanes' imports are kept. `vendor/pi/INTERFACE.md` section 9 records the order, the digests and the
+prepared-tree hashes.

@@ -61,6 +61,20 @@ describe.skipIf(!ON_WORKER)("the pinned upstream build, on a worker", () => {
     expect(provenance.resolved.commit).toBe(lock.upstream.commit);
     expect(provenance.resolved.treeHash).toBe(lock.upstream.treeHash);
     expect(provenance.baseline).toBe(provenance.applied.length === 0);
+    // The plan pins Node >=22.19.0 <23, and preparation records the interpreter it actually ran on.
+    expect(provenance.node, `build ran on ${provenance.node}`).toMatch(/^v22\.(19|[2-9]\d)/);
+    // The declared series is what actually applied, in order, and the artifact label follows from it. A
+    // patched series must never leave a baseline claim behind.
+    const declared = readFileSync(path.join(PATCHES, "series"), "utf8")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line !== "" && !line.startsWith("#"));
+    expect(provenance.applied.map((entry) => entry.name)).toEqual(declared);
+    if (declared.length === 0) {
+      expect(provenance.artifactLabel).toMatch(/^baseline: unmodified upstream/);
+    } else {
+      expect(provenance.artifactLabel).toMatch(/^patched: /);
+    }
     evidence.preparation = { stdout: preparation.stdout, resolved: provenance.resolved, applied: provenance.applied };
 
     const built = runTool("build.mjs", ["--prepared", prepared, "--artifacts", artifacts, "--lock", LOCK]);
@@ -101,6 +115,11 @@ describe.skipIf(!ON_WORKER)("the pinned upstream build, on a worker", () => {
 
     // The one build input that is not the pinned commit: a hybrid, verified before use, data only.
     expect(manifest.buildKind).toMatch(/^hybrid: pinned upstream source plus pinned release-generated data/);
+    if (declared.length === 0) {
+      expect(manifest.capability).toMatch(/^none: baseline upstream artifacts/);
+    } else {
+      expect(manifest.capability).not.toMatch(/baseline/);
+    }
     expect(manifest.reproducibility).not.toMatch(/byte reproducible/i);
     expect(manifest.generatedInputs.map((entry) => entry.id)).toEqual(["pi-ai-model-data"]);
     const [generated] = manifest.generatedInputs;

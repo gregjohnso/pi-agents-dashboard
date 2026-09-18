@@ -4,11 +4,13 @@
 # in this directory that no line names is drift and fails preparation. Names must look like
 # `NNNN-short-description.patch`.
 #
-# These three patches do not commute: 0002 and 0003 both change `packages/tui/src/{terminal,tui,index}.ts`
-# and 0001 and 0003 both change `packages/coding-agent/src/{index.ts,core/extensions/*,modes/interactive/
-# interactive-mode.ts}`. 0002 and 0003 are the serialized forms regenerated against this order, so
-# preparation applies them with no fuzz and no three-way fallback. Reordering this list breaks the
-# preparation; regenerate the later patches instead.
+# These four patches do not commute: 0002 and 0003 both change `packages/tui/src/{terminal,tui,index}.ts`,
+# 0001 and 0003 both change `packages/coding-agent/src/{index.ts,core/extensions/*,modes/interactive/
+# interactive-mode.ts}`, and 0004 changes seam A's own `core/native-submission.ts` plus the same
+# `index.ts` and `interactive-mode.ts`. 0002, 0003 and 0004 are the serialized forms regenerated against
+# this order, so preparation applies them with no fuzz and no three-way fallback. Reordering this list
+# breaks the preparation; regenerate the later patches instead.
 0001-seam-a-native-submission-barrier.patch
 0002-native-ingress-return-profile.patch
 0003-native-presentation-readiness.patch
+0004-native-canonical-admission.patch

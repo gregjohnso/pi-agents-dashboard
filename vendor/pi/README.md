@@ -7,14 +7,15 @@ directory.
 
 Business logic stays in pi-agents. A patch here supplies a native interface and nothing else.
 
-**The series carries three patches today: seam A, seams B/C/F and seam E.** Artifacts built from this lock
-are **patched**, not baseline, and they carry those five seams and nothing else. Seams D and G are not in
-this series and are not present in the artifacts. `build-manifest.json.artifactLabel` records the patched
+**The series carries four patches today: seam A, seams B/C/F, seam E and seam D.** Artifacts built from this
+lock are **patched**, not baseline, and they carry those six seams and nothing else. Seam G is not in
+this series and is not present in the artifacts. `build-manifest.json.artifactLabel` records the patched
 state; do not read a working build as evidence of any capability the series does not deliver.
 
 **None of it is qualified for activation.** The composed seams are implemented and tested against a built
-cohort, but seam D's public canonical admission/binding-commit API, seam G's drain and arbitrary-child
-terminal parity (Gate 5) do not exist. `INTERFACE.md` section 9 records the composed order and what the
+cohort, but seam D's canonical admission is reviewed-contract work rather than a frozen API backed by durable
+host storage, and seam G's drain and arbitrary-child terminal parity (Gate 5) do not exist.
+`INTERFACE.md` section 9 records the composed order and what the
 composition still does not deliver. Do not activate the root dependency and do not describe native
 attachment as shipped.
 

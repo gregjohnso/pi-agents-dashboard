@@ -1,0 +1,1424 @@
+diff --git a/packages/tui/src/editor-component.ts b/packages/tui/src/editor-component.ts
+index 5956450..b063b68 100644
+--- a/packages/tui/src/editor-component.ts
++++ b/packages/tui/src/editor-component.ts
+@@ -1,4 +1,5 @@
+ import type { AutocompleteProvider } from "./autocomplete.ts";
++import type { ReturnDisposition } from "./native-attachment.ts";
+ import type { Component } from "./tui.ts";
+ 
+ /**
+@@ -22,6 +23,12 @@ export interface EditorComponent extends Component {
+ 	/** Handle raw terminal input (key presses, paste sequences, etc.) */
+ 	handleInput(data: string): void;
+ 
++	/**
++	 * Declare whether a return sequence is this editor's own key (seam C). Absent means `'owns'`: the
++	 * editor keeps the key and the owner's host is never asked about it.
++	 */
++	declaresReturnKey?: ReturnDisposition["declaresReturnKey"];
++
+ 	// =========================================================================
+ 	// Callbacks (required)
+ 	// =========================================================================
+diff --git a/packages/tui/src/index.ts b/packages/tui/src/index.ts
+index 0d5a4a1..d9fa1bd 100644
+--- a/packages/tui/src/index.ts
++++ b/packages/tui/src/index.ts
+@@ -44,6 +44,25 @@ export {
+ } from "./components/v-stack.ts";
+ // Editor component interface (for custom editors)
+ export type { EditorComponent } from "./editor-component.ts";
++// Native attachment seams B, C and F: labelled ingress, return authorization, terminal profile
++export {
++	type AttachmentEpoch,
++	authorizeTerminalResponse,
++	declaresReturnKey,
++	getNativeAttachmentHost,
++	getVirtualTerminalProfile,
++	type NativeAttachmentHost,
++	type NativeAttachmentRegistration,
++	type NativeInputProvenance,
++	type NativeReturnRequest,
++	registerNativeAttachmentHost,
++	type ReturnAuthorization,
++	type ReturnDisposition,
++	settleTerminalResponseAuthorizations,
++	type TerminalResponseApplication,
++	type TerminalResponseKind,
++	type VirtualTerminalProfile,
++} from "./native-attachment.ts";
+ // Fuzzy matching
+ export { type FuzzyMatch, fuzzyFilter, fuzzyMatch } from "./fuzzy.ts";
+ // Keybindings
+@@ -75,9 +94,15 @@ export {
+ // LaTeX rendering
+ export { type RenderLatexOptions, renderLatex } from "./latex.ts";
+ // Input buffering for batch splitting
+-export { StdinBuffer, type StdinBufferEventMap, type StdinBufferOptions } from "./stdin-buffer.ts";
++export {
++	OriginLedger,
++	StdinBuffer,
++	type StdinBufferEventMap,
++	type StdinBufferOptions,
++	type StdinSequenceOrigin,
++} from "./stdin-buffer.ts";
+ // Terminal interface and implementations
+-export { ProcessTerminal, type Terminal } from "./terminal.ts";
++export { type NativeInputDispatch, ProcessTerminal, type Terminal } from "./terminal.ts";
+ // Terminal colors
+ export {
+ 	parseOsc11BackgroundColor,
+diff --git a/packages/tui/src/native-attachment.ts b/packages/tui/src/native-attachment.ts
+new file mode 100644
+index 0000000..ade233d
+--- /dev/null
++++ b/packages/tui/src/native-attachment.ts
+@@ -0,0 +1,341 @@
++/**
++ * Native attachment seams B, C and F.
++ *
++ * A host process can own the terminal that Pi renders into and let more than one authenticated client
++ * type into it. That needs three things Pi alone cannot supply: which client a byte span came from,
++ * whether a return key belongs to the focused component or to the host, and whether a terminal response
++ * from an unauthenticated byte stream may change Pi's negotiated capability state.
++ *
++ * This module is interfaces and one process-wide registration. It holds no attachment registry, no
++ * ownership policy and no session state: Pi never learns who is attached, only which epoch a byte span
++ * claimed. Unmanaged Pi registers nothing and every path here is skipped.
++ */
++
++/**
++ * Identity of one client attachment. `epoch` strictly increases per `attachmentId` and is never reused,
++ * so a reconnect is a new epoch and a reply from a previous connection is recognisably stale.
++ */
++export type AttachmentEpoch = { attachmentId: string; epoch: number };
++
++/**
++ * Provenance of one parsed input sequence, carried alongside the bytes through the whole native path.
++ *
++ * `origin` is the attachment that supplied the sequence's **final** byte. `mixedOrigin` records that at
++ * least one earlier byte of the same sequence came from a different attachment. Origin describes the
++ * gesture, never authorship of the shared draft.
++ */
++export type NativeInputProvenance = {
++	/** Minted per delivered sequence by the terminal, so a decision can name the exact sequence. */
++	sequenceId: string;
++	/** `null` for ordinary local stdin: unmanaged Pi has no attachment identity. */
++	origin: AttachmentEpoch | null;
++	mixedOrigin: boolean;
++	/**
++	 * The binding generation the sequence's own **final** byte was dispatched under; `0` for local stdin.
++	 * This is the generation of the bytes, not whichever generation the terminal has since reached.
++	 */
++	bindingGeneration: number;
++	/**
++	 * Native framing assembled this sequence from bytes dispatched under more than one binding
++	 * generation, so stale-generation bytes helped form it. Such a sequence never authorizes a return.
++	 */
++	mixedBindingGeneration: boolean;
++};
++
++export type TerminalResponseKind = "da" | "kitty-keyboard" | "cell-size" | "other";
++
++/**
++ * A complete terminal response that native parsing has classified and is about to apply. The host
++ * decides before any capability state moves, not after.
++ */
++export type TerminalResponseApplication = {
++	kind: TerminalResponseKind;
++	/** Increments on every capability query Pi writes, so a reply to a superseded query is detectable. */
++	requestEpoch: number;
++	/** The attachment whose bytes completed the response; `null` for local stdin. */
++	attachmentEpoch: AttachmentEpoch | null;
++	raw: Uint8Array;
++};
++
++/**
++ * The terminal Pi believes it is talking to. Fixed by the owner at launch: Pi negotiates once, and a
++ * client that attaches later missed that exchange, so it can never change the profile.
++ */
++export type VirtualTerminalProfile = {
++	profileId: string;
++	term: string;
++	capabilities: {
++		kittyKeyboard: boolean;
++		kittyGraphics: boolean;
++		mouse: boolean;
++		bracketedPaste: boolean;
++		synchronizedOutput: boolean;
++		trueColor: boolean;
++	};
++	cellSize: { width: number; height: number } | null;
++};
++
++export type NativeReturnRequest = {
++	sequenceId: string;
++	origin: AttachmentEpoch;
++	mixedOrigin: boolean;
++	binding: { generation: number };
++};
++
++/** `'native'` means deliver the key to the focused component. Anything else is the host's own action. */
++export type ReturnAuthorization = "native" | { detachOrigin: AttachmentEpoch };
++
++/**
++ * Implemented by a component that knows a return key is not its own. Absent means `'owns'`: an unknown
++ * or custom component keeps the key and the host is never asked.
++ */
++export interface ReturnDisposition {
++	declaresReturnKey(sequence: string): "owns" | "free";
++}
++
++export function declaresReturnKey(component: unknown, sequence: string): "owns" | "free" {
++	if (component === null || typeof component !== "object") return "owns";
++	const declare = (component as Partial<ReturnDisposition>).declaresReturnKey;
++	if (typeof declare !== "function") return "owns";
++	return declare.call(component, sequence) === "free" ? "free" : "owns";
++}
++
++export interface NativeAttachmentHost {
++	/** Launch-fixed; the first registration decides it and a later differing profile is refused. */
++	profile: VirtualTerminalProfile;
++
++	/**
++	 * Evaluated synchronously inside the native input turn, after focus and overlay resolution. Called
++	 * only for a single-origin return that the focused component has declared free.
++	 */
++	authorizeReturn(request: NativeReturnRequest): ReturnAuthorization;
++
++	/**
++	 * Awaited before the response changes any capability state. A rejection, a throw, a timeout or an
++	 * epoch that moved while awaiting all mean: consume the response, change nothing.
++	 */
++	beforeApplyTerminalResponse(response: TerminalResponseApplication): Promise<{ apply: boolean }>;
++}
++
++export type NativeAttachmentRegistration = { release(): void };
++
++/**
++ * How long a managed host has to authorize one classified terminal response. Expiry is a refusal: the
++ * response is consumed and no capability state moves. Every response kind uses this one bound, so a
++ * never-settling host cannot apply late and cannot defeat the drain boundary.
++ */
++const RESPONSE_AUTHORIZATION_TIMEOUT_MS = 1000;
++
++/**
++ * The registry is one host per process, and a process can hold more than one copy of this module: a
++ * bundled Pi inlines `@earendil-works/pi-tui`, so the owner's bootstrap importing the installed package
++ * and the CLI running from the bundle are two module instances. State kept in module scope would split
++ * in exactly that case — the bootstrap would register a host the bundle never sees — so it lives in one
++ * container on `globalThis` that whichever instance loads first creates and both then use.
++ *
++ * Scope is this process only. A worker thread, a child process or another realm has its own `globalThis`
++ * and therefore its own registry; nothing here crosses a process boundary and this is not a security or
++ * isolation boundary against trusted extension code.
++ *
++ * Compatibility rule: the key is unversioned and the container carries `version`. A copy of this module
++ * that understands a different version refuses to use the container rather than replacing, resetting or
++ * silently falling back to unmanaged behavior — mixing two schemas would corrupt one host's launch
++ * profile or epoch bookkeeping. Bump `NATIVE_ATTACHMENT_STATE_VERSION` only for an incompatible change
++ * to the fields below.
++ */
++const NATIVE_ATTACHMENT_STATE_KEY = Symbol.for("@earendil-works/pi-tui:native-attachment");
++const NATIVE_ATTACHMENT_STATE_VERSION = 1;
++
++type NativeAttachmentState = {
++	version: number;
++	host: NativeAttachmentHost | undefined;
++	launchProfile: VirtualTerminalProfile | undefined;
++	/**
++	 * Highest epoch seen per attachment. Response authorization has to know whether the attachment that
++	 * completed a reply has since been replaced, and the terminal and the TUI both need that answer.
++	 */
++	highestEpochByAttachment: Map<string, number>;
++	/** Every in-flight response authorization, whatever started it. `dispatchNativeInput` drains this. */
++	pendingAuthorizations: Set<Promise<void>>;
++};
++
++function isUsableState(candidate: unknown): candidate is NativeAttachmentState {
++	if (candidate === null || typeof candidate !== "object") return false;
++	const state = candidate as Partial<NativeAttachmentState>;
++	return (
++		state.version === NATIVE_ATTACHMENT_STATE_VERSION &&
++		state.highestEpochByAttachment instanceof Map &&
++		state.pendingAuthorizations instanceof Set
++	);
++}
++
++/**
++ * The process-wide container, created once. Private to this module: every caller, in either module
++ * instance, goes through the exported functions rather than touching the global object.
++ */
++function nativeAttachmentState(): NativeAttachmentState {
++	const container = globalThis as unknown as Record<symbol, unknown>;
++	const existing = container[NATIVE_ATTACHMENT_STATE_KEY];
++	if (existing !== undefined) {
++		if (!isUsableState(existing)) {
++			const found =
++				existing !== null && typeof existing === "object"
++					? `version ${String((existing as { version?: unknown }).version)}`
++					: `a ${typeof existing}`;
++			throw new Error(
++				`the native attachment registry in this process is ${found}, and this copy of ` +
++					`@earendil-works/pi-tui speaks version ${NATIVE_ATTACHMENT_STATE_VERSION}. Load one ` +
++					`compatible pi-tui version per process; the registry is never replaced or reset.`,
++			);
++		}
++		return existing;
++	}
++	const created: NativeAttachmentState = {
++		version: NATIVE_ATTACHMENT_STATE_VERSION,
++		host: undefined,
++		launchProfile: undefined,
++		highestEpochByAttachment: new Map<string, number>(),
++		pendingAuthorizations: new Set<Promise<void>>(),
++	};
++	Object.defineProperty(globalThis, NATIVE_ATTACHMENT_STATE_KEY, {
++		value: created,
++		writable: false,
++		configurable: false,
++		enumerable: false,
++	});
++	return created;
++}
++
++/**
++ * Record that this attachment epoch is now the current one for its attachment id.
++ *
++ * Internal to the package, and called from admission in `dispatchNativeInput` before that dispatch waits
++ * for its turn, so a reconnect is visible to an authorization that is already awaiting a host decision.
++ * The owner needs no out-of-band reconnect notification and there is no public mutator for this.
++ */
++export function noteAttachmentEpoch(attachmentEpoch: AttachmentEpoch): void {
++	const { highestEpochByAttachment } = nativeAttachmentState();
++	const seen = highestEpochByAttachment.get(attachmentEpoch.attachmentId);
++	if (seen === undefined || attachmentEpoch.epoch > seen) {
++		highestEpochByAttachment.set(attachmentEpoch.attachmentId, attachmentEpoch.epoch);
++	}
++}
++
++export function isSupersededAttachmentEpoch(attachmentEpoch: AttachmentEpoch | null): boolean {
++	if (!attachmentEpoch) return false;
++	const seen = nativeAttachmentState().highestEpochByAttachment.get(attachmentEpoch.attachmentId);
++	return seen !== undefined && attachmentEpoch.epoch < seen;
++}
++
++function withTimeout<T>(decision: Promise<T>): Promise<T> {
++	return new Promise<T>((resolve, reject) => {
++		const timer = setTimeout(() => {
++			reject(new Error("terminal response authorization expired"));
++		}, RESPONSE_AUTHORIZATION_TIMEOUT_MS);
++		timer.unref?.();
++		decision.then(
++			(value) => {
++				clearTimeout(timer);
++				resolve(value);
++			},
++			(error) => {
++				clearTimeout(timer);
++				reject(error);
++			},
++		);
++	});
++}
++
++/**
++ * Ask the host, then apply only if it said yes **and** the request is still the current one **and** the
++ * attachment that answered has not been superseded. `stillCurrent` is re-evaluated after the await, not
++ * before it, because the point of the seam is that state can move while the host is deciding.
++ *
++ * A refusal, a throw, a rejection or an expiry all mean: the response was consumed, nothing was applied.
++ */
++export function authorizeTerminalResponse(
++	host: NativeAttachmentHost,
++	response: TerminalResponseApplication,
++	stillCurrent: () => boolean,
++	apply: () => void,
++): Promise<void> {
++	const authorization = (async () => {
++		let permitted = false;
++		try {
++			const decision = await withTimeout(host.beforeApplyTerminalResponse(response));
++			permitted = decision?.apply === true;
++		} catch {
++			permitted = false;
++		}
++		if (!permitted) return;
++		if (!stillCurrent()) return;
++		if (isSupersededAttachmentEpoch(response.attachmentEpoch)) return;
++		apply();
++	})();
++	const { pendingAuthorizations } = nativeAttachmentState();
++	pendingAuthorizations.add(authorization);
++	void authorization.finally(() => {
++		pendingAuthorizations.delete(authorization);
++	});
++	return authorization;
++}
++
++/** Settle every in-flight response authorization. This is the drain boundary seam G refers to. */
++export async function settleTerminalResponseAuthorizations(): Promise<void> {
++	const { pendingAuthorizations } = nativeAttachmentState();
++	while (pendingAuthorizations.size > 0) {
++		await Promise.allSettled([...pendingAuthorizations]);
++	}
++}
++
++function freezeProfile(profile: VirtualTerminalProfile): VirtualTerminalProfile {
++	return Object.freeze({
++		profileId: profile.profileId,
++		term: profile.term,
++		capabilities: Object.freeze({ ...profile.capabilities }),
++		cellSize: profile.cellSize ? Object.freeze({ ...profile.cellSize }) : null,
++	});
++}
++
++function sameProfile(a: VirtualTerminalProfile, b: VirtualTerminalProfile): boolean {
++	return JSON.stringify(freezeProfile(a)) === JSON.stringify(freezeProfile(b));
++}
++
++/**
++ * The supported registration entry point, for the owner's core bootstrap, before Pi writes its startup
++ * capability queries — so the authorization path never sits behind arbitrary extension initialisation.
++ *
++ * Registration and the launch profile are process-wide, so a caller that imported a second copy of this
++ * module (the installed package alongside a bundled Pi) registers the same host the bundle consults, and
++ * the profile stays fixed for the whole launch across both copies.
++ */
++export function registerNativeAttachmentHost(host: NativeAttachmentHost): NativeAttachmentRegistration {
++	const state = nativeAttachmentState();
++	if (state.launchProfile && !sameProfile(state.launchProfile, host.profile)) {
++		throw new Error(
++			`the virtual terminal profile is fixed at launch (${state.launchProfile.profileId}); ` +
++				`refusing to replace it with ${host.profile.profileId}`,
++		);
++	}
++	if (!state.launchProfile) {
++		state.launchProfile = freezeProfile(host.profile);
++	}
++	state.host = host;
++	const registration = {
++		/** Clears this host only: a stale handle never clears a replacement registration. */
++		release(): void {
++			const current = nativeAttachmentState();
++			if (current.host === host) current.host = undefined;
++		},
++	};
++	return registration;
++}
++
++export function getNativeAttachmentHost(): NativeAttachmentHost | undefined {
++	return nativeAttachmentState().host;
++}
++
++/** The launch-fixed profile. Survives `release()`: a detaching host does not reopen the negotiation. */
++export function getVirtualTerminalProfile(): VirtualTerminalProfile | undefined {
++	return nativeAttachmentState().launchProfile;
++}
+diff --git a/packages/tui/src/stdin-buffer.ts b/packages/tui/src/stdin-buffer.ts
+index cc10c61..282842c 100644
+--- a/packages/tui/src/stdin-buffer.ts
++++ b/packages/tui/src/stdin-buffer.ts
+@@ -18,6 +18,7 @@
+  */
+ 
+ import { EventEmitter } from "events";
++import type { AttachmentEpoch } from "./native-attachment.ts";
+ 
+ const ESC = "\x1b";
+ const DEFAULT_SEQUENCE_TIMEOUT_MS = 50;
+@@ -269,9 +270,160 @@ export type StdinBufferOptions = {
+ 	escapeTimeout?: number;
+ };
+ 
++/**
++ * Origin identity is the attachment and its epoch, never object identity: a host that labels each chunk
++ * with a freshly built `{attachmentId, epoch}` is still one origin, so one client typing a fragmented
++ * sequence must not be reported as mixed origin.
++ */
++function sameOrigin(a: AttachmentEpoch | null, b: AttachmentEpoch | null): boolean {
++	if (a === null || b === null) return a === b;
++	return a.attachmentId === b.attachmentId && a.epoch === b.epoch;
++}
++
++/** Upstream's high-byte compatibility conversion, kept byte-identical and shared by both entry points. */
++function normaliseChunk(data: string | Buffer): string {
++	// If buffer has single byte > 127, convert to ESC + (byte - 128) for parseKeypress compatibility.
++	if (Buffer.isBuffer(data)) {
++		if (data.length === 1 && data[0]! > 127) {
++			return `\x1b${String.fromCharCode(data[0]! - 128)}`;
++		}
++		return data.toString();
++	}
++	return data;
++}
++
++/**
++ * Attribution of one run of characters: which attachment supplied them, under which binding generation,
++ * and whether either of those was mixed within the run.
++ *
++ * `StdinSequenceOrigin` is both what a span carries and what `take` reports, so a sequence's attribution
++ * and a span's label are one shape rather than two that can drift.
++ */
++export type StdinSequenceOrigin = {
++	origin: AttachmentEpoch | null;
++	mixedOrigin: boolean;
++	bindingGeneration: number;
++	mixedBindingGeneration: boolean;
++};
++
++const LOCAL_STDIN_ORIGIN: StdinSequenceOrigin = {
++	origin: null,
++	mixedOrigin: false,
++	bindingGeneration: 0,
++	mixedBindingGeneration: false,
++};
++
++/**
++ * Origin of every character currently held in a buffer, as run-length spans in buffer order.
++ *
++ * Sequences leave the buffer strictly front-to-back, so `take` both reports a sequence's provenance and
++ * removes exactly the characters it covered. A span carries `null` for ordinary local stdin.
++ */
++export class OriginLedger {
++	private spans: (StdinSequenceOrigin & { length: number })[] = [];
++
++	get length(): number {
++		let total = 0;
++		for (const span of this.spans) total += span.length;
++		return total;
++	}
++
++	/**
++	 * `label.mixedOrigin` and `label.mixedBindingGeneration` record that this span's own characters were
++	 * themselves assembled from more than one attachment or generation. A single character decoded from
++	 * bytes two clients each contributed part of cannot be split into separate spans, so the mixedness has
++	 * to be carried on the span instead of inferred from span boundaries.
++	 */
++	append(label: StdinSequenceOrigin, length: number): void {
++		if (length <= 0) return;
++		const mixed = label.mixedOrigin || label.mixedBindingGeneration;
++		const last = this.spans[this.spans.length - 1];
++		if (
++			last &&
++			!mixed &&
++			!last.mixedOrigin &&
++			!last.mixedBindingGeneration &&
++			last.bindingGeneration === label.bindingGeneration &&
++			sameOrigin(last.origin, label.origin)
++		) {
++			last.length += length;
++			return;
++		}
++		this.spans.push({
++			origin: label.origin,
++			mixedOrigin: label.mixedOrigin,
++			bindingGeneration: label.bindingGeneration,
++			mixedBindingGeneration: label.mixedBindingGeneration,
++			length,
++		});
++	}
++
++	appendLedger(other: OriginLedger): void {
++		for (const span of other.spans) this.append(span, span.length);
++	}
++
++	/**
++	 * Remove the first `count` characters and report their attribution: the origin and binding generation
++	 * of the **final** character taken, plus whether more than one of either contributed.
++	 */
++	take(count: number): StdinSequenceOrigin {
++		if (count <= 0) return LOCAL_STDIN_ORIGIN;
++		let remaining = count;
++		const seenOrigins: (AttachmentEpoch | null)[] = [];
++		const seenGenerations: number[] = [];
++		let last: StdinSequenceOrigin = LOCAL_STDIN_ORIGIN;
++		let mixedOriginTaken = false;
++		let mixedGenerationTaken = false;
++		while (remaining > 0 && this.spans.length > 0) {
++			const span = this.spans[0]!;
++			const used = Math.min(span.length, remaining);
++			if (!seenOrigins.some((origin) => sameOrigin(origin, span.origin))) seenOrigins.push(span.origin);
++			if (!seenGenerations.includes(span.bindingGeneration)) seenGenerations.push(span.bindingGeneration);
++			if (span.mixedOrigin) mixedOriginTaken = true;
++			if (span.mixedBindingGeneration) mixedGenerationTaken = true;
++			last = span;
++			span.length -= used;
++			remaining -= used;
++			if (span.length === 0) this.spans.shift();
++		}
++		return {
++			origin: last.origin,
++			mixedOrigin: seenOrigins.length > 1 || mixedOriginTaken,
++			bindingGeneration: last.bindingGeneration,
++			mixedBindingGeneration: seenGenerations.length > 1 || mixedGenerationTaken,
++		};
++	}
++
++	/** Drop the first `count` characters without reporting them: upstream discards those bytes. */
++	drop(count: number): void {
++		this.take(count);
++	}
++
++	/** Remove and return everything, for a hand-off from one buffer to another. */
++	detach(): OriginLedger {
++		const moved = new OriginLedger();
++		moved.spans = this.spans;
++		this.spans = [];
++		return moved;
++	}
++
++	clear(): void {
++		this.spans = [];
++	}
++
++	static uniform(origin: AttachmentEpoch | null, bindingGeneration: number, length: number): OriginLedger {
++		const ledger = new OriginLedger();
++		ledger.append(
++			{ origin, mixedOrigin: false, bindingGeneration, mixedBindingGeneration: false },
++			length,
++		);
++		return ledger;
++	}
++}
++
+ export type StdinBufferEventMap = {
+-	data: [string];
+-	paste: [string];
++	data: [string, StdinSequenceOrigin];
++	paste: [string, StdinSequenceOrigin];
+ };
+ 
+ /**
+@@ -286,6 +438,8 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
+ 	private pasteMode: boolean = false;
+ 	private pasteBuffer: string = "";
+ 	private pendingKittyPrintableCodepoint: number | undefined;
++	private readonly bufferOrigins = new OriginLedger();
++	private readonly pasteOrigins = new OriginLedger();
+ 
+ 	constructor(options: StdinBufferOptions = {}) {
+ 		super();
+@@ -293,53 +447,76 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
+ 		this.escapeTimeoutMs = options.escapeTimeout ?? DEFAULT_ESCAPE_TIMEOUT_MS;
+ 	}
+ 
+-	public process(data: string | Buffer): void {
++	/**
++	 * Feed input. `origin` labels every byte of this chunk with the attachment that sent it and
++	 * `bindingGeneration` with the binding generation it was dispatched under; unmanaged callers pass
++	 * neither, so every span stays `null` at generation `0`.
++	 */
++	public process(data: string | Buffer, origin: AttachmentEpoch | null = null, bindingGeneration = 0): void {
++		const str = normaliseChunk(data);
++		this.processWithOrigins(str, OriginLedger.uniform(origin, bindingGeneration, str.length));
++	}
++
++	/**
++	 * Feed input whose characters do not all share one origin. The ledger must describe exactly `data`,
++	 * character for character, in order; the terminal builds it while decoding bytes so that a codepoint
++	 * assembled from two clients keeps its real attribution.
++	 */
++	public processWithOrigins(data: string, origins: OriginLedger): void {
+ 		// Clear any pending timeout
+ 		if (this.timeout) {
+ 			clearTimeout(this.timeout);
+ 			this.timeout = null;
+ 		}
+ 
+-		// Handle high-byte conversion (for compatibility with parseKeypress)
+-		// If buffer has single byte > 127, convert to ESC + (byte - 128)
+-		let str: string;
+-		if (Buffer.isBuffer(data)) {
+-			if (data.length === 1 && data[0]! > 127) {
+-				const byte = data[0]! - 128;
+-				str = `\x1b${String.fromCharCode(byte)}`;
+-			} else {
+-				str = data.toString();
+-			}
+-		} else {
+-			str = data;
+-		}
++		const str = data;
+ 
+ 		if (str.length === 0 && this.buffer.length === 0) {
+-			this.emitDataSequence("");
++			this.emitDataSequence("", origins.take(0));
+ 			return;
+ 		}
+ 
+ 		this.buffer += str;
++		this.bufferOrigins.appendLedger(origins);
+ 
+-		if (this.pasteMode) {
+-			this.pasteBuffer += this.buffer;
+-			this.buffer = "";
++		this.processBuffered();
++	}
++
++	/**
++	 * A paste body is one gesture even when another attachment typed into the middle of it, so the whole
++	 * body carries final-byte attribution and `mixedOrigin` rather than being split.
++	 */
++	private completePasteIfEnded(): void {
++		const endIndex = this.pasteBuffer.indexOf(BRACKETED_PASTE_END);
++		if (endIndex === -1) return;
++
++		const pastedContent = this.pasteBuffer.slice(0, endIndex);
++		const remaining = this.pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
++		const pasteAttribution = this.pasteOrigins.take(endIndex);
++		this.pasteOrigins.drop(BRACKETED_PASTE_END.length);
++		const remainingOrigins = this.pasteOrigins.detach();
+ 
+-			const endIndex = this.pasteBuffer.indexOf(BRACKETED_PASTE_END);
+-			if (endIndex !== -1) {
+-				const pastedContent = this.pasteBuffer.slice(0, endIndex);
+-				const remaining = this.pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
++		this.pasteMode = false;
++		this.pasteBuffer = "";
++		this.pendingKittyPrintableCodepoint = undefined;
+ 
+-				this.pasteMode = false;
+-				this.pasteBuffer = "";
+-				this.pendingKittyPrintableCodepoint = undefined;
++		this.emit("paste", pastedContent, pasteAttribution);
+ 
+-				this.emit("paste", pastedContent);
++		if (remaining.length > 0) {
++			// `this.buffer` is empty here: the paste branch moved everything into `pasteBuffer`.
++			this.buffer = remaining;
++			this.bufferOrigins.appendLedger(remainingOrigins);
++			this.processBuffered();
++		}
++	}
+ 
+-				if (remaining.length > 0) {
+-					this.process(remaining);
+-				}
+-			}
++	/** The tail of `process` once the buffer and its ledger already hold the bytes to parse. */
++	private processBuffered(): void {
++		if (this.pasteMode) {
++			this.pasteBuffer += this.buffer;
++			this.buffer = "";
++			this.pasteOrigins.appendLedger(this.bufferOrigins.detach());
++			this.completePasteIfEnded();
+ 			return;
+ 		}
+ 
+@@ -348,55 +525,41 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
+ 			if (startIndex > 0) {
+ 				const beforePaste = this.buffer.slice(0, startIndex);
+ 				const result = extractCompleteSequences(beforePaste);
++				let emitted = 0;
+ 				for (const sequence of result.sequences) {
+-					this.emitDataSequence(sequence);
++					this.emitDataSequence(sequence, this.bufferOrigins.take(sequence.length));
++					emitted += sequence.length;
+ 				}
++				this.bufferOrigins.drop(startIndex - emitted);
+ 			}
+-
+ 			this.pendingKittyPrintableCodepoint = undefined;
+ 			this.buffer = this.buffer.slice(startIndex + BRACKETED_PASTE_START.length);
++			this.bufferOrigins.drop(BRACKETED_PASTE_START.length);
+ 			this.pasteMode = true;
+ 			this.pasteBuffer = this.buffer;
+ 			this.buffer = "";
+-
+-			const endIndex = this.pasteBuffer.indexOf(BRACKETED_PASTE_END);
+-			if (endIndex !== -1) {
+-				const pastedContent = this.pasteBuffer.slice(0, endIndex);
+-				const remaining = this.pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
+-
+-				this.pasteMode = false;
+-				this.pasteBuffer = "";
+-				this.pendingKittyPrintableCodepoint = undefined;
+-
+-				this.emit("paste", pastedContent);
+-
+-				if (remaining.length > 0) {
+-					this.process(remaining);
+-				}
+-			}
++			this.pasteOrigins.appendLedger(this.bufferOrigins.detach());
++			this.completePasteIfEnded();
+ 			return;
+ 		}
+ 
+ 		const result = extractCompleteSequences(this.buffer);
+ 		this.buffer = result.remainder;
+-
+ 		for (const sequence of result.sequences) {
+-			this.emitDataSequence(sequence);
++			this.emitDataSequence(sequence, this.bufferOrigins.take(sequence.length));
+ 		}
+-
+ 		if (this.buffer.length > 0) {
+ 			const timeoutMs = this.buffer === ESC ? this.escapeTimeoutMs : this.timeoutMs;
+ 			this.timeout = setTimeout(() => {
+ 				const flushed = this.flush();
+-
+ 				for (const sequence of flushed) {
+-					this.emitDataSequence(sequence);
++					this.emitDataSequence(sequence, this.bufferOrigins.take(sequence.length));
+ 				}
+ 			}, timeoutMs);
+ 		}
+ 	}
+ 
+-	private emitDataSequence(sequence: string): void {
++	private emitDataSequence(sequence: string, attribution: StdinSequenceOrigin): void {
+ 		const rawCodepoint = sequence.length === 1 ? sequence.codePointAt(0) : undefined;
+ 		if (rawCodepoint !== undefined && rawCodepoint === this.pendingKittyPrintableCodepoint) {
+ 			this.pendingKittyPrintableCodepoint = undefined;
+@@ -404,7 +567,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
+ 		}
+ 
+ 		this.pendingKittyPrintableCodepoint = parseUnmodifiedKittyPrintableCodepoint(sequence);
+-		this.emit("data", sequence);
++		this.emit("data", sequence, attribution);
+ 	}
+ 
+ 	flush(): string[] {
+@@ -432,6 +595,8 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
+ 		this.pasteMode = false;
+ 		this.pasteBuffer = "";
+ 		this.pendingKittyPrintableCodepoint = undefined;
++		this.bufferOrigins.clear();
++		this.pasteOrigins.clear();
+ 	}
+ 
+ 	getBuffer(): string {
+diff --git a/packages/tui/src/terminal.ts b/packages/tui/src/terminal.ts
+index f858bf9..e57bd83 100644
+--- a/packages/tui/src/terminal.ts
++++ b/packages/tui/src/terminal.ts
+@@ -2,9 +2,19 @@ import * as fs from "node:fs";
+ import { createRequire } from "node:module";
+ import * as path from "node:path";
+ import { setKittyProtocolActive } from "./keys.ts";
++import {
++	type AttachmentEpoch,
++	authorizeTerminalResponse,
++	getNativeAttachmentHost,
++	isSupersededAttachmentEpoch,
++	type NativeInputProvenance,
++	noteAttachmentEpoch,
++	settleTerminalResponseAuthorizations,
++	type TerminalResponseKind,
++} from "./native-attachment.ts";
+ import { isNativeModifierPressed } from "./native-modifiers.ts";
+ import { getNativeModuleCandidates } from "./native-module-path.ts";
+-import { StdinBuffer } from "./stdin-buffer.ts";
++import { OriginLedger, StdinBuffer, type StdinSequenceOrigin } from "./stdin-buffer.ts";
+ 
+ const cjsRequire = createRequire(import.meta.url);
+ 
+@@ -14,6 +24,18 @@ const TERMINAL_PROGRESS_CLEAR_SEQUENCE = "\x1b]9;4;0\x07";
+ const NATIVE_SHIFT_ENTER_SEQUENCE = "\x1b[13;2u";
+ const DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS = 7;
+ const KEYBOARD_PROTOCOL_RESPONSE_FRAGMENT_TIMEOUT_MS = 150;
++
++/**
++ * Length in bytes of the UTF-8 codepoint that starts with this lead byte, or 1 for a byte that cannot
++ * start one. Only the boundary is computed here; `Buffer.toString("utf8")` still does the decoding.
++ */
++function utf8CodepointLength(leadByte: number): number {
++	if (leadByte < 0x80) return 1;
++	if (leadByte >= 0xc2 && leadByte <= 0xdf) return 2;
++	if (leadByte >= 0xe0 && leadByte <= 0xef) return 3;
++	if (leadByte >= 0xf0 && leadByte <= 0xf4) return 4;
++	return 1; // continuation or invalid lead: consume one byte and let Node produce U+FFFD
++}
+ const KITTY_KEYBOARD_PROTOCOL_QUERY = `\x1b[>${DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS}u\x1b[?u\x1b[c`;
+ 
+ export type KeyboardProtocolNegotiationSequence =
+@@ -33,6 +55,16 @@ export function parseKeyboardProtocolNegotiationSequence(
+ 	return undefined;
+ }
+ 
++/**
++ * A complete terminal response, its exact bytes as classified, and the attribution of every character
++ * that went into it — including a prefix that arrived in an earlier read.
++ */
++type ClassifiedTerminalResponse = {
++	negotiationSequence: KeyboardProtocolNegotiationSequence;
++	raw: string;
++	attribution: StdinSequenceOrigin;
++};
++
+ function isKeyboardProtocolNegotiationSequencePrefix(sequence: string): boolean {
+ 	return sequence === "\x1b[" || /^\x1b\[\?[\d;]*$/.test(sequence);
+ }
+@@ -54,12 +86,24 @@ export function normalizeAppleTerminalInput(data: string, isAppleTerminal: boole
+ 	return normalizeNativeShiftEnterInput(data, isAppleTerminal, isShiftPressed);
+ }
+ 
++export type NativeInputDispatch = {
++	attachmentEpoch: AttachmentEpoch;
++	bytes: Uint8Array;
++	binding: { generation: number };
++};
++
+ /**
+  * Minimal terminal interface for TUI
+  */
+ export interface Terminal {
+ 	// Start the terminal with input and resize handlers
+-	start(onInput: (data: string) => void, onResize: () => void): void;
++	start(onInput: (data: string, provenance?: NativeInputProvenance) => void, onResize: () => void): void;
++
++	/**
++	 * Seam B: admit labelled bytes from one client attachment into the ordered native input path.
++	 * Present only on a terminal a host owns; ordinary stdin needs no dispatch.
++	 */
++	dispatchNativeInput?(input: NativeInputDispatch): Promise<{ consumedThrough: number }>;
+ 
+ 	// Stop the terminal and restore state
+ 	stop(): void;
+@@ -125,15 +169,40 @@ export function resolveEscapeTimeoutMs(env: NodeJS.ProcessEnv = process.env): nu
+  */
+ export class ProcessTerminal implements Terminal {
+ 	private wasRaw = false;
+-	private inputHandler?: (data: string) => void;
++	private inputHandler?: (data: string, provenance?: NativeInputProvenance) => void;
+ 	private resizeHandler?: () => void;
+ 	private _kittyProtocolActive = false;
+ 	private _modifyOtherKeysActive = false;
+ 	private keyboardProtocolPushed = false;
+ 	private keyboardProtocolNegotiationBuffer = "";
++	/** Origins of every character in `keyboardProtocolNegotiationBuffer`, so a split reply keeps them. */
++	private keyboardProtocolNegotiationOrigins = new OriginLedger();
+ 	private keyboardProtocolBufferFlushTimer?: ReturnType<typeof setTimeout>;
+ 	private stdinBuffer?: StdinBuffer;
+ 	private stdinDataHandler?: (data: string) => void;
++	/** Increments on every capability query written, so a reply to a superseded query is detectable. */
++	private requestEpoch = 0;
++	private sequenceCounter = 0;
++	private consumedThrough = 0;
++	private bindingGeneration = 0;
++	private dispatchChain: Promise<void> = Promise.resolve();
++	/**
++	 * One ordered byte queue for every attachment, not one decoder each.
++	 *
++	 * Labelled ingress is a single ordered stream. A per-attachment decoder would hold one client's
++	 * incomplete codepoint while a later client's complete key overtook it, which reverses submission
++	 * order, and it would label the finished character with only the dispatch that completed it. Bytes
++	 * therefore queue here in arrival order with their own origins.
++	 *
++	 * A codepoint is only ever assembled from bytes of one attachment, epoch and binding generation. When
++	 * a dispatch crosses any of those boundaries, whatever incomplete bytes are still queued are flushed
++	 * first, in place, so the truncated character is visibly replaced and attributed to the client that
++	 * actually sent it, instead of being silently completed by an unrelated client's byte.
++	 */
++	private pendingInputBytes: Buffer = Buffer.alloc(0);
++	private readonly pendingInputByteOrigins = new OriginLedger();
++	/** Who the queued incomplete bytes belong to, so a transition can be detected. */
++	private pendingInputOwner: { attachmentId: string; epoch: number; generation: number } | undefined;
+ 	private progressInterval?: ReturnType<typeof setInterval>;
+ 	private writeLogPath = (() => {
+ 		const env = process.env.PI_TUI_WRITE_LOG || "";
+@@ -158,7 +227,7 @@ export class ProcessTerminal implements Terminal {
+ 		return this._modifyOtherKeysActive;
+ 	}
+ 
+-	start(onInput: (data: string) => void, onResize: () => void): void {
++	start(onInput: (data: string, provenance?: NativeInputProvenance) => void, onResize: () => void): void {
+ 		this.inputHandler = onInput;
+ 		this.resizeHandler = onResize;
+ 
+@@ -205,23 +274,23 @@ export class ProcessTerminal implements Terminal {
+ 		this.stdinBuffer = new StdinBuffer({ escapeTimeout: resolveEscapeTimeoutMs() });
+ 
+ 		// Forward individual sequences to the input handler
+-		this.stdinBuffer.on("data", (sequence) => {
+-			const negotiationSequence = this.readKeyboardProtocolNegotiationSequence(sequence);
+-			if (negotiationSequence === "pending") {
++		this.stdinBuffer.on("data", (sequence, attribution) => {
++			const classified = this.readKeyboardProtocolNegotiationSequence(sequence, attribution);
++			if (classified === "pending") {
+ 				this.scheduleKeyboardProtocolNegotiationBufferFlush();
+ 				return; // Wait briefly for the rest of a split Kitty response.
+ 			}
+-			if (this.handleKeyboardProtocolNegotiationSequence(negotiationSequence)) {
++			if (classified && this.consumeNegotiationSequence(classified)) {
+ 				return;
+ 			}
+ 
+-			this.forwardInputSequence(sequence);
++			this.forwardInputSequence(sequence, attribution);
+ 		});
+ 
+ 		// Re-wrap paste content with bracketed paste markers for existing editor handling
+-		this.stdinBuffer.on("paste", (content) => {
++		this.stdinBuffer.on("paste", (content, attribution) => {
+ 			if (this.inputHandler) {
+-				this.inputHandler(`\x1b[200~${content}\x1b[201~`);
++				this.inputHandler(`\x1b[200~${content}\x1b[201~`, this.provenanceFor(attribution));
+ 			}
+ 		});
+ 
+@@ -249,14 +318,186 @@ export class ProcessTerminal implements Terminal {
+ 		process.stdin.on("data", this.stdinDataHandler!);
+ 		this.keyboardProtocolPushed = true;
+ 		this.clearKeyboardProtocolNegotiationBuffer();
++		this.requestEpoch += 1;
+ 		process.stdout.write(KITTY_KEYBOARD_PROTOCOL_QUERY);
+ 	}
+ 
++	/**
++	 * Seam B: admit one labelled byte span from a client attachment.
++	 *
++	 * Dispatches are serialized, so the ordered native path sees byte spans in submission order and the
++	 * returned `consumedThrough` is monotonic. It counts bytes accepted into that path, and the promise
++	 * resolves only once every response authorization those bytes started has settled — that is the
++	 * boundary seam G's drain refers to. A byte span that arrives on a stale binding generation or a
++	 * superseded attachment epoch is admitted nowhere and leaves `consumedThrough` unchanged.
++	 */
++	async dispatchNativeInput(input: NativeInputDispatch): Promise<{ consumedThrough: number }> {
++		// Admission runs synchronously, before this dispatch waits for its turn. A reconnect has to be
++		// visible to a response authorization that is *already* awaiting a host decision: if the epoch were
++		// only noted inside the turn, it would sit behind that pending decision and the only thing left to
++		// refuse a stale reply would be the 1000 ms bound.
++		if (!this.stdinBuffer) {
++			throw new Error("dispatchNativeInput requires a started terminal");
++		}
++		if (input.binding.generation < this.bindingGeneration) {
++			return { consumedThrough: this.consumedThrough };
++		}
++		if (isSupersededAttachmentEpoch(input.attachmentEpoch)) {
++			return { consumedThrough: this.consumedThrough };
++		}
++		const { attachmentId, epoch } = input.attachmentEpoch;
++		const generation = input.binding.generation;
++		this.bindingGeneration = generation;
++		noteAttachmentEpoch(input.attachmentEpoch);
++
++		// Admission order is submission order, so this dispatch's own boundary is fixed here. Reporting
++		// `this.consumedThrough` at resolution instead would let an earlier dispatch advertise a later
++		// dispatch's bytes, which are still queued behind it, as consumed.
++		const bytes = Buffer.from(input.bytes);
++		this.consumedThrough += bytes.length;
++		const consumedThrough = this.consumedThrough;
++
++		const previous = this.dispatchChain;
++		let releaseTurn: () => void = () => {};
++		this.dispatchChain = new Promise<void>((resolve) => {
++			releaseTurn = resolve;
++		});
++		await previous;
++		try {
++			// A codepoint never spans two clients, epochs or generations: flush any incomplete remainder
++			// from the previous owner before admitting these bytes, preserving order.
++			const owner = { attachmentId, epoch, generation };
++			if (
++				this.pendingInputBytes.length > 0 &&
++				this.pendingInputOwner !== undefined &&
++				(this.pendingInputOwner.attachmentId !== owner.attachmentId ||
++					this.pendingInputOwner.epoch !== owner.epoch ||
++					this.pendingInputOwner.generation !== owner.generation)
++			) {
++				this.flushIncompleteInputBytes();
++			}
++
++			// Queue the bytes in arrival order with their origins, then decode whatever is now complete.
++			this.pendingInputBytes = Buffer.concat([this.pendingInputBytes, bytes]);
++			this.pendingInputByteOrigins.append(
++				{
++					origin: { attachmentId, epoch },
++					mixedOrigin: false,
++					bindingGeneration: generation,
++					mixedBindingGeneration: false,
++				},
++				bytes.length,
++			);
++			this.pendingInputOwner = owner;
++
++			const decoded = this.decodeCompleteCodepoints();
++			if (decoded.text.length > 0) {
++				this.stdinBuffer?.processWithOrigins(decoded.text, decoded.origins);
++			}
++			await settleTerminalResponseAuthorizations();
++			return { consumedThrough };
++		} finally {
++			releaseTurn();
++		}
++	}
++
++	/**
++	 * Decode the queued bytes as they stand, truncated codepoint included, and hand them on. Node turns
++	 * the unfinished tail into U+FFFD, which is the honest outcome: those bytes were a real gesture from a
++	 * real client and are neither dropped nor completed by somebody else's keystroke.
++	 */
++	private flushIncompleteInputBytes(): void {
++		if (this.pendingInputBytes.length === 0) return;
++		const attribution = this.pendingInputByteOrigins.take(this.pendingInputBytes.length);
++		const text = this.pendingInputBytes.toString("utf8");
++		this.pendingInputBytes = Buffer.alloc(0);
++		this.pendingInputOwner = undefined;
++		if (text.length === 0) return;
++		const origins = new OriginLedger();
++		origins.append(attribution, text.length);
++		this.stdinBuffer?.processWithOrigins(text, origins);
++	}
++
++	/**
++	 * Take every complete UTF-8 codepoint off the front of the pending byte queue and report, per decoded
++	 * character, the origin and binding generation of its **final** byte plus whether its bytes came from
++	 * more than one attachment or generation. A trailing incomplete codepoint stays queued; nothing after
++	 * it can overtake it, because later bytes sit behind it in the same queue.
++	 */
++	private decodeCompleteCodepoints(): { text: string; origins: OriginLedger } {
++		const origins = new OriginLedger();
++		let text = "";
++		let consumed = 0;
++		while (consumed < this.pendingInputBytes.length) {
++			const width = utf8CodepointLength(this.pendingInputBytes[consumed]!);
++			if (consumed + width > this.pendingInputBytes.length) break; // incomplete: wait for the rest
++			const span = this.pendingInputBytes.subarray(consumed, consumed + width);
++			const attribution = this.pendingInputByteOrigins.take(width);
++			const character = span.toString("utf8");
++			// A 4-byte codepoint is two UTF-16 units, so the ledger is appended in units, not bytes.
++			origins.append(attribution, character.length);
++			text += character;
++			consumed += width;
++		}
++		if (consumed > 0) {
++			this.pendingInputBytes = this.pendingInputBytes.subarray(consumed);
++			if (this.pendingInputBytes.length === 0) this.pendingInputOwner = undefined;
++		}
++		return { text, origins };
++	}
++
++	/**
++	 * Provenance of one delivered sequence, taken from the attribution of the characters that formed it —
++	 * never from whichever generation the terminal has since reached. A sequence that native framing
++	 * assembled across a generation change therefore says so, instead of being presented as wholly current.
++	 */
++	private provenanceFor(attribution: StdinSequenceOrigin): NativeInputProvenance {
++		this.sequenceCounter += 1;
++		return {
++			sequenceId: `native-input-${this.sequenceCounter}`,
++			origin: attribution.origin,
++			mixedOrigin: attribution.mixedOrigin,
++			bindingGeneration: attribution.bindingGeneration,
++			mixedBindingGeneration: attribution.mixedBindingGeneration,
++		};
++	}
++
++	/**
++	 * Seam F: a classified response never moves capability state until the host has authorized it.
++	 *
++	 * Returns true when the sequence was a response and has been consumed, whatever the decision. With no
++	 * host registered this is unmanaged Pi's own immediate application, unchanged.
++	 */
++	private consumeNegotiationSequence(classified: ClassifiedTerminalResponse): boolean {
++		const host = getNativeAttachmentHost();
++		if (!host) {
++			return this.handleKeyboardProtocolNegotiationSequence(classified.negotiationSequence);
++		}
++
++		const requestEpoch = this.requestEpoch;
++		const attachmentEpoch = classified.attribution.origin;
++		const kind: TerminalResponseKind =
++			classified.negotiationSequence.type === "kitty-flags" ? "kitty-keyboard" : "da";
++		// `raw` is the complete classified response, reassembled prefix included, not the last fragment.
++		void authorizeTerminalResponse(
++			host,
++			{ kind, requestEpoch, attachmentEpoch, raw: new TextEncoder().encode(classified.raw) },
++			() => requestEpoch === this.requestEpoch,
++			() => this.applyNegotiationEffect(classified.negotiationSequence),
++		);
++		return true;
++	}
++
+ 	private handleKeyboardProtocolNegotiationSequence(
+ 		negotiationSequence: KeyboardProtocolNegotiationSequence | undefined,
+ 	): boolean {
+ 		if (!negotiationSequence) return false;
+ 		this.clearKeyboardProtocolNegotiationBuffer();
++		this.applyNegotiationEffect(negotiationSequence);
++		return true;
++	}
++
++	private applyNegotiationEffect(negotiationSequence: KeyboardProtocolNegotiationSequence): void {
+ 		if (negotiationSequence.type === "kitty-flags") {
+ 			if (negotiationSequence.flags !== 0) {
+ 				this.disableModifyOtherKeys();
+@@ -267,26 +508,37 @@ export class ProcessTerminal implements Terminal {
+ 			} else {
+ 				this.enableModifyOtherKeys();
+ 			}
+-			return true;
++			return;
+ 		}
+ 
+ 		if (!this._kittyProtocolActive) {
+ 			this.enableModifyOtherKeys();
+ 		}
+-		return true;
+ 	}
+ 
++	/**
++	 * Classify one emitted sequence, reassembling a response split across reads.
++	 *
++	 * The accumulator carries the buffered text **and** the origins of its characters, so a reply whose
++	 * prefix came from one attachment and whose final byte came from another is authorized with its
++	 * complete bytes and its real attribution, and a prefix that turns out not to be a reply is forwarded
++	 * as input with the attribution it actually had.
++	 */
+ 	private readKeyboardProtocolNegotiationSequence(
+ 		sequence: string,
+-	): KeyboardProtocolNegotiationSequence | "pending" | undefined {
++		attribution: StdinSequenceOrigin,
++	): ClassifiedTerminalResponse | "pending" | undefined {
+ 		if (this.keyboardProtocolNegotiationBuffer) {
+ 			const bufferedSequence = this.keyboardProtocolNegotiationBuffer + sequence;
+ 			const negotiationSequence = parseKeyboardProtocolNegotiationSequence(bufferedSequence);
+ 			if (negotiationSequence) {
++				this.keyboardProtocolNegotiationOrigins.append(attribution, sequence.length);
++				const combined = this.keyboardProtocolNegotiationOrigins.take(bufferedSequence.length);
+ 				this.clearKeyboardProtocolNegotiationBuffer();
+-				return negotiationSequence;
++				return { negotiationSequence, raw: bufferedSequence, attribution: combined };
+ 			}
+ 			if (isKeyboardProtocolNegotiationSequencePrefix(bufferedSequence)) {
++				this.keyboardProtocolNegotiationOrigins.append(attribution, sequence.length);
+ 				this.setKeyboardProtocolNegotiationBuffer(bufferedSequence);
+ 				return "pending";
+ 			}
+@@ -294,8 +546,9 @@ export class ProcessTerminal implements Terminal {
+ 		}
+ 
+ 		const negotiationSequence = parseKeyboardProtocolNegotiationSequence(sequence);
+-		if (negotiationSequence) return negotiationSequence;
++		if (negotiationSequence) return { negotiationSequence, raw: sequence, attribution };
+ 		if (isKeyboardProtocolNegotiationSequencePrefix(sequence)) {
++			this.keyboardProtocolNegotiationOrigins.append(attribution, sequence.length);
+ 			this.setKeyboardProtocolNegotiationBuffer(sequence);
+ 			return "pending";
+ 		}
+@@ -310,13 +563,19 @@ export class ProcessTerminal implements Terminal {
+ 	private clearKeyboardProtocolNegotiationBuffer(): void {
+ 		this.clearKeyboardProtocolNegotiationBufferFlushTimer();
+ 		this.keyboardProtocolNegotiationBuffer = "";
++		this.keyboardProtocolNegotiationOrigins.clear();
+ 	}
+ 
++	/**
++	 * A buffered prefix that never became a reply is ordinary input. It keeps the attribution its
++	 * characters arrived with rather than being relabelled as local stdin.
++	 */
+ 	private flushKeyboardProtocolNegotiationBufferAsInput(): void {
+ 		if (!this.keyboardProtocolNegotiationBuffer) return;
+ 		const sequence = this.keyboardProtocolNegotiationBuffer;
++		const attribution = this.keyboardProtocolNegotiationOrigins.take(sequence.length);
+ 		this.clearKeyboardProtocolNegotiationBuffer();
+-		this.forwardInputSequence(sequence);
++		this.forwardInputSequence(sequence, attribution);
+ 	}
+ 
+ 	private scheduleKeyboardProtocolNegotiationBufferFlush(): void {
+@@ -333,7 +592,7 @@ export class ProcessTerminal implements Terminal {
+ 		this.keyboardProtocolBufferFlushTimer = undefined;
+ 	}
+ 
+-	private forwardInputSequence(sequence: string): void {
++	private forwardInputSequence(sequence: string, attribution: StdinSequenceOrigin): void {
+ 		if (!this.inputHandler) return;
+ 		const shouldDetectNativeShiftEnter =
+ 			sequence === "\r" && (isAppleTerminalSession() || process.platform === "win32");
+@@ -342,7 +601,7 @@ export class ProcessTerminal implements Terminal {
+ 			shouldDetectNativeShiftEnter,
+ 			shouldDetectNativeShiftEnter && isNativeModifierPressed("shift"),
+ 		);
+-		this.inputHandler(input);
++		this.inputHandler(input, this.provenanceFor(attribution));
+ 	}
+ 
+ 	private enableModifyOtherKeys(): void {
+@@ -450,6 +709,9 @@ export class ProcessTerminal implements Terminal {
+ 			this.stdinBuffer.destroy();
+ 			this.stdinBuffer = undefined;
+ 		}
++		this.pendingInputBytes = Buffer.alloc(0);
++		this.pendingInputByteOrigins.clear();
++		this.pendingInputOwner = undefined;
+ 
+ 		// Remove event handlers
+ 		if (this.stdinDataHandler) {
+diff --git a/packages/tui/src/tui.ts b/packages/tui/src/tui.ts
+index 5172a9a..0db21a2 100644
+--- a/packages/tui/src/tui.ts
++++ b/packages/tui/src/tui.ts
+@@ -6,6 +6,14 @@ import * as os from "node:os";
+ import * as path from "node:path";
+ import { performance } from "node:perf_hooks";
+ import { isKeyRelease, matchesKey } from "./keys.ts";
++import {
++	type AttachmentEpoch,
++	authorizeTerminalResponse,
++	declaresReturnKey,
++	getNativeAttachmentHost,
++	type NativeInputProvenance,
++	type ReturnAuthorization,
++} from "./native-attachment.ts";
+ import type { Terminal } from "./terminal.ts";
+ import {
+ 	isOsc11BackgroundColorResponse,
+@@ -333,6 +341,8 @@ export abstract class TuiBase extends Container implements TUI {
+ 	public terminal: Terminal;
+ 	private focusedComponent: Component | null = null;
+ 	private inputListeners = new Set<TuiInputListener>();
++	/** Increments on every cell-size query, so a report for a superseded query is detectable. */
++	private cellSizeRequestEpoch = 0;
+ 
+ 	/** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
+ 	public onDebug?: () => void;
+@@ -699,7 +709,7 @@ export abstract class TuiBase extends Container implements TUI {
+ 		this.stopped = false;
+ 		this.beforeTerminalStart();
+ 		this.terminal.start(
+-			(data) => this.handleTerminalInput(data),
++			(data, provenance) => this.handleTerminalInput(data, provenance),
+ 			() => this.requestRender(),
+ 		);
+ 		this.afterTerminalStart();
+@@ -746,6 +756,7 @@ export abstract class TuiBase extends Container implements TUI {
+ 		}
+ 		// Query terminal for cell size in pixels: CSI 16 t
+ 		// Response format: CSI 6 ; height ; width t
++		this.cellSizeRequestEpoch += 1;
+ 		this.terminal.write("\x1b[16t");
+ 	}
+ 
+@@ -823,7 +834,7 @@ export abstract class TuiBase extends Container implements TUI {
+ 		}, delay);
+ 	}
+ 
+-	private handleTerminalInput(data: string): void {
++	private handleTerminalInput(data: string, provenance?: NativeInputProvenance): void {
+ 		if (this.consumeOsc11BackgroundResponse(data)) {
+ 			return;
+ 		}
+@@ -849,7 +860,7 @@ export abstract class TuiBase extends Container implements TUI {
+ 		}
+ 
+ 		// Consume terminal cell size responses without blocking unrelated input.
+-		if (this.consumeCellSizeResponse(data)) {
++		if (this.consumeCellSizeResponse(data, provenance)) {
+ 			return;
+ 		}
+ 
+@@ -894,6 +905,9 @@ export abstract class TuiBase extends Container implements TUI {
+ 			if (isKeyRelease(data) && !this.focusedComponent.wantsKeyRelease) {
+ 				return;
+ 			}
++			if (!this.deliverReturnNatively(data, provenance)) {
++				return;
++			}
+ 			this.focusedComponent.handleInput(data);
+ 			// Keyboard input is latency-sensitive. Avoid the throttled timer path,
+ 			// where even setTimeout(0) can take a full 16 ms tick on Windows.
+@@ -901,6 +915,52 @@ export abstract class TuiBase extends Container implements TUI {
+ 		}
+ 	}
+ 
++	/**
++	 * Seam C: decide whether a return key belongs to the focused component or to the owner's host.
++	 *
++	 * Evaluated synchronously here, after focus and overlay resolution above, so no stale eligibility
++	 * snapshot can decide it. Returns true when the key must be delivered natively, which is every case
++	 * except a single-origin, single-generation return that the focused component has explicitly declared
++	 * free and that the host claimed **for that same attachment**. A mixed-origin sequence can never
++	 * authorize a return (G-A8), a sequence whose native framing spans two binding generations cannot
++	 * either, and a component that declares nothing owns the key, so the host is not even asked.
++	 *
++	 * Every other outcome is native delivery: a throw, a missing result, a malformed result, or a
++	 * `detachOrigin` naming any attachment other than the one whose gesture this was. A host cannot
++	 * suppress an operator's key by returning something unrecognised, and it cannot use one client's
++	 * keystroke to detach another.
++	 */
++	private deliverReturnNatively(data: string, provenance?: NativeInputProvenance): boolean {
++		if (!provenance?.origin) return true;
++		if (provenance.mixedOrigin) return true;
++		// Bytes dispatched under an older binding generation helped frame this key, so the current
++		// generation's host must not be able to act on it.
++		if (provenance.mixedBindingGeneration) return true;
++		if (!matchesKey(data, "return")) return true;
++		const host = getNativeAttachmentHost();
++		if (!host) return true;
++		if (declaresReturnKey(this.focusedComponent, data) === "owns") return true;
++
++		const origin = provenance.origin;
++		let decision: ReturnAuthorization | undefined;
++		try {
++			decision = host.authorizeReturn({
++				sequenceId: provenance.sequenceId,
++				origin,
++				mixedOrigin: false,
++				binding: { generation: provenance.bindingGeneration },
++			});
++		} catch {
++			return true; // a failed authorization never steals the key
++		}
++		if (decision === "native") return true;
++		if (!decision || typeof decision !== "object") return true;
++		const target = (decision as { detachOrigin?: AttachmentEpoch }).detachOrigin;
++		if (!target || typeof target !== "object") return true;
++		if (target.attachmentId !== origin.attachmentId || target.epoch !== origin.epoch) return true;
++		return false;
++	}
++
+ 	private consumeOsc11BackgroundResponse(data: string): boolean {
+ 		if (this.pendingOsc11BackgroundReplies <= 0) {
+ 			return false;
+@@ -937,7 +997,7 @@ export abstract class TuiBase extends Container implements TUI {
+ 		return true;
+ 	}
+ 
+-	private consumeCellSizeResponse(data: string): boolean {
++	private consumeCellSizeResponse(data: string, provenance?: NativeInputProvenance): boolean {
+ 		// Response format: ESC [ 6 ; height ; width t
+ 		const match = data.match(/^\x1b\[6;(\d+);(\d+)t$/);
+ 		if (!match) {
+@@ -950,11 +1010,36 @@ export abstract class TuiBase extends Container implements TUI {
+ 			return true;
+ 		}
+ 
++		// Seam F: a managed host authorizes a cell-size report before it changes image geometry. It runs
++		// through the same bounded, tracked mechanism as every other response, so it cannot apply after a
++		// newer query or a replaced attachment and it cannot outlive the drain boundary. The response is
++		// consumed either way; a refusal simply changes nothing.
++		const host = getNativeAttachmentHost();
++		if (host) {
++			const requestEpoch = this.cellSizeRequestEpoch;
++			void authorizeTerminalResponse(
++				host,
++				{
++					kind: "cell-size",
++					requestEpoch,
++					attachmentEpoch: provenance?.origin ?? null,
++					raw: new TextEncoder().encode(data),
++				},
++				() => requestEpoch === this.cellSizeRequestEpoch,
++				() => this.applyCellSize(widthPx, heightPx),
++			);
++			return true;
++		}
++
++		this.applyCellSize(widthPx, heightPx);
++		return true;
++	}
++
++	private applyCellSize(widthPx: number, heightPx: number): void {
+ 		setCellDimensions({ widthPx, heightPx });
+ 		// Invalidate all components so images re-render with correct dimensions.
+ 		this.invalidate();
+ 		this.requestRender();
+-		return true;
+ 	}
+ 
+ 	/**

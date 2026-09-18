@@ -1,0 +1,21 @@
+{
+  "manifestVersion": 1,
+  "name": "native-ingress-red",
+  "description": "Behavioral RED: the lane's two case files driven against the unpatched pinned @earendil-works/pi-tui 0.84.3 install. Both cases are expected to FAIL, so collect exits nonzero by design; the failure text is the RED record and it reaches native parsing and dispatch rather than a missing import.",
+  "cases": [
+    {
+      "id": "red-native-ingress",
+      "kind": "test",
+      "config": "vitest.config.ts",
+      "file": "test/native-ingress.test.mjs",
+      "command": ["npx", "--no-install", "vitest", "run", "--config", "vitest.config.ts", "test/native-ingress.test.mjs", "--no-cache"]
+    },
+    {
+      "id": "red-native-return",
+      "kind": "test",
+      "config": "vitest.config.ts",
+      "file": "test/native-return.test.mjs",
+      "command": ["npx", "--no-install", "vitest", "run", "--config", "vitest.config.ts", "test/native-return.test.mjs", "--no-cache"]
+    }
+  ]
+}

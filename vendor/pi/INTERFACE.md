@@ -3,10 +3,11 @@
 Read this before you write a Pi source patch or consume a built artifact. `vendor/pi/README.md` is the
 maintenance procedure; this file is the contract.
 
-**Seams A, B, C, E and F are implemented and composed but NOT qualified; seams D and G are absent.** The
-series carries three ordered patches, so today's artifacts are **patched** upstream Pi 0.84.3 that expose
-the native submission barrier, labelled ingress with return authorization and the terminal profile, and
-cold presentation with readiness — and nothing else. The build is also a **hybrid** - pinned source plus
+**Seams A, B, C, E and F and the recognized part of G are implemented and composed but NOT qualified; seam D
+is absent.** The series carries four ordered patches, so today's artifacts are **patched** upstream Pi 0.84.3
+that expose the native submission barrier, labelled ingress with return authorization and the terminal
+profile, cold presentation with readiness, and the ordered input drain with the recognized external-editor
+child handoff — and nothing else. The build is also a **hybrid** - pinned source plus
 one pinned release-generated data input - which section 6 describes in full.
 
 Section 8 is the seam A contract: the public API, its managed activation, the envelope, the fence and the
@@ -15,17 +16,18 @@ section 8.6b states the selected **compatibility-first** custom-editor policy, t
 accepts, and the one operator-visible notice that states the limitation instead of hiding it. Section 9 is
 the composition: which document owns which seam, what the serialized series is, and what the composition
 itself does not deliver. What is still missing is qualification work, not a policy: the public binding/API
-freeze for seam D, seam G's drain, and whole-product qualification. That is why these artifacts are not
-cleared for dependency activation.
+freeze for seam D, seam G's arbitrary-child terminal parity (Gate 5), and whole-product qualification. That
+is why these artifacts are not cleared for dependency activation.
 
-The seam contracts live in three documents, and none of them supersedes another:
+The seam contracts live in four documents, and none of them supersedes another:
 
 | Seam | Contract document | Ordered patch |
 | --- | --- | --- |
 | A — native submission barrier | section 8 of this file | `0001-seam-a-native-submission-barrier.patch` |
 | B, C, F — labelled ingress, return authorization, terminal profile | [`docs/native-input-interface.md`](../../docs/native-input-interface.md) | `0002-native-ingress-return-profile.patch` |
 | E — cold presentation and readiness | [`INTERFACE-seam-e-presentation.md`](INTERFACE-seam-e-presentation.md) | `0003-native-presentation-readiness.patch` |
-| D, G | not written: unassigned and unimplemented | none |
+| G — ordered input drain and the recognized child-terminal handoff, Gate 5 still open | [`INTERFACE-seam-g-child-handoff.md`](INTERFACE-seam-g-child-handoff.md) | `0005-native-child-handoff.patch` |
+| D | not written: unassigned and unimplemented | none; `0004` is reserved for it |
 
 ## 1. The pin
 
@@ -415,17 +417,27 @@ contract and is unchanged.
 
 ## 9. The composed series
 
-The three patches were written against the same pinned tree by three separate lanes, and they do **not**
-commute: `packages/tui/src/{terminal,tui,index}.ts` are changed by both 0002 and 0003, and
+The four patches were written against the same pinned tree by four separate lanes, and they do **not**
+commute: `packages/tui/src/{terminal,tui,index}.ts` are changed by 0002, 0003 and 0005,
 `packages/coding-agent/src/{index.ts,core/extensions/{types,loader}.ts,modes/interactive/interactive-mode.ts}`
-by both 0001 and 0003. `patches/series` is therefore the only order these files apply in, and 0002 and 0003
+by 0001, 0003 and 0005, and `packages/tui/src/{native-attachment,stdin-buffer}.ts` by both 0002 and 0005.
+`patches/series` is therefore the only order these files apply in, and 0002 and 0003
 are the **serialized** forms regenerated in that order rather than the lanes' original diffs.
+
+The series has **no `0004`**. That position is left free for the independent canonical-admission sibling
+(seam D), which this lock does not carry and which 0005 does not depend on; `series` names four files and a
+fifth patch file in the directory would be drift.
 
 | Position | Patch | sha256 | Prepared tree after it |
 | --- | --- | --- | --- |
 | 1 | `0001-seam-a-native-submission-barrier.patch` | `c2d0a7c73bae0359357f012d95954dd9bcb645af7ca13d805623192c7d9542a7` (unchanged from the seam A lane) | `4a175953509e7a38bfbaefd0aa55f01b6168a980` |
 | 2 | `0002-native-ingress-return-profile.patch` | `9376635ebb4aa87d77354fe19c53cf70562aa37ba64f9e5513e0e2ed7ea7db1e` (serialized; the lane's own diff was `1db62cf6355d371d910a947d771a6c81efff5f4996a7a7d5b3796a5d251ae816`) | `8c21a5d8e326a44719ad53d5c6ba183db9925731` |
 | 3 | `0003-native-presentation-readiness.patch` | `cf7f5ccca6358612f17bb65583f17934fb795b9935c921efe0fbaba1737bdfb9` (serialized; the lane's own diff was `8a483bf73c9b6d6d44cea44eae2289386946e545f1b6fa2b8bd6a5fd88542868`) | `9c40d805754c6cbc5dd161ec4e1c6880b1bc1ef4` |
+| 4 | `0005-native-child-handoff.patch` | `18138c0612bf244e3cddb0d9f759b875c6786f1836a84bd082be72071b44bcaa` (taken at this position, on top of 0003) | `807c3338386c0c6264edea49dd26c33b3523ce2e` |
+
+Position 4's prepared tree is the one the seam G cohort was built from: Slurm build job `3746359`, upstream
+commit `bfb004d4418ff05c6f909eaaab856cbe75c1fde0`. `INTERFACE-seam-g-child-handoff.md` is that patch's own
+public contract and its own statement of limits.
 
 Applying each lane's patch alone to the pin still reproduces that lane's own tree
 (`4a175953509e7a38bfbaefd0aa55f01b6168a980` for A, `657974161957889b737195121078666ced55192d` for B/C/F,
@@ -442,9 +454,13 @@ prepared tree must equal the tree recorded above.
 
 ### 9.1 What the composition itself does not deliver
 
-- **No seam D and no seam G.** There is still no public canonical admission, reservation or binding-commit
-  API, and no `drainedThrough`. Composing A with B/C/F did not create one, and nothing here may be cited as
-  a D or G interface freeze.
+- **No seam D.** There is still no public canonical admission, reservation or binding-commit API. Composing
+  A with B/C/F, E and G did not create one, and nothing here may be cited as a D interface freeze.
+- **Seam G is the recognized handoff only (Gate 5 open).** 0005 delivers the ordered drain, `drainedThrough`,
+  the `handoff-closed` verdict and the paired phase announcement around Pi's external editor. Arbitrary,
+  unannounced and same-process-group children, a child's current screen, shared input and actual Kitty
+  graphics are untouched, and the retained-byte evidence is a fake in-process child route rather than a
+  cross-process host transition. Gate 5 remains mandatory and unproved.
 - **No owner bootstrap and no arbitrary-child terminal parity (Gate 5).** Managed behaviour stays inert
   until an owner process registers a host; with nothing registered every seam is the pinned baseline.
 - **No dependency activation.** The root `package.json` still installs the released Pi; these artifacts are

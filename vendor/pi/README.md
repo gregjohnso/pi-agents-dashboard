@@ -7,16 +7,18 @@ directory.
 
 Business logic stays in pi-agents. A patch here supplies a native interface and nothing else.
 
-**The series carries three patches today: seam A, seams B/C/F and seam E.** Artifacts built from this lock
-are **patched**, not baseline, and they carry those five seams and nothing else. Seams D and G are not in
-this series and are not present in the artifacts. `build-manifest.json.artifactLabel` records the patched
-state; do not read a working build as evidence of any capability the series does not deliver.
+**The series carries four patches today: seam A, seams B/C/F, seam E and seam G.** Artifacts built from this
+lock are **patched**, not baseline, and they carry those six seams and nothing else. Seam D is not in this
+series and is not present in the artifacts, and the series has no `0004`: that position is left free for the
+independent canonical-admission sibling this lock does not carry. `build-manifest.json.artifactLabel` records
+the patched state; do not read a working build as evidence of any capability the series does not deliver.
 
 **None of it is qualified for activation.** The composed seams are implemented and tested against a built
-cohort, but seam D's public canonical admission/binding-commit API, seam G's drain and arbitrary-child
-terminal parity (Gate 5) do not exist. `INTERFACE.md` section 9 records the composed order and what the
-composition still does not deliver. Do not activate the root dependency and do not describe native
-attachment as shipped.
+cohort, but seam D's public canonical admission/binding-commit API does not exist, and seam G delivers only
+the ordered input drain and the *recognized* external-editor handoff: arbitrary-child terminal parity
+(Gate 5) is unproved. `INTERFACE.md` section 9 records the composed order and what the composition still does
+not deliver, and `INTERFACE-seam-g-child-handoff.md` records seam G's own stated limits. Do not activate the
+root dependency and do not describe native attachment as shipped.
 
 **This is a hybrid build, not a source-only reconstruction.** One input comes from a published upstream
 release artifact rather than from the pinned commit: the generated model data in

@@ -9,9 +9,9 @@ that position: sha256 `18138c0612bf244e3cddb0d9f759b875c6786f1836a84bd082be72071
 commute with them. The number leaves `0004` free for the independent canonical-admission sibling: this branch
 does not carry that patch and nothing here depends on it.
 
-`vendor/pi/INTERFACE.md`, `vendor/pi/README.md` and `vendor/pi/NOTICE.md` are owned by another node and still
-describe a three-patch series. Recording the composed order, the digests and the prepared-tree hash for a
-four-patch series is the integrator's, exactly as it was for seam E.
+`vendor/pi/INTERFACE.md`, `vendor/pi/README.md` and `vendor/pi/NOTICE.md` are owned by the integrator and now
+record the four-patch series: the composed order, the per-position digests and this patch's prepared-tree hash
+are in `INTERFACE.md` section 9.
 
 `test/native-child-handoff.test.mjs` is the acceptance suite that drives this patch through an installed
 artifact cohort, named by `PI_NATIVE_ARTIFACTS_MANIFEST`. With no cohort selected it skips.

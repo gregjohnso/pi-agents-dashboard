@@ -118,13 +118,15 @@ Three holds an integrator must carry into seam G:
    is not awaited by `dispatchNativeInput`.
 3. `StdinBuffer` holds an incomplete sequence for up to 50 ms, and that wait is not awaited either.
 
-Seam G's `drainedThrough` is therefore **not** this counter: it must be `consumedThrough` **plus an explicit
-flush of all three holds** — the incomplete-UTF-8-codepoint hold, the 150 ms split-response fragment window
-and `StdinBuffer`'s 50 ms incomplete-sequence window. A drain that flushes only the two timer windows still
-leaves an unparsed codepoint behind, and a drain that flushes only the codepoint hold still leaves a held
-sequence behind. None of the three flushes exists yet: this lane implements no child spawning, no handoff and
-no arbitrary-child parity, and the composed checkpoint that serializes this patch does not implement them
-either.
+Seam G's `drainedThrough` is the **counter snapshot at the close barrier**, not an arithmetic increment for
+flushing, and it *means* that every byte accepted through that snapshot has been through all three forced
+holds and that every response authorization those bytes started has settled. A drain that flushed only the
+two timer windows would leave an unparsed codepoint behind, and one that flushed only the codepoint hold
+would leave a held sequence behind, so the order is load-bearing: the codepoint hold feeds `StdinBuffer`,
+whose released sequence can classify as a split response fragment. `vendor/pi/patches/0005-native-child-handoff.patch`
+implements exactly that drain and brackets Pi's own recognized external editor with it; see
+`vendor/pi/INTERFACE-seam-g-child-handoff.md`. It implements no arbitrary-child spawning, discovery or
+parity, and this lane's own patch still implements none of the three flushes.
 
 ## What this lane does not deliver
 

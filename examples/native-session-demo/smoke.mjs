@@ -300,11 +300,25 @@ async function driveSmoke({ root, evidenceDir, spawned, recordOwner }) {
   const statusAfterDetach = JSON.parse((await demoCommand(["status", "--root", root], { label: "demo status", spawned })).output);
   if (statusAfterDetach.ownerAliveWithZeroClients !== true) throw new Error(`the owner did not survive detaching every client: ${JSON.stringify(statusAfterDetach)}`);
   if (ownerAfterDetach.startIdentity !== ownerAtStart.startIdentity) throw new Error("the owner's start identity changed across a detach");
+  // The management bridge, observed rather than assumed. `bridge` is the only phase this channel may report,
+  // and it is not a readiness source for the demo: `native-mounted` above still comes from seam E's core
+  // bootstrap. An empty facts record is a real answer — the extension omits every value it cannot read — so
+  // what is required here is the connection and the one phase, not any particular fact.
+  const bridge = statusAfterDetach.bridge ?? {};
+  if (bridge.connected !== true) throw new Error(`the owner never connected to the management bridge: ${JSON.stringify(bridge)}`);
+  if (!(bridge.readyPhases ?? []).includes("bridge")) throw new Error(`the owner reported no bridge readiness phase: ${JSON.stringify(bridge)}`);
+  if ((bridge.readyPhases ?? []).some((phase) => phase !== "bridge")) throw new Error(`the bridge reported a phase it may not report: ${JSON.stringify(bridge)}`);
   steps.push({
     step: "detach-all",
     clientOneExit: exitOne,
     ownerAliveWithZeroClients: statusAfterDetach.ownerAliveWithZeroClients,
     ownerIdentityUnchanged: true,
+    bridge: {
+      connected: bridge.connected,
+      readyPhases: bridge.readyPhases,
+      factKeys: Object.keys(bridge.facts ?? {}).sort(),
+      reportedSeams: bridge.reportedSeams,
+    },
     detachOutput: detached.output.trim(),
   });
 

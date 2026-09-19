@@ -29,12 +29,18 @@
 
 import { chmod } from "node:fs/promises";
 import { appendFileSync } from "node:fs";
+import { randomBytes, randomUUID } from "node:crypto";
 import net from "node:net";
 import path from "node:path";
 import { ReadStream } from "node:tty";
 import { fileURLToPath } from "node:url";
 
 import { inspectProcessIdentity } from "../../runtime/process-identity-linux.mjs";
+import {
+  OWNER_SIDEBAND_SOCKET_ENV,
+  OWNER_SIDEBAND_TOKEN_ENV,
+  listenForOwnerSideband,
+} from "../../runtime/native-sideband.mjs";
 import { openOwnerPty } from "../../runtime/pty-mechanism.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "../../runtime/process-signaler.mjs";
 import { startBootstrapSideband } from "./bootstrap-sideband.mjs";
@@ -153,6 +159,85 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
     onError: (error) => log(`sideband transport: ${error.message}`),
   });
 
+  /**
+   * The owner management bridge: the reviewed sideband, listening before Pi is spawned.
+   *
+   * It is bound first so the endpoint already exists when the in-Pi extension connects out; the extension
+   * opens it beside startup and never in front of it, so a bridge that never connects leaves the demo's own
+   * path untouched. Nothing here is a readiness source for the demo: the mounted, ready and painted receipts
+   * come from seam E's core bootstrap above, and the only phase this channel reports is `bridge`.
+   */
+  const bridgeToken = randomBytes(32).toString("hex");
+  /** @type {any[]} */
+  const bridgeFrames = [];
+  /** @type {any[]} */
+  const bridgeRequests = [];
+  /** @type {any} */
+  let bridgeOwner;
+  const bridge = await listenForOwnerSideband({ socketPath: owned.sidebandSocket, token: bridgeToken });
+  log(`owner bridge listening at ${owned.sidebandSocket}`);
+
+  /** Record one bridge generation. A second connection replaces the first as this demo's current owner. */
+  const adoptBridgeOwner = (connection) => {
+    bridgeOwner = connection;
+    const generation = bridgeFrames.filter((frame) => frame.type === "bridge-connected").length + 1;
+    bridgeFrames.push({ type: "bridge-connected", generation, atHostMs: Date.now() });
+    log(`owner bridge generation ${generation} connected`);
+    connection.onFrame((frame) => {
+      // Every frame is recorded exactly as the owner reported it. Facts the extension could not read are
+      // absent rather than defaulted, and nothing here fills one in.
+      bridgeFrames.push({ ...frame, generation, atHostMs: Date.now() });
+      log(`owner bridge ${frame.type}${frame.type === "owner-ready" ? ` phase ${frame.phase}` : ""}`);
+    });
+    void connection.closed.then((outcome) => {
+      bridgeFrames.push({ type: "bridge-closed", generation, refusal: outcome.refusal ?? null, atHostMs: Date.now() });
+      if (bridgeOwner === connection) bridgeOwner = undefined;
+      log(`owner bridge generation ${generation} closed: ${JSON.stringify(outcome)}`);
+    });
+  };
+
+  /** Accept bridge generations for as long as this listener is open. A closed listener rejects, and ends this. */
+  const acceptBridgeOwners = async () => {
+    for (;;) {
+      let connection;
+      try {
+        connection = await bridge.nextOwner();
+      } catch {
+        return;
+      }
+      adoptBridgeOwner(connection);
+    }
+  };
+  void acceptBridgeOwners();
+
+  /**
+   * Ask the owner to end its own session through the bridge, and record what it answered.
+   *
+   * The receipt says what was asked and what the session looked like when it was asked. It is **not** a stop:
+   * `ctx.shutdown()` is request-only and idle-deferred, so only this manager observing a reaped exit and an
+   * absent owner ends anything. `stop` below does that work whether or not this request was answered.
+   * @param {"stop"|"abort"} request
+   */
+  const requestThroughBridge = async (request) => {
+    const connection = bridgeOwner;
+    if (connection === undefined) {
+      const absent = { request, requestId: null, sent: false, reason: "no owner is connected to the bridge", atHostMs: Date.now() };
+      bridgeRequests.push(absent);
+      return absent;
+    }
+    const requestId = randomUUID();
+    const record = { request, requestId, sent: false, reason: null, atHostMs: Date.now() };
+    try {
+      await (request === "stop" ? connection.requestStop(requestId) : connection.requestAbort(requestId));
+      record.sent = true;
+    } catch (error) {
+      record.reason = /** @type {Error} */ (error).message;
+    }
+    bridgeRequests.push(record);
+    log(`owner bridge ${request} request ${requestId}: ${record.sent ? "sent" : `refused (${record.reason})`}`);
+    return record;
+  };
+
   const ownerEnv = {
     // A replaced environment, not an augmented one: the native spawn does not inherit, and this is the whole
     // list. No API key, no operator HOME, no operator agent directory, no real session store.
@@ -167,6 +252,12 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
     PI_OFFLINE: "1",
     PI_SKIP_VERSION_CHECK: "1",
     PI_NATIVE_BOOTSTRAP_SOCKET: owned.bootstrapSocket,
+    // The management bridge the in-Pi extension connects out to. Its own token, not the control socket's: the
+    // control token authenticates operators and clients, and one credential for two channels would hand a
+    // bridge peer the operator's channel. Pi's own children inherit this environment, so the token bounds
+    // reachability to this user's processes rather than proving which process connected.
+    [OWNER_SIDEBAND_SOCKET_ENV]: owned.sidebandSocket,
+    [OWNER_SIDEBAND_TOKEN_ENV]: bridgeToken,
     PI_DEMO_TUI_PACKAGE: cohort.tuiPackageRoot,
     PI_DEMO_CONTROL_SOCKET: owned.controlSocket,
     PI_DEMO_TOKEN: token,
@@ -292,6 +383,23 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
       readiness,
       presentations,
       childPhases,
+      /**
+       * What the owner management bridge reported, verbatim.
+       *
+       * `readyPhases` can only ever contain `bridge`: the extension emits that one phase and no other, so this
+       * is not a substitute for the seam E receipts in `readiness` above. `requests` are stop/abort receipts,
+       * which record what was asked, never that anything ended.
+       */
+      bridge: {
+        socketPath: owned.sidebandSocket,
+        connected: bridgeOwner !== undefined,
+        readyPhases: bridgeFrames.filter((frame) => frame.type === "owner-ready").map((frame) => frame.phase),
+        facts: Object.assign({}, ...bridgeFrames.filter((frame) => frame.type === "owner-facts").map((frame) => frame.facts)),
+        reportedSeams: bridgeFrames.filter((frame) => frame.type === "owner-seams").map((frame) => frame.reported),
+        receipts: bridgeFrames.filter((frame) => frame.type === "owner-receipt"),
+        requests: bridgeRequests,
+        frames: bridgeFrames,
+      },
       ingressReady,
       attachments: [...clients.values()].map((client) => ({ attachmentId: client.id, epoch: client.epoch })),
       issuedEpochs: [...epochs.entries()].map(([id, epoch]) => ({ attachmentId: id, epoch })),
@@ -460,6 +568,9 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
     for (const client of [...clients.values()]) detachClient(client, "the owner is stopping");
 
     const alreadyReaped = handle.reapIfExited();
+    // The bridge is asked first, and what comes back is a receipt rather than an outcome: every verification
+    // below runs exactly as it did before this channel existed.
+    if (alreadyReaped === null) await requestThroughBridge("stop");
     if (alreadyReaped === null && ingressReady && ingress && !ingress.destroyed) {
       log("dispatching Pi's own end-of-input as the graceful stop gesture");
       forwardInput({ attachmentId: "manager-stop", epoch: 1, generation: 1, bytes: Buffer.from([0x04]) });
@@ -494,6 +605,8 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
     // terminal. It happens once, after the owner is gone, and nothing closes that fd again.
     ownerOutput.destroy();
     await sideband.close();
+    // The management bridge ends with its owner. Closing it rejects the accept loop and unlinks its endpoint.
+    await bridge.close();
     if (keepRoot) log("--keep-root was asked for; this demo removes no root at all, so the flag changes nothing");
     const pathStillNamesCreatedDirectory = await anchor.namesCreatedDirectory();
     const retention = {

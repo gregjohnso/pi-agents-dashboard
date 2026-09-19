@@ -50,6 +50,14 @@ export function demoPaths(root) {
     controlSocket: path.join(root, "s"),
     /** Seam E's core bootstrap sideband, which Pi connects out to from `main()`. */
     bootstrapSocket: path.join(root, "b"),
+    /**
+     * The owner management bridge: the in-Pi extension connects out to this one.
+     *
+     * One character for the same reason the two above are: an `AF_UNIX` path is capped at 108 bytes and the
+     * operator chooses the root. It is a sibling of the control socket inside the same `0700` directory, so
+     * the bridge is reachable by this user and nobody else.
+     */
+    sidebandSocket: path.join(root, "g"),
     token: path.join(root, "token"),
     /** Written once, at creation, as provenance for whoever reads a retained root. It authorises nothing. */
     ownership: path.join(root, "ownership.json"),

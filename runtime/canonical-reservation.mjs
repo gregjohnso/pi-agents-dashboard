@@ -440,6 +440,20 @@ function claimKeyOf(record) {
  * authoritative, in the `committed` or `transferred` record. And every record after a `prepared` must
  * name the same owner run and the same target the reservation reserved; anything else means two writers
  * disagree about this journal's history, which is refused rather than skipped.
+ *
+ * Schema validity is not enough for any of that, so the **transition** is checked too. Each writer above
+ * refuses to record a state it is not in — `abortReservation` refuses a committed reservation,
+ * `releaseCommitted` refuses an uncommitted one, a commit spends its reservation id — and replay enforces
+ * exactly those preconditions: `aborted` only from `prepared`, `released` only from `committed`, and
+ * `committed`/`transferred` only once. A `cleared` record has to name the exact reservation it clears, not
+ * merely a file and an owner. A `transferred` record has to release this owner run's own bound claim,
+ * which is the only identity `transfer` ever writes there.
+ *
+ * Without those checks a complete, schema-valid record could still erase a claim it never had the right to
+ * touch: an `aborted` appended after `committed` would free a file Pi may still be writing, which is the
+ * opposite of failing closed. Every mismatch is `JOURNAL_INCONSISTENT` — the record is evidence of a
+ * second writer disagreeing about this history, so nothing is decided from the journal at all rather than
+ * the offending line being skipped.
  * @param {any[]} records @returns {Claim[]}
  */
 function foldClaims(records) {
@@ -454,10 +468,14 @@ function foldClaims(records) {
     }
   };
   records.forEach((record, index) => {
+    const inconsistent = (/** @type {string} */ detail) => new CanonicalReservationError("JOURNAL_INCONSISTENT", `journal record ${index} ${detail}`);
     if (record.record === "cleared") {
-      // An operator clears another owner run's claim, so this record names the claim and its owner.
-      if (!claims.some((claim) => sameIdentity(claim.target, record.target) && sameOwnerRun(claim.owner, record.clearedOwner))) {
-        throw new CanonicalReservationError("JOURNAL_INCONSISTENT", `journal record ${index} clears a claim this journal does not hold`);
+      // An operator clears another owner run's claim, so this record names the exact reservation, its owner
+      // and its file. A clear that names a reservation this journal does not hold on that file is refused:
+      // matching the file and the owner alone would let a wrong reservation id free a claim.
+      const cleared = claims.find((claim) => sameIdentity(claim.target, record.target) && sameOwnerRun(claim.owner, record.clearedOwner) && claim.reservationId === record.clearedReservationId);
+      if (cleared === undefined) {
+        throw inconsistent(`clears reservation ${record.clearedReservationId}, which owner run ${record.clearedOwner.runId} does not hold on ${record.target.canonicalFile} in this journal`);
       }
       dropOwned(record.target, record.clearedOwner, null);
       return;
@@ -465,32 +483,54 @@ function foldClaims(records) {
     const key = claimKeyOf(record);
     if (record.record === "prepared") {
       if (indexOfKey(key) >= 0) {
-        throw new CanonicalReservationError("JOURNAL_INCONSISTENT", `journal record ${index} prepares reservation ${record.reservationId} a second time`);
+        throw inconsistent(`prepares reservation ${record.reservationId} a second time`);
       }
       const foreign = claims.find((claim) => sameIdentity(claim.target, record.target) && !sameOwnerRun(claim.owner, record.owner));
       if (foreign !== undefined) {
-        throw new CanonicalReservationError("JOURNAL_INCONSISTENT", `journal record ${index} reserves ${record.target.canonicalFile} while owner run ${foreign.owner.runId} holds a claim on it`);
+        throw inconsistent(`reserves ${record.target.canonicalFile} while owner run ${foreign.owner.runId} holds a claim on it`);
       }
       claims.push({ key, owner: record.owner, reservationId: record.reservationId, operation: record.operation, generation: record.generation, binds: false, state: "prepared", target: record.target });
       return;
     }
     const at = indexOfKey(key);
     if (at < 0) {
-      throw new CanonicalReservationError("JOURNAL_INCONSISTENT", `journal record ${index} is a ${record.record} for a reservation this journal never prepared`);
+      throw inconsistent(`is a ${record.record} for a reservation this journal never prepared`);
     }
     const claim = claims[at];
     if (!sameOwnerRun(claim.owner, record.owner)) {
-      throw new CanonicalReservationError("JOURNAL_INCONSISTENT", `journal record ${index} is a ${record.record} from an owner run that does not hold reservation ${record.reservationId}`);
+      throw inconsistent(`is a ${record.record} from an owner run that does not hold reservation ${record.reservationId}`);
     }
     if (!sameIdentity(claim.target, record.target)) {
-      throw new CanonicalReservationError("JOURNAL_INCONSISTENT", `journal record ${index} is a ${record.record} naming ${record.target.canonicalFile}, which reservation ${record.reservationId} did not reserve`);
+      throw inconsistent(`is a ${record.record} naming ${record.target.canonicalFile}, which reservation ${record.reservationId} did not reserve`);
     }
     if (record.record === "committed" || record.record === "transferred") {
+      if (claim.state !== "prepared") {
+        throw inconsistent(`is a second ${record.record} for reservation ${record.reservationId}, which this journal already committed`);
+      }
+      if (record.record === "transferred") {
+        if (sameIdentity(record.released, claim.target)) {
+          throw inconsistent(`transfers reservation ${record.reservationId} onto ${record.target.canonicalFile}, the file it claims to release`);
+        }
+        // `transfer` only ever releases the claim this owner run is bound to, so anything else here is a
+        // record moving a binding that was never held.
+        const boundClaim = claims.find((held) => held.state === "committed" && held.binds && sameOwnerRun(held.owner, record.owner) && sameIdentity(held.target, record.released));
+        if (boundClaim === undefined) {
+          throw inconsistent(`transfers reservation ${record.reservationId} releasing ${record.released.canonicalFile}, which is not this owner run's bound claim`);
+        }
+      }
       claims[at] = { ...claim, state: "committed", generation: record.generation, binds: record.record === "transferred" ? true : record.binds === true, target: record.target };
       if (record.record === "transferred") dropOwned(record.released, record.owner, key);
       // Now that this reservation is authoritative, the claim it supersedes on the same identity goes.
       dropOwned(record.target, record.owner, key);
       return;
+    }
+    // The two terminal records each come from exactly one state, because that is the only state their
+    // writer will record them from: an abort is how a reservation that mutated nothing ends, and a release
+    // is the explicit end of a committed claim. Accepting either from the other state is what would let a
+    // schema-valid line erase a claim it has no right to.
+    const from = record.record === "aborted" ? "prepared" : "committed";
+    if (claim.state !== from) {
+      throw inconsistent(`is an ${record.record} for reservation ${record.reservationId} while its claim is ${claim.state}; a ${record.record} is only ever recorded from ${from}`);
     }
     claims.splice(at, 1);
   });

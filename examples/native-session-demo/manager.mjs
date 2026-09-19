@@ -106,6 +106,23 @@ const BRIDGE_RECENT_ENTRIES = 16;
 const BRIDGE_RECENT_BYTES = 8_192;
 /** How much of one stored string is kept. Long enough to identify, short enough that a ring cannot blow up. */
 const BRIDGE_TEXT_LIMIT = 256;
+/**
+ * How much this consumer may ever write to the manager's log, by entries and by UTF-8 bytes.
+ *
+ * These diagnostics are not Pi's transcript and not an audit ledger: they are a non-authoritative account of what
+ * the bridge did, and the manager appends them to a file that nothing rotates. Every legitimate request an owner
+ * answers used to produce a line, so a healthy peer doing nothing wrong grew that file without bound - and so did
+ * repeated reconnects, capacity refusals and generation refusals, which is why the budget belongs to the
+ * consumer's whole lifetime and is not reset when a generation is superseded.
+ *
+ * What is bounded is only what gets written. Admission, authorization, in-flight accounting and the lifetime
+ * totals are untouched: an owner may still be asked to do unlimited sequential work, and `logDropped` says
+ * exactly how much of the account of it was not written down.
+ */
+const BRIDGE_LOG_ENTRIES = 64;
+const BRIDGE_LOG_BYTES = 16_384;
+/** One emitted line, clamped so a single line cannot consume the whole byte budget. */
+const BRIDGE_LOG_LINE = 240;
 
 /**
  * The consumer side of the owner management bridge: one active generation, bounded retention.
@@ -169,6 +186,39 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
   let droppedEvents = 0;
   const counts = { frames: 0, refusedGenerations: 0, supersededGenerations: 0 };
 
+  let logEmitted = 0;
+  let logBytes = 0;
+  let logDropped = 0;
+  let logNoticed = false;
+
+  /**
+   * Write one bridge diagnostic line, or count it as dropped.
+   *
+   * Every log path in this consumer goes through here, so the budget covers request lines, capacity refusals,
+   * generation refusals, close failures, connects and supersessions alike - bounding only the request line would
+   * leave reconnect churn unbounded. The budget is this consumer's, not a generation's, so it is not refilled by
+   * a peer that reconnects. When it runs out, exactly one notice is written saying so and naming the counter that
+   * carries the rest; after that the lines are counted and discarded.
+   * @param {string} line
+   */
+  const emit = (line) => {
+    const text = line.length > BRIDGE_LOG_LINE ? `${line.slice(0, BRIDGE_LOG_LINE)}…` : line;
+    const size = Buffer.byteLength(text, "utf8") + 1;
+    if (logEmitted >= BRIDGE_LOG_ENTRIES || logBytes + size > BRIDGE_LOG_BYTES) {
+      logDropped += 1;
+      if (logNoticed) return;
+      logNoticed = true;
+      const notice = `owner bridge reached its lifetime log budget of ${BRIDGE_LOG_ENTRIES} entries and ${BRIDGE_LOG_BYTES} bytes; further bridge lines are counted in counts.logDropped and not written`;
+      logEmitted += 1;
+      logBytes += Buffer.byteLength(notice, "utf8") + 1;
+      log(notice);
+      return;
+    }
+    logEmitted += 1;
+    logBytes += size;
+    log(text);
+  };
+
   /** @param {Record<string, unknown>} event */
   const note = (event) => {
     events.push({ ...event, atHostMs: now() });
@@ -184,11 +234,11 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
     owner.refusal = reason;
     counts.refusedGenerations += 1;
     note({ type: "bridge-refused", generation: owner.generation, reason });
-    log(`owner bridge generation ${owner.generation} refused: ${reason}`);
+    emit(`owner bridge generation ${owner.generation} refused: ${reason}`);
     try {
       owner.connection.close();
     } catch (error) {
-      log(`owner bridge generation ${owner.generation} close failed: ${/** @type {Error} */ (error).message}`);
+      emit(`owner bridge generation ${owner.generation} close failed: ${/** @type {Error} */ (error).message}`);
     }
   };
 
@@ -272,22 +322,22 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
       };
       active = owner;
       note({ type: "bridge-connected", generation: owner.generation });
-      log(`owner bridge generation ${owner.generation} connected`);
+      emit(`owner bridge generation ${owner.generation} connected`);
       if (previous !== undefined && !previous.closed) {
         counts.supersededGenerations += 1;
         note({ type: "bridge-superseded", generation: previous.generation, by: owner.generation });
-        log(`owner bridge generation ${previous.generation} superseded by ${owner.generation}`);
+        emit(`owner bridge generation ${previous.generation} superseded by ${owner.generation}`);
         try {
           previous.connection.close();
         } catch (error) {
-          log(`owner bridge generation ${previous.generation} close failed: ${/** @type {Error} */ (error).message}`);
+          emit(`owner bridge generation ${previous.generation} close failed: ${/** @type {Error} */ (error).message}`);
         }
       }
       connection.onFrame((/** @type {any} */ frame) => admit(owner, frame));
       void connection.closed.then((/** @type {any} */ outcome) => {
         owner.closed = true;
         note({ type: "bridge-closed", generation: owner.generation, refusal: outcome?.refusal ?? null });
-        log(`owner bridge generation ${owner.generation} closed: ${JSON.stringify(outcome)}`);
+        emit(`owner bridge generation ${owner.generation} closed: ${JSON.stringify(outcome)}`);
       });
       return owner.generation;
     },
@@ -325,7 +375,7 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
           atHostMs: now(),
         };
         note({ type: "bridge-request-capacity", request, generation: owner.generation, inFlight: owner.awaiting.size });
-        log(`owner bridge ${request} request refused on generation ${owner.generation}: in-flight capacity ${owner.awaiting.size} reached`);
+        emit(`owner bridge ${request} request refused on generation ${owner.generation}: in-flight capacity ${owner.awaiting.size} reached`);
         return full;
       }
       const record = { request, requestId, generation: owner.generation, admitted: true, sent: false, reason: /** @type {string|null} */ (null), atHostMs: now() };
@@ -351,7 +401,7 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
         atHostMs: record.atHostMs,
       });
       note({ type: "bridge-request", request, sent: record.sent, generation: owner.generation });
-      log(`owner bridge ${request} request ${String(requestId).slice(0, 64)} on generation ${owner.generation}: ${record.sent ? "sent" : `refused (${record.reason})`}`);
+      emit(`owner bridge ${request} request ${String(requestId).slice(0, 64)} on generation ${owner.generation}: ${record.sent ? "sent" : `refused (${record.reason})`}`);
       return record;
     },
 
@@ -379,7 +429,16 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
           ? { requested: 0, sent: 0, refused: 0, receipted: 0, capacityRefusals: 0, droppedRequests: 0, droppedReceipts: 0 }
           : { ...owner.totals, droppedRequests: owner.requests.dropped(), droppedReceipts: owner.receipts.dropped() },
         refusal: owner?.refusal ?? null,
-        counts: { ...counts, droppedEvents },
+        // Additive: the existing count names are unchanged, and these say how much of this consumer's own
+        // account of its work was written and how much was only counted.
+        counts: {
+          ...counts,
+          droppedEvents,
+          logEmitted,
+          logDropped,
+          logBudgetEntries: BRIDGE_LOG_ENTRIES,
+          logBudgetBytes: BRIDGE_LOG_BYTES,
+        },
         diagnostics: [...events],
       };
     },

@@ -1196,7 +1196,12 @@ it("leaves the endpoint in place when the parent goes away after the bind", asyn
  * @param {"disconnect"|"hold"} mode @param {string} socketPath
  */
 async function disposableParent(mode, socketPath) {
-  const child = spawn(process.execPath, [fileURLToPath(fixture("disposable-parent.mjs")), mode, socketPath], {
+  const child = spawn(process.execPath, [
+    fileURLToPath(fixture("disposable-parent.mjs")),
+    mode,
+    fileURLToPath(fixture("held-handoff-binder.mjs")),
+    socketPath,
+  ], {
     stdio: ["pipe", "pipe", "pipe"],
     env: { PATH: "/usr/bin:/bin" },
   });
@@ -1242,11 +1247,12 @@ async function disposableParent(mode, socketPath) {
     await exited;
   });
 
-  // These two markers together mean: the disposable parent exists, the production binder is its child, and that
-  // binder has bound the endpoint. Its handoff cannot complete, because the acknowledgement needs the parent's
-  // event loop and that loop is blocked.
+  // These markers together mean: the disposable parent exists, a real child is running the production
+  // `runBinder`, that binder has bound the real endpoint, and its handoff is written and held. There is no race
+  // left to lose - the binder is bound and waiting when the parent loss below happens.
   await waitFor(/binder-pid \d+/u);
   await waitFor(/native-sideband-binder: bound .* inode \d+/u);
+  await waitFor(/held-handoff-binder: handoff written and held/u);
   const parentPid = Number(/disposable-parent-pid (\d+)/u.exec(text)?.[1]);
   const binderPid = Number(/binder-pid (\d+)/u.exec(text)?.[1]);
   expect(parentPid).toBe(child.pid);
@@ -1260,7 +1266,7 @@ async function disposableParent(mode, socketPath) {
     exited,
     bothGone,
     text: () => text,
-    /** Release the barrier. This is the only way this parent ever runs code again. */
+    /** Tell the disposable parent to close its channel. Only `disconnect` mode listens for this. */
     release: () => child.stdin.end("g"),
     /**
      * Kill only the process this helper started.

@@ -684,12 +684,15 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
   try {
     await answered;
     if (outcomeNow() === "adopted") {
-      // The helper must be gone before this listener is usable. An acknowledged send is not that proof, so its
-      // real completion is awaited, bounded by the same deadline a stuck helper would otherwise outlast.
-      if (helper.connected) helper.disconnect();
+      // The channel stays open until the helper's own exit and its channel's drain. Closing it here - which this
+      // used to do - shut the only path that can reveal a second handoff or any other late traffic, so a helper
+      // that sent a valid handoff and then misbehaved was indistinguishable from one that did not. Waiting costs
+      // nothing: the helper leaves immediately after its handoff, and a helper that does not is what the
+      // deadline below is for. The listener is provisional until that wait finishes clean.
       if (!completed) await Promise.race([completion, deadline]);
       if (timedOut) throw new NativeSidebandError("SIDEBAND_BINDER_TIMEOUT", `the socket binder handed over a listener and then did not exit within ${timeoutMs}ms`);
-      // Re-checked after completion: a duplicate or late message during the wait is a refusal that must land.
+      // Read after completion, so a duplicate or malformed message that arrived during the wait is the outcome
+      // rather than something the attempt raced past.
       if (refusal !== undefined) throw new NativeSidebandError(refusal.code, refusal.message);
       if (exited === undefined || exited.code !== 0) {
         throw new NativeSidebandError("SIDEBAND_BINDER_INCOMPLETE", `the socket binder handed over a listener and then ended with code ${exited?.code ?? "none"} signal ${exited?.signal ?? "none"}`);

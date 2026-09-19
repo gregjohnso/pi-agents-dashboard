@@ -586,16 +586,29 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
     refuse("SIDEBAND_BINDER_UNUSABLE", `the socket binder could not be started: ${error.message}`);
     // A spawn failure emits `error` and `close` and may never emit `exit`; `close` below is what completes it.
   });
+  // Completion needs two independent facts, and an exit alone is not enough. A child's exit is reported through
+  // SIGCHLD, with no ordering against the IPC channel, so settling on it races a handoff that has been written
+  // and acknowledged but not yet emitted on this side - and the attempt would report an incomplete helper for a
+  // listener it was about to receive. The channel's own `disconnect` is the drain signal: the channel is parsed
+  // in order, so every message the helper sent has been emitted before it. Both, then, and not either.
+  let channelClosed = helper.connected === false;
+  const completeWhenDrained = () => {
+    if (exited !== undefined && channelClosed) noteCompletion();
+  };
   helper.once("exit", (/** @type {number|null} */ code, /** @type {string|null} */ signal) => {
-    // Recorded, but deliberately not treated as completion. See `close` below.
     exited = { code, signal };
+    completeWhenDrained();
   });
-  // `close` is what completes this attempt, not `exit`. A child's exit is observed through SIGCHLD,
-  // independently of the IPC channel, so settling on it races a handoff that has been written and acknowledged
-  // but not yet emitted on this side - and the attempt would report an incomplete helper for a listener it was
-  // about to receive. `close` fires once the channel and the helper's streams are closed, by which point every
-  // message it sent has been delivered. It is also the backstop for a spawn failure that never reaches `exit`.
-  helper.once("close", () => noteCompletion());
+  helper.once("disconnect", () => {
+    channelClosed = true;
+    completeWhenDrained();
+  });
+  // The backstop for a child that never reached `exit` at all, such as a spawn failure, so nothing below waits
+  // for an event that cannot arrive.
+  helper.once("close", () => {
+    channelClosed = true;
+    noteCompletion();
+  });
   // No refusal is raised for `disconnect`. A channel closing is what every ending child does, and treating it
   // as a failure both pre-empted the accurate diagnosis and could discard a handoff already in flight. What
   // decides is observed completion below, and a child that disconnects without completing meets the deadline.
@@ -664,7 +677,7 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
     if (outcomeNow() === "adopted") {
       // The helper must be gone before this listener is usable. An acknowledged send is not that proof, so its
       // real completion is awaited, bounded by the same deadline a stuck helper would otherwise outlast.
-      helper.disconnect();
+      if (helper.connected) helper.disconnect();
       if (!completed) await completion;
       if (timedOut) throw new NativeSidebandError("SIDEBAND_BINDER_TIMEOUT", `the socket binder handed over a listener and then did not exit within ${timeoutMs}ms`);
       // Re-checked after completion: a duplicate or late message during the wait is a refusal that must land.

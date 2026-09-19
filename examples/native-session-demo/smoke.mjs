@@ -16,6 +16,11 @@
  *
  * Every wait is on an event — a terminal read, a process exit, a socket answer — with a bound that fails the
  * smoke rather than hanging it. Timings are measured, not claimed.
+ *
+ * A pass is a conjunction, not a default. `passed` is true only when every step above held *and* the stop was
+ * verified: the original owner demonstrably gone, and an actual raw `wait(2)` status for it. An inspection that
+ * cannot answer — a permission error, malformed proc data, an ambiguous identity — is uncertainty, and
+ * uncertainty fails. The standalone run and the Vitest wrapper read that same verdict.
  */
 
 import { cp, mkdir, writeFile } from "node:fs/promises";
@@ -25,6 +30,7 @@ import { fileURLToPath } from "node:url";
 
 import { openOwnerPty } from "../../runtime/pty-mechanism.mjs";
 import { inspectProcessIdentity } from "../../runtime/process-identity-linux.mjs";
+import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "../../runtime/process-signaler.mjs";
 import { FAKE_REPLY_PREFIX, deterministicReply } from "./fake-provider.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -32,9 +38,55 @@ const DEMO = path.join(HERE, "demo.mjs");
 const COLS = 100;
 const ROWS = 30;
 const CLIENT_ENV = { PATH: "/usr/bin:/bin", HOME: "/tmp", TERM: "xterm-256color", COLUMNS: String(COLS), LINES: String(ROWS), LANG: "C.UTF-8" };
+/** Only ever applied to a process this smoke spawned, re-verified by identity immediately before every signal. */
+const CLEANUP_STOP_POLICY = { gracefulMs: 2_000, terminateMs: 2_000 };
 
 const DRAFT = "unsent draft from client one";
 const SECOND_EDIT = " and an edit from client two";
+
+/**
+ * Is the process that owned this session demonstrably gone?
+ *
+ * `ENOENT`/`ESRCH` from procfs is absence. A live PID carrying another start identity is absence too: the
+ * original owner is gone and the number was reused. Everything else — `EACCES`, malformed proc data, an
+ * ambiguous identity — is an inspection that could not answer, and that is not absence.
+ *
+ * @param {number} pid @param {string} startIdentity
+ * @param {(pid: number) => Promise<{ pid: number, processGroupId: number, startIdentity: string }>} [inspect]
+ */
+export async function verifyOwnerAbsence(pid, startIdentity, inspect = inspectProcessIdentity) {
+  try {
+    const found = await inspect(pid);
+    if (found.startIdentity !== startIdentity) {
+      return { gone: true, reason: `pid ${pid} now carries start identity ${found.startIdentity}, not the owner's ${startIdentity}`, observed: found };
+    }
+    return { gone: false, reason: `pid ${pid} is still live with the owner's start identity ${startIdentity}`, observed: found };
+  } catch (cause) {
+    const code = /** @type {any} */ (cause)?.code ?? null;
+    if (code === "ENOENT" || code === "ESRCH") return { gone: true, reason: `procfs reports ${code} for pid ${pid}`, code };
+    return { gone: false, reason: `inspecting pid ${pid} could not answer (${code ?? /** @type {Error} */ (cause).message}), so absence is unproven`, code };
+  }
+}
+
+/**
+ * What the stop answer actually proves about the owner's exit.
+ *
+ * A disposition is a description of what the manager did; only a raw `wait(2)` status with an exit code or a
+ * terminating signal is evidence that the owner exited. A stop that timed out without one is reported as
+ * unverified rather than successful, and its diagnostics are kept.
+ *
+ * @param {any} exit
+ */
+export function describeOwnerExit(exit) {
+  if (exit === null || typeof exit !== "object") return { observed: false, reason: "the stop answer carried no exit record" };
+  const disposition = exit.disposition ?? null;
+  if (exit.waitObserved === false) return { observed: false, reason: `the manager observed no wait status (disposition ${JSON.stringify(disposition)})`, disposition };
+  if (!Number.isInteger(exit.status)) return { observed: false, reason: `the stop answer carried no raw wait status (disposition ${JSON.stringify(disposition)})`, disposition };
+  if (!Number.isInteger(exit.code) && typeof exit.signal !== "string") {
+    return { observed: false, reason: `raw wait status ${exit.status} named neither an exit code nor a terminating signal`, disposition };
+  }
+  return { observed: true, status: exit.status, code: Number.isInteger(exit.code) ? exit.code : null, signal: typeof exit.signal === "string" ? exit.signal : null, disposition };
+}
 
 /** Escape sequences are the transport, not the content: assertions read the text a human would see. */
 export function stripSequences(text) {
@@ -46,7 +98,7 @@ export function stripSequences(text) {
 }
 
 /** One process on its own pseudo-terminal, with event-driven waits over what it printed. */
-async function openPtyProcess({ args, label }) {
+async function openPtyProcess({ args, label, spawned }) {
   const handle = await openOwnerPty({ command: process.execPath, args, env: CLIENT_ENV, cwd: "/tmp", cols: COLS, rows: ROWS });
   const stream = new ReadStream(handle.masterFd);
   let raw = "";
@@ -61,7 +113,7 @@ async function openPtyProcess({ args, label }) {
       }
     }
   });
-  return {
+  const opened = {
     label,
     handle,
     raw: () => raw,
@@ -120,11 +172,47 @@ async function openPtyProcess({ args, label }) {
       }
     },
   };
+  // Recorded so a failure can stop exactly the processes this smoke started, by their own spawned identity.
+  spawned.push(opened);
+  return opened;
+}
+
+/** Stop one process this smoke started, and only while its recorded identity still matches. */
+async function stopIdentifiedProcess(identity, label) {
+  const outcome = await stopVerifiedProcessGroup(
+    { pid: identity.pid, processGroupId: identity.processGroupId, startIdentity: identity.startIdentity },
+    { inspect: (pid) => inspectProcessIdentity(pid), requestGraceful: async () => {}, signalProcessGroup, sleep },
+    CLEANUP_STOP_POLICY,
+  );
+  return { label, pid: identity.pid, ...outcome };
+}
+
+/**
+ * Clean up after a smoke that did not pass: this demo's own owner, through its own `stop`, and the client
+ * processes this smoke spawned. Every signal goes through the repository's verified group stop, which re-reads
+ * PID, start identity and process group first, so a recycled PID is refused. Nothing broader is signalled.
+ */
+async function cleanUpAfterFailure({ root, spawned, owner }) {
+  const record = { demoStop: null, owner: null, spawned: [] };
+  try {
+    const answer = await demoCommand(["stop", "--root", root, "--keep-root"], { label: "demo stop (cleanup)", spawned });
+    record.demoStop = { exit: answer.exit, output: answer.output.trim().slice(-600) };
+  } catch (error) {
+    record.demoStop = { error: /** @type {Error} */ (error).message };
+  }
+  if (owner !== undefined && owner !== null) {
+    record.owner = await stopIdentifiedProcess(owner, "owner").catch((error) => ({ label: "owner", error: error.message }));
+  }
+  for (const process_ of spawned) {
+    if (process_.handle.reapIfExited() !== null) continue;
+    record.spawned.push(await stopIdentifiedProcess(process_.handle.owner, process_.label).catch((error) => ({ label: process_.label, error: error.message })));
+  }
+  return record;
 }
 
 /** One demo command, run to completion, with its stdout captured. Exit status is asserted, never ignored. */
-async function demoCommand(args, { label }) {
-  const process_ = await openPtyProcess({ args: [DEMO, ...args], label });
+async function demoCommand(args, { label, spawned }) {
+  const process_ = await openPtyProcess({ args: [DEMO, ...args], label, spawned });
   const exit = await process_.waitForExit();
   if (exit.code !== 0) {
     throw new Error(`${label} exited ${JSON.stringify(exit)}; output was ${JSON.stringify(process_.visible().slice(-2000))}`);
@@ -137,6 +225,32 @@ async function demoCommand(args, { label }) {
  */
 export async function runSmoke({ root, evidenceDir }) {
   await mkdir(evidenceDir, { recursive: true });
+  /** Every process this smoke spawned, so a failure stops exactly those and nothing else. */
+  const spawned = [];
+  /** @type {{ pid: number, processGroupId: number, startIdentity: string } | null} */
+  let owner = null;
+  try {
+    return await driveSmoke({ root, evidenceDir, spawned, recordOwner: (identity) => { owner = identity; } });
+  } catch (error) {
+    const cleanup = await cleanUpAfterFailure({ root, spawned, owner });
+    const failure = {
+      failed: true,
+      failures: [/** @type {Error} */ (error).message],
+      root,
+      owner,
+      cleanup,
+      note: "This run did not pass. The demo's own stop was attempted and only this smoke's own processes were signalled, by verified identity. A smoke-result.json beside this file, if present, holds the step evidence collected before the failure.",
+      atMs: Date.now(),
+    };
+    await writeFile(path.join(evidenceDir, "smoke-failure.json"), `${JSON.stringify(failure, null, 2)}\n`);
+    throw error;
+  }
+}
+
+/**
+ * @param {{ root: string, evidenceDir: string, spawned: any[], recordOwner: (identity: { pid: number, processGroupId: number, startIdentity: string }) => void }} options
+ */
+async function driveSmoke({ root, evidenceDir, spawned, recordOwner }) {
   const timings = {};
   const at = (name, from) => {
     timings[name] = Date.now() - from;
@@ -151,19 +265,20 @@ export async function runSmoke({ root, evidenceDir }) {
   const startArgs = [DEMO, "start", "--root", root, "--cols", String(COLS), "--rows", String(ROWS)];
   note("start", startArgs);
   const startedFrom = Date.now();
-  const started = await demoCommand(startArgs.slice(1), { label: "demo start" });
+  const started = await demoCommand(startArgs.slice(1), { label: "demo start", spawned });
   at("startMs", startedFrom);
   const ownerPid = Number(/owner pid (\d+)/u.exec(started.output)?.[1]);
   const ownerStartIdentity = /startIdentity (\d+)/u.exec(started.output)?.[1];
   if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) throw new Error(`demo start printed no owner pid: ${started.output}`);
   const ownerAtStart = await inspectProcessIdentity(ownerPid);
+  recordOwner(ownerAtStart);
   steps.push({ step: "start", ownerPid, ownerStartIdentity, output: started.output.trim() });
 
   // 1. The first attachment, on its own terminal.
   const attachOneArgs = [DEMO, "attach", "--root", root, "--id", "client-1"];
   note("attach client-1", attachOneArgs);
   const attachFrom = Date.now();
-  const clientOne = await openPtyProcess({ args: attachOneArgs, label: "client-1" });
+  const clientOne = await openPtyProcess({ args: attachOneArgs, label: "client-1", spawned });
   await clientOne.waitFor((visible) => visible.includes("attached as client-1 epoch 1"), "client-1 welcome");
   await clientOne.waitFor((visible) => visible.includes("native-session-demo"), "the first cold presentation");
   at("firstAttachToPaintMs", attachFrom);
@@ -178,10 +293,10 @@ export async function runSmoke({ root, evidenceDir }) {
   // 3. Detach everything. The owner must survive it.
   const detachArgs = [DEMO, "detach", "--root", root];
   note("detach all", detachArgs);
-  const detached = await demoCommand(detachArgs.slice(1), { label: "demo detach" });
+  const detached = await demoCommand(detachArgs.slice(1), { label: "demo detach", spawned });
   const exitOne = await clientOne.waitForExit();
   const ownerAfterDetach = await inspectProcessIdentity(ownerPid);
-  const statusAfterDetach = JSON.parse((await demoCommand(["status", "--root", root], { label: "demo status" })).output);
+  const statusAfterDetach = JSON.parse((await demoCommand(["status", "--root", root], { label: "demo status", spawned })).output);
   if (statusAfterDetach.ownerAliveWithZeroClients !== true) throw new Error(`the owner did not survive detaching every client: ${JSON.stringify(statusAfterDetach)}`);
   if (ownerAfterDetach.startIdentity !== ownerAtStart.startIdentity) throw new Error("the owner's start identity changed across a detach");
   steps.push({
@@ -196,7 +311,7 @@ export async function runSmoke({ root, evidenceDir }) {
   const reattachArgs = [DEMO, "attach", "--root", root, "--id", "client-1"];
   note("reattach client-1", reattachArgs);
   const reattachFrom = Date.now();
-  const clientOneAgain = await openPtyProcess({ args: reattachArgs, label: "client-1-epoch-2" });
+  const clientOneAgain = await openPtyProcess({ args: reattachArgs, label: "client-1-epoch-2", spawned });
   await clientOneAgain.waitFor((visible) => visible.includes("attached as client-1 epoch 2"), "client-1 epoch 2 welcome");
   await clientOneAgain.waitFor((visible) => visible.includes(DRAFT), "the retained draft on the repainted screen");
   at("reattachToRetainedDraftMs", reattachFrom);
@@ -206,7 +321,7 @@ export async function runSmoke({ root, evidenceDir }) {
   const attachTwoArgs = [DEMO, "attach", "--root", root, "--id", "client-2"];
   note("attach client-2", attachTwoArgs);
   const secondFrom = Date.now();
-  const clientTwo = await openPtyProcess({ args: attachTwoArgs, label: "client-2" });
+  const clientTwo = await openPtyProcess({ args: attachTwoArgs, label: "client-2", spawned });
   await clientTwo.waitFor((visible) => visible.includes("attached as client-2 epoch 1"), "client-2 welcome");
   await clientTwo.waitFor((visible) => visible.includes(DRAFT), "the shared draft on client-2's own cold presentation");
   at("secondAttachToSharedDraftMs", secondFrom);
@@ -234,21 +349,22 @@ export async function runSmoke({ root, evidenceDir }) {
   });
 
   // 7. Explicit stop. It reports the owner's real wait status and takes nothing else with it.
-  const detachBoth = await demoCommand(["detach", "--root", root], { label: "demo detach (second round)" });
+  const detachBoth = await demoCommand(["detach", "--root", root], { label: "demo detach (second round)", spawned });
   const exitTwo = await clientTwo.waitForExit();
   const exitOneAgain = await clientOneAgain.waitForExit();
   const stopArgs = [DEMO, "stop", "--root", root, "--keep-root"];
   note("stop", stopArgs);
   const stopFrom = Date.now();
-  const stopped = JSON.parse((await demoCommand(stopArgs.slice(1), { label: "demo stop" })).output);
+  const stopped = JSON.parse((await demoCommand(stopArgs.slice(1), { label: "demo stop", spawned })).output);
   at("stopMs", stopFrom);
-  let ownerGone = false;
-  try {
-    await inspectProcessIdentity(ownerPid);
-  } catch {
-    ownerGone = true;
-  }
-  steps.push({ step: "stop", detachOutput: detachBoth.output.trim(), clientTwoExit: exitTwo, clientOneExit: exitOneAgain, stopped, ownerGone });
+  // A pass needs both: the original owner demonstrably gone, and an actual wait status for it. Either one
+  // missing — including an inspection that could not answer — fails this run.
+  const absenceAfterStop = await verifyOwnerAbsence(ownerPid, ownerAtStart.startIdentity);
+  const exitAfterStop = describeOwnerExit(stopped.exit);
+  const failures = [];
+  if (!absenceAfterStop.gone) failures.push(`the original owner was not demonstrably gone after stop: ${absenceAfterStop.reason}`);
+  if (!exitAfterStop.observed) failures.push(`the stop reported no usable wait result: ${exitAfterStop.reason}`);
+  steps.push({ step: "stop", detachOutput: detachBoth.output.trim(), clientTwoExit: exitTwo, clientOneExit: exitOneAgain, stopped, absenceAfterStop, exitAfterStop });
 
   for (const [source, destination] of [
     [path.join(root, "manager.log"), "manager.log"],
@@ -264,9 +380,10 @@ export async function runSmoke({ root, evidenceDir }) {
   await writeFile(path.join(evidenceDir, "client-2-epoch-1.visible.txt"), clientTwo.visible());
 
   const result = {
-    passed: true,
+    passed: failures.length === 0,
+    failures,
     root,
-    owner: { pid: ownerPid, startIdentity: ownerStartIdentity, identityAtStart: ownerAtStart, identityAfterDetach: ownerAfterDetach, goneAfterStop: ownerGone },
+    owner: { pid: ownerPid, startIdentity: ownerStartIdentity, identityAtStart: ownerAtStart, identityAfterDetach: ownerAfterDetach, absenceAfterStop, exitAfterStop },
     timings,
     steps,
     commands,
@@ -294,6 +411,10 @@ export async function runSmoke({ root, evidenceDir }) {
     atMs: Date.now(),
   };
   await writeFile(path.join(evidenceDir, "smoke-result.json"), `${JSON.stringify(result, null, 2)}\n`);
+  if (failures.length > 0) {
+    // The artifact above is written first: a failed verification keeps its diagnostics instead of erasing them.
+    throw new Error(`the stop was not verified: ${failures.join("; ")}`);
+  }
   return result;
 }
 
@@ -302,7 +423,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const rootIndex = process.argv.indexOf("--root");
   if (evidenceIndex === -1) throw new Error("smoke.mjs needs --evidence <directory>");
   const result = await runSmoke({
-    root: rootIndex === -1 ? `/tmp/pi-nsd-smoke-${process.pid}` : process.argv[rootIndex + 1],
+    // The default root is unique per run, because the manager refuses a root it did not create itself.
+    root: rootIndex === -1 ? `/tmp/pi-nsd-smoke-${process.pid}-${Date.now()}` : process.argv[rootIndex + 1],
     evidenceDir: path.resolve(process.argv[evidenceIndex + 1]),
   });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);

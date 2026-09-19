@@ -34,6 +34,8 @@ its own live component tree. Nothing is replayed.
 | [owner-extension.ts](owner-extension.ts) | the Pi extension: the fake provider, and the public `TUI` handover |
 | [fake-provider.mjs](fake-provider.mjs) | deterministic replies, computed from the prompt, with no network |
 | [protocol.mjs](protocol.mjs) | one bounded frame format shared by all three peers |
+| [pending-input.mjs](pending-input.mjs) | the bounded queue for bytes sent before Pi's labelled ingress was ready |
+| [pausing-relay.mjs](pausing-relay.mjs) | one direction of the frontend's relay, pausing its source when a `write()` says no |
 | [smoke.mjs](smoke.mjs) | the acceptance smoke, driven entirely through the commands above |
 | [native-session-demo.test.mjs](native-session-demo.test.mjs) | focused cases; the smoke runs only under `PI_NATIVE_DEMO_SMOKE=1` |
 
@@ -52,6 +54,10 @@ DEMO=/mnt/main0/home/gjohnson/projects/pi-agents-native-demo-20260919/examples/n
 ```bash
 $NODE $DEMO start --root /tmp/pi-nsd-mine --cols 100 --rows 30
 ```
+
+`--root` must not exist. The manager creates it exclusively, `0700`, and owns it: it never adopts a directory it
+did not create, never chmods or writes into one, and never recovers or resets one. A leftover root from an
+earlier owner is refused by name — stop that owner, remove the directory yourself, or pass another `--root`.
 
 It prints the owner's real identity and the exact commands for the rest:
 
@@ -124,8 +130,15 @@ $NODE $DEMO stop --root /tmp/pi-nsd-mine                     # add --keep-root t
 
 `stop` detaches every client, dispatches Pi's own end-of-input as the graceful gesture, and escalates only
 through this repository's verified group stop, which re-reads PID, start identity and process group
-immediately before every signal. It prints the owner's real `wait(2)` status and removes only what this demo
-created.
+immediately before every signal. It prints the owner's real `wait(2)` status, and `waitObserved` says whether
+that status was actually observed: a teardown that timed out without one is reported as unverified rather than
+graceful, and its diagnostics are kept.
+
+What it removes is the root **this owner created**, verified against the ownership marker written at creation:
+
+- `--keep-root` keeps the root and its logs, and says so in `rootRemoval.reason`
+- a root that was replaced after this owner created it is preserved, not deleted, and the reason is printed
+- nothing outside that root is touched, and no directory this demo did not create is ever removed
 
 ### Watch the manager instead of backgrounding it
 
@@ -151,7 +164,12 @@ it — measured, not assumed. The owner's whole environment is the list in `mana
   the operator who started the owner
 - both sockets are unix-domain and `0600`, in that `0700` directory. There is no TCP listener
 - frames are bounded (256 KiB), a client that falls 4 MiB behind is disconnected **by name** rather than
-  silently dropped, and bytes sent before Pi's labelled ingress is ready are held in order and delivered once
+  silently dropped, and bytes sent before Pi's labelled ingress is ready are held in order and delivered once —
+  up to 64 KiB, decided **before** a span is held: a span that would cross the bound is refused and its
+  attachment is detached by name, so it is never delivered later and reconnecting cannot grow that queue
+- the frontend respects backpressure in both directions. A `write()` that answers `false` has already accepted
+  that chunk, so nothing is re-sent; the other side of that direction is paused and resumed on one drain, which
+  is how a slow terminal becomes visible to the manager's 4 MiB bound instead of hiding in a private queue
 
 ## Prove it
 
@@ -168,6 +186,17 @@ everything, checks the owner's identity is unchanged and unreaped, reattaches, a
 back on Pi's own repaint, attaches a second client to the same draft, edits from there, submits, and reads the
 deterministic reply on both screens. It writes each client's terminal transcript, the manager log, the
 in-Pi caller's JSONL and measured timings into `--evidence`.
+
+It passes only when the stop is verified as well: the original owner demonstrably gone (`ENOENT`/`ESRCH` from
+procfs, or a PID now carrying another start identity) **and** an actual raw `wait(2)` status with an exit code
+or a terminating signal. An inspection that cannot answer — a permission error, malformed proc data, an
+ambiguous identity — is uncertainty, and uncertainty fails. A failing run writes `smoke-failure.json`, attempts
+this demo's own `stop`, and signals only the processes it spawned itself, each re-verified by PID, start
+identity and process group first.
+
+Evidence recorded before this correction (the `merge-tree-wave-7/native-demo` run) is still a real happy path,
+but it was collected when the standalone smoke's `passed` was unconditional: it proves the user flow it
+recorded, not that a stop was verified. Only runs from this correction onward carry the conjunction above.
 
 ## Honest limits
 
@@ -186,7 +215,8 @@ in-Pi caller's JSONL and measured timings into `--evidence`.
   announcement or `handoff-closed` refusal appears in the smoke.
 - **No ledger, no canonical ownership, no recovery.** The manager holds one owner for as long as it runs. It
   is not a durable ledger, it is not a second canonical writer, and it recovers nothing: if the manager dies,
-  the pseudo-terminal closes and the owner is hung up.
+  the pseudo-terminal closes and the owner is hung up. A root left behind by a dead manager is refused by the
+  next `start`, not adopted, reset or cleaned up for you.
 - **Output produced while detached is not retained.** It is read and discarded, which is why a reattachment is
   a repaint rather than a replay.
 - **One geometry, fixed at launch.** A client whose terminal differs is told so and attaches anyway. There is

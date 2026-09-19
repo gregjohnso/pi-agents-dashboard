@@ -35,8 +35,9 @@ import { openOwnerPty } from "../../runtime/pty-mechanism.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "../../runtime/process-signaler.mjs";
 import { startBootstrapSideband } from "./bootstrap-sideband.mjs";
 import { resolveCohort } from "./cohort.mjs";
-import { createRoot, demoPaths, tokenMatches, writeOwnerRecord } from "./demo-root.mjs";
+import { createRoot, demoPaths, removeOwnedRoot, tokenMatches, writeOwnerRecord } from "./demo-root.mjs";
 import { FAKE_MODEL_ID, FAKE_PROVIDER_ID } from "./fake-provider.mjs";
+import { createPendingInputQueue } from "./pending-input.mjs";
 import { createFrameReader, encodeFrame, MAX_BODY_BYTES } from "./protocol.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -48,7 +49,7 @@ const DEFAULT_COLS = 100;
 const DEFAULT_ROWS = 30;
 /** A client this far behind is disconnected by name rather than being allowed to stall the owner. */
 const CLIENT_BUFFER_LIMIT_BYTES = 4 * 1024 * 1024;
-/** Bytes a client may send before the in-Pi caller is ready. They are delivered in order, never dropped. */
+/** Bytes a client may send before the in-Pi caller is ready. Admitted bytes are delivered in order, once. */
 const PENDING_INPUT_LIMIT_BYTES = 64 * 1024;
 const GRACEFUL_EXIT_WAIT_MS = 5_000;
 /** How long `start` waits for Pi's own `native-mounted` before it reports a failure instead of a ready owner. */
@@ -79,7 +80,7 @@ function launchProfile(cols, rows) {
 export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROWS, manifestPath, cohortRoot, log, onReady }) {
   const startedAtMs = Date.now();
   const cohort = resolveCohort({ manifestPath, cohortRoot });
-  const { paths, token } = await createRoot(root);
+  const { paths, token, ownership } = await createRoot(root);
   const profile = launchProfile(cols, rows);
   const ingressLog = path.join(root, "owner-preload.jsonl");
 
@@ -90,9 +91,8 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
   /** @type {net.Socket | undefined} */
   let ingress;
   let ingressReady = false;
-  /** @type {{ attachmentId: string, epoch: number, generation: number, bytes: Buffer }[]} */
-  const pendingInput = [];
-  let pendingInputBytes = 0;
+  /** Bytes a client sent before the in-Pi caller was ready: bounded before admission, drained in order. */
+  const pendingInput = createPendingInputQueue(PENDING_INPUT_LIMIT_BYTES);
   let inputSequence = 0;
   /** @type {any[]} */
   const readiness = [];
@@ -234,11 +234,7 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
   }
 
   function flushPendingInput() {
-    while (pendingInput.length > 0) {
-      const entry = pendingInput.shift();
-      pendingInputBytes -= entry.bytes.byteLength;
-      forwardInput(entry);
-    }
+    for (const entry of pendingInput.drain()) forwardInput(entry);
   }
 
   async function presentTo(client) {
@@ -339,7 +335,7 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
         if (role === "ingress") {
           if (header.type === "ingress-ready") {
             ingressReady = true;
-            log(`labelled ingress ready in Pi pid ${header.pid}, tui mode ${header.tuiMode}; flushing ${pendingInput.length} held frame(s)`);
+            log(`labelled ingress ready in Pi pid ${header.pid}, tui mode ${header.tuiMode}; flushing ${pendingInput.length()} held frame(s)`);
             flushPendingInput();
           } else if (header.type === "ingress-unavailable") {
             log(`labelled ingress unavailable: ${header.reason}`);
@@ -385,11 +381,11 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
               forwardInput(entry);
               return;
             }
-            pendingInput.push(entry);
-            pendingInputBytes += entry.bytes.byteLength;
-            if (pendingInputBytes > PENDING_INPUT_LIMIT_BYTES) {
+            // The bound is decided before the bytes are held, so a refused span is never delivered later.
+            const admission = pendingInput.admit(entry);
+            if (admission.outcome === "refused") {
               // Refusing the attachment is honest; silently discarding an operator's keystrokes is not.
-              detachClient(client, `the in-Pi labelled ingress was not ready and ${pendingInputBytes} held bytes crossed the ${PENDING_INPUT_LIMIT_BYTES} byte bound`);
+              detachClient(client, `the in-Pi labelled ingress was not ready and ${admission.reason}`);
             }
           } else if (header.type === "detach") {
             detachClient(client, "client requested detach");
@@ -458,7 +454,10 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
       log(`verified group stop: ${JSON.stringify(outcome)}`);
       exit = await Promise.race([handle.wait(), sleep(GRACEFUL_EXIT_WAIT_MS).then(() => null)]);
     }
-    exitRecord = { ...(exit ?? {}), disposition, elapsedMs: Date.now() - stopStartedMs };
+    exitRecord = { ...(exit ?? {}), waitObserved: exit !== null, disposition, elapsedMs: Date.now() - stopStartedMs };
+    if (exit === null) {
+      log(`no raw wait status was observed for owner ${ownerIdentity.pid} within ${GRACEFUL_EXIT_WAIT_MS}ms of ${disposition ?? "the graceful gesture"}; this teardown is unverified, not graceful`);
+    }
     log(`owner ${ownerIdentity.pid} exit: ${JSON.stringify(exitRecord)}`);
 
     const finalStatus = statusRecord();
@@ -467,10 +466,18 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
     // terminal. It happens once, after the owner is gone, and nothing closes that fd again.
     ownerOutput.destroy();
     await sideband.close();
-    await rm(paths.controlSocket, { force: true });
-    if (!keepRoot) await rm(root, { recursive: true, force: true });
-    log(`stopped; root ${keepRoot ? "kept" : "removed"}`);
-    return { owner: ownerIdentity, exit: exitRecord, rootKept: keepRoot === true };
+    // The root is removed only while it is still the one `createRoot` created here. A root that was replaced,
+    // or a `--keep-root` run, keeps its evidence: a failed teardown must not delete someone else's directory.
+    const rootRemoval = keepRoot
+      ? { removed: false, reason: "--keep-root was asked for, so this owner's root and its evidence are kept" }
+      : await removeOwnedRoot(root, ownership);
+    if (!rootRemoval.removed) {
+      await rm(paths.controlSocket, { force: true });
+      log(`stopped; root kept: ${rootRemoval.reason}`);
+    } else {
+      log(`stopped; root removed: ${rootRemoval.reason}`);
+    }
+    return { owner: ownerIdentity, exit: exitRecord, rootKept: !rootRemoval.removed, rootRemoval };
   }
 
   // `start` returns at `native-mounted`, not at first paint and not at initialization. That is the phase at

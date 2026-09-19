@@ -104,8 +104,11 @@ async function control(root, frame, expected) {
 /** `serve` in the background, waiting for the manager's own ready record rather than polling for a file. */
 async function start(options) {
   const paths = demoPaths(options.root);
-  if (existsSync(paths.controlSocket)) {
-    throw new Error(`A demo owner already holds ${paths.controlSocket}; stop it first or pass another --root`);
+  if (existsSync(options.root)) {
+    throw new Error(
+      `${options.root} already exists. The manager creates its root exclusively and never adopts or deletes a ` +
+        "path it did not create, so stop the owner that owns it, remove it yourself, or pass another --root.",
+    );
   }
   const argv = [SELF, "serve", "--root", options.root];
   if (options.cols) argv.push("--cols", String(options.cols));
@@ -200,7 +203,7 @@ async function main() {
 
   if (command === "stop") {
     const answer = await control(options.root, { type: "stop", keepRoot: options.keepRoot }, "stopped");
-    process.stdout.write(`${JSON.stringify({ owner: answer.owner, exit: answer.exit, rootKept: answer.rootKept }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({ owner: answer.owner, exit: answer.exit, rootKept: answer.rootKept, rootRemoval: answer.rootRemoval }, null, 2)}\n`);
     return;
   }
 

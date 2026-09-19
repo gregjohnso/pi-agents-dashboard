@@ -10,11 +10,16 @@
  * What it does own is its own terminal's modes. Pi negotiated and pushed modes on the *owner's* terminal, not
  * on this one, and Pi will never pop them here: the frontend that turned raw mode on is the frontend that has
  * to put its terminal back, on a clean exit, on an error and on a disconnect.
+ *
+ * It also owns backpressure in both directions. A `write()` that answers `false` has already taken the chunk it
+ * was given, so nothing is re-sent; the source of that direction is paused instead, and resumed from one drain
+ * listener once the destination has caught up.
  */
 
 import net from "node:net";
 
 import { demoPaths, readToken } from "./demo-root.mjs";
+import { createPausingRelay } from "./pausing-relay.mjs";
 import { createFrameReader, encodeFrame, MAX_BODY_BYTES } from "./protocol.mjs";
 
 /**
@@ -64,11 +69,18 @@ export async function attach({ root, attachmentId }) {
   };
 
   const socket = net.connect(paths.controlSocket);
+  let finished = false;
+  // Pi's bytes to this terminal: a slow terminal pauses the socket rather than growing stdout's queue, and
+  // the frames already decoded from the current read stay queued here in order.
+  const toTerminal = createPausingRelay({ source: socket, destination: process.stdout, canResumeSource: () => !finished });
+  // This terminal's bytes to the manager: a full socket pauses stdin rather than growing the socket's queue.
+  const toManager = createPausingRelay({ source: process.stdin, destination: socket, canResumeSource: () => !finished });
   const done = new Promise((resolve) => {
     let settled = false;
     const finish = (outcome) => {
       if (settled) return;
       settled = true;
+      finished = true;
       restore();
       resolve(outcome);
     };
@@ -91,14 +103,16 @@ export async function attach({ root, attachmentId }) {
           process.stdin.setRawMode(true);
           process.stdin.resume();
           process.stdin.on("data", (chunk) => {
+            const frames = [];
             for (let offset = 0; offset < chunk.byteLength; offset += MAX_BODY_BYTES) {
-              socket.write(encodeFrame({ type: "input" }, chunk.subarray(offset, Math.min(offset + MAX_BODY_BYTES, chunk.byteLength))));
+              frames.push(encodeFrame({ type: "input" }, chunk.subarray(offset, Math.min(offset + MAX_BODY_BYTES, chunk.byteLength))));
             }
+            toManager.send(...frames);
           });
           return;
         }
         if (header.type === "output") {
-          process.stdout.write(body);
+          toTerminal.send(body);
           return;
         }
         if (header.type === "notice") {
@@ -129,6 +143,8 @@ export async function attach({ root, attachmentId }) {
     socket.on("close", () => finish({ reason: "the manager closed this attachment", notices, welcome }));
 
     // Detach without a key parser: an operator detaches with `demo.mjs detach`, or by signalling this client.
+    // The detach frame goes straight to the socket: this attachment is ending, so keystrokes the relay is still
+    // holding are dropped rather than delivered late, and the manager sees the detach it was signalled about.
     for (const signal of /** @type {NodeJS.Signals[]} */ (["SIGTERM", "SIGHUP", "SIGINT"])) {
       process.on(signal, () => {
         socket.write(encodeFrame({ type: "detach" }));

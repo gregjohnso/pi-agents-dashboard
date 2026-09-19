@@ -53,11 +53,13 @@ export function demoPaths(root) {
     /**
      * The owner management bridge: the in-Pi extension connects out to this one.
      *
-     * One character for the same reason the two above are: an `AF_UNIX` path is capped at 108 bytes and the
-     * operator chooses the root. It is a sibling of the control socket inside the same `0700` directory, so
-     * the bridge is reachable by this user and nobody else.
+     * It sits in a subdirectory rather than beside the two sockets above, because the sideband validates the
+     * directory it is about to bind in and this demo addresses its root through a held descriptor. `lstat` of
+     * `/proc/self/fd/N` reports a symbolic link, which that validation refuses by design; `lstat` of
+     * `/proc/self/fd/N/bridge` resolves through it and reports the real directory. One character for the
+     * socket itself for the same reason as the two above: an `AF_UNIX` path is capped at 108 bytes.
      */
-    sidebandSocket: path.join(root, "g"),
+    sidebandSocket: path.join(root, "bridge", "g"),
     token: path.join(root, "token"),
     /** Written once, at creation, as provenance for whoever reads a retained root. It authorises nothing. */
     ownership: path.join(root, "ownership.json"),

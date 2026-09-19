@@ -1495,6 +1495,8 @@ async function observedParentLoss(childScript, socketPath) {
       const summary = JSON.parse(done[1]);
       return {
         summary,
+        /** The observer's own lines, verbatim, so a reader need not trust this file's paraphrase of them. */
+        verbatim: [...text.matchAll(/OBSERVER-(?:REAPED|DONE) \{.*\}/gu)].map((match) => match[0]),
         parent: summary.reaped[String(parentPid)],
         helper: summary.reaped[String(helperPid)],
       };
@@ -1517,7 +1519,7 @@ it("observes the real helper's exact terminal status after its parent is killed,
   // with a parent that dies rather than a handoff that fails.
   const replaced = await other.replaceOnto(socketPath);
   observed.killTheParent();
-  const { summary, parent, helper } = await observed.reaped();
+  const { summary, parent, helper, verbatim } = await observed.reaped();
 
   // The parent really was killed, read from its wait status rather than from a request having been made.
   expect(summary.sentSigkillToParent).toBe(true);
@@ -1563,6 +1565,8 @@ it("observes the real helper's exact terminal status after its parent is killed,
     foreignModeAfter: (after.mode & 0o777).toString(8),
     foreignStillAnswers: reply.trim(),
   })}`);
+  // The observer's own records, unparaphrased: one per reaped process plus its summary.
+  for (const line of verbatim) console.log(`OBSERVER-EVIDENCE ${line}`);
 });
 
 // The discriminating case, and the reason the observer is not ceremony. This imposter emits the production
@@ -1575,7 +1579,7 @@ it("shows that the parent-gone diagnostic and a vanished pid cannot establish an
   const observed = await observedParentLoss(fileURLToPath(fixture("parent-gone-imposter.mjs")), socketPath);
 
   observed.killTheParent();
-  const { parent, helper } = await observed.reaped();
+  const { parent, helper, verbatim } = await observed.reaped();
 
   // Exactly the old evidence set, and all of it passes for a helper that did not take the branch under test.
   expect(observed.text()).toMatch(/the parent went away after the bind; leaving the endpoint in place/u);
@@ -1596,6 +1600,7 @@ it("shows that the parent-gone diagnostic and a vanished pid cannot establish an
     helperGone: gone(observed.helperPid),
     conclusion: "diagnostic plus disappearance is satisfied by exit 0, so it cannot establish exit 4",
   })}`);
+  for (const line of verbatim) console.log(`OBSERVER-EVIDENCE ${line}`);
 });
 
 // Operator-visible failure: cleanup that unlinks on any failure would delete the socket of the listener that

@@ -459,6 +459,41 @@ position *n − 1* in a disposable tree, apply the lane's own diff on top, resol
 position *n − 1*. `prepare.mjs` then applies the whole series with no fuzz, no `-3` and no skip, and the
 prepared tree must equal the tree recorded above.
 
+### 9.0 The one qualified cohort of this series
+
+The five-patch series has been prepared, built, packed and installed exactly once, and every installed
+acceptance case of this checkpoint was pointed at that one cohort. `series` sha256
+`2c3c838458fc2279b36e2ad892c7c35f08615fb7f03b158aaa2ac97b332a79ce`.
+
+| Field | Value |
+| --- | --- |
+| Build | Slurm job `3753895`, `l40-reserved`, Node `v22.23.2` |
+| Upstream commit | `bfb004d4418ff05c6f909eaaab856cbe75c1fde0` |
+| Prepared tree | `daa4eb307949768e750c0b5c6c103ef2ccdb3430` |
+| Artifact label | `patched: 5 ordered pi-agents source patch(es) applied to the pinned commit.` |
+| Bundled CLI | `1829279e2d8626de1ffc7052ea35d90209519b2d1cbc9243ab7ac822a6ed2b1a` (`dist/bundle/cli.js`, rebuilt from the prepared source) |
+
+Packed cohort, by tarball sha256:
+
+| Package | sha256 |
+| --- | --- |
+| `@earendil-works/pi-telemetry` | `8d5692e339d04a42ca32ca883b87e85ac8f96308e2317b164492c00cd23f346c` |
+| `@earendil-works/pi-ai` | `95cfdc61c262a84ce7d5e2cdf142c59a90516cd31e25b4ea4c94d3c482b75f31` |
+| `@earendil-works/pi-agent-core` | `134b4a6ef03d4632d0454a41ab1f2b4e18dff2196ce1b3316ab5e98ef9852f35` |
+| `@earendil-works/pi-protocol` | `eea8f3235b87924fb368a2361b772b65bbd992e322fb05d554311c98d5ccdafb` |
+| `@earendil-works/pi-client` | `260dcac827d8ede81cb21a99020053fa76b073b5e9be2f12c05ba548f976d46b` |
+| `@earendil-works/pi-tui` | `20fb54ef7793469a7d7b2bef5847a78a63c94140bcee8423ad02dc928429d11a` |
+| `@earendil-works/pi-coding-agent` | `2b8858a3c252ecc8015a9ec12a0d7b7bc722d89c73e5f7d5afa4c9d25a2c4165` |
+
+A later consumer selects this cohort by its generated manifest, never by a default path:
+`PI_NATIVE_ARTIFACTS_MANIFEST` for the terminal half and `PI_SEAM_{A,D,E}_CONSUMER` / `PI_NATIVE_COHORT`
+for the installed halves, all naming the one consumer of job `3753895`. Byte reproducibility of the cohort is
+not claimed: it is one build, recorded, not re-derived.
+
+`test/native-canonical-handoff-coexistence.test.mjs` is the case that exists only because of this
+composition: seam D's admission and seam G's recognized handoff in one owner process, from one installed
+coding-agent module. It fails against either single-seam cohort.
+
 ### 9.1 What the composition itself does not deliver
 
 - **Seam D is contracted, not frozen.** 0004 delivers canonical admission on exact names with the
@@ -474,3 +509,6 @@ prepared tree must equal the tree recorded above.
   until an owner process registers a host; with nothing registered every seam is the pinned baseline.
 - **No dependency activation.** The root `package.json` still installs the released Pi; these artifacts are
   built, tested and left in a disposable directory.
+- **No whole-product qualification.** One green cohort of this series is source and seam evidence only. It is
+  not Gate 5, not Task 13/14 durability (fsync, `ENOSPC`, the journal), not Task 16's startup reservation, not
+  live activation and not operator-run extension execution.

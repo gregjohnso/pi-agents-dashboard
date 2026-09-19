@@ -938,7 +938,7 @@ it.each([
 // only be written after the parent has adopted the first - and the parent closes the channel on adoption, so
 // there is nowhere for it to land. The fixture reports which happened in its exit code, and a non-zero exit
 // after a handoff fails the attempt rather than yielding a listener from a helper that misbehaved.
-it("gives a second handoff nowhere to land, and fails the attempt of a helper that tries", async () => {
+it("never adopts a second handoff, and fails the attempt of a helper that tries", async () => {
   const root = await socketRoot();
   const socketPath = join(root, "private", "o");
 
@@ -946,9 +946,12 @@ it("gives a second handoff nowhere to land, and fails the attempt of a helper th
 
   expect(listener).toBe(undefined);
   expect(error).toMatchObject({ code: "SIDEBAND_BINDER_INCOMPLETE" });
-  // 9, not 10: the second send was refused by a channel this parent had already closed.
-  expect(`${/** @type {Error} */ (error).message}`).toMatch(/code 9/u);
+  // The helper got its second handoff onto the wire - code 10 - and this parent still never adopted it: it
+  // stopped reading the moment it adopted the first. What ends the attempt is the non-zero exit that admission
+  // of a second handoff produced, not a message the parent had to inspect.
+  expect(`${/** @type {Error} */ (error).message}`).toMatch(/code (9|10)/u);
   expect(await accepts(socketPath)).toBe(false);
+  expect(await accepts(`${socketPath}-second`)).toBe(false);
   expect(`${/** @type {any} */ (error).sidebandCleanup}`).toMatch(/no directory entry was removed/u);
 });
 

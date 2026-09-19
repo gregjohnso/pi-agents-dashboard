@@ -239,13 +239,23 @@ function createLink(socket, { maxFrameBytes, maxQueuedFrames, validate, handshak
     settle = resolve;
   });
 
-  socket.on("error", () => {});
-  socket.once("close", () => {
+  /**
+   * Make admission, delivery, subscription and the deadline inert.
+   *
+   * This runs in the same turn as the decision that ended the link, not when the socket's close event
+   * arrives a turn later: a frame already admitted must never reach a subscriber after a refusal, and a
+   * subscriber must not be retained past one.
+   */
+  const seal = () => {
     finished = true;
-    // Nothing buffered may run after the close: a queued frame and a subscriber are both dropped here.
     queued.length = 0;
     listeners.clear();
     clearTimeout(deadline);
+  };
+
+  socket.on("error", () => {});
+  socket.once("close", () => {
+    seal();
     settle({ refusal });
   });
 
@@ -253,6 +263,7 @@ function createLink(socket, { maxFrameBytes, maxQueuedFrames, validate, handshak
   const failClosed = (reason) => {
     if (finished) return;
     refusal = reason;
+    seal();
     socket.destroy();
   };
 
@@ -345,11 +356,14 @@ function createLink(socket, { maxFrameBytes, maxQueuedFrames, validate, handshak
     /**
      * Subscribe to validated frames. Everything already admitted is delivered **before this returns**,
      * so a subscriber sees the queue in arrival order and the queue cannot outlive the subscription.
-     * A listener that throws fails the connection closed, exactly as an unreadable frame does.
+     * A listener that throws fails the connection closed, exactly as an unreadable frame does, and nothing
+     * behind the frame it threw on is delivered: the link is sealed in that same turn.
      * @param {(frame: any) => void} listener
      */
     onFrame(listener) {
       if (typeof listener !== "function") throw new NativeSidebandError("SIDEBAND_LISTENER_UNUSABLE", "A sideband frame listener must be a function");
+      // A sealed link takes no subscriber: there is nothing left to deliver and nothing more can arrive.
+      if (finished) return () => {};
       listeners.add(listener);
       for (const frame of queued.splice(0)) {
         if (finished) break;
@@ -427,10 +441,16 @@ export function readOwnerSidebandEnvironment(env = process.env) {
  * connection is handed out separately rather than replacing the one before it: one owner generation is
  * one connection, and which of them the worker keeps is the worker's decision, not this listener's.
  *
- * @param {{ socketPath: string, token: string, maxFrameBytes?: number, maxQueuedFrames?: number, handshakeTimeoutMs?: number }} options
+ * @param {{ socketPath: string, token: string, maxFrameBytes?: number, maxQueuedFrames?: number, handshakeTimeoutMs?: number,
+ *   failpoint?: (stage: "after_bind") => Promise<void> }} options
  */
 export async function listenForOwnerSideband(options) {
   const { socketPath, token, maxFrameBytes, maxQueuedFrames, handshakeTimeoutMs } = boundedOptions(options);
+  // One failpoint, one stage, following the recovery seam in `state-migration.mjs`: the window between a
+  // successful bind and a finished endpoint is the only place a caller holds no close handle, so it is the
+  // only place a test can script a failure without racing an accept.
+  const failpoint = options.failpoint ?? (async () => {});
+  if (typeof failpoint !== "function") throw new TypeError("The owner sideband failpoint must be a function");
   await ensurePrivateDirectory(dirname(socketPath));
 
   /** @type {any[]} */
@@ -440,6 +460,7 @@ export async function listenForOwnerSideband(options) {
   /** @type {Set<net.Socket>} */
   const sockets = new Set();
   let closing = false;
+  let discarding = false;
 
   /** @param {any} connection */
   const handOff = (connection) => {
@@ -449,6 +470,12 @@ export async function listenForOwnerSideband(options) {
   };
 
   const server = net.createServer({ allowHalfOpen: false }, (socket) => {
+    // A connection accepted in the same turn a discard began is this listener's to end, not to hold:
+    // `server.close` waits for every accepted socket, so keeping one would stall its own shutdown.
+    if (discarding) {
+      socket.destroy();
+      return;
+    }
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
     /** @type {any} */
@@ -473,14 +500,42 @@ export async function listenForOwnerSideband(options) {
     });
   });
   server.on("error", () => {});
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(socketPath, () => {
-      server.off("error", reject);
-      resolve(undefined);
+
+  /**
+   * End everything this call owns: the sockets it accepted, its listening handle, and — only when this call
+   * actually bound it — the endpoint file.
+   *
+   * Accepted sockets go first because `server.close` waits for all of them, so a connected owner would
+   * otherwise hold this shutdown open indefinitely. `ownsEndpoint` is false for a bind that never
+   * succeeded: a path another live listener owns is that listener's socket, and removing it would take a
+   * running owner's management channel down with this call's failure.
+   * @param {boolean} ownsEndpoint
+   */
+  const discardListener = async (ownsEndpoint) => {
+    discarding = true;
+    for (const socket of [...sockets]) socket.destroy();
+    await new Promise((resolve) => server.close(() => resolve(undefined)));
+    if (ownsEndpoint) await unlink(socketPath).catch(() => {});
+  };
+
+  let bound = false;
+  try {
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, () => {
+        server.off("error", reject);
+        resolve(undefined);
+      });
     });
-  });
-  await chmodPrivateSocket(socketPath);
+    bound = true;
+    await failpoint("after_bind");
+    await chmodPrivateSocket(socketPath);
+  } catch (error) {
+    // Until this call returns its close handle, nobody else can end what it started, so it ends it here and
+    // reports the original failure rather than whatever the cleanup met.
+    await discardListener(bound);
+    throw error;
+  }
 
   return {
     socketPath,
@@ -498,11 +553,7 @@ export async function listenForOwnerSideband(options) {
         taker.reject(new NativeSidebandError("SIDEBAND_CLOSED", "The owner sideband listener is closed"));
       }
       for (const connection of waiting.splice(0)) connection.close();
-      // Every accepted socket first: `server.close` waits for all of them, so a connected owner would
-      // otherwise hold this listener's own shutdown open indefinitely.
-      for (const socket of [...sockets]) socket.destroy();
-      await new Promise((resolve) => server.close(() => resolve(undefined)));
-      await unlink(socketPath).catch(() => {});
+      await discardListener(true);
     },
   };
 }

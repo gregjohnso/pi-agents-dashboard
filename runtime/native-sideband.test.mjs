@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { lstat, mkdtemp, readFile, rm } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -362,4 +362,114 @@ it.each([
 ])("refuses %s on both ends before touching the filesystem", async (_label, options, code) => {
   await expect(listenForOwnerSideband(options)).rejects.toMatchObject({ code });
   await expect(connectOwnerSideband(options)).rejects.toMatchObject({ code });
+});
+
+/** The hello this run's token authenticates with, as one wire line. */
+function helloLine() {
+  return line({ protocol: NATIVE_SIDEBAND_PROTOCOL, type: "owner-hello", token: TOKEN });
+}
+
+// Operator-visible failure: a subscriber that throws on the first of several frames already admitted would
+// otherwise keep being handed the frames behind it, after the connection has been recorded as failed. The
+// contract is that a recorded failure discards what was buffered; a listener that saw one more fact than the
+// host's own refusal admits has been told something the host does not believe.
+it("stops delivering the moment a failure is recorded, mid drain of frames already admitted", async () => {
+  const socketPath = await socketPathForThisTest();
+  const listener = await listenForOwnerSideband({ socketPath, token: TOKEN });
+  cleanup.push(() => listener.close());
+  const arriving = listener.nextOwner();
+  const raw = await rawOwner(socketPath);
+
+  // One write, so the hello and both frames reach the host in one chunk and are admitted in one
+  // synchronous pass: by the time `nextOwner` resolves, both frames are queued with no subscriber.
+  await raw.write(
+    helloLine()
+      + line({ protocol: NATIVE_SIDEBAND_PROTOCOL, type: "owner-facts", facts: { mode: "tui" } })
+      + line({ protocol: NATIVE_SIDEBAND_PROTOCOL, type: "owner-facts", facts: { idle: true } }),
+  );
+  const owner = await arriving;
+
+  /** @type {any[]} */
+  const seen = [];
+  owner.onFrame((/** @type {any} */ frame) => {
+    seen.push(frame);
+    throw new Error("this subscriber cannot handle a frame");
+  });
+
+  expect(seen).toEqual([{ type: "owner-facts", facts: { mode: "tui" } }]);
+  await expect(owner.closed).resolves.toEqual({ refusal: "listener-failed" });
+  // Nothing may be admitted or subscribed afterwards either.
+  expect(recordFrames(owner)).toEqual([]);
+});
+
+// Operator-visible failure: a listener whose post-bind permission work fails hands its caller an error and no
+// close handle, leaving a bound socket and its accepted connections owned by nobody. The worker cannot close
+// what it was never given, so the endpoint keeps answering and keeps the process alive.
+it("releases the endpoint it bound and every connection it accepted when initialization fails, then rethrows", async () => {
+  const socketPath = await socketPathForThisTest();
+  const injected = new Error("post-bind initialization failed");
+  /** @type {any} */
+  let client;
+
+  const failure = await listenForOwnerSideband({
+    socketPath,
+    token: TOKEN,
+    failpoint: async (/** @type {string} */ stage) => {
+      if (stage !== "after_bind") return;
+      // The endpoint is live and accepting here, which is exactly the window the defect leaked.
+      client = await rawOwner(socketPath);
+      await client.write(helloLine());
+      throw injected;
+    },
+  }).then(() => undefined, (/** @type {unknown} */ error) => error);
+
+  // The caller's error is the original one, not whatever the cleanup encountered.
+  expect(failure).toBe(injected);
+  await expect(lstat(socketPath)).rejects.toMatchObject({ code: "ENOENT" });
+  await client.closed;
+  // The listening handle is gone, not merely unreferenced: the same path binds again.
+  const replacement = await listenForOwnerSideband({ socketPath, token: TOKEN });
+  cleanup.push(() => replacement.close());
+  expect((await lstat(socketPath)).mode & 0o777).toBe(0o600);
+});
+
+// The same window, failed by the real permission finalizer rather than an injected error: the socket this
+// call bound is no longer a socket when it is narrowed, so `chmodPrivateSocket` itself rejects.
+it("takes the same cleanup path when the real permission narrowing rejects", async () => {
+  const socketPath = await socketPathForThisTest();
+
+  const failure = await listenForOwnerSideband({
+    socketPath,
+    token: TOKEN,
+    failpoint: async (/** @type {string} */ stage) => {
+      if (stage !== "after_bind") return;
+      await rm(socketPath);
+      await writeFile(socketPath, "not a socket\n", { mode: 0o600 });
+    },
+  }).then(() => undefined, (/** @type {unknown} */ error) => error);
+
+  expect(`${/** @type {Error} */ (failure).message}`).toMatch(/not a socket/iu);
+  // Its own endpoint path is cleared, whatever replaced it, exactly as a successful close clears it.
+  await expect(lstat(socketPath)).rejects.toMatchObject({ code: "ENOENT" });
+  const replacement = await listenForOwnerSideband({ socketPath, token: TOKEN });
+  cleanup.push(() => replacement.close());
+  expect((await lstat(socketPath)).isSocket()).toBe(true);
+});
+
+// Operator-visible failure: cleanup that unlinks on any failure would delete the socket of the listener that
+// already owns that path, taking a live owner's management channel down with a second listener's failed bind.
+it("leaves an endpoint it did not bind alone when its own bind fails", async () => {
+  const socketPath = await socketPathForThisTest();
+  const live = await listenForOwnerSideband({ socketPath, token: TOKEN });
+  cleanup.push(() => live.close());
+  const arriving = live.nextOwner();
+
+  await expect(listenForOwnerSideband({ socketPath, token: TOKEN })).rejects.toMatchObject({ code: "EADDRINUSE" });
+
+  expect((await lstat(socketPath)).isSocket()).toBe(true);
+  const link = await connectOwnerSideband({ socketPath, token: TOKEN });
+  cleanup.push(() => link.close());
+  const owner = await arriving;
+  await link.announceBridgeReady();
+  expect(await nextFrames(owner.onFrame, 1)).toEqual([{ type: "owner-ready", phase: "bridge" }]);
 });

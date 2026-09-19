@@ -37,7 +37,7 @@ afterEach(async () => {
  * early deletes the directory the rest of the case is still using.
  * @param {() => unknown} entry
  */
-async function runCleanupNow(entry) {
+async function runCleanupNow(/** @type {() => unknown} */ entry) {
   const at = cleanup.indexOf(entry);
   if (at >= 0) cleanup.splice(at, 1);
   await entry();
@@ -1413,7 +1413,7 @@ const OBSERVER_TIMEOUT_SECONDS = 45;
  * @param {string} childScript absolute path to the child the disposable parent forks
  * @param {string} socketPath
  */
-async function observedParentLoss(childScript, socketPath, options = {}) {
+async function observedParentLoss(childScript, socketPath, options = /** @type {{ executable?: string, parentScript?: string, timeoutSeconds?: number, awaitHandoff?: boolean }} */ ({})) {
   const {
     executable = PIXI,
     parentScript = fileURLToPath(fixture("disposable-parent.mjs")),
@@ -1624,7 +1624,14 @@ it("observes the real helper's exact terminal status after its parent is killed,
   const reply = await other.stillAnswers(socketPath);
   expect(reply).toBe("alive\n");
 
+  // Successful, already-reaped cleanup: the observer finished on its own, so cleanup has nothing to signal - and
+  // must not signal these numbers anyway, because a reaped pid is free for reuse.
+  await observed.completion;
+  await observed.runCleanup();
+  expect(observed.cleanupActions()).toEqual(["observer-had-already-finished"]);
+
   console.log(`REAL-PARENT-SIGKILL-OBSERVED ${JSON.stringify({
+    cleanupActionsAfterSuccessfulReaping: observed.cleanupActions(),
     observerPid: observed.observerPid,
     disposableParentPid: observed.parentPid,
     helperPid: observed.helperPid,
@@ -1786,31 +1793,42 @@ it("settles instead of hanging when the observer cannot be started at all", asyn
 // number now. Cleanup used to do exactly that on every path, including the successful one where the observer had
 // already reported both processes reaped, and it signalled the observer in the same sweep - which would cut short
 // the cleanup phase the timeout case above depends on.
-it("signals no recorded pid number during cleanup, on the successful path and the failing one", async () => {
+it("asks the owning observer to clean up instead of signalling numbers, when it is still running", async () => {
   const root = await socketRoot();
-  const succeeded = await observedParentLoss(fileURLToPath(fixture("held-handoff-binder.mjs")), join(root, "ok"));
-  succeeded.killTheParent();
-  const { summary } = await succeeded.reaped();
-  expect(summary.reapedPids).toEqual(expect.arrayContaining([succeeded.parentPid, succeeded.helperPid]));
-  await succeeded.completion;
-
-  // Nothing is left to signal, and cleanup must not pretend otherwise by firing at numbers it no longer owns.
-  await succeeded.runCleanup();
-  expect(succeeded.cleanupActions()).toEqual(["observer-had-already-finished"]);
-
-  // The failing path: still running, so cleanup asks the owner rather than signalling parsed numbers.
+  // Still running and mid-scenario: nothing has been reaped, so this is the failure-cleanup path. The successful
+  // already-reaped path is asserted in the exact-terminal-status case, where success is what is being established.
   const running = await observedParentLoss(fileURLToPath(fixture("held-handoff-binder.mjs")), join(root, "still-running"));
+
   await running.runCleanup();
+
   const actions = running.cleanupActions();
+  // Asked the owner. Never `process.kill` on a parsed number, and never the observer before its child phase.
   expect(actions[0]).toBe("asked-observer-to-clean-up");
   expect(actions).not.toContain("killed-observer-through-its-childprocess-handle");
+  expect(running.text()).toMatch(/observer-asked-to-clean-up/u);
+  // The owner did the work: it killed the group it owns and collected every status.
+  const timeout = await running.timedOut();
+  expect(timeout.summary.endedBecause).toBe("cleanup-requested");
+  expect(timeout.cleanup.killedOwnedProcessGroup).toBe(true);
+  expect(timeout.cleanup.noChildrenRemaining).toBe(true);
+  expect(timeout.cleanup.uncertainty).toEqual([]);
   expect(gone(running.parentPid)).toBe(true);
   expect(gone(running.helperPid)).toBe(true);
 
   console.log(`CLEANUP-WITHOUT-STALE-SIGNALS ${JSON.stringify({
-    successfulPathActions: succeeded.cleanupActions(),
+    observerPid: running.observerPid,
+    disposableParentPid: running.parentPid,
+    helperPid: running.helperPid,
     stillRunningPathActions: actions,
     signalledAnyRecordedPidNumber: false,
+    endedBecause: timeout.summary.endedBecause,
+    killedOwnedProcessGroup: timeout.cleanup.killedOwnedProcessGroup,
+    reapedDuringCleanup: timeout.cleanup.reapedDuringCleanup.map((entry) => ({
+      pid: entry.pid, role: entry.role, rawWaitStatus: entry.rawWaitStatus,
+      exitCode: entry.exitCode, termSignalName: entry.termSignalName,
+    })),
+    noChildrenRemaining: timeout.cleanup.noChildrenRemaining,
+    uncertainty: timeout.cleanup.uncertainty,
   })}`);
 });
 

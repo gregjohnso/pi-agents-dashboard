@@ -509,6 +509,14 @@ export async function listenForOwnerSideband(options) {
    * otherwise hold this shutdown open indefinitely. `ownsEndpoint` is false for a bind that never
    * succeeded: a path another live listener owns is that listener's socket, and removing it would take a
    * running owner's management channel down with this call's failure.
+   *
+   * The `ownsEndpoint` unlink is the intent, not the mechanism, and it cannot be made an ownership check.
+   * Closing a bound pipe server already removes the pathname libuv bound, before this line runs, so for a
+   * path this call bound the unlink is a no-op and a post-bind replacement is removed by that close whoever
+   * made it. Guarding this unlink by the current entry's identity was measured and changes nothing. There is
+   * no public way to release a pipe server's handle without unlinking its bound pathname, so this module
+   * cannot arbitrate a post-bind replacement; the exposure is bounded to one UID by the mode-0700 directory
+   * the endpoint lives in. `native-sideband.test.mjs` pins the behaviour so a change in it is noticed.
    * @param {boolean} ownsEndpoint
    */
   const discardListener = async (ownsEndpoint) => {

@@ -499,17 +499,26 @@ it("takes the same cleanup path when the real permission narrowing rejects", asy
   }).then(() => undefined, (/** @type {unknown} */ error) => error);
 
   expect(`${/** @type {Error} */ (failure).message}`).toMatch(/not a socket/iu);
-  // The entry at this path is no longer the socket this call bound, so it is not this call's to remove:
-  // whoever replaced it owns it. The path is therefore left exactly as the replacement left it.
-  expect(await readFile(socketPath, "utf8")).toBe("not a socket\n");
+  // Its own endpoint path is cleared, whatever replaced it, exactly as a successful close clears it.
+  await expect(lstat(socketPath)).rejects.toMatchObject({ code: "ENOENT" });
+  const replacement = await listenForOwnerSideband({ socketPath, token: TOKEN });
+  cleanup.push(() => replacement.close());
+  expect((await lstat(socketPath)).isSocket()).toBe(true);
 });
 
-// Operator-visible failure: the endpoint is identified by a boolean saying "this call bound this path once",
-// not by which directory entry is there now. A replacement that arrived after the bind belongs to whoever
-// made it, and removing it on this call's way out destroys another actor's file. `server.close()` is part of
-// the path under test here, not only the explicit unlink: libuv unlinks the pathname it bound when the
-// listening handle closes, so guarding the manual unlink alone would not preserve anything.
-it("leaves a post-bind replacement of its own endpoint in place, through the whole close path", async () => {
+// A recorded platform limit, pinned so a change in it is noticed rather than assumed.
+//
+// Closing a bound pipe server removes the pathname libuv bound, before any code in this module runs: the
+// explicit unlink in `discardListener` is a no-op for a path this call bound, and guarding it by the current
+// entry's identity changes nothing. So a listener that bound this path and then failed takes a post-bind
+// replacement down with it, whoever made that replacement. This module cannot arbitrate that through Node's
+// public surface — there is no way to release a pipe server's handle without unlinking its bound pathname,
+// and no public way to bind a listener to an externally created socket descriptor that carries no pathname.
+//
+// The exposure is bounded to one UID: the endpoint lives in a directory this call guarantees at mode 0700, so
+// the only actor that can replace the entry is another process of the same user. If this case ever fails,
+// Node stopped unlinking on close and the ownership question above is worth reopening.
+it("records that closing a bound listener removes the pathname, replacement or not", async () => {
   const socketPath = await socketPathForThisTest();
   const foreign = `${socketPath}-foreign`;
 
@@ -527,10 +536,10 @@ it("leaves a post-bind replacement of its own endpoint in place, through the who
     },
   }).then(() => undefined, (/** @type {unknown} */ error) => error);
 
+  // The original failure is what the caller is told, whatever the cleanup met.
   expect(`${/** @type {Error} */ (failure).message}`).toBe("the endpoint was replaced before this call finished");
-  // The replacement is still there and still a socket: a failed call removed somebody else's endpoint only
-  // if this assertion fails.
-  expect((await lstat(socketPath)).isSocket()).toBe(true);
+  // And the replacement is gone, removed by the close of the handle that had bound this pathname.
+  await expect(lstat(socketPath)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 // Operator-visible failure: cleanup that unlinks on any failure would delete the socket of the listener that

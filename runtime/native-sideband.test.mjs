@@ -569,7 +569,7 @@ it("releases the endpoint it bound and every connection it accepted when initial
     socketPath,
     token: TOKEN,
     failpoint: async (/** @type {string} */ stage) => {
-      if (stage !== "after_bind") return;
+      if (stage !== "after_handoff") return;
       // The endpoint is live and accepting here, which is exactly the window the defect leaked.
       client = await rawOwner(socketPath);
       await client.write(helloLine());
@@ -587,63 +587,267 @@ it("releases the endpoint it bound and every connection it accepted when initial
   expect((await lstat(socketPath)).mode & 0o777).toBe(0o600);
 });
 
-// The same window, failed by the real permission finalizer rather than an injected error: the socket this
-// call bound is no longer a socket when it is narrowed, so `chmodPrivateSocket` itself rejects.
-it("takes the same cleanup path when the real permission narrowing rejects", async () => {
+// The same window, failed by the real endpoint verification rather than an injected error. Nothing narrows a
+// pathname any more - the socket is created 0600 in the binder - so what refuses here is the parent checking
+// that what it was handed really is its own socket. A regular file at that path is not, and the refusal names
+// it rather than chmod-ing or unlinking whatever is there.
+it("refuses when the endpoint it was handed is no longer its own socket, and leaves that entry alone", async () => {
   const socketPath = await socketPathForThisTest();
 
   const failure = await listenForOwnerSideband({
     socketPath,
     token: TOKEN,
     failpoint: async (/** @type {string} */ stage) => {
-      if (stage !== "after_bind") return;
+      if (stage !== "after_handoff") return;
       await rm(socketPath);
       await writeFile(socketPath, "not a socket\n", { mode: 0o600 });
     },
   }).then(() => undefined, (/** @type {unknown} */ error) => error);
 
-  expect(`${/** @type {Error} */ (failure).message}`).toMatch(/not a socket/iu);
-  // Its own endpoint path is cleared, whatever replaced it, exactly as a successful close clears it.
+  expect(failure).toMatchObject({ code: "SIDEBAND_ENDPOINT_UNUSABLE" });
+  expect(`${/** @type {Error} */ (failure).message}`).toMatch(/is not a socket/iu);
+  // The foreign entry is exactly as it was left: this refusal removes nothing it cannot identify.
+  expect(await readFile(socketPath, "utf8")).toBe("not a socket\n");
+});
+
+/**
+ * A real live listener at a path, made by another actor, ready to be replaced onto this attempt's endpoint.
+ *
+ * A regular file is not enough for these cases: the whole point is that a *working* channel somebody else owns
+ * survives, keeps its identity and still answers. So the replacement is an actual listening socket with its own
+ * accept handler, and the assertions check its inode, its mode and that it still accepts a connection.
+ */
+async function liveReplacement(root) {
+  const socketPath = join(root, "live");
+  /** @type {net.Socket[]} */
+  const accepted = [];
+  const server = net.createServer({ allowHalfOpen: false }, (socket) => {
+    accepted.push(socket);
+    socket.end("alive\n");
+  });
+  server.on("error", () => {});
+  await new Promise((resolve) => server.listen(socketPath, () => resolve(undefined)));
+  cleanup.push(() => new Promise((resolve) => server.close(() => resolve(undefined))));
+  const identity = await lstat(socketPath);
+  return {
+    socketPath,
+    identity,
+    /** Move this live socket onto another path, keeping the same inode: a rename, not a copy. */
+    async replaceOnto(target) {
+      await rm(target, { force: true });
+      await rename(socketPath, target);
+      return await lstat(target);
+    },
+    /** Prove it still answers after everything the attempt under test did. @param {string} at */
+    async stillAnswers(at) {
+      const reply = await new Promise((resolve, reject) => {
+        const client = net.createConnection(at);
+        let text = "";
+        client.on("data", (chunk) => {
+          text += String(chunk);
+        });
+        client.once("end", () => resolve(text));
+        client.once("error", reject);
+      });
+      return reply;
+    },
+  };
+}
+
+// The condition this whole helper exists for, and the one the direct bind could not meet. Another actor's live
+// listening socket is moved onto this attempt's endpoint path while the attempt is still holding it. When the
+// attempt tears itself down it must leave that socket completely alone: same inode, same mode, still accepting.
+it("preserves a live listener another actor moved onto its endpoint, through its whole teardown", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+  const other = await liveReplacement(root);
+
+  const listener = await listenForOwnerSideband({ socketPath, token: TOKEN });
+  const replaced = await other.replaceOnto(socketPath);
+
+  const outcome = await listener.close();
+
+  // Nothing of the replacement changed, and it is still a working channel.
+  const after = await lstat(socketPath);
+  expect(after.isSocket()).toBe(true);
+  expect(String(after.ino)).toBe(String(replaced.ino));
+  expect(after.mode & 0o777).toBe(replaced.mode & 0o777);
+  expect(await other.stillAnswers(socketPath)).toBe("alive\n");
+  // And the teardown says plainly that it removed nothing, rather than reporting a clean close it did not do.
+  expect(outcome).toMatchObject({ removed: false });
+  expect(`${outcome.retained}`).toMatch(/different socket occupies this endpoint's path and was left alone/u);
+});
+
+// The same preservation, when the replacement lands in the window between the close starting and the cleanup
+// deciding. The close is initiated first and the swap happens while it is settling.
+it("preserves a live listener that replaces its endpoint while the close is already running", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+  const other = await liveReplacement(root);
+
+  const listener = await listenForOwnerSideband({ socketPath, token: TOKEN });
+  // Hold a connected client so `server.close` cannot complete until it is destroyed: that is the window.
+  const client = net.createConnection(socketPath);
+  client.on("error", () => {});
+  await new Promise((resolve, reject) => {
+    client.once("connect", resolve);
+    client.once("error", reject);
+  });
+
+  const closing = listener.close();
+  const replaced = await other.replaceOnto(socketPath);
+  client.destroy();
+  const outcome = await closing;
+
+  const after = await lstat(socketPath);
+  expect(String(after.ino)).toBe(String(replaced.ino));
+  expect(await other.stillAnswers(socketPath)).toBe("alive\n");
+  expect(outcome).toMatchObject({ removed: false });
+});
+
+// A non-socket entry is not this attempt's either. A regular file another actor left at the path keeps its
+// contents: permission work never chmods a pathname, and cleanup never unlinks one it cannot identify.
+it("preserves a foreign regular file at its endpoint path and leaves its mode alone", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+
+  const listener = await listenForOwnerSideband({ socketPath, token: TOKEN });
+  await rm(socketPath);
+  await writeFile(socketPath, "not this attempt's\n", { mode: 0o644 });
+
+  const outcome = await listener.close();
+
+  expect(await readFile(socketPath, "utf8")).toBe("not this attempt's\n");
+  expect((await lstat(socketPath)).mode & 0o777).toBe(0o644);
+  expect(outcome).toMatchObject({ removed: false });
+  expect(`${outcome.retained}`).toMatch(/non-socket entry occupies this endpoint's path and was left alone/u);
+});
+
+// Its own endpoint, on the other hand, is exactly what a normal close removes - and the close says so.
+it("removes its own endpoint on a normal close, and reports that it did", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+  const listener = await listenForOwnerSideband({ socketPath, token: TOKEN });
+  expect((await lstat(socketPath)).isSocket()).toBe(true);
+
+  const outcome = await listener.close();
+
+  expect(outcome).toEqual({ removed: true, retained: null });
   await expect(lstat(socketPath)).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+// The socket exists at 0600 from the moment it exists, created that way rather than narrowed afterwards. The
+// manager's own umask is never touched, which is what this also checks: it is read before and after.
+it("creates its endpoint at 0600 without changing this process's umask", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+  const before = process.umask();
+
+  const listener = await listenForOwnerSideband({ socketPath, token: TOKEN });
+  cleanup.push(() => listener.close());
+
+  const entry = await lstat(socketPath);
+  expect(entry.isSocket()).toBe(true);
+  expect(entry.mode & 0o777).toBe(0o600);
+  expect(process.umask()).toBe(before);
+  // The snapshot the cleanup will compare against was taken from that same entry.
+  expect(listener.endpoint.ownership).toMatchObject({ mode: 0o600, inode: String(entry.ino), device: String(entry.dev) });
+});
+
+// The helper is gone before the listener is usable, and its exit is observed rather than inferred from the
+// send completing. A lingering binder beside a running owner is exactly what this forbids.
+it("observes the binder's own exit before it returns a usable listener", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+
+  const listener = await listenForOwnerSideband({ socketPath, token: TOKEN });
+  cleanup.push(() => listener.close());
+
+  // A real exit status, read from the child this call forked, not a guess about a PID.
+  expect(listener.endpoint.helperExit).toEqual({ code: 0, signal: null });
+  // And the listener it left behind actually works.
+  const arriving = listener.nextOwner();
+  const raw = await rawOwner(socketPath);
+  await raw.write(helloLine());
+  await expect(arriving).resolves.toMatchObject({ onFrame: expect.any(Function) });
+});
+
+// A bind that cannot succeed is reported as the bind failure it is, and the live listener already holding that
+// path keeps working. The refusal comes from the helper over IPC, not from a guess in the parent.
+it("refuses when the endpoint is already bound, and leaves the existing listener working", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+  const live = await listenForOwnerSideband({ socketPath, token: TOKEN });
+  cleanup.push(() => live.close());
+
+  await expect(listenForOwnerSideband({ socketPath, token: TOKEN })).rejects.toMatchObject({ code: "EADDRINUSE" });
+
+  expect((await lstat(socketPath)).isSocket()).toBe(true);
+  const arriving = live.nextOwner();
+  const raw = await rawOwner(socketPath);
+  await raw.write(helloLine());
+  await expect(arriving).resolves.toMatchObject({ onFrame: expect.any(Function) });
+});
+
+// A failure after the handoff is verified: the caller is told its own error, the inherited handle is released,
+// and because this attempt did bind that socket, its own entry goes.
+it("releases an inherited listener and its own endpoint when a post-handoff failure is injected", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+  const injected = new Error("post-handoff initialization failed");
+
+  await expect(listenForOwnerSideband({
+    socketPath,
+    token: TOKEN,
+    failpoint: async (/** @type {string} */ stage) => {
+      if (stage === "after_handoff") throw injected;
+    },
+  })).rejects.toBe(injected);
+
+  await expect(lstat(socketPath)).rejects.toMatchObject({ code: "ENOENT" });
+  // The path binds again, so nothing is left listening on it.
   const replacement = await listenForOwnerSideband({ socketPath, token: TOKEN });
   cleanup.push(() => replacement.close());
   expect((await lstat(socketPath)).isSocket()).toBe(true);
 });
 
-// A recorded platform limit, pinned so a change in it is noticed rather than assumed.
-//
-// Closing a bound pipe server removes the pathname libuv bound, before any code in this module runs: the
-// explicit unlink in `discardListener` is a no-op for a path this call bound, and guarding it by the current
-// entry's identity changes nothing. So a listener that bound this path and then failed takes a post-bind
-// replacement down with it, whoever made that replacement. This module cannot arbitrate that through Node's
-// public surface — there is no way to release a pipe server's handle without unlinking its bound pathname,
-// and no public way to bind a listener to an externally created socket descriptor that carries no pathname.
-//
-// The exposure is bounded to one UID: the endpoint lives in a directory this call guarantees at mode 0700, so
-// the only actor that can replace the entry is another process of the same user. If this case ever fails,
-// Node stopped unlinking on close and the ownership question above is worth reopening.
-it("records that closing a bound listener removes the pathname, replacement or not", async () => {
-  const socketPath = await socketPathForThisTest();
-  const foreign = `${socketPath}-foreign`;
+// A post-handoff failure whose cleanup meets a foreign entry: the original error is still what the caller sees,
+// and what the cleanup found is reported separately rather than folded into it or swallowed.
+it("keeps the original failure and reports a foreign entry the cleanup met separately", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+  const other = await liveReplacement(root);
+  const injected = new Error("post-handoff initialization failed");
 
   const failure = await listenForOwnerSideband({
     socketPath,
     token: TOKEN,
     failpoint: async (/** @type {string} */ stage) => {
-      if (stage !== "after_bind") return;
-      // Another actor replaces this path with its own live listening socket, then this call fails.
-      await rm(socketPath);
-      const other = await listenForOwnerSideband({ socketPath: foreign, token: TOKEN });
-      cleanup.push(() => other.close());
-      await rename(foreign, socketPath);
-      throw new Error("the endpoint was replaced before this call finished");
+      if (stage !== "after_handoff") return;
+      await other.replaceOnto(socketPath);
+      throw injected;
     },
   }).then(() => undefined, (/** @type {unknown} */ error) => error);
 
-  // The original failure is what the caller is told, whatever the cleanup met.
-  expect(`${/** @type {Error} */ (failure).message}`).toBe("the endpoint was replaced before this call finished");
-  // And the replacement is gone, removed by the close of the handle that had bound this pathname.
-  await expect(lstat(socketPath)).rejects.toMatchObject({ code: "ENOENT" });
+  expect(failure).toBe(injected);
+  expect(`${/** @type {any} */ (failure).sidebandCleanup}`).toMatch(/left alone/u);
+  expect(await other.stillAnswers(socketPath)).toBe("alive\n");
+});
+
+// Every client this attempt accepted is destroyed by its own teardown, so a connected owner cannot hold the
+// shutdown open and no socket outlives the listener that served it.
+it("destroys the clients it accepted when it closes", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+  const listener = await listenForOwnerSideband({ socketPath, token: TOKEN });
+  const arriving = listener.nextOwner();
+  const raw = await rawOwner(socketPath);
+  await raw.write(helloLine());
+  const owner = await arriving;
+
+  await listener.close();
+
+  await expect(owner.closed).resolves.toMatchObject({ refusal: undefined });
 });
 
 // Operator-visible failure: cleanup that unlinks on any failure would delete the socket of the listener that

@@ -121,22 +121,22 @@ async function openPtyProcess({ args, label, spawned }) {
     /**
      * Type into this process's terminal. One write, and no retry.
      *
-     * `openOwnerPty`'s `write` may accept a prefix and then throw `PTY_INPUT_BACKPRESSURE`, and in the
-     * mechanism's current state the accepted byte count exists only inside that error's human-readable
-     * message. Parsing prose for a resume offset would be a guess, and re-writing the whole buffer would
-     * duplicate the prefix the terminal already took, so this does neither: a partial write fails the smoke
-     * loudly and says why. When the mechanism exposes a structured `bytesWritten`/`totalBytes`, this is the
-     * one place that changes.
+     * `openOwnerPty`'s `write` refuses a partial write with numeric `bytesWritten`/`totalBytes` on the error, so
+     * the accepted suffix boundary is data rather than prose. This smoke still does not retry: it types spans a
+     * terminal's input buffer takes whole, so a partial write means something it does not model happened. It
+     * fails loudly and reports those two numbers as numbers — nothing is parsed out of the message text.
      */
     write(text) {
       const bytes = Buffer.from(text, "utf8");
       try {
         handle.write(bytes);
       } catch (cause) {
+        const failure = /** @type {{ code?: string, bytesWritten?: number | null, totalBytes?: number | null }} */ (cause);
         throw new Error(
-          `${label}: writing ${bytes.byteLength} bytes to its terminal failed (${/** @type {any} */ (cause).code ?? "unknown"}). ` +
-            "Nothing was retried and nothing was parsed out of the error text: the accepted byte count is not " +
-            "available as structured data, so a retry could duplicate input the terminal already accepted.",
+          `${label}: writing ${bytes.byteLength} bytes to its terminal failed (${failure.code ?? "unknown"}, ` +
+            `bytesWritten ${failure.bytesWritten ?? "null"} of totalBytes ${failure.totalBytes ?? "null"}). ` +
+            "Nothing was retried: this smoke types spans small enough to be accepted whole, so a partial write is " +
+            "a condition it does not model. The counts above are read as numbers from the error, never parsed from its text.",
           { cause },
         );
       }
@@ -395,18 +395,23 @@ async function driveSmoke({ root, evidenceDir, spawned, recordOwner }) {
       "tools are disabled with -nt, so no tool call, no child process and no Kitty graphics path is exercised",
       "geometry is fixed at launch; a client with a different terminal size is warned, not resized",
     ],
-    // The owner pseudo-terminal this ran on is a provisional dependency whose own review returned BLOCK. A
-    // passing smoke does not make it reviewed, so every run carries the caveat in its own artifact.
-    dependencyUnderReview: {
-      mechanism: "runtime/pty-mechanism.mjs and vendor/pty, merged provisionally from 715e59e",
-      verdict: "BLOCK",
-      openP1: [
-        "spawned identity can race the native reaper and PID reuse, so every owner identity recorded here inherits that doubt",
-        "a partial PTY write reports its accepted byte count only in error text; this smoke parses none of it and retries nothing",
-        "third-party notices for the shipped native artifact are unresolved, which blocks release and package qualification",
+    // The owner pseudo-terminal this ran on is merged from a reviewed correction whose remaining verdict is
+    // release-only. A passing smoke is not a release qualification, so every run carries that caveat.
+    dependency: {
+      mechanism: "runtime/pty-mechanism.mjs and vendor/pty, merged from a08bfcaa9706324eadf7347a738e81552c2cdb98",
+      artifactSha256: "1ed4ec08eb43cb1f608d5aa156d0232bc7b6965ad14852e2410ba7c64a68d7e5",
+      functionalFindingsResolved: [
+        "the owner's identity is bound at birth from a /proc snapshot read before the waiting thread starts, so a recorded PID, start identity and session cannot belong to a recycled PID",
+        "later foreground-group reads compare start identity and refuse a changed one",
+        "a partial or failed terminal write carries numeric bytesWritten/totalBytes; this smoke reports those numbers and parses no prose",
       ],
+      openVerdict: "BLOCK, release-only",
+      openP1: [
+        "@replit/ruspty@3.7.1 declares MIT but supplies no authoritative license notice, which blocks redistribution and package qualification",
+      ],
+      openP2: ["the generated provenance description understates its input groups; not a functional or release blocker, and not addressed here"],
       notCalledHere: ["foregroundProcessGroup", "resize"],
-      authorized: "run in place from this worktree; no redistribution and no live activation",
+      authorized: "private demo integration, run in place from this worktree; no publication, redistribution or live activation",
     },
     atMs: Date.now(),
   };

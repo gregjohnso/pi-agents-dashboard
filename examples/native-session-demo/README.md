@@ -5,9 +5,10 @@ session is still there — same process, same draft, same screen.
 
 This is a **development-only integration demo**. It ships in no tarball, it is not a product entry point, it
 registers a **labelled fake provider** that calls no model and needs no credential, and it makes no claim to
-be qualified. It also stands on an owner pseudo-terminal mechanism whose own review returned **BLOCK** — see
-[The mechanism underneath is not reviewed-clean](#the-mechanism-underneath-is-not-reviewed-clean). Read
-[Honest limits](#honest-limits) before drawing a conclusion from any of it.
+be qualified. The owner pseudo-terminal mechanism underneath it has had its functional findings corrected, but
+its remaining verdict still blocks **redistribution** — see
+[The mechanism underneath: corrected, still not publishable](#the-mechanism-underneath-corrected-still-not-publishable).
+Read [Honest limits](#honest-limits) before drawing a conclusion from any of it.
 
 ## What it actually is
 
@@ -108,6 +109,10 @@ The owner keeps running with zero clients attached — same PID, same start iden
 ```bash
 $NODE $DEMO status --root /tmp/pi-nsd-mine | grep -E 'ownerAliveWithZeroClients|"pid"|startIdentity'
 ```
+
+`ownerAliveWithZeroClients` means no reap has been published for the owner and no client is attached. The
+mechanism's `reapIfExited()` is a published cache, so `null` is not proof of life on its own; the smoke
+corroborates liveness by re-reading the owner's `/proc` identity and comparing its start identity.
 
 Attach again with the same `--id` and it is a new epoch of that attachment. Pi repaints it cold, and the draft
 you never sent is still on the screen, because it never left Pi.
@@ -224,21 +229,21 @@ recorded, not that a stop was verified. Only runs from this correction onward ca
 - **Linux, x86-64, glibc.** That is what the owner pseudo-terminal artifact supports; it refuses other hosts
   by name.
 
-## The mechanism underneath is not reviewed-clean
+## The mechanism underneath: corrected, still not publishable
 
 The owner pseudo-terminal this demo runs on is `runtime/pty-mechanism.mjs` and the committed artifact in
-`vendor/pty/`, merged into this tree from commit `715e59e` as a **provisional dependency**. Its own review
-returned **BLOCK** with three P1 findings. It must not be described as reviewed, and a correction is being
-made in that leaf, not here.
+`vendor/pty/`, merged into this tree from commit `a08bfca` — the reviewed correction of `715e59e`. Its scoped
+re-review resolved both functional P1 findings this demo previously inherited. What remains is a **release
+blocker**, not a functional one.
 
-What that means for this demo, concretely:
-
-| Finding | What this demo does with it |
+| Finding | Where it stands |
 | --- | --- |
-| **Spawned identity can race the native reaper and PID reuse.** The initial `/proc/<pid>` reads are not bound to the spawned child, so a recorded `startIdentity`, session and process group could in principle belong to a recycled PID. | Every owner identity this demo records, compares and prints inherits that doubt, including `status`'s `ownerAliveWithZeroClients` and the smoke's identity check. Nothing here works around it: no second identity spelling is invented, because the correction will supply a birth-bound native snapshot and a later start-identity comparison, and this demo will adopt that. The one real mitigation already present is that `stop` prefers Pi's own end-of-input and the native reaper's `wait()` status, and only escalates through the repository's verified group stop — which re-reads and refuses a mismatched identity — if that times out. |
-| **`foregroundProcessGroup()` re-reads by bare PID and compares no start identity.** | Not called anywhere in this demo. Foreground-group corroboration is not part of the path shown here. |
-| **A partial PTY write reports its accepted byte count only in error text.** | `handle.write` is used in exactly one place, `smoke.mjs`, to type into the smoke's own client terminals. It parses nothing out of that error and retries nothing: a partial write fails the smoke loudly, because re-writing the buffer would duplicate bytes the terminal already accepted and dropping it would lose them. |
-| **Third-party notices for the shipped native artifact are unresolved.** | This blocks release and package qualification. It is not a claim about a private experimental demo, and nothing here authorizes redistribution or live activation of that artifact. This demo is run in place, from a worktree, by the person who built it. |
+| **Spawned identity could race the native reaper and PID reuse.** | **Resolved in `a08bfca`.** The native patch reads `/proc/<pid>/stat` before the sole waiting thread starts, and every initial identity, session and terminal field this demo records comes from that birth snapshot. Later foreground-group reads compare start identity and refuse a changed one. `stop` still prefers Pi's own end-of-input and the reaper's `wait()` status, and escalates only through the repository's verified group stop. |
+| **A partial PTY write reported its accepted byte count only in error text.** | **Resolved in `a08bfca`.** The error now carries numeric `bytesWritten`/`totalBytes`. `handle.write` is still used in exactly one place, `smoke.mjs`, and it still does not retry: it types spans a terminal accepts whole, so a partial write fails the smoke loudly. The failure reports those two counts **as numbers read from the error**, never parsed from its message. |
+| **`reapIfExited()` is a published cache.** | Documented in the mechanism: `null` is not proof of life. This demo's `ownerAliveWithZeroClients` is read that way, and the smoke proves liveness with a `/proc` identity comparison instead. |
+| **`@replit/ruspty@3.7.1` declares MIT but supplies no authoritative license notice.** | **Open, and release-only.** It blocks redistribution and package qualification of the native artifact. It does not block this private, unpublished demo. Nothing here authorizes publication or live activation, and the demo ships in no tarball. |
+| **The generated provenance description understates its input groups.** | Open, non-blocking, and not this demo's to fix. Noted so nobody reads the notices file as complete provenance. |
 
-So: this is an **executable candidate** with those limitations named, not a clean handoff. The commands above do
-run, end to end, and the recorded evidence is real; the dependency underneath still owes a correction.
+So: the functional doubt this demo used to carry is gone, and what is left is a licensing gap that stops the
+mechanism from being shipped — not from being run here, in place, by the person who built it. The commands
+above run end to end and the recorded evidence is real; none of it is a release qualification.

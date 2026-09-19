@@ -1029,6 +1029,86 @@ describe("durable replay of an impossible history", () => {
     expect(await next.reservations.reconcile({ canonicalFile: second })).toMatchObject({ state: "live", owner: expect.objectContaining({ runId: other.runId }) });
     expect(await admitting(next, { operation: "resume", generation: 1, target: second })).toMatchObject({ refused: true, code: "TARGET_HAS_LIVE_WRITER" });
   });
+
+  /**
+   * A run id is not an owner run.
+   *
+   * `sameOwnerRun` compares all six `OWNER_FIELDS`, and live admission seeds its spent-id sets through that
+   * same comparison, so two owner runs that share a run id are distinct everywhere the module decides
+   * anything. A key naming only the run id is a second, coarser identity: it conflates them, so the second
+   * owner run's perfectly legal record is refused on replay after live admission accepted it.
+   */
+  it("replays two owner runs that share a run id but not their full identities", async () => {
+    const domain = await sessionDirectory();
+    const first = await realFile(join(domain.session, "shared-run-id-first.jsonl"));
+    const second = await realFile(join(domain.session, "shared-run-id-second.jsonl"));
+    const sharedRunId = `run-shared-${randomUUID()}`;
+    const one = ownerRun({ runId: sharedRunId, initialRowId: "row-1", ownerPid: 4242 });
+    const two = ownerRun({ runId: sharedRunId, initialRowId: "row-2", ownerPid: 4243 });
+    const host = await openOwner(domain, { owner: one });
+    const reservationId = await bind(host, first, 1);
+    await host.reservations.close();
+    const records = await journalRecords(domain.journalPath);
+    expect(records.map((record) => record.record)).toEqual(["prepared", "committed"]);
+
+    // The second owner run reuses both ids on its own file, while the first owner's claim is still live.
+    const identity = await claimIdentityOf(second);
+    await appendRecord(domain, {
+      record: "prepared",
+      owner: two,
+      operationId: records[0].operationId,
+      reservationId,
+      operation: "startup",
+      generation: 1,
+      requestedTarget: second,
+      target: identity,
+      source: null,
+    });
+    await appendRecord(domain, { record: "committed", owner: two, reservationId, generation: 1, binds: true, target: identity });
+
+    const next = await openOwner(domain);
+    expect(await next.reservations.reconcile({ canonicalFile: first })).toMatchObject({ state: "live", owner: expect.objectContaining({ ownerPid: one.ownerPid }) });
+    expect(await next.reservations.reconcile({ canonicalFile: second })).toMatchObject({ state: "live", owner: expect.objectContaining({ ownerPid: two.ownerPid }) });
+    for (const file of [first, second]) {
+      expect(await admitting(next, { operation: "resume", generation: 1, target: file }), file).toMatchObject({ refused: true, code: "TARGET_HAS_LIVE_WRITER" });
+    }
+  });
+
+  /**
+   * Two pairs that differ only by where a colon falls.
+   *
+   * Nothing forbids the separator: `identifier` and `boundedString` accept any bounded non-empty string, and
+   * this module's own `hostId` is `${machineId}:${hostname}`, so a joined key carries one by construction.
+   * Run id `run` with reservation `seg:res`, and run id `run:seg` with reservation `res`, join to the same
+   * string; so do their operation ids. They are two different owner runs holding two different files.
+   */
+  it("replays two owner runs whose joined ids collide on the separator", async () => {
+    const domain = await sessionDirectory();
+    const first = await realFile(join(domain.session, "separator-first.jsonl"));
+    const second = await realFile(join(domain.session, "separator-second.jsonl"));
+    const one = ownerRun({ runId: "run" });
+    const two = ownerRun({ runId: "run:seg" });
+    const firstIdentity = await claimIdentityOf(first);
+    const secondIdentity = await claimIdentityOf(second);
+
+    await appendRecord(domain, {
+      record: "prepared", owner: one, operationId: "seg:op", reservationId: "seg:res",
+      operation: "startup", generation: 1, requestedTarget: first, target: firstIdentity, source: null,
+    });
+    await appendRecord(domain, { record: "committed", owner: one, reservationId: "seg:res", generation: 1, binds: true, target: firstIdentity });
+    await appendRecord(domain, {
+      record: "prepared", owner: two, operationId: "op", reservationId: "res",
+      operation: "startup", generation: 1, requestedTarget: second, target: secondIdentity, source: null,
+    });
+    await appendRecord(domain, { record: "committed", owner: two, reservationId: "res", generation: 1, binds: true, target: secondIdentity });
+
+    const next = await openOwner(domain);
+    expect(await next.reservations.reconcile({ canonicalFile: first })).toMatchObject({ state: "live", owner: expect.objectContaining({ runId: "run" }) });
+    expect(await next.reservations.reconcile({ canonicalFile: second })).toMatchObject({ state: "live", owner: expect.objectContaining({ runId: "run:seg" }) });
+    for (const file of [first, second]) {
+      expect(await admitting(next, { operation: "resume", generation: 1, target: file }), file).toMatchObject({ refused: true, code: "TARGET_HAS_LIVE_WRITER" });
+    }
+  });
 });
 
 describe("crash at each side effect", () => {

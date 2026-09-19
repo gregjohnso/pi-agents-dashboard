@@ -456,7 +456,7 @@ carries its own source tests plus one line of an 0003 test that pinned the whole
 | 3 | `0003-native-presentation-readiness.patch` | `cf7f5ccca6358612f17bb65583f17934fb795b9935c921efe0fbaba1737bdfb9` (serialized; the lane's own diff was `8a483bf73c9b6d6d44cea44eae2289386946e545f1b6fa2b8bd6a5fd88542868`) | `9c40d805754c6cbc5dd161ec4e1c6880b1bc1ef4` |
 | 4 | `0004-native-canonical-admission.patch` | `1f5e78f4ebdeafcc8a161d3b0c02613256902981a12adf540ff2509329bf89d5` (authored at this position; its first form was `66cdeaacf78c3e18e8f7512abf928d7a509691ea776f368d417a60ae0e446dc0`, and the form before the one-use reservation and string-message corrections was `425ac07a02a6d10261f01ad9b8048ee5719ab745f1af6e7ffb2a08e21fc6b9d1`) | `69762c6631d6395b989735cef63f6c97a9511bf9` |
 | 5 | `0005-native-child-handoff.patch` | `18138c0612bf244e3cddb0d9f759b875c6786f1836a84bd082be72071b44bcaa` (taken after 0003 and carried unchanged at this position) | `daa4eb307949768e750c0b5c6c103ef2ccdb3430` |
-| 6 | `0006-native-consumer-capabilities.patch` | `63f186b735e440751777c70bfd564a0c5df8244ad1ad3bc6a1abef1ad60ea510` (authored at this position, against the tree positions 1-5 produce; its first form was `4a2647cd4426f7f7e80a6b51cc12b962eb5b9182d9c27273240cc7af0e7383eb`, before the ordered interval's cold-reassertion error path was closed, and then `db4d51b8dbfb0c9617e3f9de132eeb5296bbf355c8c1b6fa4fcd5caf55d83bd2`, before the BEGIN and END writes were brought inside that region) | `029408d6f4f4e397b621438a3f80b3fb034f99ab` |
+| 6 | `0006-native-consumer-capabilities.patch` | `37ddaec09df091fdf30ab3f8c10c32cfdf9820730f714323c6356b80907f548b` (authored at this position, against the tree positions 1-5 produce. Its qualified form is `63f186b735e440751777c70bfd564a0c5df8244ad1ad3bc6a1abef1ad60ea510`, which cohort `3757199` was built from; the current digest differs from it by a test hunk only, verified block by block. Earlier forms: `4a2647cd…` before the cold-reassertion error path was closed, then `db4d51b8…` before the BEGIN and END writes were brought inside that region) | `746091b78ce7b505f0170c2cb8866fe786cbb25c` (test overlay; the qualified tree is `029408d6f4f4e397b621438a3f80b3fb034f99ab`) |
 
 Position 4's tree is the one the reviewed seam D lane prepared (build job `3751264`), because positions 1-4
 are the same bytes in the same order there. Position 5's tree is this composition's own: 0005 applied to that
@@ -551,13 +551,23 @@ five-patch cohort of 9.0; `pi-tui` and `pi-coding-agent` are the two that change
 A consumer selects this cohort by its generated manifest, never by a default path. Byte reproducibility is not
 claimed: it is one build, recorded, not re-derived.
 
+**Test-only overlay after this build.** `0006`'s embedded `packages/tui/test/native-marker-failure.test.ts` was
+later corrected: its cleanup-write double threw before returning an accepted length, so three cases that claimed
+zero, partial and full cleanup admission all admitted zero. The patch digest therefore moved to
+`37ddaec09df091fdf30ab3f8c10c32cfdf9820730f714323c6356b80907f548b` and the prepared tree to
+`746091b78ce7b505f0170c2cb8866fe786cbb25c`, and **this table is not restated for them**: job `3757199` was built
+from patch `63f186b7…` and tree `029408d6…`, and its manifest, package and CLI digests stay exactly as recorded
+above. Every production hunk is byte-identical across that overlay, block by block, so the artifact was reused
+rather than rebuilt; the per-block proof and the overlay's own source run are in
+`native-consumer-seams/cleanup-test-correction/` in the orchestration workspace.
+
 `test/native-consumer-capabilities.test.mjs` is the suite that exists only because of `0006`. Against the
 five-patch cohort of 9.0 it fails 15 of its 18 original cases, including the real blocked-`session_start`
 consumer and the pseudo-terminal marker case; the three that pass in both are the cohort identity case and the
-two that require the default output to carry **no** marker byte. It now carries 27 cases: the added ones cover
-the ordered interval's error paths — including a marker write that throws after admitting zero, some or all of
-its bytes — and feed the decoder the actual arriving reads from a pseudo-terminal. Three of them fail against the
-superseded `3756759` cohort, and three others against `3756157`.
+two that require the default output to carry **no** marker byte. It now carries 30 cases: the added ones cover
+the ordered interval's error paths — including a marker write, and separately the cleanup write, that throws
+after admitting zero, some or all of its bytes — and feed the decoder the actual arriving reads from a
+pseudo-terminal. Three of them fail against the superseded `3756759` cohort, and three others against `3756157`.
 
 ### 9.1 What the composition itself does not deliver
 

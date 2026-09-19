@@ -406,6 +406,73 @@ describeCohort("the built cohort brackets an ordered presentation on the termina
 			).toEqual(["begin", "abort"]);
 		});
 	}
+	/**
+	 * The cleanup write failing after admitting zero, part or all of itself, on the installed artifact.
+	 *
+	 * The source suite sweeps this too; this proves the shipped code behaves the same way, and it exists because
+	 * the earlier version of both suites modelled only zero admission under three different titles. Each case
+	 * reconstructs the physical stream and requires exactly the chosen cleanup prefix in it.
+	 */
+	for (const [label, chooseAdmitted] of [
+		["zero bytes of", () => 0],
+		["a 7-byte prefix of", () => 7],
+		["all of", (length) => length],
+	]) {
+		it(`reports uncertainty without the token when the channel admits ${label} the cleanup write and throws`, async () => {
+			const token = tui.mintNativePresentToken();
+			const begin = tui.encodeNativePresentBegin(token);
+			const cleanup = `\x1b\\${tui.encodeNativePresentAbort(token)}`;
+			const admitted = chooseAdmitted(cleanup.length);
+			const terminal = new MarkerRecordingTerminal(100, 30, {
+				reassertThrows: true,
+				refuseAbort: true,
+				cleanupAdmits: admitted,
+			});
+			// The cleanup's own error carries the token, which is exactly what a formatted warning would leak.
+			terminal.cleanupFailure = new Error(`channel closed while writing cleanup for token ${token}`);
+			const renderer = new tui.TuiAltScreen(terminal);
+			renderer.addChild(new tui.Text("current ui", 0, 0));
+			renderer.start();
+			const warnings = [];
+			const onWarning = (warning) => warnings.push(warning.message);
+			process.on("warning", onWarning);
+			const before = terminal.writes.length;
+			try {
+				// The caller still learns the original reassertion failure, not the cleanup write's.
+				expect(() =>
+					renderer.presentNow({
+						requestId: `cleanup-admits-${admitted}`,
+						coldTerminal: true,
+						ordering: { version: 1, token },
+					}),
+				).toThrow(/reassertNegotiatedModes failed/);
+				const emitted = terminal.since(before);
+				renderer.stop();
+				// One cleanup attempt, never a second, however much of it was admitted.
+				expect(terminal.abortAttempts).toBe(1);
+				expect(terminal.attempts.filter((data) => data === cleanup)).toHaveLength(1);
+				// The physical stream is the whole BEGIN plus exactly the admitted cleanup prefix, and no END.
+				expect(emitted, `cleanup admitted ${admitted}: the stream is not BEGIN plus that exact prefix`).toBe(
+					`${begin}${cleanup.slice(0, admitted)}`,
+				);
+				expect(emitted).not.toContain(";E;");
+				// `process.emitWarning` is asynchronous, so it is read on a later turn rather than now.
+				await new Promise((resolve) => setImmediate(resolve));
+				expect(
+					warnings.some((message) => message.includes("unknown") && message.includes("Nothing is retried")),
+					`no honest report of the failed cleanup write: ${JSON.stringify(warnings)}`,
+				).toBe(true);
+				// Even with the whole cleanup admitted, neither framing state is knowable after a write that threw.
+				expect(warnings.every((message) => !/stayed open|definitely closed/.test(message))).toBe(true);
+				expect(warnings.every((message) => !message.includes(token))).toBe(true);
+				expect(warnings.every((message) => !message.includes("channel closed"))).toBe(true);
+			} finally {
+				// In a `finally`, so a failing expectation cannot leak this listener into the next case.
+				process.off("warning", onWarning);
+			}
+		});
+	}
+
 	it("reports an uncertain cleanup instead of claiming a framing state, and never retries it", async () => {
 		const token = tui.mintNativePresentToken();
 		const terminal = new MarkerRecordingTerminal(100, 30, { reassertThrows: true, refuseAbort: true });

@@ -53,15 +53,17 @@ export { loadArtifactsManifest };
  *
  * Two injectable failures, both of them real implementations a renderer does not own:
  * `reassertThrows` makes `reassertNegotiatedModes()` throw, which is the terminal-side failure that must still
- * close an ordered interval; `refuseAbort` makes the failed-attempt cleanup write throw, which is the case where
- * there is nothing left to close the framing with.
+ * close an ordered interval; `refuseAbort` makes the failed-attempt cleanup write throw **after admitting
+ * `cleanupAdmits` bytes of it**, which is the case where there is nothing left to close the framing with. The
+ * admitted count defaults to 0 and is recorded in `writes`, so a case can reconstruct the physical stream and
+ * distinguish zero, partial and full cleanup admission instead of modelling zero three times over.
  *
  * `admitPrefixOf` models the one thing `Terminal.write` never reports: how many bytes a throwing write admitted.
  * Given a predicate and a length it records that prefix as really written and then throws, so a case can drive
  * zero, partial and full acceptance before a throw and reconstruct the exact physical stream.
  */
 export class MarkerRecordingTerminal {
-	constructor(columns = 100, rows = 30, { reassertThrows = false, refuseAbort = false } = {}) {
+	constructor(columns = 100, rows = 30, { reassertThrows = false, refuseAbort = false, cleanupAdmits = 0 } = {}) {
 		this._columns = columns;
 		this._rows = rows;
 		this.writes = [];
@@ -71,9 +73,13 @@ export class MarkerRecordingTerminal {
 		this.negotiatedKittyFlags = 7;
 		this.reassertThrows = reassertThrows;
 		this.refuseAbort = refuseAbort;
+		/** How many bytes of the cleanup write to admit before `refuseAbort` throws. */
+		this.cleanupAdmits = cleanupAdmits;
 		/** `(data) => number | undefined`: admit that many bytes of this write and then throw. */
 		this.admitPrefixOf = undefined;
 		this.failure = undefined;
+		/** The error the refused cleanup write throws. Its message carries a token when a case sets one. */
+		this.cleanupFailure = undefined;
 	}
 
 	start(onInput, onResize) {
@@ -93,7 +99,11 @@ export class MarkerRecordingTerminal {
 		this.attempts.push(data);
 		if (this.refuseAbort && typeof data === "string" && data.includes(";A;")) {
 			this.abortAttempts += 1;
-			throw new Error("the output channel refused the cleanup write");
+			// The admitted prefix is recorded before the throw, because that is the only shape a real channel
+			// can present: `Terminal.write` reports no accepted-byte count when it fails.
+			const admit = Math.min(this.cleanupAdmits, data.length);
+			if (admit > 0) this.writes.push(data.slice(0, admit));
+			throw this.cleanupFailure ?? new Error("the output channel refused the cleanup write");
 		}
 		const accepted = this.admitPrefixOf?.(data);
 		if (accepted !== undefined) {

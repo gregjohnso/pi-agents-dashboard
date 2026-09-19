@@ -2516,10 +2516,10 @@ index 0000000000000000000000000000000000000000..7a8f1545597bc145c43362beb5f49e3a
 +});
 diff --git a/packages/tui/test/native-marker-failure.test.ts b/packages/tui/test/native-marker-failure.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..3ad6bff7bab116aa4a456cfb919accb23a08791f
+index 0000000000000000000000000000000000000000..3db30c25d42eb4081c32ec84f7d31acaee7fa80d
 --- /dev/null
 +++ b/packages/tui/test/native-marker-failure.test.ts
-@@ -0,0 +1,487 @@
+@@ -0,0 +1,557 @@
 +import assert from "node:assert";
 +import { randomUUID } from "node:crypto";
 +import { describe, it } from "node:test";
@@ -2559,35 +2559,48 @@ index 0000000000000000000000000000000000000000..3ad6bff7bab116aa4a456cfb919accb2
 + * bytes reached the terminal. After a write that threw, none of that is knowable from this side.
 + */
 +
++/**
++ * One write's fate.
++ *
++ * A number admits that many bytes and then throws the terminal's **own** error, so a case can assert which
++ * error identity reached the caller. An object admits `admit` bytes and then throws exactly `throws`, which is
++ * what lets a case model a write that takes a prefix and then fails with an error of its own choosing — a
++ * cleanup write whose message carries the attempt's token, for instance. Returning a plain number cannot express
++ * that, and an earlier version of this suite worked around it by throwing from the fault callback itself, which
++ * bypassed the prefix-recording path entirely and silently modelled zero admission in every case.
++ */
++type WriteFault = number | { admit: number; throws: Error };
++
 +/** A terminal that admits a chosen prefix of a chosen write and then throws, recording what it really took. */
 +class PrefixAdmittingTerminal extends VirtualTerminal {
 +	/** Exactly the bytes this terminal admitted, in order. The physical stream, reconstructed. */
 +	readonly admitted: string[] = [];
 +	/** Every `write` call's full argument, throwing calls included. */
 +	readonly attempts: string[] = [];
-+	/**
-+	 * Decide one write's fate: `undefined` admits it whole, a number admits that many bytes and then throws.
-+	 * The thrown error is this terminal's own, so a test can check the caller received that identity.
-+	 */
-+	fail: ((data: string) => number | undefined) | undefined;
++	/** Decide one write's fate; `undefined` admits it whole. See {@link WriteFault}. */
++	fail: ((data: string) => WriteFault | undefined) | undefined;
 +	failure: Error | undefined;
 +	reassertCalls = 0;
 +	reassertThrows = false;
 +
 +	override write(data: string): void {
 +		this.attempts.push(data);
-+		const accepted = this.fail?.(data);
-+		if (accepted === undefined) {
++		const fault = this.fail?.(data);
++		if (fault === undefined) {
 +			this.admitted.push(data);
 +			super.write(data);
 +			return;
 +		}
-+		if (accepted > 0) {
-+			const prefix = data.slice(0, accepted);
++		// The admitted prefix is recorded before the throw, whichever error is thrown. That ordering is the
++		// whole point of this double: `Terminal.write` reports no accepted-byte count when it throws.
++		const admit = typeof fault === "number" ? fault : fault.admit;
++		if (admit > 0) {
++			const prefix = data.slice(0, admit);
 +			this.admitted.push(prefix);
 +			super.write(prefix);
 +		}
-+		this.failure = new Error(`the output channel admitted ${accepted} byte(s) and then failed`);
++		if (typeof fault !== "number") throw fault.throws;
++		this.failure = new Error(`the output channel admitted ${admit} byte(s) and then failed`);
 +		throw this.failure;
 +	}
 +
@@ -2636,6 +2649,28 @@ index 0000000000000000000000000000000000000000..3ad6bff7bab116aa4a456cfb919accb2
 +	const index = attempts.lastIndexOf(failedArgument);
 +	assert.notEqual(index, -1, "the failing write was never attempted");
 +	return attempts.slice(index + 1);
++}
++
++/**
++ * Collect the process warnings one body emits, and detach the listener whatever the body did.
++ *
++ * `process.emitWarning` is asynchronous, so the listener has to outlive the call that triggered it, and a
++ * `process.off` placed after an assertion is skipped when that assertion throws — which leaks the listener into
++ * the next case and makes its warning count wrong. The `finally` is what keeps a failing case from corrupting
++ * the case after it.
++ */
++async function collectWarnings(body: () => void | Promise<void>): Promise<string[]> {
++	const warnings: string[] = [];
++	const onWarning = (warning: Error) => warnings.push(warning.message);
++	process.on("warning", onWarning);
++	try {
++		await body();
++		// One turn, so an `emitWarning` issued by the body has been delivered before the listener goes away.
++		await new Promise<void>((resolve) => setImmediate(resolve));
++	} finally {
++		process.off("warning", onWarning);
++	}
++	return warnings;
 +}
 +
 +describe("an ordered attempt whose BEGIN write fails", () => {
@@ -2801,91 +2836,126 @@ index 0000000000000000000000000000000000000000..3ad6bff7bab116aa4a456cfb919accb2
 +});
 +
 +describe("an ordered attempt whose cleanup write also fails", () => {
-+	for (const accepted of [0, 7, "all"] as const) {
-+		it(`reports uncertainty without the token when cleanup admits ${accepted} byte(s) and throws`, async () => {
++	// Zero, partial and full admission of the cleanup write itself, named by the byte count each case asks the
++	// channel to take before it fails. The count is not decoration: every case reconstructs the physical stream
++	// and requires exactly that many cleanup bytes in it.
++	const cleanupAdmissions: [string, (cleanupLength: number) => number][] = [
++		["zero", () => 0],
++		["a 7-byte prefix of", () => 7],
++		["all", (cleanupLength) => cleanupLength],
++	];
++	for (const [label, chooseAdmitted] of cleanupAdmissions) {
++		it(`reports uncertainty without the token when the channel admits ${label} the cleanup write and throws`, async () => {
 +			const token = mintNativePresentToken();
 +			const begin = encodeNativePresentBegin(token);
 +			const cleanup = encodeNativePresentFailedAttemptCleanup(token);
++			const admitted = chooseAdmitted(cleanup.length);
 +			const { terminal, tui } = mount(renderers[0]![1]);
-+			// The first failure is the BEGIN write; the cleanup then fails too, with an error whose message
-+			// contains the token - exactly the leak a formatted warning would have published.
++			const streamMark = terminal.admitted.length;
++			// The first failure is the BEGIN write, which admits 3 bytes. The cleanup then fails too, after
++			// admitting this case's chosen prefix, with an error whose message contains the token - exactly the
++			// leak a formatted warning would have published. `{ admit, throws }` is what makes the prefix real:
++			// throwing from the fault callback would bypass the recording path and admit nothing.
++			const cleanupFailure = new Error(`channel closed while writing cleanup for token ${token}`);
 +			terminal.fail = (data) => {
 +				if (data === begin) return 3;
-+				if (data === cleanup) {
-+					terminal.failure = new Error(`channel closed while writing cleanup for token ${token}`);
-+					throw terminal.failure;
-+				}
++				if (data === cleanup) return { admit: admitted, throws: cleanupFailure };
 +				return undefined;
 +			};
-+			const warnings: string[] = [];
-+			const onWarning = (warning: Error) => warnings.push(warning.message);
-+			process.on("warning", onWarning);
 +			let thrown: unknown;
-+			try {
-+				tui.presentNow({
-+					requestId: `cleanup-fails-${String(accepted)}`,
-+					coldTerminal: true,
-+					ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
-+				});
-+			} catch (error) {
-+				thrown = error;
-+			}
-+			terminal.fail = undefined;
-+			tui.stop();
++			let attempts: string[] = [];
++			let stream = "";
++			const warnings = await collectWarnings(() => {
++				try {
++					tui.presentNow({
++						requestId: `cleanup-fails-${admitted}`,
++						coldTerminal: true,
++						ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++					});
++				} catch (error) {
++					thrown = error;
++				}
++				terminal.fail = undefined;
++				attempts = terminal.attempts.slice();
++				stream = terminal.admitted.slice(streamMark).join("");
++				tui.stop();
++			});
 +
-+			// The caller still learns the original BEGIN failure, not the cleanup's.
-+			assert.match(String(thrown), /admitted 3 byte\(s\)/, "the cleanup failure replaced the original error");
-+			// One cleanup attempt, never a second.
-+			assert.equal(terminal.attempts.filter((data) => data === cleanup).length, 1, "cleanup was retried");
++			// The physical stream, reconstructed: the BEGIN prefix the channel took, then exactly the cleanup
++			// prefix it took. This is the assertion the previous version of this suite did not make, which is how
++			// three cases that all admitted zero cleanup bytes could pass under three different titles.
++			assert.equal(
++				stream,
++				`${begin.slice(0, 3)}${cleanup.slice(0, admitted)}`,
++				`cleanup admitted ${admitted}: the stream is not the admitted BEGIN prefix followed by exactly the ` +
++					`admitted cleanup prefix`,
++			);
++			// And the same fact stated the other way round, so a stream that merely contains the bytes somewhere
++			// cannot satisfy it.
++			assert.ok(
++				stream.endsWith(cleanup.slice(0, admitted)),
++				`cleanup admitted ${admitted}: the stream does not end with the admitted cleanup prefix`,
++			);
++			assert.equal(
++				stream.length - begin.slice(0, 3).length,
++				admitted,
++				`cleanup admitted ${admitted}: a different number of cleanup bytes reached the stream`,
++			);
 +
-+			// `process.emitWarning` is asynchronous, so it is read on a later turn.
-+			await new Promise<void>((resolve) => setImmediate(resolve));
-+			process.off("warning", onWarning);
++			// The caller still learns the original BEGIN failure: same identity, and never the cleanup's error.
++			assert.equal(thrown, terminal.failure, `cleanup admitted ${admitted}: the original error identity is lost`);
++			assert.notEqual(thrown, cleanupFailure, "the cleanup failure replaced the original error");
++			assert.match(String(thrown), /admitted 3 byte\(s\)/);
++			// One cleanup attempt, never a second, however much of it was admitted.
++			assert.equal(attempts.filter((data) => data === cleanup).length, 1, "cleanup was retried");
++			assert.deepEqual(writesAfterFailure(attempts, begin), [cleanup], "more than the one cleanup write followed");
++
 +			assert.equal(warnings.length, 1, `exactly one warning: ${JSON.stringify(warnings)}`);
 +			const [warning] = warnings as [string];
 +			// The token, the marker bytes and the arbitrary error text are all absent.
 +			assert.ok(!warning.includes(token), "the warning reproduced the attempt's token");
 +			assert.ok(!warning.includes("pi-native-present"), "the warning reproduced marker bytes");
 +			assert.ok(!warning.includes("channel closed"), "the warning formatted the thrown error's message");
-+			// And it claims neither outcome for the framing.
++			// And it claims neither outcome for the framing, which is the only honest answer after a write that
++			// threw having admitted an unknown amount - including the fully admitted case here.
 +			assert.ok(/unknown/.test(warning), `the warning does not report uncertainty: ${warning}`);
 +			assert.ok(!/stayed open|definitely closed/.test(warning), `the warning claims a framing state: ${warning}`);
 +		});
 +	}
 +
-+	it("keeps a no-complete-frame refusal a refusal even when its one cleanup write fails", () => {
++	it("keeps a no-complete-frame refusal a refusal even when its one cleanup write fails mid-admission", async () => {
 +		const token = mintNativePresentToken();
 +		const cleanup = encodeNativePresentFailedAttemptCleanup(token);
 +		const { terminal, tui } = mount(renderers[0]![1]);
-+		// A render that neither throws nor mints a receipt, and a cleanup channel that refuses.
++		const streamMark = terminal.admitted.length;
++		// A render that neither throws nor mints a receipt, and a cleanup channel that takes 5 bytes and then
++		// refuses. Partial admission here too: a refusal must not become a throw or a success either way.
 +		const patched = tui as unknown as { renderNow(force?: boolean): void };
 +		const real = patched.renderNow.bind(patched);
 +		patched.renderNow = () => {};
-+		terminal.fail = (data) => {
-+			if (data !== cleanup) return undefined;
-+			throw new Error("cleanup refused");
-+		};
-+		const warnings: string[] = [];
-+		const onWarning = (warning: Error) => warnings.push(warning.message);
-+		process.on("warning", onWarning);
-+		const outcome = tui.presentNow({
-+			requestId: "refusal-with-failing-cleanup",
-+			coldTerminal: false,
-+			ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++		terminal.fail = (data) =>
++			data === cleanup ? { admit: 5, throws: new Error("cleanup refused") } : undefined;
++		let outcome: unknown;
++		let stream = "";
++		let attempts: string[] = [];
++		const warnings = await collectWarnings(() => {
++			outcome = tui.presentNow({
++				requestId: "refusal-with-failing-cleanup",
++				coldTerminal: false,
++				ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++			});
++			patched.renderNow = real;
++			terminal.fail = undefined;
++			attempts = terminal.attempts.slice();
++			stream = terminal.admitted.slice(streamMark).join("");
++			tui.stop();
 +		});
-+		patched.renderNow = real;
-+		terminal.fail = undefined;
-+		tui.stop();
 +		// A failed cleanup does not turn a refusal into a throw or into a success.
 +		assert.deepEqual(outcome, { presented: false, reason: "no-complete-frame-support" });
-+		assert.equal(terminal.attempts.filter((data) => data === cleanup).length, 1);
-+		return new Promise<void>((resolve) => {
-+			setImmediate(() => {
-+				process.off("warning", onWarning);
-+				assert.equal(warnings.length, 1, `exactly one warning: ${JSON.stringify(warnings)}`);
-+				resolve();
-+			});
-+		});
++		assert.equal(attempts.filter((data) => data === cleanup).length, 1);
++		// BEGIN was admitted whole here, and the cleanup's first five bytes followed it and nothing more.
++		assert.equal(stream, `${encodeNativePresentBegin(token)}${cleanup.slice(0, 5)}`);
++		assert.equal(warnings.length, 1, `exactly one warning: ${JSON.stringify(warnings)}`);
 +	});
 +});
 +

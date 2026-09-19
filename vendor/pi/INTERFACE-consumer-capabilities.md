@@ -227,6 +227,17 @@ for a split or an interleave. A recorded transcript is secondary evidence only a
 is fed. In-process re-slicing of one buffer at a chosen stride remains in the suite as a supplementary check;
 it is synthetic, and an earlier receipt that called it "kernel-sized reads" was wrong.
 
+**How the write-failure cases are qualified.** A test double admits a chosen prefix of a chosen write and then
+throws, which is the only shape a channel with no accepted-byte count can present. Every case reconstructs the
+physical stream from what the double really took and requires exactly that prefix, so a title cannot stand in
+for a fact. BEGIN and END are swept at every byte prefix on both renderers; the cleanup write is covered at zero,
+partial and full admission, and the fully admitted case still reports uncertainty because a write that threw
+says nothing about what it admitted. An earlier version of this suite reported those three cleanup cases green
+while all three admitted zero bytes: the fault callback threw before returning an accepted length, so the
+double's prefix-recording path was never reached. That was a test defect, not a production one, and the
+correction is test-only — see `cleanup-test-correction/receipts.md` in the orchestration workspace for the
+per-block proof that every production hunk is byte-identical across it.
+
 **What a marker is not.** It is a boundary in a byte stream. It is not proof that a client decoded, flushed,
 parsed or displayed anything. A client acknowledgement is the host's work (Task 12/17) and is not in this
 patch.

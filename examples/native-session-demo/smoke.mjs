@@ -66,8 +66,28 @@ async function openPtyProcess({ args, label }) {
     handle,
     raw: () => raw,
     visible: () => stripSequences(raw),
+    /**
+     * Type into this process's terminal. One write, and no retry.
+     *
+     * `openOwnerPty`'s `write` may accept a prefix and then throw `PTY_INPUT_BACKPRESSURE`, and in the
+     * mechanism's current state the accepted byte count exists only inside that error's human-readable
+     * message. Parsing prose for a resume offset would be a guess, and re-writing the whole buffer would
+     * duplicate the prefix the terminal already took, so this does neither: a partial write fails the smoke
+     * loudly and says why. When the mechanism exposes a structured `bytesWritten`/`totalBytes`, this is the
+     * one place that changes.
+     */
     write(text) {
-      handle.write(Buffer.from(text, "utf8"));
+      const bytes = Buffer.from(text, "utf8");
+      try {
+        handle.write(bytes);
+      } catch (cause) {
+        throw new Error(
+          `${label}: writing ${bytes.byteLength} bytes to its terminal failed (${/** @type {any} */ (cause).code ?? "unknown"}). ` +
+            "Nothing was retried and nothing was parsed out of the error text: the accepted byte count is not " +
+            "available as structured data, so a retry could duplicate input the terminal already accepted.",
+          { cause },
+        );
+      }
     },
     waitFor(predicate, description, timeoutMs = 60_000) {
       if (predicate(stripSequences(raw), raw)) return Promise.resolve(Date.now());
@@ -258,6 +278,19 @@ export async function runSmoke({ root, evidenceDir }) {
       "tools are disabled with -nt, so no tool call, no child process and no Kitty graphics path is exercised",
       "geometry is fixed at launch; a client with a different terminal size is warned, not resized",
     ],
+    // The owner pseudo-terminal this ran on is a provisional dependency whose own review returned BLOCK. A
+    // passing smoke does not make it reviewed, so every run carries the caveat in its own artifact.
+    dependencyUnderReview: {
+      mechanism: "runtime/pty-mechanism.mjs and vendor/pty, merged provisionally from 715e59e",
+      verdict: "BLOCK",
+      openP1: [
+        "spawned identity can race the native reaper and PID reuse, so every owner identity recorded here inherits that doubt",
+        "a partial PTY write reports its accepted byte count only in error text; this smoke parses none of it and retries nothing",
+        "third-party notices for the shipped native artifact are unresolved, which blocks release and package qualification",
+      ],
+      notCalledHere: ["foregroundProcessGroup", "resize"],
+      authorized: "run in place from this worktree; no redistribution and no live activation",
+    },
     atMs: Date.now(),
   };
   await writeFile(path.join(evidenceDir, "smoke-result.json"), `${JSON.stringify(result, null, 2)}\n`);

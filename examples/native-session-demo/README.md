@@ -5,7 +5,9 @@ session is still there — same process, same draft, same screen.
 
 This is a **development-only integration demo**. It ships in no tarball, it is not a product entry point, it
 registers a **labelled fake provider** that calls no model and needs no credential, and it makes no claim to
-be qualified. Read [Honest limits](#honest-limits) before drawing a conclusion from it.
+be qualified. It also stands on an owner pseudo-terminal mechanism whose own review returned **BLOCK** — see
+[The mechanism underneath is not reviewed-clean](#the-mechanism-underneath-is-not-reviewed-clean). Read
+[Honest limits](#honest-limits) before drawing a conclusion from any of it.
 
 ## What it actually is
 
@@ -191,3 +193,22 @@ in-Pi caller's JSONL and measured timings into `--evidence`.
   no per-client viewport, and no controller or observer role.
 - **Linux, x86-64, glibc.** That is what the owner pseudo-terminal artifact supports; it refuses other hosts
   by name.
+
+## The mechanism underneath is not reviewed-clean
+
+The owner pseudo-terminal this demo runs on is `runtime/pty-mechanism.mjs` and the committed artifact in
+`vendor/pty/`, merged into this tree from commit `715e59e` as a **provisional dependency**. Its own review
+returned **BLOCK** with three P1 findings. It must not be described as reviewed, and a correction is being
+made in that leaf, not here.
+
+What that means for this demo, concretely:
+
+| Finding | What this demo does with it |
+| --- | --- |
+| **Spawned identity can race the native reaper and PID reuse.** The initial `/proc/<pid>` reads are not bound to the spawned child, so a recorded `startIdentity`, session and process group could in principle belong to a recycled PID. | Every owner identity this demo records, compares and prints inherits that doubt, including `status`'s `ownerAliveWithZeroClients` and the smoke's identity check. Nothing here works around it: no second identity spelling is invented, because the correction will supply a birth-bound native snapshot and a later start-identity comparison, and this demo will adopt that. The one real mitigation already present is that `stop` prefers Pi's own end-of-input and the native reaper's `wait()` status, and only escalates through the repository's verified group stop — which re-reads and refuses a mismatched identity — if that times out. |
+| **`foregroundProcessGroup()` re-reads by bare PID and compares no start identity.** | Not called anywhere in this demo. Foreground-group corroboration is not part of the path shown here. |
+| **A partial PTY write reports its accepted byte count only in error text.** | `handle.write` is used in exactly one place, `smoke.mjs`, to type into the smoke's own client terminals. It parses nothing out of that error and retries nothing: a partial write fails the smoke loudly, because re-writing the buffer would duplicate bytes the terminal already accepted and dropping it would lose them. |
+| **Third-party notices for the shipped native artifact are unresolved.** | This blocks release and package qualification. It is not a claim about a private experimental demo, and nothing here authorizes redistribution or live activation of that artifact. This demo is run in place, from a worktree, by the person who built it. |
+
+So: this is an **executable candidate** with those limitations named, not a clean handoff. The commands above do
+run, end to end, and the recorded evidence is real; the dependency underneath still owes a correction.

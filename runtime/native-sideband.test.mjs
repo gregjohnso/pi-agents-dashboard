@@ -31,6 +31,15 @@ afterEach(async () => {
 });
 
 /**
+ * Run the registered cleanups now, so a test can assert on what cleanup did rather than on what it will do.
+ *
+ * `afterEach` drains the same list, so anything already run here is not run twice.
+ */
+async function runCleanupNow() {
+  for (const close of cleanup.splice(0).reverse()) await close();
+}
+
+/**
  * A private directory for one socket, under the shortest base that fits.
  *
  * An `AF_UNIX` path is capped at 108 bytes by the kernel, and this suite's `TMPDIR` on a Slurm worker is a
@@ -1400,15 +1409,21 @@ const OBSERVER_TIMEOUT_SECONDS = 45;
  * @param {string} childScript absolute path to the child the disposable parent forks
  * @param {string} socketPath
  */
-async function observedParentLoss(childScript, socketPath) {
-  const observer = spawn(PIXI, [
+async function observedParentLoss(childScript, socketPath, options = {}) {
+  const {
+    executable = PIXI,
+    parentScript = fileURLToPath(fixture("disposable-parent.mjs")),
+    timeoutSeconds = OBSERVER_TIMEOUT_SECONDS,
+    awaitHandoff = true,
+  } = options;
+  const observer = spawn(executable, [
     "run", "--manifest-path", PIXI_MANIFEST, "--frozen", "python",
     fileURLToPath(fixture("subreaper-observer.py")),
     "--node", process.execPath,
-    "--parent-script", fileURLToPath(fixture("disposable-parent.mjs")),
+    "--parent-script", parentScript,
     "--child-script", childScript,
     "--socket", socketPath,
-    "--timeout", String(OBSERVER_TIMEOUT_SECONDS),
+    "--timeout", String(timeoutSeconds),
   ], {
     stdio: ["pipe", "pipe", "pipe"],
     // The inherited manifest is unset here, not overridden: an inherited value would silently select a different
@@ -1431,7 +1446,30 @@ async function observedParentLoss(childScript, socketPath) {
       serve();
     });
   }
-  const observerExited = new Promise((resolve) => observer.once("exit", (code, signal) => resolve({ code, signal })));
+  /**
+   * Three distinct facts, kept distinct.
+   *
+   * `exit` carries the status. `close` is the only one that also means the pipes are finished, so completion -
+   * what anything waiting on the final record must use - is `close`, never `exit`. And a `spawn` failure emits
+   * `error` (and `close`) with no `exit` at all, so it has to settle these too or every consumer waits forever.
+   */
+  /** @type {{ code: number|null, signal: string|null }|undefined} */
+  let exitStatus;
+  /** @type {Error|undefined} */
+  let spawnError;
+  observer.once("exit", (code, signal) => {
+    exitStatus = { code, signal };
+  });
+  const completion = new Promise((resolve) => {
+    observer.once("close", () => resolve(undefined));
+    observer.once("error", (error) => {
+      spawnError = error;
+      // `close` follows an `error` in Node, but resolving here too means a platform that does not emit it cannot
+      // strand the wait.
+      resolve(undefined);
+    });
+  });
+  const observerExited = completion.then(() => exitStatus ?? { code: null, signal: null });
 
   /** @param {RegExp} pattern */
   const waitFor = (pattern) =>
@@ -1441,42 +1479,66 @@ async function observedParentLoss(childScript, socketPath) {
         return;
       }
       waiters.push({ pattern, resolve });
-      // Bounded: if the observer dies or reports its own timeout, this stops rather than waiting for the suite's.
-      observerExited.then(() => {
-        if (!pattern.test(text)) reject(new Error(`the observer ended before ${pattern} appeared; it said: ${text.slice(-2_000)}`));
+      // Bounded on completion, which is `close`: the streams are drained by then, so a pattern still absent is
+      // genuinely absent rather than merely late.
+      completion.then(() => {
+        if (pattern.test(text)) return;
+        reject(spawnError !== undefined
+          ? new Error(`the observer could not be started (${spawnError.message}), so ${pattern} never appeared`)
+          : new Error(`the observer ended before ${pattern} appeared; it said: ${text.slice(-2_000)}`));
       });
     });
 
   const pidFrom = (/** @type {RegExp} */ pattern) => Number(pattern.exec(text)?.[1] ?? 0);
+  /** What cleanup actually did, so a test can assert it did not signal a number it no longer owns. */
+  const cleanupActions = /** @type {string[]} */ ([]);
   cleanup.push(async () => {
-    // Owned identities only, youngest first, and the wrapper last.
-    for (const pid of [pidFrom(/observed-helper-pid (\d+)/u), pidFrom(/observed-parent-pid (\d+)/u), pidFrom(/observer-pid (\d+)/u), observer.pid ?? 0]) {
-      if (pid === 0) continue;
+    // The observer owns the parent and, through the kernel, every descendant that reparents to it. So cleanup
+    // asks the observer and then waits for it - it never signals a recorded pid number, because a reaped pid is
+    // free for reuse and that number may already name something else.
+    if (spawnError !== undefined) {
+      cleanupActions.push("nothing-was-started");
+    } else if (exitStatus !== undefined) {
+      cleanupActions.push("observer-had-already-finished");
+    } else {
+      // Still running: ask it to clean up on its own terms, and only fall back to the ChildProcess handle this
+      // call owns - never to a number parsed out of a log.
+      cleanupActions.push("asked-observer-to-clean-up");
       try {
-        process.kill(pid, "SIGKILL");
+        observer.stdin.end("cleanup\n");
       } catch {
-        // Already gone, which is the expected case.
+        cleanupActions.push("observer-stdin-already-closed");
+      }
+      const settled = await Promise.race([completion.then(() => true), new Promise((resolve) => setTimeout(() => resolve(false), 15_000).unref())]);
+      if (!settled) {
+        cleanupActions.push("killed-observer-through-its-childprocess-handle");
+        observer.kill("SIGKILL");
       }
     }
-    await observerExited;
+    await completion;
   });
 
   await waitFor(/observer-pid \d+/u);
   await waitFor(/observed-parent-pid \d+/u);
-  // The same three markers the direct harness waits on, relayed verbatim through the observer: the parent exists,
-  // the child bound the real endpoint, and its handoff is written and held. Nothing is racing.
-  await waitFor(/binder-pid \d+/u);
-  await waitFor(/native-sideband-binder: bound .* inode \d+/u);
-  await waitFor(/held-handoff-binder: handoff written and held/u);
+  if (awaitHandoff) {
+    // The same three markers the direct harness waits on, relayed verbatim through the observer: the parent
+    // exists, the child bound the real endpoint, and its handoff is written and held. Nothing is racing.
+    await waitFor(/binder-pid \d+/u);
+    await waitFor(/native-sideband-binder: bound .* inode \d+/u);
+    await waitFor(/held-handoff-binder: handoff written and held/u);
+  }
 
   const observerPid = pidFrom(/observer-pid (\d+)/u);
   const parentPid = pidFrom(/observed-parent-pid (\d+)/u);
   const helperPid = pidFrom(/binder-pid (\d+)/u);
   expect(observerPid).toBeGreaterThan(0);
   expect(parentPid).toBeGreaterThan(0);
-  expect(helperPid).toBeGreaterThan(0);
-  for (const pid of [observerPid, parentPid, helperPid]) expect(pid).not.toBe(process.pid);
-  expect(new Set([observerPid, parentPid, helperPid]).size).toBe(3);
+  for (const pid of [observerPid, parentPid]) expect(pid).not.toBe(process.pid);
+  if (awaitHandoff) {
+    expect(helperPid).toBeGreaterThan(0);
+    expect(helperPid).not.toBe(process.pid);
+    expect(new Set([observerPid, parentPid, helperPid]).size).toBe(3);
+  }
 
   return {
     observerPid,
@@ -1484,9 +1546,22 @@ async function observedParentLoss(childScript, socketPath) {
     helperPid,
     waitFor,
     observerExited,
+    completion,
+    cleanupActions: () => [...cleanupActions],
+    spawnError: () => spawnError,
     text: () => text,
     /** Ask the observer to SIGKILL the one child it started. The test never signals that pid itself. */
     killTheParent: () => observer.stdin.end("kill\n"),
+    /** The observer's own timeout record, including what its bounded cleanup phase actually achieved. */
+    async timedOut() {
+      await waitFor(/OBSERVER-(DONE|TIMEOUT) /u);
+      const record = /OBSERVER-TIMEOUT (\{.*\})/u.exec(text);
+      if (record === null) throw new Error(`the observer did not time out: ${text.slice(-2_000)}`);
+      const summary = JSON.parse(record[1]);
+      if (summary.cleanup === undefined) throw new Error(`the timeout record carries no cleanup account: ${record[1]}`);
+      return { summary, cleanup: summary.cleanup };
+    },
+
     /** The observer's own summary, once it has reaped both processes. @returns {Promise<any>} */
     async reaped() {
       await waitFor(/OBSERVER-(DONE|TIMEOUT) /u);
@@ -1601,6 +1676,119 @@ it("shows that the parent-gone diagnostic and a vanished pid cannot establish an
     conclusion: "diagnostic plus disappearance is satisfied by exit 0, so it cannot establish exit 4",
   })}`);
   for (const line of verbatim) console.log(`OBSERVER-EVIDENCE ${line}`);
+});
+
+
+// Operator-visible failure: a timeout that signals and leaves is how a subreaper abandons the descendants it
+// exists to collect. This scenario never sends the kill, so the observer's own deadline fires while a real parent
+// and a real bound helper are still running - and the parent here is the SILENT one, which forked its child
+// without announcing it. An identity-based cleanup cannot name that child, so if the observer only signals pids it
+// parsed, one owned process survives and no status is ever collected for it.
+it("reaps every owned descendant on its own timeout, including one it was never told about", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "o");
+  const observed = await observedParentLoss(fileURLToPath(fixture("held-handoff-binder.mjs")), socketPath, {
+    parentScript: fileURLToPath(fixture("silent-parent.mjs")),
+    timeoutSeconds: 3,
+    awaitHandoff: false,
+  });
+
+  // The precondition this case rests on: the parent really did fork a child and really did withhold its identity.
+  await observed.waitFor(/silent-parent-withheld-child-identity yes/u);
+  await observed.waitFor(/native-sideband-binder: bound .* inode \d+/u);
+  expect(/binder-pid \d+/u.test(observed.text())).toBe(false);
+
+  // No kill is requested. The observer's own deadline is what ends this.
+  const timeout = await observed.timedOut();
+
+  expect(timeout.summary.timedOut).toBe(true);
+  expect(timeout.summary.helperPid).toBe(null);
+  // It did not stop at signalling: it killed what it owned and then stayed to collect the statuses.
+  expect(timeout.cleanup.killedOwnedProcessGroup).toBe(true);
+  expect(timeout.cleanup.noChildrenRemaining).toBe(true);
+  expect(timeout.cleanup.cleanupTimedOut).toBe(false);
+  // Both the announced parent and the descendant it never named were reaped, with real wait statuses.
+  expect(timeout.cleanup.reapedDuringCleanup.length).toBeGreaterThanOrEqual(2);
+  const roles = timeout.cleanup.reapedDuringCleanup.map((entry) => entry.role);
+  expect(roles).toContain("disposable-parent");
+  expect(roles).toContain("unexpected-descendant");
+  for (const entry of timeout.cleanup.reapedDuringCleanup) {
+    expect(typeof entry.rawWaitStatus).toBe("number");
+    expect(entry.exitedNormally || entry.terminatedBySignal).toBe(true);
+  }
+  // Uncertainty is named rather than asserted away: this run left nothing behind, and says so explicitly.
+  expect(timeout.cleanup.stillUnreaped).toEqual([]);
+  expect(timeout.cleanup.uncertainty).toEqual([]);
+  expect(gone(observed.parentPid)).toBe(true);
+
+  console.log(`OBSERVER-TIMEOUT-CLEANUP ${JSON.stringify({
+    observerPid: observed.observerPid,
+    disposableParentPid: observed.parentPid,
+    helperIdentityEverReported: timeout.summary.helperPid !== null,
+    killedOwnedProcessGroup: timeout.cleanup.killedOwnedProcessGroup,
+    reapedDuringCleanup: timeout.cleanup.reapedDuringCleanup.map((entry) => ({
+      pid: entry.pid, role: entry.role, rawWaitStatus: entry.rawWaitStatus,
+      exitCode: entry.exitCode, termSignalName: entry.termSignalName,
+    })),
+    noChildrenRemaining: timeout.cleanup.noChildrenRemaining,
+    stillUnreaped: timeout.cleanup.stillUnreaped,
+    uncertainty: timeout.cleanup.uncertainty,
+    cleanupTimedOut: timeout.cleanup.cleanupTimedOut,
+  })}`);
+});
+
+// Operator-visible failure: a `spawn` that fails emits `error` and `close` and need not emit `exit` at all, so a
+// wrapper whose completion is `exit`-only leaves both setup and teardown waiting for an event that will never
+// arrive. The suite's own timeout eventually fires, tens of seconds later, reporting nothing useful.
+it("settles instead of hanging when the observer cannot be started at all", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "o");
+  const missing = join(root, "there-is-no-such-executable-here");
+  expect(existsSync(missing)).toBe(false);
+
+  const started = Date.now();
+  const failure = await observedParentLoss(fileURLToPath(fixture("held-handoff-binder.mjs")), socketPath, {
+    executable: missing,
+    awaitHandoff: false,
+  }).then(() => undefined, (error) => error);
+
+  expect(failure).toBeInstanceOf(Error);
+  expect(`${/** @type {Error} */ (failure).message}`).toMatch(/could not be started/u);
+  expect(`${/** @type {Error} */ (failure).message}`).toMatch(/ENOENT|no such file/iu);
+  // Promptly, from the process event rather than from an outer deadline.
+  expect(Date.now() - started).toBeLessThan(15_000);
+});
+
+// Operator-visible failure: signalling a pid number after its owner was reaped is signalling whatever holds that
+// number now. Cleanup used to do exactly that on every path, including the successful one where the observer had
+// already reported both processes reaped, and it signalled the observer in the same sweep - which would cut short
+// the cleanup phase the timeout case above depends on.
+it("signals no recorded pid number during cleanup, on the successful path and the failing one", async () => {
+  const root = await socketRoot();
+  const succeeded = await observedParentLoss(fileURLToPath(fixture("held-handoff-binder.mjs")), join(root, "ok"));
+  succeeded.killTheParent();
+  const { summary } = await succeeded.reaped();
+  expect(summary.reapedPids).toEqual(expect.arrayContaining([succeeded.parentPid, succeeded.helperPid]));
+  await succeeded.completion;
+
+  // Nothing is left to signal, and cleanup must not pretend otherwise by firing at numbers it no longer owns.
+  await runCleanupNow();
+  expect(succeeded.cleanupActions()).toEqual(["observer-had-already-finished"]);
+
+  // The failing path: still running, so cleanup asks the owner rather than signalling parsed numbers.
+  const running = await observedParentLoss(fileURLToPath(fixture("held-handoff-binder.mjs")), join(root, "still-running"));
+  await runCleanupNow();
+  const actions = running.cleanupActions();
+  expect(actions[0]).toBe("asked-observer-to-clean-up");
+  expect(actions).not.toContain("killed-observer-through-its-childprocess-handle");
+  expect(gone(running.parentPid)).toBe(true);
+  expect(gone(running.helperPid)).toBe(true);
+
+  console.log(`CLEANUP-WITHOUT-STALE-SIGNALS ${JSON.stringify({
+    successfulPathActions: succeeded.cleanupActions(),
+    stillRunningPathActions: actions,
+    signalledAnyRecordedPidNumber: false,
+  })}`);
 });
 
 // Operator-visible failure: cleanup that unlinks on any failure would delete the socket of the listener that

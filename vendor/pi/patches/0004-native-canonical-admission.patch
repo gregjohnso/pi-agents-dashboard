@@ -322,10 +322,10 @@ index c3b60569e7cad7b94f47bcfdf60e14c824dd62b1..5653fc70b480596ed29bc65b34737303
  	}
 diff --git a/packages/coding-agent/src/core/native-canonical.ts b/packages/coding-agent/src/core/native-canonical.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..25ce9b22624694a2ac68d10009b83fcd21768b09
+index 0000000000000000000000000000000000000000..cbf8b0aca4fefb2bf4c3442109b6f9d34d456722
 --- /dev/null
 +++ b/packages/coding-agent/src/core/native-canonical.ts
-@@ -0,0 +1,510 @@
+@@ -0,0 +1,524 @@
 +/**
 + * Seam D: canonical admission on exact names.
 + *
@@ -467,6 +467,12 @@ index 0000000000000000000000000000000000000000..25ce9b22624694a2ac68d10009b83fcd
 +class NativeCanonicalCoordinator {
 +	#state: CanonicalCoordinatorState = "READY";
 +	#reservations = new Map<string, Reservation>();
++	/**
++	 * Every reservation id this owner has ever been admitted with, whether or not it is still live. A
++	 * reservation is one use for the **owner's lifetime**: releasing it on a successful commit or on a
++	 * definite abort removes it from `#reservations` but never makes the id usable again.
++	 */
++	#spentReservationIds = new Set<string>();
 +	#operationIds = new Map<string, string>();
 +	#ownerRunId: string | undefined;
 +	#startupAdoption: Promise<{ ok: false; code: CanonicalOperationRefusalCode; message: string } | undefined> | undefined;
@@ -498,6 +504,7 @@ index 0000000000000000000000000000000000000000..25ce9b22624694a2ac68d10009b83fcd
 +		if (host === undefined || ownerRunId === this.#ownerRunId) return;
 +		this.#ownerRunId = ownerRunId;
 +		this.#reservations.clear();
++		this.#spentReservationIds.clear();
 +		this.#operationIds.clear();
 +		this.#startupAdoption = undefined;
 +		this.#setState("READY");
@@ -595,8 +602,14 @@ index 0000000000000000000000000000000000000000..25ce9b22624694a2ac68d10009b83fcd
 +			// A `forwardTo` arm lands here too: v1 has none, so an unrecognised decision forwards nothing.
 +			return unavailable("the admission carried no reservation id");
 +		}
-+		if (this.#reservations.has(reservationId)) {
-+			return { ok: false, code: "DUPLICATE_OPERATION", message: `reservation ${reservationId} is already live` };
++		if (this.#spentReservationIds.has(reservationId)) {
++			// One use for this owner's lifetime, live or already committed. No abort is sent: the id names a
++			// reservation some other call owns, and aborting it would cancel that call's work.
++			return {
++				ok: false,
++				code: "DUPLICATE_OPERATION",
++				message: `reservation ${reservationId} was already admitted for this owner`,
++			};
 +		}
 +		if (this.#operationIds.has(operationId)) {
 +			return { ok: false, code: "DUPLICATE_OPERATION", message: `operation ${operationId} was already admitted` };
@@ -611,6 +624,7 @@ index 0000000000000000000000000000000000000000..25ce9b22624694a2ac68d10009b83fcd
 +			consumed: false,
 +		};
 +		this.#reservations.set(reservationId, reservation);
++		this.#spentReservationIds.add(reservationId);
 +		this.#operationIds.set(operationId, reservationId);
 +
 +		// ---- the shared synchronous section. Nothing is awaited between here and its end. ----
@@ -766,8 +780,8 @@ index 0000000000000000000000000000000000000000..25ce9b22624694a2ac68d10009b83fcd
 +/**
 + * Validate a refusal arm strictly, because a host that returns a decision Pi does not recognise must not be
 + * able to invent a refusal code or an unreadable message. `refused` must be exactly `true`, the code must be
-+ * one of the five public names, and the message must be a non-empty string; anything else is a malformed
-+ * decision, which is `ADMISSION_UNAVAILABLE`.
++ * one of the five public names, and the message must be a string — the adopted public type, so an empty one
++ * is a valid decision; anything else is a malformed decision, which is `ADMISSION_UNAVAILABLE`.
 + */
 +function refusalOf<T>(admission: object): CanonicalOperationResult<T> {
 +	const { refused, code, message } = admission as { refused?: unknown; code?: unknown; message?: unknown };
@@ -775,7 +789,7 @@ index 0000000000000000000000000000000000000000..25ce9b22624694a2ac68d10009b83fcd
 +	if (!CANONICAL_REFUSAL_CODES.includes(code as CanonicalRefusalCode)) {
 +		return unavailable(`the refusal named the unrecognised code ${JSON.stringify(code)}`);
 +	}
-+	if (typeof message !== "string" || message.length === 0) {
++	if (typeof message !== "string") {
 +		return unavailable(`the ${String(code)} refusal carried no message string`);
 +	}
 +	return { ok: false, code: code as CanonicalRefusalCode, message };
@@ -816,7 +830,7 @@ index 0000000000000000000000000000000000000000..25ce9b22624694a2ac68d10009b83fcd
 +	delivers: [
 +		"admission on the exact normalized absolute final filename, resolved before the reservation, for startup adoption, new, fork, resume, import, selector rename and selector delete",
 +		"one reservation consumed inside the same synchronous critical section seam A's fence uses, with no host, extension or model work awaited while it is held, and the coordinator's own state rechecked inside it",
-+		"a stale binding, a duplicate reservation or operation id, a refusal, a throw, a rejection and a malformed decision each mutate nothing",
++		"a stale binding, a refusal, a throw, a rejection and a malformed decision each mutate nothing, and a reservation or operation id is one use for the owner's whole lifetime, so a reused id mutates nothing even after its own operation committed",
 +		"an admitted create that finds the exact name taken fails the operation and aborts its reservation, with no suffix reroll and no overwrite",
 +		"a rebind committed only after this owner's own active-owner supplier reports the admitted target, carrying the generation that supplier reports, so a failed replacement stays uncertain instead of reporting a binding the owner does not hold",
 +		"a generation that advances exactly once when the owner's own canonical filename changes, and not at all for a rename, a delete or a same-file resume",
@@ -1482,10 +1496,10 @@ index 8e28e4a976efbccfa5849b38b0af870cf8c512fe..c00d8c2498930c2e1950b8854a4c661c
  	}
 diff --git a/packages/coding-agent/test/native-canonical-admission.test.ts b/packages/coding-agent/test/native-canonical-admission.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..d264bce0d7525e364ab85c13df2043a9fb3277ed
+index 0000000000000000000000000000000000000000..d76477de8ddf611e9e861c834bde608bbc481632
 --- /dev/null
 +++ b/packages/coding-agent/test/native-canonical-admission.test.ts
-@@ -0,0 +1,605 @@
+@@ -0,0 +1,701 @@
 +/**
 + * Seam D regression test: canonical admission on exact names.
 + *
@@ -1912,6 +1926,102 @@ index 0000000000000000000000000000000000000000..d264bce0d7525e364ab85c13df2043a9
 +			});
 +			expect(result).toMatchObject({ ok: false, code, message: `host says ${code}` });
 +		}
++	});
++
++	it("passes a refusal whose message is the empty string through with its own code", async () => {
++		const host = new FakeCanonicalHost();
++		activate(host);
++		bindOwner(join(workspace, "own.jsonl"));
++		host.decide = async (operation) =>
++			operation.operation === "startup"
++				? { reservationId: "startup" }
++				: { refused: true, code: "TARGET_UNCERTAIN", message: "" };
++		let mutations = 0;
++		const result = await runCanonicalOperation({
++			operation: "delete",
++			resolvedTarget: join(workspace, "other.jsonl"),
++			mutate: () => ++mutations,
++		});
++		// The adopted type is `message: string`. An empty message is a valid decision, not a malformed one, so
++		// the host's own code survives instead of being normalized to ADMISSION_UNAVAILABLE.
++		expect(result).toEqual({ ok: false, code: "TARGET_UNCERTAIN", message: "" });
++		expect(mutations).toBe(0);
++		expect(host.committed.map((entry) => entry.reservationId)).toEqual(["startup"]);
++	});
++
++	it("keeps a reservation id spent after its own operation committed, and aborts nobody's work", async () => {
++		const host = new FakeCanonicalHost();
++		activate(host);
++		bindOwner(join(workspace, "own.jsonl"));
++		// One id for two sequential operations: the first one runs to a successful commit before the second is
++		// admitted, so the live reservation map no longer holds it.
++		host.decide = async (operation) =>
++			operation.operation === "startup" ? { reservationId: "startup" } : { reservationId: "shared" };
++		let mutations = 0;
++		const mutate = () => ++mutations;
++		const first = await runCanonicalOperation({
++			operation: "rename",
++			resolvedTarget: join(workspace, "a.jsonl"),
++			mutate,
++		});
++		expect(first).toMatchObject({ ok: true, reservationId: "shared" });
++		expect(nativeCanonicalCoordinator.retainedReservations).toEqual([]);
++		expect(nativeCanonicalCoordinator.state).toBe("READY");
++
++		const second = await runCanonicalOperation({
++			operation: "delete",
++			resolvedTarget: join(workspace, "b.jsonl"),
++			mutate,
++		});
++		expect(second).toMatchObject({ ok: false, code: "DUPLICATE_OPERATION" });
++		expect(mutations).toBe(1);
++		// The id belongs to an operation the host already committed, so it is neither committed twice nor
++		// aborted: aborting it here would cancel a reservation that did its work.
++		expect(host.committed.map((entry) => entry.reservationId)).toEqual(["startup", "shared"]);
++		expect(host.aborted).toHaveLength(0);
++		expect(nativeCanonicalCoordinator.state).toBe("READY");
++	});
++
++	it("spends ids for the owner's lifetime: a new owner may reuse one, the same owner re-registering may not", async () => {
++		const previous = new FakeCanonicalHost();
++		const decide = async (operation: CanonicalOperation): Promise<CanonicalAdmission> =>
++			operation.operation === "startup" ? { reservationId: "startup" } : { reservationId: "shared" };
++		previous.decide = decide;
++		activate(previous);
++		bindOwner(join(workspace, "own.jsonl"));
++		expect(
++			await runCanonicalOperation({
++				operation: "rename",
++				resolvedTarget: join(workspace, "a.jsonl"),
++				mutate: () => "renamed",
++			}),
++		).toMatchObject({ ok: true, reservationId: "shared" });
++
++		// A different owner run id is a different lifetime, which is the only thing that clears spent ids.
++		const next = new FakeCanonicalHost();
++		next.decide = decide;
++		activate(next);
++		let mutations = 0;
++		expect(
++			await runCanonicalOperation({
++				operation: "delete",
++				resolvedTarget: join(workspace, "b.jsonl"),
++				mutate: () => ++mutations,
++			}),
++		).toMatchObject({ ok: true, reservationId: "shared" });
++		expect(mutations).toBe(1);
++
++		// The same owner re-registering its host is a resource reload, not a new lifetime: the id stays spent.
++		activate(next);
++		expect(
++			await runCanonicalOperation({
++				operation: "rename",
++				resolvedTarget: join(workspace, "c.jsonl"),
++				mutate: () => ++mutations,
++			}),
++		).toMatchObject({ ok: false, code: "DUPLICATE_OPERATION" });
++		expect(mutations).toBe(1);
++		expect(next.aborted).toHaveLength(0);
 +	});
 +
 +	it("refuses a second operation that reuses one live reservation id, and aborts nobody's work", async () => {

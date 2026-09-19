@@ -2,9 +2,9 @@
 
 This is the public contract of the one source patch this node owns,
 `vendor/pi/patches/0004-native-canonical-admission.patch`, sha256
-`425ac07a02a6d10261f01ad9b8048ee5719ab745f1af6e7ffb2a08e21fc6b9d1`. In `patches/series` it is applied
+`1f5e78f4ebdeafcc8a161d3b0c02613256902981a12adf540ff2509329bf89d5`. In `patches/series` it is applied
 fourth, after seam A, seam B/C/F and seam E; the prepared tree after the four-patch series is
-`e50de46baff8aefe82610a8db04d47c6d8575a8d` (recorded by `prepare.mjs` on worker `3749510`, Node
+`69762c6631d6395b989735cef63f6c97a9511bf9` (recorded by `prepare.mjs` on worker `3751264`, Node
 `v22.23.2`). `test/native-canonical.test.mjs` is the acceptance suite that drives it through an installed
 artifact, and `packages/coding-agent/test/native-canonical-admission.test.ts` is the patch's own upstream
 regression test.
@@ -77,8 +77,11 @@ mint a reservation, claim a mutation already happened, or move this owner's bind
    and consumes its reservation inside the same non-reentrant synchronous critical section a submission fence
    is consumed in. Nothing — host, extension, session teardown, runtime creation or model work — is awaited
    while it is held. The coordinator rechecks its own state *inside* that section, so an operation admitted at
-   the same generation as another cannot mutate once that other operation reached its commit. A temporary
-   `SessionManager` opened to rename, import, inspect or list is never the supplier.
+   the same generation as another cannot mutate once that other operation reached its commit. A reservation id
+   is one use for the **owner's lifetime**: releasing it after a successful commit or after a definite abort
+   drops it from the live set but never makes it reusable, and only a genuinely new owner run id clears the
+   ids this owner spent — the same owner re-registering its host keeps them. A temporary `SessionManager`
+   opened to rename, import, inspect or list is never the supplier.
 4. **Generations advance once per rebind, and a rebind is committed only after it happened.** The generation
    advances only when the owner's own canonical file becomes a *different file*: the initial undefined-to-file
    binding, and a successful `new`/`fork`/`resume`/`import` onto another file. A disposed session reports no
@@ -89,12 +92,14 @@ mint a reservation, claim a mutation already happened, or move this owner's bind
    another file or unbound, commits nothing and leaves the owner `PERSISTENCE_UNCERTAIN`. Selector rename and
    selector delete act on another file and commit the **unchanged** generation.
 5. **Refusals mutate nothing and disable nothing.** A refusal, a thrown or rejected handler, a malformed
-   decision, an empty or colliding reservation id, a stale binding or a reused reservation performs no native
-   mutation, changes no generation, and retries nothing automatically. A refusal arm is validated strictly:
-   `refused` must be exactly `true`, the code must be one of the five names above and the message must be a
-   non-empty string, or the decision is malformed and becomes `ADMISSION_UNAVAILABLE`. Pi shows the host's
-   message with retry and attachment guidance through its existing error channel; `/resume`, `/new`, `/fork`
-   and `/import` stay enabled, and the refusal is never fatal.
+   decision, an empty reservation id, a stale binding or a reused reservation id — one this owner was already
+   admitted with, whether it is still live or its own operation already committed — performs no native
+   mutation, changes no generation, retries nothing automatically, and aborts no reservation that belongs to
+   another call. A refusal arm is validated strictly: `refused` must be exactly `true`, the code must be one
+   of the five names above and the message must be a `string` — the adopted type, so an empty message is
+   passed through with its own code — or the decision is malformed and becomes `ADMISSION_UNAVAILABLE`. Pi
+   shows the host's message with retry and attachment guidance through its existing error channel; `/resume`,
+   `/new`, `/fork` and `/import` stay enabled, and the refusal is never fatal.
 6. **No `forwardTo` in v1.** A live-writer conflict is `TARGET_HAS_LIVE_WRITER` and a visible refusal — the
    alternative G-A3 permits. An unrecognised decision, including a `forwardTo` arm, is
    `ADMISSION_UNAVAILABLE`; nothing is routed and no IPC is attempted.

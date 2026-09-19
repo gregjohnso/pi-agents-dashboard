@@ -393,4 +393,57 @@ describe.skipIf(!CONSUMER)("seam D: an unmanaged fork is the stock fork", () => 
       resolvedTarget: { canonicalFile: harness.runtime.session.sessionManager.getSessionFile() },
     });
   });
+
+  it("D-17 overwrites a colliding branch target with no canonical host, exactly as the pinned stock fork does", async () => {
+    if (pi.setNativeSubmissionHost) pi.setNativeSubmissionHost(undefined);
+    const harness = await startRuntime();
+    const manager = harness.runtime.session.sessionManager;
+    const source = harness.persist(manager);
+    const sourceBytes = readFileSync(source, "utf8");
+    const leaf = manager.getEntries().at(-1).id;
+    resolveCalls = 0;
+
+    // A stock branch name is a fresh timestamp and a fresh uuid, so it cannot be predicted and pre-squatted.
+    // The collision is made deterministic instead: the squatter is written at the exact name the stock create
+    // is about to open, in the step between the naming and the write, read through the public
+    // `getSessionFile()`. Nothing about the create itself is replaced, and the hook is removed again below.
+    // The squatter is longer than the branch file, so a create that failed to truncate would leave a tail.
+    const squatterBytes = `${"squatter\n".repeat(512)}`;
+    const stockRewrite = pi.SessionManager.prototype._rewriteFile;
+    let squatted;
+    pi.SessionManager.prototype._rewriteFile = function squattedRewriteFile(...args) {
+      const target = this.getSessionFile();
+      if (squatted === undefined && target !== source) {
+        squatted = target;
+        writeFileSync(target, squatterBytes);
+      }
+      return stockRewrite.apply(this, args);
+    };
+    let forked;
+    try {
+      forked = await harness.runtime.fork(leaf, { position: "at" });
+    } finally {
+      pi.SessionManager.prototype._rewriteFile = stockRewrite;
+    }
+
+    // The pinned stock outcome: the branch create is not exclusive, so the taken name succeeds, is not
+    // rerolled, and nothing was reserved for it.
+    expect(forked.cancelled).toBe(false);
+    expect(resolveCalls).toBe(0);
+    const created = harness.runtime.session.sessionManager.getSessionFile();
+    expect(created).toBe(squatted);
+    expect(created).not.toBe(source);
+    // The pinned stock bytes: the squatter is fully replaced by the branch session, header first.
+    const content = readFileSync(created, "utf8");
+    expect(content).not.toContain("squatter");
+    const lines = content.split("\n").filter((line) => line.length > 0);
+    const [header, ...entries] = lines.map((line) => JSON.parse(line));
+    expect(header).toMatchObject({ type: "session", cwd: harness.root, parentSession: source });
+    expect(entries.map((entry) => entry.id)).toEqual(
+      harness.runtime.session.sessionManager.getEntries().map((entry) => entry.id),
+    );
+    expect(content).toBe(`${lines.join("\n")}\n`);
+    // The forked-from file is untouched.
+    expect(readFileSync(source, "utf8")).toBe(sourceBytes);
+  });
 });

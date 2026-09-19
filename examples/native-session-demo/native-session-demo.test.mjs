@@ -187,13 +187,19 @@ describe("cohort selection", () => {
   });
 
   it("defaults to the installed cohort built from exactly this tree's ordered patch series", async () => {
+    const patches = new URL("../../vendor/pi/patches/", import.meta.url);
     const manifest = JSON.parse(await readFile(DEFAULT_MANIFEST, "utf8"));
-    const series = (await readFile(new URL("../../vendor/pi/patches/series", import.meta.url), "utf8"))
+    const series = (await readFile(new URL("series", patches), "utf8"))
       .split("\n")
       .map((line) => line.trim())
       .filter((line) => line !== "" && !line.startsWith("#"));
     expect(manifest.series).toEqual(series);
-    expect(manifest.appliedPatches.map((applied) => applied.name)).toEqual(series);
+    // Not just the names: the cohort the demo launches was built from these exact patch bytes, in this order.
+    const digests = [];
+    for (const [position, name] of series.entries()) {
+      digests.push({ position: position + 1, name, sha256: createHash("sha256").update(await readFile(new URL(name, patches))).digest("hex") });
+    }
+    expect(manifest.appliedPatches).toEqual(digests);
     const cohort = resolveCohort({});
     expect(cohort.manifestPath).toBe(DEFAULT_MANIFEST);
     expect(cohort.patchedTreeHash).toBe(manifest.patchedTreeHash);

@@ -228,7 +228,16 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
       }
       owner.awaiting.delete(frame.requestId);
       owner.totals.receipted += 1;
-      owner.recentReceipts.add({ ...frame, requestId: boundedText(frame.requestId) });
+      // A projection of the receipt contract's own fields. Keeping the frame verbatim would let whatever a
+      // peer attached to it size every status response and the final owner record.
+      owner.recentReceipts.add({
+        type: frame.type,
+        requestId: boundedText(frame.requestId),
+        request: frame.request,
+        outcome: frame.outcome,
+        idle: frame.idle,
+        pendingMessages: frame.pendingMessages,
+      });
       return;
     }
     // `validateOwnerFrame` admits no other kind, so reaching here means the two ends disagree about the wire.
@@ -332,7 +341,15 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
         record.reason = boundedText(/** @type {Error} */ (error).message);
         owner.totals.refused += 1;
       }
-      owner.recentRequests.add({ ...record, requestId: boundedText(record.requestId) });
+      owner.recentRequests.add({
+        request: record.request,
+        requestId: boundedText(record.requestId),
+        generation: record.generation,
+        admitted: record.admitted,
+        sent: record.sent,
+        reason: record.reason,
+        atHostMs: record.atHostMs,
+      });
       note({ type: "bridge-request", request, sent: record.sent, generation: owner.generation });
       log(`owner bridge ${request} request ${String(requestId).slice(0, 64)} on generation ${owner.generation}: ${record.sent ? "sent" : `refused (${record.reason})`}`);
       return record;

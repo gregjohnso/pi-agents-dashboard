@@ -74,7 +74,7 @@ const MISSING_METHODS = ["shutdown", "abort", "isIdle", "hasPendingMessages"];
 /** A sideband failure callers can handle without reading its text. The text never carries a credential. */
 export class NativeSidebandError extends Error {
   /**
-   * @param {"SIDEBAND_PATH_UNUSABLE"|"SIDEBAND_TOKEN_UNUSABLE"|"SIDEBAND_BOUND_UNUSABLE"|"SIDEBAND_LISTENER_UNUSABLE"|"SIDEBAND_UNREACHABLE"|"SIDEBAND_CLOSED"|"SIDEBAND_FRAME_REFUSED"|"SIDEBAND_BINDER_UNUSABLE"|"SIDEBAND_BINDER_DISCONNECTED"|"SIDEBAND_BINDER_PROTOCOL"|"SIDEBAND_BINDER_REFUSED"|"SIDEBAND_BINDER_TIMEOUT"|"SIDEBAND_BINDER_INCOMPLETE"|"SIDEBAND_BIND_FAILED"|"SIDEBAND_ENDPOINT_UNUSABLE"|"EADDRINUSE"} code
+   * @param {"SIDEBAND_PATH_UNUSABLE"|"SIDEBAND_TOKEN_UNUSABLE"|"SIDEBAND_BOUND_UNUSABLE"|"SIDEBAND_LISTENER_UNUSABLE"|"SIDEBAND_UNREACHABLE"|"SIDEBAND_CLOSED"|"SIDEBAND_FRAME_REFUSED"|"SIDEBAND_BINDER_UNUSABLE"|"SIDEBAND_BINDER_PROTOCOL"|"SIDEBAND_BINDER_REFUSED"|"SIDEBAND_BINDER_TIMEOUT"|"SIDEBAND_BINDER_INCOMPLETE"|"SIDEBAND_BIND_FAILED"|"SIDEBAND_ENDPOINT_UNUSABLE"|"EADDRINUSE"} code
    * @param {string} message
    * @param {{ cause?: unknown }} [options]
    */
@@ -589,11 +589,9 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
   });
   // `close` is the backstop for a child that never reached `exit`, so nothing here waits for an impossible event.
   helper.once("close", () => noteCompletion());
-  helper.once("disconnect", () => {
-    if (outcome === "pending") {
-      refuse("SIDEBAND_BINDER_DISCONNECTED", "the socket binder's channel closed before it handed over a listener");
-    }
-  });
+  // No refusal is raised for `disconnect`. A channel closing is what every ending child does, and treating it
+  // as a failure both pre-empted the accurate diagnosis and could discard a handoff already in flight. What
+  // decides is observed completion below, and a child that disconnects without completing meets the deadline.
   helper.on("message", (/** @type {unknown} */ message, /** @type {unknown} */ handle) => {
     // Anything arriving once this attempt has an outcome is late. Its handle is still this attempt's to end,
     // and a late message after a valid handoff fails the attempt rather than being quietly ignored.

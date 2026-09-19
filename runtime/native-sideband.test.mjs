@@ -607,7 +607,7 @@ it("refuses when the endpoint it was handed is no longer its own socket, and lea
   }).then(() => undefined, (/** @type {unknown} */ error) => error);
 
   expect(failure).toMatchObject({ code: "SIDEBAND_ENDPOINT_UNUSABLE" });
-  expect(`${/** @type {Error} */ (failure).message}`).toMatch(/is not a socket/iu);
+  expect(`${/** @type {Error} */ (failure).message}`).toMatch(/is not the one this attempt bound/u);
   // The foreign entry is exactly as it was left: this refusal removes nothing it cannot identify, and says so.
   expect(await readFile(socketPath, "utf8")).toBe("not a socket\n");
   expect(`${/** @type {any} */ (failure).sidebandCleanup}`).toMatch(/left exactly as it was found/u);
@@ -961,7 +961,7 @@ it("reports a helper that closes its channel before handing anything over", asyn
 
   const { error } = await attemptWithFixture(socketPath, "disconnect-then-exit.mjs");
 
-  expect(error).toMatchObject({ code: expect.stringMatching(/^SIDEBAND_BINDER_(DISCONNECTED|INCOMPLETE)$/u) });
+  expect(error).toMatchObject({ code: "SIDEBAND_BINDER_INCOMPLETE" });
 });
 
 // The deadline covers the whole process, not the first message. Both sides of that are tested: a helper that
@@ -1037,6 +1037,10 @@ it("leaves a replaced endpoint alone when its own handoff fails after a successf
   const root = await socketRoot();
   const socketPath = join(root, "private", "o");
   await mkdir(dirname(socketPath), { recursive: true, mode: 0o700 });
+  // `runBinder` in this process sets the helper's restrictive umask. Restored after the case, or every later
+  // mkdir in this file would be created without its execute bit and fail with EACCES.
+  const restoreUmask = process.umask();
+  cleanup.push(() => process.umask(restoreUmask));
   const other = await liveReplacement(root);
   /** @type {any} */
   let replaced;
@@ -1077,6 +1081,8 @@ it("refuses a protocol version it does not speak before binding anything", async
   const root = await socketRoot();
   const socketPath = join(root, "private", "o");
   await mkdir(dirname(socketPath), { recursive: true, mode: 0o700 });
+  const restoreUmask = process.umask();
+  cleanup.push(() => process.umask(restoreUmask));
   /** @type {any} */
   let sent;
   /** @type {number|undefined} */
@@ -1112,6 +1118,8 @@ it("leaves the endpoint in place when the parent goes away after the bind", asyn
   const root = await socketRoot();
   const socketPath = join(root, "private", "o");
   await mkdir(dirname(socketPath), { recursive: true, mode: 0o700 });
+  const restoreUmask = process.umask();
+  cleanup.push(() => process.umask(restoreUmask));
   /** @type {() => void} */
   let parentGone = () => {};
   /** @type {number|undefined} */

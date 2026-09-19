@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "description": "Pinned upstream source for the native PTY artifact pi-agents ships. build.mjs verifies every field here fail-closed; nothing is resolved at build time and nothing is fetched at install time.",
+  "upstream": {
+    "package": "@replit/ruspty",
+    "version": "3.7.1",
+    "tarball": "https://registry.npmjs.org/@replit/ruspty/-/ruspty-3.7.1.tgz",
+    "integrity": "sha512-eozZABlBQp+W9BEQXiD4jwWnQUFXZQvn9Y0wyxYiMBiVJhTfMJVOySrWbGFUnSEOewfocuVde9dwNLAEpWV7cQ==",
+    "sha256": "27618ba03da31e0e048e87266c2800a63c459c4795f6b31af833265192c3cc96",
+    "license": {
+      "spdx": "MIT",
+      "declaredIn": "package.json",
+      "textPublished": false,
+      "note": "Upstream publishes no license file: neither the npm tarball nor the repository root at github.com/replit/ruspty contains LICENSE, and the only licence statement is the package.json \"license\": \"MIT\" field recorded here. No third-party licence text is reproduced in this repository, because inventing a copyright holder line would be worse than recording the absence."
+    }
+  },
+  "verifiedFiles": [
+    {
+      "path": "src/lib.rs",
+      "sha256": "4ce1a6f010fce037b211ed61b4a359340a5b7da9dcd44983abebbdce6ed8673a"
+    },
+    {
+      "path": "index.d.ts",
+      "sha256": "6808f11bef0ebce005b5b097b3b3af618e05f113c797da7ec7d4f83cc0da18b0"
+    },
+    {
+      "path": "Cargo.toml",
+      "sha256": "351ab6f8dede2b394a5e936934010273b5bf1504f4d898ad3b74199e6f076f90"
+    }
+  ],
+  "patches": [
+    {
+      "path": "patches/0001-raw-wait-status-and-no-output-injection.patch",
+      "sha256": "b4173883a32698690d0b8776179b4c7cf8aaa0fe6138eea6fbf491f569de5244"
+    }
+  ],
+  "build": {
+    "crate": "replit_ruspty",
+    "cargoArtifact": "target/release/libreplit_ruspty.so",
+    "artifact": "pi-agents-owner-pty-linux-x64-gnu.node",
+    "toolchainManifest": "pixi.toml",
+    "platform": {
+      "os": "linux",
+      "arch": "x64",
+      "libc": "glibc",
+      "note": "One artifact, one platform. The crate links glibc, libgcc_s, libm and the loader, so the shipped binary runs on linux-x64 glibc only; musl, arm64 and non-Linux hosts have no artifact and the mechanism refuses them by name rather than loading something that cannot work."
+    }
+  }
+}

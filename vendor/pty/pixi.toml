@@ -1,0 +1,9 @@
+[workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+# Build-only toolchain for the native PTY artifact. It is deliberately a separate environment from the
+# application's: pi-agents itself never needs Rust, and an operator installing the package never builds
+# anything. `pixi.lock` beside this file is the exact toolchain the committed artifact was built with.
+[dependencies]
+rust = ">=1.85,<1.95"

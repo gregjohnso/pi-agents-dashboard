@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "artifact": "pi-agents-owner-pty-linux-x64-gnu.node",
+  "sha256": "88bf1c35fd3da90c9eaca7f90372312372e69f68bc3d205bcbfbbaef41df017b",
+  "byteLength": 786416,
+  "upstream": {
+    "package": "@replit/ruspty",
+    "version": "3.7.1",
+    "sha256": "27618ba03da31e0e048e87266c2800a63c459c4795f6b31af833265192c3cc96"
+  },
+  "patches": [
+    {
+      "path": "patches/0001-raw-wait-status-and-no-output-injection.patch",
+      "sha256": "b4173883a32698690d0b8776179b4c7cf8aaa0fe6138eea6fbf491f569de5244"
+    }
+  ],
+  "platform": {
+    "os": "linux",
+    "arch": "x64",
+    "libc": "glibc",
+    "note": "One artifact, one platform. The crate links glibc, libgcc_s, libm and the loader, so the shipped binary runs on linux-x64 glibc only; musl, arm64 and non-Linux hosts have no artifact and the mechanism refuses them by name rather than loading something that cannot work.",
+    "nodeApiVersion": 4
+  },
+  "toolchain": {
+    "cargo": "cargo 1.94.0 (85eff7c80 2026-01-15)",
+    "rustc": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+    "cargoLockSha256": "14e77d7cbf51d23ea398b75e2c9062c394b81fa5c1564c4612efdb11908b45e3",
+    "glibc": "glibc 2.35"
+  },
+  "linkedLibraries": [
+    "/lib64/ld-linux-x86-64.so.2",
+    "libc.so.6",
+    "libdl.so.2",
+    "libgcc_s.so.1",
+    "libpthread.so.0",
+    "libutil.so.1",
+    "linux-vdso.so.1"
+  ],
+  "builtOn": {
+    "host": "cw-us-e4a2-l40-234-043",
+    "node": "v22.23.2"
+  },
+  "buildSeconds": 44.541
+}

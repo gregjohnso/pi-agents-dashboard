@@ -5,12 +5,36 @@ import { classifyOwnerExit, createPtyHost, MISSING_HOST_CAPABILITIES, PtyHostErr
 import { createLaunchFixedProfile } from "./terminal-profile.mjs";
 
 const OWNER_IDENTITY = { pid: 4242, startIdentity: "918273", processGroupId: 4242, sessionId: 4242 };
+/** The three fields an exact birth identity is, and the whole of what a host retains from the owner record. */
+const BIRTH_IDENTITY = { pid: OWNER_IDENTITY.pid, startIdentity: OWNER_IDENTITY.startIdentity, processGroupId: OWNER_IDENTITY.processGroupId };
 const CAPABILITIES = { kittyKeyboard: true, kittyGraphics: true, mouse: true, bracketedPaste: true, synchronizedOutput: true, trueColor: true };
 const PROFILE = createLaunchFixedProfile({ profileId: "task12-owner", term: "xterm-256color", capabilities: CAPABILITIES, cellSize: null });
 
 /** @param {string} text */
 function bytes(text) {
   return new Uint8Array(Buffer.from(text, "latin1"));
+}
+
+/** A caller's attempt to mutate a record the host handed out. A frozen record refuses it, which is the point.
+ * @param {() => void} mutate */
+function mutateIfAllowed(mutate) {
+  try {
+    mutate();
+  } catch (error) {
+    expect(error).toBeInstanceOf(TypeError);
+  }
+}
+
+/** A sink whose write throws, with the whole surface the attachment set requires. @param {string} message */
+function failingSink(message) {
+  return {
+    /** @param {Uint8Array} _payload */
+    write(_payload) {
+      throw new Error(message);
+    },
+    queuedBytes: () => 0,
+    onDrain: () => {},
+  };
 }
 
 /**
@@ -20,9 +44,12 @@ function bytes(text) {
  * which is the exact shape `PtyMechanismError` carries: the accepted prefix is data on the error, so a case
  * can assert that the host queues only the suffix.
  *
- * @param {{ rawStatus?: number | null, acceptPerWrite?: number, foreground?: number | Error }} [options]
+ * `identity` is this handle's own mutable owner record, because the real mechanism returns a mutable one too:
+ * a case can mutate it after construction and assert the host still uses the identity it was born with.
+ *
+ * @param {{ rawStatus?: number | null, acceptPerWrite?: number, foreground?: number | Error, identity?: any }} [options]
  */
-function fakeOwner({ rawStatus = null, acceptPerWrite = Number.MAX_SAFE_INTEGER, foreground = OWNER_IDENTITY.processGroupId } = {}) {
+function fakeOwner({ rawStatus = null, acceptPerWrite = Number.MAX_SAFE_INTEGER, foreground = OWNER_IDENTITY.processGroupId, identity = { ...OWNER_IDENTITY } } = {}) {
   /** @type {Uint8Array[]} */
   const writes = [];
   /** @type {{ cols: number, rows: number }[]} */
@@ -32,13 +59,14 @@ function fakeOwner({ rawStatus = null, acceptPerWrite = Number.MAX_SAFE_INTEGER,
   return {
     writes,
     resizes,
+    identity,
     closeCount: () => closes,
     setRawStatus: (/** @type {number | null} */ next) => {
       status = next;
     },
     handle: {
       masterFd: -1,
-      owner: OWNER_IDENTITY,
+      owner: identity,
       helper: null,
       /** @param {Uint8Array} payload */
       write(payload) {
@@ -383,10 +411,196 @@ it("revalidates the recorded identity immediately before the signal and refuses 
 it("records the stop intent it signalled, so a later signal death can be attributed to it", async () => {
   const signals = /** @type {string[]} */ ([]);
   const { owner, host: created } = host({ signalProcessGroup: (/** @type {number} */ pgid, /** @type {string} */ signal) => signals.push(`${pgid}:${signal}`) });
-  expect(await created.stopOwner({ signal: "SIGTERM" })).toEqual({ signalled: true, intent: { signal: "SIGTERM", identity: OWNER_IDENTITY } });
+  expect(await created.stopOwner({ signal: "SIGTERM" })).toEqual({ signalled: true, intent: { signal: "SIGTERM", identity: BIRTH_IDENTITY } });
   expect(signals).toEqual([`${OWNER_IDENTITY.processGroupId}:SIGTERM`]);
   owner.setRawStatus(15);
   expect(created.describeOwnerExit().cause).toBe("attributed-stop");
+});
+
+it("refuses a plain profile that disables a required capability rather than admitting it past the factory", () => {
+  const owner = fakeOwner();
+  for (const capability of ["kittyGraphics", "kittyKeyboard", "mouse"]) {
+    const plain = { profileId: "bypass", term: "xterm-256color", capabilities: { ...CAPABILITIES, [capability]: false }, cellSize: null };
+    let error;
+    try {
+      createPtyHost({ owner: owner.handle, profile: /** @type {any} */ (plain), queuedByteCap: 1024, cols: 100, rows: 30 });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(PtyHostError);
+    expect(/** @type {PtyHostError} */ (error).code).toBe("PTY_HOST_PROFILE_UNUSABLE");
+  }
+});
+
+it("holds its own frozen profile, so mutating the caller's records moves neither admission nor the mode bytes", () => {
+  const owner = fakeOwner();
+  const capabilities = { ...CAPABILITIES };
+  const cellSize = { width: 9, height: 19 };
+  const created = createPtyHost({
+    owner: owner.handle,
+    profile: /** @type {any} */ ({ profileId: "task12-owner", term: "xterm-256color", capabilities, cellSize }),
+    queuedByteCap: 1024,
+    cols: 100,
+    rows: 30,
+  });
+  capabilities.mouse = false;
+  cellSize.width = 1;
+
+  expect(created.profile().capabilities).toEqual(CAPABILITIES);
+  expect(created.profile().cellSize).toEqual({ width: 9, height: 19 });
+  expect(Object.isFrozen(created.profile())).toBe(true);
+  expect(Object.isFrozen(created.profile().capabilities)).toBe(true);
+  expect(Object.isFrozen(created.profile().cellSize)).toBe(true);
+  // The mode bytes were derived with mouse reporting on, so admission must still require it of a client.
+  expect(created.attach({ attachmentId: "no-mouse", sink: fakeSink().sink, declared: { capabilities: { ...CAPABILITIES, mouse: false } } })).toEqual({
+    attached: false,
+    code: "NATIVE_ATTACHMENT_UNAVAILABLE",
+    missingCapabilities: ["mouse"],
+  });
+  expect(attach(created, "full").client.text()).toBe("\u001b[?2004h\u001b[?1002h\u001b[?1006h");
+});
+
+it("admits no member at all when a new attachment's initialization write throws", () => {
+  const { host: created } = host();
+  expect(() => created.attach({ attachmentId: "ghost", sink: failingSink("the client socket is already gone"), declared: { capabilities: { ...CAPABILITIES } } })).toThrow(PtyHostError);
+  expect(created.attachments()).toEqual([]);
+  // Nothing was admitted, so no later broadcast reaches it and the epoch it never used is still available.
+  expect(created.broadcastOwnerOutput(bytes("frame")).delivered).toEqual([]);
+  const retried = attach(created, "ghost");
+  expect(retried.result.epoch).toEqual({ attachmentId: "ghost", epoch: 1 });
+  expect(retried.client.text()).toBe("\u001b[?2004h\u001b[?1002h\u001b[?1006h");
+});
+
+it("keeps the old connection and its outstanding presentation when a replacement's initialization write throws", async () => {
+  const presentation = fakePresentationChannel();
+  const { host: created } = host({ presentation: presentation.channel });
+  const first = attach(created, "a");
+  const pending = created.presentTo(first.result.epoch);
+
+  expect(() => created.attach({ attachmentId: "a", sink: failingSink("the replacement socket is already gone"), declared: { capabilities: { ...CAPABILITIES } } })).toThrow(PtyHostError);
+
+  expect(created.attachments()).toEqual([{ attachmentId: "a", epoch: 1, state: "live", inputEligible: true, drains: 0, awaitingPresentationNonce: false }]);
+  created.broadcastOwnerOutput(bytes("frame"));
+  expect(first.client.text()).toBe("\u001b[?2004h\u001b[?1002h\u001b[?1006hframe");
+
+  // The request the surviving connection made is still its own, so it is answered rather than retired.
+  presentation.requests[0].settle({
+    presented: true,
+    terminalOwner: "pi",
+    presentationNonce: "frame-1",
+    frame: { frameId: "frame-1", sequence: 1, columns: 100, rows: 30, byteLength: 512 },
+    geometryRevision: 1,
+    attachmentEpoch: first.result.epoch,
+    cold: true,
+  });
+  expect(await pending).toMatchObject({ presented: true, presentationNonce: "frame-1", recoveryArmed: false });
+  expect(created.presentationCounts()).toMatchObject({ requested: 1, presented: 1, retired: 0 });
+});
+
+it("takes a sink's false write as accepted backpressure, and writes the accepted initialization once", () => {
+  const { host: created } = host();
+  const written = /** @type {Uint8Array[]} */ ([]);
+  const backpressured = {
+    /** @param {Uint8Array} payload */
+    write(payload) {
+      written.push(payload);
+      return false;
+    },
+    queuedBytes: () => 0,
+    onDrain: () => {},
+  };
+  expect(created.attach({ attachmentId: "slow-socket", sink: backpressured, declared: { capabilities: { ...CAPABILITIES } } })).toEqual({
+    attached: true,
+    epoch: { attachmentId: "slow-socket", epoch: 1 },
+    geometry: { cols: 100, rows: 30, revision: 1 },
+  });
+  expect(created.attachments()).toEqual([{ attachmentId: "slow-socket", epoch: 1, state: "live", inputEligible: true, drains: 0, awaitingPresentationNonce: false }]);
+  expect(written.map((chunk) => Buffer.from(chunk).toString("latin1"))).toEqual(["\u001b[?2004h\u001b[?1002h\u001b[?1006h"]);
+});
+
+it("refuses an owner handle whose birth identity is not an exact pid, start identity and process group", () => {
+  for (const identity of [
+    { pid: 0, startIdentity: "918273", processGroupId: 4242 },
+    { pid: -1, startIdentity: "918273", processGroupId: 4242 },
+    { pid: 4242, startIdentity: "", processGroupId: 4242 },
+    { pid: 4242, startIdentity: "918273" },
+    { pid: 4242, startIdentity: "918273", processGroupId: 0 },
+    { pid: 4242, startIdentity: "918273", processGroupId: 1.5 },
+  ]) {
+    const owner = fakeOwner({ identity });
+    let error;
+    try {
+      createPtyHost({ owner: owner.handle, profile: PROFILE, queuedByteCap: 1024, cols: 100, rows: 30 });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(PtyHostError);
+    expect(/** @type {PtyHostError} */ (error).code).toBe("PTY_HOST_OWNER_UNUSABLE");
+  }
+});
+
+it("signals the group it was born with after the owner handle's own identity record is mutated", async () => {
+  const signals = /** @type {string[]} */ ([]);
+  const inspected = /** @type {number[]} */ ([]);
+  const owner = fakeOwner();
+  const created = createPtyHost({
+    owner: owner.handle,
+    profile: PROFILE,
+    queuedByteCap: 1024,
+    cols: 100,
+    rows: 30,
+    inspectIdentity: async (/** @type {number} */ pid) => {
+      inspected.push(pid);
+      return { ...BIRTH_IDENTITY };
+    },
+    signalProcessGroup: (/** @type {number} */ pgid, /** @type {string} */ signal) => signals.push(`${pgid}:${signal}`),
+  });
+  // The mechanism hands out its own mutable owner record, so this needs no fixture trick to reach.
+  owner.identity.pid = 1;
+  owner.identity.processGroupId = 1;
+  owner.identity.startIdentity = "0";
+
+  expect(await created.stopOwner({ signal: "SIGTERM" })).toEqual({ signalled: true, intent: { signal: "SIGTERM", identity: BIRTH_IDENTITY } });
+  expect(inspected).toEqual([BIRTH_IDENTITY.pid]);
+  expect(signals).toEqual([`${BIRTH_IDENTITY.processGroupId}:SIGTERM`]);
+});
+
+it("freezes the stop intent it hands back, so a later mutation rewrites no attribution", async () => {
+  const owner = fakeOwner();
+  const created = createPtyHost({
+    owner: owner.handle,
+    profile: PROFILE,
+    queuedByteCap: 1024,
+    cols: 100,
+    rows: 30,
+    inspectIdentity: async () => ({ ...BIRTH_IDENTITY }),
+    signalProcessGroup: () => {},
+  });
+  const stopped = /** @type {{ signalled: true, intent: { signal: string, identity: any } }} */ (await created.stopOwner({ signal: "SIGTERM" }));
+  expect(Object.isFrozen(stopped.intent)).toBe(true);
+  expect(Object.isFrozen(stopped.intent.identity)).toBe(true);
+
+  mutateIfAllowed(() => {
+    stopped.intent.signal = "SIGKILL";
+  });
+  mutateIfAllowed(() => {
+    stopped.intent.identity.startIdentity = "0";
+  });
+  mutateIfAllowed(() => {
+    owner.identity.startIdentity = "0";
+  });
+
+  owner.setRawStatus(15);
+  const exit = /** @type {{ cause: string, signal: string | null, attribution: any }} */ (created.describeOwnerExit());
+  expect(exit.cause).toBe("attributed-stop");
+  expect(exit.signal).toBe("SIGTERM");
+  expect(exit.attribution).toEqual({ signal: "SIGTERM", identity: BIRTH_IDENTITY, basis: "attribution to a recorded stop intent, not causal proof" });
+});
+
+it("reports a malformed attachment origin on a terminal response as unreadable provenance", () => {
+  const { host: created } = host();
+  expect(created.authorizeTerminalResponse({ kind: "kitty-keyboard", requestEpoch: 1, attachmentEpoch: { attachmentId: "", epoch: 0 }, raw: bytes("\u001b[?1u") })).toEqual({ apply: false, reason: "unreadable" });
+  expect(created.responseCounts()).toEqual({ total: 1, clientReply: 0, staleRequestEpoch: 0, profileFixed: 0, unreadable: 1 });
 });
 
 it("queues only the suffix a full terminal refused, and never rewrites an accepted prefix", () => {

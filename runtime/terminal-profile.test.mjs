@@ -144,6 +144,30 @@ it("counts an unreadable response record instead of guessing what it was", () =>
   expect(ledger.highestRequestEpoch("da")).toBe(0);
 });
 
+it("counts a malformed attachment origin as unreadable provenance instead of a client reply", () => {
+  const ledger = createResponseLedger();
+  // Each origin fails the shared AttachmentEpoch contract, so none of them names a client that could have
+  // replied: an empty id, an epoch below the first one ever issued, and a record carrying another field.
+  const malformed = [
+    { attachmentId: "", epoch: 1 },
+    { attachmentId: " a", epoch: 1 },
+    { attachmentId: "a", epoch: 0 },
+    { attachmentId: "a", epoch: -1 },
+    { attachmentId: "a", epoch: 1.5 },
+    { attachmentId: "a", epoch: Number.MAX_SAFE_INTEGER + 1 },
+    { attachmentId: "a", epoch: 1, generation: 1 },
+  ];
+  for (const attachmentEpoch of malformed) {
+    expect(ledger.decide({ kind: "da", requestEpoch: 3, attachmentEpoch: /** @type {any} */ (attachmentEpoch), raw: bytes("\u001b[?62;c") })).toEqual({ apply: false, reason: "unreadable" });
+  }
+  expect(ledger.counts()).toEqual({ total: malformed.length, clientReply: 0, staleRequestEpoch: 0, profileFixed: 0, unreadable: malformed.length });
+  // An unreadable record advances no epoch line, so a later local reply is still not stale.
+  expect(ledger.highestRequestEpoch("da")).toBe(0);
+  expect(ledger.decide({ kind: "da", requestEpoch: 1, attachmentEpoch: null, raw: bytes("\u001b[?62;c") })).toEqual({ apply: false, reason: "profile-fixed" });
+  // A well-formed origin is still a client reply: only unreadable provenance moved.
+  expect(ledger.decide({ kind: "da", requestEpoch: 1, attachmentEpoch: { attachmentId: "a", epoch: 1 }, raw: bytes("\u001b[?62;c") })).toEqual({ apply: false, reason: "client-reply" });
+});
+
 it("records the background-colour reply as coverage this profile does not enforce", () => {
   expect(PROFILE_COVERAGE_GAPS.map((gap) => gap.capability)).toEqual(["osc11-background-colour"]);
   const [gap] = PROFILE_COVERAGE_GAPS;

@@ -50,7 +50,7 @@ import { createAttachmentSet } from "./attachment-set.mjs";
 import { inspectProcessIdentity } from "./process-identity-linux.mjs";
 import { signalProcessGroup } from "./process-signaler.mjs";
 import { decodeWaitStatus } from "./pty-mechanism.mjs";
-import { admitClient, PROFILE_COVERAGE_GAPS, profileModeInitialization, createResponseLedger } from "./terminal-profile.mjs";
+import { admitClient, createLaunchFixedProfile, PROFILE_COVERAGE_GAPS, profileModeInitialization, createResponseLedger } from "./terminal-profile.mjs";
 
 /** @typedef {import("./terminal-profile.mjs").VirtualTerminalProfile} VirtualTerminalProfile */
 /** @typedef {import("../shared/native-contracts.mjs").AttachmentEpoch} AttachmentEpoch */
@@ -157,6 +157,51 @@ function requireDimension(name, value) {
 }
 
 /**
+ * The exact identity this owner was born with, copied out of the handle's own record and frozen.
+ *
+ * The mechanism returns a live mutable owner record, so retaining it by reference would let a later mutation
+ * of that record move every signal this host sends and rewrite what an exit was attributed to. Only the three
+ * fields an identity is are kept, and each is required: a zero or negative pid names no process, and a zero
+ * or negative process group would send a signal to a group this host never launched.
+ *
+ * @param {unknown} record @returns {ProcessIdentity}
+ */
+function requireBirthIdentity(record) {
+  if (typeof record !== "object" || record === null) {
+    throw new PtyHostError("An owner handle must carry the identity it was born with", { code: "PTY_HOST_OWNER_UNUSABLE" });
+  }
+  const { pid, startIdentity, processGroupId } = /** @type {Record<string, unknown>} */ (record);
+  if (
+    !Number.isSafeInteger(pid) || Number(pid) <= 0 ||
+    typeof startIdentity !== "string" || startIdentity.length === 0 ||
+    !Number.isSafeInteger(processGroupId) || Number(processGroupId) <= 0
+  ) {
+    throw new PtyHostError(
+      `An owner handle must carry an exact pid, start identity and process group, received ${String(pid)}/${String(startIdentity)}/${String(processGroupId)}`,
+      { code: "PTY_HOST_OWNER_UNUSABLE" },
+    );
+  }
+  return Object.freeze({ pid: /** @type {number} */ (pid), startIdentity, processGroupId: /** @type {number} */ (processGroupId) });
+}
+
+/**
+ * The sink surface an attachment needs, checked before the profile's initialization is written to it.
+ *
+ * The attachment set requires the same three methods. It is checked here as well because the initialization
+ * write happens before membership changes: an unusable sink must be refused before a byte is handed to it,
+ * not after, since accepted bytes are never written twice.
+ *
+ * @param {any} sink
+ */
+function requireSinkSurface(sink) {
+  for (const method of ["write", "queuedBytes", "onDrain"]) {
+    if (typeof sink?.[method] !== "function") {
+      throw new PtyHostError(`An attachment sink must provide ${method}`, { code: "PTY_HOST_SINK_UNUSABLE" });
+    }
+  }
+}
+
+/**
  * One host for one owner.
  *
  * `owner` is the handle [pty-mechanism.mjs](pty-mechanism.mjs) returns. Its master descriptor's lifetime
@@ -166,6 +211,12 @@ function requireDimension(name, value) {
  * `inputTarget` and `presentation` are the two supported seams this host consumes when an owner really
  * supplies them — Pi's own `dispatchNativeInput` and seam E's `present`. Both are injected because both are
  * out-of-process facts about one launch, and both are absent for the whole of this release.
+ *
+ * `profile` is reconstructed rather than retained. A structurally profile-shaped object is not a launch-fixed
+ * profile: only `createLaunchFixedProfile` refuses one that would buy a passing client by turning images,
+ * configured keys or mouse reporting off, and only its frozen copy cannot drift apart from the mode bytes
+ * derived here. So this host holds its own frozen profile, and a caller that mutates the record it passed in
+ * moves neither admission nor initialization. A profile the factory already produced passes through unchanged.
  *
  * @param {{ owner: any, profile: VirtualTerminalProfile, queuedByteCap: number, cols: number, rows: number, inputTarget?: any, presentation?: any, inspectIdentity?: (pid: number) => Promise<any>, signalProcessGroup?: (pgid: number, signal: any) => void }} options
  */
@@ -185,13 +236,18 @@ export function createPtyHost({
       throw new PtyHostError(`An owner handle must provide ${method}`, { code: "PTY_HOST_OWNER_UNUSABLE" });
     }
   }
-  const identity = owner.owner;
-  if (typeof identity !== "object" || identity === null || !Number.isSafeInteger(identity.pid) || typeof identity.startIdentity !== "string") {
-    throw new PtyHostError("An owner handle must carry the identity it was born with", { code: "PTY_HOST_OWNER_UNUSABLE" });
-  }
+  const birthIdentity = requireBirthIdentity(owner.owner);
+  let launchFixedProfile;
   let modeInitialization;
   try {
-    modeInitialization = profileModeInitialization(profile);
+    const supplied = /** @type {Partial<VirtualTerminalProfile>} */ (typeof profile === "object" && profile !== null ? profile : {});
+    launchFixedProfile = createLaunchFixedProfile({
+      profileId: /** @type {string} */ (supplied.profileId),
+      term: /** @type {string} */ (supplied.term),
+      capabilities: /** @type {any} */ (supplied.capabilities),
+      cellSize: supplied.cellSize ?? null,
+    });
+    modeInitialization = profileModeInitialization(launchFixedProfile);
   } catch (cause) {
     throw new PtyHostError("A launch-fixed terminal profile is required", { code: "PTY_HOST_PROFILE_UNUSABLE", cause });
   }
@@ -254,9 +310,9 @@ export function createPtyHost({
   ];
 
   return Object.freeze({
-    /** The launch-fixed profile, unchanged by every attach, refusal and reply. */
+    /** The launch-fixed profile this host owns, frozen at construction and unchanged by every attach, refusal and reply. */
     profile() {
-      return profile;
+      return launchFixedProfile;
     },
 
     geometry,
@@ -280,22 +336,36 @@ export function createPtyHost({
      * Admit one client, or refuse it by the name of the capability it is missing.
      *
      * The epoch comes from the adopted contract, so there is one epoch system: the next epoch for this id,
-     * never reused, and strictly above the highest this owner ever admitted for it. The profile's client-owned
-     * modes are written to the new sink immediately, before anything can broadcast to it.
+     * never reused, and strictly above the highest this owner ever admitted for it.
+     *
+     * Admission is transactional in the order below, because a half-admitted attachment is worse than a
+     * refused one. The sink is checked, then the profile's client-owned modes are written to it, and only
+     * then does it become a member — so an initialization that throws admits nobody, leaves the epoch it
+     * would have used unspent, and leaves a connection that was being replaced in place with its own
+     * outstanding request still its own. A `false` return from that write is Node's high-water mark, which
+     * means accepted: only a throw is a failure, and accepted bytes are never written again.
      *
      * @param {{ attachmentId: string, sink: any, declared: any }} request
      */
     attach({ attachmentId, sink, declared }) {
-      const admission = admitClient(profile, declared);
+      const admission = admitClient(launchFixedProfile, declared);
       if (!admission.admitted) {
         return { attached: false, code: admission.code, missingCapabilities: admission.missingCapabilities };
       }
       const superseded = attachmentSet.highestIssuedEpoch(attachmentId);
+      requireSinkSurface(sink);
+      try {
+        sink.write(modeInitialization);
+      } catch (cause) {
+        throw new PtyHostError(
+          `Attachment ${attachmentId} could not be given the profile's mode initialization, so nothing was admitted`,
+          { code: "PTY_HOST_ATTACHMENT_INITIALIZATION_FAILED", cause },
+        );
+      }
       const epoch = attachmentSet.add(nextAttachmentEpoch(attachmentId, superseded), sink);
       // A connection that is being replaced keeps nothing outstanding: its replacement must never be handed
       // the answer to a request the previous connection made.
       if (superseded !== null) retirePresentation(superseded);
-      sink.write(modeInitialization);
       return { attached: true, epoch, geometry: geometry() };
     },
 
@@ -482,7 +552,7 @@ export function createPtyHost({
     corroborateForegroundProcessGroup() {
       try {
         const foregroundProcessGroup = owner.foregroundProcessGroup();
-        return { foregroundProcessGroup, sameAsOwnerGroup: foregroundProcessGroup === identity.processGroupId, proves: "nothing" };
+        return { foregroundProcessGroup, sameAsOwnerGroup: foregroundProcessGroup === birthIdentity.processGroupId, proves: "nothing" };
       } catch {
         return { foregroundProcessGroup: null, sameAsOwnerGroup: null, proves: "nothing" };
       }
@@ -586,34 +656,34 @@ export function createPtyHost({
      * The published status is read before anything is sent, because after a signal an exit that had already
      * happened for another reason can no longer be told apart from the one it caused. The identity is
      * re-read immediately before the signal, because a PID the native thread has already reaped may belong
-     * to any process by now.
+     * to any process by now. Both the recorded intent and the copy handed back are frozen, so nothing a
+     * caller does afterwards can move the signal target or rewrite what a later exit is attributed to.
      *
      * @param {{ signal: NodeJS.Signals }} request
      */
     async stopOwner({ signal: requested }) {
       const reaped = owner.reapIfExited();
       if (reaped !== null) {
-        return { signalled: false, reason: "already-reaped", exit: classifyOwnerExit({ reaped, stopIntent, owner: identity }) };
+        return { signalled: false, reason: "already-reaped", exit: classifyOwnerExit({ reaped, stopIntent, owner: birthIdentity }) };
       }
       if (typeof requested !== "string" || requested.length === 0) {
         throw new PtyHostError("A stop names the signal it sends", { code: "PTY_HOST_INVALID_REQUEST" });
       }
       let current;
       try {
-        current = await inspectIdentity(identity.pid);
+        current = await inspectIdentity(birthIdentity.pid);
       } catch {
         return { signalled: false, reason: "identity-unreadable" };
       }
-      if (!sameIdentity(current, identity)) return { signalled: false, reason: "identity-changed" };
-      const intent = { signal: requested, identity };
-      stopIntent = intent;
-      signal(identity.processGroupId, requested);
-      return { signalled: true, intent };
+      if (!sameIdentity(current, birthIdentity)) return { signalled: false, reason: "identity-changed" };
+      stopIntent = Object.freeze({ signal: requested, identity: birthIdentity });
+      signal(birthIdentity.processGroupId, requested);
+      return { signalled: true, intent: Object.freeze({ signal: requested, identity: birthIdentity }) };
     },
 
     /** What this owner's exit can be said to be, from the published status and the recorded intent. */
     describeOwnerExit() {
-      return classifyOwnerExit({ reaped: owner.reapIfExited(), stopIntent, owner: identity });
+      return classifyOwnerExit({ reaped: owner.reapIfExited(), stopIntent, owner: birthIdentity });
     },
   });
 }

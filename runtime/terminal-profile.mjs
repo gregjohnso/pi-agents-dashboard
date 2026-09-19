@@ -28,6 +28,8 @@
  * not complete profile enforcement, and this module says so rather than implying otherwise.
  */
 
+import { parseAttachmentEpoch } from "../shared/native-contracts.mjs";
+
 /** @typedef {{ kittyKeyboard: boolean, kittyGraphics: boolean, mouse: boolean, bracketedPaste: boolean, synchronizedOutput: boolean, trueColor: boolean }} ProfileCapabilities */
 /** @typedef {{ profileId: string, term: string, capabilities: ProfileCapabilities, cellSize: { width: number, height: number } | null }} VirtualTerminalProfile */
 /** @typedef {"da" | "kitty-keyboard" | "cell-size" | "other"} TerminalResponseKind */
@@ -221,9 +223,14 @@ function readResponse(response) {
   if (!(record.raw instanceof Uint8Array)) return null;
   const origin = record.attachmentEpoch;
   if (origin !== null) {
-    if (typeof origin !== "object" || origin === null) return null;
-    const epoch = /** @type {Record<string, unknown>} */ (origin);
-    if (typeof epoch.attachmentId !== "string" || !Number.isSafeInteger(epoch.epoch)) return null;
+    // The origin is either the shared AttachmentEpoch contract or it is not readable at all. An empty id and
+    // a zero, negative, fractional or unsafe epoch name no connection this owner ever admitted, so counting
+    // one as a client reply would report provenance that does not exist.
+    try {
+      parseAttachmentEpoch(origin);
+    } catch {
+      return null;
+    }
   }
   return /** @type {TerminalResponseApplication} */ (response);
 }
@@ -233,8 +240,9 @@ function readResponse(response) {
  *
  * Nothing is applied and nothing is parsed: a decision is made from the classified record seam F hands over,
  * which is why a response-shaped byte run inside a paste body never reaches this ledger at all — Pi decided
- * it was text. The highest request epoch seen per kind is the only state, and it is what makes a reply to a
- * superseded query distinguishable from a reply to the current one.
+ * it was text. Provenance is read through the shared AttachmentEpoch contract, so a malformed origin is
+ * unreadable rather than a client reply. The highest request epoch seen per kind is the only state, and it is
+ * what makes a reply to a superseded query distinguishable from a reply to the current one.
  */
 export function createResponseLedger() {
   /** @type {Map<string, number>} */

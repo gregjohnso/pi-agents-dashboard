@@ -453,6 +453,14 @@ function claimKeyOf(record) {
  * incrementing — Pi's binding supplier reports the generation, so any value above the bound claim's is
  * legitimate and only equal or lower ones are impossible.
  *
+ * Three more things keep the replayed state coherent rather than merely non-destructive. A `committed`
+ * record's `binds` is **derived** here the way `commitBinding` derives it, so a record cannot assert a
+ * binding this owner run was not in a position to take and leave two behind. And both ids are one use for
+ * one owner run's lifetime: `admit` refuses an operation id it already spent, and a reservation id is spent
+ * by its terminal record rather than returned to the pool. Re-seeding `spentOperationIds` when the backend
+ * opens protects the next call; it says nothing about a duplicate already written, and a duplicate admission
+ * followed by an otherwise perfect transfer frees the bound file.
+ *
  * Two of the live writers' predicates are deliberately **not** reproduced here, because replay cannot know
  * them: `nextGeneration === currentGeneration()` asks what the owner's own binding supplier reported at the
  * time, and a `cleared` record's `uncertain` verdict and absence proof came from the recorded host's process
@@ -470,6 +478,17 @@ function foldClaims(records) {
   /** @type {Claim[]} */
   const claims = [];
   const indexOfKey = (/** @type {string} */ key) => claims.findIndex((claim) => claim.key === key);
+  /**
+   * Every reservation and every operation this journal has ever prepared, both scoped to one owner run.
+   *
+   * A held claim is not the question: a terminal record spends its reservation rather than returning the id
+   * to the pool, so a claim the fold has already removed is not permission to prepare that id again. The
+   * scoping matches the rest of the module — `spentOperationIds` is seeded only from the same run's records
+   * and a claim is keyed by `runId:reservationId` — so two independent owner runs sharing one session
+   * directory never collide over a string.
+   */
+  const preparedClaimKeys = new Set();
+  const preparedOperationKeys = new Set();
   /** Drop every claim one owner run holds on one identity, except the record's own reservation. */
   const dropOwned = (/** @type {ClaimIdentity} */ identity, /** @type {OwnerRunIdentity} */ owner, /** @type {string|null} */ exceptKey) => {
     for (let index = claims.length - 1; index >= 0; index -= 1) {
@@ -492,13 +511,19 @@ function foldClaims(records) {
     }
     const key = claimKeyOf(record);
     if (record.record === "prepared") {
-      if (indexOfKey(key) >= 0) {
-        throw inconsistent(`prepares reservation ${record.reservationId} a second time`);
+      if (preparedClaimKeys.has(key)) {
+        throw inconsistent(`prepares reservation ${record.reservationId} a second time for owner run ${record.owner.runId}; that id is one use for the run's lifetime and its terminal record spent it rather than freeing it`);
+      }
+      const operationKey = `${record.owner.runId}:${record.operationId}`;
+      if (preparedOperationKeys.has(operationKey)) {
+        throw inconsistent(`admits operation ${record.operationId} a second time for owner run ${record.owner.runId}; an operation id is admitted once for that run's lifetime`);
       }
       const foreign = claims.find((claim) => sameIdentity(claim.target, record.target) && !sameOwnerRun(claim.owner, record.owner));
       if (foreign !== undefined) {
         throw inconsistent(`reserves ${record.target.canonicalFile} while owner run ${foreign.owner.runId} holds a claim on it`);
       }
+      preparedClaimKeys.add(key);
+      preparedOperationKeys.add(operationKey);
       claims.push({ key, owner: record.owner, reservationId: record.reservationId, operation: record.operation, generation: record.generation, binds: false, state: "prepared", target: record.target });
       return;
     }
@@ -516,6 +541,16 @@ function foldClaims(records) {
     if (record.record === "committed" || record.record === "transferred") {
       if (claim.state !== "prepared") {
         throw inconsistent(`is a second ${record.record} for reservation ${record.reservationId}, which this journal already committed`);
+      }
+      if (record.record === "committed") {
+        // `commitBinding` derives `binds` from the binding this owner run held; it is never told it. A record
+        // that disagrees describes a binding the owner was not in a position to take, and folding it would
+        // leave two claims marked as the binding with `boundClaimIn` answering from the older one.
+        const heldBinding = claims.find((held) => held.state === "committed" && held.binds && sameOwnerRun(held.owner, record.owner));
+        const holdsBinding = heldBinding === undefined || sameIdentity(heldBinding.target, record.target);
+        if (record.binds !== holdsBinding) {
+          throw inconsistent(`commits reservation ${record.reservationId} with binds ${record.binds}, and the binding this owner run held at that point makes it ${holdsBinding}`);
+        }
       }
       if (record.record === "transferred") {
         if (sameIdentity(record.released, claim.target)) {

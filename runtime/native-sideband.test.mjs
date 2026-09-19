@@ -12,6 +12,7 @@ import {
   OWNER_SIDEBAND_SOCKET_ENV,
   OWNER_SIDEBAND_TOKEN_ENV,
   connectOwnerSideband,
+  createOwnerFrameLink,
   listenForOwnerSideband,
   readOwnerSidebandEnvironment,
 } from "./native-sideband.mjs";
@@ -122,7 +123,7 @@ function line(frame) {
 it("exposes one server, one client, one environment reader and its own protocol version", async () => {
   expect(Object.keys(await import("./native-sideband.mjs")).sort()).toEqual([
     "NATIVE_SIDEBAND_PROTOCOL", "NativeSidebandError", "OWNER_SIDEBAND_SOCKET_ENV", "OWNER_SIDEBAND_TOKEN_ENV",
-    "connectOwnerSideband", "listenForOwnerSideband", "readOwnerSidebandEnvironment",
+    "connectOwnerSideband", "createOwnerFrameLink", "listenForOwnerSideband", "readOwnerSidebandEnvironment",
   ]);
   expect(NATIVE_SIDEBAND_PROTOCOL).toBe(1);
 });
@@ -369,17 +370,120 @@ function helloLine() {
   return line({ protocol: NATIVE_SIDEBAND_PROTOCOL, type: "owner-hello", token: TOKEN });
 }
 
+/**
+ * One connected socket pair, and a link driven directly over the server end.
+ *
+ * `createOwnerFrameLink` is the boundary the two cases below need, because whether a frame was buffered
+ * *before* a subscriber existed cannot be observed through either transport: the only way to read the buffer
+ * is to drain it, and draining is the property under test. Delivering through the socket's own `data` event
+ * is exactly how a real arrival reaches the link, and doing it in one synchronous call makes the ordering the
+ * test's rather than the kernel's. No sleep, no chunk luck, no second process.
+ */
+async function ownerFrameLinkOverRealSocket(limits = {}) {
+  const root = await socketRoot();
+  const socketPath = join(root, "pair");
+  /** @type {(socket: net.Socket) => void} */
+  let arrive = () => {};
+  const accepted = new Promise((resolve) => {
+    arrive = resolve;
+  });
+  const server = net.createServer({ allowHalfOpen: false }, (socket) => arrive(socket));
+  await new Promise((resolve) => server.listen(socketPath, () => resolve(undefined)));
+  cleanup.push(() => new Promise((resolve) => server.close(() => resolve(undefined))));
+  const client = net.createConnection(socketPath);
+  client.on("error", () => {});
+  cleanup.push(() => client.destroy());
+  const hostSide = /** @type {net.Socket} */ (await accepted);
+  hostSide.on("error", () => {});
+  const link = createOwnerFrameLink(hostSide, limits);
+  return {
+    link,
+    /** Admit these frames now, in this call, through the socket's own arrival path. @param {any[]} frames */
+    deliver(frames) {
+      hostSide.emit("data", Buffer.from(frames.map((frame) => line({ protocol: NATIVE_SIDEBAND_PROTOCOL, ...frame })).join("")));
+    },
+  };
+}
+
+/** One `owner-facts` frame, numbered. @param {number} index */
+function fact(index) {
+  return { type: "owner-facts", facts: { index } };
+}
+
+// The setup every queued-drain claim rests on, asserted rather than assumed: with nothing subscribed, three
+// frames delivered in one arrival are all buffered, and the first subscriber is handed all three in order.
+// If any of them had been dropped or dispatched directly instead, this case would say so.
+it("hands a first subscriber every frame admitted before it, in arrival order", async () => {
+  const { link, deliver } = await ownerFrameLinkOverRealSocket({ maxQueuedFrames: 3 });
+
+  deliver([fact(1), fact(2), fact(3)]);
+
+  /** @type {any[]} */
+  const seen = [];
+  link.onFrame((/** @type {any} */ frame) => seen.push(frame));
+  expect(seen).toEqual([fact(1), fact(2), fact(3)]);
+});
+
+// Operator-visible failure: a subscriber that throws part way through a drain of frames already admitted
+// would otherwise keep being handed the frames behind it, after the connection has been recorded as failed. A
+// listener that saw one more fact than the host's own refusal admits has been told something the host does not
+// believe.
+//
+// Deterministic by construction: the three frames are admitted in one synchronous arrival with nothing
+// subscribed, which the case above proves buffers all three, and only then is the throwing subscriber added.
+// There is no stream segmentation to get lucky with, because the drain is the only delivery path available.
+it("stops draining the moment a failure is recorded, discarding the frames still buffered", async () => {
+  const { link, deliver } = await ownerFrameLinkOverRealSocket({ maxQueuedFrames: 3 });
+
+  deliver([fact(1), fact(2), fact(3)]);
+
+  /** @type {any[]} */
+  const seen = [];
+  link.onFrame((/** @type {any} */ frame) => {
+    seen.push(frame);
+    if (seen.length === 2) throw new Error("this subscriber cannot handle a second frame");
+  });
+
+  // The third frame was buffered behind the one that threw, and the seal discarded it.
+  expect(seen).toEqual([fact(1), fact(2)]);
+  await expect(link.closed).resolves.toEqual({ refusal: "listener-failed" });
+  /** @type {any[]} */
+  const afterwards = [];
+  link.onFrame((/** @type {any} */ frame) => afterwards.push(frame));
+  expect(afterwards).toEqual([]);
+});
+
+// The other delivery path, kept separate because it proves something different. With a subscriber already
+// installed, each frame is dispatched as it arrives and nothing is ever buffered; a throw still seals the
+// link, and a frame that arrives afterwards is refused admission rather than delivered. This is the case the
+// previous mid-drain test was silently able to become when the stream was segmented after the hello.
+it("dispatches directly when a subscriber is already installed, and seals on a throw", async () => {
+  const { link, deliver } = await ownerFrameLinkOverRealSocket({ maxQueuedFrames: 3 });
+
+  /** @type {any[]} */
+  const seen = [];
+  link.onFrame((/** @type {any} */ frame) => {
+    seen.push(frame);
+    if (seen.length === 2) throw new Error("this subscriber cannot handle a second frame");
+  });
+
+  deliver([fact(1)]);
+  deliver([fact(2)]);
+  deliver([fact(3)]);
+
+  expect(seen).toEqual([fact(1), fact(2)]);
+  await expect(link.closed).resolves.toEqual({ refusal: "listener-failed" });
+});
+
 // Operator-visible failure: a subscriber that throws on one of several frames already admitted would
 // otherwise keep being handed the frames behind it, after the connection has been recorded as failed. The
 // contract is that a recorded failure discards what was buffered; a listener that saw one more fact than the
 // host's own refusal admits has been told something the host does not believe.
 //
-// The subscriber throws on the **second** frame, which is what makes this case unable to pass for the wrong
-// reason. If the stream were segmented so that fewer frames were buffered when the subscription ran, the
-// remaining ones would be dispatched directly instead, and the recorded sequence would not be the first two:
-// the assertion fails loudly rather than quietly exercising direct delivery. The buffering itself and the
-// discard-on-failure are established by the two cases below, neither of which depends on a chunk boundary.
-it("stops delivering the moment a failure is recorded, mid drain of frames already admitted", async () => {
+// This runs over the real authenticated transport, so what it constrains is that path end to end. It makes no
+// claim about whether the three facts were buffered or dispatched directly: a stream segmented after the hello
+// would take the direct path, and the two cases above are what separate them deterministically.
+it("stops delivering the moment a failure is recorded, over the authenticated transport", async () => {
   const socketPath = await socketPathForThisTest();
   const listener = await listenForOwnerSideband({ socketPath, token: TOKEN, maxQueuedFrames: 3 });
   cleanup.push(() => listener.close());

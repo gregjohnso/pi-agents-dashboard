@@ -300,14 +300,23 @@ async function driveSmoke({ root, evidenceDir, spawned, recordOwner }) {
   const statusAfterDetach = JSON.parse((await demoCommand(["status", "--root", root], { label: "demo status", spawned })).output);
   if (statusAfterDetach.ownerAliveWithZeroClients !== true) throw new Error(`the owner did not survive detaching every client: ${JSON.stringify(statusAfterDetach)}`);
   if (ownerAfterDetach.startIdentity !== ownerAtStart.startIdentity) throw new Error("the owner's start identity changed across a detach");
-  // The management bridge, observed rather than assumed. `bridge` is the only phase this channel may report,
-  // and it is not a readiness source for the demo: `native-mounted` above still comes from seam E's core
-  // bootstrap. An empty facts record is a real answer — the extension omits every value it cannot read — so
-  // what is required here is the connection and the one phase, not any particular fact.
+  // The management bridge, observed rather than assumed, and scoped to the **current** owner generation. An
+  // empty facts record would be a real answer - the extension omits every value it cannot read - so what is
+  // required here is the connection and exactly one `bridge` phase, not any particular fact. `readyPhases` is
+  // compared exactly: one phase per generation accumulating into two would mean status is reporting a history
+  // rather than the owner it currently has.
   const bridge = statusAfterDetach.bridge ?? {};
   if (bridge.connected !== true) throw new Error(`the owner never connected to the management bridge: ${JSON.stringify(bridge)}`);
-  if (!(bridge.readyPhases ?? []).includes("bridge")) throw new Error(`the owner reported no bridge readiness phase: ${JSON.stringify(bridge)}`);
-  if ((bridge.readyPhases ?? []).some((phase) => phase !== "bridge")) throw new Error(`the bridge reported a phase it may not report: ${JSON.stringify(bridge)}`);
+  if (JSON.stringify(bridge.readyPhases) !== JSON.stringify(["bridge"])) {
+    throw new Error(`the bridge did not report exactly one bridge phase: ${JSON.stringify(bridge)}`);
+  }
+  if (bridge.generation !== 1) throw new Error(`this smoke starts one owner, so the bridge generation must be 1: ${JSON.stringify(bridge)}`);
+  if (bridge.refusal !== null) throw new Error(`the bridge refused its own owner: ${JSON.stringify(bridge)}`);
+  // Current owner facts are not a lifetime log: there is no frame history in the record at all.
+  if ("frames" in bridge) throw new Error(`the bridge status still carries a frame history: ${JSON.stringify(Object.keys(bridge))}`);
+  if (!Array.isArray(bridge.diagnostics) || bridge.diagnostics.length > 64) {
+    throw new Error(`the bridge diagnostics are not a bounded ring: ${JSON.stringify(bridge.diagnostics?.length)}`);
+  }
   steps.push({
     step: "detach-all",
     clientOneExit: exitOne,
@@ -315,9 +324,12 @@ async function driveSmoke({ root, evidenceDir, spawned, recordOwner }) {
     ownerIdentityUnchanged: true,
     bridge: {
       connected: bridge.connected,
+      generation: bridge.generation,
+      generations: bridge.generations,
       readyPhases: bridge.readyPhases,
       factKeys: Object.keys(bridge.facts ?? {}).sort(),
       reportedSeams: bridge.reportedSeams,
+      counts: bridge.counts,
     },
     detachOutput: detached.output.trim(),
   });

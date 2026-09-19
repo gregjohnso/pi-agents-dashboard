@@ -25,6 +25,7 @@ import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "../../runti
 import { DEFAULT_MANIFEST, resolveCohort } from "./cohort.mjs";
 import { FRONTEND_MODE_RESTORE, createAttachmentTeardown } from "./client.mjs";
 import { createRoot, demoPaths, readToken, tokenMatches, writeOwnerRecord } from "./demo-root.mjs";import { FAKE_REPLY_PREFIX, createFakeStreamSimple, deterministicReply } from "./fake-provider.mjs";
+import { createBridgeConsumer } from "./manager.mjs";
 import { createPausingRelay } from "./pausing-relay.mjs";
 import { createPendingInputQueue } from "./pending-input.mjs";
 import { MAX_FRAME_BYTES, createFrameReader, encodeFrame } from "./protocol.mjs";
@@ -168,6 +169,210 @@ describe("the demo's connection token", () => {
     expect(tokenMatches(`${"a".repeat(63)}b`, token)).toBe(false);
     expect(tokenMatches(undefined, token)).toBe(false);
     expect(tokenMatches(1, token)).toBe(false);
+  });
+});
+
+describe("the owner bridge consumer", () => {
+  /**
+   * One fake owner generation: the connection shape `listenForOwnerSideband` hands out, and nothing more.
+   *
+   * The behaviour under test is entirely this manager's own bookkeeping, so there is no socket, no Pi and no
+   * cohort here. Every frame is delivered synchronously by the case itself, which is what makes the
+   * supersession and flood assertions deterministic rather than timing-dependent.
+   */
+  function fakeOwnerConnection() {
+    /** @type {((frame: any) => void)[]} */
+    const listeners = [];
+    /** @type {(outcome: any) => void} */
+    let settle = () => {};
+    const closed = new Promise((resolve) => {
+      settle = resolve;
+    });
+    /** @type {any[]} */
+    const sent = [];
+    let closes = 0;
+    return {
+      connection: {
+        closed,
+        /** @param {(frame: any) => void} listener */
+        onFrame(listener) {
+          listeners.push(listener);
+          return () => {};
+        },
+        /** @param {string} requestId */
+        requestStop: async (requestId) => {
+          sent.push({ request: "stop", requestId });
+        },
+        /** @param {string} requestId */
+        requestAbort: async (requestId) => {
+          sent.push({ request: "abort", requestId });
+        },
+        close() {
+          closes += 1;
+        },
+      },
+      /** @param {any} frame */
+      emit(frame) {
+        for (const listener of [...listeners]) listener(frame);
+      },
+      /** @param {any} outcome */
+      endWith(outcome) {
+        settle(outcome);
+        return closed;
+      },
+      sent,
+      closes: () => closes,
+    };
+  }
+
+  function consumerFor() {
+    /** @type {string[]} */
+    const lines = [];
+    return { consumer: createBridgeConsumer({ log: (line) => lines.push(line) }), lines };
+  }
+
+  const READY = { type: "owner-ready", phase: "bridge" };
+  /** @param {Record<string, unknown>} facts */
+  const FACTS = (facts) => ({ type: "owner-facts", facts });
+
+  // Operator-visible failure: an authenticated peer - which, as the manager itself discloses, includes any Pi
+  // descendant that inherited the token - can send valid frames forever. Retaining each one grew this
+  // process's memory, its log, every status response and the final owner record without bound. The producer
+  // announces readiness once, forwards at most one seam table and publishes one fact snapshot per generation,
+  // so a second of any of them is already outside the contract and that connection is refused, not absorbed.
+  it("refuses a generation that floods valid frames, and keeps neither its record nor its log unbounded", () => {
+    const { consumer, lines } = consumerFor();
+    const owner = fakeOwnerConnection();
+    consumer.adopt(owner.connection);
+
+    owner.emit(READY);
+    for (let index = 0; index < 5_000; index += 1) owner.emit(FACTS({ index }));
+
+    const status = consumer.status();
+    expect(status.refusal).toMatch(/owner-facts frames and this owner generation may send 1/u);
+    expect(owner.closes()).toBe(1);
+    expect(status.connected).toBe(false);
+    // What the flood left behind is bounded: no frame history, a bounded diagnostic ring, a bounded log.
+    expect(status.diagnostics.length).toBeLessThanOrEqual(64);
+    expect(JSON.stringify(status).length).toBeLessThan(20_000);
+    expect(lines.length).toBeLessThan(20);
+    // Admission stopped at the refusal instead of counting the whole flood.
+    expect(status.counts.frames).toBeLessThan(10);
+  });
+
+  it("refuses a receipt for a request this manager never sent", () => {
+    const { consumer } = consumerFor();
+    const owner = fakeOwnerConnection();
+    consumer.adopt(owner.connection);
+
+    owner.emit({ type: "owner-receipt", requestId: "never-asked", request: "stop", outcome: "requested" });
+
+    expect(consumer.status().refusal).toMatch(/answered request never-asked, which this manager did not send/u);
+    expect(owner.closes()).toBe(1);
+  });
+
+  // A receipt is authorised by the request it answers, which is what keeps legitimate continuing work
+  // uncapped: each new request admits exactly one more receipt, and a repeat answer is unsolicited.
+  it("keeps a receipt for a request it did send, and refuses a second answer to it", async () => {
+    const { consumer } = consumerFor();
+    const owner = fakeOwnerConnection();
+    consumer.adopt(owner.connection);
+
+    const record = await consumer.request("stop", "request-1");
+    expect(record).toMatchObject({ request: "stop", requestId: "request-1", sent: true, generation: 1 });
+    expect(owner.sent).toEqual([{ request: "stop", requestId: "request-1" }]);
+    owner.emit({ type: "owner-receipt", requestId: "request-1", request: "stop", outcome: "requested" });
+    expect(consumer.status().receipts).toEqual([
+      { type: "owner-receipt", requestId: "request-1", request: "stop", outcome: "requested" },
+    ]);
+
+    owner.emit({ type: "owner-receipt", requestId: "request-1", request: "stop", outcome: "requested" });
+    expect(consumer.status().refusal).toMatch(/answered request request-1, which this manager did not send/u);
+  });
+
+  // Operator-visible failure: a reload is a new generation, and the previous connection has to end rather than
+  // stay subscribed. Deriving current facts from every generation meant a value the new one correctly omits as
+  // unknown survived from the older snapshot, and the single readiness phase each generation announces
+  // accumulated into ["bridge", "bridge"] - both of which contradict what this channel says it reports.
+  it("supersedes the previous generation, and reports only the current one's readiness and facts", () => {
+    const { consumer } = consumerFor();
+    const first = fakeOwnerConnection();
+    consumer.adopt(first.connection);
+    first.emit(READY);
+    first.emit(FACTS({ mode: "tui", thinkingLevel: "off", sessionId: "session-one" }));
+    expect(consumer.status()).toMatchObject({ generation: 1, readyPhases: ["bridge"] });
+
+    // The session reloads. This generation could not read a thinking level, and says so by omitting it.
+    const second = fakeOwnerConnection();
+    consumer.adopt(second.connection);
+    expect(first.closes()).toBe(1);
+    second.emit(READY);
+    second.emit(FACTS({ mode: "tui", sessionId: "session-two" }));
+
+    const status = consumer.status();
+    expect(status.generation).toBe(2);
+    expect(status.generations).toBe(2);
+    // Exactly one phase, not one per generation.
+    expect(status.readyPhases).toEqual(["bridge"]);
+    // The omitted fact is gone, and the one that changed is this generation's.
+    expect(status.facts).toEqual({ mode: "tui", sessionId: "session-two" });
+    expect(status.connected).toBe(true);
+  });
+
+  it("lets no late event from a superseded generation reach the current one", async () => {
+    const { consumer } = consumerFor();
+    const first = fakeOwnerConnection();
+    consumer.adopt(first.connection);
+    first.emit(READY);
+    const stale = await consumer.request("stop", "request-stale");
+    expect(stale.generation).toBe(1);
+
+    const second = fakeOwnerConnection();
+    consumer.adopt(second.connection);
+    second.emit(READY);
+    second.emit(FACTS({ sessionId: "session-two" }));
+
+    // Everything the superseded generation still does: more frames, its own receipt, and its close settling.
+    first.emit(FACTS({ sessionId: "session-one" }));
+    first.emit({ type: "owner-receipt", requestId: "request-stale", request: "stop", outcome: "requested" });
+    for (let index = 0; index < 100; index += 1) first.emit(FACTS({ index }));
+    await first.endWith({ refusal: undefined });
+
+    const status = consumer.status();
+    expect(status.generation).toBe(2);
+    expect(status.readyPhases).toEqual(["bridge"]);
+    expect(status.facts).toEqual({ sessionId: "session-two" });
+    // The old generation's receipt did not become the current one's, and its flood did not refuse generation 2.
+    expect(status.receipts).toEqual([]);
+    expect(status.requests).toEqual([]);
+    expect(status.refusal).toBe(null);
+    expect(status.connected).toBe(true);
+  });
+
+  it("reports no owner once the current generation closes, and sends nothing to it", async () => {
+    const { consumer } = consumerFor();
+    const owner = fakeOwnerConnection();
+    consumer.adopt(owner.connection);
+    owner.emit(READY);
+    await owner.endWith({ refusal: undefined });
+
+    expect(consumer.status().connected).toBe(false);
+    expect(consumer.activeGeneration()).toBe(undefined);
+    const record = await consumer.request("stop", "request-after-close");
+    expect(record).toMatchObject({ sent: false, requestId: null });
+    expect(`${record.reason}`).toMatch(/no owner generation is currently connected/u);
+    expect(owner.sent).toEqual([]);
+  });
+
+  it("bounds its diagnostic ring across reconnect churn, and says how many entries it dropped", () => {
+    const { consumer } = consumerFor();
+    for (let index = 0; index < 200; index += 1) consumer.adopt(fakeOwnerConnection().connection);
+
+    const status = consumer.status();
+    expect(status.generations).toBe(200);
+    expect(status.diagnostics.length).toBe(64);
+    expect(status.counts.droppedEvents).toBeGreaterThan(0);
+    expect(status.counts.supersededGenerations).toBe(199);
   });
 });
 

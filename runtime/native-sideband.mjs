@@ -209,6 +209,26 @@ function isOwnerHello(value, token) {
 }
 
 /**
+ * The owner-frame side of `createLink`, over a socket the caller already has.
+ *
+ * This exists as a named boundary because the queue's one load-bearing property cannot be observed through
+ * either transport: whether a frame was **buffered before a subscriber existed** is only visible by draining
+ * it, and draining is the thing under test. Driving the link directly makes delivery ordering the caller's,
+ * so a test can admit frames with nothing subscribed and then subscribe, instead of hoping a socket write
+ * arrives as one chunk.
+ *
+ * It adds no wire format, no option and no behaviour: it is `createLink` with this module's own owner-frame
+ * validator and no handshake, which is exactly the shape `connectOwnerSideband` builds after its hello. Both
+ * transports above keep their own handshakes and remain the only way a real peer is admitted.
+ *
+ * @param {net.Socket} socket @param {{ maxFrameBytes?: number, maxQueuedFrames?: number }} [limits]
+ */
+export function createOwnerFrameLink(socket, limits = {}) {
+  const { maxFrameBytes, maxQueuedFrames } = boundedOptions({ socketPath: "/owner-frame-link", token: "owner-frame-link", ...limits });
+  return createLink(socket, { maxFrameBytes, maxQueuedFrames, validate: validateOwnerFrame });
+}
+
+/**
  * One connected socket, framed, bounded and validated.
  *
  * Both lifecycle waiters are installed here, before the first `await` any caller could reach: the close

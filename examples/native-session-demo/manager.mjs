@@ -66,6 +66,85 @@ const GRACEFUL_EXIT_WAIT_MS = 5_000;
 const MOUNT_WAIT_MS = 60_000;
 const STOP_POLICY = { gracefulMs: 3_000, terminateMs: 3_000 };
 
+/**
+ * The consumer side of the owner management bridge, extracted exactly as it behaved at ddd796e.
+ *
+ * This is the behaviour the review found two P1s in, moved behind one seam and changed in no other way, so the
+ * regressions beside it fail for the defects themselves rather than for an absent export. The correction
+ * follows in the next commit.
+ *
+ * @param {{ log: (line: string) => void, maxDiagnosticEvents?: number, now?: () => number }} options
+ */
+export function createBridgeConsumer({ log, now = Date.now }) {
+  /** @type {any[]} */
+  const bridgeFrames = [];
+  /** @type {any[]} */
+  const bridgeRequests = [];
+  /** @type {any} */
+  let bridgeOwner;
+
+  return {
+    /** @param {any} connection */
+    adopt(connection) {
+      bridgeOwner = connection;
+      const generation = bridgeFrames.filter((frame) => frame.type === "bridge-connected").length + 1;
+      bridgeFrames.push({ type: "bridge-connected", generation, atHostMs: now() });
+      log(`owner bridge generation ${generation} connected`);
+      connection.onFrame((/** @type {any} */ frame) => {
+        bridgeFrames.push({ ...frame, generation, atHostMs: now() });
+        log(`owner bridge ${frame.type}${frame.type === "owner-ready" ? ` phase ${frame.phase}` : ""}`);
+      });
+      void connection.closed.then((/** @type {any} */ outcome) => {
+        bridgeFrames.push({ type: "bridge-closed", generation, refusal: outcome?.refusal ?? null, atHostMs: now() });
+        if (bridgeOwner === connection) bridgeOwner = undefined;
+        log(`owner bridge generation ${generation} closed: ${JSON.stringify(outcome)}`);
+      });
+      return generation;
+    },
+
+    /** @param {"stop"|"abort"} request @param {string} requestId */
+    async request(request, requestId) {
+      const connection = bridgeOwner;
+      if (connection === undefined) {
+        const absent = { request, requestId: null, generation: null, sent: false, reason: "no owner generation is currently connected to the bridge", atHostMs: now() };
+        bridgeRequests.push(absent);
+        return absent;
+      }
+      const record = { request, requestId, generation: null, sent: false, reason: /** @type {string|null} */ (null), atHostMs: now() };
+      try {
+        await (request === "stop" ? connection.requestStop(requestId) : connection.requestAbort(requestId));
+        record.sent = true;
+      } catch (error) {
+        record.reason = /** @type {Error} */ (error).message;
+      }
+      bridgeRequests.push(record);
+      log(`owner bridge ${request} request ${requestId}: ${record.sent ? "sent" : `refused (${record.reason})`}`);
+      return record;
+    },
+
+    status() {
+      return {
+        connected: bridgeOwner !== undefined,
+        generation: bridgeFrames.filter((frame) => frame.type === "bridge-connected").length,
+        generations: bridgeFrames.filter((frame) => frame.type === "bridge-connected").length,
+        readyPhases: bridgeFrames.filter((frame) => frame.type === "owner-ready").map((frame) => frame.phase),
+        facts: Object.assign({}, ...bridgeFrames.filter((frame) => frame.type === "owner-facts").map((frame) => frame.facts)),
+        reportedSeams: bridgeFrames.filter((frame) => frame.type === "owner-seams").map((frame) => frame.reported),
+        receipts: bridgeFrames.filter((frame) => frame.type === "owner-receipt"),
+        requests: bridgeRequests,
+        refusal: null,
+        counts: { frames: bridgeFrames.length, refusedGenerations: 0, supersededGenerations: 0, droppedEvents: 0 },
+        diagnostics: bridgeFrames,
+        frames: bridgeFrames,
+      };
+    },
+
+    activeGeneration() {
+      return bridgeOwner === undefined ? undefined : bridgeFrames.filter((frame) => frame.type === "bridge-connected").length;
+    },
+  };
+}
+
 /** The launch-fixed profile. The owner decides it before Pi negotiates; no client can change it. */
 function launchProfile(cols, rows) {
   return {
@@ -168,33 +247,9 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
    * come from seam E's core bootstrap above, and the only phase this channel reports is `bridge`.
    */
   const bridgeToken = randomBytes(32).toString("hex");
-  /** @type {any[]} */
-  const bridgeFrames = [];
-  /** @type {any[]} */
-  const bridgeRequests = [];
-  /** @type {any} */
-  let bridgeOwner;
+  const bridgeConsumer = createBridgeConsumer({ log });
   const bridge = await listenForOwnerSideband({ socketPath: owned.sidebandSocket, token: bridgeToken });
   log(`owner bridge listening at ${owned.sidebandSocket}`);
-
-  /** Record one bridge generation. A second connection replaces the first as this demo's current owner. */
-  const adoptBridgeOwner = (connection) => {
-    bridgeOwner = connection;
-    const generation = bridgeFrames.filter((frame) => frame.type === "bridge-connected").length + 1;
-    bridgeFrames.push({ type: "bridge-connected", generation, atHostMs: Date.now() });
-    log(`owner bridge generation ${generation} connected`);
-    connection.onFrame((frame) => {
-      // Every frame is recorded exactly as the owner reported it. Facts the extension could not read are
-      // absent rather than defaulted, and nothing here fills one in.
-      bridgeFrames.push({ ...frame, generation, atHostMs: Date.now() });
-      log(`owner bridge ${frame.type}${frame.type === "owner-ready" ? ` phase ${frame.phase}` : ""}`);
-    });
-    void connection.closed.then((outcome) => {
-      bridgeFrames.push({ type: "bridge-closed", generation, refusal: outcome.refusal ?? null, atHostMs: Date.now() });
-      if (bridgeOwner === connection) bridgeOwner = undefined;
-      log(`owner bridge generation ${generation} closed: ${JSON.stringify(outcome)}`);
-    });
-  };
 
   /** Accept bridge generations for as long as this listener is open. A closed listener rejects, and ends this. */
   const acceptBridgeOwners = async () => {
@@ -205,38 +260,13 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
       } catch {
         return;
       }
-      adoptBridgeOwner(connection);
+      bridgeConsumer.adopt(connection);
     }
   };
   void acceptBridgeOwners();
 
-  /**
-   * Ask the owner to end its own session through the bridge, and record what it answered.
-   *
-   * The receipt says what was asked and what the session looked like when it was asked. It is **not** a stop:
-   * `ctx.shutdown()` is request-only and idle-deferred, so only this manager observing a reaped exit and an
-   * absent owner ends anything. `stop` below does that work whether or not this request was answered.
-   * @param {"stop"|"abort"} request
-   */
-  const requestThroughBridge = async (request) => {
-    const connection = bridgeOwner;
-    if (connection === undefined) {
-      const absent = { request, requestId: null, sent: false, reason: "no owner is connected to the bridge", atHostMs: Date.now() };
-      bridgeRequests.push(absent);
-      return absent;
-    }
-    const requestId = randomUUID();
-    const record = { request, requestId, sent: false, reason: null, atHostMs: Date.now() };
-    try {
-      await (request === "stop" ? connection.requestStop(requestId) : connection.requestAbort(requestId));
-      record.sent = true;
-    } catch (error) {
-      record.reason = /** @type {Error} */ (error).message;
-    }
-    bridgeRequests.push(record);
-    log(`owner bridge ${request} request ${requestId}: ${record.sent ? "sent" : `refused (${record.reason})`}`);
-    return record;
-  };
+  /** @param {"stop"|"abort"} request */
+  const requestThroughBridge = (request) => bridgeConsumer.request(request, randomUUID());
 
   const ownerEnv = {
     // A replaced environment, not an augmented one: the native spawn does not inherit, and this is the whole
@@ -384,22 +414,17 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
       presentations,
       childPhases,
       /**
-       * What the owner management bridge reported, verbatim.
+       * What the owner management bridge reported, for the **current** owner generation only.
        *
-       * `readyPhases` can only ever contain `bridge`: the extension emits that one phase and no other, so this
-       * is not a substitute for the seam E receipts in `readiness` above. `requests` are stop/abort receipts,
-       * which record what was asked, never that anything ended.
+       * `readyPhases` can only ever contain the single `bridge` phase that generation announced: the extension
+       * emits that one phase and no other, and a reload starts a new generation rather than appending to this
+       * one. So this is not a substitute for the seam E receipts in `readiness` above. `facts` is that
+       * generation's own latest snapshot, so a value it omits because it could not read it is absent here.
+       * `requests` are stop/abort receipts, which record what was asked, never that anything ended. There is
+       * no frame history: `counts` and `diagnostics` are bounded, and an owner that reconnects or floods
+       * cannot grow this record.
        */
-      bridge: {
-        socketPath: owned.sidebandSocket,
-        connected: bridgeOwner !== undefined,
-        readyPhases: bridgeFrames.filter((frame) => frame.type === "owner-ready").map((frame) => frame.phase),
-        facts: Object.assign({}, ...bridgeFrames.filter((frame) => frame.type === "owner-facts").map((frame) => frame.facts)),
-        reportedSeams: bridgeFrames.filter((frame) => frame.type === "owner-seams").map((frame) => frame.reported),
-        receipts: bridgeFrames.filter((frame) => frame.type === "owner-receipt"),
-        requests: bridgeRequests,
-        frames: bridgeFrames,
-      },
+      bridge: { socketPath: owned.sidebandSocket, ...bridgeConsumer.status() },
       ingressReady,
       attachments: [...clients.values()].map((client) => ({ attachmentId: client.id, epoch: client.epoch })),
       issuedEpochs: [...epochs.entries()].map(([id, epoch]) => ({ attachmentId: id, epoch })),

@@ -1890,11 +1890,7 @@ it("asks the owning observer to clean up instead of signalling numbers, when it 
 it("drains trailing child output to EOF before it publishes the final record", async () => {
   const root = await socketRoot();
   const socketPath = join(root, "o");
-  const observed = await observedParentLoss(fileURLToPath(fixture("held-handoff-binder-with-trailer.mjs")), socketPath, {
-    // Short on purpose. The ordering under test holds on either ending, and a helper that stalls should end this
-    // case quickly through the timeout path rather than sit out a long deadline.
-    timeoutSeconds: 8,
-  });
+  const observed = await observedParentLoss(fileURLToPath(fixture("parent-gone-imposter-with-trailer.mjs")), socketPath);
 
   // The precondition: a third process really does hold these pipes, so their EOF is not the helper's to give.
   await observed.waitFor(/held-handoff-binder: forked a trailing-output grandchild \d+/u);
@@ -1902,8 +1898,12 @@ it("drains trailing child output to EOF before it publishes the final record", a
   observed.killTheParent();
   const { kind, summary, drain, ordering } = await observed.finalRecord();
 
-  // Real wait statuses for the owned processes, whichever ending the observer reached.
-  expect(["DONE", "TIMEOUT"]).toContain(kind);
+  // The success ending, with real wait statuses. The trailing marker depends on the grandchild being allowed to
+  // write: a timeout would SIGKILL the whole owned group and take it with them, so this case uses the child that
+  // reaches its own exit reliably and requires that ending.
+  expect(kind).toBe("DONE");
+  expect(summary.endedBecause).toBe("accounted-for");
+  expect(summary.timedOut).toBe(false);
   const parent = summary.reaped[String(observed.parentPid)];
   const helper = summary.reaped[String(observed.helperPid)];
   expect(parent).toMatchObject({ role: "disposable-parent", terminatedBySignal: true, termSignalName: "SIGKILL" });

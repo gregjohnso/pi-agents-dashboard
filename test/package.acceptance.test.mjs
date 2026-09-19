@@ -65,6 +65,10 @@ it("ships one allowlisted standalone tarball without lifecycle, private, or deve
   // the artifact would fail at the first launch on an operator's machine, not here.
   expect(listing).toContain("package/runtime/pty-mechanism.mjs");
   expect(listing).toContain("package/vendor/pty/pi-agents-owner-pty-linux-x64-gnu.node");
+  // The artifact is a Rust cdylib: the crates and the Rust standard library compiled into it are shipped
+  // here too, so their inventory and licence texts travel with the binary rather than staying in the repo.
+  expect(listing).toContain("package/vendor/pty/THIRD-PARTY-NOTICES.md");
+  expect(listing).toContain("package/vendor/pty/third-party-inventory.json");
   expect(productFiles.some((path) => /(?:^|\/)(?:test|tests|__snapshots__)(?:\/|$)|\.test\.|\.integration\.test\.|runtime\/test-fixtures\.mjs$/u.test(path))).toBe(false);
   expect(productFiles.some((path) => /(?:^|\/)(?:\.superpowers|\.vscode|\.cache|diagnostics|sessions|worktrees)(?:\/|$)/u.test(path))).toBe(false);
   expect(productFiles.some((path) => /(?:^|\/)(?:extensions|ui)(?:\/|$)/u.test(path))).toBe(false);
@@ -80,6 +84,8 @@ it("ships one allowlisted standalone tarball without lifecycle, private, or deve
   // must not also have to change what ships.
   expect(manifest.files).toContain("extension/*.mjs");
   expect(manifest.files).toContain("vendor/pty/*.node");
+  expect(manifest.files).toContain("vendor/pty/THIRD-PARTY-NOTICES.md");
+  expect(manifest.files).toContain("vendor/pty/third-party-inventory.json");
   for (const lifecycle of ["preinstall", "install", "postinstall", "prepare", "prepublish", "prepack", "postpack"]) {
     expect(manifest.scripts?.[lifecycle]).toBeUndefined();
   }

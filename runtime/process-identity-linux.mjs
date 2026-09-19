@@ -48,6 +48,24 @@ export function parseProcStat(stat) {
 }
 
 /**
+ * The exact PID/start-time/process-group identity carried by one already-read proc stat record.
+ *
+ * Separate from reading `/proc`, because a caller that holds a snapshot taken at a moment it can
+ * defend — before anything could have reaped the process and freed its PID for reuse — must be able
+ * to name the identity in that snapshot without reading the PID again.
+ *
+ * @param {string} stat
+ */
+export function identityFromProcStat(stat) {
+  const linuxIdentity = parseProcStat(stat);
+  return {
+    pid: linuxIdentity.pid,
+    processGroupId: linuxIdentity.pgid,
+    startIdentity: linuxIdentity.startTimeTicks,
+  };
+}
+
+/**
  * Inspect the exact PID/start-time/process-group identity Linux exposes in procfs.
  *
  * @param {number} pid
@@ -60,13 +78,9 @@ export async function inspectProcessIdentity(
   if (!Number.isSafeInteger(pid) || pid <= 0) {
     throw new TypeError("PID must be a positive safe integer");
   }
-  const linuxIdentity = parseProcStat(await procFs.readFile(`/proc/${pid}/stat`, "utf8"));
-  if (linuxIdentity.pid !== pid) {
+  const identity = identityFromProcStat(await procFs.readFile(`/proc/${pid}/stat`, "utf8"));
+  if (identity.pid !== pid) {
     throw new ProcessIdentityError("Linux proc stat PID does not match the requested PID");
   }
-  return {
-    pid: linuxIdentity.pid,
-    processGroupId: linuxIdentity.pgid,
-    startIdentity: linuxIdentity.startTimeTicks,
-  };
+  return identity;
 }

@@ -17,6 +17,8 @@
     "shared/*.mjs",
     "isolation/*.mjs",
     "vendor/pty/*.node",
+    "vendor/pty/THIRD-PARTY-NOTICES.md",
+    "vendor/pty/third-party-inventory.json",
     "!**/*.test.mjs",
     "!**/*.integration.test.mjs",
     "!runtime/test-fixtures.mjs",

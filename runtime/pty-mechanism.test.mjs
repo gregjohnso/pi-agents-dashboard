@@ -7,7 +7,8 @@ import { ReadStream, isatty } from "node:tty";
 
 import { afterEach, expect, it } from "vitest";
 
-import { PtyMechanismError, decodeWaitStatus, nativeArtifactPath, openOwnerPty } from "./pty-mechanism.mjs";
+import { PtyMechanismError, decodeWaitStatus, loadNativeMechanism, nativeArtifactPath, openOwnerPty } from "./pty-mechanism.mjs";
+import { parseProcStat } from "./process-identity-linux.mjs";
 import { signalProcessGroup } from "./process-signaler.mjs";
 import { openProcessLedger, reapProcessLedger, recordProcess, reportReapResults } from "../test/process-ledger.mjs";
 
@@ -15,6 +16,8 @@ const LEDGER_LABEL = "pty-mechanism";
 const NEWLINE = new Uint8Array([0x0a]);
 /** Nothing here runs Pi. A shell reading one line is enough to be a real session leader on a real pts. */
 const OWNER_ENV = { PATH: "/usr/bin:/bin", TERM: "xterm-256color" };
+/** The post-command fields of `/proc/<pid>/stat` these tests rewrite, by index. */
+const PROC_FIELD = { state: 0, ttyNumber: 4, startTicks: 19 };
 /** @type {string | undefined} */
 let ledgerPath;
 
@@ -28,13 +31,92 @@ afterEach(async () => {
   ledgerPath = undefined;
 });
 
-/** @param {string} script @param {{ cols?: number, rows?: number }} [size] */
-async function openOwner(script, size = {}) {
-  const handle = await openOwnerPty({ command: "/bin/sh", args: ["-c", script], env: OWNER_ENV, cwd: tmpdir(), ...size });
+/** @param {string} script @param {{ cols?: number, rows?: number, native?: any, readProcStat?: (pid: number) => string, writeToFd?: (fd: number, bytes: Uint8Array, offset: number, length: number) => number }} [options] */
+async function openOwner(script, options = {}) {
+  const handle = await openOwnerPty({ command: "/bin/sh", args: ["-c", script], env: OWNER_ENV, cwd: tmpdir(), ...options });
   // Recorded before anything is asserted: a test that times out never reaches its own teardown.
   ledgerPath ??= await openProcessLedger({ label: LEDGER_LABEL });
   await recordProcess(ledgerPath, `${LEDGER_LABEL} owner shell`, handle.owner);
   return handle;
+}
+
+/**
+ * The real artifact with one of its two birth/reap answers replaced.
+ *
+ * A native thread that has already reaped, and a PID Linux has already handed to another process, cannot be
+ * scheduled by a test, and waiting for real PID reuse would make these cases both slow and flaky. The owner
+ * stays a real process on a real pts; only the moment the artifact claims to have reaped it, or the record it
+ * claims to have read at its birth, is the test's.
+ *
+ * @param {{ birthProcStat?: (real: any) => string | null, rawWaitStatus?: (real: any) => number | null }} answers
+ */
+function artifactAnswering(answers) {
+  const real = loadNativeMechanism();
+  return {
+    ptyResize: real.ptyResize,
+    Pty: class {
+      /** @param {any} options */
+      constructor(options) {
+        this.inner = new real.Pty(options);
+        this.pid = /** @type {number} */ (this.inner.pid);
+      }
+      takeControllerFd() {
+        return this.inner.takeControllerFd();
+      }
+      dropUserFd() {
+        return this.inner.dropUserFd();
+      }
+      birthProcStat() {
+        return answers.birthProcStat ? answers.birthProcStat(this.inner) : this.inner.birthProcStat();
+      }
+      rawWaitStatus() {
+        return answers.rawWaitStatus ? answers.rawWaitStatus(this.inner) : this.inner.rawWaitStatus();
+      }
+    },
+  };
+}
+
+/** One proc stat record with some of its post-command fields replaced: the same PID, another process or state.
+ * @param {string} stat @param {Record<number, string>} replacements */
+function withProcFields(stat, replacements) {
+  const command = stat.slice(0, stat.lastIndexOf(") ") + 2);
+  const fields = stat.slice(command.length).trim().split(/\s+/u);
+  for (const [index, value] of Object.entries(replacements)) fields[Number(index)] = value;
+  return `${command}${fields.join(" ")}\n`;
+}
+
+/** A writer driven by one step per call: each step either accepts a byte count or throws one errno.
+ * @param {(number | NodeJS.ErrnoException)[]} steps */
+function scriptedWriter(steps) {
+  /** @type {number[]} */
+  const accepted = [];
+  /** @type {(fd: number, bytes: Uint8Array, offset: number, length: number) => number} */
+  const writeToFd = (fd, bytes, offset, length) => {
+    const step = steps.shift();
+    if (step === undefined) throw new Error("the terminal writer was called more times than the test scripted");
+    if (typeof step !== "number") throw step;
+    const taken = Math.min(step, length);
+    accepted.push(...bytes.subarray(offset, offset + taken));
+    return taken;
+  };
+  return { accepted, writeToFd };
+}
+
+/** @param {string} code */
+function errnoFailure(code) {
+  return Object.assign(new Error(code), { code });
+}
+
+/** The refusal one call answers with, so a test can assert its data instead of its prose.
+ * @param {() => unknown} call */
+function refusalOf(call) {
+  try {
+    call();
+  } catch (error) {
+    if (error instanceof PtyMechanismError) return error;
+    throw error;
+  }
+  throw new Error("the call was expected to refuse and did not");
 }
 
 /**
@@ -182,4 +264,112 @@ it("loads one committed artifact that matches its build manifest and that no one
   // Git records only the executable bit, so the group bit is whatever the checkout's umask left; a
   // world-writable native artifact is the one mode that would let anyone replace what this host loads.
   expect(statistics.mode & 0o002).toBe(0);
+});
+
+it("takes the owner's identity from the record the artifact read at its birth, not from a later read of that PID", async () => {
+  // The artifact reads /proc once, after the spawn and before its waiting thread starts, so nothing can have
+  // reaped the child and handed its PID on. A distinguishable start time in that record is how this test sees
+  // which read the handle answered from.
+  const bornAt = "424242";
+  const handle = await openOwner("read line", {
+    native: artifactAnswering({
+      birthProcStat: (real) => withProcFields(readFileSync(`/proc/${real.pid}/stat`, "utf8"), { [PROC_FIELD.startTicks]: bornAt }),
+    }),
+  });
+
+  expect(handle.owner.startIdentity).toBe(bornAt);
+  expect(parseProcStat(readFileSync(`/proc/${handle.owner.pid}/stat`, "utf8")).startTimeTicks).not.toBe(bornAt);
+  expect(handle.owner.sessionId).toBe(handle.owner.pid);
+  expect(handle.owner.processGroupId).toBe(handle.owner.pid);
+
+  handle.write(NEWLINE);
+  await handle.wait();
+  await handle.close();
+});
+
+it("keeps a handle for an owner the waiting thread already reaped, and refuses to read a terminal by that PID", async () => {
+  // The reaped owner's /proc entry is gone, which is exactly when a fresh read by PID could answer about
+  // whatever holds that number next. Both the reap and the vanished record are injected, because real PID
+  // reuse cannot be scheduled.
+  const handle = await openOwner("read line", {
+    native: artifactAnswering({
+      birthProcStat: (real) => withProcFields(readFileSync(`/proc/${real.pid}/stat`, "utf8"), { [PROC_FIELD.state]: "Z", [PROC_FIELD.ttyNumber]: "0" }),
+      rawWaitStatus: () => 1792,
+    }),
+    readProcStat: () => {
+      throw errnoFailure("ENOENT");
+    },
+  });
+
+  expect(handle.owner.sessionId).toBe(handle.owner.pid);
+  expect(handle.owner.startIdentity).toMatch(/^\d+$/u);
+  expect(handle.reapIfExited()).toEqual({ status: 1792 });
+  expect(refusalOf(() => handle.foregroundProcessGroup()).code).toBe("PTY_OWNER_EXITED");
+
+  handle.write(NEWLINE);
+  await handle.wait();
+  await handle.close();
+});
+
+it("refuses a foreground-group read once its PID names a process that started at another time", async () => {
+  const handle = await openOwner("read line", {
+    readProcStat: (pid) => withProcFields(readFileSync(`/proc/${pid}/stat`, "utf8"), { [PROC_FIELD.startTicks]: "1" }),
+  });
+
+  const refusal = refusalOf(() => handle.foregroundProcessGroup());
+  expect(refusal.code).toBe("PTY_OWNER_IDENTITY_CHANGED");
+  expect(refusal.message).toContain(String(handle.owner.pid));
+
+  handle.write(NEWLINE);
+  await handle.wait();
+  await handle.close();
+});
+
+it("refuses a write with the byte boundary it reached, and then accepts the suffix alone", async () => {
+  const steps = /** @type {(number | NodeJS.ErrnoException)[]} */ ([3, errnoFailure("EAGAIN")]);
+  const writer = scriptedWriter(steps);
+  const handle = await openOwner("read line", { writeToFd: writer.writeToFd });
+  const bytes = new Uint8Array([1, 2, 3, 4, 5, 6]);
+
+  const refusal = refusalOf(() => handle.write(bytes));
+  expect(refusal.code).toBe("PTY_INPUT_BACKPRESSURE");
+  expect(refusal.bytesWritten).toBe(3);
+  expect(refusal.totalBytes).toBe(6);
+  expect(writer.accepted).toEqual([1, 2, 3]);
+
+  // The numbers, not the message: a caller queues exactly the suffix the terminal did not take, and the
+  // accepted prefix is never offered twice.
+  steps.push(3);
+  handle.write(bytes.subarray(refusal.bytesWritten ?? 0));
+  expect(writer.accepted).toEqual([1, 2, 3, 4, 5, 6]);
+
+  await handle.close();
+  await handle.wait();
+});
+
+it("retries an interrupted write at the same offset, without repeating or dropping a byte", async () => {
+  const writer = scriptedWriter([errnoFailure("EINTR"), 2, errnoFailure("EINTR"), 4]);
+  const handle = await openOwner("read line", { writeToFd: writer.writeToFd });
+
+  handle.write(new Uint8Array([1, 2, 3, 4, 5, 6]));
+
+  expect(writer.accepted).toEqual([1, 2, 3, 4, 5, 6]);
+
+  await handle.close();
+  await handle.wait();
+});
+
+it("refuses a write that stops making progress instead of spinning on a terminal that accepts nothing", async () => {
+  const writer = scriptedWriter([2, 0]);
+  const handle = await openOwner("read line", { writeToFd: writer.writeToFd });
+
+  const refusal = refusalOf(() => handle.write(new Uint8Array([1, 2, 3, 4, 5, 6])));
+
+  expect(refusal.code).toBe("PTY_WRITE_NO_PROGRESS");
+  expect(refusal.bytesWritten).toBe(2);
+  expect(refusal.totalBytes).toBe(6);
+  expect(writer.accepted).toEqual([1, 2]);
+
+  await handle.close();
+  await handle.wait();
 });

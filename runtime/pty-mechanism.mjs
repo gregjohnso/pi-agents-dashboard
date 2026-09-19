@@ -13,10 +13,17 @@
  *
  * **The owner is reaped by the artifact, not by this process.** One thread per owner owns the single
  * `wait(2)`, stores the raw status the moment it returns, and only then notifies JavaScript. So
- * `reapIfExited()` is a synchronous read of that stored status: it never waits, never signals, and cannot
- * report a reaped owner as still running. It is also not a substitute for verifying identity before a
- * signal — stopping an owner belongs to `stopVerifiedProcessGroup`, which re-reads PID, start identity and
- * process group immediately before it fires.
+ * `reapIfExited()` is a synchronous read of that stored status: it never waits and never signals. It is a
+ * published cache of a completed reap, not a `waitpid` — the status is stored just after `wait(2)` returned,
+ * so `null` means "no status published yet", not "the owner is alive". Nothing here may treat it as proof of
+ * life: identity is revalidated immediately before any signal, which is `stopVerifiedProcessGroup`'s job.
+ *
+ * **The owner's identity is bound at birth.** The artifact reads the child's `/proc/<pid>/stat` once, after
+ * the spawn and before the waiting thread starts, and Linux cannot reuse a PID that nothing has reaped yet.
+ * That snapshot is where this module takes the owner's PID, start identity, process group, session and
+ * controlling terminal from, so a PID reused after the native thread reaps the owner cannot be mistaken for
+ * it. Every later read by PID — `foregroundProcessGroup()` — compares the start identity in that snapshot and
+ * refuses rather than returning another process's answer.
  *
  * **Platform: Linux, x86-64, glibc.** The artifact is a Node-API version 4 addon, so it is ABI-stable across
  * Node majors, but it links the build host's glibc. There is no musl, arm64 or non-Linux artifact, and
@@ -32,7 +39,7 @@ import { createRequire } from "node:module";
 import { constants } from "node:os";
 import { isatty } from "node:tty";
 
-import { inspectProcessIdentity } from "./process-identity-linux.mjs";
+import { identityFromProcStat } from "./process-identity-linux.mjs";
 
 const require = createRequire(import.meta.url);
 
@@ -47,11 +54,23 @@ const SIGNAL_NAMES = new Map(
 
 /** A refused input, an unusable host, or an owner that is not what the mechanism requires. Never a warning. */
 export class PtyMechanismError extends Error {
-  /** @param {string} message @param {{ code?: string, cause?: unknown }} [options] */
-  constructor(message, { code = "PTY_MECHANISM", cause } = {}) {
+  /** @param {string} message @param {{ code?: string, cause?: unknown, bytesWritten?: number, totalBytes?: number }} [options] */
+  constructor(message, { code = "PTY_MECHANISM", cause, bytesWritten, totalBytes } = {}) {
     super(message, { cause });
     this.name = "PtyMechanismError";
     this.code = code;
+    /**
+     * How many bytes of the refused write the terminal had already accepted, and how many were offered.
+     *
+     * Numbers, not prose: a caller that must queue the rest needs the exact suffix boundary, and parsing it
+     * back out of a message is how bytes get duplicated or dropped. `null` on every failure that is not a
+     * write.
+     *
+     * @type {number | null}
+     */
+    this.bytesWritten = bytesWritten ?? null;
+    /** @type {number | null} */
+    this.totalBytes = totalBytes ?? null;
   }
 }
 
@@ -119,14 +138,14 @@ export function decodeWaitStatus(status) {
 /**
  * The two terminal fields the shared identity parser deliberately does not expose.
  *
- * Identity itself still comes from `inspectProcessIdentity`, so there is exactly one spelling of "which
- * process is this"; these are the session and the controlling terminal's foreground group, which that parser
- * has no caller for.
+ * Identity itself still comes from `identityFromProcStat`, so there is exactly one spelling of "which process
+ * is this"; these are the session and the controlling terminal's foreground group, which that parser has no
+ * caller for. It takes the record rather than a PID, because the record a caller may trust is the one taken
+ * at a moment it can defend, not whatever `/proc/<pid>` holds now.
  *
- * @param {number} pid
+ * @param {string} stat @param {number} pid
  */
-function readTerminalFields(pid) {
-  const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+function terminalFieldsFromProcStat(stat, pid) {
   const fields = stat.slice(stat.lastIndexOf(") ") + 2).trim().split(/\s+/u);
   const [sessionId, terminalDevice, foregroundProcessGroup] = [Number(fields[3]), Number(fields[4]), Number(fields[5])];
   if (!Number.isSafeInteger(sessionId) || sessionId <= 0 || !Number.isSafeInteger(terminalDevice) || !Number.isSafeInteger(foregroundProcessGroup)) {
@@ -149,11 +168,27 @@ function requireTerminalDimension(name, value) {
  *
  * The owner is required to be a session leader on a `pts/` device before the handle is returned: a mechanism
  * that silently produced a child sharing this process's terminal would be discovered much later, by a
- * keystroke reaching the wrong process.
+ * keystroke reaching the wrong process. Every one of those facts is read from the artifact's birth snapshot of
+ * `/proc/<pid>/stat`, so the answer describes the child that was spawned even if the native thread has
+ * already reaped it and Linux has already given that PID to something else.
  *
- * @param {{ command: string, args?: string[], env?: Record<string, string>, cwd?: string, cols?: number, rows?: number, native?: any }} options
+ * `readProcStat` and `writeToFd` are the two syscall seams, injected by tests that have to make a PID reuse,
+ * a reaper ordering or a partial write happen at an exact moment instead of waiting for the kernel to produce
+ * one.
+ *
+ * @param {{ command: string, args?: string[], env?: Record<string, string>, cwd?: string, cols?: number, rows?: number, native?: any, readProcStat?: (pid: number) => string, writeToFd?: (fd: number, bytes: Uint8Array, offset: number, length: number) => number }} options
  */
-export async function openOwnerPty({ command, args = [], env = {}, cwd, cols = 80, rows = 24, native = loadNativeMechanism() }) {
+export async function openOwnerPty({
+  command,
+  args = [],
+  env = {},
+  cwd,
+  cols = 80,
+  rows = 24,
+  native = loadNativeMechanism(),
+  readProcStat = (pid) => readFileSync(`/proc/${pid}/stat`, "utf8"),
+  writeToFd = writeSync,
+}) {
   if (typeof command !== "string" || command === "") throw new PtyMechanismError("An owner command must be a non-empty string", { code: "PTY_INVALID_REQUEST" });
   requireTerminalDimension("cols", cols);
   requireTerminalDimension("rows", rows);
@@ -197,8 +232,18 @@ export async function openOwnerPty({ command, args = [], env = {}, cwd, cols = 8
   /** @type {{ state: string, sessionId: number, terminalMajor: number, foregroundProcessGroup: number }} */
   let terminal;
   try {
-    identity = await inspectProcessIdentity(pty.pid);
-    terminal = readTerminalFields(pty.pid);
+    // One record, read by the artifact before anything could have reaped this child, so its PID was still
+    // this child's: identity and terminal facts both come from it rather than from two later reads that a
+    // reaped PID could have answered on another process's behalf.
+    const birth = pty.birthProcStat();
+    if (typeof birth !== "string" || birth === "") {
+      throw new PtyMechanismError(`The artifact recorded no birth proc snapshot for owner ${pty.pid}`, { code: "PTY_OWNER_UNIDENTIFIED" });
+    }
+    identity = identityFromProcStat(birth);
+    if (identity.pid !== pty.pid) {
+      throw new PtyMechanismError(`The birth proc snapshot names ${identity.pid}, and the artifact spawned ${pty.pid}`, { code: "PTY_OWNER_UNIDENTIFIED" });
+    }
+    terminal = terminalFieldsFromProcStat(birth, identity.pid);
   } catch (cause) {
     closeSync(masterFd);
     closed = true;
@@ -211,7 +256,7 @@ export async function openOwnerPty({ command, args = [], env = {}, cwd, cols = 8
     );
   }
   // A zombie has already released its controlling terminal, so an owner that exited between the spawn and
-  // this read reports terminal 0 while its session and group are still its own. Requiring a pts of that
+  // the snapshot reports terminal 0 while its session and group are still its own. Requiring a pts of that
   // corpse would refuse a handle whose only remaining job is to report how the owner died.
   const exited = terminal.state === "Z" || pty.rawWaitStatus() !== null;
   const onPseudoTerminal = terminal.terminalMajor >= DEVPTS_MAJORS.first && terminal.terminalMajor <= DEVPTS_MAJORS.last;
@@ -230,17 +275,42 @@ export async function openOwnerPty({ command, args = [], env = {}, cwd, cols = 8
     // An in-process addon, so there is no third process between the host and its owner to identify.
     helper: null,
 
-    /** The foreground process group of the owner's controlling terminal. Corroboration only. */
+    /**
+     * The foreground process group of the owner's controlling terminal. Corroboration only.
+     *
+     * Refused rather than answered once this owner is gone: the PID alone is not the owner, and after the
+     * native thread reaps it Linux may hand that number to any process, whose foreground group would
+     * otherwise be reported as this owner's.
+     */
     foregroundProcessGroup() {
       refuseWhenClosed();
-      return readTerminalFields(identity.pid).foregroundProcessGroup;
+      const status = pty.rawWaitStatus();
+      if (status !== null) {
+        throw new PtyMechanismError(`The owner ${identity.pid} exited with raw wait status ${status} and has no terminal`, { code: "PTY_OWNER_EXITED" });
+      }
+      let stat;
+      try {
+        stat = readProcStat(identity.pid);
+      } catch (cause) {
+        throw new PtyMechanismError(`The owner ${identity.pid} has no proc record left to read a foreground group from`, { code: "PTY_OWNER_EXITED", cause });
+      }
+      const current = identityFromProcStat(stat);
+      if (current.pid !== identity.pid || current.startIdentity !== identity.startIdentity) {
+        throw new PtyMechanismError(
+          `PID ${identity.pid} now belongs to a process started at ${current.startIdentity}, not to the owner started at ${identity.startIdentity}`,
+          { code: "PTY_OWNER_IDENTITY_CHANGED" },
+        );
+      }
+      return terminalFieldsFromProcStat(stat, identity.pid).foregroundProcessGroup;
     },
 
     /**
      * Write bytes to the terminal exactly as given: no encoding, no translation, no host-side queue.
      *
-     * The descriptor is non-blocking, so a terminal whose input buffer is full reports backpressure with
-     * the count it accepted rather than silently dropping the rest. Queueing input is the ingress seam's
+     * Returns nothing on success, because success means every byte was accepted. The descriptor is
+     * non-blocking, so a terminal whose input buffer is full refuses with `bytesWritten` and `totalBytes` on
+     * the error: those two numbers are the suffix boundary the caller must queue, and they are data rather
+     * than prose precisely so nobody reads them back out of a message. Queueing input is the ingress seam's
      * job, and a second buffer here would be a second writer.
      *
      * @param {Uint8Array} bytes
@@ -250,16 +320,23 @@ export async function openOwnerPty({ command, args = [], env = {}, cwd, cols = 8
       if (!(bytes instanceof Uint8Array)) throw new PtyMechanismError("Terminal input must be a Uint8Array", { code: "PTY_INVALID_REQUEST" });
       let written = 0;
       while (written < bytes.byteLength) {
+        let accepted;
         try {
-          written += writeSync(masterFd, bytes, written, bytes.byteLength - written);
+          accepted = writeToFd(masterFd, bytes, written, bytes.byteLength - written);
         } catch (error) {
           const code = /** @type {NodeJS.ErrnoException} */ (error).code;
           if (code === "EINTR") continue;
           if (code === "EAGAIN") {
-            throw new PtyMechanismError(`The terminal accepted ${written} of ${bytes.byteLength} bytes and its input buffer is full`, { code: "PTY_INPUT_BACKPRESSURE", cause: error });
+            throw new PtyMechanismError(`The terminal accepted ${written} of ${bytes.byteLength} bytes and its input buffer is full`, { code: "PTY_INPUT_BACKPRESSURE", cause: error, bytesWritten: written, totalBytes: bytes.byteLength });
           }
-          throw new PtyMechanismError(`Writing ${bytes.byteLength} bytes to the terminal failed after ${written}`, { code: "PTY_WRITE_FAILED", cause: error });
+          throw new PtyMechanismError(`Writing ${bytes.byteLength} bytes to the terminal failed after ${written}`, { code: "PTY_WRITE_FAILED", cause: error, bytesWritten: written, totalBytes: bytes.byteLength });
         }
+        // A write that accepts nothing and reports no error would spin here forever. It is the same fact
+        // backpressure carries — this much was taken, the rest was not — so it is reported the same way.
+        if (accepted <= 0) {
+          throw new PtyMechanismError(`The terminal accepted ${written} of ${bytes.byteLength} bytes and then accepted none`, { code: "PTY_WRITE_NO_PROGRESS", bytesWritten: written, totalBytes: bytes.byteLength });
+        }
+        written += accepted;
       }
     },
 
@@ -273,10 +350,13 @@ export async function openOwnerPty({ command, args = [], env = {}, cwd, cols = 8
     },
 
     /**
-     * The owner's raw wait status if it has already been reaped, and `null` while it has not.
+     * The owner's raw wait status if a reap has already been published for it, and `null` while none has.
      *
-     * Non-blocking and signal-free, and it must be asked before any signal: once a signal is sent, an exit
-     * that had already happened for another reason can no longer be distinguished from the one it caused.
+     * Non-blocking and signal-free. It is a cache the artifact's waiting thread fills just after `wait(2)`
+     * returns, so `null` is not proof the owner is alive; only the published status is proof it is not. It
+     * must be asked before any signal: once a signal is sent, an exit that had already happened for another
+     * reason can no longer be distinguished from the one it caused. Identity is still revalidated before a
+     * signal, because this answer cannot rule out a reap that has happened but not yet been published.
      */
     reapIfExited() {
       const status = pty.rawWaitStatus();

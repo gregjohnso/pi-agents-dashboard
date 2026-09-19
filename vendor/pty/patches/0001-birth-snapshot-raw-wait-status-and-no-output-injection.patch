@@ -1,5 +1,5 @@
 diff --git a/index.d.ts b/index.d.ts
-index a52c3bd..7715b30 100644
+index a52c3bd..3009d72 100644
 --- a/index.d.ts
 +++ b/index.d.ts
 @@ -37,7 +37,7 @@ export interface PtyOptions {
@@ -19,20 +19,28 @@ index a52c3bd..7715b30 100644
  /** Resize the terminal. */
  export declare function ptyResize(fd: number, size: Size): void;
  /**
-@@ -68,6 +67,11 @@ export declare class Pty {
+@@ -68,6 +67,19 @@ export declare class Pty {
     * once (it will error the second time). The caller is responsible for closing the file
     * descriptor.
     */
 +  /**
++   * This child's /proc/<pid>/stat as it was read after the spawn and before the reaping thread
++   * started, or null if that read failed. A pid cannot be reused before it is reaped, so every
++   * field of this snapshot belongs to this child and to no later process with the same pid.
++   */
++  birthProcStat(): string | null;
++  /**
 +   * The raw wait(2) status of this process, or null while its exit has not been reaped.
-+   * Non-blocking and signal-free: it reads the state of the thread that owns the single wait(2).
++   * Non-blocking and signal-free, and a published cache of a completed reap rather than a
++   * synchronous waitpid: the status is stored after wait(2) returned, so null means no status has
++   * been published yet and not that the child is still running.
 +   */
 +  rawWaitStatus(): number | null;
    takeControllerFd(): c_int;
    /**
     * Closes the owned file descriptor for the PTY controller. The Nodejs side must call this
 diff --git a/src/lib.rs b/src/lib.rs
-index 90cb7da..2148401 100644
+index 90cb7da..08926c6 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -5,10 +5,13 @@ use std::io::{Error, Write};
@@ -50,12 +58,14 @@ index 90cb7da..2148401 100644
  use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
  use napi::Status::GenericFailure;
  use napi::{self, Env};
-@@ -31,8 +34,13 @@ struct Pty {
+@@ -31,8 +34,15 @@ struct Pty {
    user_fd: Option<OwnedFd>,
    /// The pid of the forked process.
    pub pid: u32,
 +  /// The raw `wait(2)` status the reaping thread stored, or `NOT_REAPED` while it has not returned.
 +  exit_status: Arc<AtomicI64>,
++  /// This child's `/proc/<pid>/stat`, read once after the spawn and before any `wait(2)` ran.
++  birth_proc_stat: Option<String>,
  }
  
 +/// No `wait(2)` status can be this value, so it is the one sentinel for "not reaped yet".
@@ -64,7 +74,7 @@ index 90cb7da..2148401 100644
  #[napi(string_enum)]
  pub enum Operation {
    Modify,
-@@ -72,7 +80,7 @@ struct PtyOptions {
+@@ -72,7 +82,7 @@ struct PtyOptions {
    pub apparmor_profile: Option<String>,
    pub interactive: Option<bool>,
    pub sandbox: Option<SandboxOptions>,
@@ -73,7 +83,7 @@ index 90cb7da..2148401 100644
    pub on_exit: JsFunction,
  }
  
-@@ -88,13 +96,6 @@ pub const MAX_U16_VALUE: u16 = u16::MAX;
+@@ -88,13 +98,6 @@ pub const MAX_U16_VALUE: u16 = u16::MAX;
  #[napi]
  pub const MIN_U16_VALUE: u16 = u16::MIN;
  
@@ -87,12 +97,19 @@ index 90cb7da..2148401 100644
  fn cast_to_napi_error(err: Errno) -> napi::Error {
    napi::Error::new(GenericFailure, err)
  }
-@@ -308,24 +309,21 @@ impl Pty {
+@@ -308,24 +311,31 @@ impl Pty {
        .on_exit
        .create_threadsafe_function(0, |ctx| ctx.env.create_int32(ctx.value).map(|v| vec![v]))?;
  
 +    let exit_status = Arc::new(AtomicI64::new(NOT_REAPED));
 +    let reaped_status = Arc::clone(&exit_status);
++
++    // This child's own /proc record, read here and only here. `spawn` returns after the child has
++    // exec'd, so `setsid` and TIOCSCTTY have already happened, and no `wait(2)` for this child has
++    // run yet, so Linux cannot have handed this pid to anything else: the snapshot is bound to this
++    // child. A read that fails yields no snapshot rather than a spawn failure, because the reaping
++    // thread below must still be started or the child would be left unreaped and untracked.
++    let birth_proc_stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok();
 +
      thread::spawn(move || {
        let wait_result = child.wait();
@@ -114,30 +131,47 @@ index 90cb7da..2148401 100644
 -          }
 +          // The raw wait(2) status, not an exit code. A normal exit, a terminating signal and a
 +          // core dump are three different facts, and reporting only code().unwrap_or(-1) erased
-+          // two of them irrecoverably. The store happens before the callback, so a synchronous
-+          // reader can never observe an already reaped child as still running.
++          // two of them irrecoverably. The store publishes that status after wait(2) returned and
++          // before the callback, so it is a cache of a completed reap: `None` from
++          // `raw_wait_status` does not prove the child is still running, because this thread can be
++          // between the return of wait(2) and this store. Identity must still be revalidated before
++          // anything signals this pid.
 +          let raw = status.into_raw();
 +          reaped_status.store(raw as i64, Ordering::SeqCst);
 +          ts_on_exit.call(Ok(raw), ThreadsafeFunctionCallMode::Blocking);
          }
          Err(err) => {
            ts_on_exit.call(
-@@ -346,6 +344,7 @@ impl Pty {
+@@ -346,6 +356,8 @@ impl Pty {
        controller_fd: Some(controller_fd),
        user_fd: Some(user_fd),
        pid,
 +      exit_status,
++      birth_proc_stat,
      })
    }
  
-@@ -365,6 +364,19 @@ impl Pty {
+@@ -365,6 +377,32 @@ impl Pty {
      }
    }
  
++  /// This child's `/proc/<pid>/stat` as it was read after the spawn and before the reaping thread
++  /// started, or null if that read failed.
++  ///
++  /// A pid cannot be reused before it is reaped, and nothing had reaped this child when the
++  /// snapshot was taken, so every field in it belongs to this child and to no later process that
++  /// inherits the same pid.
++  #[napi]
++  #[allow(dead_code)]
++  pub fn birth_proc_stat(&self) -> Option<String> {
++    self.birth_proc_stat.clone()
++  }
++
 +  /// The raw wait(2) status of this process, or null while its exit has not been reaped.
 +  ///
-+  /// Non-blocking and signal-free. It reads the state of the thread that owns the single wait(2)
-+  /// for this child, so it answers before the exit callback reaches JavaScript and it never waits.
++  /// A published cache of a completed reap, not a synchronous waitpid: the reaping thread stores
++  /// the status after wait(2) returned, so null means "no status published yet" and not "alive".
++  /// Non-blocking and signal-free.
 +  #[napi]
 +  #[allow(dead_code)]
 +  pub fn raw_wait_status(&self) -> Option<i32> {
@@ -150,7 +184,7 @@ index 90cb7da..2148401 100644
    /// Closes the owned file descriptor for the PTY controller. The Nodejs side must call this
    /// when it is done with the file descriptor to avoid leaking FDs.
    #[napi]
-@@ -467,35 +479,3 @@ fn set_nonblocking(fd: i32) -> Result<(), napi::Error> {
+@@ -467,35 +505,3 @@ fn set_nonblocking(fd: i32) -> Result<(), napi::Error> {
    }
    Ok(())
  }

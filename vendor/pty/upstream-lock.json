@@ -11,7 +11,7 @@
       "spdx": "MIT",
       "declaredIn": "package.json",
       "textPublished": false,
-      "note": "Upstream publishes no license file: neither the npm tarball nor the repository root at github.com/replit/ruspty contains LICENSE, and the only licence statement is the package.json \"license\": \"MIT\" field recorded here. No third-party licence text is reproduced in this repository, because inventing a copyright holder line would be worse than recording the absence."
+      "note": "Upstream publishes no license file: the pinned npm tarball has none at any depth, its Cargo.toml declares no license key, the repository listing at api.github.com/repos/replit/ruspty/contents/ (HTTP 200) contains none, and LICENSE at main, at v3.7.1 and through the GitHub license API all answer 404. The only licence statement is the package.json \"license\": \"MIT\" field recorded here. No third-party licence text is reproduced for it, because inventing a copyright holder line would be worse than recording the absence. THIRD-PARTY-NOTICES.md records that absence as a release blocker and carries the texts every other upstream in this artifact does publish."
     }
   },
   "verifiedFiles": [
@@ -30,8 +30,8 @@
   ],
   "patches": [
     {
-      "path": "patches/0001-raw-wait-status-and-no-output-injection.patch",
-      "sha256": "b4173883a32698690d0b8776179b4c7cf8aaa0fe6138eea6fbf491f569de5244"
+      "path": "patches/0001-birth-snapshot-raw-wait-status-and-no-output-injection.patch",
+      "sha256": "6f40f9fad9ca2301391f1210eb3c608b588001e44243b1ed0747dc69175c6683"
     }
   ],
   "build": {

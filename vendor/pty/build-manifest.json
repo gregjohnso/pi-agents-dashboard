@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "artifact": "pi-agents-owner-pty-linux-x64-gnu.node",
-  "sha256": "88bf1c35fd3da90c9eaca7f90372312372e69f68bc3d205bcbfbbaef41df017b",
-  "byteLength": 786416,
+  "sha256": "1ed4ec08eb43cb1f608d5aa156d0232bc7b6965ad14852e2410ba7c64a68d7e5",
+  "byteLength": 791416,
   "upstream": {
     "package": "@replit/ruspty",
     "version": "3.7.1",
@@ -10,8 +10,8 @@
   },
   "patches": [
     {
-      "path": "patches/0001-raw-wait-status-and-no-output-injection.patch",
-      "sha256": "b4173883a32698690d0b8776179b4c7cf8aaa0fe6138eea6fbf491f569de5244"
+      "path": "patches/0001-birth-snapshot-raw-wait-status-and-no-output-injection.patch",
+      "sha256": "6f40f9fad9ca2301391f1210eb3c608b588001e44243b1ed0747dc69175c6683"
     }
   ],
   "platform": {
@@ -37,8 +37,8 @@
     "linux-vdso.so.1"
   ],
   "builtOn": {
-    "host": "cw-us-e4a2-l40-234-043",
+    "host": "cw-us-e4a2-l40-202-083",
     "node": "v22.23.2"
   },
-  "buildSeconds": 44.541
+  "buildSeconds": 16.792
 }

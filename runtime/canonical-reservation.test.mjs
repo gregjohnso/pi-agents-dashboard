@@ -817,6 +817,101 @@ describe("durable replay of an impossible history", () => {
       await appendRecord(domain, { record: "transferred", owner: host.owner, reservationId: move.reservationId, generation: 2, target: records[2].target, released: records[1].target });
       return { protected: bound, real: ["prepared", "committed", "prepared"] };
     },
+
+    /**
+     * A commit claiming the binding while this owner run is already bound to another file.
+     *
+     * `commitBinding` derives `binds` rather than being told it: `holdsBinding = bound === undefined ||
+     * sameIdentity(bound.target, target)`. So with a binding on another file it writes `binds: false`, and a
+     * `true` here is a record the writer could not have produced. Nothing is freed by folding it — the owner
+     * ends up holding two `binds: true` claims and `boundClaimIn` then answers with the older one — which is
+     * why this one is about the replayed state being coherent rather than about a file being let go.
+     *
+     * The generation is deliberately the bound claim's own, so this isolates the `binds` derivation: a higher
+     * one would also have been routed to `transfer` by the writer, which is a different predicate.
+     */
+    async "a commit that claims the binding while this owner run is bound to another file"(domain) {
+      const bound = await realFile(join(domain.session, "two-bindings-bound.jsonl"));
+      const other = await realFile(join(domain.session, "two-bindings-other.jsonl"));
+      const host = await openOwner(domain);
+      await bind(host, bound, 1);
+      const selector = await admitting(host, { operation: "rename", generation: 1, target: other });
+      expect(selector).toMatchObject({ reservationId: expect.any(String) });
+      await host.reservations.close();
+      const records = await journalRecords(domain.journalPath);
+      expect(records[1]).toMatchObject({ record: "committed", binds: true });
+      await appendRecord(domain, { record: "committed", owner: host.owner, reservationId: selector.reservationId, generation: 1, binds: true, target: records[2].target });
+      return { protected: bound, real: ["prepared", "committed", "prepared"] };
+    },
+
+    /**
+     * An operation id admitted twice for one owner run, then an otherwise perfect transfer.
+     *
+     * `admit` refuses an operation id it already spent, and `openCanonicalReservations` re-seeds
+     * `spentOperationIds` from the journal — but that protects the *next* call, it does not validate a
+     * duplicate admission already recorded. Every later record here is exactly what the writer would have
+     * written, including a properly advancing transfer, so the duplicate admission is the only impossible
+     * thing in the history and it is what frees the bound file.
+     */
+    async "an operation id admitted a second time for one owner run"(domain) {
+      const bound = await realFile(join(domain.session, "duplicate-operation-bound.jsonl"));
+      const moved = await realFile(join(domain.session, "duplicate-operation-moved.jsonl"));
+      const host = await openOwner(domain);
+      await bind(host, bound, 1);
+      await host.reservations.close();
+      const records = await journalRecords(domain.journalPath);
+      const reused = records[0].operationId;
+      const reservationId = `reservation-${randomUUID()}`;
+      await appendRecord(domain, {
+        record: "prepared",
+        owner: host.owner,
+        operationId: reused,
+        reservationId,
+        operation: "resume",
+        generation: 1,
+        requestedTarget: moved,
+        target: await claimIdentityOf(moved),
+        source: records[1].target,
+      });
+      await appendRecord(domain, { record: "transferred", owner: host.owner, reservationId, generation: 2, target: await claimIdentityOf(moved), released: records[1].target });
+      return { protected: bound, real: ["prepared", "committed", "prepared"] };
+    },
+
+    /**
+     * A reservation id prepared again after a terminal record spent it.
+     *
+     * `liveReservation` treats a reservation id as one use for the owner run's lifetime, and a commit or an
+     * abort spends it rather than returning it to the pool. The fold only asked whether a claim with that key
+     * was *currently* held, so an id whose claim a terminal record removed could be prepared again — and the
+     * transfer that followed then freed the bound file. The operation id here is fresh, so this is the
+     * reservation-id lifetime and nothing else.
+     */
+    async "a reservation id prepared again after its abort spent it"(domain) {
+      const bound = await realFile(join(domain.session, "reused-reservation-bound.jsonl"));
+      const scratch = await realFile(join(domain.session, "reused-reservation-scratch.jsonl"));
+      const moved = await realFile(join(domain.session, "reused-reservation-moved.jsonl"));
+      const host = await openOwner(domain);
+      await bind(host, bound, 1);
+      const spent = await admitting(host, { operation: "rename", generation: 1, target: scratch });
+      expect(spent).toMatchObject({ reservationId: expect.any(String) });
+      await host.reservations.abortReservation({ reservationId: spent.reservationId, reason: "this rename mutated nothing" });
+      await host.reservations.close();
+      const records = await journalRecords(domain.journalPath);
+      expect(records.map((record) => record.record)).toEqual(["prepared", "committed", "prepared", "aborted"]);
+      await appendRecord(domain, {
+        record: "prepared",
+        owner: host.owner,
+        operationId: `operation-${randomUUID()}`,
+        reservationId: spent.reservationId,
+        operation: "resume",
+        generation: 1,
+        requestedTarget: moved,
+        target: await claimIdentityOf(moved),
+        source: records[1].target,
+      });
+      await appendRecord(domain, { record: "transferred", owner: host.owner, reservationId: spent.reservationId, generation: 2, target: await claimIdentityOf(moved), released: records[1].target });
+      return { protected: bound, real: ["prepared", "committed", "prepared", "aborted", "prepared"] };
+    },
   };
 
   it("refuses every complete but impossible history, frees no claim, and admits nothing", async () => {
@@ -892,6 +987,47 @@ describe("durable replay of an impossible history", () => {
     expect(await next.reservations.reconcile({ canonicalFile: bound })).toMatchObject({ state: "released" });
     expect(await next.reservations.reconcile({ canonicalFile: moved })).toMatchObject({ state: "live" });
     expect(await admitting(next, { operation: "resume", generation: 1, target: bound })).toMatchObject({ reservationId: expect.any(String) });
+  });
+
+  /**
+   * An operation id and a reservation id are one use for **one owner run's** lifetime, not globally.
+   *
+   * `spentOperationIds` is seeded only from records of the same owner run and `claimKeyOf` keys a claim by
+   * `runId:reservationId`, so a second owner run reusing either string is ordinary. The uniqueness this fold
+   * enforces has to be scoped the same way, or two independent owners sharing a session directory would
+   * block each other over a string collision.
+   */
+  it("replays one owner run's operation and reservation ids reused by an independent owner run", async () => {
+    const domain = await sessionDirectory();
+    const first = await realFile(join(domain.session, "shared-ids-first.jsonl"));
+    const second = await realFile(join(domain.session, "shared-ids-second.jsonl"));
+    const one = await openOwner(domain);
+    const reservationId = await bind(one, first, 1);
+    await one.reservations.releaseCommitted({ reservationId, reason: "the first owner is done" });
+    await one.reservations.close();
+    const records = await journalRecords(domain.journalPath);
+    expect(records.map((record) => record.record)).toEqual(["prepared", "committed", "released"]);
+
+    // A different owner run, the same two id strings, its own file.
+    const other = ownerRun({ runId: `run-independent-${randomUUID()}` });
+    const identity = await claimIdentityOf(second);
+    await appendRecord(domain, {
+      record: "prepared",
+      owner: other,
+      operationId: records[0].operationId,
+      reservationId,
+      operation: "startup",
+      generation: 1,
+      requestedTarget: second,
+      target: identity,
+      source: null,
+    });
+    await appendRecord(domain, { record: "committed", owner: other, reservationId, generation: 1, binds: true, target: identity });
+
+    const next = await openOwner(domain);
+    expect(await next.reservations.reconcile({ canonicalFile: first })).toMatchObject({ state: "released" });
+    expect(await next.reservations.reconcile({ canonicalFile: second })).toMatchObject({ state: "live", owner: expect.objectContaining({ runId: other.runId }) });
+    expect(await admitting(next, { operation: "resume", generation: 1, target: second })).toMatchObject({ refused: true, code: "TARGET_HAS_LIVE_WRITER" });
   });
 });
 

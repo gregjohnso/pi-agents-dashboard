@@ -447,7 +447,17 @@ function claimKeyOf(record) {
  * exactly those preconditions: `aborted` only from `prepared`, `released` only from `committed`, and
  * `committed`/`transferred` only once. A `cleared` record has to name the exact reservation it clears, not
  * merely a file and an owner. A `transferred` record has to release this owner run's own bound claim,
- * which is the only identity `transfer` ever writes there.
+ * which is the only identity `transfer` ever writes there, and it has to **advance** the generation past
+ * that claim: `transfer` refuses a `nextGeneration` that does not, because a binding that did not move is
+ * not a rebind, and the release is the one thing a transfer does that frees a file. Advancing is not
+ * incrementing — Pi's binding supplier reports the generation, so any value above the bound claim's is
+ * legitimate and only equal or lower ones are impossible.
+ *
+ * Two of the live writers' predicates are deliberately **not** reproduced here, because replay cannot know
+ * them: `nextGeneration === currentGeneration()` asks what the owner's own binding supplier reported at the
+ * time, and a `cleared` record's `uncertain` verdict and absence proof came from the recorded host's process
+ * table at the moment of clearing. Inventing a retrospective answer for either would be a guess presented as
+ * evidence. `PREDICATES.md` beside this tree's correction evidence records the full comparison.
  *
  * Without those checks a complete, schema-valid record could still erase a claim it never had the right to
  * touch: an `aborted` appended after `committed` would free a file Pi may still be writing, which is the
@@ -516,6 +526,12 @@ function foldClaims(records) {
         const boundClaim = claims.find((held) => held.state === "committed" && held.binds && sameOwnerRun(held.owner, record.owner) && sameIdentity(held.target, record.released));
         if (boundClaim === undefined) {
           throw inconsistent(`transfers reservation ${record.reservationId} releasing ${record.released.canonicalFile}, which is not this owner run's bound claim`);
+        }
+        // The generation is what makes the release legitimate. `transfer` refuses a `nextGeneration` that
+        // does not advance past the claim it releases, so a record at or below that generation describes a
+        // rebind that never happened — and folding it would free the file the binding is still on.
+        if (record.generation <= boundClaim.generation) {
+          throw inconsistent(`transfers reservation ${record.reservationId} at generation ${record.generation}, which does not advance past the generation ${boundClaim.generation} of the bound claim it releases on ${record.released.canonicalFile}`);
         }
       }
       claims[at] = { ...claim, state: "committed", generation: record.generation, binds: record.record === "transferred" ? true : record.binds === true, target: record.target };

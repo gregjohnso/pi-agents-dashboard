@@ -52,6 +52,7 @@ EXIT_TIMEOUT = 3
 EXIT_SETUP = 4
 HELPER_PID_MARKER = "binder-pid "
 CLEANUP_DEADLINE_SECONDS = 10
+DRAIN_DEADLINE_SECONDS = 10
 
 alarm_fired = False
 
@@ -177,6 +178,90 @@ def kill_and_reap_owned(group_pid: int, reaped: dict, reap_ready, wake_read: int
     return account
 
 
+def drain_child_output(live_streams: dict, wake_read: int, reap_ready, reaped: dict) -> dict:
+    """Read the child pipes to EOF before the final record is written, bounded, and report what was achieved.
+
+    The ordering this fixes. The main loop stops when the wait statuses are accounted for, and SIGCHLD can be
+    selected before the last bytes a child wrote are read. Emitting the final record at that point publishes a
+    verdict over output that had not been read yet, so trailing diagnostics could be lost or race the verdict.
+    This phase runs after reaping and before the final record, so anything the children wrote is relayed first.
+
+    What counts as done is EOF on the two CHILD pipes only. The signal pipe is watched, but purely so a process
+    that dies during this phase is still reaped with a real wait status - its readability is never treated as
+    child output and never contributes to completion. `stdin` is not watched at all: the controller's channel is
+    not output, and waiting for its EOF would hang on a caller that simply has nothing more to say.
+
+    Bounded by the same alarm mechanism as everything else. If EOF does not arrive in time the phase says so
+    instead of claiming the output is complete.
+    """
+    global alarm_fired
+    account = {
+        "streamsToDrain": sorted(live_streams.values()),
+        "reachedEofOn": [],
+        "stillOpenAfterDrain": [],
+        "bytesDrained": 0,
+        "drainedToEof": False,
+        "drainTimedOut": False,
+        "reapedDuringDrain": [],
+        "uncertainty": [],
+    }
+    if not live_streams:
+        account["drainedToEof"] = True
+        return account
+
+    before = set(reaped)
+    alarm_fired = False
+    signal.alarm(DRAIN_DEADLINE_SECONDS)
+    selector = selectors.DefaultSelector()
+    remaining = dict(live_streams)
+    for descriptor in remaining:
+        selector.register(descriptor, selectors.EVENT_READ, "child")
+    selector.register(wake_read, selectors.EVENT_READ, "signal")
+    try:
+        while remaining and not alarm_fired:
+            try:
+                events = selector.select()
+            except InterruptedError:
+                continue
+            for key, _mask in events:
+                descriptor = key.fd
+                if key.data == "signal":
+                    try:
+                        os.read(descriptor, 4096)
+                    except (BlockingIOError, OSError):
+                        pass
+                    # Reaped here so a late death still yields a real status; never a completion condition.
+                    reap_ready()
+                    continue
+                try:
+                    data = os.read(descriptor, 65536)
+                except BlockingIOError:
+                    continue
+                if not data:
+                    account["reachedEofOn"].append(remaining[descriptor])
+                    selector.unregister(descriptor)
+                    del remaining[descriptor]
+                    continue
+                account["bytesDrained"] += len(data)
+                sys.stdout.write(data.decode("utf-8", "replace"))
+                sys.stdout.flush()
+    finally:
+        signal.alarm(0)
+        selector.close()
+
+    account["reachedEofOn"] = sorted(account["reachedEofOn"])
+    account["stillOpenAfterDrain"] = sorted(remaining.values())
+    account["drainedToEof"] = not remaining
+    account["drainTimedOut"] = bool(remaining)
+    account["reapedDuringDrain"] = [reaped[pid] for pid in sorted(set(reaped) - before)]
+    if remaining:
+        account["uncertainty"] = [
+            "the drain deadline passed with " + ", ".join(sorted(remaining.values())) + " still open, so the "
+            "relayed output is NOT known to be complete and anything written after this point is lost",
+        ]
+    return account
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--node", required=True)
@@ -215,6 +300,7 @@ def main() -> int:
 
     selector = selectors.DefaultSelector()
     streams = {out_read: "stdout", err_read: "stderr"}
+    live_streams = dict(streams)
     for descriptor, name in ((out_read, "stdout"), (err_read, "stderr"), (wake_read, "signal"), (0, "stdin")):
         os.set_blocking(descriptor, False)
         selector.register(descriptor, selectors.EVENT_READ, name)
@@ -291,6 +377,7 @@ def main() -> int:
             if not data:
                 selector.unregister(descriptor)
                 open_streams.discard(streams[descriptor])
+                live_streams.pop(descriptor, None)
                 continue
             text = data.decode("utf-8", "replace")
             relayed += text
@@ -323,10 +410,17 @@ def main() -> int:
         "streamsStillOpenAtMainLoopEnd": sorted(open_streams),
         "timedOut": not accounted_for(),
     }
-    if not accounted_for():
+    timed_out = not accounted_for()
+    if timed_out:
         summary["cleanup"] = kill_and_reap_owned(parent_pid, reaped, reap_ready, wake_read)
-        summary["reapedPids"] = sorted(reaped)
-        summary["reaped"] = {str(pid): record for pid, record in reaped.items()}
+
+    # After reaping, before the verdict: everything the children wrote is relayed first.
+    summary["drain"] = drain_child_output(live_streams, wake_read, reap_ready, reaped)
+    summary["reapedPids"] = sorted(reaped)
+    summary["reaped"] = {str(pid): record for pid, record in reaped.items()}
+    summary["streamsStillOpenAfterDrain"] = summary["drain"]["stillOpenAfterDrain"]
+
+    if timed_out:
         emit(f"OBSERVER-TIMEOUT {json.dumps(summary)}")
         return EXIT_TIMEOUT
     emit(f"OBSERVER-DONE {json.dumps(summary)}")

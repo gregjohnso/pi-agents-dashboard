@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 
 import { afterEach, expect, it } from "vitest";
 
+import { TRAILING_MARKER } from "../test/fixtures/native-sideband/trailing-output-marker.mjs";
+
 import { BINDER_EXIT, SIDEBAND_BINDER_PROTOCOL, runBinder } from "./native-sideband-binder.mjs";
 
 import {
@@ -1466,8 +1468,15 @@ async function observedParentLoss(childScript, socketPath, options = /** @type {
   observer.once("exit", (code, signal) => {
     exitStatus = { code, signal };
   });
+  /** Did the final record's text arrive before the wrapper closed? The whole point of awaiting completion. */
+  let finalRecordSeenBeforeClose = false;
+  let closed = false;
   const completion = new Promise((resolve) => {
-    observer.once("close", () => resolve(undefined));
+    observer.once("close", () => {
+      finalRecordSeenBeforeClose = /OBSERVER-(DONE|TIMEOUT) /u.test(text);
+      closed = true;
+      resolve(undefined);
+    });
     observer.once("error", (error) => {
       spawnError = error;
       // `close` follows an `error` in Node, but resolving here too means a platform that does not emit it cannot
@@ -1552,30 +1561,52 @@ async function observedParentLoss(childScript, socketPath, options = /** @type {
     observerExited,
     completion,
     cleanupActions: () => [...cleanupActions],
+    /** Has this wrapper finished? Read synchronously, so a case can show the record text arrived first. */
+    hasClosed: () => closed,
     /** Run only this harness's cleanup, leaving the socket root and anything else alone. */
     runCleanup: () => runCleanupNow(cleanupEntry),
     spawnError: () => spawnError,
     text: () => text,
     /** Ask the observer to SIGKILL the one child it started. The test never signals that pid itself. */
     killTheParent: () => observer.stdin.end("kill\n"),
+    /**
+     * Wait until this wrapper is finished before any final evidence is read.
+     *
+     * `waitFor` resolves the moment a pattern appears, which is right for live readiness - the controller has to
+     * be able to drive the scenario while the observer is still running. It is wrong for a verdict: the final
+     * record's text can be in this buffer while the observer is still writing, so parsing then evaluates evidence
+     * over output that has not arrived. Completion is `close`, which means the process ended AND its pipes are
+     * finished, so everything it ever wrote is in `text` by the time anything below looks at it.
+     */
+    async finishedWriting() {
+      await waitFor(/OBSERVER-(DONE|TIMEOUT) /u);
+      await completion;
+      if (spawnError !== undefined) throw new Error(`the observer could not be started: ${spawnError.message}`);
+      return { finalRecordSeenBeforeClose, closed };
+    },
+
     /** The observer's own timeout record, including what its bounded cleanup phase actually achieved. */
     async timedOut() {
-      await waitFor(/OBSERVER-(DONE|TIMEOUT) /u);
+      const ordering = await this.finishedWriting();
       const record = /OBSERVER-TIMEOUT (\{.*\})/u.exec(text);
       if (record === null) throw new Error(`the observer did not time out: ${text.slice(-2_000)}`);
       const summary = JSON.parse(record[1]);
       if (summary.cleanup === undefined) throw new Error(`the timeout record carries no cleanup account: ${record[1]}`);
-      return { summary, cleanup: summary.cleanup };
+      if (summary.drain === undefined) throw new Error(`the timeout record carries no drain account: ${record[1]}`);
+      return { summary, cleanup: summary.cleanup, drain: summary.drain, ordering };
     },
 
-    /** The observer's own summary, once it has reaped both processes. @returns {Promise<any>} */
+    /** The observer's own summary, once it has reaped both processes AND finished writing. @returns {Promise<any>} */
     async reaped() {
-      await waitFor(/OBSERVER-(DONE|TIMEOUT) /u);
+      const ordering = await this.finishedWriting();
       const done = /OBSERVER-DONE (\{.*\})/u.exec(text);
       if (done === null) throw new Error(`the observer did not finish reaping: ${text.slice(-2_000)}`);
       const summary = JSON.parse(done[1]);
+      if (summary.drain === undefined) throw new Error(`the final record carries no drain account: ${done[1]}`);
       return {
         summary,
+        drain: summary.drain,
+        ordering,
         /** The observer's own lines, verbatim, so a reader need not trust this file's paraphrase of them. */
         verbatim: [...text.matchAll(/OBSERVER-(?:REAPED|DONE) \{.*\}/gu)].map((match) => match[0]),
         parent: summary.reaped[String(parentPid)],
@@ -1829,6 +1860,117 @@ it("asks the owning observer to clean up instead of signalling numbers, when it 
     })),
     noChildrenRemaining: timeout.cleanup.noChildrenRemaining,
     uncertainty: timeout.cleanup.uncertainty,
+  })}`);
+});
+
+
+// Operator-visible failure: the observer's main loop stops the moment the wait statuses are accounted for, and
+// SIGCHLD can be selected before the last bytes a child wrote have been read. Emitting the verdict there publishes
+// it over output nobody has read, and the summary could only describe the streams as still open at that point.
+//
+// This scenario puts real trailing output in exactly that window. A grandchild inherits the same stdout and stderr
+// and writes its marker when the helper - its own parent - exits, so the bytes exist after the statuses are
+// complete and EOF cannot arrive until the grandchild closes them. Nothing is timed: the write is keyed to a
+// process event, and the ordering assertion is on positions in the relayed stream rather than on a clock.
+it("drains trailing child output to EOF before it publishes the final record", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "o");
+  const observed = await observedParentLoss(fileURLToPath(fixture("held-handoff-binder-with-trailer.mjs")), socketPath);
+
+  // The precondition: a third process really does hold these pipes, so their EOF is not the helper's to give.
+  await observed.waitFor(/held-handoff-binder: forked a trailing-output grandchild \d+/u);
+
+  observed.killTheParent();
+  const { summary, drain, ordering, helper, parent } = await observed.reaped();
+
+  // The statuses are real and complete - this is the success path, not a timeout.
+  expect(summary.endedBecause).toBe("accounted-for");
+  expect(summary.timedOut).toBe(false);
+  expect(helper).toMatchObject({ role: "helper", exitedNormally: true });
+  expect(helper.exitCode).toBe(BINDER_EXIT.parentGone);
+  expect(parent).toMatchObject({ role: "disposable-parent", termSignalName: "SIGKILL" });
+
+  // EOF on both CHILD pipes was observed before the verdict. The old record could not say this at all.
+  expect(drain.streamsToDrain).toEqual(["stderr", "stdout"]);
+  expect(drain.reachedEofOn).toEqual(["stderr", "stdout"]);
+  expect(drain.drainedToEof).toBe(true);
+  expect(drain.drainTimedOut).toBe(false);
+  expect(drain.stillOpenAfterDrain).toEqual([]);
+  expect(drain.uncertainty).toEqual([]);
+  expect(summary.streamsStillOpenAfterDrain).toEqual([]);
+
+  // The ordering that matters: the trailing bytes are in the relayed stream BEFORE the final record.
+  const trailing = observed.text().indexOf(TRAILING_MARKER);
+  const verdict = observed.text().indexOf("OBSERVER-DONE ");
+  expect(trailing).toBeGreaterThanOrEqual(0);
+  expect(verdict).toBeGreaterThanOrEqual(0);
+  expect(trailing).toBeLessThan(verdict);
+
+  // And the final evidence was read only after this wrapper finished, not when its text first appeared.
+  expect(ordering.finalRecordSeenBeforeClose).toBe(true);
+  expect(ordering.closed).toBe(true);
+
+  console.log(`OBSERVER-DRAIN-ORDERING ${JSON.stringify({
+    observerPid: observed.observerPid,
+    disposableParentPid: observed.parentPid,
+    helperPid: observed.helperPid,
+    endedBecause: summary.endedBecause,
+    helperExitCode: helper.exitCode,
+    helperRawWaitStatus: helper.rawWaitStatus,
+    drain: {
+      streamsToDrain: drain.streamsToDrain,
+      reachedEofOn: drain.reachedEofOn,
+      drainedToEof: drain.drainedToEof,
+      drainTimedOut: drain.drainTimedOut,
+      bytesDrained: drain.bytesDrained,
+      stillOpenAfterDrain: drain.stillOpenAfterDrain,
+      reapedDuringDrain: drain.reapedDuringDrain.map((/** @type {any} */ entry) => ({
+        pid: entry.pid, role: entry.role, rawWaitStatus: entry.rawWaitStatus, exitCode: entry.exitCode,
+      })),
+      uncertainty: drain.uncertainty,
+    },
+    trailingMarkerIndex: trailing,
+    finalRecordIndex: verdict,
+    trailingOutputPrecededTheVerdict: trailing < verdict,
+    finalRecordSeenBeforeClose: ordering.finalRecordSeenBeforeClose,
+  })}`);
+});
+
+// Operator-visible failure: the final record's text lands in the captured buffer while the observer is still
+// finishing. A helper that returned on that text alone evaluated a verdict before the wrapper was done, which is
+// the exit-versus-data race in its plainest form. This pins that the text really does appear first - so the race
+// was reachable - and that the evidence helper nonetheless waited for completion.
+it("waits for the wrapper to close before reading final evidence, though the record text appears first", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "o");
+  const observed = await observedParentLoss(fileURLToPath(fixture("held-handoff-binder.mjs")), socketPath);
+
+  // Live readiness still works while the observer is running: the controller has to be able to drive this.
+  expect(observed.text()).toMatch(/held-handoff-binder: handoff written and held/u);
+  observed.killTheParent();
+
+  // The record's text is observable before the wrapper closes - this is the window the old helpers returned in.
+  await observed.waitFor(/OBSERVER-DONE /u);
+  const sawRecordWhileRunning = /OBSERVER-DONE /u.test(observed.text());
+  const closedWhenRecordSeen = observed.hasClosed();
+
+  const { ordering, drain } = await observed.reaped();
+
+  expect(sawRecordWhileRunning).toBe(true);
+  expect(closedWhenRecordSeen).toBe(false);
+  // After the evidence helper, the wrapper is finished and the drain account exists.
+  expect(ordering.closed).toBe(true);
+  expect(ordering.finalRecordSeenBeforeClose).toBe(true);
+  expect(drain.drainedToEof).toBe(true);
+  expect(observed.hasClosed()).toBe(true);
+
+  console.log(`FINAL-EVIDENCE-AFTER-CLOSE ${JSON.stringify({
+    observerPid: observed.observerPid,
+    recordTextVisibleBeforeClose: sawRecordWhileRunning,
+    wrapperClosedWhenRecordFirstSeen: closedWhenRecordSeen,
+    wrapperClosedWhenEvidenceRead: ordering.closed,
+    drainedToEof: drain.drainedToEof,
+    reachedEofOn: drain.reachedEofOn,
   })}`);
 });
 

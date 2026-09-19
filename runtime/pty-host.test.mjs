@@ -1289,10 +1289,12 @@ it("clears resync only after a matching control result and the matching observed
   created.broadcastOwnerOutput(bytes("FRESH-FRAME"));
   created.broadcastOwnerOutput(bytes(markers.encodeNativePresentEnd(token, identity)));
   expect(created.recoveryState()).toMatchObject({ observedEnd: true, acknowledgeable: true, freshBytes: 11 });
-  // The fresh frame reached the recovering client's own terminal and nobody else's, and the markers themselves
-  // are never forwarded.
+  // The fresh frame reached the recovering client's own terminal through the authorized route, and the same
+  // bytes still reached the live member as ordinary owner output, exactly once and without any marker byte.
   expect(client.acceptedText().endsWith("FRESH-FRAME")).toBe(true);
-  expect(live.client.text()).not.toContain("FRESH-FRAME");
+  expect(live.client.text().endsWith("FRESH-FRAME")).toBe(true);
+  expect(live.client.text().match(/FRESH-FRAME/gu)).toHaveLength(1);
+  expect(live.client.text()).not.toContain("pi-native-present");
   expect(client.acceptedText()).not.toContain("pi-native-present");
   // Still nothing is live before the client acknowledges.
   expect(created.attachments().find((entry) => entry.attachmentId === "recovering")).toMatchObject({ state: "resync-required" });
@@ -1441,7 +1443,9 @@ it("hands a fresh frame to one client in bounded chunks, and keeps marker-like t
   const identity = frameId();
   const channel = await openChannel({ protocol: 2, answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }) });
   const { host: created } = consumerHost({ channel: channel.channel, presentMarkers: markers });
-  const client = terminalOutputClient({ highWaterMark: 16, stall: true });
+  // A client that really can take a chunk of the declared maximum: the bound is about a queue that stays full,
+  // and this one drains as it goes.
+  const client = terminalOutputClient({ highWaterMark: markers.NATIVE_PRESENT_FRESH_CHUNK_MAX * 2, stall: true });
   const slow = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: client.sink, declared: { capabilities: { ...CAPABILITIES } } }));
   const live = attach(created, "live");
   created.broadcastOwnerOutput(bytes("x".repeat(2048)));
@@ -1465,13 +1469,15 @@ it("hands a fresh frame to one client in bounded chunks, and keeps marker-like t
   expect(state.freshChunks).toBe(Math.ceil(frame.length / markers.NATIVE_PRESENT_FRESH_CHUNK_MAX));
   expect(client.acceptedBytes() - acceptedBeforeFrame).toBe(frame.length);
   expect(created.acknowledgePresentation(slow.epoch, nonce)).toEqual({ cleared: true, reason: null });
-  // The live member saw none of the fresh frame and no marker bytes at all.
-  expect(live.client.text()).toBe(liveBefore);
+  // The live member received the interval's own bytes once, as owner output, and no marker byte at all.
+  expect(live.client.text().slice(liveBefore.length)).toBe(frame);
+  expect(live.client.text()).not.toContain("pi-native-present");
 
   // Marker-like terminal text that is not this attempt's framing is ordinary output, byte for byte.
+  const liveAfterFrame = live.client.text();
   const impostor = `${markers.encodeNativePresentBegin(markers.mintNativePresentToken())}plain`;
   created.broadcastOwnerOutput(bytes(impostor));
-  expect(live.client.text()).toBe(`${liveBefore}${impostor}`);
+  expect(live.client.text()).toBe(`${liveAfterFrame}${impostor}`);
 });
 
 it("refuses an acknowledgement whose nonce is not the one this attempt recorded", async () => {
@@ -1504,4 +1510,521 @@ it("refuses an ordered presentation for a frame receipt built at another geometr
   expect(await created.presentOrderedTo(slow.epoch)).toMatchObject({ presented: true, stale: true, recoveryArmed: false });
   expect(created.recoveryState()).toBe(null);
   expect(created.acknowledgePresentation(slow.epoch, "presentation-nonce-8")).toMatchObject({ cleared: false, reason: "no-armed-recovery" });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// Corrections to the consumer increment, each written against the root cause the review named.
+//
+// Root causes, in source terms at ec0608d4ec2a91f880b41ffa5caf94ba76bbca0b:
+//   1. geometry is compared once, inside completeRecoveryIfProved, and `resize` moves the revision without
+//      touching the armed attempt, so an attempt proved at revision N stays acknowledgeable at N+1.
+//   2. missingCapabilities asks whether a registry object was injected, never what that registry currently
+//      publishes, and capabilityReport samples the snapshot a second time, so one report can contradict itself.
+//   3. streamFresh ignores both the write's return and queuedBytes, so a stalled transport buffers the whole
+//      frame however large the queued byte cap is.
+//   4. the failed-END cases never put an END on the byte route before the control half failed.
+//   5. the success check binds result.ordering.token and markerCodec, not result.ordering.version.
+//   6. the armed read's open branch calls only streamFresh, so no interval byte ever reaches the attachment
+//      set: every other live member loses the frame body and anything interleaved with it.
+//   7. streamFresh captures the sink and the attempt once and then loops through external writes, so a
+//      synchronous detach, replacement or retirement from inside a write can be followed by more chunks.
+// ---------------------------------------------------------------------------------------------------------
+
+/** One armed attempt on a resync-required member, with the control half answered by `answer`. */
+async function armedAttempt({ answer, client, geometry: geometryRequest, release = true } = /** @type {any} */ ({})) {
+  const channel = await openChannel({ protocol: 2, answer });
+  const { owner, host: created } = consumerHost({ channel: channel.channel, presentMarkers: markers });
+  const target = client ?? terminalOutputClient({ stall: true });
+  const member = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: target.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  created.broadcastOwnerOutput(bytes("x".repeat(2048)));
+  if (release) target.releaseWrites();
+  expect(created.attachments().find((entry) => entry.attachmentId === "recovering")).toMatchObject({ state: "resync-required" });
+  if (geometryRequest !== undefined) created.resize({ ...geometryRequest, from: member.epoch });
+  return { channel, created, owner, target, member };
+}
+
+it("retires a proved attempt when the geometry really moves before the acknowledgement arrives", async () => {
+  if (!withCohort) return;
+  const nonce = "geometry-nonce-1";
+  const identity = frameId();
+  const { channel, created, target, member } = await armedAttempt({ answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }) });
+  const armed = /** @type {any} */ (await created.presentOrderedTo(member.epoch));
+  const token = armed.ordering.token;
+  created.broadcastOwnerOutput(bytes(`${markers.encodeNativePresentBegin(token)}FRESH${markers.encodeNativePresentEnd(token, identity)}`));
+  expect(created.recoveryState()).toMatchObject({ acknowledgeable: true });
+
+  // A resize to the size already set changes nothing and advances no revision, so it retires nothing.
+  expect(created.resize({ cols: 100, rows: 30, from: member.epoch })).toMatchObject({ changed: false, revision: 1 });
+  expect(created.recoveryState()).toMatchObject({ acknowledgeable: true });
+
+  // A real resize invalidates the frame that was painted at the previous size.
+  expect(created.resize({ cols: 120, rows: 40, from: member.epoch })).toMatchObject({ changed: true, revision: 2 });
+  expect(created.recoveryState()).toBe(null);
+  expect(created.acknowledgePresentation(member.epoch, nonce)).toMatchObject({ cleared: false });
+  expect(created.attachments()[0]).toMatchObject({ state: "resync-required" });
+  expect(created.recoveryCounts()).toMatchObject({ cleared: 0 });
+  expect(channel.commands).toHaveLength(1);
+  expect(target.acceptedText()).toContain("FRESH");
+});
+
+it("refuses to prove an attempt whose geometry moved while the control half was still outstanding", async () => {
+  if (!withCohort) return;
+  const nonce = "geometry-nonce-2";
+  const identity = frameId();
+  /** @type {(() => void)[]} */
+  const held = [];
+  const { channel, created, member } = await armedAttempt({
+    answer: (/** @type {any} */ command) => new Promise((resolve) => held.push(() => resolve(orderedResult(command, { frameId: identity, nonce })))),
+  });
+  const commandArrived = channel.nextCommand();
+  const pending = created.presentOrderedTo(member.epoch);
+  const token = /** @type {any} */ (created.recoveryState()).token;
+  await commandArrived;
+  created.broadcastOwnerOutput(bytes(`${markers.encodeNativePresentBegin(token)}FRESH${markers.encodeNativePresentEnd(token, identity)}`));
+  expect(created.recoveryState()).toMatchObject({ observedEnd: true, controlResult: false });
+
+  // The owner is resized before the control result lands. That frame is for the old size.
+  created.resize({ cols: 120, rows: 40, from: member.epoch });
+  for (const release of held.splice(0)) release();
+  await pending;
+  expect(created.recoveryState()).toBe(null);
+  expect(created.acknowledgePresentation(member.epoch, nonce)).toMatchObject({ cleared: false });
+  expect(created.attachments()[0]).toMatchObject({ state: "resync-required" });
+});
+
+it("reports attachment unavailable from the current publication, not from the presence of a registry", async () => {
+  if (!withCohort) return;
+  const channel = await openChannel({ protocol: 2 });
+  const published = publishedInputTargetRegistry();
+  const { owner, host: created } = consumerHost({ registry: published.registry, channel: channel.channel, presentMarkers: markers });
+
+  // Ordered framing is active, so the delivery boundary is not missing; the ingress route still has no producer.
+  const absent = created.capabilityReport();
+  expect(absent.orderedPresentation).toMatchObject({ active: true });
+  expect(absent.inputTarget).toMatchObject({ available: false, reason: "producer-absent", producerVersion: null });
+  expect(absent.missing).toContain(MISSING_HOST_CAPABILITIES.labelledIngress);
+  expect(created.ownerAttachmentUnavailable()).toBe(true);
+  // One report is one sample: its own halves cannot disagree.
+  expect(absent.missing.includes(MISSING_HOST_CAPABILITIES.labelledIngress)).toBe(!absent.inputTarget.available);
+  // The owner is alive through all of it, and a conforming client is still admitted and still typed at.
+  expect(owner.closeCount()).toBe(0);
+  const a = attach(created, "a");
+  expect(a.result.epoch).toEqual({ attachmentId: "a", epoch: 1 });
+
+  published.mountProducer();
+  const live = created.capabilityReport();
+  expect(live.inputTarget).toMatchObject({ available: true, reason: null, producerVersion: 1 });
+  expect(live.missing).not.toContain(MISSING_HOST_CAPABILITIES.labelledIngress);
+  expect(created.ownerAttachmentUnavailable()).toBe(false);
+
+  // Every published unavailable state, while protocol 2 stays active.
+  published.revoke();
+  expect(created.capabilityReport().inputTarget).toMatchObject({ available: false, reason: "revoked" });
+  expect(created.ownerAttachmentUnavailable()).toBe(true);
+
+  published.mountProducer();
+  const registration = published.registerHost();
+  expect(created.ownerAttachmentUnavailable()).toBe(false);
+  published.replaceHost();
+  expect(created.capabilityReport().inputTarget).toMatchObject({ available: false, reason: "host-replaced" });
+  expect(created.ownerAttachmentUnavailable()).toBe(true);
+  const second = published.registerHost();
+  expect(created.ownerAttachmentUnavailable()).toBe(false);
+  second.release();
+  expect(created.capabilityReport().inputTarget).toMatchObject({ available: false, reason: "host-released" });
+  expect(created.ownerAttachmentUnavailable()).toBe(true);
+  registration.release();
+
+  // An uninterpretable registry state stays refused rather than reset or downgraded to "no target".
+  const unsupported = publishedInputTargetRegistry({ unsupportedState: true });
+  const { host: failClosed } = consumerHost({ registry: unsupported.registry, channel: channel.channel, presentMarkers: markers });
+  expect(failClosed.capabilityReport().inputTarget).toMatchObject({ available: false, reason: "registry-unsupported" });
+  expect(failClosed.capabilityReport().missing).toContain(MISSING_HOST_CAPABILITIES.labelledIngress);
+  expect(failClosed.ownerAttachmentUnavailable()).toBe(true);
+});
+
+it("stops the fresh route at the queued byte cap instead of buffering the whole frame into a stalled client", async () => {
+  if (!withCohort) return;
+  const nonce = "bounded-nonce-1";
+  const identity = frameId();
+  // This client never finishes writing, for the whole fresh frame: its queue only grows.
+  const target = terminalOutputClient({ highWaterMark: 16, stall: true });
+  const { created, member } = await armedAttempt({ answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }), client: target, release: false });
+  const armed = /** @type {any} */ (await created.presentOrderedTo(member.epoch));
+  const token = armed.ordering.token;
+  created.broadcastOwnerOutput(bytes(markers.encodeNativePresentBegin(token)));
+
+  const frame = "F".repeat(markers.NATIVE_PRESENT_FRESH_CHUNK_MAX * 3);
+  created.broadcastOwnerOutput(bytes(frame));
+  // The cap is 1024 bytes of queue, so one 16384-byte chunk already passes it: the route stops there and the
+  // attempt is retired by the bound rather than by a mislabelled "detached attachment".
+  expect(created.recoveryState()).toBe(null);
+  expect(created.recoveryCounts()).toMatchObject({ retiredBackpressure: 1 });
+  const writesAfterStop = target.sinkWrites();
+  expect(writesAfterStop).toBeLessThanOrEqual(2);
+
+  // No further fresh chunk is written after the policy stopped the attempt, and the END cannot revive it.
+  created.broadcastOwnerOutput(bytes(`${frame}${markers.encodeNativePresentEnd(token, identity)}`));
+  expect(target.sinkWrites()).toBe(writesAfterStop);
+  expect(created.acknowledgePresentation(member.epoch, nonce)).toMatchObject({ cleared: false, reason: "no-armed-recovery" });
+  // The slow member is neither evicted nor disabled: it is still a member and still input-eligible.
+  expect(created.attachments()[0]).toMatchObject({ attachmentId: "recovering", state: "resync-required", inputEligible: true });
+  target.releaseWrites();
+});
+
+it("treats a throwing fresh write as unknown acceptance, never retries it, and keeps the accepted prefix", async () => {
+  if (!withCohort) return;
+  const identity = frameId();
+  for (const admitBeforeThrow of [0, 7, markers.NATIVE_PRESENT_FRESH_CHUNK_MAX]) {
+    const nonce = `uncertain-nonce-${admitBeforeThrow}`;
+    // The only shape a channel with no accepted-byte count can present: a chosen prefix, then a throw.
+    const target = terminalOutputClient({ throwAt: 1, admitBeforeThrow, stall: true });
+    const { created, member } = await armedAttempt({ answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }), client: target });
+    const armed = /** @type {any} */ (await created.presentOrderedTo(member.epoch));
+    const token = armed.ordering.token;
+    target.armFault();
+    const acceptedBeforeFrame = target.acceptedBytes();
+    const frame = "U".repeat(markers.NATIVE_PRESENT_FRESH_CHUNK_MAX + 64);
+    created.broadcastOwnerOutput(bytes(`${markers.encodeNativePresentBegin(token)}${frame}${markers.encodeNativePresentEnd(token, identity)}`));
+
+    expect(created.recoveryState()).toBe(null);
+    expect(created.recoveryCounts()).toMatchObject({ retiredUncertain: 1 });
+    // Exactly one attempt at that chunk, and nothing after it: a write that threw says nothing about what it took.
+    expect(target.freshWrites()).toBe(1);
+    expect(target.acceptedBytes() - acceptedBeforeFrame).toBe(admitBeforeThrow);
+    expect(created.acknowledgePresentation(member.epoch, nonce)).toMatchObject({ cleared: false, reason: "no-armed-recovery" });
+    expect(created.attachments()[0]).toMatchObject({ state: "resync-required" });
+  }
+});
+
+it("cannot clear an old nonce when a complete END was observed before the control half failed or was lost", async () => {
+  if (!withCohort) return;
+  const identity = frameId();
+  const nonce = "observed-end-nonce-1";
+  /** @type {((frame: any) => void)[]} */
+  const held = [];
+  const negative = await openChannel({
+    protocol: 2,
+    answer: (/** @type {any} */ command) =>
+      new Promise((resolve) =>
+        held.push(() =>
+          resolve({
+            type: "presentation-result",
+            protocol: 2,
+            requestId: command.requestId,
+            ordering: { version: 1, token: command.ordering.token },
+            result: { presented: false, terminalOwner: "pi", presentationNonce: null, refusal: "no-complete-frame-support", childAcknowledgement: "not-applicable" },
+          }),
+        ),
+      ),
+  });
+  const { host: created } = consumerHost({ channel: negative.channel, presentMarkers: markers });
+  const target = terminalOutputClient({ stall: true });
+  const member = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: target.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  created.broadcastOwnerOutput(bytes("x".repeat(2048)));
+  target.releaseWrites();
+  const commandArrived = negative.nextCommand();
+  const pending = created.presentOrderedTo(member.epoch);
+  const token = /** @type {any} */ (created.recoveryState()).token;
+  await commandArrived;
+
+  // The whole frame, END included, is really on the byte route before the control half answers.
+  created.broadcastOwnerOutput(bytes(`${markers.encodeNativePresentBegin(token)}WHOLE-FRAME${markers.encodeNativePresentEnd(token, identity)}`));
+  expect(created.recoveryState()).toMatchObject({ observedBegin: true, observedEnd: true, controlResult: false });
+  expect(target.acceptedText()).toContain("WHOLE-FRAME");
+
+  for (const release of held.splice(0)) release(undefined);
+  expect(await pending).toMatchObject({ presented: false, refusal: "no-complete-frame-support" });
+  expect(created.recoveryState()).toBe(null);
+  expect(created.acknowledgePresentation(member.epoch, nonce)).toMatchObject({ cleared: false });
+  expect(created.attachments()[0]).toMatchObject({ state: "resync-required" });
+
+  // The same, with the control channel lost after the END was observed.
+  const lost = await openChannel({ protocol: 2, answer: () => undefined });
+  const { host: lostHost } = consumerHost({ channel: lost.channel, presentMarkers: markers });
+  const lostTarget = terminalOutputClient({ stall: true });
+  const lostMember = /** @type {{ attached: true, epoch: any }} */ (lostHost.attach({ attachmentId: "recovering", sink: lostTarget.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  lostHost.broadcastOwnerOutput(bytes("x".repeat(2048)));
+  lostTarget.releaseWrites();
+  const lostArrived = lost.nextCommand();
+  const lostPending = lostHost.presentOrderedTo(lostMember.epoch);
+  const lostToken = /** @type {any} */ (lostHost.recoveryState()).token;
+  await lostArrived;
+  lostHost.broadcastOwnerOutput(bytes(`${markers.encodeNativePresentBegin(lostToken)}WHOLE${markers.encodeNativePresentEnd(lostToken, identity)}`));
+  expect(lostHost.recoveryState()).toMatchObject({ observedEnd: true, controlResult: false });
+  lost.loseTransport();
+  expect(await lostPending).toMatchObject({ presented: false });
+  expect(lostHost.recoveryState()).toBe(null);
+  expect(lostHost.acknowledgePresentation(lostMember.epoch, "whatever")).toMatchObject({ cleared: false });
+  expect(lostHost.attachments()[0]).toMatchObject({ state: "resync-required" });
+});
+
+it("handles a partial END and its cleanup write at zero, partial and full admission", async () => {
+  if (!withCohort) return;
+  const identity = frameId();
+  for (const [label, cleanupAdmitted] of /** @type {[string, number][]} */ ([["zero", 0], ["partial", 2], ["full", -1]])) {
+    const nonce = `cleanup-nonce-${label}`;
+    /** @type {((frame: any) => void)[]} */
+    const held = [];
+    const channel = await openChannel({
+      protocol: 2,
+      answer: (/** @type {any} */ command) =>
+        new Promise((resolve) =>
+          held.push(() =>
+            resolve({
+              type: "presentation-result",
+              protocol: 2,
+              requestId: command.requestId,
+              ordering: { version: 1, token: command.ordering.token },
+              result: { presented: false, terminalOwner: "pi", presentationNonce: null, refusal: "no-complete-frame-support", childAcknowledgement: "not-applicable" },
+            }),
+          ),
+        ),
+    });
+    const { host: created } = consumerHost({ channel: channel.channel, presentMarkers: markers });
+    const target = terminalOutputClient({ stall: true });
+    const member = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: target.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+    created.broadcastOwnerOutput(bytes("x".repeat(2048)));
+    target.releaseWrites();
+    const arrived = channel.nextCommand();
+    const pending = created.presentOrderedTo(member.epoch);
+    const token = /** @type {any} */ (created.recoveryState()).token;
+    await arrived;
+
+    // BEGIN, body, and an END whose string terminator never arrived: the failing write took a prefix only.
+    const end = markers.encodeNativePresentEnd(token, identity);
+    created.broadcastOwnerOutput(bytes(`${markers.encodeNativePresentBegin(token)}BODY${end.slice(0, end.length - 2)}`));
+    expect(created.recoveryState()).toMatchObject({ observedBegin: true, observedEnd: false });
+
+    // The failed attempt's one cleanup write: a string terminator, then that token's ABORT. Its own admission
+    // is unknown, so zero, a prefix and the whole of it are all real streams.
+    const cleanup = `\u001b\\${markers.encodeNativePresentAbort(token)}`;
+    const admitted = cleanupAdmitted < 0 ? cleanup : cleanup.slice(0, cleanupAdmitted);
+    if (admitted.length > 0) created.broadcastOwnerOutput(bytes(admitted));
+
+    if (cleanupAdmitted === 0) {
+      // Nothing closed the candidate: no END was ever observed, so there is nothing to acknowledge.
+      expect(created.recoveryState()).toMatchObject({ observedEnd: false, acknowledgeable: false });
+    } else {
+      // The cleanup's leading terminator completed the truncated END, which is exactly why an observed END is
+      // not success on its own.
+      expect(created.recoveryState() === null || /** @type {any} */ (created.recoveryState()).observedEnd).toBeTruthy();
+    }
+    for (const release of held.splice(0)) release(undefined);
+    expect(await pending).toMatchObject({ presented: false });
+    expect(created.recoveryState()).toBe(null);
+    expect(created.acknowledgePresentation(member.epoch, nonce)).toMatchObject({ cleared: false });
+    expect(created.attachments()[0]).toMatchObject({ state: "resync-required" });
+  }
+});
+
+it("refuses a successful result whose inner ordering version is missing or not the one it was asked for", async () => {
+  if (!withCohort) return;
+  const identity = frameId();
+  for (const innerVersion of [undefined, 2]) {
+    const nonce = `inner-version-nonce-${String(innerVersion)}`;
+    /** @type {((frame: any) => void)[]} */
+    const held = [];
+    const channel = await openChannel({
+      protocol: 2,
+      answer: (/** @type {any} */ command) =>
+        new Promise((resolve) =>
+          held.push(() => {
+            const frame = orderedResult(command, { frameId: identity, nonce });
+            frame.result.ordering = /** @type {any} */ (
+              innerVersion === undefined
+                ? { token: command.ordering.token, markerCodec: markers.NATIVE_PRESENT_MARKER_CODEC }
+                : { version: innerVersion, token: command.ordering.token, markerCodec: markers.NATIVE_PRESENT_MARKER_CODEC }
+            );
+            resolve(frame);
+          }),
+        ),
+    });
+    const { host: created } = consumerHost({ channel: channel.channel, presentMarkers: markers });
+    const target = terminalOutputClient({ stall: true });
+    const member = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: target.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+    created.broadcastOwnerOutput(bytes("x".repeat(2048)));
+    target.releaseWrites();
+    const arrived = channel.nextCommand();
+    const pending = created.presentOrderedTo(member.epoch);
+    const token = /** @type {any} */ (created.recoveryState()).token;
+    await arrived;
+
+    // An otherwise valid attempt: the whole frame really was bracketed on the byte route.
+    created.broadcastOwnerOutput(bytes(`${markers.encodeNativePresentBegin(token)}FRAME${markers.encodeNativePresentEnd(token, identity)}`));
+    expect(created.recoveryState()).toMatchObject({ observedEnd: true });
+    for (const release of held.splice(0)) release(undefined);
+
+    expect(await pending).toMatchObject({ presented: false });
+    expect(created.recoveryState()).toBe(null);
+    expect(created.acknowledgePresentation(member.epoch, nonce)).toMatchObject({ cleared: false });
+    expect(created.attachments()[0]).toMatchObject({ state: "resync-required" });
+  }
+});
+
+it("gives every live member the fresh interval's own bytes once, in order, while only the fresh route reaches the resync target", async () => {
+  if (!withCohort) return;
+  const nonce = "two-client-nonce-1";
+  const identity = frameId();
+  const target = terminalOutputClient({ stall: true });
+  const channel = await openChannel({ protocol: 2, answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }) });
+  const { host: created } = consumerHost({ channel: channel.channel, presentMarkers: markers });
+  const watcher = terminalOutputClient();
+  const live = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "live", sink: watcher.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  const member = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: target.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  // Only the recovering client falls behind: the watcher keeps up and stays live.
+  target.terminal.cork();
+  created.broadcastOwnerOutput(bytes("y".repeat(2048)));
+  target.terminal.uncork();
+  target.releaseWrites();
+  expect(created.attachments().find((entry) => entry.attachmentId === "live")).toMatchObject({ state: "live" });
+  expect(created.attachments().find((entry) => entry.attachmentId === "recovering")).toMatchObject({ state: "resync-required" });
+
+  const armed = /** @type {any} */ (await created.presentOrderedTo(member.epoch));
+  const token = armed.ordering.token;
+  const watcherBefore = watcher.acceptedText();
+  const targetBefore = target.acceptedBytes();
+
+  // Bytes before the interval, the bracketed frame with something interleaved inside it, and bytes after.
+  created.broadcastOwnerOutput(bytes("before-"));
+  created.broadcastOwnerOutput(bytes(`${markers.encodeNativePresentBegin(token)}FRAME-A`));
+  created.broadcastOwnerOutput(bytes("FRAME-B"));
+  created.broadcastOwnerOutput(bytes(markers.encodeNativePresentEnd(token, identity)));
+
+  // The live member received every non-framing byte exactly once and in order, and no marker byte at all.
+  const liveSaw = watcher.acceptedText().slice(watcherBefore.length);
+  expect(liveSaw).toBe("before-FRAME-AFRAME-B");
+  expect(liveSaw).not.toContain("pi-native-present");
+  // The resync target received the frame body through the authorized route only, and nothing from before it.
+  const targetSaw = target.acceptedText().slice(target.acceptedText().length - (target.acceptedBytes() - targetBefore));
+  expect(targetSaw).toBe("FRAME-AFRAME-B");
+  expect(targetSaw).not.toContain("before-");
+
+  expect(created.acknowledgePresentation(member.epoch, nonce)).toEqual({ cleared: true, reason: null });
+  // Ordinary output after the acknowledgement reaches both, once each.
+  created.broadcastOwnerOutput(bytes("after"));
+  expect(watcher.acceptedText().endsWith("after")).toBe(true);
+  expect(target.acceptedText().endsWith("after")).toBe(true);
+});
+
+it("keeps delivering the interval to live members when the fresh route fails mid-frame", async () => {
+  if (!withCohort) return;
+  const nonce = "two-client-nonce-2";
+  const identity = frameId();
+  const target = terminalOutputClient({ stall: true, throwAt: 1 });
+  const channel = await openChannel({ protocol: 2, answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }) });
+  const { host: created } = consumerHost({ channel: channel.channel, presentMarkers: markers });
+  const watcher = terminalOutputClient();
+  created.attach({ attachmentId: "live", sink: watcher.sink, declared: { capabilities: { ...CAPABILITIES } } });
+  const member = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: target.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  target.terminal.cork();
+  created.broadcastOwnerOutput(bytes("y".repeat(2048)));
+  target.terminal.uncork();
+  target.releaseWrites();
+
+  const armed = /** @type {any} */ (await created.presentOrderedTo(member.epoch));
+  const token = armed.ordering.token;
+  target.armFault();
+  const watcherBefore = watcher.acceptedText();
+  created.broadcastOwnerOutput(bytes(`${markers.encodeNativePresentBegin(token)}INSIDE`));
+  // The fresh route is gone, and the live member still has the interval's bytes.
+  expect(created.recoveryState()).toBe(null);
+  expect(watcher.acceptedText().slice(watcherBefore.length)).toBe("INSIDE");
+  created.broadcastOwnerOutput(bytes("-TAIL"));
+  expect(watcher.acceptedText().slice(watcherBefore.length)).toBe("INSIDE-TAIL");
+  expect(created.acknowledgePresentation(member.epoch, nonce)).toMatchObject({ cleared: false, reason: "no-armed-recovery" });
+});
+
+it("writes no later fresh chunk after its own sink synchronously detaches the connection it was repainting", async () => {
+  if (!withCohort) return;
+  const nonce = "reentry-nonce-1";
+  const identity = frameId();
+  /** @type {any} */
+  let created = null;
+  /** @type {any} */
+  let member = null;
+  let reentered = false;
+  let armedHook = false;
+  let freshWrites = 0;
+  // The client's transport reaches back into the host from inside its own write, which is the boundary the
+  // accepted admission path already guards. The fresh route must apply the same rule.
+  const target = terminalOutputClient({
+    stall: true,
+    onSinkWrite: () => {
+      if (!armedHook || reentered) return;
+      freshWrites += 1;
+      if (freshWrites !== 1) return;
+      reentered = true;
+      created.detach(member.epoch, "the client dropped mid-frame");
+    },
+  });
+  const channel = await openChannel({ protocol: 2, answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }) });
+  const opened = consumerHost({ channel: channel.channel, presentMarkers: markers });
+  created = opened.host;
+  const admitted = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: target.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  member = admitted;
+  created.broadcastOwnerOutput(bytes("x".repeat(2048)));
+  target.releaseWrites();
+  expect(created.attachments()[0]).toMatchObject({ state: "resync-required" });
+
+  const armed = /** @type {any} */ (await created.presentOrderedTo(admitted.epoch));
+  const token = armed.ordering.token;
+  const writesBeforeFrame = target.sinkWrites();
+  armedHook = true;
+  const frame = "R".repeat(markers.NATIVE_PRESENT_FRESH_CHUNK_MAX * 3);
+  created.broadcastOwnerOutput(bytes(`${markers.encodeNativePresentBegin(token)}${frame}`));
+
+  expect(reentered).toBe(true);
+  // The chunk that reentered was accepted; nothing after it was written to a connection that is gone.
+  expect(target.sinkWrites()).toBe(writesBeforeFrame + 1);
+  expect(created.recoveryState()).toBe(null);
+  expect(created.attachments()).toEqual([]);
+  expect(created.acknowledgePresentation(admitted.epoch, nonce)).toMatchObject({ cleared: false, reason: "no-armed-recovery" });
+});
+
+it("leaves a replacement admitted from inside a fresh write untouched by the attempt it replaced", async () => {
+  if (!withCohort) return;
+  const nonce = "reentry-nonce-2";
+  const identity = frameId();
+  /** @type {any} */
+  let created = null;
+  let reentered = false;
+  let armedHook = false;
+  let freshWrites = 0;
+  const replacement = terminalOutputClient();
+  const target = terminalOutputClient({
+    stall: true,
+    onSinkWrite: () => {
+      if (!armedHook || reentered) return;
+      freshWrites += 1;
+      if (freshWrites !== 1) return;
+      reentered = true;
+      created.attach({ attachmentId: "recovering", sink: replacement.sink, declared: { capabilities: { ...CAPABILITIES } } });
+    },
+  });
+  const channel = await openChannel({ protocol: 2, answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }) });
+  const opened = consumerHost({ channel: channel.channel, presentMarkers: markers });
+  created = opened.host;
+  const admitted = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: target.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  created.broadcastOwnerOutput(bytes("x".repeat(2048)));
+  target.releaseWrites();
+
+  const armed = /** @type {any} */ (await created.presentOrderedTo(admitted.epoch));
+  const token = armed.ordering.token;
+  const writesBeforeFrame = target.sinkWrites();
+  armedHook = true;
+  const frame = "S".repeat(markers.NATIVE_PRESENT_FRESH_CHUNK_MAX * 3);
+  created.broadcastOwnerOutput(bytes(`${markers.encodeNativePresentBegin(token)}${frame}`));
+
+  expect(reentered).toBe(true);
+  expect(target.sinkWrites()).toBe(writesBeforeFrame + 1);
+  // The newer connection holds the id at the next epoch, and the retired attempt's fresh route wrote nothing to
+  // it: what it received is the owner output every live member receives, once, not a repaint of a frame that was
+  // never its own.
+  expect(created.attachments()).toEqual([{ attachmentId: "recovering", epoch: 2, state: "live", inputEligible: true, drains: 0, awaitingPresentationNonce: false }]);
+  expect(replacement.acceptedText().startsWith("\u001b[?2004h\u001b[?1002h\u001b[?1006h")).toBe(true);
+  expect(replacement.acceptedText()).not.toContain("pi-native-present");
+  expect(created.recoveryCounts()).toMatchObject({ cleared: 0 });
+  expect(created.recoveryState()).toBe(null);
+  expect(created.acknowledgePresentation(admitted.epoch, nonce)).toMatchObject({ cleared: false, reason: "no-armed-recovery" });
 });

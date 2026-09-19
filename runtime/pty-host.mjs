@@ -404,7 +404,7 @@ export function createPtyHost({
    * ordinary output away from a client that fell behind (G-A6). A cold presentation has to reach that one
    * member and nobody else, so the host keeps the prepared sink it already owns rather than asking the set for
    * a per-member write it does not publish.
-   * @type {Map<string, { epoch: AttachmentEpoch, prepared: { write: (bytes: Uint8Array) => unknown } }>}
+   * @type {Map<string, { epoch: AttachmentEpoch, prepared: { write: (bytes: Uint8Array) => unknown, queuedBytes: () => number } }>}
    */
   const admittedSinks = new Map();
   const orderedPresentation = /** @type {{ active: true, declared: { version: number, markerCodec: string, tokenBytes: number, maxMarkerBytes: number, freshChunkMax: number } } | { active: false, reason: string }} */ (
@@ -424,13 +424,21 @@ export function createPtyHost({
    */
   let armedRecovery = null;
   let requestSequence = 0;
-  const recoveryCounts = { armed: 0, refusedAdmission: 0, freshChunks: 0, freshBytes: 0, failed: 0, acknowledgeable: 0, cleared: 0 };
+  const recoveryCounts = { armed: 0, refusedAdmission: 0, freshChunks: 0, freshBytes: 0, failed: 0, acknowledgeable: 0, cleared: 0, retiredBackpressure: 0, retiredUncertain: 0, retiredGeometry: 0, lastRetirement: /** @type {string | null} */ (null) };
 
   /** Stop recognising this attempt's framing, whatever ended it. No tail is kept and nothing is replayed.
    * @param {string | null} failure */
   const retireRecovery = (failure) => {
     if (armedRecovery === null) return;
-    if (failure !== null) recoveryCounts.failed += 1;
+    if (failure !== null) {
+      recoveryCounts.failed += 1;
+      recoveryCounts.lastRetirement = failure;
+      // Truthful reasons: a bounded route, an uncertain write and a moved geometry are not a detached client.
+      if (failure === "fresh-route-backpressure" || failure === "fresh-route-queue-unreadable") recoveryCounts.retiredBackpressure += 1;
+      else if (failure === "fresh-write-uncertain") recoveryCounts.retiredUncertain += 1;
+      else if (failure === "geometry-moved") recoveryCounts.retiredGeometry += 1;
+      armedRecovery.failure = failure;
+    }
     try {
       armedRecovery.decoder.disarm();
     } catch {
@@ -477,33 +485,95 @@ export function createPtyHost({
   /**
    * Hand one fresh span to the one client this attempt is repainting, in bounded chunks.
    *
-   * `freshChunkMax` is the bound the peer declared, so it is honoured here rather than treated as advice. A
-   * `false` return is Node's high-water mark: the bytes were admitted once and are never written again. A throw
-   * leaves what the transport accepted unknown, which can never authorize a retry, so the attempt fails.
+   * Three bounds apply, and the first two are the peer's and this host's own declared numbers rather than
+   * advice. `freshChunkMax` sizes each chunk. `queuedByteCap` bounds what may be outstanding in that client's
+   * transport, judged the way the attachment set judges it: the queue is read after a write, and a queue that is
+   * past the cap stops the route. So at most the chunk already in flight can exceed the cap — a write's effect
+   * cannot be known before it happens — and nothing further is written, buffered, queued or replayed. A `false`
+   * return is Node's high-water mark: those bytes were admitted exactly once and are never rewritten, and it
+   * ends the route for this attempt because the next chunk would only grow a queue that is already full.
+   * A throw leaves what the transport accepted unknown, which can never authorize a retry.
+   *
+   * The client is neither evicted nor disabled by any of this, the owner's output is never stalled for it, and
+   * nothing after the stop is written. The cost is recovery liveness: a client that cannot take a frame inside
+   * the cap stays `resync-required` until a later attempt succeeds.
+   *
+   * Every write and every queue read is a call into the caller's own transport, so after each one this checks
+   * that the same attempt and the same admitted connection are still current — the same rule admission follows.
    *
    * @param {Uint8Array} span
    */
   const streamFresh = (span) => {
     const attempt = armedRecovery;
     if (attempt === null) return;
-    const held = admittedSinks.get(attempt.epoch.attachmentId);
-    if (held === undefined || held.epoch.epoch !== attempt.epoch.epoch) {
+    /** The exact connection and prepared handoff this attempt is repainting, or `null` if it moved. */
+    const currentTarget = () => {
+      if (armedRecovery !== attempt || attempt.failure !== null) return null;
+      const held = admittedSinks.get(attempt.epoch.attachmentId);
+      if (held === undefined || held.epoch.epoch !== attempt.epoch.epoch) return null;
+      return held;
+    };
+    let held = currentTarget();
+    if (held === null) {
       retireRecovery("attachment-retired");
       return;
     }
     const bound = orderedPresentation.active ? orderedPresentation.declared.freshChunkMax : span.byteLength;
     for (let offset = 0; offset < span.byteLength; offset += bound) {
       const chunk = span.subarray(offset, Math.min(offset + bound, span.byteLength));
+      let queued;
       try {
-        held.prepared.write(chunk);
+        queued = held.prepared.queuedBytes();
+      } catch {
+        retireRecovery("fresh-route-queue-unreadable");
+        return;
+      }
+      // Reading the queue is a call into the transport too, so the attempt may be gone by now.
+      if (currentTarget() === null) {
+        retireRecovery("attachment-retired");
+        return;
+      }
+      if (!Number.isSafeInteger(queued) || /** @type {number} */ (queued) < 0) {
+        retireRecovery("fresh-route-queue-unreadable");
+        return;
+      }
+      if (/** @type {number} */ (queued) > queuedByteCap) {
+        retireRecovery("fresh-route-backpressure");
+        return;
+      }
+      let admitted;
+      try {
+        admitted = held.prepared.write(chunk);
       } catch {
         retireRecovery("fresh-write-uncertain");
         return;
       }
+      // Accepted exactly once, counted exactly once, and never written again whatever the return said.
       attempt.freshBytes += chunk.byteLength;
       attempt.freshChunks += 1;
       recoveryCounts.freshBytes += chunk.byteLength;
       recoveryCounts.freshChunks += 1;
+      const stillCurrent = currentTarget();
+      if (stillCurrent === null) {
+        retireRecovery("attachment-retired");
+        return;
+      }
+      held = stillCurrent;
+      let queuedAfter;
+      try {
+        queuedAfter = held.prepared.queuedBytes();
+      } catch {
+        retireRecovery("fresh-route-queue-unreadable");
+        return;
+      }
+      if (currentTarget() === null) {
+        retireRecovery("attachment-retired");
+        return;
+      }
+      if (admitted === false || !Number.isSafeInteger(queuedAfter) || /** @type {number} */ (queuedAfter) > queuedByteCap) {
+        retireRecovery("fresh-route-backpressure");
+        return;
+      }
     }
   };
 
@@ -562,10 +632,10 @@ export function createPtyHost({
     }
     /** @type {import("./attachment-set.mjs").BroadcastResult} */
     const result = { delivered: [], skipped: [], markedResyncRequired: [], failures: [] };
-    /** @param {Uint8Array} span */
-    const ordinary = (span) => {
+    /** @param {Uint8Array} span @param {boolean} insideInterval */
+    const ordinary = (span, insideInterval) => {
       if (span.byteLength === 0) return;
-      if (armedRecovery !== null && armedRecovery.observedEnd !== null) {
+      if (!insideInterval && armedRecovery !== null && armedRecovery.observedEnd !== null) {
         // The repainting member is still `resync-required`, so the set skipped it: its screen is behind again
         // and this attempt can no longer be acknowledged, even when the control result succeeded already.
         armedRecovery.skippedOrdinaryAfterEnd = true;
@@ -583,8 +653,19 @@ export function createPtyHost({
       if (event.kind === "bytes" || event.kind === "refused") {
         // A refusal is not a loss: the candidate's bytes are reproduced, so they travel the route their phase
         // says. A refused candidate carrying this attempt's token still ends the attempt.
-        if (open) streamFresh(event.bytes);
-        else ordinary(event.bytes);
+        //
+        // Inside the interval those bytes are two things at once and both routes are taken: they are this
+        // attempt's fresh frame for the one member being repainted, and they are still the owner's output for
+        // every member that is keeping up. The attachment set skips a `resync-required` member, so the member
+        // being repainted receives them once, through the authorized fresh route only — and the live members do
+        // not lose the frame body or anything interleaved with it. The broadcast happens even when the fresh
+        // route has just been retired: one client's transport is not the others' problem.
+        if (open) {
+          streamFresh(event.bytes);
+          ordinary(event.bytes, true);
+        } else {
+          ordinary(event.bytes, false);
+        }
         if (event.kind === "refused") retireRecovery(`framing-refused:${event.reason}`);
         continue;
       }
@@ -626,16 +707,19 @@ export function createPtyHost({
   const geometry = () => ({ cols: geometryCols, rows: geometryRows, revision: geometryRevision });
 
   /**
-   * What is still missing, by name — and nothing that is now available.
+   * What is still missing, by name — from the state this host is in right now.
    *
-   * Labelled ingress is missing only while this host has no route to a dispatch target at all. A route that
-   * exists and currently publishes nothing is a registry state, reported with the registry's own reason rather
-   * than as an absent capability. The presentation delivery boundary is missing only while ordered framing is
-   * not active: with it active the boundary exists, and what remains unproved is the client's own
-   * acknowledgement, which this host requires rather than assumes.
+   * Labelled ingress is missing while there is no route at all **and** while the route there is publishes no
+   * usable target: API availability, an injected adapter and a current publication are three different facts,
+   * and only the third one is a dispatch target. One snapshot is passed in, so the two halves of one report
+   * cannot disagree about it. The presentation delivery boundary is missing only while ordered framing is not
+   * active: with it active the boundary exists, and what remains unproved is the client's own acknowledgement,
+   * which this host requires rather than assumes.
+   *
+   * @param {{ target: any }} sampled
    */
-  const missingCapabilities = () => [
-    ...(inputTargetRegistry === null && inputTarget === null ? [MISSING_HOST_CAPABILITIES.labelledIngress] : []),
+  const missingCapabilities = (sampled) => [
+    ...(sampled.target === null ? [MISSING_HOST_CAPABILITIES.labelledIngress] : []),
     ...(orderedPresentation.active ? [] : [MISSING_HOST_CAPABILITIES.presentationDeliveryBoundary]),
   ];
 
@@ -649,9 +733,11 @@ export function createPtyHost({
 
     /** What this host cannot do, by name, plus the profile coverage it cannot enforce and the seams it has. */
     capabilityReport() {
+      // One sample of a mutable registry, read once and used for every field, so this report cannot contradict
+      // itself about whether a target exists.
       const target = inputTargetState();
       return {
-        missing: missingCapabilities(),
+        missing: missingCapabilities(target),
         coverageGaps: PROFILE_COVERAGE_GAPS,
         // API availability is not producer availability, and a resolved handle is neither: all three are
         // reported separately so no caller infers support from an exported version.
@@ -665,11 +751,12 @@ export function createPtyHost({
     /**
      * Whether a conforming client can be given native attachment on this owner right now.
      *
-     * Derived from the capability report, not from membership: the owner runs either way, and this is the
-     * **G-A7** mark that says attachment is unavailable while naming what is missing.
+     * Derived from the same validated snapshot the report is derived from, not from membership and not from the
+     * presence of an adapter: the owner runs either way, and this is the **G-A7** mark that says attachment is
+     * unavailable while naming what is missing.
      */
     ownerAttachmentUnavailable() {
-      return missingCapabilities().length > 0;
+      return missingCapabilities(inputTargetState()).length > 0;
     },
 
     /**
@@ -774,6 +861,10 @@ export function createPtyHost({
       geometryCols = nextCols;
       geometryRows = nextRows;
       geometryRevision += 1;
+      // A frame painted at the previous size is not this size's screen, so an attempt armed or already proved
+      // for it is retired here rather than left to be acknowledged later. A resize that changed nothing
+      // advanced no revision and retires nothing.
+      retireRecovery("geometry-moved");
       return { ...geometry(), changed: true };
     },
 
@@ -1093,7 +1184,14 @@ export function createPtyHost({
         presentationCounts.refused += 1;
         return { presented: false, refusal: "control-result-unbound", attachmentEpoch: asked };
       }
-      if (result?.presented !== true || result.ordering?.token !== token || result.ordering?.markerCodec !== orderedPresentation.declared.markerCodec) {
+      if (
+        result?.presented !== true ||
+        result.ordering?.token !== token ||
+        result.ordering?.markerCodec !== orderedPresentation.declared.markerCodec ||
+        result.ordering?.version !== orderedPresentation.declared.version
+      ) {
+        // The inner ordering carries the same version/token pair plus the codec. A missing or different inner
+        // version is not the framing this host armed, so it is refused rather than read past.
         retireRecovery("control-result-negative");
         presentationCounts.refused += 1;
         return { presented: false, refusal: typeof result?.refusal === "string" ? result.refusal : "control-result-negative", attachmentEpoch: asked };
@@ -1181,6 +1279,13 @@ export function createPtyHost({
           observedEnd: attempt.observedEnd !== null,
           controlResult: attempt.control !== null,
         };
+      }
+      // Geometry is revalidated here as well as on resize: an acknowledgement is about the screen this frame was
+      // painted for, and this is the last moment before `resync-required` is cleared.
+      if (attempt.geometryRevision !== geometryRevision) {
+        retireRecovery("geometry-moved");
+        presentationCounts.acknowledgementsRefused += 1;
+        return { cleared: false, reason: "geometry-moved" };
       }
       const cleared = attachmentSet.acknowledgePresentation(asked, nonce);
       if (!cleared) {

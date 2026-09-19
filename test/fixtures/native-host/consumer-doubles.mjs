@@ -346,15 +346,18 @@ export async function bootstrapChannel({ protocol = 2, orderedPresentation, answ
  * boundary a recovery acknowledgement is allowed to mean. Production client transport is a later task: this is
  * the deterministic harness that boundary is exercised through, not that transport.
  *
- * @param {{ highWaterMark?: number, failAt?: number, stall?: boolean }} [options]
+ * @param {{ highWaterMark?: number, failAt?: number, stall?: boolean, throwAt?: number, admitBeforeThrow?: number, onSinkWrite?: (index: number) => void }} [options]
  */
-export function terminalOutputClient({ highWaterMark = 64, failAt = -1, stall = false } = {}) {
+export function terminalOutputClient({ highWaterMark = 64, failAt = -1, stall = false, throwAt = -1, admitBeforeThrow = 0, onSinkWrite } = {}) {
   /** @type {Buffer[]} */
   const accepted = [];
   /** @type {(() => void)[]} */
   const held = [];
   let handed = 0;
   let writes = 0;
+  let sinkWrites = 0;
+  let faultArmed = throwAt < 0;
+  let faultCounter = 0;
   let stalled = stall;
   const terminal = new Writable({
     highWaterMark,
@@ -385,11 +388,36 @@ export function terminalOutputClient({ highWaterMark = 64, failAt = -1, stall = 
       stalled = false;
       for (const settle of held.splice(0)) settle();
     },
+    /** How many times the host wrote to this client's sink, so a case can prove no retry and no later chunk. */
+    sinkWrites: () => sinkWrites,
+    /** Start counting toward `throwAt` now, so the fault lands on a chosen fresh chunk. */
+    armFault() {
+      faultArmed = true;
+      faultCounter = 0;
+    },
+    /** Sink writes since the fault was armed: the writes a case is reasoning about, and nothing before them. */
+    freshWrites: () => faultCounter,
     /** Every byte handed over has been accepted, in order, by this client's own terminal output. */
     acknowledgeable: () => handed > 0 && Buffer.concat(accepted).byteLength === handed && !terminal.errored,
     sink: {
       /** @param {Uint8Array} payload */
       write(payload) {
+        sinkWrites += 1;
+        // The client's own transport speaking for itself: a hook that can reenter the host synchronously, and a
+        // channel that admits a chosen prefix and then throws — the only shape a write with no accepted-byte
+        // count can present.
+        if (onSinkWrite !== undefined) onSinkWrite(sinkWrites);
+        if (faultArmed) faultCounter += 1;
+        // The fault is counted from the moment a case arms it, so an attachment's own initialization write is
+        // never the write that throws: a case chooses which fresh chunk fails.
+        if (faultArmed && faultCounter === throwAt) {
+          const admitted = Math.max(0, Math.min(admitBeforeThrow, payload.byteLength));
+          if (admitted > 0) {
+            handed += admitted;
+            terminal.write(Buffer.from(payload.subarray(0, admitted)));
+          }
+          throw new Error(`the client's transport threw after admitting ${admitted} of ${payload.byteLength} bytes`);
+        }
         handed += payload.byteLength;
         // A `false` return is this stream's high-water mark. The bytes are admitted once either way.
         return terminal.write(Buffer.from(payload));

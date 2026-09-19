@@ -1,5 +1,5 @@
 // A refusal message that nonetheless carries a bound server: the refusal must not leak the listener.
-import { bindPrivately, send, FIXTURE_PROTOCOL } from "./binder-fixture.mjs";
-const { server } = await bindPrivately(process.argv[2]);
+import { FIXTURE_PROTOCOL, SOCKET_PATH, bindPrivately, send } from "./binder-fixture.mjs";
+const { server } = await bindPrivately(SOCKET_PATH);
 await send({ protocol: FIXTURE_PROTOCOL, type: "sideband-binder-refused", reason: "fixture refuses on purpose" }, server);
 process.exit(0);

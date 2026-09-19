@@ -1,7 +1,7 @@
 // Two valid handoffs. The second arrives before this process exits, so the parent must still refuse.
-import { bindPrivately, send, proofFor, FIXTURE_PROTOCOL } from "./binder-fixture.mjs";
+import { FIXTURE_PROTOCOL, SOCKET_PATH, bindPrivately, proofFor, send } from "./binder-fixture.mjs";
 import net from "node:net";
-const socketPath = process.argv[2];
+const socketPath = SOCKET_PATH;
 const { server, proof } = await bindPrivately(socketPath);
 await send({ protocol: FIXTURE_PROTOCOL, type: "sideband-bound", socketPath, proof }, server);
 const second = net.createServer();

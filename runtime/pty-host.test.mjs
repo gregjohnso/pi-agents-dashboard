@@ -25,6 +25,40 @@ function mutateIfAllowed(mutate) {
   }
 }
 
+/**
+ * One client sink a case can configure to fail where a real transport does, recording every byte it accepted.
+ *
+ * `onDrainThrows` is a transport that cannot take a drain listener at all, and `writeReturnsFalse` is Node's
+ * high-water mark, which means accepted. A case sets both, so an initialization written too early shows up as
+ * a recorded byte run rather than as a throw that would hide the ordering.
+ *
+ * @param {{ onDrainThrows?: boolean, writeReturnsFalse?: boolean, queued?: number, onWrite?: () => void }} [options]
+ */
+function probeSink({ onDrainThrows = false, writeReturnsFalse = false, queued = 0, onWrite } = {}) {
+  /** @type {Uint8Array[]} */
+  const written = [];
+  let drainRegistrations = 0;
+  return {
+    written,
+    text: () => Buffer.concat(written.map((chunk) => Buffer.from(chunk))).toString("latin1"),
+    drainRegistrations: () => drainRegistrations,
+    sink: {
+      /** @param {Uint8Array} payload */
+      write(payload) {
+        written.push(payload);
+        if (onWrite !== undefined) onWrite();
+        return writeReturnsFalse ? false : undefined;
+      },
+      queuedBytes: () => queued,
+      /** @param {() => void} _listener */
+      onDrain(_listener) {
+        if (onDrainThrows) throw new Error("this transport cannot register a drain listener");
+        drainRegistrations += 1;
+      },
+    },
+  };
+}
+
 /** A sink whose write throws, with the whole surface the attachment set requires. @param {string} message */
 function failingSink(message) {
   return {
@@ -516,6 +550,131 @@ it("takes a sink's false write as accepted backpressure, and writes the accepted
   });
   expect(created.attachments()).toEqual([{ attachmentId: "slow-socket", epoch: 1, state: "live", inputEligible: true, drains: 0, awaitingPresentationNonce: false }]);
   expect(written.map((chunk) => Buffer.from(chunk).toString("latin1"))).toEqual(["\u001b[?2004h\u001b[?1002h\u001b[?1006h"]);
+});
+
+it("refuses a malformed attachment id before one byte reaches the candidate, and spends no epoch on it", () => {
+  const { host: created } = host();
+  // Every one of these is refused by the shared epoch contract rather than by this host's own opinion: an
+  // empty id, an untrimmed id on either side, and an id past the bounded length.
+  for (const attachmentId of ["", " a", "a ", "a".repeat(257)]) {
+    const candidate = probeSink({ writeReturnsFalse: true });
+    expect(() => created.attach({ attachmentId, sink: candidate.sink, declared: { capabilities: { ...CAPABILITIES } } })).toThrow();
+    // A write that answers false is accepted, so ordering is the only thing that keeps these bytes unsent.
+    expect(candidate.written).toEqual([]);
+    expect(candidate.drainRegistrations()).toBe(0);
+    expect(created.attachments()).toEqual([]);
+  }
+  // None of them spent an epoch, so the first well-formed admission is still epoch 1.
+  expect(attach(created, "a").result.epoch).toEqual({ attachmentId: "a", epoch: 1 });
+});
+
+it("leaves a live connection and its outstanding presentation untouched when a malformed id is refused", async () => {
+  const presentation = fakePresentationChannel();
+  const { host: created } = host({ presentation: presentation.channel });
+  const first = attach(created, "a");
+  const pending = created.presentTo(first.result.epoch);
+
+  // A malformed id can never be the id of an admitted connection, so this is the only replacement shape it
+  // reaches: the refusal must leave the member that is there, and its request, exactly as they were.
+  const candidate = probeSink({ writeReturnsFalse: true });
+  expect(() => created.attach({ attachmentId: " a", sink: candidate.sink, declared: { capabilities: { ...CAPABILITIES } } })).toThrow();
+  expect(candidate.written).toEqual([]);
+
+  expect(created.attachments()).toEqual([{ attachmentId: "a", epoch: 1, state: "live", inputEligible: true, drains: 0, awaitingPresentationNonce: false }]);
+  created.broadcastOwnerOutput(bytes("frame"));
+  expect(first.client.text()).toBe("\u001b[?2004h\u001b[?1002h\u001b[?1006hframe");
+  presentation.requests[0].settle({
+    presented: true,
+    terminalOwner: "pi",
+    presentationNonce: "frame-1",
+    frame: { frameId: "frame-1", sequence: 1, columns: 100, rows: 30, byteLength: 512 },
+    geometryRevision: 1,
+    attachmentEpoch: first.result.epoch,
+    cold: true,
+  });
+  expect(await pending).toMatchObject({ presented: true, presentationNonce: "frame-1" });
+});
+
+it("refuses a sink that cannot register a drain listener before it writes the initialization to it", () => {
+  const { host: created } = host();
+  const candidate = probeSink({ onDrainThrows: true, writeReturnsFalse: true });
+  let error;
+  try {
+    created.attach({ attachmentId: "no-drain", sink: candidate.sink, declared: { capabilities: { ...CAPABILITIES } } });
+  } catch (caught) {
+    error = caught;
+  }
+  expect(error).toBeInstanceOf(PtyHostError);
+  expect(/** @type {PtyHostError} */ (error).code).toBe("PTY_HOST_SINK_UNUSABLE");
+  expect(candidate.written).toEqual([]);
+  expect(created.attachments()).toEqual([]);
+  // The refused attempt spent no epoch: a sink that could take a listener is admitted at epoch 1.
+  expect(attach(created, "no-drain").result.epoch).toEqual({ attachmentId: "no-drain", epoch: 1 });
+});
+
+it("keeps the old connection, its epoch line and its request when a replacement cannot register a drain", async () => {
+  const presentation = fakePresentationChannel();
+  const { host: created } = host({ presentation: presentation.channel });
+  const first = attach(created, "a");
+  const pending = created.presentTo(first.result.epoch);
+
+  const candidate = probeSink({ onDrainThrows: true, writeReturnsFalse: true });
+  expect(() => created.attach({ attachmentId: "a", sink: candidate.sink, declared: { capabilities: { ...CAPABILITIES } } })).toThrow(PtyHostError);
+  expect(candidate.written).toEqual([]);
+
+  expect(created.attachments()).toEqual([{ attachmentId: "a", epoch: 1, state: "live", inputEligible: true, drains: 0, awaitingPresentationNonce: false }]);
+  created.broadcastOwnerOutput(bytes("frame"));
+  expect(first.client.text()).toBe("\u001b[?2004h\u001b[?1002h\u001b[?1006hframe");
+  presentation.requests[0].settle({
+    presented: true,
+    terminalOwner: "pi",
+    presentationNonce: "frame-1",
+    frame: { frameId: "frame-1", sequence: 1, columns: 100, rows: 30, byteLength: 512 },
+    geometryRevision: 1,
+    attachmentEpoch: first.result.epoch,
+    cold: true,
+  });
+  expect(await pending).toMatchObject({ presented: true, presentationNonce: "frame-1" });
+
+  // The failed replacement spent no epoch, so the connection that really replaces it is epoch 2.
+  const replacement = probeSink();
+  expect(created.attach({ attachmentId: "a", sink: replacement.sink, declared: { capabilities: { ...CAPABILITIES } } })).toMatchObject({
+    attached: true,
+    epoch: { attachmentId: "a", epoch: 2 },
+  });
+  expect(replacement.text()).toBe("\u001b[?2004h\u001b[?1002h\u001b[?1006h");
+});
+
+it("does not overwrite a newer member admitted from inside its own initialization write", () => {
+  const { host: created } = host();
+  const inner = probeSink();
+  let reentered = false;
+  const candidate = probeSink({
+    writeReturnsFalse: true,
+    onWrite: () => {
+      if (reentered) return;
+      reentered = true;
+      created.attach({ attachmentId: "a", sink: inner.sink, declared: { capabilities: { ...CAPABILITIES } } });
+    },
+  });
+
+  let error;
+  try {
+    created.attach({ attachmentId: "a", sink: candidate.sink, declared: { capabilities: { ...CAPABILITIES } } });
+  } catch (caught) {
+    error = caught;
+  }
+  expect(error).toBeInstanceOf(PtyHostError);
+  expect(/** @type {PtyHostError} */ (error).code).toBe("PTY_HOST_ATTACHMENT_SUPERSEDED");
+
+  // The connection admitted from inside that write keeps the id, its epoch and its one initialization.
+  expect(created.attachments()).toEqual([{ attachmentId: "a", epoch: 1, state: "live", inputEligible: true, drains: 0, awaitingPresentationNonce: false }]);
+  expect(inner.text()).toBe("\u001b[?2004h\u001b[?1002h\u001b[?1006h");
+  // The candidate was written to exactly once and is nobody's member, so no broadcast reaches it.
+  expect(candidate.written).toHaveLength(1);
+  created.broadcastOwnerOutput(bytes("frame"));
+  expect(candidate.written).toHaveLength(1);
+  expect(inner.text()).toBe("\u001b[?2004h\u001b[?1002h\u001b[?1006hframe");
 });
 
 it("refuses an owner handle whose birth identity is not an exact pid, start identity and process group", () => {

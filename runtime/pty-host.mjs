@@ -185,20 +185,61 @@ function requireBirthIdentity(record) {
 }
 
 /**
- * The sink surface an attachment needs, checked before the profile's initialization is written to it.
+ * The epoch number one attachment id has reached, with `0` for an id no connection has ever used.
  *
- * The attachment set requires the same three methods. It is checked here as well because the initialization
- * write happens before membership changes: an unusable sink must be refused before a byte is handed to it,
- * not after, since accepted bytes are never written twice.
+ * Only for comparing the set's own highest issued epoch against itself across one admission, which is how a
+ * connection admitted from inside a sink callback is noticed. It mints nothing and is not a second epoch line.
+ *
+ * @param {AttachmentEpoch | null} issued
+ */
+function issuedEpoch(issued) {
+  return issued === null ? 0 : issued.epoch;
+}
+
+/**
+ * One admission's sink, with its drain registration already performed, ready to hand to the attachment set.
+ *
+ * Admission has one externally accepted effect — the initialization write — and it must be the last thing
+ * that can fail. The set registers a drain listener as part of `add`, and that registration is a call into the
+ * client's transport, so it can throw *after* those bytes were accepted. Preparing the sink moves that one
+ * external call in front of the write: the listener is registered here, once, and the set is later handed a
+ * registration that only records where to forward. So the set's `add` has nothing fallible left in it that
+ * belongs to the transport.
+ *
+ * The forwarded listener stays inert until this admission actually commits, and a candidate that never becomes
+ * a member forwards nothing for the rest of its life — a refused or superseded connection's drains cannot
+ * touch the member that holds its id. Each method keeps the caller's sink as its receiver.
  *
  * @param {any} sink
  */
-function requireSinkSurface(sink) {
+function prepareAttachmentSink(sink) {
   for (const method of ["write", "queuedBytes", "onDrain"]) {
     if (typeof sink?.[method] !== "function") {
       throw new PtyHostError(`An attachment sink must provide ${method}`, { code: "PTY_HOST_SINK_UNUSABLE" });
     }
   }
+  /** The set's own listener for this admission, or `null` while this candidate is not a member. */
+  let member = /** @type {(() => void) | null} */ (null);
+  try {
+    sink.onDrain(() => {
+      if (member !== null) member();
+    });
+  } catch (cause) {
+    throw new PtyHostError("An attachment sink must be able to register a drain listener", { code: "PTY_HOST_SINK_UNUSABLE", cause });
+  }
+  return {
+    /** @param {Uint8Array} bytes */
+    write(bytes) {
+      return sink.write(bytes);
+    },
+    queuedBytes() {
+      return sink.queuedBytes();
+    },
+    /** @param {() => void} listener */
+    onDrain(listener) {
+      member = listener;
+    },
+  };
 }
 
 /**
@@ -338,12 +379,20 @@ export function createPtyHost({
      * The epoch comes from the adopted contract, so there is one epoch system: the next epoch for this id,
      * never reused, and strictly above the highest this owner ever admitted for it.
      *
-     * Admission is transactional in the order below, because a half-admitted attachment is worse than a
-     * refused one. The sink is checked, then the profile's client-owned modes are written to it, and only
-     * then does it become a member — so an initialization that throws admits nobody, leaves the epoch it
-     * would have used unspent, and leaves a connection that was being replaced in place with its own
-     * outstanding request still its own. A `false` return from that write is Node's high-water mark, which
-     * means accepted: only a throw is a failure, and accepted bytes are never written again.
+     * Admission is ordered so that the initialization write is the last thing that can fail, because those
+     * bytes are accepted by the client's transport and can never be sent again. Everything fallible runs
+     * first: the client's declaration, the id and the epoch it would take, the sink's surface, and the one
+     * drain registration the set would otherwise perform after the write. Only then are the profile's
+     * client-owned modes written, exactly once, and only then does the candidate become a member. A `false`
+     * return from that write is Node's high-water mark, which means accepted: only a throw is a failure.
+     *
+     * So a refused id, an exhausted epoch space, an unusable sink and a transport that cannot take a drain
+     * listener all leave the candidate unwritten, the membership untouched, a connection being replaced in
+     * place with its own outstanding request, and the epoch this attempt would have used unspent.
+     *
+     * A sink callback can admit another connection for this id while the initialization is in flight. That
+     * newer member keeps the id: this attempt refuses rather than overwriting it, and its own prevalidated
+     * epoch is never reused for anybody.
      *
      * @param {{ attachmentId: string, sink: any, declared: any }} request
      */
@@ -353,16 +402,24 @@ export function createPtyHost({
         return { attached: false, code: admission.code, missingCapabilities: admission.missingCapabilities };
       }
       const superseded = attachmentSet.highestIssuedEpoch(attachmentId);
-      requireSinkSurface(sink);
+      const minted = nextAttachmentEpoch(attachmentId, superseded);
+      const prepared = prepareAttachmentSink(sink);
       try {
-        sink.write(modeInitialization);
+        prepared.write(modeInitialization);
       } catch (cause) {
         throw new PtyHostError(
           `Attachment ${attachmentId} could not be given the profile's mode initialization, so nothing was admitted`,
           { code: "PTY_HOST_ATTACHMENT_INITIALIZATION_FAILED", cause },
         );
       }
-      const epoch = attachmentSet.add(nextAttachmentEpoch(attachmentId, superseded), sink);
+      const admittedSince = attachmentSet.highestIssuedEpoch(attachmentId);
+      if (issuedEpoch(admittedSince) !== issuedEpoch(superseded)) {
+        throw new PtyHostError(
+          `Attachment ${attachmentId} was admitted at epoch ${issuedEpoch(admittedSince)} while this connection was being initialized, so this connection was not admitted`,
+          { code: "PTY_HOST_ATTACHMENT_SUPERSEDED" },
+        );
+      }
+      const epoch = attachmentSet.add(minted, prepared);
       // A connection that is being replaced keeps nothing outstanding: its replacement must never be handed
       // the answer to a request the previous connection made.
       if (superseded !== null) retirePresentation(superseded);

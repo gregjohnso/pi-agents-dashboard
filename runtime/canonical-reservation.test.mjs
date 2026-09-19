@@ -1090,6 +1090,9 @@ describe("durable replay of an impossible history", () => {
     const two = ownerRun({ runId: "run:seg" });
     const firstIdentity = await claimIdentityOf(first);
     const secondIdentity = await claimIdentityOf(second);
+    // Every record here is synthesized, so nothing has opened the journal yet. `openDurableAppendStore`
+    // refuses a store that is not 0600, and that refusal would mask what this case is about.
+    await writeFile(domain.journalPath, "", { mode: 0o600 });
 
     await appendRecord(domain, {
       record: "prepared", owner: one, operationId: "seg:op", reservationId: "seg:res",

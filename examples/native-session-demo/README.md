@@ -75,12 +75,34 @@ frame reaches the terminal. It does not wait for first paint or for initializati
 dialog cannot hold your attach command.
 
 Which Pi runs is chosen by manifest, not by whatever npm happens to have installed. The default is the
-qualified five-patch composition (seams A, B/C/F, E, D, G; build stage Slurm job `3753895`, prepared tree
-`daa4eb307949768e750c0b5c6c103ef2ccdb3430`). Seam D's canonical admission is in those bytes and inert here:
-it does nothing until a host registers the canonical trio, and this demo registers no canonical host.
+qualified **six**-patch cohort (seams A, B/C/F, E, D, G plus native consumer capabilities; build stage Slurm
+job `3757199`, built tree `029408d6f4f4e397b621438a3f80b3fb034f99ab`, upstream
+`bfb004d4418ff05c6f909eaaab856cbe75c1fde0`).
+
+Two things are in those bytes and do **not** run here:
+
+- Seam D's canonical admission does nothing until a host registers the canonical trio, and this demo registers
+  no canonical host. Its presence is not pre-spawn canonical authority.
+- Patch 0006's bootstrap protocol 2, published input target and `dcs-pi-native-present-v1` codec are explicit
+  opt-in. This demo stays on protocol 1, which `resolveCohort` reports as `bootstrapProtocolInUse: 1`.
+
+Patch `0006-native-consumer-capabilities.patch` has two identities and both are recorded, because only one of
+them describes the bytes you run:
+
+| identity | sha256 | tree |
+|---|---|---|
+| built into cohort `3757199` — what executes | `63f186b735e440751777c70bfd564a0c5df8244ad1ad3bc6a1abef1ad60ea510` | `029408d6f4f4e397b621438a3f80b3fb034f99ab` |
+| current in this tree — accepted **test-only** overlay, never built | `37ddaec09df091fdf30ab3f8c10c32cfdf9820730f714323c6356b80907f548b` | would be `746091b78ce7b505f0170c2cb8866fe786cbb25c` |
+
+Patches 0001-0005 are byte-identical between this tree and that build, so the difference is confined to 0006.
 
 ```bash
+# The default, spelled out. Omit --manifest to get exactly this.
 $NODE $DEMO start --root /tmp/pi-nsd-mine \
+  --manifest /mnt/main0/home/gjohnson/projects/pi-agents-tool-error-summary/.superpowers/sdd/2026-09-17-native-attachment/native-consumer-seams/marker-failure/qualification/final-3757199/final-artifacts-manifest.json
+
+# The previously accepted five-patch composition is still selectable.
+$NODE $DEMO start --root /tmp/pi-nsd-five \
   --manifest /mnt/main0/home/gjohnson/projects/pi-agents-tool-error-summary/.superpowers/sdd/2026-09-17-native-attachment/runtime-wave-1/canonical-composition/logs/final-artifacts-manifest.json
 ```
 

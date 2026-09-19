@@ -22,7 +22,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { inspectProcessIdentity } from "../../runtime/process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "../../runtime/process-signaler.mjs";
 
-import { DEFAULT_MANIFEST, resolveCohort } from "./cohort.mjs";
+import { CONSUMER_CAPABILITY_PATCH, DEFAULT_MANIFEST, FIVE_PATCH_MANIFEST, resolveCohort } from "./cohort.mjs";
 import { FRONTEND_MODE_RESTORE, createAttachmentTeardown } from "./client.mjs";
 import { createRoot, demoPaths, readToken, tokenMatches, writeOwnerRecord } from "./demo-root.mjs";import { FAKE_REPLY_PREFIX, createFakeStreamSimple, deterministicReply } from "./fake-provider.mjs";
 import { createBridgeConsumer } from "./manager.mjs";
@@ -541,24 +541,66 @@ describe("cohort selection", () => {
     expect(() => resolveCohort({ manifestPath })).toThrowError(/names no consumerRoot/u);
   });
 
-  it("defaults to the installed cohort built from exactly this tree's ordered patch series", async () => {
+  it("defaults to the six-patch cohort and tells the truth about which patch bytes built it", async () => {
     const patches = new URL("../../vendor/pi/patches/", import.meta.url);
     const manifest = JSON.parse(await readFile(DEFAULT_MANIFEST, "utf8"));
     const series = (await readFile(new URL("series", patches), "utf8"))
       .split("\n")
       .map((line) => line.trim())
       .filter((line) => line !== "" && !line.startsWith("#"));
+
+    // The order is this tree's order, and it is six patches now, ending in the consumer-capability patch.
     expect(manifest.series).toEqual(series);
-    // Not just the names: the cohort the demo launches was built from these exact patch bytes, in this order.
-    const digests = [];
-    for (const [position, name] of series.entries()) {
-      digests.push({ position: position + 1, name, sha256: createHash("sha256").update(await readFile(new URL(name, patches))).digest("hex") });
+    expect(series).toHaveLength(6);
+    expect(series[5]).toBe(CONSUMER_CAPABILITY_PATCH.name);
+    expect(manifest.mode).toBe("patched");
+
+    /** @param {string} name */
+    const digestOf = async (name) => createHash("sha256").update(await readFile(new URL(name, patches))).digest("hex");
+    const built = new Map(manifest.appliedPatches.map((/** @type {any} */ entry) => [entry.name, entry]));
+
+    // The first five are byte-identical between this tree and the build, so the whole difference below is
+    // isolated to one patch rather than being a general drift between source and artifacts.
+    for (const [position, name] of series.slice(0, 5).entries()) {
+      expect(built.get(name)).toEqual({ position: position + 1, name, sha256: await digestOf(name) });
     }
-    expect(manifest.appliedPatches).toEqual(digests);
+
+    // Patch 0006 is where the two identities part, and both are checked against their real sources.
+    const sixth = built.get(CONSUMER_CAPABILITY_PATCH.name);
+    expect(sixth.position).toBe(6);
+    expect(sixth.sha256).toBe(CONSUMER_CAPABILITY_PATCH.builtIntoCohort.sha256);
+    expect(await digestOf(CONSUMER_CAPABILITY_PATCH.name)).toBe(CONSUMER_CAPABILITY_PATCH.currentInThisTree.sha256);
+    // Deliberately unequal: this tree carries an accepted test-only overlay that was never built into the
+    // cohort. A test that demanded they match would force one of the two records to be relabelled.
+    expect(CONSUMER_CAPABILITY_PATCH.currentInThisTree.sha256).not.toBe(CONSUMER_CAPABILITY_PATCH.builtIntoCohort.sha256);
+    expect(CONSUMER_CAPABILITY_PATCH.currentInThisTree.wouldProduceTreeHash).not.toBe(CONSUMER_CAPABILITY_PATCH.builtIntoCohort.patchedTreeHash);
+
     const cohort = resolveCohort({});
     expect(cohort.manifestPath).toBe(DEFAULT_MANIFEST);
+    expect(cohort.buildSlurmJobId).toBe("3757199");
+    expect(cohort.upstreamCommit).toBe(manifest.upstreamCommit);
+    expect(cohort.series).toEqual(series);
+    // What executes is described by the BUILT tree hash, never by the overlay's.
+    expect(cohort.patchedTreeHash).toBe(CONSUMER_CAPABILITY_PATCH.builtIntoCohort.patchedTreeHash);
     expect(cohort.patchedTreeHash).toBe(manifest.patchedTreeHash);
     expect(createHash("sha256").update(await readFile(cohort.bundledCli)).digest("hex")).toBe(manifest.bundledCliSha256);
+  });
+
+  // Patch 0006 ships bootstrap protocol 2. Shipping it is not running it, and the demo says which it uses
+  // rather than leaving a reader to infer authority from the cohort's contents.
+  it("keeps bootstrap protocol 1 as the demo's behaviour even though the cohort carries protocol 2", async () => {
+    const cohort = resolveCohort({});
+    expect(cohort.bootstrapProtocolInUse).toBe(1);
+    expect(cohort.series).toContain(CONSUMER_CAPABILITY_PATCH.name);
+  });
+
+  // The five-patch composition stays selectable, so this intake does not strand the previously accepted cohort.
+  it("still accepts the five-patch composition when it is named explicitly", async () => {
+    const cohort = resolveCohort({ manifestPath: FIVE_PATCH_MANIFEST });
+    expect(cohort.manifestPath).toBe(FIVE_PATCH_MANIFEST);
+    expect(cohort.series).toHaveLength(5);
+    expect(cohort.series).not.toContain(CONSUMER_CAPABILITY_PATCH.name);
+    expect(cohort.patchedTreeHash).not.toBe(CONSUMER_CAPABILITY_PATCH.builtIntoCohort.patchedTreeHash);
   });
 });
 

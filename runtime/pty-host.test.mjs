@@ -1072,13 +1072,13 @@ it("refuses an unusable construction rather than defaulting it", () => {
 // ---------------------------------------------------------------------------------------------------------
 
 /** One host wired to the consumer seams a case supplies. Everything else stays the accepted construction.
- * @param {{ registry?: any, channel?: any, presentMarkers?: any, owner?: any }} [options] */
-function consumerHost({ registry = null, channel = null, presentMarkers = null, owner: ownerOptions = {} } = {}) {
+ * @param {{ registry?: any, channel?: any, presentMarkers?: any, owner?: any, queuedByteCap?: number }} [options] */
+function consumerHost({ registry = null, channel = null, presentMarkers = null, owner: ownerOptions = {}, queuedByteCap = 1024 } = {}) {
   const owner = fakeOwner(ownerOptions);
   const created = createPtyHost({
     owner: owner.handle,
     profile: PROFILE,
-    queuedByteCap: 1024,
+    queuedByteCap,
     cols: 100,
     rows: 30,
     inputTargetRegistry: registry,
@@ -1442,13 +1442,13 @@ it("hands a fresh frame to one client in bounded chunks, and keeps marker-like t
   const nonce = "presentation-nonce-6";
   const identity = frameId();
   const channel = await openChannel({ protocol: 2, answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }) });
-  const { host: created } = consumerHost({ channel: channel.channel, presentMarkers: markers });
-  // A client that really can take a chunk of the declared maximum: the bound is about a queue that stays full,
-  // and this one drains as it goes.
+  const { host: created } = consumerHost({ channel: channel.channel, presentMarkers: markers, queuedByteCap: markers.NATIVE_PRESENT_FRESH_CHUNK_MAX * 4 });
+  // A client that really can take a chunk of the declared maximum, under a budget larger than that maximum: the
+  // peer's bound is what sizes these chunks, and the queue bound is what the separate prospective cases cover.
   const client = terminalOutputClient({ highWaterMark: markers.NATIVE_PRESENT_FRESH_CHUNK_MAX * 2, stall: true });
   const slow = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: client.sink, declared: { capabilities: { ...CAPABILITIES } } }));
   const live = attach(created, "live");
-  created.broadcastOwnerOutput(bytes("x".repeat(2048)));
+  created.broadcastOwnerOutput(bytes("x".repeat(markers.NATIVE_PRESENT_FRESH_CHUNK_MAX * 5)));
   client.releaseWrites();
   const liveBefore = live.client.text();
   const acceptedBeforeFrame = client.acceptedBytes();
@@ -1531,12 +1531,12 @@ it("refuses an ordered presentation for a frame receipt built at another geometr
 // ---------------------------------------------------------------------------------------------------------
 
 /** One armed attempt on a resync-required member, with the control half answered by `answer`. */
-async function armedAttempt({ answer, client, geometry: geometryRequest, release = true } = /** @type {any} */ ({})) {
+async function armedAttempt({ answer, client, geometry: geometryRequest, release = true, queuedByteCap = 1024 } = /** @type {any} */ ({})) {
   const channel = await openChannel({ protocol: 2, answer });
-  const { owner, host: created } = consumerHost({ channel: channel.channel, presentMarkers: markers });
+  const { owner, host: created } = consumerHost({ channel: channel.channel, presentMarkers: markers, queuedByteCap });
   const target = client ?? terminalOutputClient({ stall: true });
   const member = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: target.sink, declared: { capabilities: { ...CAPABILITIES } } }));
-  created.broadcastOwnerOutput(bytes("x".repeat(2048)));
+  created.broadcastOwnerOutput(bytes("x".repeat(queuedByteCap * 2)));
   if (release) target.releaseWrites();
   expect(created.attachments().find((entry) => entry.attachmentId === "recovering")).toMatchObject({ state: "resync-required" });
   if (geometryRequest !== undefined) created.resize({ ...geometryRequest, from: member.epoch });
@@ -1678,8 +1678,8 @@ it("treats a throwing fresh write as unknown acceptance, never retries it, and k
   for (const admitBeforeThrow of [0, 7, markers.NATIVE_PRESENT_FRESH_CHUNK_MAX]) {
     const nonce = `uncertain-nonce-${admitBeforeThrow}`;
     // The only shape a channel with no accepted-byte count can present: a chosen prefix, then a throw.
-    const target = terminalOutputClient({ throwAt: 1, admitBeforeThrow, stall: true });
-    const { created, member } = await armedAttempt({ answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }), client: target });
+    const target = terminalOutputClient({ throwAt: 1, admitBeforeThrow, stall: true, highWaterMark: markers.NATIVE_PRESENT_FRESH_CHUNK_MAX * 4 });
+    const { created, member } = await armedAttempt({ answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }), client: target, queuedByteCap: markers.NATIVE_PRESENT_FRESH_CHUNK_MAX * 4 });
     const armed = /** @type {any} */ (await created.presentOrderedTo(member.epoch));
     const token = armed.ordering.token;
     target.armFault();
@@ -2027,4 +2027,294 @@ it("leaves a replacement admitted from inside a fresh write untouched by the att
   expect(created.recoveryCounts()).toMatchObject({ cleared: 0 });
   expect(created.recoveryState()).toBe(null);
   expect(created.acknowledgePresentation(admitted.epoch, nonce)).toMatchObject({ cleared: false, reason: "no-armed-recovery" });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// Prospective queue admission and captured-attempt identity.
+//
+// Root causes, in source terms at 95b2a6d6eb8f912848835a892758d1db1156f0bd:
+//   1. runtime/pty-host.mjs:521-545 admits a chunk whenever the queue is currently at or under the cap and
+//      then sizes that chunk by `freshChunkMax` alone, so with cap 1024 and a 16384-byte peer maximum a drained
+//      client that stalls for recovery really receives 16 KiB before the post-write check retires the attempt.
+//      The bound has to be spent before the write, from the remaining budget.
+//   2. runtime/pty-host.mjs:430-449 `retireRecovery` always mutates the global `armedRecovery`, and every call
+//      site in `streamFresh` (returns and catch paths alike) reaches it after its own captured attempt was
+//      already found stale. A callback that retires the old attempt and synchronously arms a newer one therefore
+//      has that newer attempt disarmed by the old continuation.
+//   3. runtime/pty-host.mjs:650-685 re-reads the global `armedRecovery` per decoded event, so the remaining
+//      events of an old read can set flags on, or be streamed as fresh bytes of, a newer attempt.
+//   4. runtime/pty-host.mjs presentOrderedTo checks input eligibility only. An already-live member therefore
+//      receives the interval twice — once through the fresh route and once through the broadcast — and its
+//      acknowledgement can never clear anything, so the attempt stays armed forever.
+// ---------------------------------------------------------------------------------------------------------
+
+/** A resync-required member whose transport is genuinely drained: the precondition a queue bound needs. */
+async function drainedResyncMember({ answer, client, queuedByteCap = 1024 } = /** @type {any} */ ({})) {
+  const channel = await openChannel({ protocol: 2, answer });
+  const { owner, host: created } = consumerHost({ channel: channel.channel, presentMarkers: markers, queuedByteCap });
+  const target = client ?? terminalOutputClient({ stall: true });
+  const member = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: target.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  // Fall behind while stalled — the burst has to really pass this host's cap — then finish everything that was
+  // handed over, so the transport is genuinely empty before recovery is asked for.
+  target.stall();
+  created.broadcastOwnerOutput(bytes("x".repeat(queuedByteCap * 2)));
+  target.releaseWrites();
+  expect(created.attachments().find((entry) => entry.attachmentId === "recovering")).toMatchObject({ state: "resync-required", inputEligible: true });
+  // The precondition, asserted rather than assumed: nothing of the initialization or the burst is outstanding.
+  expect(target.queuedBytes()).toBe(0);
+  return { channel, created, owner, target, member };
+}
+
+it("spends the queued byte cap before the write, not after it", async () => {
+  if (!withCohort) return;
+  const nonce = "prospective-nonce-1";
+  const identity = frameId();
+  const cap = 1024;
+  const target = terminalOutputClient({ highWaterMark: 16 });
+  const { created, member } = await drainedResyncMember({ answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }), client: target, queuedByteCap: cap });
+  const armed = /** @type {any} */ (await created.presentOrderedTo(member.epoch));
+  const token = armed.ordering.token;
+  created.broadcastOwnerOutput(bytes(markers.encodeNativePresentBegin(token)));
+  expect(created.recoveryState()).toMatchObject({ observedBegin: true });
+
+  // Now the client stops finishing its writes, with nothing outstanding: the fresh route is what fills its queue.
+  target.stall();
+  expect(target.queuedBytes()).toBe(0);
+  const writesBeforeFrame = target.sinkWrites();
+  // The burst that made this member fall behind is spent; from here the fresh route is the only writer, and its
+  // own high-water mark is what the cap has to bound.
+  target.resetPeak();
+  expect(target.peakQueued()).toBe(0);
+
+  // A body larger than the peer maximum, under a cap smaller than the peer maximum.
+  const frame = "P".repeat(markers.NATIVE_PRESENT_FRESH_CHUNK_MAX * 2);
+  expect(cap).toBeLessThan(markers.NATIVE_PRESENT_FRESH_CHUNK_MAX);
+  created.broadcastOwnerOutput(bytes(frame));
+
+  // The intended fresh write really happened, was sized by the remaining budget rather than by the peer
+  // maximum, answered false, and was counted exactly once.
+  const freshSizes = target.handedSizes().slice(writesBeforeFrame);
+  expect(freshSizes).toEqual([cap]);
+  expect(created.recoveryCounts()).toMatchObject({ freshBytes: cap, freshChunks: 1, retiredBackpressure: 1 });
+  expect(target.peakQueued()).toBeLessThanOrEqual(cap);
+  expect(created.recoveryState()).toBe(null);
+
+  // Nothing follows the stop, and the member is neither evicted nor disabled.
+  created.broadcastOwnerOutput(bytes(`${frame}${markers.encodeNativePresentEnd(token, identity)}`));
+  expect(target.handedSizes().slice(writesBeforeFrame)).toEqual([cap]);
+  expect(created.acknowledgePresentation(member.epoch, nonce)).toMatchObject({ cleared: false, reason: "no-armed-recovery" });
+  expect(created.attachments()[0]).toMatchObject({ attachmentId: "recovering", state: "resync-required", inputEligible: true });
+  target.releaseWrites();
+});
+
+it("refuses a fresh write outright when the queue already holds the whole budget", async () => {
+  if (!withCohort) return;
+  const nonce = "prospective-nonce-2";
+  const identity = frameId();
+  const cap = 1024;
+  const target = terminalOutputClient({ highWaterMark: 16 });
+  const { created, member } = await drainedResyncMember({ answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }), client: target, queuedByteCap: cap });
+  const armed = /** @type {any} */ (await created.presentOrderedTo(member.epoch));
+  const token = armed.ordering.token;
+  created.broadcastOwnerOutput(bytes(markers.encodeNativePresentBegin(token)));
+
+  // The transport is stalled with the whole budget outstanding before the frame arrives.
+  target.stall();
+  target.sink.write(new Uint8Array(cap));
+  expect(target.queuedBytes()).toBe(cap);
+  const writesBeforeFrame = target.sinkWrites();
+
+  created.broadcastOwnerOutput(bytes("Q".repeat(4096)));
+  // No fresh write was attempted at all: there was no budget for one.
+  expect(target.sinkWrites()).toBe(writesBeforeFrame);
+  expect(created.recoveryCounts()).toMatchObject({ freshChunks: 0, retiredBackpressure: 1 });
+  expect(created.recoveryState()).toBe(null);
+  expect(created.attachments()[0]).toMatchObject({ state: "resync-required", inputEligible: true });
+  target.releaseWrites();
+});
+
+/**
+ * One reentry case: a caller callback retires the old attempt with a real resize and synchronously arms a
+ * distinct newer one, then either returns or throws. The newer attempt must survive the old continuation.
+ *
+ * @param {{ from: "queued-before-write" | "queued-after-write" | "write", thenThrow?: boolean }} where
+ */
+async function reentryArmsNewerAttempt({ from, thenThrow = false }) {
+  const identity = frameId();
+  const firstNonce = `reentry-first-${from}`;
+  const secondNonce = `reentry-second-${from}`;
+  /** @type {any[]} */
+  const answered = [];
+  const channel = await openChannel({
+    protocol: 2,
+    answer: (/** @type {any} */ command) => {
+      answered.push(command);
+      const second = answered.length === 2;
+      return orderedResult(command, {
+        frameId: identity,
+        nonce: second ? secondNonce : firstNonce,
+        columns: second ? 120 : 100,
+        rows: second ? 40 : 30,
+        geometryRevision: second ? 2 : 1,
+      });
+    },
+  });
+  /** @type {any} */
+  let created = null;
+  /** @type {any} */
+  let member = null;
+  let reentered = false;
+  /** @type {any} */
+  let newerAttempt = null;
+  /** @type {any} */
+  let pendingSecond = null;
+  const reenter = () => {
+    if (reentered) return;
+    reentered = true;
+    // A real resize retires the old attempt and leaves this member resync-required, so a new request for the
+    // same connection is genuinely admissible rather than accidentally refused.
+    created.resize({ cols: 120, rows: 40, from: member.epoch });
+    pendingSecond = created.presentOrderedTo(member.epoch);
+    newerAttempt = created.recoveryState();
+    if (thenThrow) throw new Error(`the client's transport threw after arming a newer attempt from ${from}`);
+  };
+  let hookArmed = false;
+  const target = terminalOutputClient({
+    onSinkWrite: () => {
+      if (hookArmed && from === "write") reenter();
+    },
+    onQueuedBytes: (index) => {
+      if (from === "queued-before-write" && index === 1) reenter();
+      if (from === "queued-after-write" && index === 2) reenter();
+    },
+  });
+  const opened = consumerHost({ channel: channel.channel, presentMarkers: markers, queuedByteCap: markers.NATIVE_PRESENT_FRESH_CHUNK_MAX * 4 });
+  created = opened.host;
+  const admitted = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: target.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  member = admitted;
+  target.stall();
+  created.broadcastOwnerOutput(bytes("x".repeat(markers.NATIVE_PRESENT_FRESH_CHUNK_MAX * 5)));
+  target.releaseWrites();
+  expect(created.attachments()[0]).toMatchObject({ state: "resync-required" });
+  expect(target.queuedBytes()).toBe(0);
+
+  const first = /** @type {any} */ (await created.presentOrderedTo(admitted.epoch));
+  const firstToken = first.ordering.token;
+  created.broadcastOwnerOutput(bytes(markers.encodeNativePresentBegin(firstToken)));
+  expect(created.recoveryState()).toMatchObject({ token: firstToken, observedBegin: true });
+  target.armQueueHook();
+  hookArmed = true;
+
+  // The old attempt's own fresh span, during which the callback moves everything.
+  created.broadcastOwnerOutput(bytes("Z".repeat(markers.NATIVE_PRESENT_FRESH_CHUNK_MAX + 128)));
+  expect(reentered).toBe(true);
+  return { created, target, channel, member: admitted, identity, firstToken, secondNonce, newerAttempt, pendingSecond };
+}
+
+for (const from of /** @type {("queued-before-write" | "queued-after-write" | "write")[]} */ (["queued-before-write", "queued-after-write", "write"])) {
+  for (const thenThrow of [false, true]) {
+    it(`keeps a newer attempt armed when a ${from} callback retires the old one and ${thenThrow ? "throws" : "returns"}`, async () => {
+      if (!withCohort) return;
+      const { created, target, member, identity, firstToken, secondNonce, newerAttempt, pendingSecond } = await reentryArmsNewerAttempt({ from, thenThrow });
+
+      // A distinct newer attempt really was armed inside the callback.
+      expect(newerAttempt).not.toBe(null);
+      expect(newerAttempt.token).not.toBe(firstToken);
+
+      // It survived the old continuation, with none of the old attempt's fresh-byte accounting or flags.
+      const surviving = /** @type {any} */ (created.recoveryState());
+      expect(surviving).not.toBe(null);
+      expect(surviving.token).toBe(newerAttempt.token);
+      expect(surviving.observedBegin).toBe(false);
+      expect(surviving.observedEnd).toBe(false);
+      expect(surviving.freshBytes).toBe(0);
+
+      // And it can still complete on its own receipt: its own control result, its own BEGIN, body and END, then
+      // its own acknowledgement.
+      expect(await pendingSecond).toMatchObject({ presented: true, recoveryArmed: true, ordering: { token: surviving.token } });
+      const body = "N";
+      created.broadcastOwnerOutput(bytes(`${markers.encodeNativePresentBegin(surviving.token)}${body}${markers.encodeNativePresentEnd(surviving.token, identity)}`));
+      const proved = /** @type {any} */ (created.recoveryState());
+      expect(proved).toMatchObject({ token: surviving.token, observedBegin: true, observedEnd: true, acknowledgeable: true });
+      expect(created.acknowledgePresentation(member.epoch, secondNonce)).toEqual({ cleared: true, reason: null });
+      expect(created.attachments()[0]).toMatchObject({ state: "live" });
+      target.releaseWrites();
+    });
+  }
+}
+
+it("fails a later fresh chunk after an accepted prefix, and still gives live members every byte once", async () => {
+  if (!withCohort) return;
+  const nonce = "mid-span-nonce-1";
+  const identity = frameId();
+  const chunkMax = markers.NATIVE_PRESENT_FRESH_CHUNK_MAX;
+  // A cap well above the peer maximum, so the peer maximum is what sizes the chunks and more than one is sent.
+  const target = terminalOutputClient({ highWaterMark: chunkMax * 8, throwAt: 2, admitBeforeThrow: 7 });
+  const channel = await openChannel({ protocol: 2, answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }) });
+  const { host: created } = consumerHost({ channel: channel.channel, presentMarkers: markers, queuedByteCap: chunkMax * 4 });
+  const watcher = terminalOutputClient({ highWaterMark: chunkMax * 8 });
+  created.attach({ attachmentId: "live", sink: watcher.sink, declared: { capabilities: { ...CAPABILITIES } } });
+  const member = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: target.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  target.stall();
+  created.broadcastOwnerOutput(bytes("y".repeat(chunkMax * 5)));
+  target.releaseWrites();
+  expect(created.attachments().find((entry) => entry.attachmentId === "recovering")).toMatchObject({ state: "resync-required" });
+  expect(created.attachments().find((entry) => entry.attachmentId === "live")).toMatchObject({ state: "live" });
+
+  const armed = /** @type {any} */ (await created.presentOrderedTo(member.epoch));
+  const token = armed.ordering.token;
+  created.broadcastOwnerOutput(bytes(markers.encodeNativePresentBegin(token)));
+  target.armFault();
+  const acceptedBeforeFrame = target.acceptedBytes();
+  const watcherBefore = watcher.acceptedText();
+
+  // Two chunks: the first is accepted whole, the second admits seven bytes and then throws.
+  const body = "M".repeat(chunkMax + 512);
+  created.broadcastOwnerOutput(bytes(body));
+
+  expect(target.freshWrites()).toBe(2);
+  expect(target.acceptedBytes() - acceptedBeforeFrame).toBe(chunkMax + 7);
+  expect(created.recoveryCounts()).toMatchObject({ retiredUncertain: 1 });
+  expect(created.recoveryState()).toBe(null);
+
+  // Every non-framing byte reached the live member once, in order, with no marker byte.
+  expect(watcher.acceptedText().slice(watcherBefore.length)).toBe(body);
+  expect(watcher.acceptedText()).not.toContain("pi-native-present");
+
+  // No later fresh write, and the ordinary tail stays away from the resync target.
+  const acceptedAfterFailure = target.acceptedBytes();
+  created.broadcastOwnerOutput(bytes("-ordinary-tail"));
+  expect(target.freshWrites()).toBe(2);
+  expect(target.acceptedBytes()).toBe(acceptedAfterFailure);
+  expect(watcher.acceptedText().endsWith("-ordinary-tail")).toBe(true);
+  expect(created.acknowledgePresentation(member.epoch, nonce)).toMatchObject({ cleared: false, reason: "no-armed-recovery" });
+  expect(created.attachments().find((entry) => entry.attachmentId === "recovering")).toMatchObject({ state: "resync-required", inputEligible: true });
+});
+
+it("refuses managed recovery for a member that is already live, rather than delivering twice and waiting forever", async () => {
+  if (!withCohort) return;
+  const nonce = "already-live-nonce-1";
+  const identity = frameId();
+  const channel = await openChannel({ protocol: 2, answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }) });
+  const { host: created } = consumerHost({ channel: channel.channel, presentMarkers: markers, queuedByteCap: 1024 * 64 });
+  const healthy = terminalOutputClient({ highWaterMark: 1024 * 64 });
+  const member = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "healthy", sink: healthy.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  created.broadcastOwnerOutput(bytes("keeping up"));
+  expect(created.attachments()[0]).toMatchObject({ attachmentId: "healthy", state: "live" });
+
+  const refused = /** @type {any} */ (await created.presentOrderedTo(member.epoch));
+  expect(refused).toMatchObject({ presented: false, refusal: "member-not-resync-required" });
+  // Nothing was armed and no command was sent, so there is no attempt waiting for an acknowledgement that a
+  // live member can never give: the attachment set only clears `resync-required`.
+  expect(created.recoveryState()).toBe(null);
+  expect(channel.commands).toEqual([]);
+
+  // Ordinary output still reaches it exactly once, through the one route it has.
+  const before = healthy.acceptedText();
+  created.broadcastOwnerOutput(bytes("one-copy"));
+  expect(healthy.acceptedText().slice(before.length)).toBe("one-copy");
+  expect(healthy.acceptedText().match(/one-copy/gu)).toHaveLength(1);
+
+  // Plain local-only presentation is a separate API and is unaffected by this refusal.
+  expect(await created.presentTo(member.epoch)).toMatchObject({ presented: false, refusal: "presentation-channel-unavailable" });
 });

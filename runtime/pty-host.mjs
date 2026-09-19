@@ -426,10 +426,20 @@ export function createPtyHost({
   let requestSequence = 0;
   const recoveryCounts = { armed: 0, refusedAdmission: 0, freshChunks: 0, freshBytes: 0, failed: 0, acknowledgeable: 0, cleared: 0, retiredBackpressure: 0, retiredUncertain: 0, retiredGeometry: 0, lastRetirement: /** @type {string | null} */ (null) };
 
-  /** Stop recognising this attempt's framing, whatever ended it. No tail is kept and nothing is replayed.
-   * @param {string | null} failure */
-  const retireRecovery = (failure) => {
+  /**
+   * Stop recognising one attempt's framing, whatever ended it. No tail is kept and nothing is replayed.
+   *
+   * `forAttempt` is the attempt the caller was working on. Retirement belongs to that attempt and to no other:
+   * a continuation that discovers its own attempt has already been replaced must not disarm whatever is armed
+   * now, because a caller callback can retire the old attempt and arm a newer one in the same synchronous turn.
+   * Passing `null` means "whatever is armed", which is only correct for a caller that is not inside a
+   * continuation of an older attempt.
+   *
+   * @param {string | null} failure @param {any} [forAttempt]
+   */
+  const retireRecovery = (failure, forAttempt = null) => {
     if (armedRecovery === null) return;
+    if (forAttempt !== null && forAttempt !== armedRecovery) return;
     if (failure !== null) {
       recoveryCounts.failed += 1;
       recoveryCounts.lastRetirement = failure;
@@ -486,13 +496,16 @@ export function createPtyHost({
    * Hand one fresh span to the one client this attempt is repainting, in bounded chunks.
    *
    * Three bounds apply, and the first two are the peer's and this host's own declared numbers rather than
-   * advice. `freshChunkMax` sizes each chunk. `queuedByteCap` bounds what may be outstanding in that client's
-   * transport, judged the way the attachment set judges it: the queue is read after a write, and a queue that is
-   * past the cap stops the route. So at most the chunk already in flight can exceed the cap — a write's effect
-   * cannot be known before it happens — and nothing further is written, buffered, queued or replayed. A `false`
-   * return is Node's high-water mark: those bytes were admitted exactly once and are never rewritten, and it
-   * ends the route for this attempt because the next chunk would only grow a queue that is already full.
-   * A throw leaves what the transport accepted unknown, which can never authorize a retry.
+   * advice. `freshChunkMax` is the largest chunk the peer declared. `queuedByteCap` is the whole budget this
+   * client's transport may hold, and it is spent **before** a write rather than checked after one: each chunk is
+   * sized to whatever remains of that budget, so no write is issued for more bytes than the cap allows and the
+   * queue never crosses it. A budget already spent refuses the write outright. This depends on one stated
+   * property of a sink: `queuedBytes()` counts the bytes it has accepted and not yet completed, so
+   * `queued + chunk.byteLength` is the queue that write produces.
+   *
+   * A `false` return is Node's high-water mark: those bytes were admitted exactly once and are never rewritten,
+   * and it ends the route for this attempt under the conservative policy. A throw leaves what the transport
+   * accepted unknown, which can never authorize a retry.
    *
    * The client is neither evicted nor disabled by any of this, the owner's output is never stalled for it, and
    * nothing after the stop is written. The cost is recovery liveness: a client that cannot take a frame inside
@@ -500,12 +513,13 @@ export function createPtyHost({
    *
    * Every write and every queue read is a call into the caller's own transport, so after each one this checks
    * that the same attempt and the same admitted connection are still current — the same rule admission follows.
+   * When they are not, this continuation stops and retires **its own** attempt only: a callback may already have
+   * armed a newer one, and that newer attempt is not this continuation's to disarm.
    *
-   * @param {Uint8Array} span
+   * @param {Uint8Array} span @param {any} attempt
    */
-  const streamFresh = (span) => {
-    const attempt = armedRecovery;
-    if (attempt === null) return;
+  const streamFresh = (span, attempt) => {
+    if (attempt === null || armedRecovery !== attempt) return;
     /** The exact connection and prepared handoff this attempt is repainting, or `null` if it moved. */
     const currentTarget = () => {
       if (armedRecovery !== attempt || attempt.failure !== null) return null;
@@ -515,63 +529,55 @@ export function createPtyHost({
     };
     let held = currentTarget();
     if (held === null) {
-      retireRecovery("attachment-retired");
+      retireRecovery("attachment-retired", attempt);
       return;
     }
-    const bound = orderedPresentation.active ? orderedPresentation.declared.freshChunkMax : span.byteLength;
-    for (let offset = 0; offset < span.byteLength; offset += bound) {
-      const chunk = span.subarray(offset, Math.min(offset + bound, span.byteLength));
+    const peerMax = orderedPresentation.active ? orderedPresentation.declared.freshChunkMax : span.byteLength;
+    let offset = 0;
+    while (offset < span.byteLength) {
       let queued;
       try {
         queued = held.prepared.queuedBytes();
       } catch {
-        retireRecovery("fresh-route-queue-unreadable");
+        retireRecovery("fresh-route-queue-unreadable", attempt);
         return;
       }
       // Reading the queue is a call into the transport too, so the attempt may be gone by now.
       if (currentTarget() === null) {
-        retireRecovery("attachment-retired");
+        retireRecovery("attachment-retired", attempt);
         return;
       }
       if (!Number.isSafeInteger(queued) || /** @type {number} */ (queued) < 0) {
-        retireRecovery("fresh-route-queue-unreadable");
+        retireRecovery("fresh-route-queue-unreadable", attempt);
         return;
       }
-      if (/** @type {number} */ (queued) > queuedByteCap) {
-        retireRecovery("fresh-route-backpressure");
+      const budget = queuedByteCap - /** @type {number} */ (queued);
+      if (budget <= 0) {
+        retireRecovery("fresh-route-backpressure", attempt);
         return;
       }
+      const chunk = span.subarray(offset, offset + Math.min(peerMax, budget, span.byteLength - offset));
       let admitted;
       try {
         admitted = held.prepared.write(chunk);
       } catch {
-        retireRecovery("fresh-write-uncertain");
+        retireRecovery("fresh-write-uncertain", attempt);
         return;
       }
       // Accepted exactly once, counted exactly once, and never written again whatever the return said.
+      offset += chunk.byteLength;
       attempt.freshBytes += chunk.byteLength;
       attempt.freshChunks += 1;
       recoveryCounts.freshBytes += chunk.byteLength;
       recoveryCounts.freshChunks += 1;
       const stillCurrent = currentTarget();
       if (stillCurrent === null) {
-        retireRecovery("attachment-retired");
+        retireRecovery("attachment-retired", attempt);
         return;
       }
       held = stillCurrent;
-      let queuedAfter;
-      try {
-        queuedAfter = held.prepared.queuedBytes();
-      } catch {
-        retireRecovery("fresh-route-queue-unreadable");
-        return;
-      }
-      if (currentTarget() === null) {
-        retireRecovery("attachment-retired");
-        return;
-      }
-      if (admitted === false || !Number.isSafeInteger(queuedAfter) || /** @type {number} */ (queuedAfter) > queuedByteCap) {
-        retireRecovery("fresh-route-backpressure");
+      if (admitted === false) {
+        retireRecovery("fresh-route-backpressure", attempt);
         return;
       }
     }
@@ -589,19 +595,19 @@ export function createPtyHost({
     if (attempt === null || attempt.acknowledgeable || attempt.failure !== null) return;
     if (attempt.control === null || attempt.observedEnd === null) return;
     if (attempt.observedEnd.frameId !== attempt.control.frameId) {
-      retireRecovery("frame-identity-mismatch");
+      retireRecovery("frame-identity-mismatch", attempt);
       return;
     }
     if (attempt.skippedOrdinaryAfterEnd) {
-      retireRecovery("ordinary-output-skipped-after-end");
+      retireRecovery("ordinary-output-skipped-after-end", attempt);
       return;
     }
     if (attempt.geometryRevision !== geometryRevision) {
-      retireRecovery("geometry-moved");
+      retireRecovery("geometry-moved", attempt);
       return;
     }
     if (!attachmentSet.recordPresentationNonce(attempt.epoch, attempt.control.presentationNonce)) {
-      retireRecovery("attachment-retired");
+      retireRecovery("attachment-retired", attempt);
       return;
     }
     attempt.acknowledgeable = true;
@@ -621,13 +627,16 @@ export function createPtyHost({
    * @param {Uint8Array} bytes
    */
   const decodeArmedRead = (bytes) => {
+    // One read belongs to the attempt that was armed when it started. A caller callback can retire that attempt
+    // and arm a newer one part-way through these events; the remaining events are still the old read's, so they
+    // are neither streamed as the newer attempt's frame nor allowed to set its flags.
     const attempt = /** @type {NonNullable<typeof armedRecovery>} */ (armedRecovery);
     /** @type {any[]} */
     let events;
     try {
       events = attempt.decoder.decode(bytes);
     } catch (cause) {
-      retireRecovery("decoder-refused-read");
+      retireRecovery("decoder-refused-read", attempt);
       return attachmentSet.broadcast(bytes);
     }
     /** @type {import("./attachment-set.mjs").BroadcastResult} */
@@ -635,12 +644,12 @@ export function createPtyHost({
     /** @param {Uint8Array} span @param {boolean} insideInterval */
     const ordinary = (span, insideInterval) => {
       if (span.byteLength === 0) return;
-      if (!insideInterval && armedRecovery !== null && armedRecovery.observedEnd !== null) {
+      if (!insideInterval && armedRecovery === attempt && attempt.observedEnd !== null) {
         // The repainting member is still `resync-required`, so the set skipped it: its screen is behind again
         // and this attempt can no longer be acknowledged, even when the control result succeeded already.
-        armedRecovery.skippedOrdinaryAfterEnd = true;
-        const alreadyProved = armedRecovery.acknowledgeable;
-        if (alreadyProved) retireRecovery("ordinary-output-skipped-after-end");
+        attempt.skippedOrdinaryAfterEnd = true;
+        const alreadyProved = attempt.acknowledgeable;
+        if (alreadyProved) retireRecovery("ordinary-output-skipped-after-end", attempt);
       }
       const broadcast = attachmentSet.broadcast(span);
       result.delivered.push(...broadcast.delivered);
@@ -649,7 +658,9 @@ export function createPtyHost({
       result.failures.push(...broadcast.failures);
     };
     for (const event of events) {
-      const open = armedRecovery !== null && armedRecovery.open;
+      // `mine` is the whole condition for touching framing state: this read's own attempt is still the armed one.
+      const mine = armedRecovery === attempt && attempt.failure === null;
+      const open = mine && attempt.open;
       if (event.kind === "bytes" || event.kind === "refused") {
         // A refusal is not a loss: the candidate's bytes are reproduced, so they travel the route their phase
         // says. A refused candidate carrying this attempt's token still ends the attempt.
@@ -659,30 +670,31 @@ export function createPtyHost({
         // every member that is keeping up. The attachment set skips a `resync-required` member, so the member
         // being repainted receives them once, through the authorized fresh route only — and the live members do
         // not lose the frame body or anything interleaved with it. The broadcast happens even when the fresh
-        // route has just been retired: one client's transport is not the others' problem.
+        // route has just been retired, or when a newer attempt has taken over: one client's transport, and one
+        // superseded attempt, are not the other members' problem.
         if (open) {
-          streamFresh(event.bytes);
+          streamFresh(event.bytes, attempt);
           ordinary(event.bytes, true);
         } else {
           ordinary(event.bytes, false);
         }
-        if (event.kind === "refused") retireRecovery(`framing-refused:${event.reason}`);
+        if (event.kind === "refused" && mine) retireRecovery(`framing-refused:${event.reason}`, attempt);
         continue;
       }
-      if (armedRecovery === null || event.token !== armedRecovery.token) continue;
+      if (!mine || event.token !== attempt.token) continue;
       if (event.kind === "begin") {
-        armedRecovery.observedBegin = true;
-        armedRecovery.open = true;
+        attempt.observedBegin = true;
+        attempt.open = true;
         continue;
       }
       if (event.kind === "end") {
-        armedRecovery.open = false;
-        armedRecovery.observedEnd = { frameId: event.frameId };
+        attempt.open = false;
+        attempt.observedEnd = { frameId: event.frameId };
         completeRecoveryIfProved();
         continue;
       }
       // ABORT says the attempt failed. It undoes nothing, and a frame or even an END may already have gone out.
-      retireRecovery("aborted");
+      retireRecovery("aborted", attempt);
     }
     return result;
   };
@@ -1117,6 +1129,16 @@ export function createPtyHost({
         return { presented: false, refusal: "ordered-presentation-unavailable", reason: orderedPresentation.reason, attachmentEpoch: asked };
       }
       if (!attachmentSet.isInputEligible(asked)) return { presented: false, refusal: "not-attached", attachmentEpoch: asked };
+      // Managed recovery repaints a member the attachment set is holding back. A member that is keeping up is
+      // already receiving the owner's output on the one route it has, so arming an attempt for it would hand it
+      // the interval twice and then wait for an acknowledgement that cannot clear anything: the set clears only
+      // `resync-required`. Refusing by name keeps one delivery path and a truthful completion, and leaves the
+      // separate local-only `presentTo` untouched. Task11's membership rules are not changed by this.
+      const memberState = attachmentSet.attachments().find((entry) => entry.attachmentId === asked.attachmentId && entry.epoch === asked.epoch)?.state;
+      if (memberState !== "resync-required") {
+        recoveryCounts.refusedAdmission += 1;
+        return { presented: false, refusal: "member-not-resync-required", memberState: memberState ?? null, attachmentEpoch: asked };
+      }
       if (childPhaseRecord !== null) return { presented: false, refusal: "child-owns-terminal", attachmentEpoch: asked };
       if (typeof presentation?.send !== "function") return { presented: false, refusal: "presentation-channel-unavailable", attachmentEpoch: asked };
       if (armedRecovery !== null) {
@@ -1180,7 +1202,7 @@ export function createPtyHost({
         frame.ordering?.token === token &&
         frame.ordering?.version === orderedPresentation.declared.version;
       if (!bound) {
-        retireRecovery("control-result-unbound");
+        retireRecovery("control-result-unbound", attempt);
         presentationCounts.refused += 1;
         return { presented: false, refusal: "control-result-unbound", attachmentEpoch: asked };
       }
@@ -1192,12 +1214,12 @@ export function createPtyHost({
       ) {
         // The inner ordering carries the same version/token pair plus the codec. A missing or different inner
         // version is not the framing this host armed, so it is refused rather than read past.
-        retireRecovery("control-result-negative");
+        retireRecovery("control-result-negative", attempt);
         presentationCounts.refused += 1;
         return { presented: false, refusal: typeof result?.refusal === "string" ? result.refusal : "control-result-negative", attachmentEpoch: asked };
       }
       if (!presentMarkers.isNativePresentFrameId(result.frame?.frameId) || typeof result.presentationNonce !== "string") {
-        retireRecovery("receipt-identity-unusable");
+        retireRecovery("receipt-identity-unusable", attempt);
         presentationCounts.refused += 1;
         return { presented: false, refusal: "receipt-identity-unusable", attachmentEpoch: asked };
       }
@@ -1205,7 +1227,7 @@ export function createPtyHost({
       const stale = result.geometryRevision !== geometryRevision || result.frame.columns !== geometryCols || result.frame.rows !== geometryRows;
       if (stale) {
         presentationCounts.staleReceipt += 1;
-        retireRecovery("stale-receipt");
+        retireRecovery("stale-receipt", attempt);
         return { presented: true, stale: true, recoveryArmed: false, attachmentEpoch: asked, presentationNonce: result.presentationNonce, frame: result.frame };
       }
       attempt.control = { presentationNonce: result.presentationNonce, frameId: result.frame.frameId };

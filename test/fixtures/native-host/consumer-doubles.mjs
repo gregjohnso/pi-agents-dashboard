@@ -346,16 +346,28 @@ export async function bootstrapChannel({ protocol = 2, orderedPresentation, answ
  * boundary a recovery acknowledgement is allowed to mean. Production client transport is a later task: this is
  * the deterministic harness that boundary is exercised through, not that transport.
  *
- * @param {{ highWaterMark?: number, failAt?: number, stall?: boolean, throwAt?: number, admitBeforeThrow?: number, onSinkWrite?: (index: number) => void }} [options]
+ * The sink's byte-accounting contract, which the prospective queue bound depends on: `queuedBytes()` is the
+ * exact number of bytes this transport has accepted and not yet completed — the `Writable`'s own
+ * `writableLength` — so it rises by exactly what a write handed over and falls only as the stream drains. A
+ * host may therefore treat `queuedBytes() + chunk.byteLength` as the queue that write would produce. `peakQueued`
+ * records the high-water mark that really occurred, so a case proves the bound instead of describing it.
+ *
+ * @param {{ highWaterMark?: number, failAt?: number, stall?: boolean, throwAt?: number, admitBeforeThrow?: number, onSinkWrite?: (index: number) => void, onQueuedBytes?: (index: number) => void }} [options]
  */
-export function terminalOutputClient({ highWaterMark = 64, failAt = -1, stall = false, throwAt = -1, admitBeforeThrow = 0, onSinkWrite } = {}) {
+export function terminalOutputClient({ highWaterMark = 64, failAt = -1, stall = false, throwAt = -1, admitBeforeThrow = 0, onSinkWrite, onQueuedBytes } = {}) {
   /** @type {Buffer[]} */
   const accepted = [];
   /** @type {(() => void)[]} */
   const held = [];
+  /** Every byte count this host handed to the sink, in order, so a case can assert the sizes it chose. */
+  /** @type {number[]} */
+  const handedSizes = [];
   let handed = 0;
   let writes = 0;
   let sinkWrites = 0;
+  let queueReads = 0;
+  let queueHookArmed = false;
+  let peakQueued = 0;
   let faultArmed = throwAt < 0;
   let faultCounter = 0;
   let stalled = stall;
@@ -388,12 +400,33 @@ export function terminalOutputClient({ highWaterMark = 64, failAt = -1, stall = 
       stalled = false;
       for (const settle of held.splice(0)) settle();
     },
+    /** Stop finishing writes again, so a drained client can be made slow for one recovery attempt. */
+    stall() {
+      stalled = true;
+    },
+    /** The largest queue this client's own transport ever really held. */
+    peakQueued: () => peakQueued,
+    /** Start measuring the high-water mark again, so a case bounds one route rather than the whole session. */
+    resetPeak() {
+      peakQueued = terminal.writableLength;
+    },
+    /** What this client's transport reports outstanding right now: the precondition a bound case asserts. */
+    queuedBytes: () => terminal.writableLength,
+    /** The byte count of every write handed over, in order. */
+    handedSizes: () => [...handedSizes],
     /** How many times the host wrote to this client's sink, so a case can prove no retry and no later chunk. */
     sinkWrites: () => sinkWrites,
+    /** How many times the host read this client's queue. */
+    queueReads: () => queueReads,
     /** Start counting toward `throwAt` now, so the fault lands on a chosen fresh chunk. */
     armFault() {
       faultArmed = true;
       faultCounter = 0;
+    },
+    /** Let `onQueuedBytes` fire from here on, so a case reenters from a chosen queue read. */
+    armQueueHook() {
+      queueHookArmed = true;
+      queueReads = 0;
     },
     /** Sink writes since the fault was armed: the writes a case is reasoning about, and nothing before them. */
     freshWrites: () => faultCounter,
@@ -403,6 +436,7 @@ export function terminalOutputClient({ highWaterMark = 64, failAt = -1, stall = 
       /** @param {Uint8Array} payload */
       write(payload) {
         sinkWrites += 1;
+        handedSizes.push(payload.byteLength);
         // The client's own transport speaking for itself: a hook that can reenter the host synchronously, and a
         // channel that admits a chosen prefix and then throws — the only shape a write with no accepted-byte
         // count can present.
@@ -415,14 +449,21 @@ export function terminalOutputClient({ highWaterMark = 64, failAt = -1, stall = 
           if (admitted > 0) {
             handed += admitted;
             terminal.write(Buffer.from(payload.subarray(0, admitted)));
+            peakQueued = Math.max(peakQueued, terminal.writableLength);
           }
           throw new Error(`the client's transport threw after admitting ${admitted} of ${payload.byteLength} bytes`);
         }
         handed += payload.byteLength;
         // A `false` return is this stream's high-water mark. The bytes are admitted once either way.
-        return terminal.write(Buffer.from(payload));
+        const accepting = terminal.write(Buffer.from(payload));
+        peakQueued = Math.max(peakQueued, terminal.writableLength);
+        return accepting;
       },
-      queuedBytes: () => terminal.writableLength,
+      queuedBytes() {
+        queueReads += 1;
+        if (queueHookArmed && onQueuedBytes !== undefined) onQueuedBytes(queueReads);
+        return terminal.writableLength;
+      },
       /** @param {() => void} listener */
       onDrain(listener) {
         terminal.on("drain", listener);

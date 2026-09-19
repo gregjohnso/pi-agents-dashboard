@@ -617,7 +617,7 @@ it("refuses when the endpoint it was handed is no longer its own socket, and lea
  * survives, keeps its identity and still answers. So the replacement is an actual listening socket with its own
  * accept handler, and the assertions check its inode, its mode and that it still accepts a connection.
  */
-async function liveReplacement(root) {
+async function liveReplacement(/** @type {string} */ root) {
   const socketPath = join(root, "live");
   /** @type {net.Socket[]} */
   const accepted = [];
@@ -633,7 +633,7 @@ async function liveReplacement(root) {
     socketPath,
     identity,
     /** Move this live socket onto another path, keeping the same inode: a rename, not a copy. */
-    async replaceOnto(target) {
+    async replaceOnto(/** @type {string} */ target) {
       await rm(target, { force: true });
       await rename(socketPath, target);
       return await lstat(target);
@@ -678,31 +678,34 @@ it("preserves a live listener another actor moved onto its endpoint, through its
   expect(`${outcome.retained}`).toMatch(/different socket occupies this endpoint's path and was left alone/u);
 });
 
-// The same preservation, when the replacement lands in the window between the close starting and the cleanup
-// deciding. The close is initiated first and the swap happens while it is settling.
+// The same preservation, when the replacement lands in the window between the close completing and the
+// ownership decision being made. Holding a connected client cannot script that window - this listener's own
+// teardown destroys the sockets it accepted before it closes the handle - so the replacement is injected
+// through the `during_close` seam, which fires exactly there. No sleep and no race.
 it("preserves a live listener that replaces its endpoint while the close is already running", async () => {
   const root = await socketRoot();
   const socketPath = join(root, "private", "o");
   const other = await liveReplacement(root);
+  /** @type {any} */
+  let replaced;
 
-  const listener = await listenForOwnerSideband({ socketPath, token: TOKEN });
-  // Hold a connected client so `server.close` cannot complete until it is destroyed: that is the window.
-  const client = net.createConnection(socketPath);
-  client.on("error", () => {});
-  await new Promise((resolve, reject) => {
-    client.once("connect", resolve);
-    client.once("error", reject);
+  const listener = await listenForOwnerSideband({
+    socketPath,
+    token: TOKEN,
+    failpoint: async (/** @type {string} */ stage) => {
+      if (stage !== "during_close") return;
+      replaced = await other.replaceOnto(socketPath);
+    },
   });
 
-  const closing = listener.close();
-  const replaced = await other.replaceOnto(socketPath);
-  client.destroy();
-  const outcome = await closing;
+  const outcome = await listener.close();
 
   const after = await lstat(socketPath);
   expect(String(after.ino)).toBe(String(replaced.ino));
+  expect(after.mode & 0o777).toBe(replaced.mode & 0o777);
   expect(await other.stillAnswers(socketPath)).toBe("alive\n");
   expect(outcome).toMatchObject({ removed: false });
+  expect(`${outcome.retained}`).toMatch(/different socket occupies this endpoint's path and was left alone/u);
 });
 
 // A non-socket entry is not this attempt's either. A regular file another actor left at the path keeps its
@@ -714,11 +717,14 @@ it("preserves a foreign regular file at its endpoint path and leaves its mode al
   const listener = await listenForOwnerSideband({ socketPath, token: TOKEN });
   await rm(socketPath);
   await writeFile(socketPath, "not this attempt's\n", { mode: 0o644 });
+  // Whatever the umask made of that request is the baseline: the point is that cleanup changes nothing.
+  const created = await lstat(socketPath);
 
   const outcome = await listener.close();
 
   expect(await readFile(socketPath, "utf8")).toBe("not this attempt's\n");
-  expect((await lstat(socketPath)).mode & 0o777).toBe(0o644);
+  expect((await lstat(socketPath)).mode & 0o777).toBe(created.mode & 0o777);
+  expect(String((await lstat(socketPath)).ino)).toBe(String(created.ino));
   expect(outcome).toMatchObject({ removed: false });
   expect(`${outcome.retained}`).toMatch(/non-socket entry occupies this endpoint's path and was left alone/u);
 });

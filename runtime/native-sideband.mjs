@@ -74,7 +74,7 @@ const MISSING_METHODS = ["shutdown", "abort", "isIdle", "hasPendingMessages"];
 /** A sideband failure callers can handle without reading its text. The text never carries a credential. */
 export class NativeSidebandError extends Error {
   /**
-   * @param {"SIDEBAND_PATH_UNUSABLE"|"SIDEBAND_TOKEN_UNUSABLE"|"SIDEBAND_BOUND_UNUSABLE"|"SIDEBAND_LISTENER_UNUSABLE"|"SIDEBAND_UNREACHABLE"|"SIDEBAND_CLOSED"|"SIDEBAND_FRAME_REFUSED"} code
+   * @param {"SIDEBAND_PATH_UNUSABLE"|"SIDEBAND_TOKEN_UNUSABLE"|"SIDEBAND_BOUND_UNUSABLE"|"SIDEBAND_LISTENER_UNUSABLE"|"SIDEBAND_UNREACHABLE"|"SIDEBAND_CLOSED"|"SIDEBAND_FRAME_REFUSED"|"SIDEBAND_BINDER_UNUSABLE"|"SIDEBAND_BINDER_DISCONNECTED"|"SIDEBAND_BINDER_PROTOCOL"|"SIDEBAND_BINDER_REFUSED"|"SIDEBAND_BINDER_TIMEOUT"|"SIDEBAND_BINDER_INCOMPLETE"|"SIDEBAND_BIND_FAILED"|"SIDEBAND_ENDPOINT_UNUSABLE"|"EADDRINUSE"} code
    * @param {string} message
    * @param {{ cause?: unknown }} [options]
    */
@@ -500,10 +500,9 @@ function sameEntry(snapshot, metadata) {
  * - The endpoint's identity, type, owner and mode are captured before any application callback exists, so the
  *   snapshot cleanup compares against cannot have been influenced by a connection this listener served.
  *
- * @param {{ socketPath: string, execPath?: string, timeoutMs?: number,
- *   failpoint?: (stage: "after_handoff") => Promise<void> }} request
+ * @param {{ socketPath: string, execPath?: string, timeoutMs?: number }} request
  */
-async function bindThroughHelper({ socketPath, execPath = process.execPath, timeoutMs = BINDER_HANDOFF_TIMEOUT_MS, failpoint }) {
+async function bindThroughHelper({ socketPath, execPath = process.execPath, timeoutMs = BINDER_HANDOFF_TIMEOUT_MS }) {
   const helper = fork(BINDER_ENTRY, [socketPath], {
     execPath,
     // Nothing of this process's own invocation reaches the helper: no inherited V8 or loader flags, no
@@ -512,14 +511,14 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
     env: { PATH: "/usr/bin:/bin" },
     // Its stdout and stderr are streams for a human, never a protocol; the handle arrives on the IPC channel.
     stdio: ["ignore", "pipe", "pipe", "ipc"],
-    shell: false,
+    // `fork` never goes through a shell, so there is no shell option to disable here.
     detached: false,
     windowsHide: true,
   });
 
   /** @type {string[]} */
   const diagnostics = [];
-  const collect = (chunk) => {
+  const collect = (/** @type {unknown} */ chunk) => {
     if (diagnostics.length >= 16) return;
     diagnostics.push(String(chunk).slice(0, 512));
   };
@@ -541,7 +540,7 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
     settle = () => resolve(undefined);
   });
 
-  /** @param {string} code @param {string} message */
+  /** @param {any} code @param {string} message */
   const refuse = (code, message) => {
     if (refusal === undefined) refusal = { code, message };
     settle();
@@ -617,7 +616,6 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
     if (exited?.code !== 0) {
       throw new NativeSidebandError("SIDEBAND_BINDER_INCOMPLETE", `the socket binder handed over a listener and then exited with code ${exited?.code} signal ${exited?.signal}`);
     }
-    if (failpoint !== undefined) await failpoint("after_handoff");
     // Captured before any application callback exists, so nothing this listener serves can influence it.
     const metadata = await lstat(socketPath, { bigint: false });
     if (metadata.isSymbolicLink()) throw new NativeSidebandError("SIDEBAND_ENDPOINT_UNUSABLE", "The owner sideband endpoint must not be a symbolic link");
@@ -649,7 +647,7 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
  *
  * @param {{ socketPath: string, token: string, maxFrameBytes?: number, maxQueuedFrames?: number, handshakeTimeoutMs?: number,
  *   binderTimeoutMs?: number, execPath?: string,
- *   failpoint?: (stage: "after_handoff") => Promise<void> }} options
+ *   failpoint?: (stage: "after_handoff"|"during_close") => Promise<void> }} options
  */
 export async function listenForOwnerSideband(options) {
   const { socketPath, token, maxFrameBytes, maxQueuedFrames, handshakeTimeoutMs } = boundedOptions(options);
@@ -681,7 +679,6 @@ export async function listenForOwnerSideband(options) {
     socketPath,
     execPath: options.execPath,
     timeoutMs: options.binderTimeoutMs,
-    failpoint,
   });
 
   const onConnection = (/** @type {net.Socket} */ socket) => {
@@ -739,6 +736,9 @@ export async function listenForOwnerSideband(options) {
     discarding = true;
     for (const socket of [...sockets]) socket.destroy();
     await new Promise((resolve) => server.close(() => resolve(undefined)));
+    // The window the decision names: the listening handle is released and the ownership decision has not been
+    // made yet. A replacement that lands here must still be preserved.
+    await failpoint("during_close").catch(() => {});
     /** @type {any} */
     let metadata;
     try {

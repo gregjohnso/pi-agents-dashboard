@@ -1623,7 +1623,7 @@ index 9621d1fb7e88ad824669fed40ee6e1eb5013064c..8fe39289132f707c48f92d20b1f3c1a0
  			process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
  		}
 diff --git a/packages/tui/src/tui.ts b/packages/tui/src/tui.ts
-index d7c9e61977b796b65846741b194e7eb54297b0ce..4e5003e5ea9288b8609d574562c1ad2263a1b627 100644
+index d7c9e61977b796b65846741b194e7eb54297b0ce..45c9233831cc980ac966ec64e705426fd2f82f5b 100644
 --- a/packages/tui/src/tui.ts
 +++ b/packages/tui/src/tui.ts
 @@ -22,6 +22,15 @@ import {
@@ -1653,7 +1653,7 @@ index d7c9e61977b796b65846741b194e7eb54297b0ce..4e5003e5ea9288b8609d574562c1ad22
  	private focusedComponent: Component | null = null;
  	private inputListeners = new Set<TuiInputListener>();
  	/** Increments on every cell-size query, so a report for a superseded query is detectable. */
-@@ -400,6 +411,11 @@ export abstract class TuiBase extends Container implements TUI {
+@@ -400,6 +411,16 @@ export abstract class TuiBase extends Container implements TUI {
  	 * Synchronous by construction: the receipt has to name the frame this request produced, so the render
  	 * is forced here rather than requested. A renderer that is stopped or has released the screen presents
  	 * nothing, because whatever now owns the terminal must not be painted over.
@@ -1662,10 +1662,15 @@ index d7c9e61977b796b65846741b194e7eb54297b0ce..4e5003e5ea9288b8609d574562c1ad22
 +	 * own write path: BEGIN before the first byte this request writes, END carrying the receipt's `frameId`
 +	 * after the last one, ABORT instead of END when no complete frame was produced. Without `ordering` not
 +	 * one marker byte is written, so Pi's default output is unchanged.
++	 *
++	 * **Everything after BEGIN is inside one protected region.** The cold reassertion writes terminal and
++	 * renderer mode bytes of its own, so it belongs inside the interval, and a reassertion that throws must
++	 * close the interval exactly as a throwing render does. An interval left open would make every later byte
++	 * on that terminal look like part of this frame to a host that is decoding the markers.
  	 */
  	presentNow(request: PresentationRequest): PresentationOutcome {
  		if (this.stopped) return { presented: false, reason: "renderer-stopped" };
-@@ -409,19 +425,38 @@ export abstract class TuiBase extends Container implements TUI {
+@@ -409,22 +430,69 @@ export abstract class TuiBase extends Container implements TUI {
  		if (unsupported) return { presented: false, reason: unsupported };
  		const released = this.screenReleasedReason();
  		if (released) return { presented: false, reason: released };
@@ -1679,33 +1684,71 @@ index d7c9e61977b796b65846741b194e7eb54297b0ce..4e5003e5ea9288b8609d574562c1ad22
 +			return { presented: false, reason: "unsupported-ordering" };
 +		}
  
-+		// BEGIN opens the armed interval here, before the cold reassertion, so every byte this request writes
-+		// is inside the interval and nothing else is.
-+		if (ordering) this.terminal.write(encodeNativePresentBegin(ordering.token));
- 		const cold = request.coldTerminal ? this.reassertPresentation() : undefined;
- 		const before = this.lastFrame;
+-		const cold = request.coldTerminal ? this.reassertPresentation() : undefined;
+-		const before = this.lastFrame;
 -		this.pendingPresentation = { requestId: request.requestId, cold };
-+		this.pendingPresentation = { requestId: request.requestId, cold, ordering };
++		// BEGIN opens the armed interval here, so every byte this request writes is inside it and nothing else
++		// is. From this line on, no path may return or throw without closing the interval.
++		if (ordering) this.terminal.write(encodeNativePresentBegin(ordering.token));
++		let receipt: PresentationFrameReceipt | undefined;
  		try {
- 			this.renderNow(true);
+-			this.renderNow(true);
+-		} finally {
+-			this.pendingPresentation = undefined;
++			// The cold reassertion is inside the protected region, not before it: it writes mode bytes through
++			// this same terminal, and `Terminal.reassertNegotiatedModes` is an implementation this class does not
++			// own and cannot assume will return.
++			const cold = request.coldTerminal ? this.reassertPresentation() : undefined;
++			const before = this.lastFrame;
++			this.pendingPresentation = { requestId: request.requestId, cold, ordering };
++			try {
++				this.renderNow(true);
++			} finally {
++				this.pendingPresentation = undefined;
++			}
++			const rendered = this.lastFrame;
++			if (rendered && rendered !== before && rendered.requestId === request.requestId) receipt = rendered;
 +		} catch (error) {
 +			// Whatever was written stays written: ABORT says the interval closed without a frame, and only a
-+			// later complete presentation recovers the screen.
-+			if (ordering) this.terminal.write(encodeNativePresentAbort(ordering.token));
++			// later complete presentation recovers the screen. The original failure is what the caller gets.
++			if (ordering) this.abortOrderedPresentation(ordering.token);
 +			throw error;
- 		} finally {
- 			this.pendingPresentation = undefined;
  		}
- 		const receipt = this.lastFrame;
- 		if (!receipt || receipt === before || receipt.requestId !== request.requestId) {
-+			if (ordering) this.terminal.write(encodeNativePresentAbort(ordering.token));
+-		const receipt = this.lastFrame;
+-		if (!receipt || receipt === before || receipt.requestId !== request.requestId) {
++		if (!receipt) {
++			if (ordering) this.abortOrderedPresentation(ordering.token);
  			return { presented: false, reason: "no-complete-frame-support" };
  		}
++		// A throwing END write propagates: the frame really was handed over, so ABORT would be a lie about it,
++		// and a caller that never receives `presented: true` has been told the boundary is not closed.
 +		if (ordering) this.terminal.write(encodeNativePresentEnd(ordering.token, receipt.frameId));
  		return { presented: true, receipt };
  	}
  
-@@ -484,6 +519,13 @@ export abstract class TuiBase extends Container implements TUI {
++	/**
++	 * Close a failed ordered interval, once.
++	 *
++	 * If writing ABORT itself fails there is no second channel to say so on, and there is nothing to retry: an
++	 * accepted prefix must never be written twice. The failure is therefore reported as a process warning —
++	 * this package has no logger of its own — naming that the interval was left open, and no caller is told the
++	 * marker was delivered. The token is not in the message: it is the host's own per-attempt secret.
++	 */
++	private abortOrderedPresentation(token: string): void {
++		try {
++			this.terminal.write(encodeNativePresentAbort(token));
++		} catch (error) {
++			process.emitWarning(
++				`an ordered presentation interval was left open: writing its ABORT marker failed (${String(error)}). ` +
++					`The marker is not retried, and no interval close is claimed.`,
++			);
++		}
++	}
++
+ 	onFrameHandedToTerminal(listener: (receipt: PresentationFrameReceipt) => void): () => void {
+ 		this.frameListeners.add(listener);
+ 		return () => {
+@@ -484,6 +552,13 @@ export abstract class TuiBase extends Container implements TUI {
  			rows: frame.rows,
  			byteLength: frame.byteLength,
  			cold: this.pendingPresentation?.cold,
@@ -1721,10 +1764,10 @@ index d7c9e61977b796b65846741b194e7eb54297b0ce..4e5003e5ea9288b8609d574562c1ad22
  		for (const listener of this.frameListeners) listener(receipt);
 diff --git a/packages/tui/test/native-consumer-capabilities.test.ts b/packages/tui/test/native-consumer-capabilities.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..470570d68efd1b8c512bc50a502a88113e100fb0
+index 0000000000000000000000000000000000000000..7881b24992d538d72436c8b63caf6d3b13ebdc7a
 --- /dev/null
 +++ b/packages/tui/test/native-consumer-capabilities.test.ts
-@@ -0,0 +1,585 @@
+@@ -0,0 +1,692 @@
 +/**
 + * The two consumer capabilities `0006` adds, driven through the real objects rather than through symbols.
 + *
@@ -2277,6 +2320,113 @@ index 0000000000000000000000000000000000000000..470570d68efd1b8c512bc50a502a8811
 +			assert.equal(emitted, "", "a refused ordering writes no byte at all");
 +		});
 +	}
++
++	/**
++	 * A terminal whose cold reassertion throws, and whose write path stays usable.
++	 *
++	 * `Terminal.reassertNegotiatedModes` is an implementation `TuiBase` does not own: the pinned
++	 * `ProcessTerminal` has one, a third-party terminal may have one that fails, and the renderer may not
++	 * assume it returns. The output channel is deliberately left writable, so a failure to close the interval
++	 * would be the renderer's and not the terminal's.
++	 */
++	class ReassertFailingTerminal extends RecordingTerminal {
++		reassertCalls = 0;
++
++		reassertNegotiatedModes(): never {
++			this.reassertCalls += 1;
++			throw new Error("reassertNegotiatedModes failed");
++		}
++	}
++
++	/** A terminal that accepts every write except the ABORT marker, so the marker write itself fails. */
++	class AbortRefusingTerminal extends RecordingTerminal {
++		abortAttempts = 0;
++
++		reassertNegotiatedModes(): never {
++			throw new Error("reassertNegotiatedModes failed");
++		}
++
++		override write(data: string): void {
++			if (data.includes(";A;")) {
++				this.abortAttempts += 1;
++				throw new Error("the output channel refused the ABORT marker");
++			}
++			super.write(data);
++		}
++	}
++
++	it("closes the interval with ABORT when the cold reassertion throws after BEGIN", () => {
++		const token = mintNativePresentToken();
++		const terminal = new ReassertFailingTerminal();
++		const tui = new TuiAltScreen(terminal);
++		tui.addChild(new Text("current ui", 0, 0));
++		tui.start();
++		const before = terminal.writes.length;
++		assert.throws(
++			() =>
++				tui.presentNow({
++					requestId: "cold-reassert-throws:1:1",
++					// Cold, so the reassertion runs at all. It is the first thing after BEGIN that writes.
++					coldTerminal: true,
++					ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++				}),
++			/reassertNegotiatedModes failed/,
++		);
++		const emitted = terminal.since(before);
++		tui.stop();
++		assert.equal(terminal.reassertCalls, 1, "the reassertion really ran, so the interval really was open");
++		const decoder = new NativePresentMarkerDecoder();
++		decoder.arm(token);
++		const events = decoder.decode(Buffer.from(emitted, "latin1"));
++		const framing = events.filter((event) => event.kind !== "bytes").map((event) => event.kind);
++		// The whole point: BEGIN is closed by ABORT, there is no END, and the interval does not stay open for
++		// every later byte on this terminal to look like part of this frame.
++		assert.deepEqual(framing, ["begin", "abort"]);
++		assert.equal(decoder.phase, "idle");
++		assert.ok(!emitted.includes(";E;"), "no END marker was written");
++	});
++
++	it("reports a failed ABORT write instead of claiming the interval closed, and never retries it", () => {
++		const token = mintNativePresentToken();
++		const terminal = new AbortRefusingTerminal();
++		const tui = new TuiAltScreen(terminal);
++		tui.addChild(new Text("current ui", 0, 0));
++		tui.start();
++		const warnings: string[] = [];
++		const onWarning = (warning: Error) => warnings.push(warning.message);
++		process.on("warning", onWarning);
++		const before = terminal.writes.length;
++		// The caller still learns the original failure, not the marker's.
++		assert.throws(
++			() =>
++				tui.presentNow({
++					requestId: "abort-write-fails:1:1",
++					coldTerminal: true,
++					ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++				}),
++			/reassertNegotiatedModes failed/,
++		);
++		const emitted = terminal.since(before);
++		tui.stop();
++		assert.equal(terminal.abortAttempts, 1, "the ABORT marker is attempted once and never retried");
++		assert.ok(!emitted.includes(";A;"), "nothing claims the ABORT reached the terminal");
++		assert.ok(!emitted.includes(";E;"));
++		// `process.emitWarning` is asynchronous, so the warning is read on the next turn rather than now.
++		return new Promise<void>((resolve) => {
++			setImmediate(() => {
++				process.off("warning", onWarning);
++				assert.ok(
++					warnings.some((message) => message.includes("was left open") && message.includes("not retried")),
++					`the failure was not reported: ${JSON.stringify(warnings)}`,
++				);
++				assert.ok(
++					warnings.every((message) => !message.includes(token)),
++					"the host's per-attempt token is not put in a process warning",
++				);
++				resolve();
++			});
++		});
++	});
 +
 +	it("closes the interval with ABORT when no complete frame was produced", () => {
 +		const token = mintNativePresentToken();

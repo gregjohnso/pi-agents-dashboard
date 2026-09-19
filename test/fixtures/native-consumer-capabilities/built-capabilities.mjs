@@ -50,14 +50,22 @@ export { loadArtifactsManifest };
  *
  * The presentation boundary these cases are about is exactly this handoff, so the double keeps it visible.
  * Recorded bytes are not proof that a client displayed anything, and no case here says they are.
+ *
+ * Two injectable failures, both of them real implementations a renderer does not own:
+ * `reassertThrows` makes `reassertNegotiatedModes()` throw, which is the terminal-side failure that must still
+ * close an ordered interval; `refuseAbort` makes the ABORT marker's own write throw, which is the case where
+ * there is nothing left to close the interval with.
  */
 export class MarkerRecordingTerminal {
-	constructor(columns = 100, rows = 30) {
+	constructor(columns = 100, rows = 30, { reassertThrows = false, refuseAbort = false } = {}) {
 		this._columns = columns;
 		this._rows = rows;
 		this.writes = [];
 		this.reassertCalls = 0;
+		this.abortAttempts = 0;
 		this.negotiatedKittyFlags = 7;
+		this.reassertThrows = reassertThrows;
+		this.refuseAbort = refuseAbort;
 	}
 
 	start(onInput, onResize) {
@@ -74,6 +82,10 @@ export class MarkerRecordingTerminal {
 	async drainInput() {}
 
 	write(data) {
+		if (this.refuseAbort && typeof data === "string" && data.includes(";A;")) {
+			this.abortAttempts += 1;
+			throw new Error("the output channel refused the ABORT marker");
+		}
 		this.writes.push(data);
 	}
 
@@ -95,6 +107,7 @@ export class MarkerRecordingTerminal {
 
 	reassertNegotiatedModes() {
 		this.reassertCalls += 1;
+		if (this.reassertThrows) throw new Error("reassertNegotiatedModes failed");
 		this.write("\x1b[?2004h\x1b[=7;1u");
 		return {
 			reemitted: ["bracketed-paste", "kitty-keyboard-flags"],
@@ -121,10 +134,15 @@ export class MarkerRecordingTerminal {
 }
 
 /**
- * Decode one byte string twice: coalesced in a single read, and segmented at a fixed stride.
+ * Decode one byte string twice: coalesced in a single read, and re-sliced at a fixed stride.
  *
- * Both answers must agree, because a framing decoder that depends on where a read boundary fell is not a
- * framing decoder. The stride is explicit rather than random so a failure is reproducible.
+ * **Supplementary only, and synthetic.** The stride is this file's choice, not a boundary any stream produced,
+ * so this helper can show that the decoder's framing does not depend on where a caller cuts a buffer. It is not
+ * and never was evidence about a real stream: the live raw-chunk observer in `live-raw-decoder.mjs` is the only
+ * thing that feeds the decoder actual arriving reads. An earlier receipt described this helper's output as
+ * "kernel-sized reads"; that was wrong, and this comment is the correction.
+ *
+ * The stride is explicit rather than random so a failure is reproducible.
  */
 export function decodeBothWays(tui, token, raw, stride = 7) {
 	const coalesced = new tui.NativePresentMarkerDecoder();
@@ -143,6 +161,8 @@ export function decodeBothWays(tui, token, raw, stride = 7) {
 	events.push(...segmented.flush());
 	return {
 		oneRead,
+		/** Re-sliced by this helper at `stride`. Synthetic: no stream produced these boundaries. */
+		resliced: events,
 		segmented: events,
 		maxRetained,
 		summary: (list) => list.map((event) => event.kind),

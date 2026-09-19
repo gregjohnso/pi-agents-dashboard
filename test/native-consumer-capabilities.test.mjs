@@ -20,6 +20,7 @@
  */
 
 import { existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
@@ -31,6 +32,7 @@ import {
 	importBuiltCapabilitiesIfSelected,
 	MarkerRecordingTerminal,
 } from "./fixtures/native-consumer-capabilities/built-capabilities.mjs";
+import { fixtureHandshake, liveRawDecoder } from "./fixtures/native-consumer-capabilities/live-raw-decoder.mjs";
 import { newAttachmentNamespace } from "./fixtures/native-ingress/built-pipeline.mjs";
 import { spawnPiUnderPty, startBootstrapHost } from "./fixtures/native-presentation/bootstrap-host.mjs";
 import { resolveInstalledEntry, resolveInstalledPackageDirectory } from "./fixtures/native-presentation/recording-terminal.mjs";
@@ -43,6 +45,10 @@ const COHORT = process.env.PI_NATIVE_COHORT;
 const REPOSITORY = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const EARLY_PRELOAD = path.join(REPOSITORY, "test/fixtures/native-consumer-capabilities/early-ingress-preload.mjs");
 const BLOCKING_EXTENSION = path.join(REPOSITORY, "test/fixtures/native-consumer-capabilities/blocking-extension.ts");
+const ORDERED_STREAM_PROBE = path.join(
+	REPOSITORY,
+	"test/fixtures/native-consumer-capabilities/ordered-stream-probe.mjs",
+);
 
 const harness = createRealProcessHarness("native-consumer-capabilities");
 
@@ -300,11 +306,13 @@ describeCohort("the built cohort brackets an ordered presentation on the termina
 			expect(emitted.startsWith(tui.encodeNativePresentBegin(token))).toBe(true);
 			expect(emitted.endsWith(tui.encodeNativePresentEnd(token, outcome.receipt.frameId))).toBe(true);
 
+			// Supplementary and synthetic: this re-slices one buffer at a stride this file chose, which shows the
+			// framing does not depend on where a caller cuts a buffer. The real-stream proof is the live
+			// raw-chunk case under a pseudo-terminal further down this file, not this.
 			const decoded = decodeBothWays(tui, token, emitted);
 			expect(decoded.summary(decoded.oneRead)[0]).toBe("begin");
 			expect(decoded.summary(decoded.oneRead).at(-1)).toBe("end");
-			// Segmented and coalesced reads agree, and the decoder never held more than its declared bound.
-			expect(decoded.carried(decoded.segmented)).toBe(decoded.carried(decoded.oneRead));
+			expect(decoded.carried(decoded.resliced)).toBe(decoded.carried(decoded.oneRead));
 			expect(decoded.maxRetained).toBeLessThanOrEqual(128);
 			const ended = decoded.oneRead.at(-1);
 			expect(ended.frameId).toBe(outcome.receipt.frameId);
@@ -335,7 +343,102 @@ describeCohort("the built cohort brackets an ordered presentation on the termina
 			expect(badToken).toEqual({ presented: false, reason: "unsupported-ordering" });
 			expect(emitted).toBe("");
 		});
+
+		it(`${name} closes the interval with ABORT when the cold reassertion throws after BEGIN`, () => {
+			const token = tui.mintNativePresentToken();
+			// The terminal's own `reassertNegotiatedModes` throws and its write path stays usable, so a
+			// still-open interval would be the renderer's failure and not the terminal's.
+			const terminal = new MarkerRecordingTerminal(100, 30, { reassertThrows: true });
+			const renderer = new tui[name](terminal);
+			renderer.addChild(new tui.Text("current ui", 0, 0));
+			renderer.start();
+			const before = terminal.writes.length;
+			expect(() =>
+				renderer.presentNow({
+					requestId: "cold-reassert-throws:1:1",
+					coldTerminal: true,
+					ordering: { version: 1, token },
+				}),
+			).toThrow(/reassertNegotiatedModes failed/);
+			const emitted = terminal.since(before);
+			renderer.stop();
+			expect(terminal.reassertCalls).toBe(1);
+			const decoder = new tui.NativePresentMarkerDecoder();
+			decoder.arm(token);
+			const framing = decoder
+				.decode(Buffer.from(emitted, "latin1"))
+				.filter((event) => event.kind !== "bytes")
+				.map((event) => event.kind);
+			// Anything but ["begin","abort"] leaves a host decoding every later byte on this terminal as part
+			// of a frame that never completed.
+			expect(framing).toEqual(["begin", "abort"]);
+			expect(decoder.phase).toBe("idle");
+			expect(emitted).not.toContain(";E;");
+		});
+
+		it(`${name} closes the interval with ABORT when the render produces no complete frame`, () => {
+			const token = tui.mintNativePresentToken();
+			const terminal = new MarkerRecordingTerminal();
+			const renderer = new tui[name](terminal);
+			renderer.addChild(new tui.Text("current ui", 0, 0));
+			renderer.start();
+			// A render that neither throws nor mints a receipt: the completeness check is the only thing that
+			// can notice, and it has to close the interval too.
+			const real = renderer.renderNow.bind(renderer);
+			renderer.renderNow = () => {};
+			const before = terminal.writes.length;
+			const outcome = renderer.presentNow({
+				requestId: "no-frame:1:1",
+				coldTerminal: true,
+				ordering: { version: 1, token },
+			});
+			const emitted = terminal.since(before);
+			renderer.renderNow = real;
+			renderer.stop();
+			expect(outcome).toEqual({ presented: false, reason: "no-complete-frame-support" });
+			const decoder = new tui.NativePresentMarkerDecoder();
+			decoder.arm(token);
+			expect(
+				decoder
+					.decode(Buffer.from(emitted, "latin1"))
+					.filter((event) => event.kind !== "bytes")
+					.map((event) => event.kind),
+			).toEqual(["begin", "abort"]);
+		});
 	}
+
+	it("reports a failed ABORT write instead of claiming the interval closed, and never retries it", async () => {
+		const token = tui.mintNativePresentToken();
+		const terminal = new MarkerRecordingTerminal(100, 30, { reassertThrows: true, refuseAbort: true });
+		const renderer = new tui.TuiAltScreen(terminal);
+		renderer.addChild(new tui.Text("current ui", 0, 0));
+		renderer.start();
+		const warnings = [];
+		const onWarning = (warning) => warnings.push(warning.message);
+		process.on("warning", onWarning);
+		const before = terminal.writes.length;
+		// The caller still learns the original failure, not the marker write's.
+		expect(() =>
+			renderer.presentNow({
+				requestId: "abort-write-fails:1:1",
+				coldTerminal: true,
+				ordering: { version: 1, token },
+			}),
+		).toThrow(/reassertNegotiatedModes failed/);
+		const emitted = terminal.since(before);
+		renderer.stop();
+		expect(terminal.abortAttempts).toBe(1);
+		expect(emitted).not.toContain(";A;");
+		expect(emitted).not.toContain(";E;");
+		// `process.emitWarning` is asynchronous, so it is read on a later turn rather than now.
+		await new Promise((resolve) => setImmediate(resolve));
+		process.off("warning", onWarning);
+		expect(
+			warnings.some((message) => message.includes("was left open") && message.includes("not retried")),
+			`no honest report of the failed ABORT write: ${JSON.stringify(warnings)}`,
+		).toBe(true);
+		expect(warnings.every((message) => !message.includes(token))).toBe(true);
+	});
 
 	it("keeps untrusted marker-like text byte-identical and refuses ambiguous armed markers", () => {
 		const token = tui.mintNativePresentToken();
@@ -491,7 +594,16 @@ describe("the built cohort under a real pseudo-terminal", () => {
 
 			const bootstrap = await startBootstrapHost();
 			const transcriptPath = path.join(kept, "transcript");
+			// Armed before the process exists, and fed every raw read the relay delivers while Pi runs. The
+			// decoder therefore sees the actual arriving chunk boundaries, not a string this file re-sliced.
+			const live = liveRawDecoder(tui);
+			const token = tui.mintNativePresentToken();
+			live.arm(token);
+			// A unique printable draft, so a later native frame either carries these exact characters or does
+			// not. An admission receipt is not an editor-render observation.
+			const draft = `PI-DRAFT-${randomUUID().slice(0, 8).toUpperCase()}`;
 			const pty = spawnPiUnderPty({
+				onRawStdout: (chunk) => live.onRawStdout(chunk),
 				command: `${process.execPath} --import ${EARLY_PRELOAD} ${cli} --tui-mode regular`,
 				cwd: project,
 				env: childEnvironment({
@@ -510,6 +622,7 @@ describe("the built cohort under a real pseudo-terminal", () => {
 					PI_CONSUMER_TUI_PACKAGE: tuiPackageRoot,
 					PI_CONSUMER_CODING_AGENT_ENTRY: codingAgentEntry,
 					PI_BLOCKING_EXTENSION_LOG: blockingLog,
+					PI_CONSUMER_DRAFT: draft,
 				}),
 				transcriptPath,
 			});
@@ -557,7 +670,12 @@ describe("the built cohort under a real pseudo-terminal", () => {
 				const dispatched = observed.find((entry) => entry.event === "dispatched");
 				expect(dispatched, `the consumer never dispatched: ${JSON.stringify(observed)}`).toBeTruthy();
 				expect(dispatched.admitted).toBe(true);
-				expect(dispatched.consumedThrough).toBeGreaterThan(0);
+				expect(dispatched.draft).toBe(draft);
+				expect(dispatched.consumedThrough).toBe(draft.length);
+				// The positive profile has every capability on, Kitty graphics included: a qualification must not
+				// turn a feature off to make its own profile pass.
+				const registered = observed.find((entry) => entry.event === "hostRegistered");
+				expect(registered.kittyGraphics).toBe(true);
 
 				// The ordering the design requires: the publication is observed before `native-mounted`, and
 				// before any extension callback could have run.
@@ -571,8 +689,7 @@ describe("the built cohort under a real pseudo-terminal", () => {
 				expect((await events(blockingLog)).some((entry) => entry.event === "sessionStartReleased")).toBe(false);
 
 				// Capability two: one explicitly managed ordered presentation, and its markers on the real
-				// pseudo-terminal stream.
-				const token = tui.mintNativePresentToken();
+				// pseudo-terminal stream, decoded from raw reads that arrived while Pi was still running.
 				breadcrumb("awaiting the ordered result");
 				const marked = bootstrap.waitFor((frame) => frame.type === "presentation-result", "the ordered result");
 				const before = pty.length();
@@ -596,27 +713,49 @@ describe("the built cohort under a real pseudo-terminal", () => {
 					markerCodec: "dcs-pi-native-present-v1",
 				});
 
-				// Read the markers back off the pseudo-terminal the child actually wrote to. The terminal read
-				// boundaries are whatever the kernel produced, which is the segmentation this codec has to
-				// survive; the transcript file is the same bytes coalesced.
-				await pty.waitUntil(
-					(output) => output.includes(tui.encodeNativePresentEnd(token, frameId)),
-					"the END marker on the pseudo-terminal",
+				// The live decoder has been consuming raw reads all along, so this waits on a decoded event
+				// rather than on a string search or a timer, and then asserts what the decoder already saw.
+				await live.waitForEvent(
+					(seen) => seen.some((event) => event.kind === "end" && event.frameId === frameId),
+					"the END marker for this frame",
 				);
-				const streamed = pty.since(before);
-				const decoded = decodeBothWays(tui, token, streamed, 13);
-				const framing = decoded.summary(decoded.oneRead).filter((kind) => kind !== "bytes");
+				const framing = live.framing();
 				expect(framing).toEqual(["begin", "end"]);
-				expect(decoded.oneRead.at(-1).kind === "end" ? decoded.oneRead.at(-1).frameId : null).toBe(frameId);
-				expect(decoded.maxRetained).toBeLessThanOrEqual(128);
-				// Same framing from the retained transcript, so the observation is not an artifact of this
-				// process's own reads.
+				const begun = live.first("begin");
+				const ended = live.first("end");
+				expect(ended.frameId).toBe(frameId);
+				expect(ended.token).toBe(token);
+				// Progress before completion, as a recorded fact: BEGIN came out of an earlier arriving read than
+				// END did, so the decoder was emitting events while the interval was still open. Nothing here
+				// waited for a completed interval and then decoded a buffer.
+				expect(begun.chunkIndex).toBeLessThan(ended.chunkIndex);
+				expect(begun.phase).toBe("open");
+				expect(ended.phase).toBe("idle");
+				// The bound, sampled after every arriving read rather than once at the end.
+				const observation = live.observation();
+				expect(observation.maxRetainedBytes).toBeLessThanOrEqual(observation.decoderMaxRetainedBound);
+				expect(observation.chunkCount).toBeGreaterThan(1);
+				await writeFile(path.join(kept, "live-raw-decoder.json"), `${JSON.stringify(observation, null, 2)}\n`);
+
+				// The frame's own bytes, with the markers stripped, and the draft this consumer typed through the
+				// published target while `session_start` was still blocked. This is the editor-render observation
+				// the admission receipt cannot give: the characters are in a frame Pi built and handed over.
+				const carried = live.carried();
+				expect(carried.length).toBeGreaterThan(0);
+				expect(carried).not.toContain("pi-native-present");
+				expect(
+					carried.includes(draft),
+					`the draft ${draft} never appeared in the presented frame; carried ${carried.length} bytes`,
+				).toBe(true);
+				expect((await events(blockingLog)).some((entry) => entry.event === "sessionStartReleased")).toBe(false);
+
+				// Secondary only: the recorded transcript. It is never the prerequisite for decoding, and it is
+				// a lossy UTF-8 view of two mixed streams, so it is checked for marker presence and no more.
 				const transcript = await readFile(transcriptPath, "latin1");
-				const fromFile = decodeBothWays(tui, token, transcript, 4096);
-				expect(fromFile.summary(fromFile.oneRead).filter((kind) => kind !== "bytes")).toEqual(["begin", "end"]);
-				// The interval carries the frame and not the markers.
-				expect(decoded.carried(decoded.oneRead)).not.toContain("pi-native-present");
-				expect(decoded.carried(decoded.oneRead).length).toBeGreaterThan(0);
+				expect(transcript).toContain(tui.encodeNativePresentBegin(token));
+				expect(transcript).toContain(tui.encodeNativePresentEnd(token, frameId));
+				// The relay's own stderr is not Pi's PTY output and was never fed to the decoder.
+				expect(typeof pty.relayDiagnostics()).toBe("string");
 			} finally {
 				pty.write("\x03");
 				pty.write("\x03");
@@ -628,6 +767,160 @@ describe("the built cohort under a real pseudo-terminal", () => {
 			expect(exited).toBeTruthy();
 		},
 	);
+
+	/**
+	 * Deterministic segmentation and interleaving, on the same real pseudo-terminal, with the cohort's own codec
+	 * and decoder on both ends.
+	 *
+	 * Pi's `presentNow` runs the whole interval in one synchronous call, so against the renderer alone nobody can
+	 * ask for a marker to be split at a chosen byte, and nobody can put a byte inside the interval on purpose.
+	 * Waiting for a lucky boundary is not a proof and a sleep is not coordination, so the producer here is the
+	 * `ordered-stream-probe.mjs` fixture: it encodes the markers with the **installed** codec, writes each of
+	 * them in two halves, and writes the second half only after this reader confirms over a disposable handshake
+	 * that the first half arrived. The in-interval sentinel comes from a child process that inherited the same
+	 * PTY, so it is outside any `Terminal.write` body, and it is released one line at a time.
+	 *
+	 * This says nothing about Pi's renderer; the case above says that. This says the decoder survives real
+	 * partial markers and real out-of-band interleaving on a real PTY.
+	 */
+	cohortIt("decodes real split markers and real in-interval out-of-band bytes on a pseudo-terminal", async () => {
+		const root = await harness.stateRoot("consumer-ordered-stream-");
+		const project = path.join(root, "project");
+		await mkdir(project, { recursive: true });
+		const kept = process.env.PI_CONSUMER_EVIDENCE_DIR
+			? path.join(process.env.PI_CONSUMER_EVIDENCE_DIR, "deterministic-split-and-interleave")
+			: root;
+		await mkdir(kept, { recursive: true });
+		const transcriptPath = path.join(kept, "transcript");
+
+		const tuiPackageRoot = resolveInstalledPackageDirectory(COHORT, "@earendil-works/pi-tui");
+		const token = tui.mintNativePresentToken();
+		const frameId = randomUUID();
+		const live = liveRawDecoder(tui);
+		live.arm(token);
+		const handshake = await fixtureHandshake();
+		const pty = spawnPiUnderPty({
+			onRawStdout: (chunk) => live.onRawStdout(chunk),
+			command: `${process.execPath} ${ORDERED_STREAM_PROBE}`,
+			cwd: project,
+			env: childEnvironment({
+				HOME: path.join(root, "home"),
+				TERM: "xterm-256color",
+				COLUMNS: "100",
+				LINES: "30",
+				PI_ORDERED_PROBE_HANDSHAKE: handshake.socketPath,
+				PI_ORDERED_PROBE_TUI: tuiPackageRoot,
+				PI_ORDERED_PROBE_MARKER: token,
+				PI_ORDERED_PROBE_FRAME_ID: frameId,
+			}),
+			transcriptPath,
+		});
+		const identity = await inspectProcessIdentity(pty.child.pid);
+		await harness.record("the ordered-stream probe under a pseudo-terminal", identity);
+
+		// A fixture that died must fail this case now, with what it printed, instead of letting every later
+		// bounded wait expire in turn.
+		let finished = false;
+		const died = new Promise((_resolve, reject) => {
+			pty.child.on("exit", (code, signal) => {
+				if (finished) return;
+				reject(
+					new Error(
+						`the ordered-stream probe exited early (code ${code}, signal ${signal}); ` +
+							`relay saw: ${JSON.stringify(pty.output().slice(-600))}`,
+					),
+				);
+			});
+		});
+		died.catch(() => {});
+		const guard = (promise) => Promise.race([promise, died]);
+
+		try {
+			handshake.release("start");
+
+			// BEGIN, first half only. The reader confirms the marker is genuinely incomplete before the rest is
+			// written: the decoder is holding a partial candidate across a real received read boundary.
+			await guard(handshake.waitFor("begin-first-half"));
+			// The handshake says the fixture wrote it; this says the decoder received it. The decoder is holding
+			// an undecided partial candidate, which is exactly what no completed-string harness can show.
+			const partial = await guard(
+				live.waitForState((seen) => seen.retained > 0, "a retained partial BEGIN candidate"),
+			);
+			expect(live.framing(), "half a BEGIN marker is not a BEGIN").toEqual([]);
+			expect(partial.retained).toBeGreaterThan(0);
+			expect(partial.retained).toBeLessThanOrEqual(tui.NativePresentMarkerDecoder.MAX_RETAINED_BYTES);
+
+			handshake.release("begin-second-half");
+			await guard(live.waitForKind("begin", "BEGIN completed across the boundary"));
+			await guard(handshake.waitFor("begin-complete"));
+			const begun = live.first("begin");
+			expect(begun.token).toBe(token);
+			// The two halves arrived in different reads, which is the whole point of the confirmed gap.
+			const beginChunk = begun.chunkIndex;
+			expect(beginChunk).toBeGreaterThan(0);
+
+			await guard(handshake.waitFor("payload-a"));
+			await guard(
+				live.waitForEvent(
+					(seen) => seen.some((event) => event.kind === "bytes" && event.phase === "open"),
+					"in-interval payload bytes",
+				),
+			);
+			// Decoder progress with the interval still open, before anything has completed it.
+			expect(live.framing()).toEqual(["begin"]);
+
+			// The in-interval, out-of-band sentinel: a different process writing to the same PTY, one confirmed
+			// line at a time, with the interval open the whole way through.
+			const sentinels = ["<<sentinel-1>>", "<<sentinel-2>>", "<<sentinel-3>>"];
+			for (const [index, sentinel] of sentinels.entries()) {
+				handshake.release(`sentinel-${index + 1}`);
+				await guard(handshake.waitFor(`sentinel-${index + 1}-written`));
+				await guard(live.waitForState((seen) => seen.carried.includes(sentinel), `${sentinel} inside the interval`));
+				expect(live.framing(), "the interval is still open while out-of-band bytes arrive").toEqual(["begin"]);
+				handshake.release(`sentinel-${index + 1}-seen`);
+			}
+
+			handshake.release("end");
+			await guard(handshake.waitFor("payload-b"));
+			await guard(handshake.waitFor("end-first-half"));
+			// Half an END marker does not close the interval either, and the decoder holds it as a candidate.
+			const partialEnd = await guard(live.waitForState((seen) => seen.retained > 0, "a retained partial END candidate"));
+			expect(live.framing()).toEqual(["begin"]);
+			expect(partialEnd.retained).toBeLessThanOrEqual(tui.NativePresentMarkerDecoder.MAX_RETAINED_BYTES);
+			handshake.release("end-second-half");
+			await guard(live.waitForKind("end", "END completed across the boundary"));
+			await guard(handshake.waitFor("end-complete"));
+			handshake.release("exit");
+
+			const ended = live.first("end");
+			expect(ended.frameId).toBe(frameId);
+			expect(ended.chunkIndex).toBeGreaterThan(beginChunk);
+			expect(live.framing()).toEqual(["begin", "end"]);
+
+			const carried = live.carried();
+			// Every out-of-band sentinel is reproduced verbatim and in its own emitted order, and the payload
+			// pieces keep their order around them. Nothing was reordered and nothing was swallowed.
+			for (const sentinel of sentinels) expect(carried).toContain(sentinel);
+			expect(carried.indexOf("<<sentinel-1>>")).toBeLessThan(carried.indexOf("<<sentinel-2>>"));
+			expect(carried.indexOf("<<sentinel-2>>")).toBeLessThan(carried.indexOf("<<sentinel-3>>"));
+			expect(carried.indexOf("[payload-a]")).toBeLessThan(carried.indexOf("<<sentinel-1>>"));
+			expect(carried.indexOf("<<sentinel-3>>")).toBeLessThan(carried.indexOf("[payload-b]"));
+			expect(carried).not.toContain("pi-native-present");
+
+			const observation = live.observation();
+			expect(observation.maxRetainedBytes).toBeLessThanOrEqual(observation.decoderMaxRetainedBound);
+			expect(observation.chunkCount).toBeGreaterThanOrEqual(6);
+			await writeFile(
+				path.join(kept, "live-raw-decoder.json"),
+				`${JSON.stringify({ ...observation, sentinels, splitOffsets: { begin: 24, end: 30 } }, null, 2)}\n`,
+			);
+		} finally {
+			finished = true;
+			pty.child.kill("SIGKILL");
+			await pty.exited();
+			await handshake.close();
+		}
+	});
 
 	cohortIt("writes no marker byte for a protocol-1 launch asking for an ordinary presentation", async () => {
 		const root = await harness.stateRoot("consumer-default-silence-");

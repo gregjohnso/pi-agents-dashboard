@@ -27,6 +27,13 @@ import path from "node:path";
 const logPath = process.env.PI_CONSUMER_TARGET_LOG;
 const tuiPackageRoot = process.env.PI_CONSUMER_TUI_PACKAGE;
 const codingAgentEntry = process.env.PI_CONSUMER_CODING_AGENT_ENTRY;
+/**
+ * The draft this consumer types through the published target.
+ *
+ * Unique and printable, and supplied by the case rather than invented here, so the case can look for these
+ * exact characters in a later native frame instead of trusting an admission receipt.
+ */
+const draft = process.env.PI_CONSUMER_DRAFT ?? "PI-DRAFT-FALLBACK";
 
 let order = 0;
 
@@ -82,39 +89,51 @@ if (typeof tui.subscribeNativeInputTarget !== "function") {
 		});
 		if (!next.target || dispatched) return;
 		dispatched = true;
-		// Off the notification turn: a consumer must not re-enter Pi's own startup path. The bytes are one
-		// printable character, labelled with this consumer's own attachment epoch and binding generation.
+		// Off the notification turn: a consumer must not re-enter Pi's own startup path. The bytes are a unique
+		// printable draft, labelled with this consumer's own attachment epoch and binding generation, so a later
+		// native frame either carries it or does not — `admitted: true` alone is an admission receipt, not an
+		// observation that the draft reached the editor.
 		setImmediate(async () => {
 			try {
 				const host = tui.registerNativeAttachmentHost({
 					profile: {
 						profileId: "early-ingress-consumer",
 						term: process.env.TERM ?? "xterm-256color",
+						// Every capability enabled, including Kitty graphics. A positive qualification must not
+						// weaken a feature to make its own profile pass: the cold reassertion's image-cache
+						// invalidation only means anything when graphics are on.
 						capabilities: {
 							kittyKeyboard: true,
-							kittyGraphics: false,
+							kittyGraphics: true,
 							mouse: true,
 							bracketedPaste: true,
 							synchronizedOutput: true,
 							trueColor: true,
 						},
-						cellSize: null,
+						cellSize: { width: 8, height: 16 },
 					},
 					authorizeReturn: () => "native",
 					beforeApplyTerminalResponse: async () => ({ apply: true }),
 				});
-				record({ event: "hostRegistered", registered: typeof host?.release === "function" });
+				record({
+					event: "hostRegistered",
+					registered: typeof host?.release === "function",
+					profile: tui.getVirtualTerminalProfile()?.profileId ?? null,
+					kittyGraphics: tui.getVirtualTerminalProfile()?.capabilities?.kittyGraphics ?? null,
+				});
 				// Registering rotates the publication, so the current snapshot is read again rather than the
 				// handle captured before it.
 				const current = tui.nativeInputTargetSnapshot();
 				const result = await current.target.dispatchNativeInput({
 					attachmentEpoch: { attachmentId: "early-consumer", epoch: 1 },
-					bytes: new Uint8Array(Buffer.from("Z", "utf8")),
+					bytes: new Uint8Array(Buffer.from(draft, "utf8")),
 					binding: { generation: 1 },
 				});
 				record({
 					event: "dispatched",
 					publicationId: current.publication?.publicationId ?? null,
+					draft,
+					draftBytes: Buffer.byteLength(draft, "utf8"),
 					admitted: result.admitted === true,
 					reason: result.reason ?? null,
 					consumedThrough: result.consumedThrough ?? null,

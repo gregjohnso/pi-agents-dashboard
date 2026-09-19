@@ -151,11 +151,23 @@ marker is at most 128 bytes: BEGIN and ABORT are 68, END is 105.
 
 **Where they are written.** `TuiBase.presentNow` writes BEGIN as the first byte of the interval — before the
 cold reassertion — and END carrying the receipt's `frameId` as the last, on the terminal's own `write` path.
-If the render throws, or produced no complete frame for this request, ABORT closes the interval instead and
-the bytes already written stay written: only a later complete presentation recovers the screen. Without an
-`ordering` on the request, **not one marker byte is written**, so Pi's default output is unchanged. An unknown
-ordering version, an unknown codec or a non-canonical token is refused by the preflight, before any byte, as
-`{ presented: false, reason: "unsupported-ordering" }`.
+**Everything after BEGIN is inside one protected region**, the cold reassertion included: if the reassertion
+throws, if the render throws, or if the render produces no complete frame for this request, ABORT closes the
+interval instead of leaving it open, and the bytes already written stay written — only a later complete
+presentation recovers the screen. An interval left open would make every later byte on that terminal look like
+part of this frame to a host that is decoding the markers.
+
+Two failure cases are named rather than papered over. If writing **ABORT itself** fails there is no second
+channel to say so on and nothing to retry — an accepted prefix must never be written twice — so the failure is
+reported as a process warning naming that the interval was left open, no caller is told the marker was
+delivered, and the original failure is still what `presentNow` throws. The host's per-attempt token is not put
+in that message. If writing **END** fails the throw propagates: the frame really was handed over, so ABORT
+would be a lie about it, and a caller that never receives `presented: true` has been told the boundary is not
+closed.
+
+Without an `ordering` on the request, **not one marker byte is written**, so Pi's default output is unchanged. An
+unknown ordering version, an unknown codec or a non-canonical token is refused by the preflight, before any
+byte, as `{ presented: false, reason: "unsupported-ordering" }`.
 
 **What the decoder is.** A framing decoder, and deliberately not a VT, key or screen parser. It recognizes
 exactly the markers of the token it is armed with and **reproduces every other byte verbatim**, which is what
@@ -169,6 +181,16 @@ decoded input exactly.
 being decoded. A candidate that reaches the bound without terminating is refused as `overlong-candidate` and
 never grown. Where a read boundary fell is not part of the framing: the same bytes decode the same way split at
 every byte boundary and coalesced into one read.
+
+**How that is qualified, and how it is not.** The real-stream evidence feeds the decoder the exact raw `Buffer`
+reads as they arrive from the pseudo-terminal relay while the producer is still running, stamps every decoded
+event with the arriving read it came from, and samples `retainedBytes()` after every read. Two producers are
+used for two different reasons: Pi's own renderer, which proves a real ordered presentation is bracketed; and a
+fixture producer that splits each marker across a reader-confirmed gap and has a child process write inside the
+interval, because `presentNow` runs the whole interval in one synchronous call and therefore cannot be asked
+for a split or an interleave. A recorded transcript is secondary evidence only and is never the input a decoder
+is fed. In-process re-slicing of one buffer at a chosen stride remains in the suite as a supplementary check;
+it is synthetic, and an earlier receipt that called it "kernel-sized reads" was wrong.
 
 **What a marker is not.** It is a boundary in a byte stream. It is not proof that a client decoded, flushed,
 parsed or displayed anything. A client acknowledgement is the host's work (Task 12/17) and is not in this

@@ -456,7 +456,7 @@ carries its own source tests plus one line of an 0003 test that pinned the whole
 | 3 | `0003-native-presentation-readiness.patch` | `cf7f5ccca6358612f17bb65583f17934fb795b9935c921efe0fbaba1737bdfb9` (serialized; the lane's own diff was `8a483bf73c9b6d6d44cea44eae2289386946e545f1b6fa2b8bd6a5fd88542868`) | `9c40d805754c6cbc5dd161ec4e1c6880b1bc1ef4` |
 | 4 | `0004-native-canonical-admission.patch` | `1f5e78f4ebdeafcc8a161d3b0c02613256902981a12adf540ff2509329bf89d5` (authored at this position; its first form was `66cdeaacf78c3e18e8f7512abf928d7a509691ea776f368d417a60ae0e446dc0`, and the form before the one-use reservation and string-message corrections was `425ac07a02a6d10261f01ad9b8048ee5719ab745f1af6e7ffb2a08e21fc6b9d1`) | `69762c6631d6395b989735cef63f6c97a9511bf9` |
 | 5 | `0005-native-child-handoff.patch` | `18138c0612bf244e3cddb0d9f759b875c6786f1836a84bd082be72071b44bcaa` (taken after 0003 and carried unchanged at this position) | `daa4eb307949768e750c0b5c6c103ef2ccdb3430` |
-| 6 | `0006-native-consumer-capabilities.patch` | `4a2647cd4426f7f7e80a6b51cc12b962eb5b9182d9c27273240cc7af0e7383eb` (authored at this position, against the tree positions 1-5 produce) | `242c89af869cb8c0630d1ef0a570b27dfa9b8496` |
+| 6 | `0006-native-consumer-capabilities.patch` | `db4d51b8dbfb0c9617e3f9de132eeb5296bbf355c8c1b6fa4fcd5caf55d83bd2` (authored at this position, against the tree positions 1-5 produce; its first form was `4a2647cd4426f7f7e80a6b51cc12b962eb5b9182d9c27273240cc7af0e7383eb`, before the ordered interval's cold-reassertion error path was closed) | `47c732932946858e0f43a4826f921c59d1f05e72` |
 
 Position 4's tree is the one the reviewed seam D lane prepared (build job `3751264`), because positions 1-4
 are the same bytes in the same order there. Position 5's tree is this composition's own: 0005 applied to that
@@ -513,17 +513,24 @@ coding-agent module. It fails against either single-seam cohort.
 
 ### 9.2 The one qualified cohort of the six-patch series
 
-`0006` is new source, so it warranted exactly one new qualifying cohort, and this is it. The five-patch record
-in 9.0 is kept as it was: that cohort is not rebuilt, not modified and not superseded as a record of what it
-proved. `series` sha256 `56f3234fa623e581a7e3b964dd79145bf5e5174c39fc13e8389bde2c00b24a57`.
+`0006` is new source, so it warranted exactly one new qualifying cohort. `0006` was then **corrected** for an
+ordered-interval error-path defect, which is new source again and warranted one more. The record below is that
+corrected cohort; the superseded one is kept beneath it, because it is what the first review read. The
+five-patch record in 9.0 is kept as it was: that cohort is not rebuilt, not modified and not superseded as a
+record of what it proved. `series` sha256 `56f3234fa623e581a7e3b964dd79145bf5e5174c39fc13e8389bde2c00b24a57`.
 
 | Field | Value |
 | --- | --- |
-| Build | Slurm job `3756157`, `l40-reserved`, Node `v22.23.2` |
+| Build | Slurm job `3756759`, `l40-reserved`, Node `v22.23.2` |
 | Upstream commit | `bfb004d4418ff05c6f909eaaab856cbe75c1fde0`, tree `562b495c89525fbefb00795d77f34586b69e7068` |
-| Prepared tree | `242c89af869cb8c0630d1ef0a570b27dfa9b8496` |
+| Prepared tree | `47c732932946858e0f43a4826f921c59d1f05e72` |
 | Artifact label | `patched: 6 ordered pi-agents source patch(es) applied to the pinned commit.` |
-| Bundled CLI | `f82d7db25f123f9ccc81aa6f776cb5e4464b973ca14dee91cc33eb471280c1bd` (`dist/bundle/cli.js`, rebuilt from the prepared source) |
+| Bundled CLI | `192a2262b85f150e23e5fc64a84a6b3384c167c57ac9eae2330472eea471f310` (`dist/bundle/cli.js`, rebuilt from the prepared source) |
+
+Superseded, and kept as a record rather than promoted: job `3756157`, prepared tree
+`242c89af869cb8c0630d1ef0a570b27dfa9b8496`, bundled CLI
+`f82d7db25f123f9ccc81aa6f776cb5e4464b973ca14dee91cc33eb471280c1bd`. Its `presentNow` could leave an ordered
+interval open when the cold reassertion threw, so it is the RED target for that regression and nothing else.
 
 Packed cohort, by tarball sha256. The five packages `0006` does not touch carry the same digests as the
 five-patch cohort of 9.0; `pi-tui` and `pi-coding-agent` are the two that changed:
@@ -535,16 +542,18 @@ five-patch cohort of 9.0; `pi-tui` and `pi-coding-agent` are the two that change
 | `@earendil-works/pi-agent-core` | `134b4a6ef03d4632d0454a41ab1f2b4e18dff2196ce1b3316ab5e98ef9852f35` |
 | `@earendil-works/pi-protocol` | `eea8f3235b87924fb368a2361b772b65bbd992e322fb05d554311c98d5ccdafb` |
 | `@earendil-works/pi-client` | `260dcac827d8ede81cb21a99020053fa76b073b5e9be2f12c05ba548f976d46b` |
-| `@earendil-works/pi-tui` | `fc33a1c6dd3515d22fefd060eea337d8ed6ce99fe1bf83aa4682d9673862e333` |
-| `@earendil-works/pi-coding-agent` | `9939e22922b6ec90e69898b4a82cb0f76e4d3dabb50bf4d7e26d4f1321e9a51a` |
+| `@earendil-works/pi-tui` | `c4377061bdc04c7247dde12842bd1f41b0383d8dda86701f691f405bf4e0c654` |
+| `@earendil-works/pi-coding-agent` | `ee50101569343fe15b1835d0e48a430c7518809bc51890141939d448fbfb06c2` |
 
 A consumer selects this cohort by its generated manifest, never by a default path. Byte reproducibility is not
 claimed: it is one build, recorded, not re-derived.
 
 `test/native-consumer-capabilities.test.mjs` is the suite that exists only because of `0006`. Against the
-five-patch cohort of 9.0 it fails 15 of its 18 cases, including the real blocked-`session_start` consumer and
-the pseudo-terminal marker case; the three that pass in both are the cohort identity case and the two that
-require the default output to carry **no** marker byte.
+five-patch cohort of 9.0 it fails 15 of its 18 original cases, including the real blocked-`session_start`
+consumer and the pseudo-terminal marker case; the three that pass in both are the cohort identity case and the
+two that require the default output to carry **no** marker byte. It now carries 24 cases: the added ones cover
+the ordered interval's error paths and feed the decoder the actual arriving reads from a pseudo-terminal, and
+three of them fail against the superseded `3756157` cohort.
 
 ### 9.1 What the composition itself does not deliver
 

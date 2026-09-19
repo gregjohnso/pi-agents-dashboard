@@ -1,8 +1,28 @@
-import { expect, it } from "vitest";
+import { afterEach, expect, it } from "vitest";
 
 import { createAttachmentSet } from "./attachment-set.mjs";
-import { classifyOwnerExit, createPtyHost, MISSING_HOST_CAPABILITIES, PtyHostError } from "./pty-host.mjs";
+import { classifyOwnerExit, createPtyHost, MISSING_HOST_CAPABILITIES, ORDERED_BOOTSTRAP_PROTOCOL, PtyHostError } from "./pty-host.mjs";
 import { createLaunchFixedProfile } from "./terminal-profile.mjs";
+import { acceptedMarkerApi, bootstrapChannel, publishedInputTargetRegistry, terminalOutputClient } from "../test/fixtures/native-host/consumer-doubles.mjs";
+
+/**
+ * The accepted native build this host consumes, when a cohort is selected.
+ *
+ * The marker framing must be the build the running Pi writes, so it is never resolved from this package's own
+ * pinned dependency: the cases that consume it are selected by `PI_NATIVE_ARTIFACTS_MANIFEST` and skip without
+ * one, exactly like the other cohort suites in this repository.
+ */
+const accepted = await acceptedMarkerApi();
+const withCohort = accepted.selected;
+/** @type {any} */
+const markers = accepted.api;
+
+/** Channels a case opened, closed after it whatever happened: a real socket outlives a failed expectation. */
+/** @type {{ close: () => Promise<void> }[]} */
+const openChannels = [];
+afterEach(async () => {
+  for (const channel of openChannels.splice(0)) await channel.close();
+});
 
 const OWNER_IDENTITY = { pid: 4242, startIdentity: "918273", processGroupId: 4242, sessionId: 4242 };
 /** The three fields an exact birth identity is, and the whole of what a host retains from the owner record. */
@@ -1038,4 +1058,450 @@ it("refuses an unusable construction rather than defaulting it", () => {
   expect(() => createPtyHost({ owner: owner.handle, profile: PROFILE, queuedByteCap: 1024, cols: 0, rows: 24 })).toThrow(PtyHostError);
   expect(() => createPtyHost({ owner: /** @type {any} */ ({}), profile: PROFILE, queuedByteCap: 1024, cols: 80, rows: 24 })).toThrow(PtyHostError);
   expect(() => createPtyHost({ owner: owner.handle, profile: /** @type {any} */ ({ profileId: "x" }), queuedByteCap: 1024, cols: 80, rows: 24 })).toThrow(PtyHostError);
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// The accepted capability consumers.
+//
+// Process placement, which every case below depends on: the published input-target registry is PROCESS-LOCAL
+// to Pi. Calling `nativeInputTargetSnapshot()` here, in the host process, reads this process's own empty
+// container — which the first case proves against the accepted build rather than asserting from a document.
+// So the host consumes the snapshot/subscription *shape* from whoever runs Pi-side, and four boundaries stay
+// distinct: the bootstrap-2 control frames on a real socket, the marker framing decoded out of the PTY bytes,
+// the fresh bytes handed to one client transport, and that client's own local `Writable` acceptance.
+// ---------------------------------------------------------------------------------------------------------
+
+/** One host wired to the consumer seams a case supplies. Everything else stays the accepted construction.
+ * @param {{ registry?: any, channel?: any, presentMarkers?: any, owner?: any }} [options] */
+function consumerHost({ registry = null, channel = null, presentMarkers = null, owner: ownerOptions = {} } = {}) {
+  const owner = fakeOwner(ownerOptions);
+  const created = createPtyHost({
+    owner: owner.handle,
+    profile: PROFILE,
+    queuedByteCap: 1024,
+    cols: 100,
+    rows: 30,
+    inputTargetRegistry: registry,
+    presentation: channel,
+    presentMarkers,
+    inspectIdentity: async () => ({ ...BIRTH_IDENTITY }),
+    signalProcessGroup: () => {},
+  });
+  return { owner, host: created };
+}
+
+/** Open a real bootstrap socket and close it after the case, whatever the case does. @param {any} [options] */
+async function openChannel(options) {
+  const opened = await bootstrapChannel(options);
+  openChannels.push(opened);
+  return opened;
+}
+
+/** The successful `presentation-result` frame Pi answers one `present-ordered` command with.
+ * @param {any} command @param {{ frameId: string, nonce: string, columns?: number, rows?: number, geometryRevision?: number }} receipt */
+function orderedResult(command, receipt) {
+  const { frameId, nonce, columns = 100, rows = 30, geometryRevision = 1 } = receipt;
+  return {
+    type: "presentation-result",
+    protocol: ORDERED_BOOTSTRAP_PROTOCOL,
+    requestId: command.requestId,
+    ordering: { version: command.ordering.version, token: command.ordering.token },
+    result: {
+      presented: true,
+      terminalOwner: "pi",
+      presentationNonce: nonce,
+      frame: { frameId, sequence: 1, columns, rows, byteLength: 64 },
+      geometryRevision,
+      attachmentEpoch: command.attachmentEpoch,
+      cold: true,
+      coldReassertion: undefined,
+      ordering: { version: command.ordering.version, token: command.ordering.token, markerCodec: markers?.NATIVE_PRESENT_MARKER_CODEC },
+    },
+  };
+}
+
+/** A renderer frame id has the shape the codec requires, so a case cannot pass with a placeholder. */
+function frameId() {
+  return "1f2e3d4c-5b6a-4798-8899-aabbccddeeff";
+}
+
+it("reads the real published registry in this process and finds no producer, because that registry is Pi's own", async () => {
+  if (!withCohort) return;
+  // The accepted build's own function, called from the host process. API availability is not producer
+  // availability, and this is what makes the placement statement above a fact rather than a claim.
+  const snapshot = markers.nativeInputTargetSnapshot();
+  expect(snapshot.apiVersion).toBe(markers.NATIVE_INPUT_TARGET_API_VERSION);
+  expect(snapshot.producerVersion).toBe(null);
+  expect(snapshot.target).toBe(null);
+  expect(snapshot.reason).toBe("producer-absent");
+
+  const { owner, host: created } = consumerHost({ registry: { snapshot: () => markers.nativeInputTargetSnapshot(), subscribe: (/** @type {any} */ listener) => markers.subscribeNativeInputTarget(listener) } });
+  const a = attach(created, "a");
+  expect(await created.deliverInput({ epoch: a.result.epoch, bytes: bytes("x") })).toMatchObject({
+    delivered: false,
+    admitted: null,
+    reason: "input-target-unavailable",
+    targetReason: "producer-absent",
+    producerVersion: null,
+  });
+  // No unlabelled fallback: nothing this client typed reached the master.
+  expect(owner.writes).toEqual([]);
+  expect(created.capabilityReport().inputTarget).toMatchObject({ route: "published-registry", apiVersion: 1, producerVersion: null, available: false, reason: "producer-absent" });
+});
+
+it("dispatches labelled input through a publication and keeps a revoked handle's bytes with their sender", async () => {
+  const published = publishedInputTargetRegistry();
+  const { owner, host: created } = consumerHost({ registry: published.registry });
+  const a = attach(created, "a");
+
+  // Before a producer publishes there is no target, and the refusal names the registry's own reason.
+  expect(await created.deliverInput({ epoch: a.result.epoch, bytes: bytes("early") })).toMatchObject({ reason: "input-target-unavailable", targetReason: "producer-absent" });
+
+  const publication = published.mountProducer();
+  const admitted = /** @type {any} */ (await created.deliverInput({ epoch: a.result.epoch, bytes: bytes("typed") }));
+  expect(admitted).toMatchObject({ delivered: true, admitted: true, consumedThrough: 5 });
+  expect(admitted.publication).toEqual(publication);
+  expect(published.dispatched.map((entry) => Buffer.from(entry.bytes).toString("latin1"))).toEqual(["typed"]);
+
+  // Synchronous revocation: the handle refuses itself, carries no consumedThrough, and the span stays the
+  // sender's to deliver once.
+  published.revoke();
+  expect(await created.deliverInput({ epoch: a.result.epoch, bytes: bytes("after") })).toMatchObject({ reason: "input-target-unavailable", targetReason: "revoked" });
+  expect(published.dispatched).toHaveLength(1);
+  expect(owner.writes).toEqual([]);
+});
+
+it("names every registry state the published contract declares, and never infers support from the API version", async () => {
+  const published = publishedInputTargetRegistry();
+  const { host: created } = consumerHost({ registry: published.registry });
+  const a = attach(created, "a");
+  published.mountProducer();
+  const registration = published.registerHost();
+
+  expect(await created.deliverInput({ epoch: a.result.epoch, bytes: bytes("one") })).toMatchObject({ delivered: true });
+  const first = created.capabilityReport().inputTarget.publication.sequence;
+
+  // Registration rotates the publication for a new host rather than restarting the renderer.
+  published.replaceHost();
+  expect(await created.deliverInput({ epoch: a.result.epoch, bytes: bytes("two") })).toMatchObject({ reason: "input-target-unavailable", targetReason: "host-replaced" });
+
+  const second = published.registerHost();
+  expect(created.capabilityReport().inputTarget.publication.sequence).toBeGreaterThan(first);
+  expect(await created.deliverInput({ epoch: a.result.epoch, bytes: bytes("three") })).toMatchObject({ delivered: true });
+
+  second.release();
+  expect(await created.deliverInput({ epoch: a.result.epoch, bytes: bytes("four") })).toMatchObject({ reason: "input-target-unavailable", targetReason: "host-released" });
+  registration.release();
+});
+
+it("refuses labelled input by seam G's own reason while a handoff has closed admission", async () => {
+  const published = publishedInputTargetRegistry();
+  published.mountProducer();
+  const { host: created } = consumerHost({ registry: published.registry });
+  const a = attach(created, "a");
+  published.closeHandoff(true);
+
+  const refused = await created.deliverInput({ epoch: a.result.epoch, bytes: bytes("into the child") });
+  expect(refused).toMatchObject({ delivered: false, admitted: false, reason: "handoff-closed" });
+  // The drain closed the terminal's admission, not the publication: the bytes are still the sender's, handed
+  // out exactly once.
+  expect(created.takeRefusedInput().map((span) => Buffer.from(span.bytes).toString("latin1"))).toEqual(["into the child"]);
+  expect(created.takeRefusedInput()).toEqual([]);
+
+  published.closeHandoff(false);
+  expect(await created.deliverInput({ epoch: a.result.epoch, bytes: bytes("back") })).toMatchObject({ delivered: true });
+});
+
+it("fails closed on a registry state this copy cannot interpret, instead of reporting no target", async () => {
+  const published = publishedInputTargetRegistry({ unsupportedState: true });
+  const { owner, host: created } = consumerHost({ registry: published.registry });
+  const a = attach(created, "a");
+  expect(await created.deliverInput({ epoch: a.result.epoch, bytes: bytes("x") })).toMatchObject({ reason: "input-target-unavailable", targetReason: "registry-unsupported" });
+  expect(created.capabilityReport().inputTarget).toMatchObject({ reason: "registry-unsupported", available: false });
+  expect(owner.writes).toEqual([]);
+});
+
+it("activates ordered presentation only against a protocol-2 hello that declares this build's own framing", async () => {
+  if (!withCohort) return;
+  const two = await openChannel({ protocol: 2 });
+  const { host: active } = consumerHost({ channel: two.channel, presentMarkers: markers });
+  expect(active.capabilityReport().orderedPresentation).toEqual({
+    active: true,
+    protocol: 2,
+    version: markers.NATIVE_PRESENT_ORDERING_VERSION,
+    markerCodec: markers.NATIVE_PRESENT_MARKER_CODEC,
+    tokenBytes: markers.NATIVE_PRESENT_TOKEN_BYTES,
+    maxMarkerBytes: markers.NATIVE_PRESENT_MARKER_MAX_BYTES,
+    freshChunkMax: markers.NATIVE_PRESENT_FRESH_CHUNK_MAX,
+  });
+  expect(active.capabilityReport().missing).not.toContain(MISSING_HOST_CAPABILITIES.presentationDeliveryBoundary);
+
+  // An old Pi ignores the selector and sends its protocol-1 hello. That is compatible, not a failure, and not
+  // one ordered command may be sent on it.
+  const one = await openChannel({ protocol: 1 });
+  const { host: compatible } = consumerHost({ channel: one.channel, presentMarkers: markers });
+  expect(compatible.capabilityReport().orderedPresentation).toEqual({ active: false, reason: "bootstrap-protocol-1" });
+  const a = attach(compatible, "a");
+  expect(await compatible.presentOrderedTo(a.result.epoch)).toMatchObject({ presented: false, refusal: "ordered-presentation-unavailable", reason: "bootstrap-protocol-1" });
+  expect(one.commands).toEqual([]);
+  expect(compatible.acknowledgePresentation(a.result.epoch, "frame-1")).toMatchObject({ cleared: false, missingCapability: MISSING_HOST_CAPABILITIES.presentationDeliveryBoundary });
+
+  // A hello whose declared bounds are not this build's is refused by the field that differs, never downgraded.
+  const mismatched = await openChannel({ protocol: 2, orderedPresentation: { version: 1, markerCodec: markers.NATIVE_PRESENT_MARKER_CODEC, tokenBytes: 32, maxMarkerBytes: 128, freshChunkMax: 4096 } });
+  const { host: refused } = consumerHost({ channel: mismatched.channel, presentMarkers: markers });
+  expect(refused.capabilityReport().orderedPresentation).toEqual({ active: false, reason: "ordered-presentation-mismatch:freshChunkMax" });
+});
+
+it("clears resync only after a matching control result and the matching observed END, in either order", async () => {
+  if (!withCohort) return;
+  const nonce = "presentation-nonce-1";
+  const identity = frameId();
+  const channel = await openChannel({ protocol: 2, answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }) });
+  const { host: created } = consumerHost({ channel: channel.channel, presentMarkers: markers });
+
+  const client = terminalOutputClient({ stall: true });
+  const slow = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: client.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  const live = attach(created, "live");
+  // A burst the client has not finished writing carries its own queue past the cap, which is what marks it
+  // resync-required. It stays a member and stays input-eligible (G-A6).
+  created.broadcastOwnerOutput(bytes("x".repeat(2048)));
+  client.releaseWrites();
+  expect(created.attachments().find((entry) => entry.attachmentId === "recovering")).toMatchObject({ state: "resync-required", inputEligible: true });
+  const acceptedBeforeRecovery = client.acceptedBytes();
+
+  const presented = /** @type {any} */ (await created.presentOrderedTo(slow.epoch));
+  expect(presented).toMatchObject({ presented: true, recoveryArmed: true, acknowledgeable: false, presentationNonce: nonce });
+  expect(channel.commands).toHaveLength(1);
+  expect(channel.commands[0]).toMatchObject({ type: "present-ordered", protocol: 2, coldTerminal: true, ordering: { version: 1 } });
+  expect(markers.isNativePresentToken(channel.commands[0].ordering.token)).toBe(true);
+
+  // Control first, bytes second. Ordinary output before BEGIN still goes to the live member only.
+  created.broadcastOwnerOutput(bytes("ordinary"));
+  expect(client.acceptedBytes()).toBe(acceptedBeforeRecovery);
+  expect(live.client.text()).toContain("ordinary");
+
+  const token = presented.ordering.token;
+  created.broadcastOwnerOutput(bytes(markers.encodeNativePresentBegin(token)));
+  expect(created.recoveryState()).toMatchObject({ observedBegin: true, observedEnd: false, controlResult: true, acknowledgeable: false });
+  // Early acknowledgement is refused: the frame boundary has not closed.
+  expect(created.acknowledgePresentation(slow.epoch, nonce)).toMatchObject({ cleared: false, reason: "frame-boundary-not-observed" });
+
+  created.broadcastOwnerOutput(bytes("FRESH-FRAME"));
+  created.broadcastOwnerOutput(bytes(markers.encodeNativePresentEnd(token, identity)));
+  expect(created.recoveryState()).toMatchObject({ observedEnd: true, acknowledgeable: true, freshBytes: 11 });
+  // The fresh frame reached the recovering client's own terminal and nobody else's, and the markers themselves
+  // are never forwarded.
+  expect(client.acceptedText().endsWith("FRESH-FRAME")).toBe(true);
+  expect(live.client.text()).not.toContain("FRESH-FRAME");
+  expect(client.acceptedText()).not.toContain("pi-native-present");
+  // Still nothing is live before the client acknowledges.
+  expect(created.attachments().find((entry) => entry.attachmentId === "recovering")).toMatchObject({ state: "resync-required" });
+
+  expect(client.acknowledgeable()).toBe(true);
+  expect(created.acknowledgePresentation(slow.epoch, nonce)).toEqual({ cleared: true, reason: null });
+  expect(created.attachments().find((entry) => entry.attachmentId === "recovering")).toMatchObject({ state: "live" });
+  expect(created.recoveryState()).toBe(null);
+  expect(created.recoveryCounts()).toMatchObject({ armed: 1, cleared: 1, failed: 0 });
+});
+
+it("accepts the byte half before the control half, and only then records the acknowledgement it expects", async () => {
+  if (!withCohort) return;
+  const nonce = "presentation-nonce-2";
+  const identity = frameId();
+  /** @type {((frame: any) => void)[]} */
+  const held = [];
+  const channel = await openChannel({
+    protocol: 2,
+    answer: (/** @type {any} */ command) => new Promise((resolve) => held.push(() => resolve(orderedResult(command, { frameId: identity, nonce })))),
+  });
+  const { host: created } = consumerHost({ channel: channel.channel, presentMarkers: markers });
+  const client = terminalOutputClient({ stall: true });
+  const slow = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: client.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  created.broadcastOwnerOutput(bytes("x".repeat(2048)));
+  client.releaseWrites();
+
+  const commandArrived = channel.nextCommand();
+  const pending = created.presentOrderedTo(slow.epoch);
+  const token = /** @type {any} */ (created.recoveryState()).token;
+  await commandArrived;
+  // The whole frame, including END, arrives before the control result. That is not success yet.
+  created.broadcastOwnerOutput(bytes(`${markers.encodeNativePresentBegin(token)}FRESH${markers.encodeNativePresentEnd(token, identity)}`));
+  expect(created.recoveryState()).toMatchObject({ observedEnd: true, controlResult: false, acknowledgeable: false });
+  expect(created.acknowledgePresentation(slow.epoch, nonce)).toMatchObject({ cleared: false, reason: "control-result-outstanding" });
+
+  for (const release of held.splice(0)) release(undefined);
+  expect(await pending).toMatchObject({ presented: true, recoveryArmed: true, acknowledgeable: true });
+  expect(created.acknowledgePresentation(slow.epoch, nonce)).toEqual({ cleared: true, reason: null });
+  expect(client.acceptedText().endsWith("FRESH")).toBe(true);
+});
+
+it("leaves an observed END failed when the control half is negative, aborted or lost", async () => {
+  if (!withCohort) return;
+  const identity = frameId();
+  // A negative result: a complete END was observed, and the attempt still failed.
+  const negative = await openChannel({
+    protocol: 2,
+    answer: (/** @type {any} */ command) => ({ type: "presentation-result", protocol: 2, requestId: command.requestId, ordering: { version: 1, token: command.ordering.token }, result: { presented: false, terminalOwner: "pi", presentationNonce: null, refusal: "no-complete-frame-support", childAcknowledgement: "not-applicable" } }),
+  });
+  const { host: refusedHost } = consumerHost({ channel: negative.channel, presentMarkers: markers });
+  const refusedClient = terminalOutputClient({ stall: true });
+  const refusedMember = /** @type {{ attached: true, epoch: any }} */ (refusedHost.attach({ attachmentId: "recovering", sink: refusedClient.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  refusedHost.broadcastOwnerOutput(bytes("x".repeat(2048)));
+  refusedClient.releaseWrites();
+  expect(await refusedHost.presentOrderedTo(refusedMember.epoch)).toMatchObject({ presented: false, refusal: "no-complete-frame-support" });
+  expect(refusedHost.recoveryState()).toBe(null);
+  expect(refusedHost.acknowledgePresentation(refusedMember.epoch, "anything")).toMatchObject({ cleared: false, reason: "no-armed-recovery" });
+  expect(refusedHost.attachments()[0]).toMatchObject({ state: "resync-required" });
+
+  // An ABORT on the byte route after a successful control result: the attempt failed and no nonce survives it.
+  const nonce = "presentation-nonce-3";
+  const aborted = await openChannel({ protocol: 2, answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }) });
+  const { host: abortedHost } = consumerHost({ channel: aborted.channel, presentMarkers: markers });
+  const abortedClient = terminalOutputClient({ stall: true });
+  const abortedMember = /** @type {{ attached: true, epoch: any }} */ (abortedHost.attach({ attachmentId: "recovering", sink: abortedClient.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  abortedHost.broadcastOwnerOutput(bytes("x".repeat(2048)));
+  abortedClient.releaseWrites();
+  const armed = /** @type {any} */ (await abortedHost.presentOrderedTo(abortedMember.epoch));
+  const token = armed.ordering.token;
+  abortedHost.broadcastOwnerOutput(bytes(`${markers.encodeNativePresentBegin(token)}PART`));
+  abortedHost.broadcastOwnerOutput(bytes(markers.encodeNativePresentAbort(token)));
+  expect(abortedHost.recoveryState()).toBe(null);
+  expect(abortedHost.acknowledgePresentation(abortedMember.epoch, nonce)).toMatchObject({ cleared: false, reason: "no-armed-recovery" });
+  expect(abortedHost.attachments()[0]).toMatchObject({ state: "resync-required" });
+  expect(abortedHost.recoveryCounts()).toMatchObject({ failed: 1, cleared: 0 });
+
+  // A lost control transport is uncertain, not success.
+  const lost = await openChannel({ protocol: 2, answer: () => undefined });
+  const { host: lostHost } = consumerHost({ channel: lost.channel, presentMarkers: markers });
+  const lostMember = attach(lostHost, "recovering");
+  const pending = lostHost.presentOrderedTo(lostMember.result.epoch);
+  await new Promise((resolve) => setImmediate(resolve));
+  lost.loseTransport();
+  await expect(pending).resolves.toMatchObject({ presented: false });
+});
+
+it("invalidates a proved attempt when ordinary output the member could not receive follows its END", async () => {
+  if (!withCohort) return;
+  const nonce = "presentation-nonce-4";
+  const identity = frameId();
+  const channel = await openChannel({ protocol: 2, answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }) });
+  const { host: created } = consumerHost({ channel: channel.channel, presentMarkers: markers });
+  const client = terminalOutputClient({ stall: true });
+  const slow = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: client.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  created.broadcastOwnerOutput(bytes("x".repeat(2048)));
+  client.releaseWrites();
+  const armed = /** @type {any} */ (await created.presentOrderedTo(slow.epoch));
+  const token = armed.ordering.token;
+  created.broadcastOwnerOutput(bytes(`${markers.encodeNativePresentBegin(token)}FRESH${markers.encodeNativePresentEnd(token, identity)}`));
+  expect(created.recoveryState()).toMatchObject({ acknowledgeable: true });
+
+  // Post-END ordinary output is skipped for a resync-required member, so its screen is behind again. The known
+  // liveness cost of Task 11 stands: this attempt can no longer be acknowledged.
+  created.broadcastOwnerOutput(bytes("later ordinary output"));
+  expect(created.recoveryState()).toBe(null);
+  expect(created.acknowledgePresentation(slow.epoch, nonce)).toMatchObject({ cleared: false, reason: "no-armed-recovery" });
+  expect(created.attachments()[0]).toMatchObject({ state: "resync-required" });
+  expect(created.recoveryCounts()).toMatchObject({ failed: 1, cleared: 0 });
+});
+
+it("refuses a second recovery while one is armed, and retires an armed attempt on detach or replacement", async () => {
+  if (!withCohort) return;
+  const nonce = "presentation-nonce-5";
+  const identity = frameId();
+  const channel = await openChannel({ protocol: 2, answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }) });
+  const { host: created } = consumerHost({ channel: channel.channel, presentMarkers: markers });
+  const client = terminalOutputClient({ stall: true });
+  const first = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: client.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  created.broadcastOwnerOutput(bytes("x".repeat(2048)));
+  client.releaseWrites();
+  const armed = /** @type {any} */ (await created.presentOrderedTo(first.epoch));
+  expect(armed.recoveryArmed).toBe(true);
+
+  // Bounded admission: an armed stream is never silently replaced.
+  expect(await created.presentOrderedTo(first.epoch)).toMatchObject({ presented: false, refusal: "recovery-already-armed" });
+  expect(created.recoveryState()).toMatchObject({ token: armed.ordering.token });
+  expect(channel.commands).toHaveLength(1);
+
+  // A replacement for the same id retires it: the new connection is never handed the old attempt's frame.
+  const replacement = terminalOutputClient();
+  created.attach({ attachmentId: "recovering", sink: replacement.sink, declared: { capabilities: { ...CAPABILITIES } } });
+  expect(created.recoveryState()).toBe(null);
+  expect(created.acknowledgePresentation(first.epoch, nonce)).toMatchObject({ cleared: false, reason: "no-armed-recovery" });
+  // The retired attempt's framing is nobody's frame now: the replacement receives those bytes as ordinary
+  // verbatim output, markers included, and no recovery is armed for it.
+  const stale = `${markers.encodeNativePresentBegin(armed.ordering.token)}STALE`;
+  created.broadcastOwnerOutput(bytes(stale));
+  expect(replacement.acceptedText().endsWith(stale)).toBe(true);
+  expect(created.recoveryState()).toBe(null);
+});
+
+it("hands a fresh frame to one client in bounded chunks, and keeps marker-like text verbatim for everyone else", async () => {
+  if (!withCohort) return;
+  const nonce = "presentation-nonce-6";
+  const identity = frameId();
+  const channel = await openChannel({ protocol: 2, answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }) });
+  const { host: created } = consumerHost({ channel: channel.channel, presentMarkers: markers });
+  const client = terminalOutputClient({ highWaterMark: 16, stall: true });
+  const slow = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: client.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  const live = attach(created, "live");
+  created.broadcastOwnerOutput(bytes("x".repeat(2048)));
+  client.releaseWrites();
+  const liveBefore = live.client.text();
+  const acceptedBeforeFrame = client.acceptedBytes();
+
+  const armed = /** @type {any} */ (await created.presentOrderedTo(slow.epoch));
+  const token = armed.ordering.token;
+  const begin = markers.encodeNativePresentBegin(token);
+  // Split BEGIN across two reads: where a read boundary fell is not part of the framing.
+  created.broadcastOwnerOutput(bytes(begin.slice(0, 9)));
+  created.broadcastOwnerOutput(bytes(begin.slice(9)));
+  const frame = "F".repeat(markers.NATIVE_PRESENT_FRESH_CHUNK_MAX + 321);
+  created.broadcastOwnerOutput(bytes(frame));
+  created.broadcastOwnerOutput(bytes(markers.encodeNativePresentEnd(token, identity)));
+
+  const state = /** @type {any} */ (created.recoveryState());
+  expect(state).toMatchObject({ observedBegin: true, observedEnd: true, freshBytes: frame.length });
+  // Bounded route: the frame was handed over in ceil(length / freshChunkMax) chunks, none of them larger.
+  expect(state.freshChunks).toBe(Math.ceil(frame.length / markers.NATIVE_PRESENT_FRESH_CHUNK_MAX));
+  expect(client.acceptedBytes() - acceptedBeforeFrame).toBe(frame.length);
+  expect(created.acknowledgePresentation(slow.epoch, nonce)).toEqual({ cleared: true, reason: null });
+  // The live member saw none of the fresh frame and no marker bytes at all.
+  expect(live.client.text()).toBe(liveBefore);
+
+  // Marker-like terminal text that is not this attempt's framing is ordinary output, byte for byte.
+  const impostor = `${markers.encodeNativePresentBegin(markers.mintNativePresentToken())}plain`;
+  created.broadcastOwnerOutput(bytes(impostor));
+  expect(live.client.text()).toBe(`${liveBefore}${impostor}`);
+});
+
+it("refuses an acknowledgement whose nonce is not the one this attempt recorded", async () => {
+  if (!withCohort) return;
+  const nonce = "presentation-nonce-7";
+  const identity = frameId();
+  const channel = await openChannel({ protocol: 2, answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }) });
+  const { host: created } = consumerHost({ channel: channel.channel, presentMarkers: markers });
+  const client = terminalOutputClient({ stall: true });
+  const slow = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: client.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  created.broadcastOwnerOutput(bytes("x".repeat(2048)));
+  client.releaseWrites();
+  const armed = /** @type {any} */ (await created.presentOrderedTo(slow.epoch));
+  created.broadcastOwnerOutput(bytes(`${markers.encodeNativePresentBegin(armed.ordering.token)}FRESH${markers.encodeNativePresentEnd(armed.ordering.token, identity)}`));
+
+  expect(created.acknowledgePresentation(slow.epoch, "another-nonce")).toEqual({ cleared: false, reason: "acknowledgement-not-current" });
+  expect(created.attachments()[0]).toMatchObject({ state: "resync-required" });
+  // A stale epoch for the same id is refused as well: this attempt belongs to one exact connection.
+  expect(created.acknowledgePresentation({ attachmentId: "recovering", epoch: slow.epoch.epoch + 1 }, nonce)).toMatchObject({ cleared: false, reason: "no-armed-recovery" });
+});
+
+it("refuses an ordered presentation for a frame receipt built at another geometry", async () => {
+  if (!withCohort) return;
+  const channel = await openChannel({ protocol: 2, answer: (/** @type {any} */ command) => orderedResult(command, { frameId: frameId(), nonce: "presentation-nonce-8", columns: 80, rows: 24 }) });
+  const { host: created } = consumerHost({ channel: channel.channel, presentMarkers: markers });
+  const client = terminalOutputClient({ stall: true });
+  const slow = /** @type {{ attached: true, epoch: any }} */ (created.attach({ attachmentId: "recovering", sink: client.sink, declared: { capabilities: { ...CAPABILITIES } } }));
+  created.broadcastOwnerOutput(bytes("x".repeat(2048)));
+  client.releaseWrites();
+  expect(await created.presentOrderedTo(slow.epoch)).toMatchObject({ presented: true, stale: true, recoveryArmed: false });
+  expect(created.recoveryState()).toBe(null);
+  expect(created.acknowledgePresentation(slow.epoch, "presentation-nonce-8")).toMatchObject({ cleared: false, reason: "no-armed-recovery" });
 });

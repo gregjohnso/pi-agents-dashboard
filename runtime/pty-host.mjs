@@ -37,12 +37,32 @@
  * stop reads it first, revalidates the recorded identity, and only then signals — after a signal, an exit
  * that had already happened for another reason can no longer be told apart from the one it caused.
  *
+ * **Labelled ingress has a published target now, and it is process-local to Pi.**
+ * `nativeInputTargetSnapshot`/`subscribeNativeInputTarget` read a container inside the Pi process: importing
+ * them here, in the host process, would read this process's empty registry and answer `producer-absent`
+ * forever. They are not an IPC bridge and this module does not pretend otherwise. `inputTargetRegistry` is
+ * therefore injected with exactly the published snapshot/subscription shape, and whoever supplies it runs
+ * where the registry lives — Pi-side. The host consumes publications, distinguishes API version from producer
+ * version, follows replacement and synchronous revocation, and refuses by the registry's own reason. With no
+ * route at all `deliverInput` still refuses by name: `MISSING_HOST_CAPABILITIES.labelledIngress`. It is never
+ * answered by writing the client's bytes to the master unlabelled.
+ *
+ * **A presentation receipt still is not a delivery boundary; `dcs-pi-native-present-v1` is.** Four distinct
+ * boundaries are kept apart on purpose: the bootstrap-2 request/result frames (a control channel), the marker
+ * framing decoded out of the PTY master's bytes (a byte boundary), the fresh bytes handed to one client
+ * transport, and that client's acknowledgement that its own local terminal-output `Writable` accepted them in
+ * order. A usable ordered presentation needs **both** the matching successful control result and the matching
+ * observed BEGIN/END; an END alone can be a fully admitted END followed by a throwing write, or a partial END
+ * finished by the failed attempt's cleanup terminator. Nothing is live before the client's acknowledgement,
+ * nothing is replayed, and no output tail is retained.
+ *
  * **Boundary.** This module keeps no copy of any byte it hands to a sink, never parses input or output, never
  * decodes a key, never judges paste completeness, and never stops the owner because the attachment set is
  * empty. Terminal-response decisions belong to the launch-fixed profile in
  * [terminal-profile.mjs](terminal-profile.mjs); epochs belong to
  * [shared/native-contracts.mjs](../shared/native-contracts.mjs); membership and backpressure belong to
- * [attachment-set.mjs](attachment-set.mjs).
+ * [attachment-set.mjs](attachment-set.mjs); the marker framing belongs to the accepted `pi-tui` build, whose
+ * public API is injected rather than re-implemented.
  */
 
 import { nextAttachmentEpoch, parseAttachmentEpoch } from "../shared/native-contracts.mjs";
@@ -73,6 +93,54 @@ export const MISSING_HOST_CAPABILITIES = Object.freeze({
 
 /** The error codes a `write` failure carries the accepted prefix on, so only the suffix is ever queued. */
 const PARTIAL_WRITE_CODES = Object.freeze(["PTY_INPUT_BACKPRESSURE", "PTY_WRITE_NO_PROGRESS"]);
+
+/** The bootstrap protocol that carries `present-ordered`. Protocol 1 is not extended and stays compatible. */
+export const ORDERED_BOOTSTRAP_PROTOCOL = 2;
+
+/** The named marker API this host consumes from the build its owner runs. Absent names refuse activation. */
+const REQUIRED_MARKER_API = Object.freeze([
+  "NATIVE_PRESENT_MARKER_CODEC",
+  "NATIVE_PRESENT_ORDERING_VERSION",
+  "NATIVE_PRESENT_TOKEN_BYTES",
+  "NATIVE_PRESENT_MARKER_MAX_BYTES",
+  "NATIVE_PRESENT_FRESH_CHUNK_MAX",
+  "NativePresentMarkerDecoder",
+  "mintNativePresentToken",
+  "isNativePresentToken",
+  "isNativePresentFrameId",
+]);
+
+/**
+ * Whether one protocol-2 hello really declares the framing the injected build speaks.
+ *
+ * Both halves are checked against each other rather than assumed: the hello is the launch Pi answered with,
+ * and the marker API is the build this host was handed. A protocol-1 hello is a compatible old Pi, not a
+ * failure, and either way not one ordered command is sent — an unsupported ordering is never downgraded to an
+ * unordered presentation.
+ *
+ * @param {any} hello @param {any} markers
+ * @returns {{ active: true, declared: { version: number, markerCodec: string, tokenBytes: number, maxMarkerBytes: number, freshChunkMax: number } } | { active: false, reason: string }}
+ */
+function readOrderedPresentationHello(hello, markers) {
+  if (typeof markers !== "object" || markers === null) return { active: false, reason: "marker-api-absent" };
+  const missing = REQUIRED_MARKER_API.find((name) => markers[name] === undefined);
+  if (missing !== undefined) return { active: false, reason: `marker-api-incomplete:${missing}` };
+  if (typeof hello !== "object" || hello === null || hello.type !== "native-bootstrap") return { active: false, reason: "bootstrap-hello-unreadable" };
+  if (hello.protocol !== ORDERED_BOOTSTRAP_PROTOCOL) return { active: false, reason: "bootstrap-protocol-1" };
+  const declared = hello.orderedPresentation;
+  if (typeof declared !== "object" || declared === null) return { active: false, reason: "ordered-presentation-undeclared" };
+  const expected = {
+    version: markers.NATIVE_PRESENT_ORDERING_VERSION,
+    markerCodec: markers.NATIVE_PRESENT_MARKER_CODEC,
+    tokenBytes: markers.NATIVE_PRESENT_TOKEN_BYTES,
+    maxMarkerBytes: markers.NATIVE_PRESENT_MARKER_MAX_BYTES,
+    freshChunkMax: markers.NATIVE_PRESENT_FRESH_CHUNK_MAX,
+  };
+  for (const [field, value] of Object.entries(expected)) {
+    if (declared[field] !== value) return { active: false, reason: `ordered-presentation-mismatch:${field}` };
+  }
+  return { active: true, declared: Object.freeze({ ...expected }) };
+}
 
 /** A refused request, or a host that cannot be built as asked. Never a warning and never a default. */
 export class PtyHostError extends Error {
@@ -253,9 +321,13 @@ function prepareAttachmentSink(sink) {
  * belongs to whatever wrapped it in a stream, so nothing here ever closes it: an empty attachment set is not
  * an orphan, and the owner outlives every client.
  *
- * `inputTarget` and `presentation` are the two supported seams this host consumes when an owner really
- * supplies them — Pi's own `dispatchNativeInput` and seam E's `present`. Both are injected because both are
- * out-of-process facts about one launch, and both are absent for the whole of this release.
+ * `inputTarget`, `inputTargetRegistry`, `presentation` and `presentMarkers` are the seams this host consumes
+ * from the launch it belongs to. `inputTargetRegistry` is the published snapshot/subscription pair, supplied by
+ * whoever runs inside Pi's process, because that registry is process-local; `inputTarget` is a single already
+ * resolved dispatch handle for a caller that holds one. `presentation` is the bootstrap channel: `hello` is the
+ * first frame Pi sent and `send` carries one command frame to its reply. `presentMarkers` is the accepted
+ * `pi-tui` public marker API of the build this owner runs — injected, never re-implemented, and never resolved
+ * from this package's own pinned dependency, because the framing must be the one the running Pi writes.
  *
  * `profile` is reconstructed rather than retained. A structurally profile-shaped object is not a launch-fixed
  * profile: only `createLaunchFixedProfile` refuses one that would buy a passing client by turning images,
@@ -263,7 +335,7 @@ function prepareAttachmentSink(sink) {
  * derived here. So this host holds its own frozen profile, and a caller that mutates the record it passed in
  * moves neither admission nor initialization. A profile the factory already produced passes through unchanged.
  *
- * @param {{ owner: any, profile: VirtualTerminalProfile, queuedByteCap: number, cols: number, rows: number, inputTarget?: any, presentation?: any, inspectIdentity?: (pid: number) => Promise<any>, signalProcessGroup?: (pgid: number, signal: any) => void }} options
+ * @param {{ owner: any, profile: VirtualTerminalProfile, queuedByteCap: number, cols: number, rows: number, inputTarget?: any, inputTargetRegistry?: any, presentation?: any, presentMarkers?: any, inspectIdentity?: (pid: number) => Promise<any>, signalProcessGroup?: (pgid: number, signal: any) => void }} options
  */
 export function createPtyHost({
   owner,
@@ -272,7 +344,9 @@ export function createPtyHost({
   cols,
   rows,
   inputTarget = null,
+  inputTargetRegistry = null,
   presentation = null,
+  presentMarkers = null,
   inspectIdentity = inspectProcessIdentity,
   signalProcessGroup: signal = signalProcessGroup,
 }) {
@@ -323,11 +397,213 @@ export function createPtyHost({
   /** @type {Map<string, { epoch: AttachmentEpoch, token: object }>} */
   const outstandingPresentations = new Map();
   const presentationCounts = { requested: 0, presented: 0, refused: 0, retired: 0, staleReceipt: 0, acknowledgementsRefused: 0 };
+  /**
+   * The prepared handoff of each current member, so one armed recovery can be streamed to exactly one client.
+   *
+   * The attachment set broadcasts and deliberately skips a `resync-required` member, which is what keeps
+   * ordinary output away from a client that fell behind (G-A6). A cold presentation has to reach that one
+   * member and nobody else, so the host keeps the prepared sink it already owns rather than asking the set for
+   * a per-member write it does not publish.
+   * @type {Map<string, { epoch: AttachmentEpoch, prepared: { write: (bytes: Uint8Array) => unknown } }>}
+   */
+  const admittedSinks = new Map();
+  const orderedPresentation = /** @type {{ active: true, declared: { version: number, markerCodec: string, tokenBytes: number, maxMarkerBytes: number, freshChunkMax: number } } | { active: false, reason: string }} */ (
+    presentation === null && presentMarkers === null
+      ? { active: false, reason: "ordered-presentation-not-configured" }
+      : readOrderedPresentationHello(presentation?.hello, presentMarkers)
+  );
+  /**
+   * The one armed ordered attempt, or `null`.
+   *
+   * Two independent signals have to arrive before this attempt can be acknowledged, and they can arrive in
+   * either order: the control result of the request that armed it, and the BEGIN/END observed on the byte
+   * route. Neither alone is success. `freshBytes` counts what was handed to the client transport, and
+   * `skippedOrdinaryAfterEnd` records ordinary output the member could not receive after the interval closed,
+   * which invalidates the repaint even if the control result succeeds later.
+   * @type {null | { epoch: AttachmentEpoch, token: string, requestId: string, geometryRevision: number, decoder: any, open: boolean, observedBegin: boolean, observedEnd: null | { frameId: string }, control: null | { presentationNonce: string, frameId: string }, freshBytes: number, freshChunks: number, skippedOrdinaryAfterEnd: boolean, failure: null | string, acknowledgeable: boolean }}
+   */
+  let armedRecovery = null;
+  let requestSequence = 0;
+  const recoveryCounts = { armed: 0, refusedAdmission: 0, freshChunks: 0, freshBytes: 0, failed: 0, acknowledgeable: 0, cleared: 0 };
+
+  /** Stop recognising this attempt's framing, whatever ended it. No tail is kept and nothing is replayed.
+   * @param {string | null} failure */
+  const retireRecovery = (failure) => {
+    if (armedRecovery === null) return;
+    if (failure !== null) recoveryCounts.failed += 1;
+    try {
+      armedRecovery.decoder.disarm();
+    } catch {
+      // A decoder that refuses to disarm is still dropped: this host keeps no framing state of its own.
+    }
+    armedRecovery = null;
+  };
+
+  /** The registry state this host can see right now, without inferring support from an exported version. */
+  const inputTargetState = () => {
+    if (inputTargetRegistry !== null) {
+      let snapshot;
+      try {
+        snapshot = inputTargetRegistry.snapshot();
+      } catch (error) {
+        // A present-but-uninterpretable publication record, or a producer version this copy does not speak, is
+        // refused by the registry with a throw. Fail closed and never reset it.
+        return { route: "published-registry", apiVersion: null, producerVersion: null, publication: null, target: null, reason: "registry-unsupported", error: /** @type {Error} */ (error).message };
+      }
+      return {
+        route: "published-registry",
+        apiVersion: snapshot?.apiVersion ?? null,
+        producerVersion: snapshot?.producerVersion ?? null,
+        publication: snapshot?.publication ?? null,
+        target: snapshot?.target ?? null,
+        reason: snapshot?.target ? null : (snapshot?.reason ?? "producer-absent"),
+      };
+    }
+    if (inputTarget !== null) {
+      return { route: "resolved-handle", apiVersion: null, producerVersion: null, publication: inputTarget.publication ?? null, target: inputTarget, reason: null };
+    }
+    return { route: null, apiVersion: null, producerVersion: null, publication: null, target: null, reason: "no-input-route" };
+  };
 
   /** @param {AttachmentEpoch} epoch */
   const retirePresentation = (epoch) => {
     const outstanding = outstandingPresentations.get(epoch.attachmentId);
     if (outstanding !== undefined && outstanding.epoch.epoch === epoch.epoch) outstandingPresentations.delete(epoch.attachmentId);
+    if (armedRecovery !== null && armedRecovery.epoch.attachmentId === epoch.attachmentId && armedRecovery.epoch.epoch === epoch.epoch) {
+      retireRecovery("attachment-retired");
+    }
+  };
+
+  /**
+   * Hand one fresh span to the one client this attempt is repainting, in bounded chunks.
+   *
+   * `freshChunkMax` is the bound the peer declared, so it is honoured here rather than treated as advice. A
+   * `false` return is Node's high-water mark: the bytes were admitted once and are never written again. A throw
+   * leaves what the transport accepted unknown, which can never authorize a retry, so the attempt fails.
+   *
+   * @param {Uint8Array} span
+   */
+  const streamFresh = (span) => {
+    const attempt = armedRecovery;
+    if (attempt === null) return;
+    const held = admittedSinks.get(attempt.epoch.attachmentId);
+    if (held === undefined || held.epoch.epoch !== attempt.epoch.epoch) {
+      retireRecovery("attachment-retired");
+      return;
+    }
+    const bound = orderedPresentation.active ? orderedPresentation.declared.freshChunkMax : span.byteLength;
+    for (let offset = 0; offset < span.byteLength; offset += bound) {
+      const chunk = span.subarray(offset, Math.min(offset + bound, span.byteLength));
+      try {
+        held.prepared.write(chunk);
+      } catch {
+        retireRecovery("fresh-write-uncertain");
+        return;
+      }
+      attempt.freshBytes += chunk.byteLength;
+      attempt.freshChunks += 1;
+      recoveryCounts.freshBytes += chunk.byteLength;
+      recoveryCounts.freshChunks += 1;
+    }
+  };
+
+  /**
+   * Record the expected acknowledgement once **both** signals have arrived, and not one moment earlier.
+   *
+   * The control result with its matching receipt identity, and the matching BEGIN/END observed on the byte
+   * route. Recording the nonce changes no member state: the attachment set still holds this member
+   * `resync-required`, and only the client's own acknowledgement of this exact nonce clears it.
+   */
+  const completeRecoveryIfProved = () => {
+    const attempt = armedRecovery;
+    if (attempt === null || attempt.acknowledgeable || attempt.failure !== null) return;
+    if (attempt.control === null || attempt.observedEnd === null) return;
+    if (attempt.observedEnd.frameId !== attempt.control.frameId) {
+      retireRecovery("frame-identity-mismatch");
+      return;
+    }
+    if (attempt.skippedOrdinaryAfterEnd) {
+      retireRecovery("ordinary-output-skipped-after-end");
+      return;
+    }
+    if (attempt.geometryRevision !== geometryRevision) {
+      retireRecovery("geometry-moved");
+      return;
+    }
+    if (!attachmentSet.recordPresentationNonce(attempt.epoch, attempt.control.presentationNonce)) {
+      retireRecovery("attachment-retired");
+      return;
+    }
+    attempt.acknowledgeable = true;
+    recoveryCounts.acknowledgeable += 1;
+  };
+
+  /**
+   * One read of the master while an attempt is armed, split into this attempt's frame and everything else.
+   *
+   * The framing decoder is the accepted build's own: every byte that is not one of the armed token's markers is
+   * reproduced verbatim, so ordinary output stays byte-identical and a refusal still carries its candidate's
+   * bytes. Inside the interval the bytes are this attempt's fresh frame and go to the one member being
+   * repainted. Outside it they are ordinary output and go to the live members exactly as before — which is also
+   * why ordinary output arriving after END invalidates the repaint: the repainting member is still
+   * `resync-required`, so the set skipped it and its screen is behind again.
+   *
+   * @param {Uint8Array} bytes
+   */
+  const decodeArmedRead = (bytes) => {
+    const attempt = /** @type {NonNullable<typeof armedRecovery>} */ (armedRecovery);
+    /** @type {any[]} */
+    let events;
+    try {
+      events = attempt.decoder.decode(bytes);
+    } catch (cause) {
+      retireRecovery("decoder-refused-read");
+      return attachmentSet.broadcast(bytes);
+    }
+    /** @type {import("./attachment-set.mjs").BroadcastResult} */
+    const result = { delivered: [], skipped: [], markedResyncRequired: [], failures: [] };
+    /** @param {Uint8Array} span */
+    const ordinary = (span) => {
+      if (span.byteLength === 0) return;
+      if (armedRecovery !== null && armedRecovery.observedEnd !== null) {
+        // The repainting member is still `resync-required`, so the set skipped it: its screen is behind again
+        // and this attempt can no longer be acknowledged, even when the control result succeeded already.
+        armedRecovery.skippedOrdinaryAfterEnd = true;
+        const alreadyProved = armedRecovery.acknowledgeable;
+        if (alreadyProved) retireRecovery("ordinary-output-skipped-after-end");
+      }
+      const broadcast = attachmentSet.broadcast(span);
+      result.delivered.push(...broadcast.delivered);
+      result.skipped.push(...broadcast.skipped);
+      result.markedResyncRequired.push(...broadcast.markedResyncRequired);
+      result.failures.push(...broadcast.failures);
+    };
+    for (const event of events) {
+      const open = armedRecovery !== null && armedRecovery.open;
+      if (event.kind === "bytes" || event.kind === "refused") {
+        // A refusal is not a loss: the candidate's bytes are reproduced, so they travel the route their phase
+        // says. A refused candidate carrying this attempt's token still ends the attempt.
+        if (open) streamFresh(event.bytes);
+        else ordinary(event.bytes);
+        if (event.kind === "refused") retireRecovery(`framing-refused:${event.reason}`);
+        continue;
+      }
+      if (armedRecovery === null || event.token !== armedRecovery.token) continue;
+      if (event.kind === "begin") {
+        armedRecovery.observedBegin = true;
+        armedRecovery.open = true;
+        continue;
+      }
+      if (event.kind === "end") {
+        armedRecovery.open = false;
+        armedRecovery.observedEnd = { frameId: event.frameId };
+        completeRecoveryIfProved();
+        continue;
+      }
+      // ABORT says the attempt failed. It undoes nothing, and a frame or even an END may already have gone out.
+      retireRecovery("aborted");
+    }
+    return result;
   };
 
   /** @param {Uint8Array} span @returns {{ accepted: number, remainder: Uint8Array | null }} */
@@ -349,9 +625,18 @@ export function createPtyHost({
 
   const geometry = () => ({ cols: geometryCols, rows: geometryRows, revision: geometryRevision });
 
+  /**
+   * What is still missing, by name — and nothing that is now available.
+   *
+   * Labelled ingress is missing only while this host has no route to a dispatch target at all. A route that
+   * exists and currently publishes nothing is a registry state, reported with the registry's own reason rather
+   * than as an absent capability. The presentation delivery boundary is missing only while ordered framing is
+   * not active: with it active the boundary exists, and what remains unproved is the client's own
+   * acknowledgement, which this host requires rather than assumes.
+   */
   const missingCapabilities = () => [
-    ...(inputTarget === null ? [MISSING_HOST_CAPABILITIES.labelledIngress] : []),
-    MISSING_HOST_CAPABILITIES.presentationDeliveryBoundary,
+    ...(inputTargetRegistry === null && inputTarget === null ? [MISSING_HOST_CAPABILITIES.labelledIngress] : []),
+    ...(orderedPresentation.active ? [] : [MISSING_HOST_CAPABILITIES.presentationDeliveryBoundary]),
   ];
 
   return Object.freeze({
@@ -362,9 +647,19 @@ export function createPtyHost({
 
     geometry,
 
-    /** What this host cannot do, by name, plus the profile coverage it cannot enforce. */
+    /** What this host cannot do, by name, plus the profile coverage it cannot enforce and the seams it has. */
     capabilityReport() {
-      return { missing: missingCapabilities(), coverageGaps: PROFILE_COVERAGE_GAPS };
+      const target = inputTargetState();
+      return {
+        missing: missingCapabilities(),
+        coverageGaps: PROFILE_COVERAGE_GAPS,
+        // API availability is not producer availability, and a resolved handle is neither: all three are
+        // reported separately so no caller infers support from an exported version.
+        inputTarget: { route: target.route, apiVersion: target.apiVersion, producerVersion: target.producerVersion, publication: target.publication, available: target.target !== null, reason: target.reason },
+        orderedPresentation: orderedPresentation.active
+          ? { active: true, protocol: ORDERED_BOOTSTRAP_PROTOCOL, ...orderedPresentation.declared }
+          : { active: false, reason: orderedPresentation.reason },
+      };
     },
 
     /**
@@ -442,6 +737,7 @@ export function createPtyHost({
       // A connection that is being replaced keeps nothing outstanding: its replacement must never be handed
       // the answer to a request the previous connection made.
       if (superseded !== null) retirePresentation(superseded);
+      admittedSinks.set(epoch.attachmentId, { epoch, prepared });
       return { attached: true, epoch, geometry: geometry() };
     },
 
@@ -449,6 +745,8 @@ export function createPtyHost({
     detach(epoch, reason) {
       const asked = parseAttachmentEpoch(epoch);
       retirePresentation(asked);
+      const held = admittedSinks.get(asked.attachmentId);
+      if (held !== undefined && held.epoch.epoch === asked.epoch) admittedSinks.delete(asked.attachmentId);
       return attachmentSet.remove(asked);
     },
 
@@ -484,7 +782,8 @@ export function createPtyHost({
     broadcastOwnerOutput(bytes) {
       if (!(bytes instanceof Uint8Array)) throw new PtyHostError("Owner output is a Uint8Array", { code: "PTY_HOST_INVALID_REQUEST" });
       readBytes += bytes.byteLength;
-      return attachmentSet.broadcast(bytes);
+      if (armedRecovery === null) return attachmentSet.broadcast(bytes);
+      return decodeArmedRead(bytes);
     },
 
     /** Bytes this host has read off the master. The only read position it has, and no frame names one. */
@@ -514,22 +813,32 @@ export function createPtyHost({
       if (childPhaseRecord !== null) {
         return Promise.resolve({ delivered: false, admitted: null, reason: "child-owns-terminal", childPhaseId: childPhaseRecord.childPhaseId });
       }
-      if (inputTarget === null) {
-        return Promise.resolve({ delivered: false, admitted: null, reason: "labelled-ingress-unavailable", missingCapability: MISSING_HOST_CAPABILITIES.labelledIngress });
+      // The current publication is read per call, because the registry is the authority and a handle this host
+      // cached could have been revoked or replaced since. Nothing here is inferred from an exported version.
+      const route = inputTargetState();
+      if (route.target === null) {
+        if (route.route === null) {
+          return Promise.resolve({ delivered: false, admitted: null, reason: "labelled-ingress-unavailable", missingCapability: MISSING_HOST_CAPABILITIES.labelledIngress });
+        }
+        return Promise.resolve({ delivered: false, admitted: null, reason: "input-target-unavailable", targetReason: route.reason, producerVersion: route.producerVersion });
       }
+      const publication = route.publication;
       /** @type {Promise<any>} */
       let dispatched;
       try {
-        dispatched = Promise.resolve(inputTarget.dispatchNativeInput({ attachmentEpoch: asked, bytes, binding: { generation: bindingGeneration } }));
+        dispatched = Promise.resolve(route.target.dispatchNativeInput({ attachmentEpoch: asked, bytes, binding: { generation: bindingGeneration } }));
       } catch (error) {
         dispatched = Promise.reject(error);
       }
       const settled = dispatchAccounting.then(() => dispatched).then(
         (result) => {
-          if (result?.admitted === true) return { delivered: true, admitted: true, consumedThrough: result.consumedThrough };
+          if (result?.admitted === true) return { delivered: true, admitted: true, consumedThrough: result.consumedThrough, publication };
           if (result?.admitted === false) {
-            refusedInput.push({ epoch: asked, bytes, reason: typeof result.reason === "string" ? result.reason : "refused" });
-            return { delivered: false, admitted: false, reason: typeof result.reason === "string" ? result.reason : "refused", consumedThrough: result.consumedThrough };
+            // `target-revoked` is the handle's own synchronous refusal and carries no `consumedThrough`: nothing
+            // was dispatched, so the span stays the sender's exactly like seam G's `handoff-closed`.
+            const reason = typeof result.reason === "string" ? result.reason : "refused";
+            refusedInput.push({ epoch: asked, bytes, reason });
+            return { delivered: false, admitted: false, reason, consumedThrough: result.consumedThrough, publication };
           }
           return { delivered: false, admitted: null, reason: "dispatch-answer-unreadable" };
         },
@@ -695,22 +1004,192 @@ export function createPtyHost({
     },
 
     /**
-     * A client's echo of a presentation nonce. Counted, and it clears nothing.
+     * Ask Pi for one **ordered** cold presentation and arm this attempt's framing, or refuse by name.
      *
-     * The echo would be proof of a current screen only if the frame it names had provably passed through this
-     * host to that client. Nothing orders the receipt against this host's own reads, so accepting the echo
-     * would mark a possibly stale screen current. Membership and input eligibility are untouched: a client
-     * that stays `resync-required` keeps typing.
+     * This is the managed-recovery command, and it is the only one that writes markers. A fresh token is minted
+     * per attempt by the accepted build's own minter, the decoder is armed with it before the command is sent —
+     * so BEGIN cannot arrive unrecognised — and one command frame carries the exact published `present-ordered`
+     * shape. The result is bound to this attempt by `requestId`, by the echoed `ordering.token` and by the
+     * receipt's own frame identity; anything else retires the token.
+     *
+     * Nothing here acknowledges anything. Success means the control half arrived; the byte half arrives on the
+     * read route, and only when both agree is an acknowledgement even possible.
+     *
+     * An attempt already armed is refused rather than silently replaced: replacing it would leave the first
+     * attempt's markers armed to nobody while its client waited for a repaint that is no longer coming.
+     *
+     * @param {AttachmentEpoch} epoch
+     */
+    async presentOrderedTo(epoch) {
+      const asked = parseAttachmentEpoch(epoch);
+      if (!orderedPresentation.active) {
+        return { presented: false, refusal: "ordered-presentation-unavailable", reason: orderedPresentation.reason, attachmentEpoch: asked };
+      }
+      if (!attachmentSet.isInputEligible(asked)) return { presented: false, refusal: "not-attached", attachmentEpoch: asked };
+      if (childPhaseRecord !== null) return { presented: false, refusal: "child-owns-terminal", attachmentEpoch: asked };
+      if (typeof presentation?.send !== "function") return { presented: false, refusal: "presentation-channel-unavailable", attachmentEpoch: asked };
+      if (armedRecovery !== null) {
+        recoveryCounts.refusedAdmission += 1;
+        return { presented: false, refusal: "recovery-already-armed", armedFor: armedRecovery.epoch, attachmentEpoch: asked };
+      }
+      const token = presentMarkers.mintNativePresentToken();
+      if (!presentMarkers.isNativePresentToken(token)) {
+        return { presented: false, refusal: "token-unusable", attachmentEpoch: asked };
+      }
+      requestSequence += 1;
+      const requestId = `${asked.attachmentId}:${asked.epoch}:${requestSequence}`;
+      const decoder = new presentMarkers.NativePresentMarkerDecoder();
+      decoder.arm(token);
+      const requestedRevision = geometryRevision;
+      armedRecovery = {
+        epoch: asked,
+        token,
+        requestId,
+        geometryRevision: requestedRevision,
+        decoder,
+        open: false,
+        observedBegin: false,
+        observedEnd: null,
+        control: null,
+        freshBytes: 0,
+        freshChunks: 0,
+        skippedOrdinaryAfterEnd: false,
+        failure: null,
+        acknowledgeable: false,
+      };
+      const attempt = armedRecovery;
+      recoveryCounts.armed += 1;
+      presentationCounts.requested += 1;
+      /** @type {any} */
+      let frame;
+      try {
+        frame = await presentation.send({
+          type: "present-ordered",
+          protocol: ORDERED_BOOTSTRAP_PROTOCOL,
+          requestId,
+          ordering: { version: orderedPresentation.declared.version, token },
+          attachmentEpoch: asked,
+          geometryRevision: requestedRevision,
+          coldTerminal: true,
+        });
+      } catch (error) {
+        if (armedRecovery === attempt) retireRecovery("control-transport-lost");
+        presentationCounts.refused += 1;
+        return { presented: false, refusal: "presentation-failed", reason: /** @type {Error} */ (error).message, attachmentEpoch: asked };
+      }
+      if (armedRecovery !== attempt) {
+        presentationCounts.retired += 1;
+        return { presented: false, refusal: "attachment-retired", attachmentEpoch: asked };
+      }
+      const result = frame?.result;
+      const bound =
+        frame?.type === "presentation-result" &&
+        frame.protocol === ORDERED_BOOTSTRAP_PROTOCOL &&
+        frame.requestId === requestId &&
+        frame.ordering?.token === token &&
+        frame.ordering?.version === orderedPresentation.declared.version;
+      if (!bound) {
+        retireRecovery("control-result-unbound");
+        presentationCounts.refused += 1;
+        return { presented: false, refusal: "control-result-unbound", attachmentEpoch: asked };
+      }
+      if (result?.presented !== true || result.ordering?.token !== token || result.ordering?.markerCodec !== orderedPresentation.declared.markerCodec) {
+        retireRecovery("control-result-negative");
+        presentationCounts.refused += 1;
+        return { presented: false, refusal: typeof result?.refusal === "string" ? result.refusal : "control-result-negative", attachmentEpoch: asked };
+      }
+      if (!presentMarkers.isNativePresentFrameId(result.frame?.frameId) || typeof result.presentationNonce !== "string") {
+        retireRecovery("receipt-identity-unusable");
+        presentationCounts.refused += 1;
+        return { presented: false, refusal: "receipt-identity-unusable", attachmentEpoch: asked };
+      }
+      presentationCounts.presented += 1;
+      const stale = result.geometryRevision !== geometryRevision || result.frame.columns !== geometryCols || result.frame.rows !== geometryRows;
+      if (stale) {
+        presentationCounts.staleReceipt += 1;
+        retireRecovery("stale-receipt");
+        return { presented: true, stale: true, recoveryArmed: false, attachmentEpoch: asked, presentationNonce: result.presentationNonce, frame: result.frame };
+      }
+      attempt.control = { presentationNonce: result.presentationNonce, frameId: result.frame.frameId };
+      // The byte half may already be complete: a fast output route can deliver END before this reply lands.
+      completeRecoveryIfProved();
+      return {
+        presented: true,
+        recoveryArmed: armedRecovery === attempt,
+        acknowledgeable: attempt.acknowledgeable,
+        ordering: { version: orderedPresentation.declared.version, token },
+        presentationNonce: result.presentationNonce,
+        geometryRevision: result.geometryRevision,
+        frame: result.frame,
+        attachmentEpoch: asked,
+      };
+    },
+
+    /** What this host can say about the one armed ordered attempt. Two independent signals, reported apart. */
+    recoveryState() {
+      if (armedRecovery === null) return null;
+      return {
+        epoch: armedRecovery.epoch,
+        token: armedRecovery.token,
+        observedBegin: armedRecovery.observedBegin,
+        observedEnd: armedRecovery.observedEnd !== null,
+        controlResult: armedRecovery.control !== null,
+        freshBytes: armedRecovery.freshBytes,
+        freshChunks: armedRecovery.freshChunks,
+        skippedOrdinaryAfterEnd: armedRecovery.skippedOrdinaryAfterEnd,
+        acknowledgeable: armedRecovery.acknowledgeable,
+      };
+    },
+
+    recoveryCounts() {
+      return { ...recoveryCounts };
+    },
+
+    /**
+     * A client's echo of a presentation nonce.
+     *
+     * The echo is the client's statement that its own local terminal-output `Writable` accepted every fresh
+     * byte of this frame, in order. It is not the host's socket admission, not an OS flush, not a parse and not
+     * a pixel, and this host cannot and does not check those.
+     *
+     * It clears `resync-required` only for an attempt this host already proved twice over: the matching
+     * successful control result with its receipt identity, and the matching BEGIN/END observed on the byte
+     * route. Without ordered framing there is no boundary at all and the echo still clears nothing.
      *
      * @param {AttachmentEpoch} epoch @param {unknown} nonce
      */
     acknowledgePresentation(epoch, nonce) {
-      presentationCounts.acknowledgementsRefused += 1;
-      return {
-        cleared: false,
-        reason: "presentation-delivery-boundary-unavailable",
-        missingCapability: MISSING_HOST_CAPABILITIES.presentationDeliveryBoundary,
-      };
+      if (!orderedPresentation.active) {
+        presentationCounts.acknowledgementsRefused += 1;
+        return {
+          cleared: false,
+          reason: "presentation-delivery-boundary-unavailable",
+          missingCapability: MISSING_HOST_CAPABILITIES.presentationDeliveryBoundary,
+        };
+      }
+      const asked = parseAttachmentEpoch(epoch);
+      const attempt = armedRecovery;
+      if (attempt === null || attempt.epoch.attachmentId !== asked.attachmentId || attempt.epoch.epoch !== asked.epoch) {
+        presentationCounts.acknowledgementsRefused += 1;
+        return { cleared: false, reason: "no-armed-recovery" };
+      }
+      if (!attempt.acknowledgeable) {
+        presentationCounts.acknowledgementsRefused += 1;
+        return {
+          cleared: false,
+          reason: attempt.control === null ? "control-result-outstanding" : "frame-boundary-not-observed",
+          observedEnd: attempt.observedEnd !== null,
+          controlResult: attempt.control !== null,
+        };
+      }
+      const cleared = attachmentSet.acknowledgePresentation(asked, nonce);
+      if (!cleared) {
+        presentationCounts.acknowledgementsRefused += 1;
+        return { cleared: false, reason: "acknowledgement-not-current" };
+      }
+      recoveryCounts.cleared += 1;
+      retireRecovery(null);
+      return { cleared: true, reason: null };
     },
 
     presentationCounts() {

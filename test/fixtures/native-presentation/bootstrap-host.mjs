@@ -131,8 +131,20 @@ export async function startBootstrapHost() {
 /**
  * Pi under a real pseudo-terminal, through `script`, which is what makes the client a terminal rather than
  * a pipe: the alt screen, mouse modes and the Kitty keyboard negotiation all need one.
+ *
+ * Two observation layers, and they are not the same thing:
+ *
+ *   - `output`/`since`/`waitForText`/`waitUntil` are the existing UTF-8 **string** view. They concatenate the
+ *     relay's stdout and the relay's own stderr and decode each read as UTF-8, so they are lossy for raw bytes
+ *     and they mix two streams. Left exactly as they were, because other suites read them.
+ *   - `onRawStdout(chunk)` is the additive **raw** view: the exact `Buffer` of every read delivered on the
+ *     relay's stdout, before any string conversion, in arrival order. That is the layer a byte-framing decoder
+ *     has to be fed. Name it accurately: this is the `script` relay's stdout pipe, not the PTY master. Pi's own
+ *     stdout and stderr share the PTY and both arrive here, but the relay copies them onto this pipe, so a read
+ *     boundary here is the relay's, not a kernel PTY read. `relayDiagnostics()` is the relay's own stderr,
+ *     which is not PTY-relayed Pi output at all and is never fed to a decoder.
  */
-export function spawnPiUnderPty({ command, cwd, env, transcriptPath }) {
+export function spawnPiUnderPty({ command, cwd, env, transcriptPath, onRawStdout }) {
   const child = spawn("script", ["-qfec", command, transcriptPath], {
     cwd,
     env,
@@ -140,6 +152,7 @@ export function spawnPiUnderPty({ command, cwd, env, transcriptPath }) {
     stdio: ["pipe", "pipe", "pipe"],
   });
   let output = "";
+  let relayDiagnostics = "";
   const waiters = [];
   const predicateWaiters = [];
   const onChunk = (chunk) => {
@@ -157,8 +170,16 @@ export function spawnPiUnderPty({ command, cwd, env, transcriptPath }) {
       }
     }
   };
-  child.stdout.on("data", onChunk);
-  child.stderr.on("data", onChunk);
+  child.stdout.on("data", (chunk) => {
+    // Raw first, and only for this stream. A decoder handed the string view has already lost the byte
+    // boundaries and has been given the relay's diagnostics as though they were Pi's own output.
+    if (onRawStdout) onRawStdout(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    onChunk(chunk);
+  });
+  child.stderr.on("data", (chunk) => {
+    relayDiagnostics += chunk.toString("utf8");
+    onChunk(chunk);
+  });
   child.stdin.on("error", () => {});
 
   return {
@@ -166,6 +187,8 @@ export function spawnPiUnderPty({ command, cwd, env, transcriptPath }) {
     output: () => output,
     since: (index) => output.slice(index),
     length: () => output.length,
+    /** The relay's own stderr diagnostics. Not Pi output, and never decoded as framing. */
+    relayDiagnostics: () => relayDiagnostics,
     write(data) {
       if (child.stdin.writable) child.stdin.write(data);
     },

@@ -1,0 +1,3079 @@
+diff --git a/packages/coding-agent/src/core/native-bootstrap.ts b/packages/coding-agent/src/core/native-bootstrap.ts
+index e86bbfbccdc07ac05cb26117f24ed3dfea5f0c87..91220be6ba4901e489329a9a8da5ffe71ebc6c40 100644
+--- a/packages/coding-agent/src/core/native-bootstrap.ts
++++ b/packages/coding-agent/src/core/native-bootstrap.ts
+@@ -19,7 +19,7 @@
+  * leaves Pi running exactly as an unmanaged Pi runs; {@link nativeBootstrapStatus} names what happened.
+  *
+  * The inbound side is bounded and fail-closed. A command is one newline-terminated JSON object of at most
+- * {@link NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES} bytes, carrying `protocol: 1` and exactly the fields
++ * {@link NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES} bytes, carrying the selected `protocol` and exactly the fields
+  * {@link NativeBootstrapCommand} names; anything else is answered with one `error` frame and acted on in no
+  * other way. Input that never terminates a frame within the bound, or a frame larger than it, closes the
+  * channel instead of growing a retained string. The bound is measured on the **raw** frame the peer sent,
+@@ -28,9 +28,26 @@
+  * refusal is flushed, so neither a frame already buffered behind the breach nor one arriving on a later data
+  * event can reach `presentTerminal`. Nothing crossing this boundary is cast: each field is validated and
+  * copied, so a host cannot reach `presentTerminal` with a value it did not declare.
++ *
++ * **Protocol 2 is explicit, opt-in and not an extension of protocol 1.** Protocol 1's reviewed parser
++ * requires `protocol === 1` and the single `present` command, and extra hello fields are not an approved
++ * extension point for it. With {@link NATIVE_BOOTSTRAP_PROTOCOL_ENV} absent this channel sends and accepts
++ * the protocol-1 frames byte for byte as before, so a new Pi against an old host is unchanged. With the
++ * value `2` it sends a protocol-2 hello that declares its ordered-presentation framing and accepts only the
++ * protocol-2 schema. Any other value fails closed: nothing is opened and {@link nativeBootstrapStatus} says
++ * why. An old Pi ignores the selector entirely and sends its protocol-1 hello, which a protocol-2 host has
++ * to refuse locally before it sends any command; no old Pi is expected to emit a new named refusal.
+  */
+ 
+ import * as net from "node:net";
++import {
++	isNativePresentToken,
++	NATIVE_PRESENT_FRESH_CHUNK_MAX,
++	NATIVE_PRESENT_MARKER_CODEC,
++	NATIVE_PRESENT_MARKER_MAX_BYTES,
++	NATIVE_PRESENT_ORDERING_VERSION,
++	NATIVE_PRESENT_TOKEN_BYTES,
++} from "@earendil-works/pi-tui";
+ import {
+ 	NATIVE_PRESENTATION_CAPABILITY,
+ 	nativeReadiness,
+@@ -44,8 +61,32 @@ import {
+ /** The environment variable a host sets to the path of the unix-domain listener it already created. */
+ export const NATIVE_BOOTSTRAP_SOCKET_ENV = "PI_NATIVE_BOOTSTRAP_SOCKET";
+ 
++/**
++ * The launch selector for the ordered-presentation protocol. Absent or `1` keeps protocol 1 unchanged; `2`
++ * opts in; anything else fails closed. Separate from the socket variable, which is unchanged, because the
++ * transport and the schema are two different decisions.
++ */
++export const NATIVE_BOOTSTRAP_PROTOCOL_ENV = "PI_NATIVE_BOOTSTRAP_PROTOCOL";
++
+ export const NATIVE_BOOTSTRAP_PROTOCOL = 1;
+ 
++/** The ordered-presentation protocol. Never negotiated field by field: a peer speaks one of the two, whole. */
++export const NATIVE_BOOTSTRAP_ORDERED_PROTOCOL = 2;
++
++export type NativeBootstrapProtocol = typeof NATIVE_BOOTSTRAP_PROTOCOL | typeof NATIVE_BOOTSTRAP_ORDERED_PROTOCOL;
++
++/**
++ * What a protocol-2 hello declares about ordered presentation, so a host matches on named bounds instead of
++ * inferring them from a frame that happens to fit.
++ */
++export const NATIVE_BOOTSTRAP_ORDERED_PRESENTATION = {
++	version: NATIVE_PRESENT_ORDERING_VERSION,
++	markerCodec: NATIVE_PRESENT_MARKER_CODEC,
++	tokenBytes: NATIVE_PRESENT_TOKEN_BYTES,
++	maxMarkerBytes: NATIVE_PRESENT_MARKER_MAX_BYTES,
++	freshChunkMax: NATIVE_PRESENT_FRESH_CHUNK_MAX,
++} as const;
++
+ /**
+  * The largest inbound command frame this channel accepts, in bytes, newline included.
+  *
+@@ -58,49 +99,63 @@ export const NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES = 8192;
+ const MAX_REQUEST_ID_LENGTH = 200;
+ const MAX_ATTACHMENT_ID_LENGTH = 200;
+ 
+-/** Pi to host. */
++/** Pi to host. Every frame carries the protocol this launch selected, and never a mixture. */
+ export type NativeBootstrapFrame =
+ 	/** Sent once, immediately on connection, before anything else. */
+ 	| {
+ 			type: "native-bootstrap";
+-			protocol: typeof NATIVE_BOOTSTRAP_PROTOCOL;
++			protocol: NativeBootstrapProtocol;
+ 			pid: number;
+ 			capability: typeof NATIVE_PRESENTATION_CAPABILITY;
+ 			/** Phases already reached when the channel opened. Empty at launch, non-empty on a late open. */
+ 			reached: ReadinessRecord[];
++			/** Protocol 2 only. Its absence from a protocol-1 hello is what keeps that hello byte-compatible. */
++			orderedPresentation?: typeof NATIVE_BOOTSTRAP_ORDERED_PRESENTATION;
+ 	  }
+ 	/** One per phase, as it is recorded. */
+-	| { type: "native-readiness"; protocol: typeof NATIVE_BOOTSTRAP_PROTOCOL; readiness: ReadinessRecord }
++	| { type: "native-readiness"; protocol: NativeBootstrapProtocol; readiness: ReadinessRecord }
+ 	| {
+ 			type: "presentation-result";
+-			protocol: typeof NATIVE_BOOTSTRAP_PROTOCOL;
++			protocol: NativeBootstrapProtocol;
+ 			requestId: string;
+ 			result: PresentTerminalResult;
++			/** Echoed for a `present-ordered` command, so a host binds this result to the markers it armed. */
++			ordering?: { version: number; token: string };
+ 	  }
+ 	/**
+ 	 * One refusal, for one inbound frame Pi did not act on: unparseable, not an object, another protocol
+ 	 * version, an unsupported command, a field that is missing or not the declared type, a frame past the
+ 	 * byte bound, or a presentation that threw. `requestId` is echoed when the host supplied a usable one.
+ 	 */
+-	| { type: "error"; protocol: typeof NATIVE_BOOTSTRAP_PROTOCOL; requestId: string | undefined; error: string };
++	| { type: "error"; protocol: NativeBootstrapProtocol; requestId: string | undefined; error: string };
+ 
+ /**
+- * Host to Pi. The only command. `requestId` is the host's own correlation id and is echoed on the reply.
++ * Host to Pi. `requestId` is the host's own correlation id and is echoed on the reply.
++ *
++ * `protocol` is required inbound as well as outbound: a host built against another version of this channel
++ * must be refused by version rather than partially understood by field.
+  *
+- * `protocol` is required inbound as well as outbound: a host built against a later channel must be refused
+- * by version rather than partially understood by field.
++ * `present` keeps exactly its protocol-1 meaning under both protocols, and that meaning is named here: it
++ * reports a **local** handoff of the frame to `Terminal.write`, writes no marker, and qualifies no physical
++ * delivery. `present-ordered` exists under protocol 2 only and is the command a host uses when it needs the
++ * frame's own boundary in the terminal's byte stream.
+  */
+-export type NativeBootstrapCommand = {
+-	type: "present";
+-	protocol: typeof NATIVE_BOOTSTRAP_PROTOCOL;
+-	requestId: string;
+-} & PresentTerminalRequest;
++export type NativeBootstrapCommand =
++	| ({ type: "present"; protocol: NativeBootstrapProtocol; requestId: string } & PresentTerminalRequest)
++	| ({
++			type: "present-ordered";
++			protocol: typeof NATIVE_BOOTSTRAP_ORDERED_PROTOCOL;
++			requestId: string;
++			ordering: { version: number; token: string };
++	  } & PresentTerminalRequest);
+ 
+ export type NativeBootstrapState = "unconfigured" | "connecting" | "open" | "closed" | "failed";
+ 
+ export type NativeBootstrapStatus = {
+ 	state: NativeBootstrapState;
+ 	socketPath: string | undefined;
++	/** The protocol this launch selected. Reported so a test or a host can tell 1 from 2 without a frame. */
++	protocol: NativeBootstrapProtocol;
+ 	/** Frames Pi has handed to the socket, so a test or a host can tell silence from a lost connection. */
+ 	framesSent: number;
+ 	lastError: string | undefined;
+@@ -130,6 +185,11 @@ type NativeBootstrapChannel = {
+ 	pendingReadiness: ReadinessRecord[];
+ 	/** Every readiness `sequence` already written or carried in the hello, so no record is sent twice. */
+ 	deliveredReadiness: Set<number>;
++	/**
++	 * The selected protocol. Optional under the additive rule: a record an older copy of this module created
++	 * carries none, and reading it as protocol 1 is exactly what that copy meant, so the state version stays 1.
++	 */
++	protocol?: NativeBootstrapProtocol;
+ };
+ 
+ function isUsableChannel(candidate: unknown): candidate is NativeBootstrapChannel {
+@@ -208,8 +268,27 @@ function send(frame: NativeBootstrapFrame): void {
+ 	writeFrame(frame);
+ }
+ 
++function selectedProtocol(): NativeBootstrapProtocol {
++	return channel().protocol ?? NATIVE_BOOTSTRAP_PROTOCOL;
++}
++
++/**
++ * Read the launch selector. Absent and `1` are protocol 1; `2` is protocol 2; anything else is a refusal
++ * this channel reports rather than guesses past.
++ */
++function resolveConfiguredProtocol(): NativeBootstrapProtocol | { refused: string } {
++	const configured = process.env[NATIVE_BOOTSTRAP_PROTOCOL_ENV];
++	if (!configured || configured === String(NATIVE_BOOTSTRAP_PROTOCOL)) return NATIVE_BOOTSTRAP_PROTOCOL;
++	if (configured === String(NATIVE_BOOTSTRAP_ORDERED_PROTOCOL)) return NATIVE_BOOTSTRAP_ORDERED_PROTOCOL;
++	return {
++		refused:
++			`${NATIVE_BOOTSTRAP_PROTOCOL_ENV}=${configured} names no protocol this build speaks; it speaks ` +
++			`${NATIVE_BOOTSTRAP_PROTOCOL} and ${NATIVE_BOOTSTRAP_ORDERED_PROTOCOL}. No channel was opened.`,
++	};
++}
++
+ function errorFrame(requestId: string | undefined, error: string): NativeBootstrapFrame {
+-	return { type: "error", protocol: NATIVE_BOOTSTRAP_PROTOCOL, requestId, error };
++	return { type: "error", protocol: selectedProtocol(), requestId, error };
+ }
+ 
+ function describe(value: unknown): string {
+@@ -237,24 +316,33 @@ function boundedInteger(value: unknown): number | undefined {
+  *
+  * Nothing is cast: the returned command carries only validated values, so no host-supplied shape reaches
+  * `presentTerminal`. `protocol` is checked before `type`, because a frame from another version of this
+- * channel must be refused by version rather than by the field names this version happens to know.
++ * channel must be refused by version rather than by the field names this version happens to know. The
++ * selected protocol is the only accepted one — a protocol-1 launch refuses a protocol-2 frame and the
++ * reverse — and `present-ordered` exists under protocol 2 alone.
+  */
+-function validateCommand(value: unknown): NativeBootstrapCommand | CommandRejection {
++function validateCommand(value: unknown, protocol: NativeBootstrapProtocol): NativeBootstrapCommand | CommandRejection {
+ 	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+ 		return { refused: `command must be a JSON object, received ${describe(value)}`, requestId: undefined };
+ 	}
+ 	const frame = value as Record<string, unknown>;
+ 	// Echoed only when the host's own correlation id is a usable bounded string.
+ 	const requestId = boundedString(frame.requestId, MAX_REQUEST_ID_LENGTH);
+-	if (frame.protocol !== NATIVE_BOOTSTRAP_PROTOCOL) {
++	if (frame.protocol !== protocol) {
+ 		return {
+-			refused: `unsupported protocol ${describe(frame.protocol)}; this channel speaks protocol ${NATIVE_BOOTSTRAP_PROTOCOL}`,
++			refused: `unsupported protocol ${describe(frame.protocol)}; this channel speaks protocol ${protocol}`,
+ 			requestId,
+ 		};
+ 	}
+-	if (frame.type !== "present") {
++	const ordered = frame.type === "present-ordered";
++	if (frame.type !== "present" && !ordered) {
+ 		return { refused: `unsupported command: ${describe(frame.type)}`, requestId };
+ 	}
++	if (ordered && protocol !== NATIVE_BOOTSTRAP_ORDERED_PROTOCOL) {
++		return {
++			refused: `present-ordered needs protocol ${NATIVE_BOOTSTRAP_ORDERED_PROTOCOL}; this channel speaks protocol ${protocol}`,
++			requestId,
++		};
++	}
+ 	if (requestId === undefined) {
+ 		return {
+ 			refused: `requestId must be a string of 1 to ${MAX_REQUEST_ID_LENGTH} characters`,
+@@ -281,13 +369,50 @@ function validateCommand(value: unknown): NativeBootstrapCommand | CommandReject
+ 	if (typeof frame.coldTerminal !== "boolean") {
+ 		return { refused: `coldTerminal must be a boolean, received ${describe(frame.coldTerminal)}`, requestId };
+ 	}
++	if (!ordered) {
++		return {
++			type: "present",
++			protocol,
++			requestId,
++			attachmentEpoch: { attachmentId, epoch: epochNumber },
++			geometryRevision,
++			coldTerminal: frame.coldTerminal,
++		};
++	}
++	// An unknown ordering version or a non-canonical token is refused here, before presentation, and never
++	// downgraded to an unordered presentation: a host that asked for a boundary does not silently lose it.
++	const requested = frame.ordering;
++	if (typeof requested !== "object" || requested === null || Array.isArray(requested)) {
++		return { refused: `ordering must be an object, received ${describe(requested)}`, requestId };
++	}
++	const ordering = requested as Record<string, unknown>;
++	if (ordering.version !== NATIVE_PRESENT_ORDERING_VERSION) {
++		return {
++			refused: `unsupported ordering version ${describe(ordering.version)}; this build speaks ${NATIVE_PRESENT_ORDERING_VERSION} of ${NATIVE_PRESENT_MARKER_CODEC}`,
++			requestId,
++		};
++	}
++	if (ordering.markerCodec !== undefined && ordering.markerCodec !== NATIVE_PRESENT_MARKER_CODEC) {
++		return {
++			refused: `unsupported ordering codec ${describe(ordering.markerCodec)}; this build speaks ${NATIVE_PRESENT_MARKER_CODEC}`,
++			requestId,
++		};
++	}
++	const token = ordering.token;
++	if (!isNativePresentToken(token)) {
++		return {
++			refused: `ordering.token must be ${NATIVE_PRESENT_TOKEN_BYTES} random bytes as canonical unpadded base64url`,
++			requestId,
++		};
++	}
+ 	return {
+-		type: "present",
+-		protocol: NATIVE_BOOTSTRAP_PROTOCOL,
++		type: "present-ordered",
++		protocol: NATIVE_BOOTSTRAP_ORDERED_PROTOCOL,
+ 		requestId,
+ 		attachmentEpoch: { attachmentId, epoch: epochNumber },
+ 		geometryRevision,
+ 		coldTerminal: frame.coldTerminal,
++		ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
+ 	};
+ }
+ 
+@@ -299,17 +424,20 @@ async function handleCommand(line: string): Promise<void> {
+ 		send(errorFrame(undefined, `unparseable command: ${error instanceof Error ? error.message : String(error)}`));
+ 		return;
+ 	}
+-	const command = validateCommand(parsed);
++	const protocol = selectedProtocol();
++	const command = validateCommand(parsed, protocol);
+ 	if ("refused" in command) {
+ 		send(errorFrame(command.requestId, command.refused));
+ 		return;
+ 	}
++	const ordering = command.type === "present-ordered" ? command.ordering : undefined;
+ 	let result: PresentTerminalResult;
+ 	try {
+ 		result = await presentTerminal({
+ 			attachmentEpoch: command.attachmentEpoch,
+ 			geometryRevision: command.geometryRevision,
+ 			coldTerminal: command.coldTerminal,
++			ordering,
+ 		});
+ 	} catch (error) {
+ 		// A renderer or a host-registered provider can throw. The host asked, so the host is told, and the
+@@ -317,7 +445,7 @@ async function handleCommand(line: string): Promise<void> {
+ 		send(errorFrame(command.requestId, `presentation failed: ${describe(error)}`));
+ 		return;
+ 	}
+-	send({ type: "presentation-result", protocol: NATIVE_BOOTSTRAP_PROTOCOL, requestId: command.requestId, result });
++	send({ type: "presentation-result", protocol, requestId: command.requestId, result, ordering });
+ }
+ 
+ /**
+@@ -406,6 +534,17 @@ export function startNativeBootstrapChannel(): NativeBootstrapStatus {
+ 	open.pendingReadiness = [];
+ 	open.deliveredReadiness = new Set();
+ 	open.inbound = "";
++	// The protocol is decided before the transport: a launch that named a protocol this build cannot speak
++	// opens nothing at all, rather than connecting and then discovering it mid-stream.
++	const protocol = resolveConfiguredProtocol();
++	if (typeof protocol !== "number") {
++		open.protocol = NATIVE_BOOTSTRAP_PROTOCOL;
++		open.state = "failed";
++		open.lastError = protocol.refused;
++		open.socketPath = undefined;
++		return nativeBootstrapStatus();
++	}
++	open.protocol = protocol;
+ 	const configured = process.env[NATIVE_BOOTSTRAP_SOCKET_ENV];
+ 	if (!configured) {
+ 		open.state = "unconfigured";
+@@ -417,7 +556,7 @@ export function startNativeBootstrapChannel(): NativeBootstrapStatus {
+ 	// Subscribed before connecting, so there is no window in which a phase is recorded and no one is
+ 	// listening. Records that arrive before the hello queue in `send` and are delivered after it, once.
+ 	open.unsubscribe = nativeReadiness().subscribe((readiness) => {
+-		send({ type: "native-readiness", protocol: NATIVE_BOOTSTRAP_PROTOCOL, readiness });
++		send({ type: "native-readiness", protocol, readiness });
+ 	});
+ 	const connection = net.connect(configured);
+ 	open.socket = connection;
+@@ -427,13 +566,16 @@ export function startNativeBootstrapChannel(): NativeBootstrapStatus {
+ 	connection.on("connect", () => {
+ 		open.state = "open";
+ 		const reached = nativeReadinessSnapshot().reached;
+-		// The hello, first, before any readiness frame.
++		// The hello, first, before any readiness frame. `orderedPresentation` is present under protocol 2
++		// only, and `JSON.stringify` drops the undefined, so the protocol-1 hello is the same bytes as before.
+ 		writeFrame({
+ 			type: "native-bootstrap",
+-			protocol: NATIVE_BOOTSTRAP_PROTOCOL,
++			protocol,
+ 			pid: process.pid,
+ 			capability: NATIVE_PRESENTATION_CAPABILITY,
+ 			reached,
++			orderedPresentation:
++				protocol === NATIVE_BOOTSTRAP_ORDERED_PROTOCOL ? NATIVE_BOOTSTRAP_ORDERED_PRESENTATION : undefined,
+ 		});
+ 		open.helloSent = true;
+ 		// Whatever the snapshot carried is delivered; it is not repeated as an event.
+@@ -441,7 +583,7 @@ export function startNativeBootstrapChannel(): NativeBootstrapStatus {
+ 		const queued = open.pendingReadiness;
+ 		open.pendingReadiness = [];
+ 		for (const readiness of queued) {
+-			send({ type: "native-readiness", protocol: NATIVE_BOOTSTRAP_PROTOCOL, readiness });
++			send({ type: "native-readiness", protocol, readiness });
+ 		}
+ 	});
+ 	connection.on("data", (chunk: Buffer | string) => {
+@@ -475,6 +617,7 @@ export function nativeBootstrapStatus(): NativeBootstrapStatus {
+ 	return {
+ 		state: open.state,
+ 		socketPath: open.socketPath,
++		protocol: open.protocol ?? NATIVE_BOOTSTRAP_PROTOCOL,
+ 		framesSent: open.framesSent,
+ 		lastError: open.lastError,
+ 	};
+diff --git a/packages/coding-agent/src/core/native-presentation.ts b/packages/coding-agent/src/core/native-presentation.ts
+index 218fd7474879e6af46911ba3c4a5a1fc25431772..d8a5be241c7aa6382d95587920f1c430371310bb 100644
+--- a/packages/coding-agent/src/core/native-presentation.ts
++++ b/packages/coding-agent/src/core/native-presentation.ts
+@@ -25,7 +25,7 @@
+  * Those stay in the host.
+  */
+ 
+-import type { PresentationOutcome, PresentationRequest } from "@earendil-works/pi-tui";
++import type { NativePresentOrdering, PresentationOutcome, PresentationRequest } from "@earendil-works/pi-tui";
+ 
+ /** One attachment's identity and epoch. An epoch strictly increases and is never reused. */
+ export type AttachmentEpoch = { attachmentId: string; epoch: number };
+@@ -50,6 +50,11 @@ export type PresentTerminalRequest = {
+ 	attachmentEpoch: AttachmentEpoch;
+ 	geometryRevision: GeometryRevision;
+ 	coldTerminal: boolean;
++	/**
++	 * Explicit ordered-presentation framing for this one request. Absent leaves the presentation exactly as
++	 * protocol 1 performs it: a local `Terminal.write` handoff, with no marker byte written anywhere.
++	 */
++	ordering?: NativePresentOrdering;
+ };
+ 
+ /** Why Pi presented nothing. Each value names a real state; none of them fakes a repaint. */
+@@ -61,7 +66,9 @@ export type PresentationRefusal =
+ 	/** No renderer has mounted yet, or the renderer has stopped. */
+ 	| "no-native-renderer"
+ 	/** The active renderer hands the terminal incremental fragments and mints no complete-frame receipt. */
+-	| "no-complete-frame-support";
++	| "no-complete-frame-support"
++	/** The request asked for an ordering version, codec or token this build does not speak. */
++	| "unsupported-ordering";
+ 
+ export type PresentTerminalResult =
+ 	| {
+@@ -74,6 +81,13 @@ export type PresentTerminalResult =
+ 			attachmentEpoch: AttachmentEpoch;
+ 			cold: boolean;
+ 			coldReassertion: ColdPresentationReassertion | undefined;
++			/**
++			 * The framing this frame was bracketed with, echoed for a request that asked for it.
++			 *
++			 * It says the BEGIN and END markers were written around this frame's own bytes on the terminal Pi
++			 * holds. It is still not a client display acknowledgement.
++			 */
++			ordering?: { version: number; token: string; markerCodec: string };
+ 	  }
+ 	| {
+ 			presented: false;
+@@ -302,8 +316,21 @@ export async function presentTerminal(request: PresentTerminalRequest): Promise<
+ 	const outcome = active.present({
+ 		requestId: `${request.attachmentEpoch.attachmentId}:${request.attachmentEpoch.epoch}:${request.geometryRevision}`,
+ 		coldTerminal: request.coldTerminal,
++		ordering: request.ordering,
+ 	});
+ 	if (!outcome.presented) {
++		if (outcome.reason === "unsupported-ordering") {
++			return {
++				presented: false,
++				terminalOwner: "pi",
++				presentationNonce: null,
++				refusal: "unsupported-ordering",
++				childAcknowledgement: "not-applicable",
++				reason: "the request asked for an ordered-presentation framing this build does not speak; nothing was written",
++				attachmentEpoch: request.attachmentEpoch,
++				geometryRevision: request.geometryRevision,
++			};
++		}
+ 		return {
+ 			presented: false,
+ 			terminalOwner: outcome.reason === "no-complete-frame-support" ? "pi" : "none",
+@@ -331,6 +358,7 @@ export async function presentTerminal(request: PresentTerminalRequest): Promise<
+ 		attachmentEpoch: request.attachmentEpoch,
+ 		cold: request.coldTerminal,
+ 		coldReassertion: describeReassertion(outcome),
++		ordering: outcome.receipt.ordering,
+ 	};
+ }
+ 
+diff --git a/packages/coding-agent/src/index.ts b/packages/coding-agent/src/index.ts
+index 60b1c797b90870f197d2866846a5351e9ec3df14..6e90e61c4c256927e1fbc5fd97bfcb7997ad5592 100644
+--- a/packages/coding-agent/src/index.ts
++++ b/packages/coding-agent/src/index.ts
+@@ -240,11 +240,15 @@ export type {
+ // Seam E core bootstrap: the launch-time readiness sideband, opened before any extension is loaded.
+ export {
+ 	NATIVE_BOOTSTRAP_MAX_COMMAND_BYTES,
++	NATIVE_BOOTSTRAP_ORDERED_PRESENTATION,
++	NATIVE_BOOTSTRAP_ORDERED_PROTOCOL,
+ 	NATIVE_BOOTSTRAP_PROTOCOL,
++	NATIVE_BOOTSTRAP_PROTOCOL_ENV,
+ 	NATIVE_BOOTSTRAP_SOCKET_ENV,
+ 	NATIVE_BOOTSTRAP_STATE_VERSION,
+ 	type NativeBootstrapCommand,
+ 	type NativeBootstrapFrame,
++	type NativeBootstrapProtocol,
+ 	type NativeBootstrapState,
+ 	type NativeBootstrapStatus,
+ 	nativeBootstrapStatus,
+diff --git a/packages/coding-agent/test/native-bootstrap-protocol.test.ts b/packages/coding-agent/test/native-bootstrap-protocol.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e4b937fc8c374eadc3b0f34d36b6516ed67a8e7b
+--- /dev/null
++++ b/packages/coding-agent/test/native-bootstrap-protocol.test.ts
+@@ -0,0 +1,280 @@
++/**
++ * Bootstrap protocol 2: the explicit, opt-in ordered-presentation schema.
++ *
++ * Protocol 1 is not extended. These cases hold that line from both sides: with no selector the channel is the
++ * protocol-1 channel, hello included and `present-ordered` refused; with `PI_NATIVE_BOOTSTRAP_PROTOCOL=2` it
++ * is the protocol-2 channel, which declares its framing in the hello, accepts `present-ordered`, and refuses a
++ * protocol-1 frame by version. Any other selector value opens nothing at all.
++ *
++ * Nothing here claims a client displayed a frame. The presentation provider is a double: what is under test is
++ * the schema, the refusals and what actually reaches `presentTerminal`.
++ */
++
++import { mkdtemp, rm } from "node:fs/promises";
++import * as net from "node:net";
++import { join } from "node:path";
++import { afterEach, describe, expect, it } from "vitest";
++import { mintNativePresentToken, NATIVE_PRESENT_MARKER_CODEC, NATIVE_PRESENT_ORDERING_VERSION } from "@earendil-works/pi-tui";
++import {
++	NATIVE_BOOTSTRAP_ORDERED_PRESENTATION,
++	NATIVE_BOOTSTRAP_ORDERED_PROTOCOL,
++	NATIVE_BOOTSTRAP_PROTOCOL,
++	NATIVE_BOOTSTRAP_PROTOCOL_ENV,
++	NATIVE_BOOTSTRAP_SOCKET_ENV,
++	nativeBootstrapStatus,
++	startNativeBootstrapChannel,
++	stopNativeBootstrapChannel,
++} from "../src/core/native-bootstrap.ts";
++import { setNativePresentationProvider } from "../src/core/native-presentation.ts";
++
++/** What the presentation provider double recorded for one request. */
++type PresentationRequestSeen = {
++	requestId: string;
++	coldTerminal: boolean;
++	ordering: { version: number; token: string } | undefined;
++};
++
++function fakeReceipt(frameId: string, ordering?: { version: number; token: string; markerCodec: string }) {
++	return {
++		frameId,
++		sequence: 1,
++		requestId: undefined,
++		columns: 120,
++		rows: 40,
++		byteLength: 512,
++		cold: undefined,
++		ordering,
++	};
++}
++
++/** One host-side listener: a real unix-domain server, and every wait bounded by its own rejection. */
++async function hostListener() {
++	const directory = await mkdtemp("/tmp/pi-native-protocol2-");
++	const socketPath = join(directory, "s");
++	const frames: Record<string, any>[] = [];
++	let waiting: ((frame: Record<string, any>) => void) | undefined;
++	let peer: net.Socket | undefined;
++	let buffered = "";
++	const server = net.createServer({ allowHalfOpen: true }, (connection) => {
++		peer = connection;
++		connection.setEncoding("utf8");
++		connection.on("error", () => {});
++		connection.on("data", (chunk: string) => {
++			buffered += chunk;
++			let newline = buffered.indexOf("\n");
++			while (newline !== -1) {
++				const line = buffered.slice(0, newline);
++				buffered = buffered.slice(newline + 1);
++				if (line.trim()) {
++					const frame = JSON.parse(line) as Record<string, any>;
++					frames.push(frame);
++					waiting?.(frame);
++					waiting = undefined;
++				}
++				newline = buffered.indexOf("\n");
++			}
++		});
++	});
++	await new Promise<void>((resolve) => server.listen(socketPath, () => resolve()));
++	return {
++		socketPath,
++		frames,
++		next: (label = "a frame", timeoutMs = 10_000) =>
++			new Promise<Record<string, any>>((resolve, reject) => {
++				const timer = setTimeout(() => {
++					waiting = undefined;
++					reject(new Error(`${label} never arrived within ${timeoutMs}ms; frames so far: ${JSON.stringify(frames)}`));
++				}, timeoutMs);
++				waiting = (frame) => {
++					clearTimeout(timer);
++					resolve(frame);
++				};
++			}),
++		send: (command: unknown) => peer?.write(`${JSON.stringify(command)}\n`),
++		async close() {
++			peer?.destroy();
++			await new Promise<void>((resolve) => server.close(() => resolve()));
++			await rm(directory, { recursive: true, force: true });
++		},
++	};
++}
++
++describe("bootstrap protocol selection", () => {
++	let openHost: Awaited<ReturnType<typeof hostListener>> | undefined;
++	const seen: PresentationRequestSeen[] = [];
++
++	async function openListener(protocol?: string) {
++		openHost = await hostListener();
++		process.env[NATIVE_BOOTSTRAP_SOCKET_ENV] = openHost.socketPath;
++		if (protocol === undefined) delete process.env[NATIVE_BOOTSTRAP_PROTOCOL_ENV];
++		else process.env[NATIVE_BOOTSTRAP_PROTOCOL_ENV] = protocol;
++		seen.length = 0;
++		setNativePresentationProvider({
++			present: (request) => {
++				seen.push({ requestId: request.requestId, coldTerminal: request.coldTerminal, ordering: request.ordering });
++				return {
++					presented: true as const,
++					receipt: fakeReceipt(
++						"11111111-2222-4333-8444-555555555555",
++						request.ordering
++							? { version: request.ordering.version, token: request.ordering.token, markerCodec: NATIVE_PRESENT_MARKER_CODEC }
++							: undefined,
++					),
++				};
++			},
++			release: () => undefined,
++		});
++		return openHost;
++	}
++
++	afterEach(async () => {
++		setNativePresentationProvider(undefined);
++		stopNativeBootstrapChannel();
++		delete process.env[NATIVE_BOOTSTRAP_SOCKET_ENV];
++		delete process.env[NATIVE_BOOTSTRAP_PROTOCOL_ENV];
++		await openHost?.close();
++		openHost = undefined;
++	});
++
++	const presentCommand = (protocol: number, requestId: string, extra: Record<string, unknown> = {}) => ({
++		type: "present",
++		protocol,
++		requestId,
++		attachmentEpoch: { attachmentId: "attach-protocol", epoch: 1 },
++		geometryRevision: 3,
++		coldTerminal: true,
++		...extra,
++	});
++
++	it("keeps the protocol-1 channel exactly as it was when no selector is set", async () => {
++		const host = await openListener();
++		const hello = host.next("the hello");
++		startNativeBootstrapChannel();
++		const helloFrame = await hello;
++		expect(helloFrame.protocol).toBe(NATIVE_BOOTSTRAP_PROTOCOL);
++		// The absence of this field is what keeps the protocol-1 hello byte-compatible with the reviewed one.
++		expect("orderedPresentation" in helloFrame).toBe(false);
++		expect(nativeBootstrapStatus().protocol).toBe(NATIVE_BOOTSTRAP_PROTOCOL);
++
++		const presented = host.next("the presentation result");
++		host.send(presentCommand(NATIVE_BOOTSTRAP_PROTOCOL, "p1-present"));
++		const result = await presented;
++		expect(result.result.presented).toBe(true);
++		expect("ordering" in result).toBe(false);
++		expect(seen[0]?.ordering).toBeUndefined();
++
++		const refused = host.next("the refusal");
++		host.send({
++			...presentCommand(NATIVE_BOOTSTRAP_PROTOCOL, "p1-ordered"),
++			type: "present-ordered",
++			ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token: mintNativePresentToken() },
++		});
++		const refusal = await refused;
++		expect(refusal.type).toBe("error");
++		expect(refusal.error).toContain(`present-ordered needs protocol ${NATIVE_BOOTSTRAP_ORDERED_PROTOCOL}`);
++		expect(seen).toHaveLength(1);
++	});
++
++	it("declares its framing and carries an ordered request through under the selector", async () => {
++		const host = await openListener("2");
++		const hello = host.next("the hello");
++		startNativeBootstrapChannel();
++		const helloFrame = await hello;
++		expect(helloFrame.protocol).toBe(NATIVE_BOOTSTRAP_ORDERED_PROTOCOL);
++		expect(helloFrame.orderedPresentation).toEqual(NATIVE_BOOTSTRAP_ORDERED_PRESENTATION);
++		expect(helloFrame.orderedPresentation.markerCodec).toBe(NATIVE_PRESENT_MARKER_CODEC);
++		expect(helloFrame.orderedPresentation.tokenBytes).toBe(32);
++		expect(helloFrame.orderedPresentation.maxMarkerBytes).toBe(128);
++		expect(helloFrame.orderedPresentation.freshChunkMax).toBe(16384);
++		expect(nativeBootstrapStatus().protocol).toBe(NATIVE_BOOTSTRAP_ORDERED_PROTOCOL);
++
++		const token = mintNativePresentToken();
++		const presented = host.next("the ordered presentation result");
++		host.send({
++			...presentCommand(NATIVE_BOOTSTRAP_ORDERED_PROTOCOL, "p2-ordered"),
++			type: "present-ordered",
++			ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token, markerCodec: NATIVE_PRESENT_MARKER_CODEC },
++		});
++		const result = await presented;
++		expect(result.protocol).toBe(NATIVE_BOOTSTRAP_ORDERED_PROTOCOL);
++		expect(result.result.presented).toBe(true);
++		// The token reaches the renderer, and the result binds this frame to the markers the host armed.
++		expect(seen[0]?.ordering).toEqual({ version: NATIVE_PRESENT_ORDERING_VERSION, token });
++		expect(result.ordering).toEqual({ version: NATIVE_PRESENT_ORDERING_VERSION, token });
++		expect(result.result.ordering).toEqual({
++			version: NATIVE_PRESENT_ORDERING_VERSION,
++			token,
++			markerCodec: NATIVE_PRESENT_MARKER_CODEC,
++		});
++	});
++
++	it("keeps `present` under protocol 2 with its protocol-1 local-write meaning and no framing", async () => {
++		const host = await openListener("2");
++		const hello = host.next("the hello");
++		startNativeBootstrapChannel();
++		await hello;
++		const presented = host.next("the presentation result");
++		host.send(presentCommand(NATIVE_BOOTSTRAP_ORDERED_PROTOCOL, "p2-present"));
++		const result = await presented;
++		expect(result.result.presented).toBe(true);
++		expect(seen[0]?.ordering).toBeUndefined();
++		expect(result.result.ordering).toBeUndefined();
++	});
++
++	it("refuses a protocol-1 frame on a protocol-2 channel, and names both versions", async () => {
++		const host = await openListener("2");
++		const hello = host.next("the hello");
++		startNativeBootstrapChannel();
++		await hello;
++		const refused = host.next("the refusal");
++		host.send(presentCommand(NATIVE_BOOTSTRAP_PROTOCOL, "wrong-version"));
++		const refusal = await refused;
++		expect(refusal.type).toBe("error");
++		expect(refusal.protocol).toBe(NATIVE_BOOTSTRAP_ORDERED_PROTOCOL);
++		expect(refusal.error).toContain("unsupported protocol 1");
++		expect(refusal.error).toContain(`protocol ${NATIVE_BOOTSTRAP_ORDERED_PROTOCOL}`);
++		expect(seen).toHaveLength(0);
++	});
++
++	const badOrderings: [string, unknown, string][] = [
++		["an unknown version", { version: 99, token: "TOKEN" }, "unsupported ordering version 99"],
++		["an unknown codec", { version: 1, token: "TOKEN", markerCodec: "dcs-something-else" }, "unsupported ordering codec"],
++		["a padded token", { version: 1, token: "AAAA=" }, "canonical unpadded base64url"],
++		["no ordering at all", undefined, "ordering must be an object"],
++	];
++
++	for (const [label, ordering, message] of badOrderings) {
++		it(`refuses ${label} before presenting anything`, async () => {
++			const host = await openListener("2");
++			const hello = host.next("the hello");
++			startNativeBootstrapChannel();
++			await hello;
++			const refused = host.next("the refusal");
++			const resolved =
++				ordering && typeof ordering === "object"
++					? { ...(ordering as Record<string, unknown>), token: (ordering as { token: string }).token === "TOKEN" ? mintNativePresentToken() : (ordering as { token: string }).token }
++					: undefined;
++			host.send({
++				...presentCommand(NATIVE_BOOTSTRAP_ORDERED_PROTOCOL, `bad-${label.replace(/\s+/g, "-")}`),
++				type: "present-ordered",
++				ordering: resolved,
++			});
++			const refusal = await refused;
++			expect(refusal.type).toBe("error");
++			expect(refusal.error).toContain(message);
++			// No fallback: an unusable ordering never becomes an unordered presentation.
++			expect(seen).toHaveLength(0);
++		});
++	}
++
++	it("opens nothing and says why when the selector names a protocol this build does not speak", async () => {
++		const host = await openListener("3");
++		const status = startNativeBootstrapChannel();
++		expect(status.state).toBe("failed");
++		expect(status.socketPath).toBeUndefined();
++		expect(status.framesSent).toBe(0);
++		expect(status.lastError).toContain(`${NATIVE_BOOTSTRAP_PROTOCOL_ENV}=3`);
++		expect(status.protocol).toBe(NATIVE_BOOTSTRAP_PROTOCOL);
++		expect(host.frames).toEqual([]);
++	});
++});
+diff --git a/packages/coding-agent/test/native-presentation.test.ts b/packages/coding-agent/test/native-presentation.test.ts
+index 22f93491429e1e8492d4d98753f9e5f3d40ef48a..3ef7c4f41241f3d948034e27808f96bee0eee115 100644
+--- a/packages/coding-agent/test/native-presentation.test.ts
++++ b/packages/coding-agent/test/native-presentation.test.ts
+@@ -794,6 +794,9 @@ describe("core bootstrap sideband", () => {
+ 		expect(startNativeBootstrapChannel()).toEqual({
+ 			state: "unconfigured",
+ 			socketPath: undefined,
++			// The selector is absent, so this launch is protocol 1: the status names it rather than leaving a
++			// caller to infer it from a frame that an unconfigured channel never sends.
++			protocol: NATIVE_BOOTSTRAP_PROTOCOL,
+ 			framesSent: 0,
+ 			lastError: undefined,
+ 		});
+diff --git a/packages/tui/src/index.ts b/packages/tui/src/index.ts
+index 7ed55b981178889eb0eb59f1a22c2b265bd2637a..db4ca5a37b3d0955ab9f109c608f63a970b20ac7 100644
+--- a/packages/tui/src/index.ts
++++ b/packages/tui/src/index.ts
+@@ -55,9 +55,18 @@ export {
+ 	getNativeAttachmentHost,
+ 	getVirtualTerminalProfile,
+ 	isChildTerminalHandoffActive,
++	NATIVE_INPUT_TARGET_API_VERSION,
++	NATIVE_INPUT_TARGET_PRODUCER_VERSION,
+ 	type NativeAttachmentHost,
+ 	type NativeAttachmentRegistration,
+ 	type NativeInputProvenance,
++	type NativeInputTarget,
++	type NativeInputTargetPublication,
++	type NativeInputTargetRevoked,
++	type NativeInputTargetSnapshot,
++	type NativeInputTargetSubscription,
++	type NativeInputTargetUnavailableReason,
++	nativeInputTargetSnapshot,
+ 	type NativeReturnRequest,
+ 	nextChildTerminalPhaseId,
+ 	notifyChildTerminalPhase,
+@@ -66,6 +75,7 @@ export {
+ 	type ReturnAuthorization,
+ 	type ReturnDisposition,
+ 	settleTerminalResponseAuthorizations,
++	subscribeNativeInputTarget,
+ 	SUPPORTED_CHILD_TERMINAL_HANDOFF_VERSION,
+ 	type TerminalResponseApplication,
+ 	type TerminalResponseKind,
+@@ -113,6 +123,26 @@ export {
+ 	type PresentationUnavailableReason,
+ 	type ReassertedTerminalModes,
+ } from "./native-presentation.ts";
++// The ordered-presentation framing codec and its bounded decoder. One implementation, so a host and its
++// tests never drift into two subtly different parsers.
++export {
++	encodeNativePresentAbort,
++	encodeNativePresentBegin,
++	encodeNativePresentEnd,
++	isNativePresentFrameId,
++	isNativePresentToken,
++	mintNativePresentToken,
++	NATIVE_PRESENT_FRESH_CHUNK_MAX,
++	NATIVE_PRESENT_MARKER_CODEC,
++	NATIVE_PRESENT_MARKER_MAX_BYTES,
++	NATIVE_PRESENT_ORDERING_VERSION,
++	NATIVE_PRESENT_TOKEN_BYTES,
++	NATIVE_PRESENT_TOKEN_LENGTH,
++	NativePresentMarkerDecoder,
++	type NativePresentMarkerEvent,
++	type NativePresentMarkerRefusal,
++	type NativePresentOrdering,
++} from "./native-present-markers.ts";
+ // Input buffering for batch splitting
+ export {
+ 	OriginLedger,
+diff --git a/packages/tui/src/native-attachment.ts b/packages/tui/src/native-attachment.ts
+index 47a42591a131278bf2ea67abf04bfbb0a6a0b042..60fe93934c74e2ca3b905aca66ff35cd8c46ad80 100644
+--- a/packages/tui/src/native-attachment.ts
++++ b/packages/tui/src/native-attachment.ts
+@@ -11,14 +11,42 @@
+  * This module is interfaces and one process-wide registration. It holds no attachment registry, no
+  * ownership policy and no session state: Pi never learns who is attached, only which epoch a byte span
+  * claimed. Unmanaged Pi registers nothing and every path here is skipped.
++ *
++ * It also publishes seam B's ingress target. Labelled dispatch has always existed on `ProcessTerminal`, but
++ * reaching that object meant reaching Pi's renderer, and the only route to it ran through an extension's
++ * `session_start` handler — which an arbitrary extension can block forever. The publication below is that
++ * early public route: a narrow handle, minted when the terminal is dispatch-ready, revoked when it stops,
++ * and refused the moment either the publication or the registered host object moves.
+  */
+ 
++// Type-only, and therefore erased: `terminal.ts` imports this module's values, and the input target's
++// signature is the terminal's own dispatch signature rather than a second copy of it.
++import type { NativeInputDispatch, NativeInputDispatchResult } from "./terminal.ts";
++
+ /**
+  * Identity of one client attachment. `epoch` strictly increases per `attachmentId` and is never reused,
+  * so a reconnect is a new epoch and a reply from a previous connection is recognisably stale.
+  */
+ export type AttachmentEpoch = { attachmentId: string; epoch: number };
+ 
++/**
++ * The version of the native input target API this build exports.
++ *
++ * This is API availability and nothing else: a consumer that resolves
++ * {@link NATIVE_INPUT_TARGET_API_VERSION} knows the functions exist, not that anything has published a
++ * target. Producer availability is separate, and reported per snapshot.
++ */
++export const NATIVE_INPUT_TARGET_API_VERSION = 1;
++
++/**
++ * The version of the publishing half — this build's `ProcessTerminal`.
++ *
++ * A process can hold a new installed copy of this package next to an older bundled Pi. The new copy exports
++ * the API; the old bundle's terminal publishes nothing. That case reports `producerVersion: null`, and a
++ * consumer must not infer support from the API version alone.
++ */
++export const NATIVE_INPUT_TARGET_PRODUCER_VERSION = 1;
++
+ /**
+  * Provenance of one parsed input sequence, carried alongside the bytes through the whole native path.
+  *
+@@ -154,6 +182,59 @@ export interface NativeAttachmentHost {
+ 
+ export type NativeAttachmentRegistration = { release(): void };
+ 
++/**
++ * One publication of a started renderer's input target. Minted per `ProcessTerminal.start()`, so a restart
++ * is a new publication and an older handle is recognisably stale.
++ */
++export type NativeInputTargetPublication = {
++	publicationId: string;
++	/** Monotonic for this process, across every module copy sharing the registry. */
++	sequence: number;
++	producerVersion: number;
++};
++
++/** The wrapper's own refusal. It carries no `consumedThrough`: nothing was dispatched, so nothing was consumed. */
++export type NativeInputTargetRevoked = { admitted: false; reason: "target-revoked" };
++
++/**
++ * The narrow dispatch handle: a publication record and one labelled-ingress call.
++ *
++ * Deliberately not a TUI, a terminal, a key parser or a private field. A handle whose publication is no
++ * longer current, or whose captured managed host is no longer the registered one, refuses synchronously
++ * instead of dispatching.
++ */
++export type NativeInputTarget = {
++	readonly publication: NativeInputTargetPublication;
++	dispatchNativeInput(input: NativeInputDispatch): Promise<NativeInputDispatchResult | NativeInputTargetRevoked>;
++};
++
++/** Why no target is currently available. Each value names a real state; none of them is a fallback. */
++export type NativeInputTargetUnavailableReason =
++	/** No copy of this build's producer has published in this process. An older bundled Pi reports this. */
++	| "producer-absent"
++	/** A producer published, and that publication has been revoked: the renderer stopped, or is restarting. */
++	| "revoked"
++	/** A publication exists, and the host it captured has been released. */
++	| "host-released"
++	/** A publication exists, and a different host object is now registered. */
++	| "host-replaced";
++
++export type NativeInputTargetSnapshot = {
++	apiVersion: typeof NATIVE_INPUT_TARGET_API_VERSION;
++	/** `null` until a producer of this build publishes. Never cleared once observed. */
++	producerVersion: number | null;
++	publication: NativeInputTargetPublication | null;
++	target: NativeInputTarget | null;
++	/** `null` exactly when `target` is present. */
++	reason: NativeInputTargetUnavailableReason | null;
++};
++
++export type NativeInputTargetSubscription = {
++	/** The state at subscription time, so no caller has to read and then subscribe and lose what happened between. */
++	snapshot: NativeInputTargetSnapshot;
++	unsubscribe(): void;
++};
++
+ /**
+  * How long a managed host has to authorize one classified terminal response. Expiry is a refusal: the
+  * response is consumed and no capability state moves. Every response kind uses this one bound, so a
+@@ -202,6 +283,38 @@ type NativeAttachmentState = {
+ 	 */
+ 	childTerminalPhaseListeners?: Set<(phase: ChildTerminalPhase) => void>;
+ 	childTerminalPhaseCounter?: number;
++	/**
++	 * The native input target's four optional fields, under the same additive rule: an older copy reads none
++	 * of them, so `NATIVE_ATTACHMENT_STATE_VERSION` stays 1. What an older copy *does* share is `host`, and
++	 * that is deliberate — it is the one field a stale handle can check without any callback.
++	 */
++	nativeInputTargetProducerVersion?: number;
++	nativeInputTargetPublicationCounter?: number;
++	/** The live producer mount: set for the whole of one `ProcessTerminal.start()`/`stop()` interval. */
++	nativeInputTargetMount?: NativeInputTargetMount;
++	/** The current publication, or undefined once revoked. Identity is the staleness check. */
++	nativeInputTargetPublication?: NativeInputTargetRecord;
++	nativeInputTargetListeners?: Set<(snapshot: NativeInputTargetSnapshot) => void>;
++};
++
++/** One started renderer's terminal, owned by the producer that mounted it. */
++type NativeInputTargetMount = {
++	owner: object;
++	dispatch: (input: NativeInputDispatch) => Promise<NativeInputDispatchResult>;
++};
++
++/**
++ * One publication, with the two identities every handle invocation re-checks.
++ *
++ * `host` is the exact object `state.host` held when this publication was minted. Any registration path,
++ * including an older copy of this module that knows nothing about input targets, moves `state.host`, so
++ * comparing that object is what makes a stale handle refuse without depending on a callback being delivered.
++ */
++type NativeInputTargetRecord = {
++	publication: NativeInputTargetPublication;
++	host: NativeAttachmentHost | undefined;
++	mount: NativeInputTargetMount;
++	target: NativeInputTarget;
+ };
+ 
+ function isUsableState(candidate: unknown): candidate is NativeAttachmentState {
+@@ -327,6 +440,195 @@ export function nextChildTerminalPhaseId(): string {
+ 	return `child-phase-${next}`;
+ }
+ 
++function nativeInputTargetListeners(): Set<(snapshot: NativeInputTargetSnapshot) => void> {
++	const state = nativeAttachmentState();
++	state.nativeInputTargetListeners ??= new Set<(snapshot: NativeInputTargetSnapshot) => void>();
++	return state.nativeInputTargetListeners;
++}
++
++/**
++ * Refuse a container whose optional input-target fields this copy cannot interpret.
++ *
++ * Refusing is the whole point: resetting the fields would hand out a target whose publication another copy
++ * of this module still believes in, and falling back to "no target" would hide a genuinely mixed process.
++ * A container that simply does not carry these fields is not malformed — that is the additive rule.
++ */
++function validateNativeInputTargetState(state: NativeAttachmentState): void {
++	const producerVersion = state.nativeInputTargetProducerVersion;
++	if (producerVersion !== undefined && producerVersion !== NATIVE_INPUT_TARGET_PRODUCER_VERSION) {
++		throw new Error(
++			`the native input target in this process was published by producer version ${String(producerVersion)} and ` +
++				`this copy of @earendil-works/pi-tui speaks producer version ${NATIVE_INPUT_TARGET_PRODUCER_VERSION}. ` +
++				`The publication is left untouched; load one compatible pi-tui version per process.`,
++		);
++	}
++	const counter = state.nativeInputTargetPublicationCounter;
++	if (counter !== undefined && !(Number.isSafeInteger(counter) && counter >= 0)) {
++		throw new Error(`the native input target publication counter is ${String(counter)}, which is not a count`);
++	}
++	if (state.nativeInputTargetPublication === undefined) return;
++	const record = state.nativeInputTargetPublication as Partial<NativeInputTargetRecord>;
++	const publication = record.publication as Partial<NativeInputTargetPublication> | undefined;
++	const usable =
++		publication !== undefined &&
++		typeof publication === "object" &&
++		typeof publication.publicationId === "string" &&
++		Number.isSafeInteger(publication.sequence) &&
++		publication.producerVersion === NATIVE_INPUT_TARGET_PRODUCER_VERSION &&
++		typeof record.mount?.dispatch === "function" &&
++		typeof record.target?.dispatchNativeInput === "function";
++	if (!usable) {
++		throw new Error(
++			"the native input target publication on this process is not a record this copy of " +
++				"@earendil-works/pi-tui can interpret. It is left untouched rather than reset.",
++		);
++	}
++}
++
++/**
++ * Mint the next publication for a mounted producer, capturing both identities a handle re-checks.
++ *
++ * Every publication is a new record and a new handle: a restart, a host replacement and a second renderer
++ * all produce one, and every earlier handle is stale from that moment.
++ */
++function publishNativeInputTarget(state: NativeAttachmentState, mount: NativeInputTargetMount): void {
++	const sequence = (state.nativeInputTargetPublicationCounter ?? 0) + 1;
++	state.nativeInputTargetPublicationCounter = sequence;
++	const publication: NativeInputTargetPublication = Object.freeze({
++		publicationId: `native-input-target-${sequence}`,
++		sequence,
++		producerVersion: NATIVE_INPUT_TARGET_PRODUCER_VERSION,
++	});
++	const record: NativeInputTargetRecord = {
++		publication,
++		host: state.host,
++		mount,
++		// Replaced below; a handle and its record refer to each other, and the record is the identity.
++		target: undefined as unknown as NativeInputTarget,
++	};
++	record.target = Object.freeze({
++		publication,
++		dispatchNativeInput(input: NativeInputDispatch): Promise<NativeInputDispatchResult | NativeInputTargetRevoked> {
++			// Synchronous, on every call, against the shared container: this is the check that survives an
++			// older module copy replacing or releasing the host without notifying anyone.
++			const current = nativeAttachmentState();
++			if (current.nativeInputTargetPublication !== record || current.host !== record.host) {
++				const revoked: NativeInputTargetRevoked = { admitted: false, reason: "target-revoked" };
++				return Promise.resolve(revoked);
++			}
++			return record.mount.dispatch(input);
++		},
++	});
++	state.nativeInputTargetPublication = record;
++}
++
++function notifyNativeInputTargetListeners(): void {
++	const snapshot = nativeInputTargetSnapshot();
++	for (const listener of [...nativeInputTargetListeners()]) {
++		try {
++			listener(snapshot);
++		} catch (error) {
++			process.emitWarning(`a native input target listener threw: ${String(error)}`);
++		}
++	}
++}
++
++/**
++ * Package-internal: publish this build's started terminal as the process's native input target.
++ *
++ * Called at the end of `ProcessTerminal.start()`, after stdin buffering, the stdin handler and the startup
++ * capability query exist, so a host that dispatches on the first snapshot reaches a terminal that is ready
++ * for it. `owner` is the terminal instance, and only that instance's own `stop()` revokes its mount.
++ */
++export function mountNativeInputTarget(
++	owner: object,
++	dispatch: (input: NativeInputDispatch) => Promise<NativeInputDispatchResult>,
++): void {
++	const state = nativeAttachmentState();
++	validateNativeInputTargetState(state);
++	state.nativeInputTargetProducerVersion = NATIVE_INPUT_TARGET_PRODUCER_VERSION;
++	const mount: NativeInputTargetMount = { owner, dispatch };
++	state.nativeInputTargetMount = mount;
++	publishNativeInputTarget(state, mount);
++	notifyNativeInputTargetListeners();
++}
++
++/**
++ * Package-internal: revoke synchronously, at the first point of `ProcessTerminal.stop()`.
++ *
++ * A terminal that is no longer the mounted one revokes nothing: a stopped instance must not take the
++ * publication of the instance that replaced it.
++ */
++export function unmountNativeInputTarget(owner: object): void {
++	const state = nativeAttachmentState();
++	validateNativeInputTargetState(state);
++	const mount = state.nativeInputTargetMount;
++	if (mount?.owner !== owner) return;
++	state.nativeInputTargetMount = undefined;
++	if (state.nativeInputTargetPublication?.mount === mount) state.nativeInputTargetPublication = undefined;
++	notifyNativeInputTargetListeners();
++}
++
++/**
++ * The current state of the native input target, read fresh from the shared container.
++ *
++ * `apiVersion` is what this copy exports. `producerVersion` is `null` until a producer of this build has
++ * published, and stays set afterwards, so "no new producer in this process" is distinguishable from "a
++ * producer published and its target is currently unavailable".
++ */
++export function nativeInputTargetSnapshot(): NativeInputTargetSnapshot {
++	const state = nativeAttachmentState();
++	validateNativeInputTargetState(state);
++	const producerVersion = state.nativeInputTargetProducerVersion ?? null;
++	const record = state.nativeInputTargetPublication;
++	if (!record) {
++		return {
++			apiVersion: NATIVE_INPUT_TARGET_API_VERSION,
++			producerVersion,
++			publication: null,
++			target: null,
++			reason: producerVersion === null ? "producer-absent" : "revoked",
++		};
++	}
++	if (state.host !== record.host) {
++		return {
++			apiVersion: NATIVE_INPUT_TARGET_API_VERSION,
++			producerVersion,
++			publication: record.publication,
++			target: null,
++			reason: state.host === undefined ? "host-released" : "host-replaced",
++		};
++	}
++	return {
++		apiVersion: NATIVE_INPUT_TARGET_API_VERSION,
++		producerVersion,
++		publication: record.publication,
++		target: record.target,
++		reason: null,
++	};
++}
++
++/**
++ * Subscribe, and receive the state as it is at subscription time in the same call.
++ *
++ * The listener is registered before the snapshot is taken, so no transition can fall between the two. A
++ * caller may therefore observe one transition twice; it can never miss one. Notification is a convenience:
++ * staleness is enforced by the handle itself, because an older module copy can move the host without
++ * calling anything here.
++ */
++export function subscribeNativeInputTarget(
++	listener: (snapshot: NativeInputTargetSnapshot) => void,
++): NativeInputTargetSubscription {
++	const listeners = nativeInputTargetListeners();
++	listeners.add(listener);
++	return {
++		snapshot: nativeInputTargetSnapshot(),
++		unsubscribe(): void {
++			listeners.delete(listener);
++		},
++	};
++}
++
+ function withTimeout<T>(decision: Promise<T>): Promise<T> {
+ 	return new Promise<T>((resolve, reject) => {
+ 		const timer = setTimeout(() => {
+@@ -429,11 +731,24 @@ export function registerNativeAttachmentHost(host: NativeAttachmentHost): Native
+ 		state.launchProfile = freezeProfile(host.profile);
+ 	}
+ 	state.host = host;
++	// A mounted producer rotates to a new publication for a host that actually moved, so a handle taken
++	// before this registration refuses and the new host gets a handle of its own.
++	const mounted = state.nativeInputTargetMount;
++	if (mounted && state.nativeInputTargetPublication?.host !== host) {
++		publishNativeInputTarget(state, mounted);
++		notifyNativeInputTargetListeners();
++	}
+ 	const registration = {
+ 		/** Clears this host only: a stale handle never clears a replacement registration. */
+ 		release(): void {
+ 			const current = nativeAttachmentState();
+ 			if (current.host === host) current.host = undefined;
++			// Revoked synchronously, and only for this host's own publication. The mount survives, so a later
++			// registration republishes without restarting the renderer.
++			if (current.nativeInputTargetPublication?.host === host) {
++				current.nativeInputTargetPublication = undefined;
++				notifyNativeInputTargetListeners();
++			}
+ 		},
+ 	};
+ 	return registration;
+diff --git a/packages/tui/src/native-present-markers.ts b/packages/tui/src/native-present-markers.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..25c4d4dd192224400eb635c0f2c26d7a55e21f64
+--- /dev/null
++++ b/packages/tui/src/native-present-markers.ts
+@@ -0,0 +1,331 @@
++/**
++ * `dcs-pi-native-present-v1`: the one framing codec for an explicitly managed ordered presentation.
++ *
++ * Seam E's receipt says the renderer handed a complete frame to {@link Terminal.write}. It does not say
++ * where that frame began and ended in the bytes a host reads back off the PTY master, so a host cannot tell
++ * the frame's own bytes from whatever else Pi wrote around them. These markers are that boundary, and
++ * nothing else: they are written **only** for a presentation request that carries an explicit
++ * {@link NativePresentOrdering}, so Pi's default output is byte-for-byte unchanged.
++ *
++ * The wire form, where `ESC \` is the two bytes 0x1b 0x5c:
++ *
++ *   BEGIN  `ESC P =pi-native-present;1;B;<token> ESC \`
++ *   END    `ESC P =pi-native-present;1;E;<token>;<frameId> ESC \`
++ *   ABORT  `ESC P =pi-native-present;1;A;<token> ESC \`
++ *
++ * `token` is 32 cryptographic random bytes as exactly 43 canonical unpadded base64url characters, minted
++ * per attempt by the host. `frameId` is the renderer's own 36-character UUID from the frame receipt. Every
++ * marker is at most {@link NATIVE_PRESENT_MARKER_MAX_BYTES} bytes.
++ *
++ * The token is not a security boundary against a same-process or same-UID actor: it distinguishes *this*
++ * armed attempt's markers from marker-like bytes that arrive from anywhere else, which is what a host needs
++ * to avoid acting on terminal text it does not own.
++ *
++ * {@link NativePresentMarkerDecoder} is a framing decoder and deliberately not a VT, key or screen parser.
++ * It recognizes exactly the markers of the token it is armed with, reproduces every other byte verbatim,
++ * and retains at most {@link NATIVE_PRESENT_MARKER_MAX_BYTES} bytes between calls. One implementation is
++ * exported so a host and its tests never drift into two subtly different parsers.
++ */
++
++import { randomBytes } from "node:crypto";
++
++/** The codec name a capability declaration carries, so a peer matches on a name rather than a shape. */
++export const NATIVE_PRESENT_MARKER_CODEC = "dcs-pi-native-present-v1";
++
++/** The ordering version this build speaks. An unknown version is refused before anything is written. */
++export const NATIVE_PRESENT_ORDERING_VERSION = 1;
++
++/** Random bytes behind one token, and the canonical unpadded base64url length that encodes them. */
++export const NATIVE_PRESENT_TOKEN_BYTES = 32;
++export const NATIVE_PRESENT_TOKEN_LENGTH = 43;
++
++/** The largest marker this codec emits or accepts, in bytes. Longer candidates are refused, never buffered. */
++export const NATIVE_PRESENT_MARKER_MAX_BYTES = 128;
++
++/**
++ * The largest fresh chunk a host may hand to one client transport in the armed interval.
++ *
++ * Declared here because it is part of what a capability declaration promises a peer, not because this module
++ * writes or reads client transports: streaming is the host's work.
++ */
++export const NATIVE_PRESENT_FRESH_CHUNK_MAX = 16_384;
++
++/** A host's explicit ordered-presentation request: which framing version, and the token to arm. */
++export type NativePresentOrdering = { version: number; token: string };
++
++const ESC = 0x1b;
++const STRING_TERMINATOR = Buffer.from([0x1b, 0x5c]);
++const INTRODUCER = Buffer.from("\x1bP=pi-native-present;1;", "latin1");
++const FRAME_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
++const EMPTY = Buffer.alloc(0);
++
++/**
++ * Whether this is a canonical token: 43 base64url characters that decode to exactly 32 bytes and re-encode
++ * to the same 43 characters. The round trip is the canonicality check — it rejects padding, whitespace, the
++ * standard base64 alphabet and a final character carrying non-zero bits.
++ */
++export function isNativePresentToken(candidate: unknown): candidate is string {
++	if (typeof candidate !== "string" || candidate.length !== NATIVE_PRESENT_TOKEN_LENGTH) return false;
++	if (!/^[A-Za-z0-9_-]+$/.test(candidate)) return false;
++	const decoded = Buffer.from(candidate, "base64url");
++	return decoded.length === NATIVE_PRESENT_TOKEN_BYTES && decoded.toString("base64url") === candidate;
++}
++
++/** A renderer frame id, as `crypto.randomUUID` writes it: 36 lowercase characters. */
++export function isNativePresentFrameId(candidate: unknown): candidate is string {
++	return typeof candidate === "string" && FRAME_ID_PATTERN.test(candidate);
++}
++
++/** One fresh token per attempt. Cryptographic randomness, never a counter and never reused. */
++export function mintNativePresentToken(): string {
++	return randomBytes(NATIVE_PRESENT_TOKEN_BYTES).toString("base64url");
++}
++
++function requireToken(token: string): string {
++	if (!isNativePresentToken(token)) {
++		throw new Error(
++			`an ordered-presentation token must be ${NATIVE_PRESENT_TOKEN_LENGTH} canonical unpadded base64url ` +
++				`characters encoding ${NATIVE_PRESENT_TOKEN_BYTES} bytes`,
++		);
++	}
++	return token;
++}
++
++export function encodeNativePresentBegin(token: string): string {
++	return `\x1bP=pi-native-present;1;B;${requireToken(token)}\x1b\\`;
++}
++
++export function encodeNativePresentEnd(token: string, frameId: string): string {
++	if (!isNativePresentFrameId(frameId)) {
++		throw new Error("an ordered-presentation END marker needs the renderer's 36-character frame id");
++	}
++	return `\x1bP=pi-native-present;1;E;${requireToken(token)};${frameId}\x1b\\`;
++}
++
++export function encodeNativePresentAbort(token: string): string {
++	return `\x1bP=pi-native-present;1;A;${requireToken(token)}\x1b\\`;
++}
++
++/**
++ * The bytes one failed ordered attempt writes, once, to close its framing.
++ *
++ * Package-internal on purpose: it is not re-exported from `index.ts`, because no new public API symbol is
++ * authorized. It lives here anyway so the byte layout stays in the module that owns the framing.
++ *
++ * A DCS string terminator, then this token's exact ABORT marker. The leading terminator is there because
++ * `Terminal.write` reports no accepted-byte count when it throws: the failed attempt may have left an
++ * unterminated marker candidate in the stream, and the terminator ends it before ABORT is read. Both parts are
++ * ordinary stream bytes to any reader that is not armed with this token.
++ *
++ * What it does **not** mean: that no frame bytes were written, that a partial marker was removed, or that the
++ * interval definitely closed. It is a bounded cleanup write, never a rollback and never a replay.
++ */
++export function encodeNativePresentFailedAttemptCleanup(token: string): string {
++	return `\x1b\\${encodeNativePresentAbort(token)}`;
++}
++
++/**
++ * Why the decoder refused a candidate that carried the armed token.
++ *
++ * A refusal never suppresses bytes: the candidate is reproduced verbatim on the refusal event, so a host
++ * that forwards both event kinds still forwards the exact physical stream.
++ */
++export type NativePresentMarkerRefusal =
++	/** A second BEGIN with the armed token while an interval was already open. */
++	| "duplicate-begin"
++	/** END with the armed token outside an open interval. */
++	| "unexpected-end"
++	/** ABORT with the armed token outside an open interval. */
++	| "unexpected-abort"
++	/** The armed token, in a marker whose remaining fields are not the ones this codec declares. */
++	| "malformed-marker"
++	/** A candidate that reached the byte bound without terminating. Never buffered further. */
++	| "overlong-candidate";
++
++/**
++ * One decoded step.
++ *
++ * `bytes` and `refused` carry the bytes they reproduce. `begin`, `end` and `abort` reproduce nothing: the
++ * armed marker is stripped. Concatenating the carried bytes in event order, with each recognized marker
++ * re-encoded at its own position, reproduces the decoded input exactly.
++ */
++export type NativePresentMarkerEvent =
++	| { kind: "bytes"; bytes: Uint8Array }
++	| { kind: "begin"; token: string }
++	| { kind: "end"; token: string; frameId: string }
++	| { kind: "abort"; token: string }
++	| { kind: "refused"; reason: NativePresentMarkerRefusal; bytes: Uint8Array };
++
++/** What a partial candidate turned out to be. */
++type CandidateMatch =
++	| { match: "none" }
++	| { match: "partial" }
++	| { match: "overlong" }
++	| { match: "marker"; length: number; event: NativePresentMarkerEvent };
++
++/**
++ * A bounded framing decoder for one armed token.
++ *
++ * Arm it with the attempt's token, feed it the PTY bytes in physical order, and read the events back. While
++ * it is not armed every byte is reproduced verbatim, which is what keeps untrusted marker-like terminal
++ * text byte-identical.
++ *
++ * Undecided bytes are held, armed or not: a candidate split across two reads cannot be classified until the
++ * rest of it arrives. {@link flush} releases them as the verbatim bytes they turned out to be, which is what
++ * a caller does at EOF or when it stops decoding.
++ */
++export class NativePresentMarkerDecoder {
++	/** At most this many bytes are ever held between calls: an unterminated candidate's prefix. */
++	static readonly MAX_RETAINED_BYTES = NATIVE_PRESENT_MARKER_MAX_BYTES;
++
++	private token: string | undefined;
++	private open = false;
++	private retained: Buffer = EMPTY;
++
++	/** The token whose markers are currently recognized, or undefined while nothing is armed. */
++	get armedToken(): string | undefined {
++		return this.token;
++	}
++
++	/** `"open"` between an accepted BEGIN and its END or ABORT. */
++	get phase(): "idle" | "open" {
++		return this.open ? "open" : "idle";
++	}
++
++	/** Bytes held right now. The bound this codec promises, readable rather than asserted in prose. */
++	retainedBytes(): number {
++		return this.retained.length;
++	}
++
++	/**
++	 * Arm one attempt. Re-arming drops any open interval, because the previous attempt's END can no longer
++	 * be believed, and it never drops retained bytes: those are stream bytes, not attempt state.
++	 */
++	arm(token: string): void {
++		this.token = requireToken(token);
++		this.open = false;
++	}
++
++	/** Stop recognizing markers. Every later marker-like byte is reproduced verbatim. */
++	disarm(): void {
++		this.token = undefined;
++		this.open = false;
++	}
++
++	/**
++	 * Flush whatever is retained as verbatim bytes, so a closing stream loses nothing.
++	 *
++	 * A partial candidate at EOF was never a marker: it is stream bytes, and it is reported as such.
++	 */
++	flush(): NativePresentMarkerEvent[] {
++		if (this.retained.length === 0) return [];
++		const bytes = this.retained;
++		this.retained = EMPTY;
++		return [{ kind: "bytes", bytes }];
++	}
++
++	decode(chunk: Uint8Array): NativePresentMarkerEvent[] {
++		const buffer = this.retained.length > 0 ? Buffer.concat([this.retained, Buffer.from(chunk)]) : Buffer.from(chunk);
++		this.retained = EMPTY;
++		const events: NativePresentMarkerEvent[] = [];
++		let plainFrom = 0;
++		let cursor = 0;
++		const emitPlainThrough = (end: number) => {
++			if (end > plainFrom) events.push({ kind: "bytes", bytes: buffer.subarray(plainFrom, end) });
++			plainFrom = end;
++		};
++		while (cursor < buffer.length) {
++			const escape = buffer.indexOf(ESC, cursor);
++			if (escape === -1) break;
++			const candidate = buffer.subarray(escape);
++			const matched = this.matchCandidate(candidate);
++			if (matched.match === "none") {
++				cursor = escape + 1;
++				continue;
++			}
++			if (matched.match === "partial") {
++				// Retain the candidate and nothing else: its bytes are still undecided, every byte before it
++				// is not.
++				emitPlainThrough(escape);
++				this.retained = Buffer.from(candidate);
++				return events;
++			}
++			if (matched.match === "overlong") {
++				// Not a marker, and never grown further. Reproduce up to the next escape, which is where the
++				// next candidate could start, and keep scanning from there.
++				const next = candidate.indexOf(ESC, 1);
++				const end = next === -1 ? buffer.length : escape + next;
++				emitPlainThrough(escape);
++				events.push({ kind: "refused", reason: "overlong-candidate", bytes: buffer.subarray(escape, end) });
++				plainFrom = end;
++				cursor = end;
++				continue;
++			}
++			emitPlainThrough(escape);
++			events.push(matched.event);
++			plainFrom = escape + matched.length;
++			cursor = plainFrom;
++		}
++		emitPlainThrough(buffer.length);
++		return events;
++	}
++
++	/**
++	 * Classify one candidate that starts at an escape byte.
++	 *
++	 * A candidate is only ever bytes that begin with this codec's own introducer, or a prefix of it, so
++	 * ordinary escape sequences, sixel data and image protocols are `none` on their first differing byte and
++	 * are never buffered.
++	 */
++	private matchCandidate(candidate: Buffer): CandidateMatch {
++		const shared = Math.min(candidate.length, INTRODUCER.length);
++		if (!candidate.subarray(0, shared).equals(INTRODUCER.subarray(0, shared))) return { match: "none" };
++		if (candidate.length < INTRODUCER.length) return { match: "partial" };
++		const terminator = candidate.indexOf(STRING_TERMINATOR, INTRODUCER.length);
++		if (terminator === -1) {
++			return candidate.length >= NATIVE_PRESENT_MARKER_MAX_BYTES ? { match: "overlong" } : { match: "partial" };
++		}
++		const length = terminator + STRING_TERMINATOR.length;
++		if (length > NATIVE_PRESENT_MARKER_MAX_BYTES) return { match: "overlong" };
++		const body = candidate.subarray(INTRODUCER.length, terminator).toString("latin1");
++		const event = this.classifyBody(body, candidate.subarray(0, length));
++		return event ? { match: "marker", length, event } : { match: "none" };
++	}
++
++	/**
++	 * Decide what one terminated candidate's body means, or return undefined for bytes that are not this
++	 * codec's marker at all.
++	 *
++	 * A body that does not carry the armed token is never this decoder's business: an unarmed decoder, a
++	 * wrong or stale token, and an unrecognizable body are all reproduced verbatim. Only the armed token in
++	 * a marker whose remaining fields are wrong, or in the wrong phase, is refused.
++	 */
++	private classifyBody(body: string, raw: Buffer): NativePresentMarkerEvent | undefined {
++		const selector = body.slice(0, 2);
++		if (selector !== "B;" && selector !== "E;" && selector !== "A;") return undefined;
++		const token = body.slice(2, 2 + NATIVE_PRESENT_TOKEN_LENGTH);
++		if (this.token === undefined || token !== this.token) return undefined;
++		const rest = body.slice(2 + NATIVE_PRESENT_TOKEN_LENGTH);
++		const refuse = (reason: NativePresentMarkerRefusal): NativePresentMarkerEvent => ({
++			kind: "refused",
++			reason,
++			bytes: Buffer.from(raw),
++		});
++		if (selector === "E;") {
++			const frameId = rest.startsWith(";") ? rest.slice(1) : undefined;
++			if (frameId === undefined || !isNativePresentFrameId(frameId)) return refuse("malformed-marker");
++			if (!this.open) return refuse("unexpected-end");
++			this.open = false;
++			return { kind: "end", token, frameId };
++		}
++		if (rest.length > 0) return refuse("malformed-marker");
++		if (selector === "B;") {
++			if (this.open) return refuse("duplicate-begin");
++			this.open = true;
++			return { kind: "begin", token };
++		}
++		if (!this.open) return refuse("unexpected-abort");
++		this.open = false;
++		return { kind: "abort", token };
++	}
++}
+diff --git a/packages/tui/src/native-presentation.ts b/packages/tui/src/native-presentation.ts
+index 01e7631b6efd3345dc8a90bdba6008f2f1a9c158..681b85cf34708ac7cce382d1bf93295eee647224 100644
+--- a/packages/tui/src/native-presentation.ts
++++ b/packages/tui/src/native-presentation.ts
+@@ -14,6 +14,10 @@
+  * 3. a receipt naming the complete frame the renderer actually handed to the terminal, and the geometry
+  *    it was built at.
+  *
++ * An explicitly managed ordered presentation adds a fourth, in `native-present-markers.ts`: the same frame,
++ * bracketed on the terminal's byte stream so a host can tell this frame's own bytes from everything else Pi
++ * wrote. That framing is written only when a request asks for it.
++ *
+  * The receipt is minted after the frame bytes are handed to {@link Terminal.write}. That is a local
+  * handoff, not a client display acknowledgement: proving a client displayed the frame requires the client
+  * to echo the receipt back, which is the host's work and is deliberately not modelled here.
+@@ -24,6 +28,7 @@
+  */
+ 
+ import type { ImageProtocol } from "./terminal-image.ts";
++import type { NativePresentOrdering } from "./native-present-markers.ts";
+ 
+ /**
+  * Terminal-owned modes reasserted for a cold terminal.
+@@ -79,11 +84,24 @@ export interface PresentationFrameReceipt {
+ 	/** UTF-8 bytes handed to {@link Terminal.write}, counted with `Buffer.byteLength`. */
+ 	byteLength: number;
+ 	cold: ColdReassertion | undefined;
++	/**
++	 * Present only for a frame an explicit ordered-presentation request bracketed.
++	 *
++	 * The BEGIN marker was written immediately before this frame's own bytes and the END marker carrying
++	 * `frameId` immediately after them, on the same {@link Terminal.write} path. That is a physical boundary
++	 * in the terminal's byte stream, and it is still not a client display acknowledgement.
++	 */
++	ordering?: { version: number; token: string; markerCodec: string };
+ }
+ 
+ export interface PresentationRequest {
+ 	requestId: string;
+ 	coldTerminal: boolean;
++	/**
++	 * Explicit opt-in to `dcs-pi-native-present-v1` framing. Absent — which is every ordinary render and
++	 * every protocol-1 presentation — writes no marker byte at all.
++	 */
++	ordering?: NativePresentOrdering;
+ }
+ 
+ export type PresentationUnavailableReason =
+@@ -95,7 +113,12 @@ export type PresentationUnavailableReason =
+ 	 * This renderer mints no complete-frame receipt. Reported by the capability preflight, before any
+ 	 * mode byte or render is written, so a refusal never leaves half a presentation behind.
+ 	 */
+-	| "no-complete-frame-support";
++	| "no-complete-frame-support"
++	/**
++	 * The request carried an ordering version, codec or token this build does not speak. Refused by the same
++	 * preflight, before any marker or mode byte: an unknown framing is never approximated.
++	 */
++	| "unsupported-ordering";
+ 
+ export type PresentationOutcome =
+ 	| { presented: true; receipt: PresentationFrameReceipt }
+diff --git a/packages/tui/src/terminal.ts b/packages/tui/src/terminal.ts
+index 9621d1fb7e88ad824669fed40ee6e1eb5013064c..8fe39289132f707c48f92d20b1f3c1a0b08c9176 100644
+--- a/packages/tui/src/terminal.ts
++++ b/packages/tui/src/terminal.ts
+@@ -7,10 +7,12 @@ import {
+ 	authorizeTerminalResponse,
+ 	getNativeAttachmentHost,
+ 	isSupersededAttachmentEpoch,
++	mountNativeInputTarget,
+ 	type NativeInputProvenance,
+ 	noteAttachmentEpoch,
+ 	settleTerminalResponseAuthorizations,
+ 	type TerminalResponseKind,
++	unmountNativeInputTarget,
+ } from "./native-attachment.ts";
+ import { isNativeModifierPressed } from "./native-modifiers.ts";
+ import { getNativeModuleCandidates } from "./native-module-path.ts";
+@@ -324,6 +326,12 @@ export class ProcessTerminal implements Terminal {
+ 		// Query Kitty keyboard protocol and fall back to modifyOtherKeys when DA confirms no Kitty response.
+ 		// See: https://sw.kovidgoyal.net/kitty/keyboard-protocol/
+ 		this.queryAndEnableKittyProtocol();
++
++		// Last, and only once everything a dispatch needs exists: the stdin buffer, the stdin handler, the
++		// negotiation state and the startup query. `TuiBase.start()` calls this synchronously and returns, and
++		// `InteractiveMode` records `native-mounted` only after that return, so a host reading the first
++		// snapshot reaches a terminal that is already dispatch-ready and does so before any extension callback.
++		mountNativeInputTarget(this, (input) => this.dispatchNativeInput(input));
+ 	}
+ 
+ 	/**
+@@ -820,6 +828,10 @@ export class ProcessTerminal implements Terminal {
+ 	}
+ 
+ 	stop(): void {
++		// First, before any buffer or handler is destroyed: a handle must refuse rather than reach a terminal
++		// that is halfway through stopping.
++		unmountNativeInputTarget(this);
++
+ 		if (this.clearProgressInterval()) {
+ 			process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
+ 		}
+diff --git a/packages/tui/src/tui.ts b/packages/tui/src/tui.ts
+index d7c9e61977b796b65846741b194e7eb54297b0ce..61c4ee6859138e9ea1ace005fd8094048ad2bc42 100644
+--- a/packages/tui/src/tui.ts
++++ b/packages/tui/src/tui.ts
+@@ -22,6 +22,15 @@ import {
+ 	type PresentationRequest,
+ 	type PresentationUnavailableReason,
+ } from "./native-presentation.ts";
++import {
++	encodeNativePresentBegin,
++	encodeNativePresentEnd,
++	encodeNativePresentFailedAttemptCleanup,
++	isNativePresentToken,
++	NATIVE_PRESENT_MARKER_CODEC,
++	NATIVE_PRESENT_ORDERING_VERSION,
++	type NativePresentOrdering,
++} from "./native-present-markers.ts";
+ import type { Terminal } from "./terminal.ts";
+ import {
+ 	isOsc11BackgroundColorResponse,
+@@ -335,6 +344,18 @@ export interface TUI extends Component {
+ 
+ export const VIEWPORT_TUI = Symbol.for("@earendil-works/pi-tui/viewport");
+ 
++/**
++ * The one thing a failed ordered-presentation cleanup write can honestly say.
++ *
++ * Fixed text, by construction. A thrown error's message is arbitrary caller-supplied text that may itself
++ * contain the attempt's token, so nothing from the error is formatted into it, and it claims neither that the
++ * framing stayed open nor that it closed — after a write that threw, neither is known.
++ */
++const ORDERED_PRESENTATION_CLEANUP_UNCERTAIN =
++	"an ordered presentation attempt failed and its single framing cleanup write also failed; whether that " +
++	"cleanup was admitted, and whether the attempt's framing closed, are both unknown. Nothing is retried and " +
++	"no completion is claimed. Retire the attempt and present again with a new token to recover.";
++
+ export interface ViewportTUI extends TUI {
+ 	readonly [VIEWPORT_TUI]: true;
+ 	setLayoutRoot(component: Component | undefined): void;
+@@ -350,7 +371,9 @@ export abstract class TuiBase extends Container implements TUI {
+ 	private frameListeners = new Set<(receipt: PresentationFrameReceipt) => void>();
+ 	private frameSequence = 0;
+ 	private lastFrame: PresentationFrameReceipt | undefined;
+-	private pendingPresentation: { requestId: string; cold: ColdReassertion | undefined } | undefined;
++	private pendingPresentation:
++		| { requestId: string; cold: ColdReassertion | undefined; ordering: NativePresentOrdering | undefined }
++		| undefined;
+ 	private focusedComponent: Component | null = null;
+ 	private inputListeners = new Set<TuiInputListener>();
+ 	/** Increments on every cell-size query, so a report for a superseded query is detectable. */
+@@ -400,6 +423,17 @@ export abstract class TuiBase extends Container implements TUI {
+ 	 * Synchronous by construction: the receipt has to name the frame this request produced, so the render
+ 	 * is forced here rather than requested. A renderer that is stopped or has released the screen presents
+ 	 * nothing, because whatever now owns the terminal must not be painted over.
++	 *
++	 * A request carrying `ordering` is bracketed with `dcs-pi-native-present-v1` markers on the terminal's
++	 * own write path: BEGIN before the first byte this request writes, END carrying the receipt's `frameId`
++	 * after the last one. Without `ordering` not one marker byte is written, so Pi's default output is
++	 * unchanged.
++	 *
++	 * **Every write of an ordered attempt is inside one failure-handling region**, BEGIN and END included.
++	 * `Terminal.write` is a synchronous local admission call that reports no accepted-byte count when it
++	 * throws, so a throw may have admitted nothing, a prefix, or everything. No exception from any step of an
++	 * ordered attempt produces `presented: true`, nothing accepted is ever rewritten, and a failed attempt
++	 * makes at most one bounded cleanup write. A failing BEGIN does not go on to reassert modes or render.
+ 	 */
+ 	presentNow(request: PresentationRequest): PresentationOutcome {
+ 		if (this.stopped) return { presented: false, reason: "renderer-stopped" };
+@@ -409,22 +443,82 @@ export abstract class TuiBase extends Container implements TUI {
+ 		if (unsupported) return { presented: false, reason: unsupported };
+ 		const released = this.screenReleasedReason();
+ 		if (released) return { presented: false, reason: released };
++		// An ordering this build does not speak is refused by the same preflight: no marker, no mode byte and
++		// no render. A token that is not canonical is exactly as unusable as an unknown version.
++		const requested = request.ordering;
++		if (
++			requested !== undefined &&
++			(requested.version !== NATIVE_PRESENT_ORDERING_VERSION || !isNativePresentToken(requested.token))
++		) {
++			return { presented: false, reason: "unsupported-ordering" };
++		}
++		// The attempt's own snapshot of the validated ordering. Cleanup has to name the token this attempt
++		// armed, and the caller's object is the caller's to mutate while the render runs.
++		const ordering: NativePresentOrdering | undefined =
++			requested === undefined ? undefined : { version: requested.version, token: requested.token };
+ 
+-		const cold = request.coldTerminal ? this.reassertPresentation() : undefined;
+-		const before = this.lastFrame;
+-		this.pendingPresentation = { requestId: request.requestId, cold };
++		let receipt: PresentationFrameReceipt | undefined;
+ 		try {
+-			this.renderNow(true);
++			// BEGIN is inside the region. A BEGIN that throws is a failed attempt that still needs its one
++			// cleanup write, and it must not go on to reassert modes or render: there is no interval to fill.
++			if (ordering) this.terminal.write(encodeNativePresentBegin(ordering.token));
++			// The cold reassertion writes mode bytes through this same terminal, and
++			// `Terminal.reassertNegotiatedModes` is an implementation this class does not own and cannot assume
++			// will return.
++			const cold = request.coldTerminal ? this.reassertPresentation() : undefined;
++			const before = this.lastFrame;
++			this.pendingPresentation = { requestId: request.requestId, cold, ordering };
++			try {
++				this.renderNow(true);
++			} finally {
++				this.pendingPresentation = undefined;
++			}
++			const rendered = this.lastFrame;
++			if (rendered && rendered !== before && rendered.requestId === request.requestId) receipt = rendered;
++			// END is inside the region too. A throwing END write does not mean the frame was not handed over and
++			// does not mean END was not admitted — it means this attempt cannot be reported successful, so the
++			// caller gets the throw and a consumer that saw END on the byte route still has no success.
++			if (receipt && ordering) this.terminal.write(encodeNativePresentEnd(ordering.token, receipt.frameId));
++		} catch (error) {
++			// Whatever was admitted stays admitted: cleanup closes this attempt's framing, it does not undo it,
++			// and only a later independent presentation with a new token recovers the screen. The original
++			// failure, with its identity, is what the caller gets.
++			if (ordering) this.closeFailedOrderedAttempt(ordering.token);
++			throw error;
+ 		} finally {
++			// Cleared on every exit, including the paths that never reached the inner render.
+ 			this.pendingPresentation = undefined;
+ 		}
+-		const receipt = this.lastFrame;
+-		if (!receipt || receipt === before || receipt.requestId !== request.requestId) {
++		if (!receipt) {
++			// A refusal is still a failed ordered attempt: it gets the same one cleanup write, and it stays a
++			// refusal even if that write fails.
++			if (ordering) this.closeFailedOrderedAttempt(ordering.token);
+ 			return { presented: false, reason: "no-complete-frame-support" };
+ 		}
+ 		return { presented: true, receipt };
+ 	}
+ 
++	/**
++	 * Close one failed ordered attempt, with at most one bounded write, and never a retry.
++	 *
++	 * The write is a DCS string terminator followed by this token's exact ABORT marker. The terminator is there
++	 * because a failed marker write may have left an unterminated candidate in the stream; ABORT then says this
++	 * attempt failed. Neither part claims that no frame bytes were written, and neither undoes any.
++	 *
++	 * If this write itself throws, what was admitted and whether the framing closed are both unknown, and there
++	 * is nothing safe to do about it: retrying could write an accepted prefix twice. The uncertainty is reported
++	 * as a fixed process warning — this package has no logger of its own. The warning formats no error object
++	 * and carries no token or marker bytes, because a thrown error's message is arbitrary text that may itself
++	 * contain the attempt's token, and it does not claim the interval either stayed open or closed.
++	 */
++	private closeFailedOrderedAttempt(token: string): void {
++		try {
++			this.terminal.write(encodeNativePresentFailedAttemptCleanup(token));
++		} catch {
++			process.emitWarning(ORDERED_PRESENTATION_CLEANUP_UNCERTAIN);
++		}
++	}
++
+ 	onFrameHandedToTerminal(listener: (receipt: PresentationFrameReceipt) => void): () => void {
+ 		this.frameListeners.add(listener);
+ 		return () => {
+@@ -484,6 +578,13 @@ export abstract class TuiBase extends Container implements TUI {
+ 			rows: frame.rows,
+ 			byteLength: frame.byteLength,
+ 			cold: this.pendingPresentation?.cold,
++			ordering: this.pendingPresentation?.ordering
++				? {
++						version: NATIVE_PRESENT_ORDERING_VERSION,
++						token: this.pendingPresentation.ordering.token,
++						markerCodec: NATIVE_PRESENT_MARKER_CODEC,
++					}
++				: undefined,
+ 		};
+ 		this.lastFrame = receipt;
+ 		for (const listener of this.frameListeners) listener(receipt);
+diff --git a/packages/tui/test/native-consumer-capabilities.test.ts b/packages/tui/test/native-consumer-capabilities.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a8f1545597bc145c43362beb5f49e3a370b5894
+--- /dev/null
++++ b/packages/tui/test/native-consumer-capabilities.test.ts
+@@ -0,0 +1,697 @@
++/**
++ * The two consumer capabilities `0006` adds, driven through the real objects rather than through symbols.
++ *
++ * 1. **An early public ingress target.** Labelled dispatch already existed on `ProcessTerminal`, but the only
++ *    published route to that object ran through an extension's `session_start` handler. These cases drive the
++ *    publication a started terminal makes, the identity checks a handle re-runs on every call, and what
++ *    happens when an older module copy moves the host without telling anybody.
++ * 2. **A physical presentation boundary.** Seam E's receipt says the renderer handed a complete frame over.
++ *    These cases read the bytes the terminal actually received and require the BEGIN/END markers to bracket
++ *    exactly that frame, and require *no* marker byte at all when no ordering was requested.
++ *
++ * What they do not claim: that a client displayed anything. Every assertion here stops at the terminal object
++ * the renderer wrote to.
++ */
++
++import assert from "node:assert";
++import { randomUUID } from "node:crypto";
++import { after, before, describe, it } from "node:test";
++import { Text } from "../src/components/text.ts";
++import {
++	encodeNativePresentAbort,
++	encodeNativePresentBegin,
++	encodeNativePresentEnd,
++	isNativePresentFrameId,
++	isNativePresentToken,
++	mintNativePresentToken,
++	NATIVE_PRESENT_MARKER_CODEC,
++	NATIVE_PRESENT_MARKER_MAX_BYTES,
++	NATIVE_PRESENT_ORDERING_VERSION,
++	NativePresentMarkerDecoder,
++	type NativePresentMarkerEvent,
++} from "../src/native-present-markers.ts";
++import {
++	NATIVE_INPUT_TARGET_API_VERSION,
++	NATIVE_INPUT_TARGET_PRODUCER_VERSION,
++	type NativeAttachmentHost,
++	type NativeInputTargetSnapshot,
++	nativeInputTargetSnapshot,
++	registerNativeAttachmentHost,
++	subscribeNativeInputTarget,
++	type VirtualTerminalProfile,
++} from "../src/native-attachment.ts";
++import { ProcessTerminal } from "../src/terminal.ts";
++import { TuiAltScreen } from "../src/tui-alt-screen.ts";
++import { TuiMainScreen } from "../src/tui-main-screen.ts";
++import { VirtualTerminal } from "./virtual-terminal.ts";
++
++/** One profile for the whole file: the launch profile is fixed by the first registration in this process. */
++const PROFILE: VirtualTerminalProfile = {
++	profileId: "consumer-capabilities",
++	term: "xterm-256color",
++	capabilities: {
++		kittyKeyboard: true,
++		kittyGraphics: false,
++		mouse: true,
++		bracketedPaste: true,
++		synchronizedOutput: true,
++		trueColor: true,
++	},
++	cellSize: null,
++};
++
++function host(): NativeAttachmentHost {
++	return {
++		profile: PROFILE,
++		authorizeReturn: () => "native",
++		beforeApplyTerminalResponse: async () => ({ apply: true }),
++	};
++}
++
++/**
++ * The process registry, reached directly for one purpose only: to act as an **older** copy of
++ * `native-attachment.ts` would. Such a copy sets `state.host` and knows nothing about publications, so it
++ * cannot rotate or notify. That is the case the identity guard exists for, and no public API can stage it.
++ */
++function registryAsOlderCopy(): { host: NativeAttachmentHost | undefined } {
++	const key = Symbol.for("@earendil-works/pi-tui:native-attachment");
++	return (globalThis as unknown as Record<symbol, { host: NativeAttachmentHost | undefined }>)[key];
++}
++
++const bytes = (text: string) => new TextEncoder().encode(text);
++const dispatch = (data: string, attachmentId = "client-a", epoch = 1, generation = 0) => ({
++	attachmentEpoch: { attachmentId, epoch },
++	bytes: bytes(data),
++	binding: { generation },
++});
++
++describe("the native input target", () => {
++	const written: string[] = [];
++	const realWrite = process.stdout.write.bind(process.stdout);
++
++	before(() => {
++		// `ProcessTerminal` writes mode bytes to the real stdout; capture them so the runner's output stays
++		// readable and so a case can assert on what the terminal emitted.
++		(process.stdout as unknown as { write: unknown }).write = (chunk: string | Uint8Array) => {
++			written.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
++			return true;
++		};
++	});
++
++	after(() => {
++		(process.stdout as unknown as { write: unknown }).write = realWrite;
++	});
++
++	it("exports its API version and reports no producer before any terminal has started", () => {
++		assert.equal(NATIVE_INPUT_TARGET_API_VERSION, 1);
++		const snapshot = nativeInputTargetSnapshot();
++		assert.equal(snapshot.apiVersion, NATIVE_INPUT_TARGET_API_VERSION);
++		// API availability is not producer availability: this is the new-installed-copy/old-bundled-producer
++		// report, and a consumer must not infer support from the exported version.
++		assert.equal(snapshot.producerVersion, null);
++		assert.equal(snapshot.publication, null);
++		assert.equal(snapshot.target, null);
++		assert.equal(snapshot.reason, "producer-absent");
++	});
++
++	it("publishes a dispatchable target once the terminal is started, and revokes it at stop", async () => {
++		const registration = registerNativeAttachmentHost(host());
++		const terminal = new ProcessTerminal();
++		const delivered: string[] = [];
++		terminal.start((data) => delivered.push(data), () => {});
++
++		const published = nativeInputTargetSnapshot();
++		assert.equal(published.producerVersion, NATIVE_INPUT_TARGET_PRODUCER_VERSION);
++		assert.ok(published.target, "a started terminal publishes a target");
++		assert.equal(published.reason, null);
++		assert.equal(published.publication?.sequence, published.target?.publication.sequence);
++
++		const admitted = await published.target.dispatchNativeInput(dispatch("x"));
++		assert.equal(admitted.admitted, true);
++		assert.deepEqual(delivered, ["x"]);
++
++		terminal.stop();
++		const revoked = nativeInputTargetSnapshot();
++		assert.equal(revoked.target, null);
++		assert.equal(revoked.publication, null);
++		assert.equal(revoked.reason, "revoked");
++		// The producer is remembered: "no new producer in this process" and "a producer published and its
++		// target is gone" are different answers.
++		assert.equal(revoked.producerVersion, NATIVE_INPUT_TARGET_PRODUCER_VERSION);
++		assert.deepEqual(await published.target.dispatchNativeInput(dispatch("y")), {
++			admitted: false,
++			reason: "target-revoked",
++		});
++		registration.release();
++	});
++
++	it("mints a new publication per restart and leaves every earlier handle refusing", async () => {
++		const registration = registerNativeAttachmentHost(host());
++		const terminal = new ProcessTerminal();
++		terminal.start(() => {}, () => {});
++		const first = nativeInputTargetSnapshot().target;
++		assert.ok(first);
++		terminal.stop();
++		terminal.start(() => {}, () => {});
++		const second = nativeInputTargetSnapshot().target;
++		assert.ok(second);
++		assert.notEqual(second, first);
++		assert.ok(second.publication.sequence > first.publication.sequence);
++		assert.deepEqual(await first.dispatchNativeInput(dispatch("a")), {
++			admitted: false,
++			reason: "target-revoked",
++		});
++		assert.equal((await second.dispatchNativeInput(dispatch("a"))).admitted, true);
++		terminal.stop();
++		registration.release();
++	});
++
++	it("refuses a handle after an older copy replaced the shared host without any callback", async () => {
++		const first = host();
++		const registration = registerNativeAttachmentHost(first);
++		const terminal = new ProcessTerminal();
++		terminal.start(() => {}, () => {});
++		const target = nativeInputTargetSnapshot().target;
++		assert.ok(target);
++
++		// Exactly what an older `registerNativeAttachmentHost` does: the shared host moves, nothing rotates
++		// and nothing is notified. Safety may not depend on a notification that copy cannot send.
++		registryAsOlderCopy().host = host();
++		const stale = nativeInputTargetSnapshot();
++		assert.equal(stale.target, null);
++		assert.equal(stale.reason, "host-replaced");
++		assert.ok(stale.publication, "the publication is still reported; only the target is withheld");
++		assert.deepEqual(await target.dispatchNativeInput(dispatch("a")), {
++			admitted: false,
++			reason: "target-revoked",
++		});
++
++		// And the same for an older copy's `release()`, which clears the host outright.
++		registryAsOlderCopy().host = undefined;
++		assert.equal(nativeInputTargetSnapshot().reason, "host-released");
++
++		registryAsOlderCopy().host = first;
++		assert.ok(nativeInputTargetSnapshot().target, "restoring the captured host restores the target");
++		terminal.stop();
++		registration.release();
++	});
++
++	it("rotates the publication for a new registration and revokes on release, without restarting", async () => {
++		const first = registerNativeAttachmentHost(host());
++		const terminal = new ProcessTerminal();
++		terminal.start(() => {}, () => {});
++		const before = nativeInputTargetSnapshot();
++		assert.ok(before.target);
++
++		const second = registerNativeAttachmentHost(host());
++		const rotated = nativeInputTargetSnapshot();
++		assert.ok(rotated.target);
++		assert.ok(rotated.publication && before.publication);
++		assert.ok(rotated.publication.sequence > before.publication.sequence);
++		assert.deepEqual(await before.target.dispatchNativeInput(dispatch("a")), {
++			admitted: false,
++			reason: "target-revoked",
++		});
++		assert.equal((await rotated.target.dispatchNativeInput(dispatch("a"))).admitted, true);
++
++		second.release();
++		assert.equal(nativeInputTargetSnapshot().target, null);
++		assert.equal(nativeInputTargetSnapshot().reason, "revoked");
++
++		// The mount survived the release, so a new registration republishes with no renderer restart.
++		const third = registerNativeAttachmentHost(host());
++		const republished = nativeInputTargetSnapshot();
++		assert.ok(republished.target);
++		assert.equal((await republished.target.dispatchNativeInput(dispatch("a"))).admitted, true);
++
++		terminal.stop();
++		third.release();
++		first.release();
++	});
++
++	it("hands the current state back from subscribe itself", async () => {
++		const seen: NativeInputTargetSnapshot[] = [];
++		const registration = registerNativeAttachmentHost(host());
++		const terminal = new ProcessTerminal();
++		const { snapshot, unsubscribe } = subscribeNativeInputTarget((next) => seen.push(next));
++		// Subscribed and read in one call, so nothing can fall between the read and the subscription.
++		assert.equal(snapshot.target, null);
++		terminal.start(() => {}, () => {});
++		terminal.stop();
++		unsubscribe();
++		terminal.start(() => {}, () => {});
++		terminal.stop();
++		assert.deepEqual(
++			seen.map((entry) => entry.reason),
++			[null, "revoked"],
++		);
++		registration.release();
++	});
++
++	it("refuses through the current handle while a seam G drain holds admission closed", async () => {
++		const registration = registerNativeAttachmentHost({ ...host(), childTerminalHandoff: { version: 1 } });
++		const terminal = new ProcessTerminal();
++		terminal.start(() => {}, () => {});
++		const target = nativeInputTargetSnapshot().target;
++		assert.ok(target);
++		const lease = await terminal.drainNativeInput();
++		// The handle is current; the terminal itself is closed. The refusal is the terminal's, named, and the
++		// bytes stay the sender's.
++		const closed = await target.dispatchNativeInput(dispatch("a"));
++		assert.equal(closed.admitted, false);
++		assert.equal("reason" in closed ? closed.reason : undefined, "handoff-closed");
++		lease.reopen();
++		assert.equal((await target.dispatchNativeInput(dispatch("a"))).admitted, true);
++		terminal.stop();
++		registration.release();
++	});
++});
++
++describe("the dcs-pi-native-present-v1 codec", () => {
++	const token = mintNativePresentToken();
++	const other = mintNativePresentToken();
++	const frameId = randomUUID();
++
++	function drain(decoder: NativePresentMarkerDecoder, chunks: Uint8Array[]): NativePresentMarkerEvent[] {
++		const events: NativePresentMarkerEvent[] = [];
++		for (const chunk of chunks) events.push(...decoder.decode(chunk));
++		events.push(...decoder.flush());
++		return events;
++	}
++
++	/** The verbatim stream a caller can rebuild from the events, markers re-encoded at their own position. */
++	function reproduced(events: NativePresentMarkerEvent[]): string {
++		return events
++			.map((event) => {
++				if (event.kind === "bytes" || event.kind === "refused") return Buffer.from(event.bytes).toString("latin1");
++				if (event.kind === "begin") return encodeNativePresentBegin(event.token);
++				if (event.kind === "abort") return encodeNativePresentAbort(event.token);
++				return encodeNativePresentEnd(event.token, event.frameId);
++			})
++			.join("");
++	}
++
++	/** Adjacent verbatim runs are one run: where a read boundary fell is not part of the framing. */
++	function shape(events: NativePresentMarkerEvent[]): string[] {
++		const kinds: string[] = [];
++		for (const event of events) {
++			if (event.kind === "bytes" && kinds[kinds.length - 1] === "bytes") continue;
++			kinds.push(event.kind);
++		}
++		return kinds;
++	}
++
++	it("mints canonical tokens and accepts only the renderer's frame id", () => {
++		assert.equal(token.length, 43);
++		assert.ok(isNativePresentToken(token));
++		assert.ok(!isNativePresentToken(`${token}=`), "padding is not canonical");
++		assert.ok(!isNativePresentToken(token.slice(0, 42)), "a short token is not 32 bytes");
++		assert.ok(!isNativePresentToken(`${token.slice(0, 42)}B`), "a final character with set bits is not canonical");
++		assert.ok(isNativePresentFrameId(frameId));
++		assert.ok(!isNativePresentFrameId(frameId.toUpperCase()));
++		assert.ok(!isNativePresentFrameId(frameId.slice(0, 35)));
++		assert.throws(() => encodeNativePresentBegin("not-a-token"));
++		assert.throws(() => encodeNativePresentEnd(token, "not-a-frame-id"));
++		assert.ok(encodeNativePresentEnd(token, frameId).length <= NATIVE_PRESENT_MARKER_MAX_BYTES);
++	});
++
++	it("recognizes a BEGIN/frame/END interval split at every byte boundary", () => {
++		const stream = `${encodeNativePresentBegin(token)}frame bytes${encodeNativePresentEnd(token, frameId)}tail`;
++		const raw = Buffer.from(stream, "latin1");
++		for (let cut = 0; cut <= raw.length; cut += 1) {
++			const decoder = new NativePresentMarkerDecoder();
++			decoder.arm(token);
++			const events = drain(decoder, [raw.subarray(0, cut), raw.subarray(cut)]);
++			assert.deepEqual(shape(events), ["begin", "bytes", "end", "bytes"], `split at ${cut}`);
++			assert.equal(reproduced(events), stream, `split at ${cut} reproduces the stream`);
++			assert.equal(decoder.retainedBytes(), 0);
++			assert.equal(decoder.phase, "idle");
++		}
++	});
++
++	it("recognizes an interval coalesced into one read, byte by byte as well", () => {
++		const stream = `${encodeNativePresentBegin(token)}one frame${encodeNativePresentEnd(token, frameId)}`;
++		const coalesced = new NativePresentMarkerDecoder();
++		coalesced.arm(token);
++		assert.deepEqual(
++			coalesced.decode(Buffer.from(stream, "latin1")).map((event) => event.kind),
++			["begin", "bytes", "end"],
++		);
++		const dribbled = new NativePresentMarkerDecoder();
++		dribbled.arm(token);
++		const raw = Buffer.from(stream, "latin1");
++		const events: NativePresentMarkerEvent[] = [];
++		for (const byte of raw) {
++			events.push(...dribbled.decode(Buffer.from([byte])));
++			assert.ok(dribbled.retainedBytes() <= NATIVE_PRESENT_MARKER_MAX_BYTES);
++		}
++		// One byte per read: nine separate verbatim runs for nine frame bytes, and the same framing either way.
++		assert.equal(events.filter((event) => event.kind === "bytes").length, 9);
++		assert.deepEqual(shape(events), ["begin", "bytes", "end"]);
++	});
++
++	it("preserves unarmed, wrong-token and stale marker-like bytes exactly", () => {
++		const foreign = `${encodeNativePresentBegin(other)}text${encodeNativePresentEnd(other, frameId)}`;
++		const unarmed = new NativePresentMarkerDecoder();
++		assert.equal(reproduced(drain(unarmed, [Buffer.from(foreign, "latin1")])), foreign);
++		assert.deepEqual(
++			drain(new NativePresentMarkerDecoder(), [Buffer.from(foreign, "latin1")]).map((event) => event.kind),
++			["bytes"],
++		);
++		const armed = new NativePresentMarkerDecoder();
++		armed.arm(token);
++		const events = drain(armed, [Buffer.from(foreign, "latin1")]);
++		assert.deepEqual(
++			events.map((event) => event.kind),
++			["bytes"],
++			"a wrong token is not this decoder's marker; nothing is stripped and nothing is refused",
++		);
++		assert.equal(reproduced(events), foreign);
++		// An introducer this codec never wrote is also just text.
++		const lookalike = "\x1bP=pi-native-present;1;Z;whatever\x1b\\";
++		assert.equal(reproduced(drain(new NativePresentMarkerDecoder(), [Buffer.from(lookalike, "latin1")])), lookalike);
++	});
++
++	it("refuses a duplicate BEGIN, a stray END or ABORT, and a malformed armed marker, losing no byte", () => {
++		const begin = encodeNativePresentBegin(token);
++		const duplicated = `${begin}a${begin}b${encodeNativePresentEnd(token, frameId)}`;
++		const decoder = new NativePresentMarkerDecoder();
++		decoder.arm(token);
++		const events = drain(decoder, [Buffer.from(duplicated, "latin1")]);
++		assert.deepEqual(shape(events), ["begin", "bytes", "refused", "bytes", "end"]);
++		assert.equal(events[2].kind === "refused" ? events[2].reason : undefined, "duplicate-begin");
++		assert.equal(reproduced(events), duplicated, "the refused marker's bytes are reproduced verbatim");
++
++		const stray = new NativePresentMarkerDecoder();
++		stray.arm(token);
++		const strayEvents = drain(stray, [Buffer.from(encodeNativePresentEnd(token, frameId), "latin1")]);
++		assert.equal(strayEvents[0].kind === "refused" ? strayEvents[0].reason : undefined, "unexpected-end");
++		const strayAbort = new NativePresentMarkerDecoder();
++		strayAbort.arm(token);
++		const abortEvents = drain(strayAbort, [Buffer.from(encodeNativePresentAbort(token), "latin1")]);
++		assert.equal(abortEvents[0].kind === "refused" ? abortEvents[0].reason : undefined, "unexpected-abort");
++
++		const malformed = `\x1bP=pi-native-present;1;E;${token};not-a-uuid\x1b\\`;
++		const bad = new NativePresentMarkerDecoder();
++		bad.arm(token);
++		const badEvents = drain(bad, [Buffer.from(malformed, "latin1")]);
++		assert.equal(badEvents[0].kind === "refused" ? badEvents[0].reason : undefined, "malformed-marker");
++		assert.equal(reproduced(badEvents), malformed);
++	});
++
++	it("refuses an overlong candidate instead of buffering it, and stays inside its byte bound", () => {
++		const overlong = `\x1bP=pi-native-present;1;B;${"A".repeat(400)}\x1b\\rest`;
++		const decoder = new NativePresentMarkerDecoder();
++		decoder.arm(token);
++		const events: NativePresentMarkerEvent[] = [];
++		const raw = Buffer.from(overlong, "latin1");
++		for (let offset = 0; offset < raw.length; offset += 7) {
++			events.push(...decoder.decode(raw.subarray(offset, offset + 7)));
++			assert.ok(
++				decoder.retainedBytes() <= NATIVE_PRESENT_MARKER_MAX_BYTES,
++				`retained ${decoder.retainedBytes()} bytes`,
++			);
++		}
++		events.push(...decoder.flush());
++		assert.ok(events.some((event) => event.kind === "refused" && event.reason === "overlong-candidate"));
++		assert.equal(reproduced(events), overlong);
++		assert.equal(decoder.phase, "idle", "an overlong candidate opens no interval");
++	});
++
++	it("carries the frame id on END, so a host matches either arrival order", () => {
++		// The E result travels the host's own transport and the END marker travels the terminal stream; neither
++		// orders the other. Matching is by frame id, which is on the marker, so END observed first and E result
++		// observed first are the same case.
++		const decoder = new NativePresentMarkerDecoder();
++		decoder.arm(token);
++		const events = drain(decoder, [
++			Buffer.from(`${encodeNativePresentBegin(token)}frame${encodeNativePresentEnd(token, frameId)}`, "latin1"),
++		]);
++		const ended = events.find((event) => event.kind === "end");
++		assert.equal(ended?.kind === "end" ? ended.frameId : undefined, frameId);
++		assert.equal(ended?.kind === "end" ? ended.token : undefined, token);
++		// A result naming a different frame does not match this interval, whichever arrived first.
++		assert.notEqual(ended?.kind === "end" ? ended.frameId : undefined, randomUUID());
++	});
++
++	it("streams megabytes without accumulating them", () => {		const decoder = new NativePresentMarkerDecoder();
++		decoder.arm(token);
++		decoder.decode(Buffer.from(encodeNativePresentBegin(token), "latin1"));
++		const chunk = Buffer.alloc(16 * 1024, 0x61);
++		let forwarded = 0;
++		for (let index = 0; index < 128; index += 1) {
++			for (const event of decoder.decode(chunk)) {
++				if (event.kind === "bytes") forwarded += event.bytes.length;
++			}
++			assert.ok(decoder.retainedBytes() <= NATIVE_PRESENT_MARKER_MAX_BYTES);
++		}
++		assert.equal(forwarded, 128 * chunk.length, "every byte was forwarded, none retained");
++		assert.deepEqual(
++			decoder.decode(Buffer.from(encodeNativePresentEnd(token, frameId), "latin1")).map((event) => event.kind),
++			["end"],
++		);
++	});
++});
++
++describe("ordered presentation on the renderer's own write path", () => {
++	class RecordingTerminal extends VirtualTerminal {
++		readonly writes: string[] = [];
++
++		override write(data: string): void {
++			this.writes.push(data);
++			super.write(data);
++		}
++
++		since(index: number): string {
++			return this.writes.slice(index).join("");
++		}
++	}
++
++	/** Both native renderers: the fullscreen one and the main-screen one. */
++	const renderers: [string, (terminal: RecordingTerminal) => TuiAltScreen | TuiMainScreen][] = [
++		["TuiAltScreen", (terminal) => new TuiAltScreen(terminal)],
++		["TuiMainScreen", (terminal) => new TuiMainScreen(terminal)],
++	];
++
++	for (const [name, create] of renderers) {
++		it(`${name} writes no marker byte when no ordering was requested`, () => {
++			const terminal = new RecordingTerminal();
++			const tui = create(terminal);
++			tui.addChild(new Text("current ui", 0, 0));
++			tui.start();
++			const before = terminal.writes.length;
++			const outcome = tui.presentNow({ requestId: "plain:1:1", coldTerminal: true });
++			const emitted = terminal.since(before);
++			tui.stop();
++			assert.equal(outcome.presented, true);
++			assert.ok(!emitted.includes("pi-native-present"), "default output carries no marker");
++			assert.equal(outcome.presented && outcome.receipt.ordering, undefined);
++		});
++
++		it(`${name} brackets exactly the requested frame, and the decoder recovers it`, () => {
++			const token = mintNativePresentToken();
++			const terminal = new RecordingTerminal();
++			const tui = create(terminal);
++			tui.addChild(new Text("current ui", 0, 0));
++			tui.start();
++			const before = terminal.writes.length;
++			const outcome = tui.presentNow({
++				requestId: "ordered:1:1",
++				coldTerminal: true,
++				ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++			});
++			const emitted = terminal.since(before);
++			tui.stop();
++			assert.ok(outcome.presented);
++			assert.deepEqual(outcome.receipt.ordering, {
++				version: NATIVE_PRESENT_ORDERING_VERSION,
++				token,
++				markerCodec: NATIVE_PRESENT_MARKER_CODEC,
++			});
++			// BEGIN is the first byte of the interval and END the last: the cold reassertion and the frame are
++			// inside, and nothing else is.
++			assert.ok(emitted.startsWith(encodeNativePresentBegin(token)));
++			assert.ok(emitted.endsWith(encodeNativePresentEnd(token, outcome.receipt.frameId)));
++			const decoder = new NativePresentMarkerDecoder();
++			decoder.arm(token);
++			const events = decoder.decode(Buffer.from(emitted, "latin1"));
++			assert.equal(events[0].kind, "begin");
++			assert.equal(events[events.length - 1].kind, "end");
++			const ended = events[events.length - 1];
++			assert.equal(ended.kind === "end" ? ended.frameId : undefined, outcome.receipt.frameId);
++			const carried = events
++				.filter((event) => event.kind === "bytes")
++				.map((event) => Buffer.from(event.bytes).toString("latin1"))
++				.join("");
++			assert.equal(Buffer.byteLength(carried, "latin1") > 0, true);
++			assert.equal(decoder.retainedBytes(), 0);
++		});
++
++		it(`${name} refuses an ordering it does not speak before writing anything`, () => {
++			const terminal = new RecordingTerminal();
++			const tui = create(terminal);
++			tui.addChild(new Text("current ui", 0, 0));
++			tui.start();
++			const before = terminal.writes.length;
++			const unknownVersion = tui.presentNow({
++				requestId: "bad-version:1:1",
++				coldTerminal: true,
++				ordering: { version: 99, token: mintNativePresentToken() },
++			});
++			const badToken = tui.presentNow({
++				requestId: "bad-token:1:1",
++				coldTerminal: true,
++				ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token: "not-a-token" },
++			});
++			const emitted = terminal.since(before);
++			tui.stop();
++			assert.deepEqual(unknownVersion, { presented: false, reason: "unsupported-ordering" });
++			assert.deepEqual(badToken, { presented: false, reason: "unsupported-ordering" });
++			assert.equal(emitted, "", "a refused ordering writes no byte at all");
++		});
++	}
++
++	/**
++	 * A terminal whose cold reassertion throws, and whose write path stays usable.
++	 *
++	 * `Terminal.reassertNegotiatedModes` is an implementation `TuiBase` does not own: the pinned
++	 * `ProcessTerminal` has one, a third-party terminal may have one that fails, and the renderer may not
++	 * assume it returns. The output channel is deliberately left writable, so a failure to close the interval
++	 * would be the renderer's and not the terminal's.
++	 */
++	class ReassertFailingTerminal extends RecordingTerminal {
++		reassertCalls = 0;
++
++		reassertNegotiatedModes(): never {
++			this.reassertCalls += 1;
++			throw new Error("reassertNegotiatedModes failed");
++		}
++	}
++
++	/** A terminal that accepts every write except the failed-attempt cleanup, so the cleanup write itself fails. */
++	class AbortRefusingTerminal extends RecordingTerminal {
++		abortAttempts = 0;
++
++		reassertNegotiatedModes(): never {
++			throw new Error("reassertNegotiatedModes failed");
++		}
++
++		override write(data: string): void {
++			if (data.includes(";A;")) {
++				this.abortAttempts += 1;
++				throw new Error("the output channel refused the cleanup write");
++			}
++			super.write(data);
++		}
++	}
++
++	it("closes the interval with ABORT when the cold reassertion throws after BEGIN", () => {
++		const token = mintNativePresentToken();
++		const terminal = new ReassertFailingTerminal();
++		const tui = new TuiAltScreen(terminal);
++		tui.addChild(new Text("current ui", 0, 0));
++		tui.start();
++		const before = terminal.writes.length;
++		assert.throws(
++			() =>
++				tui.presentNow({
++					requestId: "cold-reassert-throws:1:1",
++					// Cold, so the reassertion runs at all. It is the first thing after BEGIN that writes.
++					coldTerminal: true,
++					ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++				}),
++			/reassertNegotiatedModes failed/,
++		);
++		const emitted = terminal.since(before);
++		tui.stop();
++		assert.equal(terminal.reassertCalls, 1, "the reassertion really ran, so the interval really was open");
++		const decoder = new NativePresentMarkerDecoder();
++		decoder.arm(token);
++		const events = decoder.decode(Buffer.from(emitted, "latin1"));
++		const framing = events.filter((event) => event.kind !== "bytes").map((event) => event.kind);
++		// The whole point: BEGIN is closed by ABORT, there is no END, and the interval does not stay open for
++		// every later byte on this terminal to look like part of this frame.
++		assert.deepEqual(framing, ["begin", "abort"]);
++		assert.equal(decoder.phase, "idle");
++		assert.ok(!emitted.includes(";E;"), "no END marker was written");
++	});
++
++	it("reports an uncertain cleanup instead of claiming a framing state, and never retries it", () => {
++		const token = mintNativePresentToken();
++		const terminal = new AbortRefusingTerminal();
++		const tui = new TuiAltScreen(terminal);
++		tui.addChild(new Text("current ui", 0, 0));
++		tui.start();
++		const warnings: string[] = [];
++		const onWarning = (warning: Error) => warnings.push(warning.message);
++		process.on("warning", onWarning);
++		const before = terminal.writes.length;
++		// The caller still learns the original failure, not the cleanup write's.
++		assert.throws(
++			() =>
++				tui.presentNow({
++					requestId: "abort-write-fails:1:1",
++					coldTerminal: true,
++					ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++				}),
++			/reassertNegotiatedModes failed/,
++		);
++		const emitted = terminal.since(before);
++		tui.stop();
++		assert.equal(terminal.abortAttempts, 1, "the cleanup write is attempted once and never retried");
++		assert.ok(!emitted.includes(";A;"), "nothing claims the cleanup reached the terminal");
++		assert.ok(!emitted.includes(";E;"));
++		// `process.emitWarning` is asynchronous, so the warning is read on the next turn rather than now.
++		return new Promise<void>((resolve) => {
++			setImmediate(() => {
++				process.off("warning", onWarning);
++				assert.ok(
++					warnings.some((message) => message.includes("unknown") && message.includes("Nothing is retried")),
++					`the uncertainty was not reported: ${JSON.stringify(warnings)}`,
++				);
++				assert.ok(
++					warnings.every((message) => !/stayed open|definitely closed/.test(message)),
++					"a warning claimed the framing definitely stayed open or definitely closed",
++				);
++				assert.ok(
++					warnings.every((message) => !message.includes(token)),
++					"the host's per-attempt token is not put in a process warning",
++				);
++				resolve();
++			});
++		});
++	});
++
++	it("closes the interval with ABORT when no complete frame was produced", () => {
++		const token = mintNativePresentToken();
++		const terminal = new RecordingTerminal();
++		// `TuiAltScreen` with a render that throws: the interval has to close, and the bytes already written
++		// stay written. Only a later complete presentation recovers the screen.
++		const tui = new TuiAltScreen(terminal);
++		tui.addChild(new Text("current ui", 0, 0));
++		tui.start();
++		const failing = tui as unknown as { renderNow(force?: boolean): void };
++		const realRender = failing.renderNow.bind(failing);
++		failing.renderNow = () => {
++			throw new Error("render failed");
++		};
++		const before = terminal.writes.length;
++		assert.throws(() =>
++			tui.presentNow({
++				requestId: "aborted:1:1",
++				coldTerminal: false,
++				ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++			}),
++		);
++		const emitted = terminal.since(before);
++		failing.renderNow = realRender;
++		tui.stop();
++		const decoder = new NativePresentMarkerDecoder();
++		decoder.arm(token);
++		// The cleanup's leading string terminator is ordinary bytes here, because BEGIN was already complete.
++		assert.deepEqual(
++			decoder.decode(Buffer.from(emitted, "latin1")).map((event) => event.kind),
++			["begin", "bytes", "abort"],
++		);
++	});
++});
+diff --git a/packages/tui/test/native-marker-failure.test.ts b/packages/tui/test/native-marker-failure.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..3db30c25d42eb4081c32ec84f7d31acaee7fa80d
+--- /dev/null
++++ b/packages/tui/test/native-marker-failure.test.ts
+@@ -0,0 +1,557 @@
++import assert from "node:assert";
++import { randomUUID } from "node:crypto";
++import { describe, it } from "node:test";
++import { Text } from "../src/components/text.ts";
++import {
++	encodeNativePresentAbort,
++	encodeNativePresentBegin,
++	encodeNativePresentEnd,
++	encodeNativePresentFailedAttemptCleanup,
++	mintNativePresentToken,
++	NATIVE_PRESENT_MARKER_MAX_BYTES,
++	NATIVE_PRESENT_ORDERING_VERSION,
++	NativePresentMarkerDecoder,
++	type NativePresentMarkerEvent,
++} from "../src/native-present-markers.ts";
++import { TuiAltScreen } from "../src/tui-alt-screen.ts";
++import { TuiMainScreen } from "../src/tui-main-screen.ts";
++import { VirtualTerminal } from "./virtual-terminal.ts";
++
++/**
++ * Ordered-presentation marker-write failure, against the contract the parent selected.
++ *
++ * `Terminal.write` is a synchronous local admission call that reports **no accepted-byte count when it throws**.
++ * A throw may therefore have admitted nothing, an arbitrary prefix, or all of it. Every case here drives that
++ * directly: a terminal that admits exactly `n` bytes of a chosen write and then throws, for every `n` across
++ * both markers, and the physical byte stream reconstructed from what was actually admitted.
++ *
++ * Three rules are under test and they are not the same rule:
++ *
++ *   1. no exception from an ordered attempt produces `presented: true`;
++ *   2. nothing admitted is ever rewritten, and a failed attempt makes at most **one** bounded cleanup write of
++ *      `ESC \` followed by that token's exact ABORT marker;
++ *   3. a decoder's event list is not an outcome. A fully admitted END followed by a throwing write decodes as
++ *      `end`, and the attempt still failed, because success needs the control result **and** the observed END.
++ *
++ * What none of these claim: that cleanup removed anything, that the framing definitely closed, or that no frame
++ * bytes reached the terminal. After a write that threw, none of that is knowable from this side.
++ */
++
++/**
++ * One write's fate.
++ *
++ * A number admits that many bytes and then throws the terminal's **own** error, so a case can assert which
++ * error identity reached the caller. An object admits `admit` bytes and then throws exactly `throws`, which is
++ * what lets a case model a write that takes a prefix and then fails with an error of its own choosing — a
++ * cleanup write whose message carries the attempt's token, for instance. Returning a plain number cannot express
++ * that, and an earlier version of this suite worked around it by throwing from the fault callback itself, which
++ * bypassed the prefix-recording path entirely and silently modelled zero admission in every case.
++ */
++type WriteFault = number | { admit: number; throws: Error };
++
++/** A terminal that admits a chosen prefix of a chosen write and then throws, recording what it really took. */
++class PrefixAdmittingTerminal extends VirtualTerminal {
++	/** Exactly the bytes this terminal admitted, in order. The physical stream, reconstructed. */
++	readonly admitted: string[] = [];
++	/** Every `write` call's full argument, throwing calls included. */
++	readonly attempts: string[] = [];
++	/** Decide one write's fate; `undefined` admits it whole. See {@link WriteFault}. */
++	fail: ((data: string) => WriteFault | undefined) | undefined;
++	failure: Error | undefined;
++	reassertCalls = 0;
++	reassertThrows = false;
++
++	override write(data: string): void {
++		this.attempts.push(data);
++		const fault = this.fail?.(data);
++		if (fault === undefined) {
++			this.admitted.push(data);
++			super.write(data);
++			return;
++		}
++		// The admitted prefix is recorded before the throw, whichever error is thrown. That ordering is the
++		// whole point of this double: `Terminal.write` reports no accepted-byte count when it throws.
++		const admit = typeof fault === "number" ? fault : fault.admit;
++		if (admit > 0) {
++			const prefix = data.slice(0, admit);
++			this.admitted.push(prefix);
++			super.write(prefix);
++		}
++		if (typeof fault !== "number") throw fault.throws;
++		this.failure = new Error(`the output channel admitted ${admit} byte(s) and then failed`);
++		throw this.failure;
++	}
++
++	reassertNegotiatedModes(): { reemitted: string[]; kittyKeyboard: undefined; modifyOtherKeys: boolean; title: undefined; progress: boolean } {
++		this.reassertCalls += 1;
++		if (this.reassertThrows) throw new Error("reassertNegotiatedModes failed");
++		this.write("\x1b[?2004h");
++		return { reemitted: ["bracketed-paste"], kittyKeyboard: undefined, modifyOtherKeys: false, title: undefined, progress: false };
++	}
++
++	/** The physical stream: what this terminal actually took, with nothing this test invented. */
++	stream(): string {
++		return this.admitted.join("");
++	}
++}
++
++type Renderer = TuiAltScreen | TuiMainScreen;
++
++const renderers: [string, (terminal: PrefixAdmittingTerminal) => Renderer][] = [
++	["TuiAltScreen", (terminal) => new TuiAltScreen(terminal)],
++	["TuiMainScreen", (terminal) => new TuiMainScreen(terminal)],
++];
++
++function mount(make: (terminal: PrefixAdmittingTerminal) => Renderer): { terminal: PrefixAdmittingTerminal; tui: Renderer } {
++	const terminal = new PrefixAdmittingTerminal();
++	const tui = make(terminal);
++	tui.addChild(new Text("current ui", 0, 0));
++	tui.start();
++	return { terminal, tui };
++}
++
++/** Decode a physical stream with one armed decoder and report what a consumer on that route would have seen. */
++function observe(token: string, stream: string): { framing: string[]; events: NativePresentMarkerEvent[]; endFrameIds: string[] } {
++	const decoder = new NativePresentMarkerDecoder();
++	decoder.arm(token);
++	const events = [...decoder.decode(Buffer.from(stream, "latin1")), ...decoder.flush()];
++	return {
++		framing: events.filter((event) => event.kind !== "bytes").map((event) => event.kind),
++		events,
++		endFrameIds: events.flatMap((event) => (event.kind === "end" ? [event.frameId] : [])),
++	};
++}
++
++/** Every write the attempt made after the one that failed. There must be exactly one, and it must be cleanup. */
++function writesAfterFailure(attempts: string[], failedArgument: string): string[] {
++	const index = attempts.lastIndexOf(failedArgument);
++	assert.notEqual(index, -1, "the failing write was never attempted");
++	return attempts.slice(index + 1);
++}
++
++/**
++ * Collect the process warnings one body emits, and detach the listener whatever the body did.
++ *
++ * `process.emitWarning` is asynchronous, so the listener has to outlive the call that triggered it, and a
++ * `process.off` placed after an assertion is skipped when that assertion throws — which leaks the listener into
++ * the next case and makes its warning count wrong. The `finally` is what keeps a failing case from corrupting
++ * the case after it.
++ */
++async function collectWarnings(body: () => void | Promise<void>): Promise<string[]> {
++	const warnings: string[] = [];
++	const onWarning = (warning: Error) => warnings.push(warning.message);
++	process.on("warning", onWarning);
++	try {
++		await body();
++		// One turn, so an `emitWarning` issued by the body has been delivered before the listener goes away.
++		await new Promise<void>((resolve) => setImmediate(resolve));
++	} finally {
++		process.off("warning", onWarning);
++	}
++	return warnings;
++}
++
++describe("an ordered attempt whose BEGIN write fails", () => {
++	for (const [name, make] of renderers) {
++		it(`${name} makes one bounded cleanup write, renders nothing, and never rewrites the admitted prefix`, () => {
++			const token = mintNativePresentToken();
++			const begin = encodeNativePresentBegin(token);
++			const cleanup = encodeNativePresentFailedAttemptCleanup(token);
++			// Every byte prefix of BEGIN, zero and whole included. These markers are short by design, so the
++			// exhaustive sweep is cheap and there is no "representative prefix" hand-waving.
++			for (let accepted = 0; accepted <= begin.length; accepted += 1) {
++				const { terminal, tui } = mount(make);
++				// Marks taken after `start()`: its own mode bytes are not part of this attempt.
++				const attemptMark = terminal.attempts.length;
++				const streamMark = terminal.admitted.length;
++				terminal.fail = (data) => (data === begin ? accepted : undefined);
++				let thrown: unknown;
++				try {
++					tui.presentNow({
++						requestId: `begin-fails-${accepted}`,
++						coldTerminal: true,
++						ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++					});
++					assert.fail(`a failed BEGIN at ${accepted} byte(s) must not return`);
++				} catch (error) {
++					thrown = error;
++				}
++				terminal.fail = undefined;
++				// Read before `stop()`, which writes its own teardown bytes.
++				const attempts = terminal.attempts.slice(attemptMark);
++				const stream = terminal.admitted.slice(streamMark).join("");
++				const reassertCalls = terminal.reassertCalls;
++				tui.stop();
++
++				// The caller gets the terminal's own error object, not a wrapper and not the cleanup's.
++				assert.equal(thrown, terminal.failure, `prefix ${accepted}: the original failure identity is lost`);
++				// A failing BEGIN opens no interval to fill: no mode reassertion, no render, no END.
++				assert.equal(reassertCalls, 0, `prefix ${accepted}: a failed BEGIN still reasserted modes`);
++				assert.ok(!stream.includes(";E;"), `prefix ${accepted}: a failed BEGIN still wrote an END marker`);
++				// Exactly two write calls, and the second is the one bounded cleanup.
++				assert.deepEqual(attempts, [begin, cleanup], `prefix ${accepted}: not exactly BEGIN then one cleanup`);
++				assert.deepEqual(writesAfterFailure(attempts, begin), [cleanup], `prefix ${accepted}: cleanup was retried`);
++				// Nothing admitted is ever written twice: the physical stream is the prefix, then the cleanup.
++				assert.equal(stream, `${begin.slice(0, accepted)}${cleanup}`, `prefix ${accepted}: the stream was rewritten`);
++				assert.ok(cleanup.length <= 2 + NATIVE_PRESENT_MARKER_MAX_BYTES, "cleanup is bounded");
++
++				// What a consumer on the byte route sees. It never amounts to a frame, whatever the prefix was.
++				const seen = observe(token, stream);
++				assert.deepEqual(seen.endFrameIds, [], `prefix ${accepted}: a failed BEGIN produced an END event`);
++				assert.ok(
++					!seen.framing.includes("end"),
++					`prefix ${accepted}: framing ${JSON.stringify(seen.framing)} contains an end`,
++				);
++			}
++		});
++	}
++
++	it("keeps the whole failed BEGIN out of the interval when the marker was fully admitted before the throw", () => {
++		// The one prefix worth naming on its own: BEGIN was admitted in full and the write still threw, so the
++		// decoder really does open an interval, and cleanup's ABORT really does close it. That is the only
++		// prefix where the cleanup's leading terminator is ordinary bytes rather than a candidate terminator.
++		const token = mintNativePresentToken();
++		const begin = encodeNativePresentBegin(token);
++		const { terminal, tui } = mount(renderers[0]![1]);
++		const streamMark = terminal.admitted.length;
++		terminal.fail = (data) => (data === begin ? data.length : undefined);
++		assert.throws(() =>
++			tui.presentNow({
++				requestId: "begin-fully-admitted",
++				coldTerminal: true,
++				ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++			}),
++		);
++		terminal.fail = undefined;
++		const stream = terminal.admitted.slice(streamMark).join("");
++		tui.stop();
++		const seen = observe(token, stream);
++		assert.deepEqual(seen.framing, ["begin", "abort"]);
++		assert.equal(stream, `${begin}${encodeNativePresentFailedAttemptCleanup(token)}`);
++	});
++});
++
++describe("an ordered attempt whose END write fails", () => {
++	for (const [name, make] of renderers) {
++		it(`${name} keeps the frame, closes the attempt once, and is never a success`, () => {
++			const token = mintNativePresentToken();
++			const begin = encodeNativePresentBegin(token);
++			const cleanup = encodeNativePresentFailedAttemptCleanup(token);
++			// Every byte prefix of END, which is the longer marker.
++			let sawFullyAdmittedEnd = false;
++			let sawCleanupCompletedEnd = false;
++			for (let accepted = 0; ; accepted += 1) {
++				const { terminal, tui } = mount(make);
++				const attemptMark = terminal.attempts.length;
++				const streamMark = terminal.admitted.length;
++				let endArgument: string | undefined;
++				terminal.fail = (data) => {
++					if (!data.startsWith(`\x1bP=pi-native-present;1;E;${token}`)) return undefined;
++					endArgument = data;
++					return Math.min(accepted, data.length);
++				};
++				let thrown: unknown;
++				let outcome: unknown;
++				try {
++					outcome = tui.presentNow({
++						requestId: `end-fails-${accepted}`,
++						coldTerminal: true,
++						ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++					});
++				} catch (error) {
++					thrown = error;
++				}
++				terminal.fail = undefined;
++				const attempts = terminal.attempts.slice(attemptMark);
++				const stream = terminal.admitted.slice(streamMark).join("");
++				tui.stop();
++				assert.ok(endArgument, `prefix ${accepted}: no END write was attempted`);
++
++				// Rule 1: an ordered attempt whose END write threw is never reported successful.
++				assert.equal(outcome, undefined, `prefix ${accepted}: a failed END returned an outcome`);
++				assert.equal(thrown, terminal.failure, `prefix ${accepted}: the original failure identity is lost`);
++				// Rule 2: exactly one cleanup write after the failure, and no retry of the END itself.
++				assert.deepEqual(writesAfterFailure(attempts, endArgument), [cleanup], `prefix ${accepted}: not one cleanup`);
++				assert.equal(
++					attempts.filter((data) => data === endArgument).length,
++					1,
++					`prefix ${accepted}: the END write was retried`,
++				);
++				// The physical stream ends with exactly the admitted END prefix followed by the cleanup, and the
++				// frame bytes before it are untouched: nothing was rolled back and nothing was rewritten.
++				assert.ok(stream.startsWith(begin), `prefix ${accepted}: the interval did not start with BEGIN`);
++				assert.ok(
++					stream.endsWith(`${endArgument.slice(0, Math.min(accepted, endArgument.length))}${cleanup}`),
++					`prefix ${accepted}: the admitted END prefix or the cleanup was rewritten`,
++				);
++
++				// Rule 3: the decoder's events are not the outcome. Two different prefixes produce a matching `end`
++				// on the byte route - the whole marker admitted before the throw, and a marker missing only its
++				// terminator, which the cleanup's own leading terminator then completes. Both attempts failed. Only
++				// the conjunction of a successful control result and an observed matching END is success.
++				const seen = observe(token, stream);
++				const fullyAdmitted = accepted >= endArgument.length;
++				if (seen.endFrameIds.length > 0) {
++					assert.equal(outcome, undefined, `prefix ${accepted}: an observed END came with a returned outcome`);
++					assert.equal(seen.endFrameIds.length, 1, `prefix ${accepted}: more than one END event`);
++					if (fullyAdmitted) sawFullyAdmittedEnd = true;
++					else sawCleanupCompletedEnd = true;
++				}
++				if (fullyAdmitted) {
++					assert.deepEqual(
++						seen.framing,
++						["begin", "end", "refused"],
++						`prefix ${accepted}: ${JSON.stringify(seen.framing)}`,
++					);
++					break;
++				}
++			}
++			assert.ok(sawFullyAdmittedEnd, "the sweep never reached a fully admitted END");
++			// The hazard the contract exists for has to have been exercised, not assumed.
++			assert.ok(sawCleanupCompletedEnd, "no prefix was completed into an END by the cleanup terminator");
++		});
++	}
++});
++
++describe("an ordered attempt whose cleanup write also fails", () => {
++	// Zero, partial and full admission of the cleanup write itself, named by the byte count each case asks the
++	// channel to take before it fails. The count is not decoration: every case reconstructs the physical stream
++	// and requires exactly that many cleanup bytes in it.
++	const cleanupAdmissions: [string, (cleanupLength: number) => number][] = [
++		["zero", () => 0],
++		["a 7-byte prefix of", () => 7],
++		["all", (cleanupLength) => cleanupLength],
++	];
++	for (const [label, chooseAdmitted] of cleanupAdmissions) {
++		it(`reports uncertainty without the token when the channel admits ${label} the cleanup write and throws`, async () => {
++			const token = mintNativePresentToken();
++			const begin = encodeNativePresentBegin(token);
++			const cleanup = encodeNativePresentFailedAttemptCleanup(token);
++			const admitted = chooseAdmitted(cleanup.length);
++			const { terminal, tui } = mount(renderers[0]![1]);
++			const streamMark = terminal.admitted.length;
++			// The first failure is the BEGIN write, which admits 3 bytes. The cleanup then fails too, after
++			// admitting this case's chosen prefix, with an error whose message contains the token - exactly the
++			// leak a formatted warning would have published. `{ admit, throws }` is what makes the prefix real:
++			// throwing from the fault callback would bypass the recording path and admit nothing.
++			const cleanupFailure = new Error(`channel closed while writing cleanup for token ${token}`);
++			terminal.fail = (data) => {
++				if (data === begin) return 3;
++				if (data === cleanup) return { admit: admitted, throws: cleanupFailure };
++				return undefined;
++			};
++			let thrown: unknown;
++			let attempts: string[] = [];
++			let stream = "";
++			const warnings = await collectWarnings(() => {
++				try {
++					tui.presentNow({
++						requestId: `cleanup-fails-${admitted}`,
++						coldTerminal: true,
++						ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++					});
++				} catch (error) {
++					thrown = error;
++				}
++				terminal.fail = undefined;
++				attempts = terminal.attempts.slice();
++				stream = terminal.admitted.slice(streamMark).join("");
++				tui.stop();
++			});
++
++			// The physical stream, reconstructed: the BEGIN prefix the channel took, then exactly the cleanup
++			// prefix it took. This is the assertion the previous version of this suite did not make, which is how
++			// three cases that all admitted zero cleanup bytes could pass under three different titles.
++			assert.equal(
++				stream,
++				`${begin.slice(0, 3)}${cleanup.slice(0, admitted)}`,
++				`cleanup admitted ${admitted}: the stream is not the admitted BEGIN prefix followed by exactly the ` +
++					`admitted cleanup prefix`,
++			);
++			// And the same fact stated the other way round, so a stream that merely contains the bytes somewhere
++			// cannot satisfy it.
++			assert.ok(
++				stream.endsWith(cleanup.slice(0, admitted)),
++				`cleanup admitted ${admitted}: the stream does not end with the admitted cleanup prefix`,
++			);
++			assert.equal(
++				stream.length - begin.slice(0, 3).length,
++				admitted,
++				`cleanup admitted ${admitted}: a different number of cleanup bytes reached the stream`,
++			);
++
++			// The caller still learns the original BEGIN failure: same identity, and never the cleanup's error.
++			assert.equal(thrown, terminal.failure, `cleanup admitted ${admitted}: the original error identity is lost`);
++			assert.notEqual(thrown, cleanupFailure, "the cleanup failure replaced the original error");
++			assert.match(String(thrown), /admitted 3 byte\(s\)/);
++			// One cleanup attempt, never a second, however much of it was admitted.
++			assert.equal(attempts.filter((data) => data === cleanup).length, 1, "cleanup was retried");
++			assert.deepEqual(writesAfterFailure(attempts, begin), [cleanup], "more than the one cleanup write followed");
++
++			assert.equal(warnings.length, 1, `exactly one warning: ${JSON.stringify(warnings)}`);
++			const [warning] = warnings as [string];
++			// The token, the marker bytes and the arbitrary error text are all absent.
++			assert.ok(!warning.includes(token), "the warning reproduced the attempt's token");
++			assert.ok(!warning.includes("pi-native-present"), "the warning reproduced marker bytes");
++			assert.ok(!warning.includes("channel closed"), "the warning formatted the thrown error's message");
++			// And it claims neither outcome for the framing, which is the only honest answer after a write that
++			// threw having admitted an unknown amount - including the fully admitted case here.
++			assert.ok(/unknown/.test(warning), `the warning does not report uncertainty: ${warning}`);
++			assert.ok(!/stayed open|definitely closed/.test(warning), `the warning claims a framing state: ${warning}`);
++		});
++	}
++
++	it("keeps a no-complete-frame refusal a refusal even when its one cleanup write fails mid-admission", async () => {
++		const token = mintNativePresentToken();
++		const cleanup = encodeNativePresentFailedAttemptCleanup(token);
++		const { terminal, tui } = mount(renderers[0]![1]);
++		const streamMark = terminal.admitted.length;
++		// A render that neither throws nor mints a receipt, and a cleanup channel that takes 5 bytes and then
++		// refuses. Partial admission here too: a refusal must not become a throw or a success either way.
++		const patched = tui as unknown as { renderNow(force?: boolean): void };
++		const real = patched.renderNow.bind(patched);
++		patched.renderNow = () => {};
++		terminal.fail = (data) =>
++			data === cleanup ? { admit: 5, throws: new Error("cleanup refused") } : undefined;
++		let outcome: unknown;
++		let stream = "";
++		let attempts: string[] = [];
++		const warnings = await collectWarnings(() => {
++			outcome = tui.presentNow({
++				requestId: "refusal-with-failing-cleanup",
++				coldTerminal: false,
++				ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++			});
++			patched.renderNow = real;
++			terminal.fail = undefined;
++			attempts = terminal.attempts.slice();
++			stream = terminal.admitted.slice(streamMark).join("");
++			tui.stop();
++		});
++		// A failed cleanup does not turn a refusal into a throw or into a success.
++		assert.deepEqual(outcome, { presented: false, reason: "no-complete-frame-support" });
++		assert.equal(attempts.filter((data) => data === cleanup).length, 1);
++		// BEGIN was admitted whole here, and the cleanup's first five bytes followed it and nothing more.
++		assert.equal(stream, `${encodeNativePresentBegin(token)}${cleanup.slice(0, 5)}`);
++		assert.equal(warnings.length, 1, `exactly one warning: ${JSON.stringify(warnings)}`);
++	});
++});
++
++describe("what survives a failed ordered attempt", () => {
++	it("clears pending presentation state on every failing exit", () => {
++		const token = mintNativePresentToken();
++		const begin = encodeNativePresentBegin(token);
++		const { terminal, tui } = mount(renderers[0]![1]);
++		const inspect = tui as unknown as { pendingPresentation: unknown };
++		terminal.fail = (data) => (data === begin ? 0 : undefined);
++		assert.throws(() =>
++			tui.presentNow({
++				requestId: "pending-cleared",
++				coldTerminal: true,
++				ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++			}),
++		);
++		assert.equal(inspect.pendingPresentation, undefined, "a failed BEGIN left pending presentation state behind");
++		terminal.fail = undefined;
++		terminal.reassertThrows = true;
++		assert.throws(() =>
++			tui.presentNow({
++				requestId: "pending-cleared-reassert",
++				coldTerminal: true,
++				ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++			}),
++		);
++		assert.equal(inspect.pendingPresentation, undefined, "a failed reassertion left pending presentation state behind");
++		terminal.reassertThrows = false;
++		tui.stop();
++	});
++
++	it("presents successfully on a later independent request with a new token", () => {
++		const first = mintNativePresentToken();
++		const second = mintNativePresentToken();
++		const begin = encodeNativePresentBegin(first);
++		const { terminal, tui } = mount(renderers[0]![1]);
++		terminal.fail = (data) => (data === begin ? 11 : undefined);
++		assert.throws(() =>
++			tui.presentNow({
++				requestId: "retired-token",
++				coldTerminal: true,
++				ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token: first },
++			}),
++		);
++		terminal.fail = undefined;
++		const mark = terminal.admitted.length;
++		// A new attempt, a new token. Nothing about it reuses or revalidates the retired one.
++		const outcome = tui.presentNow({
++			requestId: "fresh-token",
++			coldTerminal: true,
++			ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token: second },
++		});
++		const fresh = terminal.admitted.slice(mark).join("");
++		tui.stop();
++		assert.ok(outcome.presented, "a fresh-token attempt on a healthy channel must succeed");
++		if (!outcome.presented) throw new Error("unreachable");
++		const seen = observe(second, fresh);
++		assert.deepEqual(seen.framing, ["begin", "end"]);
++		assert.deepEqual(seen.endFrameIds, [outcome.receipt.frameId]);
++		// The retired token's own decoder sees no frame of its own in the fresh interval.
++		assert.deepEqual(observe(first, fresh).framing, []);
++		assert.ok(!fresh.includes(first), "the fresh interval carries the retired token");
++	});
++
++	it("writes no marker or cleanup byte for an unordered request or a refused ordering", () => {
++		const { terminal, tui } = mount(renderers[0]![1]);
++		const mark = terminal.attempts.length;
++		const plain = tui.presentNow({ requestId: "plain", coldTerminal: true });
++		const refusedVersion = tui.presentNow({
++			requestId: "refused-version",
++			coldTerminal: true,
++			ordering: { version: 99, token: mintNativePresentToken() },
++		});
++		const refusedToken = tui.presentNow({
++			requestId: "refused-token",
++			coldTerminal: true,
++			ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token: "not-a-token" },
++		});
++		const written = terminal.attempts.slice(mark).join("");
++		tui.stop();
++		assert.ok(plain.presented, "an unordered presentation still presents");
++		assert.deepEqual(refusedVersion, { presented: false, reason: "unsupported-ordering" });
++		assert.deepEqual(refusedToken, { presented: false, reason: "unsupported-ordering" });
++		// Default output is unchanged: no marker, and no cleanup for something that never started.
++		assert.ok(!written.includes("pi-native-present"), "an unordered or refused request wrote framing bytes");
++	});
++});
++
++describe("the cleanup bytes themselves", () => {
++	it("are the string terminator followed by this token's exact ABORT marker, and nothing else", () => {
++		const token = mintNativePresentToken();
++		assert.equal(encodeNativePresentFailedAttemptCleanup(token), `\x1b\\${encodeNativePresentAbort(token)}`);
++		assert.equal(encodeNativePresentFailedAttemptCleanup(token).length, 2 + encodeNativePresentAbort(token).length);
++		// Bounded: the terminator plus one marker, both inside the decoder's candidate bound.
++		assert.ok(encodeNativePresentAbort(token).length <= NATIVE_PRESENT_MARKER_MAX_BYTES);
++	});
++
++	it("terminate an unterminated candidate rather than leaving it to breach the decoder's bound", () => {
++		// The reason the terminator leads. An END body whose own terminator never arrived keeps absorbing bytes
++		// until it finds one, so whatever follows is read as part of that candidate.
++		const token = mintNativePresentToken();
++		const frameId = randomUUID();
++		const end = encodeNativePresentEnd(token, frameId);
++		const truncated = end.slice(0, end.length - 2);
++		const prefix = `${encodeNativePresentBegin(token)}frame${truncated}`;
++		const withCleanup = observe(token, `${prefix}${encodeNativePresentFailedAttemptCleanup(token)}`);
++		// With the leading terminator the truncated END is completed and then the ABORT is read on its own. That
++		// is exactly why an observed END is not by itself a successful presentation: cleanup can finish one.
++		assert.deepEqual(withCleanup.framing, ["begin", "end", "refused"], JSON.stringify(withCleanup.framing));
++		assert.deepEqual(withCleanup.endFrameIds, [frameId]);
++
++		const bareAbort = observe(token, `${prefix}${encodeNativePresentAbort(token)}`);
++		// Without it, the truncated END plus the whole ABORT is a 171-byte candidate that breaches the 128-byte
++		// bound, so it is refused as overlong and the ABORT is only recognized on the rescan behind it. Recorded
++		// as what the decoder really does, not as absorption: either way no frame was presented.
++		assert.deepEqual(bareAbort.framing, ["begin", "refused", "abort"], JSON.stringify(bareAbort.framing));
++		assert.deepEqual(bareAbort.endFrameIds, [], "a bare ABORT after a truncated END must not yield an END");
++		assert.ok(truncated.length + encodeNativePresentAbort(token).length > NATIVE_PRESENT_MARKER_MAX_BYTES);
++	});
++});

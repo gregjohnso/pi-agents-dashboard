@@ -4,10 +4,12 @@ Read this before you write a Pi source patch or consume a built artifact. `vendo
 maintenance procedure; this file is the contract.
 
 **Seams A, B, C, D, E and F and the recognized part of G are implemented and composed but NOT qualified.** The
-series carries five ordered patches, so today's artifacts are **patched** upstream Pi 0.84.3 that expose the
+series carries six ordered patches, so today's artifacts are **patched** upstream Pi 0.84.3 that expose the
 native submission barrier, labelled ingress with return authorization and the terminal profile, cold
-presentation with readiness, canonical admission on exact names, and the ordered input drain with the
-recognized external-editor child handoff — and nothing else. The build is also a **hybrid** - pinned source plus
+presentation with readiness, canonical admission on exact names, the ordered input drain with the recognized
+external-editor child handoff, and — from `0006` — a published input target for labelled ingress, the
+`dcs-pi-native-present-v1` ordered-presentation framing with its bounded decoder, and the explicit opt-in
+bootstrap protocol 2 — and nothing else. The build is also a **hybrid** - pinned source plus
 one pinned release-generated data input - which section 6 describes in full.
 
 Section 8 is the seam A contract: the public API, its managed activation, the envelope, the fence and the
@@ -18,9 +20,13 @@ the composition: which document owns which seam, what the serialized series is, 
 itself does not deliver. What is still missing is qualification work, not a policy: seam G's arbitrary-child
 terminal parity (Gate 5) and whole-product qualification. Seam D's canonical admission arrived with `0004` and
 is contracted in `INTERFACE-seam-d-canonical.md`; it is implemented and tested against a built cohort, not
-frozen and not qualified. That is why these artifacts are not cleared for dependency activation.
+frozen and not qualified. `0006` adds the two consumer capabilities the five-patch cohort lacked — an early
+public ingress target and a physical presentation boundary — and is contracted in
+`INTERFACE-consumer-capabilities.md`; it is likewise implemented and tested against a built cohort, and it
+adds no host, no client, no acknowledgement and no Task 11 change. That is why these artifacts are not cleared
+for dependency activation.
 
-The seam contracts live in five documents, and none of them supersedes another:
+The seam contracts live in six documents, and none of them supersedes another:
 
 | Seam | Contract document | Ordered patch |
 | --- | --- | --- |
@@ -29,6 +35,7 @@ The seam contracts live in five documents, and none of them supersedes another:
 | E — cold presentation and readiness | [`INTERFACE-seam-e-presentation.md`](INTERFACE-seam-e-presentation.md) | `0003-native-presentation-readiness.patch` |
 | D — canonical admission on exact names | [`INTERFACE-seam-d-canonical.md`](INTERFACE-seam-d-canonical.md) | `0004-native-canonical-admission.patch` |
 | G — ordered input drain and the recognized child-terminal handoff, Gate 5 still open | [`INTERFACE-seam-g-child-handoff.md`](INTERFACE-seam-g-child-handoff.md) | `0005-native-child-handoff.patch` |
+| Consumer capabilities — the published input target, ordered-presentation framing, bootstrap protocol 2 | [`INTERFACE-consumer-capabilities.md`](INTERFACE-consumer-capabilities.md) | `0006-native-consumer-capabilities.patch` |
 
 ## 1. The pin
 
@@ -419,7 +426,7 @@ contract and is unchanged.
 
 ## 9. The composed series
 
-The five patches were written against the same pinned tree by five separate lanes, and they do **not**
+The first five patches were written against the same pinned tree by five separate lanes, and they do **not**
 commute: `packages/tui/src/{terminal,tui,index}.ts` are changed by 0002, 0003 and 0005,
 `packages/coding-agent/src/{index.ts,core/extensions/{types,loader}.ts,modes/interactive/interactive-mode.ts}`
 by 0001, 0003, 0004 and 0005, `packages/tui/src/{native-attachment,stdin-buffer}.ts` by both 0002 and 0005,
@@ -433,6 +440,15 @@ byte**: its `index.ts` and `interactive-mode.ts` hunks touch neither the export 
 refusal and naming regions 0004 rewrites, so it applies at position 5 with no fuzz and needed no
 re-serialization. Its contract is `INTERFACE-seam-g-child-handoff.md`.
 
+0006 was authored **at** position 6, against the tree positions 1-5 produce, and touches
+`packages/tui/src/{native-attachment,terminal,tui,index,native-presentation}.ts`, the new
+`packages/tui/src/native-present-markers.ts`, and
+`packages/coding-agent/src/{index.ts,core/native-bootstrap.ts,core/native-presentation.ts}` — every one of
+them a file an earlier patch already rewrote. It therefore applies at this position and nowhere else, and it
+carries its own source tests plus one line of an 0003 test that pinned the whole
+`nativeBootstrapStatus()` object, which gained a `protocol` field. Its contract is
+`INTERFACE-consumer-capabilities.md`.
+
 | Position | Patch | sha256 | Prepared tree after it |
 | --- | --- | --- | --- |
 | 1 | `0001-seam-a-native-submission-barrier.patch` | `c2d0a7c73bae0359357f012d95954dd9bcb645af7ca13d805623192c7d9542a7` (unchanged from the seam A lane) | `4a175953509e7a38bfbaefd0aa55f01b6168a980` |
@@ -440,6 +456,7 @@ re-serialization. Its contract is `INTERFACE-seam-g-child-handoff.md`.
 | 3 | `0003-native-presentation-readiness.patch` | `cf7f5ccca6358612f17bb65583f17934fb795b9935c921efe0fbaba1737bdfb9` (serialized; the lane's own diff was `8a483bf73c9b6d6d44cea44eae2289386946e545f1b6fa2b8bd6a5fd88542868`) | `9c40d805754c6cbc5dd161ec4e1c6880b1bc1ef4` |
 | 4 | `0004-native-canonical-admission.patch` | `1f5e78f4ebdeafcc8a161d3b0c02613256902981a12adf540ff2509329bf89d5` (authored at this position; its first form was `66cdeaacf78c3e18e8f7512abf928d7a509691ea776f368d417a60ae0e446dc0`, and the form before the one-use reservation and string-message corrections was `425ac07a02a6d10261f01ad9b8048ee5719ab745f1af6e7ffb2a08e21fc6b9d1`) | `69762c6631d6395b989735cef63f6c97a9511bf9` |
 | 5 | `0005-native-child-handoff.patch` | `18138c0612bf244e3cddb0d9f759b875c6786f1836a84bd082be72071b44bcaa` (taken after 0003 and carried unchanged at this position) | `daa4eb307949768e750c0b5c6c103ef2ccdb3430` |
+| 6 | `0006-native-consumer-capabilities.patch` | `37ddaec09df091fdf30ab3f8c10c32cfdf9820730f714323c6356b80907f548b` (authored at this position, against the tree positions 1-5 produce. Its qualified form is `63f186b735e440751777c70bfd564a0c5df8244ad1ad3bc6a1abef1ad60ea510`, which cohort `3757199` was built from; the current digest differs from it by a test hunk only, verified block by block. Earlier forms: `4a2647cd…` before the cold-reassertion error path was closed, then `db4d51b8…` before the BEGIN and END writes were brought inside that region) | `746091b78ce7b505f0170c2cb8866fe786cbb25c` (test overlay; the qualified tree is `029408d6f4f4e397b621438a3f80b3fb034f99ab`) |
 
 Position 4's tree is the one the reviewed seam D lane prepared (build job `3751264`), because positions 1-4
 are the same bytes in the same order there. Position 5's tree is this composition's own: 0005 applied to that
@@ -494,6 +511,64 @@ not claimed: it is one build, recorded, not re-derived.
 composition: seam D's admission and seam G's recognized handoff in one owner process, from one installed
 coding-agent module. It fails against either single-seam cohort.
 
+### 9.2 The one qualified cohort of the six-patch series
+
+`0006` is new source, so it warranted exactly one new qualifying cohort. `0006` was then **corrected** for an
+ordered-interval error-path defect, which is new source again and warranted one more. The record below is that
+corrected cohort; the superseded one is kept beneath it, because it is what the first review read. The
+five-patch record in 9.0 is kept as it was: that cohort is not rebuilt, not modified and not superseded as a
+record of what it proved. `series` sha256 `56f3234fa623e581a7e3b964dd79145bf5e5174c39fc13e8389bde2c00b24a57`.
+
+| Field | Value |
+| --- | --- |
+| Build | Slurm job `3757199`, `l40-reserved`, Node `v22.23.2` |
+| Upstream commit | `bfb004d4418ff05c6f909eaaab856cbe75c1fde0`, tree `562b495c89525fbefb00795d77f34586b69e7068` |
+| Prepared tree | `029408d6f4f4e397b621438a3f80b3fb034f99ab` |
+| Artifact label | `patched: 6 ordered pi-agents source patch(es) applied to the pinned commit.` |
+| Bundled CLI | `fd123694ecdb5c728c71b258ab2210214acc61624c218a3fa0ecad2ed5da2f06` (`dist/bundle/cli.js`, rebuilt from the prepared source) |
+
+Superseded, and kept as records rather than promoted: job `3756759`, prepared tree
+`47c732932946858e0f43a4826f921c59d1f05e72`, bundled CLI
+`192a2262b85f150e23e5fc64a84a6b3384c167c57ac9eae2330472eea471f310` — its `presentNow` made **no** cleanup write
+when the BEGIN or END write itself threw, so it is the RED target for that regression; and job `3756157`,
+prepared tree `242c89af869cb8c0630d1ef0a570b27dfa9b8496`, bundled CLI
+`f82d7db25f123f9ccc81aa6f776cb5e4464b973ca14dee91cc33eb471280c1bd`, whose `presentNow` could additionally leave
+an interval open when the cold reassertion threw.
+
+Packed cohort, by tarball sha256. The five packages `0006` does not touch carry the same digests as the
+five-patch cohort of 9.0; `pi-tui` and `pi-coding-agent` are the two that changed:
+
+| Package | sha256 |
+| --- | --- |
+| `@earendil-works/pi-telemetry` | `8d5692e339d04a42ca32ca883b87e85ac8f96308e2317b164492c00cd23f346c` |
+| `@earendil-works/pi-ai` | `95cfdc61c262a84ce7d5e2cdf142c59a90516cd31e25b4ea4c94d3c482b75f31` |
+| `@earendil-works/pi-agent-core` | `134b4a6ef03d4632d0454a41ab1f2b4e18dff2196ce1b3316ab5e98ef9852f35` |
+| `@earendil-works/pi-protocol` | `eea8f3235b87924fb368a2361b772b65bbd992e322fb05d554311c98d5ccdafb` |
+| `@earendil-works/pi-client` | `260dcac827d8ede81cb21a99020053fa76b073b5e9be2f12c05ba548f976d46b` |
+| `@earendil-works/pi-tui` | `e0c13bcbbc8bc1ad211f6c49752a73e0c8e27df494f0b89fbb2bcf5cc807f3b7` |
+| `@earendil-works/pi-coding-agent` | `4a62191911eaa5faf11c7b7feb55025ce94f94dad041179de4989c70fb64dc16` |
+
+A consumer selects this cohort by its generated manifest, never by a default path. Byte reproducibility is not
+claimed: it is one build, recorded, not re-derived.
+
+**Test-only overlay after this build.** `0006`'s embedded `packages/tui/test/native-marker-failure.test.ts` was
+later corrected: its cleanup-write double threw before returning an accepted length, so three cases that claimed
+zero, partial and full cleanup admission all admitted zero. The patch digest therefore moved to
+`37ddaec09df091fdf30ab3f8c10c32cfdf9820730f714323c6356b80907f548b` and the prepared tree to
+`746091b78ce7b505f0170c2cb8866fe786cbb25c`, and **this table is not restated for them**: job `3757199` was built
+from patch `63f186b7…` and tree `029408d6…`, and its manifest, package and CLI digests stay exactly as recorded
+above. Every production hunk is byte-identical across that overlay, block by block, so the artifact was reused
+rather than rebuilt; the per-block proof and the overlay's own source run are in
+`native-consumer-seams/cleanup-test-correction/` in the orchestration workspace.
+
+`test/native-consumer-capabilities.test.mjs` is the suite that exists only because of `0006`. Against the
+five-patch cohort of 9.0 it fails 15 of its 18 original cases, including the real blocked-`session_start`
+consumer and the pseudo-terminal marker case; the three that pass in both are the cohort identity case and the
+two that require the default output to carry **no** marker byte. It now carries 30 cases: the added ones cover
+the ordered interval's error paths — including a marker write, and separately the cleanup write, that throws
+after admitting zero, some or all of its bytes — and feed the decoder the actual arriving reads from a
+pseudo-terminal. Three of them fail against the superseded `3756759` cohort, and three others against `3756157`.
+
 ### 9.1 What the composition itself does not deliver
 
 - **Seam D is contracted, not frozen.** 0004 delivers canonical admission on exact names with the
@@ -505,6 +580,17 @@ coding-agent module. It fails against either single-seam cohort.
   unannounced and same-process-group children, a child's current screen, shared input and actual Kitty
   graphics are untouched, and the retained-byte evidence is a fake in-process child route rather than a
   cross-process host transition. Gate 5 remains mandatory and unproved.
+- **The consumer capabilities are a boundary, not a delivery path.** `0006` publishes an input target and
+  brackets an ordered presentation on the terminal's byte stream. It adds no host, no client, no fresh-route
+  streaming, no queue accounting and no acknowledgement, it changes nothing in Task 11, and a marker is never
+  evidence that a client decoded, flushed or displayed anything. `INTERFACE-consumer-capabilities.md` states
+  the full limit list, including the recovery-liveness cost the preserved Task 11 contract keeps.
+- **An observed END is not a successful presentation.** `Terminal.write` reports no accepted-byte count when it
+  throws, so a failed ordered attempt may already have admitted the whole frame and even END, and the one
+  bounded `ESC \` + ABORT cleanup write can itself complete a partial marker. A consumer may treat an attempt as
+  usable only with **both** the successful presentation result and the matching observed END; anything else
+  retires that token. If the cleanup write itself fails, what it admitted and whether the framing closed are
+  unknown, are never retried, and are reported as uncertainty rather than as either outcome.
 - **No owner bootstrap and no arbitrary-child terminal parity (Gate 5).** Managed behaviour stays inert
   until an owner process registers a host; with nothing registered every seam is the pinned baseline.
 - **No dependency activation.** The root `package.json` still installs the released Pi; these artifacts are

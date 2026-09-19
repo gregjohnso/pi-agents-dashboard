@@ -4,7 +4,7 @@
 # in this directory that no line names is drift and fails preparation. Names must look like
 # `NNNN-short-description.patch`.
 #
-# These five patches do not commute: 0002, 0003 and 0005 all change `packages/tui/src/{terminal,tui,index}.ts`,
+# These six patches do not commute: 0002, 0003 and 0005 all change `packages/tui/src/{terminal,tui,index}.ts`,
 # 0001, 0003, 0004 and 0005 all change `packages/coding-agent/src/{index.ts,core/extensions/*,modes/interactive/
 # interactive-mode.ts}`, 0004 also changes seam A's own `core/native-submission.ts`, and 0002 and 0005 both
 # change `packages/tui/src/{native-attachment,stdin-buffer}.ts`. 0002, 0003 and 0004 are the serialized forms
@@ -16,8 +16,16 @@
 # regions 0004 rewrites, so `git apply --check --index --whitespace=error` accepts it at this position with no
 # fuzz. It is therefore carried byte for byte rather than regenerated. 0005 depends on 0002 and 0003 and not on
 # 0004; 0004 depends on 0001 and does not depend on 0005.
+#
+# 0006 is the native consumer-capability patch: the published input target in `packages/tui/src/{native-attachment,
+# terminal,index}.ts`, the `dcs-pi-native-present-v1` codec in the new `packages/tui/src/native-present-markers.ts`
+# with the ordered bracket in `{native-presentation,tui}.ts`, and bootstrap protocol 2 in
+# `packages/coding-agent/src/core/{native-bootstrap,native-presentation}.ts`. It is generated against the tree
+# 0001-0005 leave behind and applies only at this position; it is last because every file it touches is a file
+# an earlier patch already rewrote.
 0001-seam-a-native-submission-barrier.patch
 0002-native-ingress-return-profile.patch
 0003-native-presentation-readiness.patch
 0004-native-canonical-admission.patch
 0005-native-child-handoff.patch
+0006-native-consumer-capabilities.patch

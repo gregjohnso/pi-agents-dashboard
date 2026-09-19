@@ -425,9 +425,30 @@ async function readJournal(journalPath) {
   });
 }
 
+/**
+ * One owner-scoped key: the complete owner run, and one id that run scopes.
+ *
+ * Two things have to hold, and a `runId`-and-id join satisfies neither. **It has to be the same identity the
+ * rest of the module uses.** `sameOwnerRun` compares all six `OWNER_FIELDS`, and live admission seeds its
+ * spent-id sets through that same comparison, so two owner runs that share a run id are distinct everywhere
+ * a decision is made — and a key naming only the run id conflates them, refusing the second run's legal
+ * record after admission accepted it. **And it has to be unambiguous.** Nothing forbids the separator:
+ * `identifier` and `boundedString` accept any bounded non-empty string, and this module's own `hostId` is
+ * `${machineId}:${hostname}`, so a joined key carries one by construction. Run id `a` with id `b:c` and run
+ * id `a:b` with id `c` join to one string.
+ *
+ * The fixed seven-element tuple is serialized as JSON, which is injective over these validated scalars and
+ * keeps the number `4242` distinct from the string `"4242"`. Nothing here is persisted or compared across
+ * processes: these keys exist only inside one fold, so this is a representation, not a format.
+ * @param {OwnerRunIdentity} owner @param {string} id @returns {string}
+ */
+function ownerScopedKey(owner, id) {
+  return JSON.stringify([...OWNER_FIELDS.map((field) => /** @type {any} */ (owner)[field]), id]);
+}
+
 /** @param {any} record */
 function claimKeyOf(record) {
-  return `${record.owner.runId}:${record.reservationId}`;
+  return ownerScopedKey(record.owner, record.reservationId);
 }
 
 /**
@@ -483,9 +504,9 @@ function foldClaims(records) {
    *
    * A held claim is not the question: a terminal record spends its reservation rather than returning the id
    * to the pool, so a claim the fold has already removed is not permission to prepare that id again. The
-   * scoping matches the rest of the module — `spentOperationIds` is seeded only from the same run's records
-   * and a claim is keyed by `runId:reservationId` — so two independent owner runs sharing one session
-   * directory never collide over a string.
+   * scoping is `ownerScopedKey`, the same complete owner identity `sameOwnerRun` compares and live admission
+   * seeds from — so two owner runs sharing one session directory never collide, whether they share a run id
+   * or merely a separator.
    */
   const preparedClaimKeys = new Set();
   const preparedOperationKeys = new Set();
@@ -514,7 +535,7 @@ function foldClaims(records) {
       if (preparedClaimKeys.has(key)) {
         throw inconsistent(`prepares reservation ${record.reservationId} a second time for owner run ${record.owner.runId}; that id is one use for the run's lifetime and its terminal record spent it rather than freeing it`);
       }
-      const operationKey = `${record.owner.runId}:${record.operationId}`;
+      const operationKey = ownerScopedKey(record.owner, record.operationId);
       if (preparedOperationKeys.has(operationKey)) {
         throw inconsistent(`admits operation ${record.operationId} a second time for owner run ${record.owner.runId}; an operation id is admitted once for that run's lifetime`);
       }

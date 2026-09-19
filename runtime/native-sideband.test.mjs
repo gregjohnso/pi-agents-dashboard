@@ -1,8 +1,10 @@
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { afterEach, expect, it } from "vitest";
 
@@ -934,25 +936,40 @@ it.each([
   }
 });
 
-// One handoff per helper. Node queues a handle send behind its own acknowledgement, so a second handoff can
-// only be written after the parent has adopted the first - and the parent closes the channel on adoption, so
-// there is nowhere for it to land. The fixture reports which happened in its exit code, and a non-zero exit
-// after a handoff fails the attempt rather than yielding a listener from a helper that misbehaved.
-it("never adopts a second handoff, and fails the attempt of a helper that tries", async () => {
+// One handoff per helper, established by observing the second rather than by inferring it from an exit code.
+// The parent keeps its IPC channel open until the helper's own exit and the channel's drain, so a second
+// message is delivered and refused as a protocol violation. Both fixtures below exit 0 on every ordinary path,
+// so the refusal cannot come from an unrelated non-zero exit, and both listeners the parent was handed have to
+// be disposed rather than left accepting.
+it("refuses a second handoff as a protocol violation and disposes both listeners, from a helper that exits 0", async () => {
   const root = await socketRoot();
   const socketPath = join(root, "private", "o");
 
   const { listener, error } = await attemptWithFixture(socketPath, "duplicate-handoff.mjs");
 
   expect(listener).toBe(undefined);
-  expect(error).toMatchObject({ code: "SIDEBAND_BINDER_INCOMPLETE" });
-  // The helper got its second handoff onto the wire - code 10 - and this parent still never adopted it: it
-  // stopped reading the moment it adopted the first. What ends the attempt is the non-zero exit that admission
-  // of a second handoff produced, not a message the parent had to inspect.
-  expect(`${/** @type {Error} */ (error).message}`).toMatch(/code (9|10)/u);
+  expect(error).toMatchObject({ code: "SIDEBAND_BINDER_PROTOCOL" });
+  expect(`${/** @type {Error} */ (error).message}`).toMatch(/another message after its handoff/u);
+  // Neither the provisionally adopted listener nor the duplicate is still accepting: both were disposed.
   expect(await accepts(socketPath)).toBe(false);
   expect(await accepts(`${socketPath}-second`)).toBe(false);
+  // Both entries are still on disk. Refusing does not make either of them this attempt's to remove.
+  expect(existsSync(socketPath)).toBe(true);
+  expect(existsSync(`${socketPath}-second`)).toBe(true);
   expect(`${/** @type {any} */ (error).sidebandCleanup}`).toMatch(/no directory entry was removed/u);
+});
+
+it("refuses malformed late traffic after a valid handoff, and disposes the listener it had adopted", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+
+  const { listener, error } = await attemptWithFixture(socketPath, "handoff-then-malformed.mjs");
+
+  expect(listener).toBe(undefined);
+  expect(error).toMatchObject({ code: "SIDEBAND_BINDER_PROTOCOL" });
+  expect(`${/** @type {Error} */ (error).message}`).toMatch(/another message after its handoff/u);
+  expect(await accepts(socketPath)).toBe(false);
+  expect(existsSync(socketPath)).toBe(true);
 });
 
 it("reports a spawn failure without waiting for an exit that cannot happen", async () => {
@@ -1165,6 +1182,163 @@ it("leaves the endpoint in place when the parent goes away after the bind", asyn
 
   expect(exitCode).toBe(BINDER_EXIT.parentGone);
   expect((await lstat(socketPath)).isSocket()).toBe(true);
+});
+
+
+/**
+ * Start a real, disposable parent process that forks the production binder and holds its handoff.
+ *
+ * Everything here is a real process: the binder is the shipped implementation, the parent is a separate
+ * killable process, and the IPC channel between them is a real one. The disposable parent blocks its own event
+ * loop on stdin, which is what stalls the handoff acknowledgement, so both scenarios below are deterministic
+ * without a sleep and without a poll. Every process this starts is owned and ended by this helper.
+ *
+ * @param {"disconnect"|"hold"} mode @param {string} socketPath
+ */
+async function disposableParent(mode, socketPath) {
+  const child = spawn(process.execPath, [fileURLToPath(fixture("disposable-parent.mjs")), mode, socketPath], {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: { PATH: "/usr/bin:/bin" },
+  });
+  let text = "";
+  /** @type {{ pattern: RegExp, resolve: (seen: string) => void }[]} */
+  let waiters = [];
+  const serve = () => {
+    waiters = waiters.filter((waiter) => {
+      if (!waiter.pattern.test(text)) return true;
+      waiter.resolve(text);
+      return false;
+    });
+  };
+  for (const stream of [child.stdout, child.stderr]) {
+    stream.on("data", (chunk) => {
+      text += String(chunk);
+      serve();
+    });
+  }
+  const exited = new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })));
+  // EOF on the shared stderr pipe. The binder inherited this write end, so it closes only once BOTH the
+  // disposable parent and the binder are gone. That is how helper termination is established in the case where
+  // the parent is killed outright and can report nothing itself.
+  const bothGone = new Promise((resolve) => child.stderr.once("close", () => resolve(undefined)));
+
+  /** @param {RegExp} pattern */
+  const waitFor = (pattern) =>
+    new Promise((resolve) => {
+      if (pattern.test(text)) resolve(text);
+      else waiters.push({ pattern, resolve });
+    });
+
+  cleanup.push(async () => {
+    // Owned: whatever the case did or failed to do, neither process outlives it.
+    for (const pid of [child.pid ?? 0, Number(/binder-pid (\d+)/u.exec(text)?.[1] ?? 0)]) {
+      if (pid === 0) continue;
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // Already gone, which is the expected case.
+      }
+    }
+    await exited;
+  });
+
+  // These two markers together mean: the disposable parent exists, the production binder is its child, and that
+  // binder has bound the endpoint. Its handoff cannot complete, because the acknowledgement needs the parent's
+  // event loop and that loop is blocked.
+  await waitFor(/binder-pid \d+/u);
+  await waitFor(/native-sideband-binder: bound .* inode \d+/u);
+  const parentPid = Number(/disposable-parent-pid (\d+)/u.exec(text)?.[1]);
+  const binderPid = Number(/binder-pid (\d+)/u.exec(text)?.[1]);
+  expect(parentPid).toBe(child.pid);
+  expect(binderPid).toBeGreaterThan(0);
+  expect(binderPid).not.toBe(process.pid);
+
+  return {
+    parentPid,
+    binderPid,
+    waitFor,
+    exited,
+    bothGone,
+    text: () => text,
+    /** Release the barrier. This is the only way this parent ever runs code again. */
+    release: () => child.stdin.end("g"),
+    /**
+     * Kill only the process this helper started.
+     *
+     * The pid is the one `spawn` returned and the process identified itself with that same pid on its own
+     * stdout, checked here again, so this cannot reach a manager or any other worker.
+     */
+    sigkillTheParent: () => {
+      expect(parentPid).toBe(child.pid);
+      process.kill(parentPid, "SIGKILL");
+    },
+  };
+}
+
+/** Is this pid gone? Asked once, after an event that already established termination - never in a loop. @param {number} pid */
+function gone(pid) {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return /** @type {any} */ (error).code === "ESRCH";
+  }
+}
+
+// Operator-visible failure: a parent that closes the channel while a handoff is in flight leaves behind a helper
+// that has bound an endpoint. A helper that tidied up by closing its server would unlink a path it can no longer
+// prove is its own; one that simply lingered would hold a listening socket nobody owns. Driven as real processes
+// against the shipped binder, because an in-process callback with a stubbed exit can show neither outcome.
+it("ends the real helper and keeps the endpoint when its real parent closes the channel mid-handoff", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "o");
+  const parent = await disposableParent("disconnect", socketPath);
+
+  parent.release();
+  await parent.waitFor(/binder-exit /u);
+  const outcome = /binder-exit (\d+) (\w+)/u.exec(parent.text());
+
+  // The real parent observed its real child's terminal outcome, which it is entitled to do as the parent.
+  expect(Number(outcome?.[1])).toBe(BINDER_EXIT.parentGone);
+  expect(outcome?.[2]).toBe("null");
+  expect(parent.text()).toMatch(/the parent went away after the bind; leaving the endpoint in place/u);
+  await expect(parent.exited).resolves.toMatchObject({ code: 0, signal: null });
+  await parent.bothGone;
+  expect(gone(parent.binderPid)).toBe(true);
+  expect(gone(parent.parentPid)).toBe(true);
+
+  // The entry is retained and nothing is listening on it: the descriptors went with the helper. A stale entry is
+  // the honest outcome, because nobody left alive can prove it is theirs to remove.
+  expect((await lstat(socketPath)).isSocket()).toBe(true);
+  expect(await accepts(socketPath)).toBe(false);
+});
+
+// The same question with no opportunity to run any code at all: the parent is killed outright while the handoff
+// is in flight. A foreign replacement is moved onto the path first, so this also establishes that abrupt parent
+// death does not take an unrelated live listener with it.
+it("ends the real helper on abrupt parent death, leaving a foreign replacement usable and untouched", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "o");
+  const parent = await disposableParent("hold", socketPath);
+  const other = await liveReplacement(root);
+
+  // Moved on after the bind, so it is the helper's own endpoint that is displaced: the post-bind replacement
+  // case again, now with a parent that dies rather than a handoff that fails.
+  const replaced = await other.replaceOnto(socketPath);
+  parent.sigkillTheParent();
+
+  await expect(parent.exited).resolves.toMatchObject({ code: null, signal: "SIGKILL" });
+  // EOF on the stderr both processes held: the helper is gone too, and it said why on the way out.
+  await parent.bothGone;
+  expect(parent.text()).toMatch(/the parent went away after the bind; leaving the endpoint in place/u);
+  expect(gone(parent.binderPid)).toBe(true);
+  expect(gone(parent.parentPid)).toBe(true);
+
+  // Unchanged and still answering: the dying helper removed nothing and closed nothing that was not its own.
+  const after = await lstat(socketPath);
+  expect(String(after.ino)).toBe(String(replaced.ino));
+  expect(after.mode & 0o777).toBe(replaced.mode & 0o777);
+  expect(await other.stillAnswers(socketPath)).toBe("alive\n");
 });
 
 // Operator-visible failure: cleanup that unlinks on any failure would delete the socket of the listener that

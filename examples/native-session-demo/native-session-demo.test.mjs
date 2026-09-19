@@ -397,10 +397,45 @@ describe("the owner bridge consumer", () => {
     expect(status.totals.droppedReceipts).toBeGreaterThan(400);
     // The status response and the final owner record are the same shape, so one bound covers both.
     expect(JSON.stringify(status).length).toBeLessThan(40_000);
-    // The log is append-only and is meant to carry one line per request: bounding its total would hide work
-    // that really happened. What has to hold is that no single line is unbounded.
-    expect(lines.length).toBeGreaterThanOrEqual(500);
+    // The bridge's own log emission is bounded for the life of this consumer, by entries and by UTF-8 bytes,
+    // and by each line's size. This is non-authoritative diagnostics, not Pi's transcript: 500 legitimate
+    // requests were all admitted, sent and answered above, and what is bounded is only what this consumer
+    // writes about them. Per-line truncation alone is not a bound on retention.
+    expect(lines.length).toBeLessThanOrEqual(status.counts.logBudgetEntries);
+    expect(Buffer.byteLength(lines.join("\n"), "utf8")).toBeLessThanOrEqual(status.counts.logBudgetBytes);
     expect(Math.max(...lines.map((line) => line.length))).toBeLessThan(200);
+    // What was not written is counted rather than hidden, and the two counters account for every attempt.
+    expect(status.counts.logEmitted).toBe(lines.length);
+    expect(status.counts.logDropped).toBeGreaterThan(400);
+    // Exactly one suppression notice, so the notice itself cannot become the unbounded output.
+    expect(lines.filter((line) => line.includes("lifetime log budget"))).toHaveLength(1);
+  });
+
+  // Operator-visible failure: a budget reset per generation is not a lifetime bound. A peer that reconnects,
+  // is superseded, gets refused and fills its in-flight window over and over drives the reconnect, capacity and
+  // refusal log paths rather than the request path, so bounding only the request line leaves the on-disk log
+  // growing with churn. Every bridge-consumer log path shares one lifetime budget.
+  it("keeps its lifetime log budget across reconnect, capacity and refusal churn", async () => {
+    const { consumer, lines } = consumerFor();
+
+    for (let generation = 0; generation < 40; generation += 1) {
+      const owner = fakeOwnerConnection();
+      consumer.adopt(owner.connection);
+      // Fill the in-flight window and then keep asking, so the capacity-refusal path runs repeatedly.
+      for (let index = 0; index < 12; index += 1) await consumer.request("stop", `churn-${generation}-${index}`);
+      // A second readiness phase is outside the producer's contract, so this generation is refused and closed.
+      owner.emit(READY);
+      owner.emit(READY);
+    }
+
+    const status = consumer.status();
+    expect(status.generations).toBe(40);
+    expect(lines.length).toBeLessThanOrEqual(status.counts.logBudgetEntries);
+    expect(Buffer.byteLength(lines.join("\n"), "utf8")).toBeLessThanOrEqual(status.counts.logBudgetBytes);
+    expect(status.counts.logEmitted).toBe(lines.length);
+    // Far more was attempted than written, across the reconnect, capacity and refusal paths alike.
+    expect(status.counts.logDropped).toBeGreaterThan(100);
+    expect(lines.filter((line) => line.includes("lifetime log budget"))).toHaveLength(1);
   });
 
   // An entry count alone is not a bound. A request id or an error string may be near the wire's own frame

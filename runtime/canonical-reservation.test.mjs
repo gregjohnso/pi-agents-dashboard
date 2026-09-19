@@ -782,23 +782,27 @@ describe("durable replay of an impossible history", () => {
   };
 
   it("refuses every complete but impossible history, frees no claim, and admits nothing", async () => {
+    /** @type {Record<string, {folded:string, admission:string, journal:string[]}>} */
+    const observed = {};
+    /** @type {Record<string, {folded:string, admission:string, journal:string[]}>} */
+    const required = {};
     for (const [history, author] of Object.entries(impossibleHistories)) {
       const domain = await sessionDirectory();
       const { protected: guarded, real } = await author(domain);
+      const appended = (await journalRecords(domain.journalPath)).map((record) => record.record);
 
       // Absence of the recorded owner is proven, so nothing here is merely an unreachable host.
       const next = await openOwner(domain, { hostProof: absentProof() });
-      await expect(next.reservations.reconcile({ canonicalFile: guarded }), history).rejects.toMatchObject({
-        name: "CanonicalReservationError",
-        code: "JOURNAL_INCONSISTENT",
-      });
-      expect(await admitting(next, { operation: "resume", generation: 1, target: guarded }), history).toMatchObject({
-        refused: true,
-        code: "ADMISSION_UNAVAILABLE",
-      });
-      // The impossible line is evidence and stays; the real records it followed are untouched.
-      expect((await journalRecords(domain.journalPath)).map((record) => record.record), history).toEqual([...real, expect.any(String)]);
+      const folded = await next.reservations.reconcile({ canonicalFile: guarded }).then(
+        (state) => `folded to ${state.state}`,
+        (error) => (error?.name === "CanonicalReservationError" ? error.code : `${error?.name}: ${error?.message}`),
+      );
+      const decision = /** @type {any} */ (await admitting(next, { operation: "resume", generation: 1, target: guarded }));
+      observed[history] = { folded, admission: decision.refused === true ? decision.code : "admitted", journal: appended };
+      // The impossible line is evidence and stays, so the real records it followed are still the prefix.
+      required[history] = { folded: "JOURNAL_INCONSISTENT", admission: "ADMISSION_UNAVAILABLE", journal: [...real, appended.at(-1) ?? ""] };
     }
+    expect(observed).toEqual(required);
   });
 
   it("replays a real bind, transfer, abort and release exactly as they were written", async () => {

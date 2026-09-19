@@ -230,7 +230,7 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
       owner.totals.receipted += 1;
       // A projection of the receipt contract's own fields. Keeping the frame verbatim would let whatever a
       // peer attached to it size every status response and the final owner record.
-      owner.recentReceipts.add({
+      owner.receipts.add({
         type: frame.type,
         requestId: boundedText(frame.requestId),
         request: frame.request,
@@ -260,8 +260,8 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
         // In-flight only: an entry lives here until its receipt arrives or its write fails. It is the one
         // structure a silent peer could grow, which is why admission is windowed rather than unlimited.
         awaiting: new Map(),
-        recentRequests: boundedRing(),
-        recentReceipts: boundedRing(),
+        requests: boundedRing(),
+        receipts: boundedRing(),
         // Lifetime counters. These are what stay truthful about how much legitimate work happened.
         totals: { requested: 0, sent: 0, refused: 0, receipted: 0, capacityRefusals: 0 },
         seen: /** @type {Record<string, number>} */ ({}),
@@ -341,7 +341,7 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
         record.reason = boundedText(/** @type {Error} */ (error).message);
         owner.totals.refused += 1;
       }
-      owner.recentRequests.add({
+      owner.requests.add({
         request: record.request,
         requestId: boundedText(record.requestId),
         generation: record.generation,
@@ -371,13 +371,13 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
         facts: owner?.facts === undefined ? {} : { ...owner.facts },
         reportedSeams: owner?.reportedSeams === undefined ? [] : [owner.reportedSeams],
         // Bounded recent detail plus lifetime totals. Neither grows with how much legitimate work an owner did.
-        recentReceipts: owner?.recentReceipts.values() ?? [],
-        recentRequests: owner?.recentRequests.values() ?? [],
+        receipts: owner?.receipts.values() ?? [],
+        requests: owner?.requests.values() ?? [],
         inFlightRequests: owner?.awaiting.size ?? 0,
         inFlightCapacity: BRIDGE_IN_FLIGHT_REQUESTS,
         totals: owner === undefined
           ? { requested: 0, sent: 0, refused: 0, receipted: 0, capacityRefusals: 0, droppedRequests: 0, droppedReceipts: 0 }
-          : { ...owner.totals, droppedRequests: owner.recentRequests.dropped(), droppedReceipts: owner.recentReceipts.dropped() },
+          : { ...owner.totals, droppedRequests: owner.requests.dropped(), droppedReceipts: owner.receipts.dropped() },
         refusal: owner?.refusal ?? null,
         counts: { ...counts, droppedEvents },
         diagnostics: [...events],

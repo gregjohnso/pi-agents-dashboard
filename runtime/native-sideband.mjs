@@ -584,10 +584,14 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
     // A spawn failure emits `error` and `close` and may never emit `exit`; `close` below is what completes it.
   });
   helper.once("exit", (/** @type {number|null} */ code, /** @type {string|null} */ signal) => {
+    // Recorded, but deliberately not treated as completion. See `close` below.
     exited = { code, signal };
-    noteCompletion();
   });
-  // `close` is the backstop for a child that never reached `exit`, so nothing here waits for an impossible event.
+  // `close` is what completes this attempt, not `exit`. A child's exit is observed through SIGCHLD,
+  // independently of the IPC channel, so settling on it races a handoff that has been written and acknowledged
+  // but not yet emitted on this side - and the attempt would report an incomplete helper for a listener it was
+  // about to receive. `close` fires once the channel and the helper's streams are closed, by which point every
+  // message it sent has been delivered. It is also the backstop for a spawn failure that never reaches `exit`.
   helper.once("close", () => noteCompletion());
   // No refusal is raised for `disconnect`. A channel closing is what every ending child does, and treating it
   // as a failure both pre-empted the accurate diagnosis and could discard a handoff already in flight. What
@@ -694,7 +698,7 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
     await abandon();
     if (error instanceof NativeSidebandError) {
       Object.defineProperty(error, "sidebandCleanup", {
-        value: "no directory entry was removed: this attempt did not complete an ownership proof, so whatever is at that path is left as found and is explicit uncertainty",
+        value: "no directory entry was removed: this attempt did not complete an ownership proof, so whatever is at that path is left exactly as it was found and is explicit uncertainty",
         enumerable: false,
       });
     }

@@ -779,6 +779,44 @@ describe("durable replay of an impossible history", () => {
       await appendRecord(domain, { record: "transferred", owner: host.owner, reservationId: move.reservationId, generation: 2, target: records[2].target, released: await claimIdentityOf(unrelated) });
       return { protected: source, real: ["prepared", "committed", "prepared"] };
     },
+
+    /**
+     * The two non-advancing transfers.
+     *
+     * `transfer` refuses a `nextGeneration` that does not advance past the claim it is releasing, because a
+     * binding that did not move is not a rebind. Without that condition on replay, a record naming the right
+     * bound file at a generation the binding never reached still frees that file, which is the one thing a
+     * transfer's release is allowed to do and only when it really moved.
+     */
+    async "a transfer at the same generation as the bound claim it releases"(domain) {
+      const bound = await realFile(join(domain.session, "same-generation-bound.jsonl"));
+      const moved = await realFile(join(domain.session, "same-generation-moved.jsonl"));
+      const host = await openOwner(domain);
+      await bind(host, bound, 1);
+      const move = await admitting(host, { generation: 1, target: moved });
+      expect(move).toMatchObject({ reservationId: expect.any(String) });
+      await host.reservations.close();
+      const records = await journalRecords(domain.journalPath);
+      expect(records[1]).toMatchObject({ record: "committed", generation: 1, binds: true });
+      // Right owner, right reservation, right target, and the released identity really is the bound claim.
+      // Only the generation is impossible: it is the one the binding already had.
+      await appendRecord(domain, { record: "transferred", owner: host.owner, reservationId: move.reservationId, generation: 1, target: records[2].target, released: records[1].target });
+      return { protected: bound, real: ["prepared", "committed", "prepared"] };
+    },
+
+    async "a transfer at a lower generation than the bound claim it releases"(domain) {
+      const bound = await realFile(join(domain.session, "regressing-bound.jsonl"));
+      const moved = await realFile(join(domain.session, "regressing-moved.jsonl"));
+      const host = await openOwner(domain, { generation: 3 });
+      await bind(host, bound, 3);
+      const move = await admitting(host, { generation: 3, target: moved });
+      expect(move).toMatchObject({ reservationId: expect.any(String) });
+      await host.reservations.close();
+      const records = await journalRecords(domain.journalPath);
+      expect(records[1]).toMatchObject({ record: "committed", generation: 3, binds: true });
+      await appendRecord(domain, { record: "transferred", owner: host.owner, reservationId: move.reservationId, generation: 2, target: records[2].target, released: records[1].target });
+      return { protected: bound, real: ["prepared", "committed", "prepared"] };
+    },
   };
 
   it("refuses every complete but impossible history, frees no claim, and admits nothing", async () => {
@@ -831,6 +869,29 @@ describe("durable replay of an impossible history", () => {
       expect(await next.reservations.reconcile({ canonicalFile: file }), file).toMatchObject({ state: "released" });
       expect(await admitting(next, { operation: "resume", generation: 1, target: file }), file).toMatchObject({ reservationId: expect.any(String) });
     }
+  });
+
+  it("replays a transfer that advances the generation by more than one", async () => {
+    const domain = await sessionDirectory();
+    const bound = await realFile(join(domain.session, "jump-bound.jsonl"));
+    const moved = await realFile(join(domain.session, "jump-moved.jsonl"));
+    const host = await openOwner(domain);
+    await bind(host, bound, 1);
+    const move = await admitting(host, { generation: 1, target: moved });
+    // Pi's binding supplier reports what it reports. A rebind advances the generation; it does not increment
+    // it, so the rule replay enforces has to be "advances past the bound claim" and not "is one more than it".
+    host.setGeneration(5);
+    await host.reservations.commitBinding({ reservationId: move.reservationId, nextGeneration: 5 });
+    await host.reservations.close();
+
+    const records = await journalRecords(domain.journalPath);
+    expect(records.map((record) => record.record)).toEqual(["prepared", "committed", "prepared", "transferred"]);
+    expect(records[3]).toMatchObject({ record: "transferred", generation: 5, released: { canonicalFile: await realpath(bound) } });
+
+    const next = await openOwner(domain);
+    expect(await next.reservations.reconcile({ canonicalFile: bound })).toMatchObject({ state: "released" });
+    expect(await next.reservations.reconcile({ canonicalFile: moved })).toMatchObject({ state: "live" });
+    expect(await admitting(next, { operation: "resume", generation: 1, target: bound })).toMatchObject({ reservationId: expect.any(String) });
   });
 });
 

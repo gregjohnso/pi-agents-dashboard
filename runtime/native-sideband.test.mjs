@@ -369,36 +369,43 @@ function helloLine() {
   return line({ protocol: NATIVE_SIDEBAND_PROTOCOL, type: "owner-hello", token: TOKEN });
 }
 
-// Operator-visible failure: a subscriber that throws on the first of several frames already admitted would
+// Operator-visible failure: a subscriber that throws on one of several frames already admitted would
 // otherwise keep being handed the frames behind it, after the connection has been recorded as failed. The
 // contract is that a recorded failure discards what was buffered; a listener that saw one more fact than the
 // host's own refusal admits has been told something the host does not believe.
 //
-// Each line is written and awaited separately, so this case makes no claim about how the stream is
-// segmented. What it constrains is the subscriber-throw path: the first frame handed over seals the link, so
-// nothing behind it is delivered whether it was queued or still in flight. That frames really are buffered
-// while nothing is subscribed, and that a seal really discards the buffer, are the two cases below — both
-// established without depending on a chunk boundary.
+// The subscriber throws on the **second** frame, which is what makes this case unable to pass for the wrong
+// reason. If the stream were segmented so that fewer frames were buffered when the subscription ran, the
+// remaining ones would be dispatched directly instead, and the recorded sequence would not be the first two:
+// the assertion fails loudly rather than quietly exercising direct delivery. The buffering itself and the
+// discard-on-failure are established by the two cases below, neither of which depends on a chunk boundary.
 it("stops delivering the moment a failure is recorded, mid drain of frames already admitted", async () => {
   const socketPath = await socketPathForThisTest();
-  const listener = await listenForOwnerSideband({ socketPath, token: TOKEN });
+  const listener = await listenForOwnerSideband({ socketPath, token: TOKEN, maxQueuedFrames: 3 });
   cleanup.push(() => listener.close());
   const arriving = listener.nextOwner();
   const raw = await rawOwner(socketPath);
 
-  await raw.write(helloLine());
+  await raw.write(
+    helloLine()
+      + line({ protocol: NATIVE_SIDEBAND_PROTOCOL, type: "owner-facts", facts: { index: 1 } })
+      + line({ protocol: NATIVE_SIDEBAND_PROTOCOL, type: "owner-facts", facts: { index: 2 } })
+      + line({ protocol: NATIVE_SIDEBAND_PROTOCOL, type: "owner-facts", facts: { index: 3 } }),
+  );
   const owner = await arriving;
-  await raw.write(line({ protocol: NATIVE_SIDEBAND_PROTOCOL, type: "owner-facts", facts: { mode: "tui" } }));
-  await raw.write(line({ protocol: NATIVE_SIDEBAND_PROTOCOL, type: "owner-facts", facts: { idle: true } }));
 
   /** @type {any[]} */
   const seen = [];
   owner.onFrame((/** @type {any} */ frame) => {
     seen.push(frame);
-    throw new Error("this subscriber cannot handle a frame");
+    if (seen.length === 2) throw new Error("this subscriber cannot handle a second frame");
   });
 
-  expect(seen).toEqual([{ type: "owner-facts", facts: { mode: "tui" } }]);
+  // The third frame was buffered behind the one that threw and is not delivered.
+  expect(seen).toEqual([
+    { type: "owner-facts", facts: { index: 1 } },
+    { type: "owner-facts", facts: { index: 2 } },
+  ]);
   await expect(owner.closed).resolves.toEqual({ refusal: "listener-failed" });
   // Nothing may be admitted or subscribed afterwards either.
   expect(recordFrames(owner)).toEqual([]);

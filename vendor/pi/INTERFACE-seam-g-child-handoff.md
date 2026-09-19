@@ -1,17 +1,16 @@
 # vendor/pi seam G interface: ordered input drain and recognized child-terminal handoff
 
 This is the public contract of the one source patch this node owns,
-`vendor/pi/patches/0005-native-child-handoff.patch`. In this branch's series it is applied fourth, directly
-after `0003-native-presentation-readiness.patch`, and the file in `patches/series` is the diff taken at exactly
-that position: sha256 `18138c0612bf244e3cddb0d9f759b875c6786f1836a84bd082be72071b44bcaa`, prepared tree
-`807c3338386c0c6264edea49dd26c33b3523ce2e` (build job `3746359`, upstream commit
-`bfb004d4418ff05c6f909eaaab856cbe75c1fde0`). It depends on seams B/C/F (0002) and E (0003) and does not
-commute with them. The number leaves `0004` free for the independent canonical-admission sibling: this branch
-does not carry that patch and nothing here depends on it.
+`vendor/pi/patches/0005-native-child-handoff.patch`. It was taken directly after
+`0003-native-presentation-readiness.patch`, sha256
+`18138c0612bf244e3cddb0d9f759b875c6786f1836a84bd082be72071b44bcaa`, and in this branch's five-patch series it
+is applied **fifth**, after `0004-native-canonical-admission.patch`, carried byte for byte: it applies there
+with no fuzz, so it was not re-serialized. It depends on seams B/C/F (0002) and E (0003) and does not commute
+with them; it does not depend on 0004. `INTERFACE.md` section 9 records the per-position digests and the
+prepared tree each position produces, including the one this patch produces at position 5.
 
-`vendor/pi/INTERFACE.md`, `vendor/pi/README.md` and `vendor/pi/NOTICE.md` are owned by the integrator and now
-record the four-patch series: the composed order, the per-position digests and this patch's prepared-tree hash
-are in `INTERFACE.md` section 9.
+`vendor/pi/INTERFACE.md`, `vendor/pi/README.md` and `vendor/pi/NOTICE.md` are owned by the integrator and
+record the composed order.
 
 `test/native-child-handoff.test.mjs` is the acceptance suite that drives this patch through an installed
 artifact cohort, named by `PI_NATIVE_ARTIFACTS_MANIFEST`. With no cohort selected it skips.

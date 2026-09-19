@@ -3,11 +3,11 @@
 Read this before you write a Pi source patch or consume a built artifact. `vendor/pi/README.md` is the
 maintenance procedure; this file is the contract.
 
-**Seams A, B, C, E and F and the recognized part of G are implemented and composed but NOT qualified; seam D
-is absent.** The series carries four ordered patches, so today's artifacts are **patched** upstream Pi 0.84.3
-that expose the native submission barrier, labelled ingress with return authorization and the terminal
-profile, cold presentation with readiness, and the ordered input drain with the recognized external-editor
-child handoff — and nothing else. The build is also a **hybrid** - pinned source plus
+**Seams A, B, C, D, E and F and the recognized part of G are implemented and composed but NOT qualified.** The
+series carries five ordered patches, so today's artifacts are **patched** upstream Pi 0.84.3 that expose the
+native submission barrier, labelled ingress with return authorization and the terminal profile, cold
+presentation with readiness, canonical admission on exact names, and the ordered input drain with the
+recognized external-editor child handoff — and nothing else. The build is also a **hybrid** - pinned source plus
 one pinned release-generated data input - which section 6 describes in full.
 
 Section 8 is the seam A contract: the public API, its managed activation, the envelope, the fence and the
@@ -15,19 +15,20 @@ receipts a consumer can rely on. Section 8.6 states the draft behaviour the defa
 section 8.6b states the selected **compatibility-first** custom-editor policy, the limitation that policy
 accepts, and the one operator-visible notice that states the limitation instead of hiding it. Section 9 is
 the composition: which document owns which seam, what the serialized series is, and what the composition
-itself does not deliver. What is still missing is qualification work, not a policy: the public binding/API
-freeze for seam D, seam G's arbitrary-child terminal parity (Gate 5), and whole-product qualification. That
-is why these artifacts are not cleared for dependency activation.
+itself does not deliver. What is still missing is qualification work, not a policy: seam G's arbitrary-child
+terminal parity (Gate 5) and whole-product qualification. Seam D's canonical admission arrived with `0004` and
+is contracted in `INTERFACE-seam-d-canonical.md`; it is implemented and tested against a built cohort, not
+frozen and not qualified. That is why these artifacts are not cleared for dependency activation.
 
-The seam contracts live in four documents, and none of them supersedes another:
+The seam contracts live in five documents, and none of them supersedes another:
 
 | Seam | Contract document | Ordered patch |
 | --- | --- | --- |
 | A — native submission barrier | section 8 of this file | `0001-seam-a-native-submission-barrier.patch` |
 | B, C, F — labelled ingress, return authorization, terminal profile | [`docs/native-input-interface.md`](../../docs/native-input-interface.md) | `0002-native-ingress-return-profile.patch` |
 | E — cold presentation and readiness | [`INTERFACE-seam-e-presentation.md`](INTERFACE-seam-e-presentation.md) | `0003-native-presentation-readiness.patch` |
+| D — canonical admission on exact names | [`INTERFACE-seam-d-canonical.md`](INTERFACE-seam-d-canonical.md) | `0004-native-canonical-admission.patch` |
 | G — ordered input drain and the recognized child-terminal handoff, Gate 5 still open | [`INTERFACE-seam-g-child-handoff.md`](INTERFACE-seam-g-child-handoff.md) | `0005-native-child-handoff.patch` |
-| D | not written: unassigned and unimplemented | none; `0004` is reserved for it |
 
 ## 1. The pin
 
@@ -229,7 +230,8 @@ consumes it in the same **synchronous** region as the first native mutation or c
   through an **internal** supplier registered by `AgentSession`, and the generation advances only when the
   owner's own canonical file changes. This supplier is seam-A fence coordination and nothing more: it is
   not exported, it is not a frozen binding-commit API, and it supplies no admission, reservation or commit
-  contract. Seam D remains unresolved and unassigned, and this must not be cited as readiness for it. A temporary `SessionManager` opened to rename, import or list some other session
+  contract. Seam D's admission, reservation and commit contract is a separate patch, `0004`, documented in
+  `INTERFACE-seam-d-canonical.md`; it reads this same supplier and exports nothing new of it. A temporary `SessionManager` opened to rename, import or list some other session
   is not the owner's session and cannot move the binding. The observation is repeated inside the critical
   section, so a rebind between grant and mutation is refused with `STALE_BINDING` and mutates nothing.
 - Because the section is synchronous, it is never held across an extension handler, a child submission or
@@ -411,33 +413,38 @@ says seam A is implemented but not qualified.
 
 No durable ledger, no blob storage, no ownership or attachment policy, no canonical admission, no
 reservation, no session management. It reconstructs no extension-private editor state, and it never
-reimplements, wraps, replaces or disables a custom editor. The binding is observed, never admitted: this is
-not seam D and it admits, reserves and refuses nothing. The advisory `input` event keeps its existing catch-and-continue
+reimplements, wraps, replaces or disables a custom editor. The binding is observed here, never admitted: the
+admission, reservation and commit contract is seam D's own patch, `0004`. The advisory `input` event keeps its existing catch-and-continue
 contract and is unchanged.
 
 ## 9. The composed series
 
-The four patches were written against the same pinned tree by four separate lanes, and they do **not**
+The five patches were written against the same pinned tree by five separate lanes, and they do **not**
 commute: `packages/tui/src/{terminal,tui,index}.ts` are changed by 0002, 0003 and 0005,
 `packages/coding-agent/src/{index.ts,core/extensions/{types,loader}.ts,modes/interactive/interactive-mode.ts}`
-by 0001, 0003 and 0005, and `packages/tui/src/{native-attachment,stdin-buffer}.ts` by both 0002 and 0005.
-`patches/series` is therefore the only order these files apply in, and 0002 and 0003
-are the **serialized** forms regenerated in that order rather than the lanes' original diffs.
+by 0001, 0003, 0004 and 0005, `packages/tui/src/{native-attachment,stdin-buffer}.ts` by both 0002 and 0005,
+and seam A's own `packages/coding-agent/src/core/native-submission.ts` by both 0001 and 0004.
+`patches/series` is therefore the only order these files apply in, and 0002, 0003 and 0004 are the
+**serialized** forms regenerated in that order rather than the lanes' original diffs. Seam D's 0004 was
+written on top of the applied 0001-0003 series; its contract is `INTERFACE-seam-d-canonical.md`.
 
-The series has **no `0004`**. That position is left free for the independent canonical-admission sibling
-(seam D), which this lock does not carry and which 0005 does not depend on; `series` names four files and a
-fifth patch file in the directory would be drift.
+0005 was taken directly after 0003, before 0004 existed in any series, and it is carried here **byte for
+byte**: its `index.ts` and `interactive-mode.ts` hunks touch neither the export block nor the session,
+refusal and naming regions 0004 rewrites, so it applies at position 5 with no fuzz and needed no
+re-serialization. Its contract is `INTERFACE-seam-g-child-handoff.md`.
 
 | Position | Patch | sha256 | Prepared tree after it |
 | --- | --- | --- | --- |
 | 1 | `0001-seam-a-native-submission-barrier.patch` | `c2d0a7c73bae0359357f012d95954dd9bcb645af7ca13d805623192c7d9542a7` (unchanged from the seam A lane) | `4a175953509e7a38bfbaefd0aa55f01b6168a980` |
 | 2 | `0002-native-ingress-return-profile.patch` | `9376635ebb4aa87d77354fe19c53cf70562aa37ba64f9e5513e0e2ed7ea7db1e` (serialized; the lane's own diff was `1db62cf6355d371d910a947d771a6c81efff5f4996a7a7d5b3796a5d251ae816`) | `8c21a5d8e326a44719ad53d5c6ba183db9925731` |
 | 3 | `0003-native-presentation-readiness.patch` | `cf7f5ccca6358612f17bb65583f17934fb795b9935c921efe0fbaba1737bdfb9` (serialized; the lane's own diff was `8a483bf73c9b6d6d44cea44eae2289386946e545f1b6fa2b8bd6a5fd88542868`) | `9c40d805754c6cbc5dd161ec4e1c6880b1bc1ef4` |
-| 4 | `0005-native-child-handoff.patch` | `18138c0612bf244e3cddb0d9f759b875c6786f1836a84bd082be72071b44bcaa` (taken at this position, on top of 0003) | `807c3338386c0c6264edea49dd26c33b3523ce2e` |
+| 4 | `0004-native-canonical-admission.patch` | `1f5e78f4ebdeafcc8a161d3b0c02613256902981a12adf540ff2509329bf89d5` (authored at this position; its first form was `66cdeaacf78c3e18e8f7512abf928d7a509691ea776f368d417a60ae0e446dc0`, and the form before the one-use reservation and string-message corrections was `425ac07a02a6d10261f01ad9b8048ee5719ab745f1af6e7ffb2a08e21fc6b9d1`) | `69762c6631d6395b989735cef63f6c97a9511bf9` |
+| 5 | `0005-native-child-handoff.patch` | `18138c0612bf244e3cddb0d9f759b875c6786f1836a84bd082be72071b44bcaa` (taken after 0003 and carried unchanged at this position) | `daa4eb307949768e750c0b5c6c103ef2ccdb3430` |
 
-Position 4's prepared tree is the one the seam G cohort was built from: Slurm build job `3746359`, upstream
-commit `bfb004d4418ff05c6f909eaaab856cbe75c1fde0`. `INTERFACE-seam-g-child-handoff.md` is that patch's own
-public contract and its own statement of limits.
+Position 4's tree is the one the reviewed seam D lane prepared (build job `3751264`), because positions 1-4
+are the same bytes in the same order there. Position 5's tree is this composition's own: 0005 applied to that
+index. Before this composition, 0005 alone after 0003 prepared `807c3338386c0c6264edea49dd26c33b3523ce2e`
+(seam G build job `3746359`), and that tree is not what this five-patch series prepares.
 
 Applying each lane's patch alone to the pin still reproduces that lane's own tree
 (`4a175953509e7a38bfbaefd0aa55f01b6168a980` for A, `657974161957889b737195121078666ced55192d` for B/C/F,
@@ -452,10 +459,47 @@ position *n − 1* in a disposable tree, apply the lane's own diff on top, resol
 position *n − 1*. `prepare.mjs` then applies the whole series with no fuzz, no `-3` and no skip, and the
 prepared tree must equal the tree recorded above.
 
+### 9.0 The one qualified cohort of this series
+
+The five-patch series has been prepared, built, packed and installed exactly once, and every installed
+acceptance case of this checkpoint was pointed at that one cohort. `series` sha256
+`2c3c838458fc2279b36e2ad892c7c35f08615fb7f03b158aaa2ac97b332a79ce`.
+
+| Field | Value |
+| --- | --- |
+| Build | Slurm job `3753895`, `l40-reserved`, Node `v22.23.2` |
+| Upstream commit | `bfb004d4418ff05c6f909eaaab856cbe75c1fde0` |
+| Prepared tree | `daa4eb307949768e750c0b5c6c103ef2ccdb3430` |
+| Artifact label | `patched: 5 ordered pi-agents source patch(es) applied to the pinned commit.` |
+| Bundled CLI | `1829279e2d8626de1ffc7052ea35d90209519b2d1cbc9243ab7ac822a6ed2b1a` (`dist/bundle/cli.js`, rebuilt from the prepared source) |
+
+Packed cohort, by tarball sha256:
+
+| Package | sha256 |
+| --- | --- |
+| `@earendil-works/pi-telemetry` | `8d5692e339d04a42ca32ca883b87e85ac8f96308e2317b164492c00cd23f346c` |
+| `@earendil-works/pi-ai` | `95cfdc61c262a84ce7d5e2cdf142c59a90516cd31e25b4ea4c94d3c482b75f31` |
+| `@earendil-works/pi-agent-core` | `134b4a6ef03d4632d0454a41ab1f2b4e18dff2196ce1b3316ab5e98ef9852f35` |
+| `@earendil-works/pi-protocol` | `eea8f3235b87924fb368a2361b772b65bbd992e322fb05d554311c98d5ccdafb` |
+| `@earendil-works/pi-client` | `260dcac827d8ede81cb21a99020053fa76b073b5e9be2f12c05ba548f976d46b` |
+| `@earendil-works/pi-tui` | `20fb54ef7793469a7d7b2bef5847a78a63c94140bcee8423ad02dc928429d11a` |
+| `@earendil-works/pi-coding-agent` | `2b8858a3c252ecc8015a9ec12a0d7b7bc722d89c73e5f7d5afa4c9d25a2c4165` |
+
+A later consumer selects this cohort by its generated manifest, never by a default path:
+`PI_NATIVE_ARTIFACTS_MANIFEST` for the terminal half and `PI_SEAM_{A,D,E}_CONSUMER` / `PI_NATIVE_COHORT`
+for the installed halves, all naming the one consumer of job `3753895`. Byte reproducibility of the cohort is
+not claimed: it is one build, recorded, not re-derived.
+
+`test/native-canonical-handoff-coexistence.test.mjs` is the case that exists only because of this
+composition: seam D's admission and seam G's recognized handoff in one owner process, from one installed
+coding-agent module. It fails against either single-seam cohort.
+
 ### 9.1 What the composition itself does not deliver
 
-- **No seam D.** There is still no public canonical admission, reservation or binding-commit API. Composing
-  A with B/C/F, E and G did not create one, and nothing here may be cited as a D interface freeze.
+- **Seam D is contracted, not frozen.** 0004 delivers canonical admission on exact names with the
+  reservation, commit and refusal rules `INTERFACE-seam-d-canonical.md` states. There is no durable
+  reservation backend, no pre-spawn startup reservation and no public coordinator, and every test of it uses a
+  fake host, so nothing here may be cited as a D API freeze or as durable-storage evidence.
 - **Seam G is the recognized handoff only (Gate 5 open).** 0005 delivers the ordered drain, `drainedThrough`,
   the `handoff-closed` verdict and the paired phase announcement around Pi's external editor. Arbitrary,
   unannounced and same-process-group children, a child's current screen, shared input and actual Kitty
@@ -465,3 +509,6 @@ prepared tree must equal the tree recorded above.
   until an owner process registers a host; with nothing registered every seam is the pinned baseline.
 - **No dependency activation.** The root `package.json` still installs the released Pi; these artifacts are
   built, tested and left in a disposable directory.
+- **No whole-product qualification.** One green cohort of this series is source and seam evidence only. It is
+  not Gate 5, not Task 13/14 durability (fsync, `ENOSPC`, the journal), not Task 16's startup reservation, not
+  live activation and not operator-run extension execution.

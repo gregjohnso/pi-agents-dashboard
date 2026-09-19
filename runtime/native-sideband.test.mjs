@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -631,6 +631,9 @@ async function liveReplacement(/** @type {string} */ root) {
   server.on("error", () => {});
   await new Promise((resolve) => server.listen(socketPath, () => resolve(undefined)));
   cleanup.push(() => new Promise((resolve) => server.close(() => resolve(undefined))));
+  // Narrowed to 0600 so this stands in for the case that matters: a replacement indistinguishable from a
+  // correct endpoint by owner and mode. A test-side chmod of the test's own socket, not of a foreign entry.
+  await chmod(socketPath, 0o600);
   const identity = await lstat(socketPath);
   return {
     socketPath,

@@ -249,15 +249,16 @@ describe("the owner bridge consumer", () => {
     for (let index = 0; index < 5_000; index += 1) owner.emit(FACTS({ index }));
 
     const status = consumer.status();
-    expect(status.refusal).toMatch(/owner-facts frames and this owner generation may send 1/u);
+    // What the flood left behind is bounded: no frame history, a bounded diagnostic ring, a bounded log.
+    expect(JSON.stringify(status).length).toBeLessThan(20_000);
+    expect(status.diagnostics.length).toBeLessThanOrEqual(64);
+    expect(lines.length).toBeLessThan(20);
+    // Admission stopped at the refusal instead of absorbing the whole flood.
+    expect(status.counts.frames).toBeLessThan(10);
+    // And the offending generation is the one that paid for it.
+    expect(String(status.refusal)).toMatch(/owner-facts frames and this owner generation may send 1/u);
     expect(owner.closes()).toBe(1);
     expect(status.connected).toBe(false);
-    // What the flood left behind is bounded: no frame history, a bounded diagnostic ring, a bounded log.
-    expect(status.diagnostics.length).toBeLessThanOrEqual(64);
-    expect(JSON.stringify(status).length).toBeLessThan(20_000);
-    expect(lines.length).toBeLessThan(20);
-    // Admission stopped at the refusal instead of counting the whole flood.
-    expect(status.counts.frames).toBeLessThan(10);
   });
 
   it("refuses a receipt for a request this manager never sent", () => {
@@ -267,7 +268,7 @@ describe("the owner bridge consumer", () => {
 
     owner.emit({ type: "owner-receipt", requestId: "never-asked", request: "stop", outcome: "requested" });
 
-    expect(consumer.status().refusal).toMatch(/answered request never-asked, which this manager did not send/u);
+    expect(String(consumer.status().refusal)).toMatch(/answered request never-asked, which this manager did not send/u);
     expect(owner.closes()).toBe(1);
   });
 
@@ -287,7 +288,7 @@ describe("the owner bridge consumer", () => {
     ]);
 
     owner.emit({ type: "owner-receipt", requestId: "request-1", request: "stop", outcome: "requested" });
-    expect(consumer.status().refusal).toMatch(/answered request request-1, which this manager did not send/u);
+    expect(String(consumer.status().refusal)).toMatch(/answered request request-1, which this manager did not send/u);
   });
 
   // Operator-visible failure: a reload is a new generation, and the previous connection has to end rather than

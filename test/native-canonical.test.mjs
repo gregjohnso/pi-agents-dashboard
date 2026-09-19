@@ -22,7 +22,7 @@
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import {
   CONSUMER,
@@ -242,5 +242,155 @@ describe.skipIf(!CONSUMER)("seam D: canonical admission, through the installed a
     const notDelivered = capability.notDelivered.join(" ");
     for (const claim of ["Task 14", "Task 16", "forwardTo", "gate 5"]) expect(notDelivered).toContain(claim);
     expect(typeof pi.CanonicalOperationRefusedError).toBe("function");
+  });
+
+  it("D-10 commits a real different-file resume only with the generation the owner's own binding reports", async () => {
+    const host = newHost();
+    activate(host);
+    const harness = await startRuntime();
+    harness.persist(harness.runtime.session.sessionManager);
+    const other = harness.writeSession("other");
+
+    const resumed = await harness.runtime.switchSession(other);
+
+    expect(resumed.cancelled).toBe(false);
+    expect(harness.runtime.session.sessionManager.getSessionFile()).toBe(other);
+    const [startup, rebind] = host.committed;
+    expect(rebind.nextGeneration).toBe(startup.nextGeneration + 1);
+    // The committed generation is the one seam A reports for this owner, not one derived from the target.
+    await harness.runtime.session.prompt("bound", { nativeSubmit: { source: "startup-prompt" } });
+    expect(host.envelopes.at(-1).binding).toEqual({ canonicalFile: other, generation: rebind.nextGeneration });
+    expect(host.aborted).toHaveLength(0);
+  });
+
+  it("D-11 commits the unchanged generation for a real same-file resume", async () => {
+    const host = newHost();
+    activate(host);
+    const harness = await startRuntime();
+    const ownFile = harness.persist(harness.runtime.session.sessionManager);
+
+    const resumed = await harness.runtime.switchSession(ownFile);
+
+    expect(resumed.cancelled).toBe(false);
+    expect(harness.runtime.session.sessionManager.getSessionFile()).toBe(ownFile);
+    // A disposed session reports no file and rebinding the same file is not a rebind: the generation stands.
+    const [startup, resume] = host.committed;
+    expect(resume.nextGeneration).toBe(startup.nextGeneration);
+    await harness.runtime.session.prompt("still bound", { nativeSubmit: { source: "startup-prompt" } });
+    expect(host.envelopes.at(-1).binding).toEqual({ canonicalFile: ownFile, generation: startup.nextGeneration });
+  });
+
+  it("D-12 stays fail-closed when the session replacement fails after the mutation, and commits nothing for it", async () => {
+    const host = newHost();
+    activate(host);
+    const harness = await startRuntime();
+    harness.persist(harness.runtime.session.sessionManager);
+    harness.failNextRuntimeCreation("runtime creation failed");
+
+    await expect(harness.runtime.newSession()).rejects.toThrow(/runtime creation failed/);
+
+    // Only the startup adoption committed: the host is never told the owner moved, and nothing is rolled back.
+    expect(host.committed.map((entry) => entry.reservationId)).toEqual(["reservation-1"]);
+    expect(host.aborted).toHaveLength(0);
+    // READY is not restored after a replacement that failed.
+    await expect(harness.runtime.newSession()).rejects.toMatchObject({ code: "PERSISTENCE_UNCERTAIN" });
+    expect(host.committed.map((entry) => entry.reservationId)).toEqual(["reservation-1"]);
+  });
+
+  it("D-13 refuses a rebind whose replacement left this owner off the admitted target, and commits nothing", async () => {
+    const host = newHost();
+    activate(host);
+    const harness = await startRuntime();
+    harness.persist(harness.runtime.session.sessionManager);
+    const other = harness.writeSession("other");
+    // The replacement resolves, but the session it installs owns no canonical file.
+    harness.bindNextRuntimeToMemory();
+
+    await expect(harness.runtime.switchSession(other)).rejects.toMatchObject({
+      name: "CanonicalOperationRefusedError",
+      code: "PERSISTENCE_UNCERTAIN",
+    });
+
+    expect(host.committed.map((entry) => entry.reservationId)).toEqual(["reservation-1"]);
+    expect(host.aborted).toHaveLength(0);
+    // The owner stays fail-closed: seam A refuses at its own boundary rather than dispatching against a
+    // binding the host was never told about.
+    await expect(
+      harness.runtime.session.prompt("blocked", { nativeSubmit: { source: "startup-prompt" } }),
+    ).rejects.toThrow(/PERSISTENCE_UNCERTAIN/);
+  });
+
+  it("D-14 aborts a resume refused by its own validated precondition and leaves resume usable", async () => {
+    const host = newHost();
+    activate(host);
+    const harness = await startRuntime();
+    const ownFile = harness.persist(harness.runtime.session.sessionManager);
+    const missingCwd = harness.writeSession("missing-cwd", { cwd: path.join(harness.root, "gone") });
+    const bytes = readFileSync(missingCwd, "utf8");
+
+    await expect(harness.runtime.switchSession(missingCwd)).rejects.toMatchObject({ name: "MissingSessionCwdError" });
+
+    // The open wrote nothing, so this is a definite no-mutation outcome: one abort, no commit, no uncertainty.
+    expect(readFileSync(missingCwd, "utf8")).toBe(bytes);
+    expect(harness.runtime.session.sessionManager.getSessionFile()).toBe(ownFile);
+    expect(host.aborted).toHaveLength(1);
+    const resumed = await harness.runtime.switchSession(missingCwd, { cwdOverride: harness.root });
+    expect(resumed.cancelled).toBe(false);
+    expect(harness.runtime.session.sessionManager.getSessionFile()).toBe(missingCwd);
+  });
+});
+
+describe.skipIf(!CONSUMER)("seam D: an unmanaged fork is the stock fork", () => {
+  let resolveCalls = 0;
+  let original;
+
+  beforeAll(async () => {
+    original = pi.SessionManager.prototype.resolveNextSessionFile;
+    pi.SessionManager.prototype.resolveNextSessionFile = function countedResolveNextSessionFile(...args) {
+      resolveCalls += 1;
+      return original.apply(this, args);
+    };
+  });
+
+  afterAll(() => {
+    pi.SessionManager.prototype.resolveNextSessionFile = original;
+  });
+
+  it("D-15 never pre-resolves or reserves a branch target with no canonical host, and still forks", async () => {
+    if (pi.setNativeSubmissionHost) pi.setNativeSubmissionHost(undefined);
+    const harness = await startRuntime();
+    const manager = harness.runtime.session.sessionManager;
+    const source = harness.persist(manager);
+    const leaf = manager.getEntries().at(-1).id;
+    resolveCalls = 0;
+
+    const forked = await harness.runtime.fork(leaf, { position: "at" });
+
+    expect(forked.cancelled).toBe(false);
+    // No reserved target means the stock naming and the stock non-exclusive create, exactly as before seam D.
+    expect(resolveCalls).toBe(0);
+    const created = harness.runtime.session.sessionManager.getSessionFile();
+    expect(created).not.toBe(source);
+    expect(existsSync(created)).toBe(true);
+    expect(existsSync(source)).toBe(true);
+  });
+
+  it("D-16 resolves the branch target exactly once for a managed fork", async () => {
+    const host = newHost();
+    activate(host);
+    const harness = await startRuntime();
+    const manager = harness.runtime.session.sessionManager;
+    harness.persist(manager);
+    const leaf = manager.getEntries().at(-1).id;
+    resolveCalls = 0;
+
+    const forked = await harness.runtime.fork(leaf, { position: "at" });
+
+    expect(forked.cancelled).toBe(false);
+    expect(resolveCalls).toBe(1);
+    expect(host.admitted.at(-1)).toMatchObject({
+      operation: "fork",
+      resolvedTarget: { canonicalFile: harness.runtime.session.sessionManager.getSessionFile() },
+    });
   });
 });

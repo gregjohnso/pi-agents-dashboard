@@ -433,7 +433,7 @@ was written on top of the applied series and is a fourth non-commuting position:
 | 1 | `0001-seam-a-native-submission-barrier.patch` | `c2d0a7c73bae0359357f012d95954dd9bcb645af7ca13d805623192c7d9542a7` (unchanged from the seam A lane) | `4a175953509e7a38bfbaefd0aa55f01b6168a980` |
 | 2 | `0002-native-ingress-return-profile.patch` | `9376635ebb4aa87d77354fe19c53cf70562aa37ba64f9e5513e0e2ed7ea7db1e` (serialized; the lane's own diff was `1db62cf6355d371d910a947d771a6c81efff5f4996a7a7d5b3796a5d251ae816`) | `8c21a5d8e326a44719ad53d5c6ba183db9925731` |
 | 3 | `0003-native-presentation-readiness.patch` | `cf7f5ccca6358612f17bb65583f17934fb795b9935c921efe0fbaba1737bdfb9` (serialized; the lane's own diff was `8a483bf73c9b6d6d44cea44eae2289386946e545f1b6fa2b8bd6a5fd88542868`) | `9c40d805754c6cbc5dd161ec4e1c6880b1bc1ef4` |
-| 4 | `0004-native-canonical-admission.patch` | `66cdeaacf78c3e18e8f7512abf928d7a509691ea776f368d417a60ae0e446dc0` (authored at this position; it has no earlier form) | `87062556dde3b44331f1638c51062a8c390548ce` |
+| 4 | `0004-native-canonical-admission.patch` | `425ac07a02a6d10261f01ad9b8048ee5719ab745f1af6e7ffb2a08e21fc6b9d1` (authored at this position; its first form, before the reviewed seam D corrections, was `66cdeaacf78c3e18e8f7512abf928d7a509691ea776f368d417a60ae0e446dc0`) | `e50de46baff8aefe82610a8db04d47c6d8575a8d` |
 
 Applying each lane's patch alone to the pin still reproduces that lane's own tree
 (`4a175953509e7a38bfbaefd0aa55f01b6168a980` for A, `657974161957889b737195121078666ced55192d` for B/C/F,

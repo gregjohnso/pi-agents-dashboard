@@ -10,7 +10,7 @@
  * evidence about durable storage or about the pre-spawn startup reservation Task 16 owns.
  */
 
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -198,8 +198,17 @@ export async function createInstalledRuntime({ workspace } = {}) {
 
   const services = { cwd: root, agentDir: root };
   const created = [];
+  let nextRuntimeError;
+  let nextRuntimeManager;
   const createRuntime = async ({ sessionManager }) => {
-    const session = sessionOf(sessionManager);
+    if (nextRuntimeError) {
+      const error = nextRuntimeError;
+      nextRuntimeError = undefined;
+      throw error;
+    }
+    const manager = nextRuntimeManager ?? sessionManager;
+    nextRuntimeManager = undefined;
+    const session = sessionOf(manager);
     created.push(session);
     return { session, services, diagnostics: [] };
   };
@@ -218,6 +227,26 @@ export async function createInstalledRuntime({ workspace } = {}) {
       sessionManager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
       sessionManager.appendMessage(assistant("hi"));
       return sessionManager.getSessionFile();
+    },
+    /** Make the next runtime creation fail, which is how a real session replacement fails after the mutation. */
+    failNextRuntimeCreation(message) {
+      nextRuntimeError = new Error(message);
+    },
+    /**
+     * Make the next runtime creation bind a session that owns no canonical file, which is what a replacement
+     * that never reached the admitted target leaves behind.
+     */
+    bindNextRuntimeToMemory() {
+      nextRuntimeManager = pi.SessionManager.inMemory(root);
+    },
+    /** Write one session file this runtime can resume, with the cwd the caller asks for. */
+    writeSession(name, { cwd = root, id = name } = {}) {
+      const file = path.join(sessions, `2026-01-01T00-00-00-000Z_${name}.jsonl`);
+      writeFileSync(
+        file,
+        `${JSON.stringify({ type: "session", version: 3, id, timestamp: new Date().toISOString(), cwd })}\n`,
+      );
+      return file;
     },
     dispose() {
       for (const entry of created) {

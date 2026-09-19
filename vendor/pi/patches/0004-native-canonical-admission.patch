@@ -1,5 +1,5 @@
 diff --git a/packages/coding-agent/src/core/agent-session-runtime.ts b/packages/coding-agent/src/core/agent-session-runtime.ts
-index c3b60569e7cad7b94f47bcfdf60e14c824dd62b1..f00496e1394dc304a7a29896a0475edfd3e65b52 100644
+index c3b60569e7cad7b94f47bcfdf60e14c824dd62b1..5653fc70b480596ed29bc65b3473730328955051 100644
 --- a/packages/coding-agent/src/core/agent-session-runtime.ts
 +++ b/packages/coding-agent/src/core/agent-session-runtime.ts
 @@ -1,4 +1,4 @@
@@ -46,50 +46,95 @@ index c3b60569e7cad7b94f47bcfdf60e14c824dd62b1..f00496e1394dc304a7a29896a0475edf
  /**
   * Result returned by runtime creation.
   *
-@@ -207,8 +234,29 @@ export class AgentSessionRuntime {
+@@ -207,18 +234,41 @@ export class AgentSessionRuntime {
  		}
  
  		const previousSessionFile = this.session.sessionFile;
 -		const sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
 -		assertSessionCwdExists(sessionManager, this.cwd);
+-		await this.teardownCurrent("resume", sessionManager.getSessionFile());
+-		this.apply(
+-			await this.createRuntime({
+-				cwd: sessionManager.getCwd(),
+-				agentDir: this.services.agentDir,
+-				sessionManager,
+-				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+-				projectTrustContext: options?.projectTrustContextFactory?.(sessionManager.getCwd()),
+-			}),
+-		);
 +		// Seam D: the exact selected file is admitted before it is opened, because opening it can rewrite an
 +		// empty file or migrate a legacy one.
 +		const resolvedTarget = resolvePath(sessionPath);
 +		const admission = await runCanonicalOperation({
 +			operation: "resume",
 +			resolvedTarget,
-+			rebinds: true,
 +			mutate: () => {
 +				const opened = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
 +				try {
 +					assertSessionCwdExists(opened, this.cwd);
 +				} catch (error) {
-+					// A validated precondition, not an ambiguous write: the reservation is aborted and this owner
-+					// stays certain.
++					// A validated precondition failure is a definite no-mutation outcome only when the open itself
++					// wrote nothing. Opening can initialize an empty file or migrate a legacy one, and a rewritten
++					// file must not be labelled unmutated: that failure stays ambiguous and keeps the reservation.
++					if (opened.fileRewrittenOnLoad()) throw error;
 +					throw new CanonicalMutationNotPerformedError(error);
 +				}
 +				return opened;
++			},
++			rebind: async (sessionManager) => {
++				await this.teardownCurrent("resume", sessionManager.getSessionFile());
++				this.apply(
++					await this.createRuntime({
++						cwd: sessionManager.getCwd(),
++						agentDir: this.services.agentDir,
++						sessionManager,
++						sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
++						projectTrustContext: options?.projectTrustContextFactory?.(sessionManager.getCwd()),
++					}),
++				);
 +			},
 +		});
 +		if (!admission.ok) {
 +			throw new CanonicalOperationRefusedError("resume", resolvedTarget, admission.code, admission.message);
 +		}
-+		const sessionManager = admission.value;
- 		await this.teardownCurrent("resume", sessionManager.getSessionFile());
- 		this.apply(
- 			await this.createRuntime({
-@@ -241,6 +289,26 @@ export class AgentSessionRuntime {
+ 		await this.finishSessionReplacement(options?.withSession);
+ 		return { cancelled: false };
+ 	}
+@@ -241,16 +291,40 @@ export class AgentSessionRuntime {
  		if (options?.parentSession) {
  			sessionManager.newSession({ parentSession: options.parentSession });
  		}
+-
+-		await this.teardownCurrent("new", sessionManager.getSessionFile());
+-		this.apply(
+-			await this.createRuntime({
+-				cwd: this.cwd,
+-				agentDir: this.services.agentDir,
+-				sessionManager,
+-				sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
+-			}),
+-		);
 +		// Seam D: constructing the manager resolves the final name and writes nothing, so the exact file this
 +		// owner will create is admitted before the first write to it.
 +		const resolvedTarget = sessionManager.getSessionFile();
-+		if (resolvedTarget !== undefined) {
++		const replace = async () => {
++			await this.teardownCurrent("new", sessionManager.getSessionFile());
++			this.apply(
++				await this.createRuntime({
++					cwd: this.cwd,
++					agentDir: this.services.agentDir,
++					sessionManager,
++					sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
++				}),
++			);
++		};
++		if (resolvedTarget === undefined) {
++			// An in-memory session names no file, so there is nothing to admit.
++			await replace();
++		} else {
 +			const admission = await runCanonicalOperation({
 +				operation: "new",
 +				resolvedTarget,
-+				rebinds: true,
 +				mutate: () => {
 +					if (sessionManager.getSessionFile() !== resolvedTarget) {
 +						throw new CanonicalMutationNotPerformedError(
@@ -97,24 +142,46 @@ index c3b60569e7cad7b94f47bcfdf60e14c824dd62b1..f00496e1394dc304a7a29896a0475edf
 +						);
 +					}
 +				},
++				rebind: replace,
 +			});
 +			if (!admission.ok) {
 +				throw new CanonicalOperationRefusedError("new", resolvedTarget, admission.code, admission.message);
 +			}
 +		}
- 
- 		await this.teardownCurrent("new", sessionManager.getSessionFile());
- 		this.apply(
-@@ -296,6 +364,24 @@ export class AgentSessionRuntime {
+ 		if (options?.setup) {
+ 			await options.setup(this.session.sessionManager);
+ 			this.session.agent.state.messages = this.session.sessionManager.buildSessionContext().messages;
+@@ -296,15 +370,37 @@ export class AgentSessionRuntime {
  			if (!targetLeafId) {
  				const sessionManager = SessionManager.create(this.cwd, sessionDir);
  				sessionManager.newSession({ parentSession: currentSessionFile });
+-				await this.teardownCurrent("fork", sessionManager.getSessionFile());
+-				this.apply(
+-					await this.createRuntime({
+-						cwd: this.cwd,
+-						agentDir: this.services.agentDir,
+-						sessionManager,
+-						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+-					}),
+-				);
 +				const resolvedTarget = sessionManager.getSessionFile();
-+				if (resolvedTarget !== undefined) {
++				const replace = async () => {
++					await this.teardownCurrent("fork", sessionManager.getSessionFile());
++					this.apply(
++						await this.createRuntime({
++							cwd: this.cwd,
++							agentDir: this.services.agentDir,
++							sessionManager,
++							sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
++						}),
++					);
++				};
++				if (resolvedTarget === undefined) {
++					await replace();
++				} else {
 +					const admission = await runCanonicalOperation({
 +						operation: "fork",
 +						resolvedTarget,
-+						rebinds: true,
 +						mutate: () => {
 +							if (sessionManager.getSessionFile() !== resolvedTarget) {
 +								throw new CanonicalMutationNotPerformedError(
@@ -122,41 +189,77 @@ index c3b60569e7cad7b94f47bcfdf60e14c824dd62b1..f00496e1394dc304a7a29896a0475edf
 +								);
 +							}
 +						},
++						rebind: replace,
 +					});
 +					if (!admission.ok) {
 +						throw new CanonicalOperationRefusedError("fork", resolvedTarget, admission.code, admission.message);
 +					}
 +				}
- 				await this.teardownCurrent("fork", sessionManager.getSessionFile());
- 				this.apply(
- 					await this.createRuntime({
-@@ -315,7 +401,24 @@ export class AgentSessionRuntime {
+ 				await this.finishSessionReplacement(options?.withSession);
+ 				return { cancelled: false, selectedText };
+ 			}
+@@ -315,19 +411,48 @@ export class AgentSessionRuntime {
  				);
  			}
  			const sessionManager = SessionManager.open(currentSessionFile, sessionDir);
 -			const forkedSessionPath = sessionManager.createBranchedSession(targetLeafId);
-+			// Seam D: the branched file's exact name is resolved first and admitted before it is created. An
-+			// admitted create that finds the name taken fails here; it never rerolls a name or overwrites.
-+			const resolvedTarget = sessionManager.resolveNextSessionFile();
-+			let forkedSessionPath: string | undefined;
+-			if (!forkedSessionPath) {
+-				throw new Error("Failed to create forked session");
++			// Seam D: a managed fork resolves the branched file's exact name first and admits it before the create.
++			// An admitted create that finds the name taken fails here; it never rerolls a name or overwrites. With
++			// no canonical host nothing is pre-resolved or reserved, so the stock branch create — its own naming and
++			// its own collision behaviour — is what runs.
++			const resolvedTarget = nativeCanonicalManaged() ? sessionManager.resolveNextSessionFile() : undefined;
++			const replace = async () => {
++				await this.teardownCurrent("fork", sessionManager.getSessionFile());
++				this.apply(
++					await this.createRuntime({
++						cwd: sessionManager.getCwd(),
++						agentDir: this.services.agentDir,
++						sessionManager,
++						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
++					}),
++				);
++			};
 +			if (resolvedTarget === undefined) {
-+				forkedSessionPath = sessionManager.createBranchedSession(targetLeafId);
++				const forkedSessionPath = sessionManager.createBranchedSession(targetLeafId);
++				if (!forkedSessionPath) {
++					throw new Error("Failed to create forked session");
++				}
++				await replace();
 +			} else {
 +				const admission = await runCanonicalOperation({
 +					operation: "fork",
 +					resolvedTarget,
-+					rebinds: true,
-+					mutate: () => sessionManager.createBranchedSession(targetLeafId),
++					// The branch create's only write is the exclusive `wx` create of this exact target, so an EEXIST
++					// from it proves no byte changed.
++					exclusiveCreate: true,
++					mutate: () => {
++						const forkedSessionPath = sessionManager.createBranchedSession(targetLeafId);
++						if (!forkedSessionPath) {
++							throw new CanonicalMutationNotPerformedError(new Error("Failed to create forked session"));
++						}
++						return forkedSessionPath;
++					},
++					rebind: replace,
 +				});
 +				if (!admission.ok) {
 +					throw new CanonicalOperationRefusedError("fork", resolvedTarget, admission.code, admission.message);
 +				}
-+				forkedSessionPath = admission.value;
-+			}
- 			if (!forkedSessionPath) {
- 				throw new Error("Failed to create forked session");
  			}
-@@ -376,12 +479,35 @@ export class AgentSessionRuntime {
+-			await this.teardownCurrent("fork", sessionManager.getSessionFile());
+-			this.apply(
+-				await this.createRuntime({
+-					cwd: sessionManager.getCwd(),
+-					agentDir: this.services.agentDir,
+-					sessionManager,
+-					sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+-				}),
+-			);
+ 			await this.finishSessionReplacement(options?.withSession);
+ 			return { cancelled: false, selectedText };
+ 		}
+@@ -376,21 +501,46 @@ export class AgentSessionRuntime {
  		}
  
  		const previousSessionFile = this.session.sessionFile;
@@ -165,44 +268,64 @@ index c3b60569e7cad7b94f47bcfdf60e14c824dd62b1..f00496e1394dc304a7a29896a0475edf
 +		// Seam D: the destination is the exact final path, admitted before the copy and before the open. A
 +		// managed import creates the destination exclusively, so an existing session file is never overwritten.
 +		const exclusive = nativeCanonicalManaged();
++		const destination = resolve(destinationPath);
 +		const admission = await runCanonicalOperation({
 +			operation: "import",
-+			resolvedTarget: resolve(destinationPath),
-+			rebinds: true,
++			resolvedTarget: destination,
++			exclusiveCreate: exclusive,
 +			mutate: () => {
-+				if (resolve(destinationPath) !== resolvedPath) {
++				let copied = false;
++				if (destination !== resolvedPath) {
 +					copyFileSync(resolvedPath, destinationPath, exclusive ? constants.COPYFILE_EXCL : 0);
++					copied = true;
 +				}
 +				const opened = SessionManager.open(destinationPath, sessionDir, cwdOverride);
 +				try {
 +					assertSessionCwdExists(opened, this.cwd);
 +				} catch (error) {
++					// The copy created the destination and the open can rewrite it, so this failure is a definite
++					// no-mutation outcome only when neither happened.
++					if (copied || opened.fileRewrittenOnLoad()) throw error;
 +					throw new CanonicalMutationNotPerformedError(error);
 +				}
 +				return opened;
 +			},
++			rebind: async (sessionManager) => {
++				await this.teardownCurrent("resume", sessionManager.getSessionFile());
++				this.apply(
++					await this.createRuntime({
++						cwd: sessionManager.getCwd(),
++						agentDir: this.services.agentDir,
++						sessionManager,
++						sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
++					}),
++				);
++			},
 +		});
 +		if (!admission.ok) {
-+			throw new CanonicalOperationRefusedError(
-+				"import",
-+				resolve(destinationPath),
-+				admission.code,
-+				admission.message,
-+			);
++			throw new CanonicalOperationRefusedError("import", destination, admission.code, admission.message);
  		}
 -
 -		const sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
 -		assertSessionCwdExists(sessionManager, this.cwd);
-+		const sessionManager = admission.value;
- 		await this.teardownCurrent("resume", sessionManager.getSessionFile());
- 		this.apply(
- 			await this.createRuntime({
+-		await this.teardownCurrent("resume", sessionManager.getSessionFile());
+-		this.apply(
+-			await this.createRuntime({
+-				cwd: sessionManager.getCwd(),
+-				agentDir: this.services.agentDir,
+-				sessionManager,
+-				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+-			}),
+-		);
+ 		await this.finishSessionReplacement();
+ 		return { cancelled: false };
+ 	}
 diff --git a/packages/coding-agent/src/core/native-canonical.ts b/packages/coding-agent/src/core/native-canonical.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..d7cf332bf865eba86701c20423f07eccafa0eab7
+index 0000000000000000000000000000000000000000..25ce9b22624694a2ac68d10009b83fcd21768b09
 --- /dev/null
 +++ b/packages/coding-agent/src/core/native-canonical.ts
-@@ -0,0 +1,435 @@
+@@ -0,0 +1,510 @@
 +/**
 + * Seam D: canonical admission on exact names.
 + *
@@ -224,7 +347,8 @@ index 0000000000000000000000000000000000000000..d7cf332bf865eba86701c20423f07ecc
 + * 2. **Seam A and seam D share one binding source and one synchronous critical section.** The binding comes
 + *    only from the active owner's own session through the barrier's supplier, and the fence check, the
 + *    reservation consumption and the native mutation run in one uninterrupted turn. Nothing is ever awaited
-+ *    while that section is held.
++ *    while that section is held, and a rebind is committed only once that same supplier reports the admitted
++ *    target and its own generation.
 + * 3. **Unresolved persistence fails closed.** While a commit is pending, and permanently after a lost commit
 + *    receipt or an ambiguously failed mutation, every later canonical mutation and every seam A
 + *    authorization or dispatch is refused with `PERSISTENCE_UNCERTAIN`. Nothing is rolled back, replayed,
@@ -248,12 +372,16 @@ index 0000000000000000000000000000000000000000..d7cf332bf865eba86701c20423f07ecc
 +	resolvedTarget: { canonicalFile: string };
 +}
 +
-+export type CanonicalRefusalCode =
-+	| "TARGET_HAS_LIVE_WRITER"
-+	| "TARGET_UNCERTAIN"
-+	| "STALE_BINDING"
-+	| "DUPLICATE_OPERATION"
-+	| "ADMISSION_UNAVAILABLE";
++/** The five public refusal codes, exactly. A decision naming anything else is malformed. */
++export const CANONICAL_REFUSAL_CODES = [
++	"TARGET_HAS_LIVE_WRITER",
++	"TARGET_UNCERTAIN",
++	"STALE_BINDING",
++	"DUPLICATE_OPERATION",
++	"ADMISSION_UNAVAILABLE",
++] as const;
++
++export type CanonicalRefusalCode = (typeof CANONICAL_REFUSAL_CODES)[number];
 +
 +export type CanonicalAdmission =
 +	| { reservationId: string }
@@ -299,10 +427,25 @@ index 0000000000000000000000000000000000000000..d7cf332bf865eba86701c20423f07ecc
 +	operation: CanonicalOperationKind;
 +	/** The exact normalized absolute file this operation creates, opens, copies, appends to or unlinks. */
 +	resolvedTarget: string;
-+	/** True when success makes `resolvedTarget` this owner's own canonical file. Rename and delete do not. */
-+	rebinds: boolean;
 +	/** The one native mutation. Must be synchronous: it runs inside the shared critical section. */
 +	mutate: () => T;
++	/**
++	 * The asynchronous replacement that actually moves this owner's binding onto `resolvedTarget`: the call
++	 * site's own session teardown and runtime creation. Present for a rebind (`new`, `fork`, `resume`,
++	 * `import`) and absent for an operation on another file (`rename`, `delete`, startup adoption).
++	 *
++	 * It runs after the synchronous mutation and outside the synchronous section, while every later protected
++	 * canonical mutation and every seam A boundary is already blocked. The commit that follows carries the
++	 * generation the active-owner supplier itself reports once this resolved — never one computed from the
++	 * requested target.
++	 */
++	rebind?: (value: T) => Promise<void>;
++	/**
++	 * True only where this mutation's first write is an exclusive create of `resolvedTarget` — `wx` or
++	 * `COPYFILE_EXCL` — so an `EEXIST` from it proves no byte changed. Everywhere else an `EEXIST` may follow
++	 * a side effect and is mutation uncertainty, not a definite no-mutation abort.
++	 */
++	exclusiveCreate?: boolean;
 +}
 +
 +interface Reservation {
@@ -385,7 +528,6 @@ index 0000000000000000000000000000000000000000..d7cf332bf865eba86701c20423f07ecc
 +			this.#startupAdoption = this.#run(host, {
 +				operation: "startup",
 +				resolvedTarget: binding.canonicalFile,
-+				rebinds: false,
 +				mutate: () => undefined,
 +			}).then((adopted) => {
 +				if (adopted.ok) return undefined;
@@ -400,29 +542,35 @@ index 0000000000000000000000000000000000000000..d7cf332bf865eba86701c20423f07ecc
 +		const host = this.host;
 +		this.#syncOwner(host);
 +		if (!host) {
-+			// Unmanaged: exactly the mutation stock Pi performs, and exactly the error it throws. The
-+			// not-performed marker is a managed classification only, so it is unwrapped here.
++			// Unmanaged: exactly the mutation stock Pi performs, in the order it performs it, and exactly the
++			// error it throws. The not-performed marker is a managed classification only, so it is unwrapped here.
++			let value: T;
 +			try {
-+				return { ok: true, managed: false, value: request.mutate(), reservationId: undefined, nextGeneration: undefined };
++				value = request.mutate();
 +			} catch (error) {
 +				throw error instanceof CanonicalMutationNotPerformedError ? error.cause : error;
 +			}
++			await request.rebind?.(value);
++			return { ok: true, managed: false, value, reservationId: undefined, nextGeneration: undefined };
 +		}
-+		if (this.#state !== "READY") {
-+			return {
-+				ok: false,
-+				code: "PERSISTENCE_UNCERTAIN",
-+				message:
-+					this.#state === "COMMIT_PENDING"
-+						? "a canonical commit is still pending; this operation performed nothing"
-+						: "this owner's canonical persistence is unresolved; recovery is an explicit host action",
-+			};
-+		}
++		if (this.#state !== "READY") return this.#unresolved();
 +		if (request.operation !== "startup") {
 +			const blocked = await this.#adoptStartupBinding(host);
 +			if (blocked) return { ok: false, code: blocked.code, message: blocked.message };
 +		}
 +		return this.#run(host, request);
++	}
++
++	/** The fail-closed refusal, with the reason this owner is not `READY`. */
++	#unresolved(): { ok: false; code: "PERSISTENCE_UNCERTAIN"; message: string } {
++		return {
++			ok: false,
++			code: "PERSISTENCE_UNCERTAIN",
++			message:
++				this.#state === "COMMIT_PENDING"
++					? "a canonical commit is still pending; this operation performed nothing"
++					: "this owner's canonical persistence is unresolved; recovery is an explicit host action",
++		};
 +	}
 +
 +	async #run<T>(host: NativeCanonicalHost, request: CanonicalOperationRequest<T>): Promise<CanonicalOperationResult<T>> {
@@ -441,10 +589,7 @@ index 0000000000000000000000000000000000000000..d7cf332bf865eba86701c20423f07ecc
 +			return unavailable(`the admission handler failed: ${describeError(error)}`);
 +		}
 +		if (!admission || typeof admission !== "object") return unavailable("the admission handler returned no decision");
-+		if ("refused" in admission && admission.refused) {
-+			const code = admission.code ?? "ADMISSION_UNAVAILABLE";
-+			return { ok: false, code, message: admission.message ?? "no message given" };
-+		}
++		if ("refused" in admission) return refusalOf(admission);
 +		const reservationId = (admission as { reservationId?: unknown }).reservationId;
 +		if (typeof reservationId !== "string" || reservationId.length === 0) {
 +			// A `forwardTo` arm lands here too: v1 has none, so an unrecognised decision forwards nothing.
@@ -470,11 +615,15 @@ index 0000000000000000000000000000000000000000..d7cf332bf865eba86701c20423f07ecc
 +
 +		// ---- the shared synchronous section. Nothing is awaited between here and its end. ----
 +		let outcome:
-+			| { mutated: true; value: T; nextGeneration: number }
++			| { mutated: true; value: T; generation: number }
 +			| { mutated: false; refusal: { ok: false; code: CanonicalOperationRefusalCode; message: string } }
 +			| { mutated: "unknown"; error: unknown; definite: boolean };
 +		try {
 +			outcome = nativeSubmissionBarrier.runCanonicalMutation(() => {
++				// The coordinator's own state is rechecked *here*, inside the section: another operation admitted
++				// at the same generation can have reached its commit while this one awaited its own admission, and
++				// its reservation id is its own, so the earlier pre-admission check does not cover this.
++				if (this.#state !== "READY") return { mutated: false as const, refusal: this.#unresolved() };
 +				if (reservation.consumed) {
 +					return {
 +						mutated: false as const,
@@ -504,17 +653,17 @@ index 0000000000000000000000000000000000000000..d7cf332bf865eba86701c20423f07ecc
 +				try {
 +					value = request.mutate();
 +				} catch (error) {
++					// Only two outcomes prove nothing changed: the call site's own not-performed marker, and an
++					// `EEXIST` from a call site whose first write is the exclusive create of this exact target. A
++					// late `EEXIST` from anywhere else may follow a side effect and stays uncertain.
 +					const definite =
 +						error instanceof CanonicalMutationNotPerformedError ||
-+						(error as { code?: unknown } | null)?.code === "EEXIST";
++						(request.exclusiveCreate === true && (error as { code?: unknown } | null)?.code === "EEXIST");
 +					return { mutated: "unknown" as const, error, definite };
 +				}
-+				const after = nativeSubmissionBarrier.binding;
-+				const nextGeneration =
-+					request.rebinds && request.resolvedTarget !== after.canonicalFile
-+						? after.generation + 1
-+						: after.generation;
-+				return { mutated: true as const, value, nextGeneration };
++				// The generation an operation on another file commits: the one the supplier reports right now,
++				// unchanged. A rebind's generation is not known yet — its replacement has not run.
++				return { mutated: true as const, value, generation: nativeSubmissionBarrier.binding.generation };
 +			});
 +		} catch (error) {
 +			// The section refused to run at all — a re-entrant canonical mutation. Nothing ran, so the
@@ -527,10 +676,12 @@ index 0000000000000000000000000000000000000000..d7cf332bf865eba86701c20423f07ecc
 +
 +		if (outcome.mutated === false) {
 +			this.#release(reservation);
-+			// A stale binding leaves this reservation unused, so it is aborted. A duplicate consumption names a
-+			// reservation some earlier call already owns, and aborting that one would cancel its work.
-+			if (outcome.refusal.code === "STALE_BINDING") {
-+				await this.#abort(host, reservation, `stale binding: ${outcome.refusal.message}`);
++			// A stale binding, and a refusal this owner's own unresolved persistence caused, both leave *this*
++			// reservation definitely unused, so it is aborted — its id is its own, so aborting it cancels no other
++			// operation's work and changes no other operation's state. A duplicate consumption names a reservation
++			// some earlier call already owns, and aborting that one would cancel its work.
++			if (outcome.refusal.code === "STALE_BINDING" || outcome.refusal.code === "PERSISTENCE_UNCERTAIN") {
++				await this.#abort(host, reservation, `the operation performed nothing: ${outcome.refusal.message}`);
 +			}
 +			return outcome.refusal;
 +		}
@@ -546,9 +697,35 @@ index 0000000000000000000000000000000000000000..d7cf332bf865eba86701c20423f07ecc
 +			throw outcome.error;
 +		}
 +
++		// The mutation is done and unresolved until the host commits it: later canonical mutations and seam A
++		// boundaries are blocked from here, across the awaited replacement below, and the synchronous section is
++		// not held for any of it.
 +		this.#setState("COMMIT_PENDING");
++		let nextGeneration = outcome.generation;
++		if (request.rebind) {
++			try {
++				await request.rebind(outcome.value);
++			} catch (error) {
++				// The mutation happened and this owner's binding never reached the target. Nothing is committed,
++				// nothing is rolled back, and the reservation stays retained: the state is fail-closed, not READY.
++				this.#setState("UNCERTAIN");
++				throw error;
++			}
++			// The authoritative supplier, read after the replacement finished: the commit carries the generation
++			// it reports, never one computed from the requested target.
++			const rebound = nativeSubmissionBarrier.runCanonicalMutation(() => nativeSubmissionBarrier.binding);
++			if (rebound.canonicalFile !== request.resolvedTarget) {
++				this.#setState("UNCERTAIN");
++				return {
++					ok: false,
++					code: "PERSISTENCE_UNCERTAIN",
++					message: `the canonical mutation happened but this owner is bound to ${rebound.canonicalFile ?? "no file"} rather than the admitted ${request.resolvedTarget}; nothing was committed`,
++				};
++			}
++			nextGeneration = rebound.generation;
++		}
 +		try {
-+			await host.commitBinding({ reservationId, nextGeneration: outcome.nextGeneration });
++			await host.commitBinding({ reservationId, nextGeneration });
 +		} catch (error) {
 +			// The commit receipt is lost. The reservation stays retained and this owner stays fail-closed.
 +			this.#setState("UNCERTAIN");
@@ -559,8 +736,10 @@ index 0000000000000000000000000000000000000000..d7cf332bf865eba86701c20423f07ecc
 +			};
 +		}
 +		this.#release(reservation);
-+		this.#setState("READY");
-+		return { ok: true, managed: true, value: outcome.value, reservationId, nextGeneration: outcome.nextGeneration };
++		// Only this operation's pending commit is cleared. Uncertainty another operation recorded while this
++		// commit was in flight outlives it rather than being reset to READY.
++		if (this.#state === "COMMIT_PENDING") this.#setState("READY");
++		return { ok: true, managed: true, value: outcome.value, reservationId, nextGeneration };
 +	}
 +
 +	#release(reservation: Reservation): void {
@@ -582,6 +761,24 @@ index 0000000000000000000000000000000000000000..d7cf332bf865eba86701c20423f07ecc
 +
 +function unavailable<T>(message: string): CanonicalOperationResult<T> {
 +	return { ok: false, code: "ADMISSION_UNAVAILABLE", message };
++}
++
++/**
++ * Validate a refusal arm strictly, because a host that returns a decision Pi does not recognise must not be
++ * able to invent a refusal code or an unreadable message. `refused` must be exactly `true`, the code must be
++ * one of the five public names, and the message must be a non-empty string; anything else is a malformed
++ * decision, which is `ADMISSION_UNAVAILABLE`.
++ */
++function refusalOf<T>(admission: object): CanonicalOperationResult<T> {
++	const { refused, code, message } = admission as { refused?: unknown; code?: unknown; message?: unknown };
++	if (refused !== true) return unavailable(`the admission carried refused: ${String(refused)}, which is not true`);
++	if (!CANONICAL_REFUSAL_CODES.includes(code as CanonicalRefusalCode)) {
++		return unavailable(`the refusal named the unrecognised code ${JSON.stringify(code)}`);
++	}
++	if (typeof message !== "string" || message.length === 0) {
++		return unavailable(`the ${String(code)} refusal carried no message string`);
++	}
++	return { ok: false, code: code as CanonicalRefusalCode, message };
 +}
 +
 +function describeError(error: unknown): string {
@@ -618,9 +815,10 @@ index 0000000000000000000000000000000000000000..d7cf332bf865eba86701c20423f07ecc
 +	version: 1,
 +	delivers: [
 +		"admission on the exact normalized absolute final filename, resolved before the reservation, for startup adoption, new, fork, resume, import, selector rename and selector delete",
-+		"one reservation consumed inside the same synchronous critical section seam A's fence uses, with no host, extension or model work awaited while it is held",
++		"one reservation consumed inside the same synchronous critical section seam A's fence uses, with no host, extension or model work awaited while it is held, and the coordinator's own state rechecked inside it",
 +		"a stale binding, a duplicate reservation or operation id, a refusal, a throw, a rejection and a malformed decision each mutate nothing",
 +		"an admitted create that finds the exact name taken fails the operation and aborts its reservation, with no suffix reroll and no overwrite",
++		"a rebind committed only after this owner's own active-owner supplier reports the admitted target, carrying the generation that supplier reports, so a failed replacement stays uncertain instead of reporting a binding the owner does not hold",
 +		"a generation that advances exactly once when the owner's own canonical filename changes, and not at all for a rename, a delete or a same-file resume",
 +		"fail-closed PERSISTENCE_UNCERTAIN for later canonical mutations and for seam A authorization and dispatch while a commit is pending or unresolved",
 +	],
@@ -852,10 +1050,10 @@ index 842f7b75b0b19b980dc8275c0c5cb66191eafcce..0147a36b7f67710ed8a115e8eb5a3e4c
  			host.nativeSubmitOutcome({
  				submissionId,
 diff --git a/packages/coding-agent/src/core/session-manager.ts b/packages/coding-agent/src/core/session-manager.ts
-index f8db9b0e5b54233db7d0076a32e8857d6470f6f7..1b92846c0d35af955b9b4e80e2aba566880a4953 100644
+index f8db9b0e5b54233db7d0076a32e8857d6470f6f7..cf0be3e01215326cb3ba9869f417cd354963f228 100644
 --- a/packages/coding-agent/src/core/session-manager.ts
 +++ b/packages/coding-agent/src/core/session-manager.ts
-@@ -864,6 +864,12 @@ export class SessionManager {
+@@ -864,6 +864,18 @@ export class SessionManager {
  	private labelsById: Map<string, string> = new Map();
  	private labelTimestampsById: Map<string, string> = new Map();
  	private leafId: string | null = null;
@@ -865,10 +1063,40 @@ index f8db9b0e5b54233db7d0076a32e8857d6470f6f7..1b92846c0d35af955b9b4e80e2aba566
 +	 * naming step. Undefined for every unmanaged flow, which names its file exactly as before.
 +	 */
 +	private pendingSessionTarget: { sessionFile: string; sessionId: string; timestamp: string } | undefined;
++	/**
++	 * Seam D: whether loading the current session file rewrote it — an empty file initialized with a header,
++	 * or a legacy file migrated. A call site that admitted this exact file reads it to tell a failure that
++	 * definitely changed nothing from one that followed a write.
++	 */
++	private rewroteFileOnLoad = false;
  
  	private constructor(
  		cwd: string,
-@@ -931,8 +937,11 @@ export class SessionManager {
+@@ -893,6 +905,7 @@ export class SessionManager {
+ 	}
+ 
+ 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
++		this.rewroteFileOnLoad = false;
+ 		this.sessionFile = resolvePath(sessionFile);
+ 		if (existsSync(this.sessionFile)) {
+ 			this.fileEntries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
+@@ -907,6 +920,7 @@ export class SessionManager {
+ 				this.newSession();
+ 				this.sessionFile = explicitPath;
+ 				this._rewriteFile();
++				this.rewroteFileOnLoad = true;
+ 				this.flushed = true;
+ 				return;
+ 			}
+@@ -916,6 +930,7 @@ export class SessionManager {
+ 
+ 			if (migrateToCurrentVersion(this.fileEntries)) {
+ 				this._rewriteFile();
++				this.rewroteFileOnLoad = true;
+ 			}
+ 
+ 			this._buildIndex();
+@@ -931,8 +946,11 @@ export class SessionManager {
  		if (options?.id !== undefined) {
  			assertValidSessionId(options.id);
  		}
@@ -882,7 +1110,7 @@ index f8db9b0e5b54233db7d0076a32e8857d6470f6f7..1b92846c0d35af955b9b4e80e2aba566
  		const header: SessionHeader = {
  			type: "session",
  			version: CURRENT_SESSION_VERSION,
-@@ -950,11 +959,38 @@ export class SessionManager {
+@@ -950,11 +968,46 @@ export class SessionManager {
  
  		if (this.persist) {
  			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
@@ -919,10 +1147,18 @@ index f8db9b0e5b54233db7d0076a32e8857d6470f6f7..1b92846c0d35af955b9b4e80e2aba566
 +		return pending;
 +	}
 +
++	/**
++	 * Whether loading the current session file rewrote it: an empty file initialized with a header, or a
++	 * legacy file migrated to the current version. False for a file that was only read.
++	 */
++	fileRewrittenOnLoad(): boolean {
++		return this.rewroteFileOnLoad;
++	}
++
  	private _buildIndex(): void {
  		this.byId.clear();
  		this.labelsById.clear();
-@@ -976,9 +1012,11 @@ export class SessionManager {
+@@ -976,9 +1029,11 @@ export class SessionManager {
  		}
  	}
  
@@ -936,7 +1172,7 @@ index f8db9b0e5b54233db7d0076a32e8857d6470f6f7..1b92846c0d35af955b9b4e80e2aba566
  		try {
  			for (const entry of this.fileEntries) {
  				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
-@@ -1412,6 +1450,7 @@ export class SessionManager {
+@@ -1412,6 +1467,7 @@ export class SessionManager {
  	 */
  	createBranchedSession(leafId: string): string | undefined {
  		const previousSessionFile = this.sessionFile;
@@ -944,7 +1180,7 @@ index f8db9b0e5b54233db7d0076a32e8857d6470f6f7..1b92846c0d35af955b9b4e80e2aba566
  		const path = this.getBranch(leafId);
  		if (path.length === 0) {
  			throw new Error(`Entry ${leafId} not found`);
-@@ -1428,10 +1467,10 @@ export class SessionManager {
+@@ -1428,10 +1484,10 @@ export class SessionManager {
  			pathParentId = entry.id;
  		}
  
@@ -958,7 +1194,7 @@ index f8db9b0e5b54233db7d0076a32e8857d6470f6f7..1b92846c0d35af955b9b4e80e2aba566
  
  		const header: SessionHeader = {
  			type: "session",
-@@ -1482,7 +1521,7 @@ export class SessionManager {
+@@ -1482,7 +1538,7 @@ export class SessionManager {
  			// no-assistant guard later resets flushed to false.
  			const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
  			if (hasAssistant) {
@@ -1005,7 +1241,7 @@ index b4a9b0f6b290bd12340ef172f2cdd6f3706d877a..00114bd4f467c65079c681e6babdc237
  	type ModelScopeDiagnostic,
  	type ResolveCliModelResult,
 diff --git a/packages/coding-agent/src/modes/interactive/components/session-selector.ts b/packages/coding-agent/src/modes/interactive/components/session-selector.ts
-index 4949eee5124d5306240ddeb5e35200e23f9ca228..88ad0be9b44477a5b30af28f6ad9023714a9f2ea 100644
+index 4949eee5124d5306240ddeb5e35200e23f9ca228..b2f5ca10df210db9f2fc08c5f185db4255a3610f 100644
 --- a/packages/coding-agent/src/modes/interactive/components/session-selector.ts
 +++ b/packages/coding-agent/src/modes/interactive/components/session-selector.ts
 @@ -1,6 +1,5 @@
@@ -1020,31 +1256,47 @@ index 4949eee5124d5306240ddeb5e35200e23f9ca228..88ad0be9b44477a5b30af28f6ad90237
  	visibleWidth,
  } from "@earendil-works/pi-tui";
  import { KeybindingsManager } from "../../../core/keybindings.ts";
-+import { runCanonicalOperation } from "../../../core/native-canonical.ts";
++import { CanonicalMutationNotPerformedError, runCanonicalOperation } from "../../../core/native-canonical.ts";
  import type { SessionInfo, SessionListProgress } from "../../../core/session-manager.ts";
 -import { canonicalizePath as _canonicalizePath } from "../../../utils/paths.ts";
-+import { canonicalizePath as _canonicalizePath, resolvePath } from "../../../utils/paths.ts";
++import { canonicalizePath as _canonicalizePath, getFileRevision, resolvePath } from "../../../utils/paths.ts";
  import { theme } from "../theme/theme.ts";
  import { DynamicBorder } from "./dynamic-border.ts";
  import { keyHint, keyText } from "./keybinding-hints.ts";
-@@ -640,11 +640,12 @@ class SessionList implements Component, Focusable {
+@@ -640,11 +640,28 @@ class SessionList implements Component, Focusable {
  type SessionsLoader = (onProgress?: SessionListProgress) => Promise<SessionInfo[]>;
  
  /**
 - * Delete a session file, trying the `trash` CLI first, then falling back to unlink
-+ * Delete a session file, trying the `trash` CLI first, then falling back to unlink.
++ * Thrown when a session file was not deleted: neither `trash` nor `unlink` removed it.
 + *
-+ * Synchronous: seam D consumes its reservation in the same uninterrupted turn as this deletion, so the
-+ * unlink cannot be an awaited boundary. `spawnSync` was already synchronous.
++ * Seam D needs a throw rather than a soft `{ok:false}`, because a failed deletion must never be committed as
++ * a completed canonical operation. The selector shows the same message it always showed.
   */
 -async function deleteSessionFile(
 -	sessionPath: string,
 -): Promise<{ ok: boolean; method: "trash" | "unlink"; error?: string }> {
++class SessionDeleteFailedError extends Error {
++	readonly detail: string;
++
++	constructor(detail: string) {
++		super(detail);
++		this.name = "SessionDeleteFailedError";
++		this.detail = detail;
++	}
++}
++
++/**
++ * Delete a session file, trying the `trash` CLI first, then falling back to unlink.
++ *
++ * Synchronous: seam D consumes its reservation in the same uninterrupted turn as this deletion, so the
++ * unlink cannot be an awaited boundary. `spawnSync` was already synchronous.
++ */
 +function deleteSessionFile(sessionPath: string): { ok: boolean; method: "trash" | "unlink"; error?: string } {
  	// Try `trash` first (if installed)
  	const trashArgs = sessionPath.startsWith("-") ? ["--", sessionPath] : [sessionPath];
  	const trashResult = spawnSync("trash", trashArgs, { encoding: "utf-8" });
-@@ -669,7 +670,7 @@ async function deleteSessionFile(
+@@ -669,7 +686,7 @@ async function deleteSessionFile(
  
  	// Fallback to permanent deletion
  	try {
@@ -1053,33 +1305,52 @@ index 4949eee5124d5306240ddeb5e35200e23f9ca228..88ad0be9b44477a5b30af28f6ad90237
  		return { ok: true, method: "unlink" };
  	} catch (err) {
  		const unlinkError = err instanceof Error ? err.message : String(err);
-@@ -830,7 +831,23 @@ export class SessionSelectorComponent extends Container implements Focusable {
+@@ -830,7 +847,42 @@ export class SessionSelectorComponent extends Container implements Focusable {
  
  		// Handle session deletion
  		this.sessionList.onDeleteSession = async (sessionPath: string) => {
 -			const result = await deleteSessionFile(sessionPath);
 +			// Seam D: the exact selected file is admitted before it is trashed or unlinked, and a refusal is
 +			// shown in the selector's own status line. Deleting another session never moves this owner's binding.
-+			const admission = await runCanonicalOperation({
-+				operation: "delete",
-+				resolvedTarget: resolvePath(sessionPath),
-+				rebinds: false,
-+				mutate: () => deleteSessionFile(sessionPath),
-+			});
-+			if (!admission.ok) {
-+				this.header.setStatusMessage(
-+					{ type: "error", message: `Cannot delete (${admission.code}): ${admission.message}` },
-+					5000,
-+				);
++			const target = resolvePath(sessionPath);
++			let result: { ok: boolean; method: "trash" | "unlink"; error?: string };
++			try {
++				const admission = await runCanonicalOperation({
++					operation: "delete",
++					resolvedTarget: target,
++					mutate: () => {
++						// `trash` is an external command that runs before the unlink, so a failed deletion is not by
++						// itself proof that nothing changed. The file's own revision is: an unchanged one is the
++						// explicit no-mutation proof this reservation may be aborted on, and anything else stays
++						// uncertain. Either way a failure is never committed as a completed deletion.
++						const before = getFileRevision(target);
++						const deletion = deleteSessionFile(sessionPath);
++						if (deletion.ok) return deletion;
++						const failure = new SessionDeleteFailedError(deletion.error ?? "Unknown error");
++						const unchanged = before !== undefined && getFileRevision(target) === before;
++						throw unchanged ? new CanonicalMutationNotPerformedError(failure) : failure;
++					},
++				});
++				if (!admission.ok) {
++					this.header.setStatusMessage(
++						{ type: "error", message: `Cannot delete (${admission.code}): ${admission.message}` },
++						5000,
++					);
++					this.requestRender();
++					return;
++				}
++				result = admission.value;
++			} catch (error) {
++				if (!(error instanceof SessionDeleteFailedError)) throw error;
++				this.header.setStatusMessage({ type: "error", message: `Failed to delete: ${error.detail}` }, 3000);
 +				this.requestRender();
 +				return;
 +			}
-+			const result = admission.value;
  
  			if (result.ok) {
  				if (this.currentSessions) {
 diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
-index 8e28e4a976efbccfa5849b38b0af870cf8c512fe..bdc41e5c82ddd7bc372c19275625faee43b9c6ca 100644
+index 8e28e4a976efbccfa5849b38b0af870cf8c512fe..c00d8c2498930c2e1950b8854a4c661cef96c1dd 100644
 --- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
 +++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
 @@ -57,7 +57,11 @@ import {
@@ -1163,7 +1434,7 @@ index 8e28e4a976efbccfa5849b38b0af870cf8c512fe..bdc41e5c82ddd7bc372c19275625faee
  				this.reportRefusedSubmission(
  					text,
  					new NativeSubmissionRefusedError({
-@@ -5803,8 +5826,20 @@ export class InteractiveMode {
+@@ -5803,8 +5826,19 @@ export class InteractiveMode {
  					renameSession: async (sessionFilePath: string, nextName: string | undefined) => {
  						const next = (nextName ?? "").trim();
  						if (!next) return;
@@ -1174,7 +1445,6 @@ index 8e28e4a976efbccfa5849b38b0af870cf8c512fe..bdc41e5c82ddd7bc372c19275625faee
 +						const admission = await runCanonicalOperation({
 +							operation: "rename",
 +							resolvedTarget: resolvePath(sessionFilePath),
-+							rebinds: false,
 +							mutate: () => {
 +								const mgr = SessionManager.open(sessionFilePath);
 +								mgr.appendSessionInfo(next);
@@ -1186,7 +1456,7 @@ index 8e28e4a976efbccfa5849b38b0af870cf8c512fe..bdc41e5c82ddd7bc372c19275625faee
  					},
  					showRenameHint: true,
  					keybindings: this.keybindings,
-@@ -5849,6 +5884,7 @@ export class InteractiveMode {
+@@ -5849,6 +5883,7 @@ export class InteractiveMode {
  				this.showStatus("Resumed session in current cwd");
  				return result;
  			}
@@ -1194,7 +1464,7 @@ index 8e28e4a976efbccfa5849b38b0af870cf8c512fe..bdc41e5c82ddd7bc372c19275625faee
  			return this.handleFatalRuntimeError("Failed to resume session", error);
  		}
  	}
-@@ -6549,6 +6585,7 @@ export class InteractiveMode {
+@@ -6549,6 +6584,7 @@ export class InteractiveMode {
  				this.showError(`Failed to import session: ${error.message}`);
  				return;
  			}
@@ -1202,7 +1472,7 @@ index 8e28e4a976efbccfa5849b38b0af870cf8c512fe..bdc41e5c82ddd7bc372c19275625faee
  			await this.handleFatalRuntimeError("Failed to import session", error);
  		}
  	}
-@@ -6833,6 +6870,7 @@ export class InteractiveMode {
+@@ -6833,6 +6869,7 @@ export class InteractiveMode {
  			this.chatContainer.addChild(new Text(`${theme.fg("accent", "✓ New session started")}`, 1, 1));
  			this.ui.requestRender();
  		} catch (error: unknown) {
@@ -1212,10 +1482,10 @@ index 8e28e4a976efbccfa5849b38b0af870cf8c512fe..bdc41e5c82ddd7bc372c19275625faee
  	}
 diff --git a/packages/coding-agent/test/native-canonical-admission.test.ts b/packages/coding-agent/test/native-canonical-admission.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..24cb8c198d28e60153eed870e274a1bc05d3ca5e
+index 0000000000000000000000000000000000000000..d264bce0d7525e364ab85c13df2043a9fb3277ed
 --- /dev/null
 +++ b/packages/coding-agent/test/native-canonical-admission.test.ts
-@@ -0,0 +1,416 @@
+@@ -0,0 +1,605 @@
 +/**
 + * Seam D regression test: canonical admission on exact names.
 + *
@@ -1225,14 +1495,16 @@ index 0000000000000000000000000000000000000000..24cb8c198d28e60153eed870e274a1bc
 + * this proves nothing about Task 14 storage or about the pre-spawn startup reservation Task 16 owns.
 + */
 +
-+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
++import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 +import { tmpdir } from "node:os";
 +import { join } from "node:path";
 +import { afterEach, beforeEach, describe, expect, it } from "vitest";
 +import {
++	CANONICAL_REFUSAL_CODES,
 +	type CanonicalAdmission,
 +	type CanonicalOperation,
 +	nativeCanonicalCapability,
++	nativeCanonicalCoordinator,
 +	runCanonicalOperation,
 +} from "../src/core/native-canonical.ts";
 +import {
@@ -1241,7 +1513,7 @@ index 0000000000000000000000000000000000000000..24cb8c198d28e60153eed870e274a1bc
 +	setNativeSubmissionHost,
 +	type SubmissionEnvelope,
 +} from "../src/core/native-submission.ts";
-+import { SessionManager } from "../src/core/session-manager.ts";
++import { CURRENT_SESSION_VERSION, SessionManager } from "../src/core/session-manager.ts";
 +
 +let owners = 0;
 +let workspace: string;
@@ -1327,7 +1599,6 @@ index 0000000000000000000000000000000000000000..24cb8c198d28e60153eed870e274a1bc
 +		const result = await runCanonicalOperation({
 +			operation: "rename",
 +			resolvedTarget: join(workspace, "other.jsonl"),
-+			rebinds: false,
 +			mutate: () => "mutated",
 +		});
 +		expect(result).toMatchObject({ ok: true, managed: false, value: "mutated" });
@@ -1349,7 +1620,7 @@ index 0000000000000000000000000000000000000000..24cb8c198d28e60153eed870e274a1bc
 +});
 +
 +describe("seam D: admission before the first side effect", () => {
-+	it("admits the exact resolved name, mutates once, and commits the advanced generation", async () => {
++	it("admits the exact resolved name, mutates once, and commits the generation the supplier reports", async () => {
 +		const host = new FakeCanonicalHost();
 +		activate(host);
 +		const owner = bindOwner(join(workspace, "own.jsonl"));
@@ -1363,18 +1634,97 @@ index 0000000000000000000000000000000000000000..24cb8c198d28e60153eed870e274a1bc
 +		const result = await runCanonicalOperation({
 +			operation: "new",
 +			resolvedTarget: target,
-+			rebinds: true,
 +			mutate: () => {
 +				trace.push("mutate");
 +				writeFileSync(target, "{}\n", { flag: "wx" });
-+				owner.set(target);
 +				return "created";
++			},
++			// The replacement a call site owns: the old session is disposed and the new one binds the target.
++			rebind: async (value) => {
++				trace.push(`rebind:${value}`);
++				owner.set(undefined);
++				await Promise.resolve();
++				owner.set(target);
 +			},
 +		});
 +		expect(result.ok).toBe(true);
-+		expect(trace).toEqual([`admit:startup:${join(workspace, "own.jsonl")}`, `admit:new:${target}`, "mutate"]);
++		expect(trace).toEqual([
++			`admit:startup:${join(workspace, "own.jsonl")}`,
++			`admit:new:${target}`,
++			"mutate",
++			"rebind:created",
++		]);
++		// The committed generation is the one the barrier reports after the replacement, not target arithmetic.
++		expect(nativeSubmissionBarrier.binding).toEqual({ canonicalFile: target, generation: before + 1 });
 +		expect(host.committed.at(-1)).toEqual({ reservationId: "reservation-2", nextGeneration: before + 1 });
 +		expect(host.aborted).toHaveLength(0);
++	});
++
++	it("commits the unchanged generation for a same-file resume that disposes and rebinds one file", async () => {
++		const host = new FakeCanonicalHost();
++		activate(host);
++		const own = join(workspace, "own.jsonl");
++		const owner = bindOwner(own);
++		const generation = nativeSubmissionBarrier.binding.generation;
++		const result = await runCanonicalOperation({
++			operation: "resume",
++			resolvedTarget: own,
++			mutate: () => "reopened",
++			rebind: async () => {
++				owner.set(undefined);
++				await Promise.resolve();
++				owner.set(own);
++			},
++		});
++		expect(result).toMatchObject({ ok: true, nextGeneration: generation });
++		expect(host.committed.at(-1)?.nextGeneration).toBe(generation);
++	});
++
++	it("commits nothing when the replacement leaves this owner off the admitted target", async () => {
++		const host = new FakeCanonicalHost();
++		activate(host);
++		const owner = bindOwner(join(workspace, "own.jsonl"));
++		const target = join(workspace, "target.jsonl");
++		const result = await runCanonicalOperation({
++			operation: "resume",
++			resolvedTarget: target,
++			mutate: () => "mutated",
++			// A replacement that resolves without binding the target: the host must not be told the owner moved.
++			rebind: async () => {
++				owner.set(join(workspace, "elsewhere.jsonl"));
++			},
++		});
++		expect(result).toMatchObject({ ok: false, code: "PERSISTENCE_UNCERTAIN" });
++		// Only the startup adoption committed; the rebind did not.
++		expect(host.committed.map((entry) => entry.reservationId)).toEqual(["reservation-1"]);
++		expect(host.aborted).toHaveLength(0);
++		expect(nativeCanonicalCoordinator.state).toBe("UNCERTAIN");
++	});
++
++	it("stays fail-closed and commits nothing when the replacement itself fails", async () => {
++		const host = new FakeCanonicalHost();
++		activate(host);
++		bindOwner(join(workspace, "own.jsonl"));
++		await expect(
++			runCanonicalOperation({
++				operation: "new",
++				resolvedTarget: join(workspace, "target.jsonl"),
++				mutate: () => "created",
++				rebind: async () => {
++					throw new Error("runtime creation failed");
++				},
++			}),
++		).rejects.toThrow(/runtime creation failed/);
++		expect(host.committed.map((entry) => entry.reservationId)).toEqual(["reservation-1"]);
++		expect(host.aborted).toHaveLength(0);
++		expect(nativeCanonicalCoordinator.state).toBe("UNCERTAIN");
++		// Not restored to READY: a later canonical mutation and seam A both stay refused.
++		const later = await runCanonicalOperation({
++			operation: "rename",
++			resolvedTarget: join(workspace, "other.jsonl"),
++			mutate: () => "renamed",
++		});
++		expect(later).toMatchObject({ ok: false, code: "PERSISTENCE_UNCERTAIN" });
 +	});
 +
 +	it("commits the unchanged generation for a rename and a delete of another file", async () => {
@@ -1388,7 +1738,6 @@ index 0000000000000000000000000000000000000000..24cb8c198d28e60153eed870e274a1bc
 +			const result = await runCanonicalOperation({
 +				operation,
 +				resolvedTarget: other,
-+				rebinds: false,
 +				mutate: () => operation,
 +			});
 +			expect(result.ok).toBe(true);
@@ -1431,14 +1780,59 @@ index 0000000000000000000000000000000000000000..24cb8c198d28e60153eed870e274a1bc
 +			runCanonicalOperation({
 +				operation: "fork",
 +				resolvedTarget: target,
-+				rebinds: true,
++				exclusiveCreate: true,
 +				mutate: () => manager.createBranchedSession(leaf),
++				rebind: async () => {
++					throw new Error("the replacement must never run for a create that failed");
++				},
 +			}),
 +		).rejects.toMatchObject({ code: "EEXIST" });
 +		expect(readFileSync(target, "utf8")).toBe("squatter\n");
 +		// One abort for the fork's reservation, and a commit only for the startup adoption that preceded it.
 +		expect(host.aborted.map((entry) => entry.reservationId)).toEqual(["reservation-2"]);
 +		expect(host.committed.map((entry) => entry.reservationId)).toEqual(["reservation-1"]);
++	});
++
++	it("keeps an EEXIST from a call site that is not an exclusive create uncertain, and aborts nothing", async () => {
++		const host = new FakeCanonicalHost();
++		activate(host);
++		bindOwner(join(workspace, "own.jsonl"));
++		const other = join(workspace, "other.jsonl");
++		writeFileSync(other, "{}\n");
++		await expect(
++			runCanonicalOperation({
++				operation: "rename",
++				resolvedTarget: other,
++				mutate: () => {
++					// A late EEXIST, after this mutation already appended: it proves nothing about the bytes.
++					appendFileSync(other, "appended\n");
++					throw Object.assign(new Error("EEXIST: file already exists"), { code: "EEXIST" });
++				},
++			}),
++		).rejects.toMatchObject({ code: "EEXIST" });
++		expect(host.aborted).toHaveLength(0);
++		expect(nativeCanonicalCoordinator.state).toBe("UNCERTAIN");
++	});
++
++	it("reports whether opening a session file rewrote it, which is what a definite no-mutation failure needs", () => {
++		const sessions = join(workspace, "sessions");
++		mkdirSync(sessions, { recursive: true });
++		const header = {
++			type: "session",
++			version: CURRENT_SESSION_VERSION,
++			id: "01a0b6d7-0000-7000-8000-000000000001",
++			timestamp: new Date().toISOString(),
++			cwd: workspace,
++		};
++		const current = join(sessions, "current.jsonl");
++		writeFileSync(current, `${JSON.stringify(header)}\n`);
++		expect(SessionManager.open(current).fileRewrittenOnLoad()).toBe(false);
++		const legacy = join(sessions, "legacy.jsonl");
++		writeFileSync(legacy, `${JSON.stringify({ ...header, version: 1 })}\n`);
++		expect(SessionManager.open(legacy).fileRewrittenOnLoad()).toBe(true);
++		const empty = join(sessions, "empty.jsonl");
++		writeFileSync(empty, "");
++		expect(SessionManager.open(empty).fileRewrittenOnLoad()).toBe(true);
 +	});
 +});
 +
@@ -1466,6 +1860,23 @@ index 0000000000000000000000000000000000000000..24cb8c198d28e60153eed870e274a1bc
 +			decide: async () => ({ forwardTo: { canonicalFile: "/elsewhere.jsonl" } }) as unknown as CanonicalAdmission,
 +			code: "ADMISSION_UNAVAILABLE",
 +		},
++		{
++			name: "a refusal naming a code outside the five public ones",
++			decide: async () => ({ refused: true, code: "TARGET_BUSY", message: "busy" }) as unknown as CanonicalAdmission,
++			code: "ADMISSION_UNAVAILABLE",
++		},
++		{
++			name: "a refusal whose message is not a string",
++			decide: async () =>
++				({ refused: true, code: "TARGET_UNCERTAIN", message: { text: "busy" } }) as unknown as CanonicalAdmission,
++			code: "ADMISSION_UNAVAILABLE",
++		},
++		{
++			name: "a refusal flag that is not exactly true",
++			decide: async () =>
++				({ refused: "yes", code: "STALE_BINDING", message: "stale" }) as unknown as CanonicalAdmission,
++			code: "ADMISSION_UNAVAILABLE",
++		},
 +	];
 +	for (const entry of cases) {
 +		it(`performs no mutation for ${entry.name}`, async () => {
@@ -1477,7 +1888,6 @@ index 0000000000000000000000000000000000000000..24cb8c198d28e60153eed870e274a1bc
 +			const result = await runCanonicalOperation({
 +				operation: "delete",
 +				resolvedTarget: join(workspace, "other.jsonl"),
-+				rebinds: false,
 +				mutate: () => ++mutations,
 +			});
 +			expect(result).toMatchObject({ ok: false, code: entry.code });
@@ -1486,26 +1896,81 @@ index 0000000000000000000000000000000000000000..24cb8c198d28e60153eed870e274a1bc
 +		});
 +	}
 +
-+	it("lets two operations await admission concurrently while only one consumes its reservation", async () => {
++	it("passes each of the five public refusal codes through with the host's own message", async () => {
++		for (const code of CANONICAL_REFUSAL_CODES) {
++			const host = new FakeCanonicalHost();
++			activate(host);
++			bindOwner(join(workspace, "own.jsonl"));
++			host.decide = async (operation) =>
++				operation.operation === "startup"
++					? { reservationId: "startup" }
++					: { refused: true, code, message: `host says ${code}` };
++			const result = await runCanonicalOperation({
++				operation: "delete",
++				resolvedTarget: join(workspace, "other.jsonl"),
++				mutate: () => "deleted",
++			});
++			expect(result).toMatchObject({ ok: false, code, message: `host says ${code}` });
++		}
++	});
++
++	it("refuses a second operation that reuses one live reservation id, and aborts nobody's work", async () => {
 +		const host = new FakeCanonicalHost();
 +		activate(host);
 +		bindOwner(join(workspace, "own.jsonl"));
-+		host.decide = async (operation) => {
-+			if (operation.operation === "startup") return { reservationId: "startup" };
-+			// One host, one reservation id for both in-flight operations: only one may consume it.
-+			return { reservationId: "contended" };
++		let release: (() => void) | undefined;
++		host.commit = async (commit) => {
++			if (commit.reservationId !== "shared") return;
++			await new Promise<void>((resolve) => {
++				release = resolve;
++			});
 +		};
++		// One id for both in-flight operations: the reservation is one use, so the second cannot consume it.
++		host.decide = async (operation) =>
++			operation.operation === "startup" ? { reservationId: "startup" } : { reservationId: "shared" };
 +		let mutations = 0;
 +		const mutate = () => ++mutations;
-+		const [first, second] = await Promise.all([
-+			runCanonicalOperation({ operation: "rename", resolvedTarget: join(workspace, "a.jsonl"), rebinds: false, mutate }),
-+			runCanonicalOperation({ operation: "delete", resolvedTarget: join(workspace, "b.jsonl"), rebinds: false, mutate }),
-+		]);
-+		const outcomes = [first, second];
-+		expect(outcomes.filter((outcome) => outcome.ok)).toHaveLength(1);
-+		const refused = outcomes.find((outcome) => !outcome.ok) as { ok: false; code: string };
-+		expect(["DUPLICATE_OPERATION", "STALE_BINDING", "PERSISTENCE_UNCERTAIN"]).toContain(refused.code);
++		const first = runCanonicalOperation({ operation: "rename", resolvedTarget: join(workspace, "a.jsonl"), mutate });
++		const second = runCanonicalOperation({ operation: "delete", resolvedTarget: join(workspace, "b.jsonl"), mutate });
++		expect(await second).toMatchObject({ ok: false, code: "DUPLICATE_OPERATION" });
 +		expect(mutations).toBe(1);
++		// The live reservation belongs to the first operation, so nothing aborted it.
++		expect(host.aborted).toHaveLength(0);
++		release?.();
++		expect(await first).toMatchObject({ ok: true });
++	});
++
++	it("refuses a distinct reservation admitted while another operation's commit is pending, and aborts it", async () => {
++		const host = new FakeCanonicalHost();
++		activate(host);
++		bindOwner(join(workspace, "own.jsonl"));
++		let release: (() => void) | undefined;
++		host.commit = async (commit) => {
++			if (commit.reservationId !== "first") return;
++			await new Promise<void>((resolve) => {
++				release = resolve;
++			});
++		};
++		// Two operations admitted at the same generation, each with its own reservation id.
++		const ids = ["first", "second"];
++		host.decide = async (operation) =>
++			operation.operation === "startup" ? { reservationId: "startup" } : { reservationId: ids.shift() ?? "extra" };
++		let mutations = 0;
++		const mutate = () => ++mutations;
++		const first = runCanonicalOperation({ operation: "rename", resolvedTarget: join(workspace, "a.jsonl"), mutate });
++		const second = runCanonicalOperation({ operation: "delete", resolvedTarget: join(workspace, "b.jsonl"), mutate });
++		// The first operation mutated and is waiting for its commit; the second is refused inside the shared
++		// synchronous section, mutates nothing, and its own unused reservation is aborted.
++		expect(await second).toMatchObject({ ok: false, code: "PERSISTENCE_UNCERTAIN" });
++		expect(mutations).toBe(1);
++		expect(host.aborted).toEqual([
++			{ reservationId: "second", reason: expect.stringContaining("commit is still pending") },
++		]);
++		// Aborting the unused reservation did not disturb the operation still in flight.
++		expect(nativeCanonicalCoordinator.state).toBe("COMMIT_PENDING");
++		release?.();
++		expect(await first).toMatchObject({ ok: true, reservationId: "first" });
++		expect(nativeCanonicalCoordinator.state).toBe("READY");
 +	});
 +
 +	it("refuses a stale binding when the owner rebinds while admission is pending, and aborts it", async () => {
@@ -1520,7 +1985,6 @@ index 0000000000000000000000000000000000000000..24cb8c198d28e60153eed870e274a1bc
 +		const result = await runCanonicalOperation({
 +			operation: "rename",
 +			resolvedTarget: join(workspace, "other.jsonl"),
-+			rebinds: false,
 +			mutate: () => ++mutations,
 +		});
 +		expect(result).toMatchObject({ ok: false, code: "STALE_BINDING" });
@@ -1541,7 +2005,6 @@ index 0000000000000000000000000000000000000000..24cb8c198d28e60153eed870e274a1bc
 +		const first = await runCanonicalOperation({
 +			operation: "rename",
 +			resolvedTarget: join(workspace, "other.jsonl"),
-+			rebinds: false,
 +			mutate: () => "renamed",
 +		});
 +		expect(first).toMatchObject({ ok: false, code: "PERSISTENCE_UNCERTAIN" });
@@ -1553,7 +2016,6 @@ index 0000000000000000000000000000000000000000..24cb8c198d28e60153eed870e274a1bc
 +		const second = await runCanonicalOperation({
 +			operation: "delete",
 +			resolvedTarget: join(workspace, "other.jsonl"),
-+			rebinds: false,
 +			mutate: () => ++mutations,
 +		});
 +		expect(second).toMatchObject({ ok: false, code: "PERSISTENCE_UNCERTAIN" });
@@ -1576,7 +2038,6 @@ index 0000000000000000000000000000000000000000..24cb8c198d28e60153eed870e274a1bc
 +			runCanonicalOperation({
 +				operation: "delete",
 +				resolvedTarget: join(workspace, "other.jsonl"),
-+				rebinds: false,
 +				mutate: () => {
 +					throw new Error("half-written");
 +				},
@@ -1586,7 +2047,6 @@ index 0000000000000000000000000000000000000000..24cb8c198d28e60153eed870e274a1bc
 +		const later = await runCanonicalOperation({
 +			operation: "rename",
 +			resolvedTarget: join(workspace, "other.jsonl"),
-+			rebinds: false,
 +			mutate: () => "renamed",
 +		});
 +		expect(later).toMatchObject({ ok: false, code: "PERSISTENCE_UNCERTAIN" });
@@ -1603,7 +2063,6 @@ index 0000000000000000000000000000000000000000..24cb8c198d28e60153eed870e274a1bc
 +		const result = await runCanonicalOperation({
 +			operation: "rename",
 +			resolvedTarget: join(workspace, "other.jsonl"),
-+			rebinds: false,
 +			mutate: () => {
 +				mutations += 1;
 +				// A host that calls back into Pi from inside the section gets a definite refusal, not a
@@ -1632,3 +2091,121 @@ index 0000000000000000000000000000000000000000..24cb8c198d28e60153eed870e274a1bc
 +		expect(notDelivered).toMatch(/gate 5/);
 +	});
 +});
+diff --git a/packages/coding-agent/test/session-selector-path-delete.test.ts b/packages/coding-agent/test/session-selector-path-delete.test.ts
+index cb702d5e2e9bdf5d67027848866c1a90ccc9bab2..9fa9f23107f0fb6ff06770e3ba460e2a7de9bac9 100644
+--- a/packages/coding-agent/test/session-selector-path-delete.test.ts
++++ b/packages/coding-agent/test/session-selector-path-delete.test.ts
+@@ -1,9 +1,10 @@
+-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
++import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+ import { tmpdir } from "node:os";
+ import { join } from "node:path";
+ import { setKeybindings } from "@earendil-works/pi-tui";
+ import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+ import { KeybindingsManager } from "../src/core/keybindings.ts";
++import { nativeSubmissionBarrier, setNativeSubmissionHost } from "../src/core/native-submission.ts";
+ import type { SessionInfo } from "../src/core/session-manager.ts";
+ import { SessionSelectorComponent } from "../src/modes/interactive/components/session-selector.ts";
+ import { initTheme } from "../src/modes/interactive/theme/theme.ts";
+@@ -351,4 +352,101 @@ describe("session selector path/delete interactions", () => {
+ 		expect(confirmationChanges).toEqual([]);
+ 		expect(errorMessage).toBe("Cannot delete the currently active session");
+ 	});
++
++	/**
++	 * Seam D: a deletion that failed is never a completed canonical operation.
++	 *
++	 * `deleteSessionFile` runs the external `trash` command before the unlink, so a bare failure is not proof
++	 * that nothing changed; the file's own revision is. An unchanged revision aborts the reservation, and the
++	 * selector shows exactly the error it always showed.
++	 */
++	describe("a failed deletion", () => {
++		function undeletableSession(): { sessionPath: string; directory: string } {
++			const baseDir = mkdtempSync(join(tmpdir(), "pi-selector-delete-"));
++			tempDirs.push(baseDir);
++			const directory = join(baseDir, "sessions");
++			mkdirSync(directory);
++			const sessionPath = join(directory, "doomed.jsonl");
++			writeFileSync(sessionPath, "{}\n");
++			// A read-only directory is what makes both `trash` and `unlink` fail without touching the file.
++			chmodSync(directory, 0o500);
++			return { sessionPath, directory };
++		}
++
++		function selectorFor(sessionPath: string): SessionSelectorComponent {
++			return new SessionSelectorComponent(
++				async () => [makeSession({ id: "doomed", path: sessionPath })],
++				async () => [],
++				() => {},
++				() => {},
++				() => {},
++				() => {},
++				{ keybindings },
++			);
++		}
++
++		afterEach(() => {
++			setNativeSubmissionHost(undefined);
++			nativeSubmissionBarrier.bindOwnerSession(undefined);
++			for (const dir of readOnlyDirs.splice(0)) chmodSync(dir, 0o700);
++		});
++
++		const readOnlyDirs: string[] = [];
++
++		it("is aborted rather than committed, and still shows the selector's own error", async () => {
++			const { sessionPath, directory } = undeletableSession();
++			readOnlyDirs.push(directory);
++			const committed: string[] = [];
++			const aborted: { reservationId: string; reason: string }[] = [];
++			let reservations = 0;
++			setNativeSubmissionHost({
++				ownerRunId: "selector-delete-owner",
++				async beforeNativeSubmit(envelope) {
++					return {
++						authorized: true,
++						fence: {
++							submissionId: envelope.submissionId,
++							ownerRunId: "selector-delete-owner",
++							bindingGeneration: envelope.binding.generation,
++							nonce: "nonce",
++						},
++					};
++				},
++				async recordEffectivePayload() {
++					return { recorded: true };
++				},
++				nativeSubmitOutcome() {},
++				async admitCanonicalOperation() {
++					return { reservationId: `reservation-${++reservations}` };
++				},
++				async commitBinding(commit) {
++					committed.push(commit.reservationId);
++				},
++				async abortReservation(abort) {
++					aborted.push(abort);
++				},
++			});
++			const selector = selectorFor(sessionPath);
++			await flushPromises();
++
++			await selector.getSessionList().onDeleteSession?.(sessionPath);
++
++			expect(existsSync(sessionPath)).toBe(true);
++			expect(committed).toEqual([]);
++			expect(aborted).toHaveLength(1);
++			expect(stripAnsi(selector.render(120).join("\n"))).toContain("Failed to delete:");
++		});
++
++		it("keeps the unmanaged selector error unchanged with no canonical host", async () => {
++			const { sessionPath, directory } = undeletableSession();
++			readOnlyDirs.push(directory);
++			const selector = selectorFor(sessionPath);
++			await flushPromises();
++
++			await selector.getSessionList().onDeleteSession?.(sessionPath);
++
++			expect(existsSync(sessionPath)).toBe(true);
++			expect(stripAnsi(selector.render(120).join("\n"))).toContain("Failed to delete:");
++		});
++	});
+ });

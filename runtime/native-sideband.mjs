@@ -533,6 +533,9 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
 
   /** @type {"pending"|"adopted"|"refused"} */
   let outcome = "pending";
+  // Read through a call, because every write to `outcome` happens in one of the observers below. A direct read
+  // here would be narrowed to its initial value, and the typechecker would call the adopted branch unreachable.
+  const outcomeNow = () => outcome;
   /** @type {net.Server|undefined} */
   let inherited;
   /** @type {{ device: string, inode: string, mode: number, uid: number }|undefined} */
@@ -658,7 +661,7 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
 
   try {
     await answered;
-    if (outcome === "adopted") {
+    if (outcomeNow() === "adopted") {
       // The helper must be gone before this listener is usable. An acknowledged send is not that proof, so its
       // real completion is awaited, bounded by the same deadline a stuck helper would otherwise outlast.
       helper.disconnect();

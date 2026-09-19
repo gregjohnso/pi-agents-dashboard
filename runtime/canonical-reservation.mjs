@@ -11,10 +11,15 @@
  *
  * - **The domain is one Pi session directory, not a state root.** Two dashboard state roots can be
  *   configured against one Pi session directory, so a lock under a state root would exclude nothing.
- *   `canonicalReservationPaths` derives both paths from the session directory and `open` refuses a
- *   journal and a lock that do not share one directory.
+ *   `openCanonicalReservations` therefore takes the **session directory** as its authority and derives
+ *   both paths with `canonicalReservationPaths`; a journal or lock the caller also supplies must be
+ *   exactly that derived path. A pair under a state root is refused even when the pair agrees with
+ *   itself, because two such pairs exclude nothing across roots.
  * - **Identity is the canonicalized path plus `{device, inode}`.** A symlink, a symlinked parent and a
- *   hard link are all one claim, so an alias cannot be admitted beside the file it names.
+ *   hard link are all one claim, so an alias cannot be admitted beside the file it names. Two *hard
+ *   links* have two canonicalized paths, so the lock set carries a `{device, inode}` lock as well as a
+ *   path lock, and every identity is re-resolved under the complete lock set: a path lock alone would
+ *   let two simultaneous admissions through two links each take their own lock and both win.
  * - **Absence is proven by a trusted verifier for the *recorded* host and boot.** `hostProof` is that
  *   adapter. This machine's process table says nothing about a claim recorded on another host, and a
  *   requester cannot assert absence: there is no parameter for it. An unreachable recorded host stays
@@ -61,7 +66,30 @@ const LOCK_DIRECTORY_NAME = "locks";
 const DOMAIN_MODE = 0o700;
 // Two absolute paths, an owner identity and a reason, with room to spare for the longest of each.
 const MAX_RECORD_BYTES = 16_384;
-const RECORD_KINDS = ["prepared", "committed", "transferred", "released", "aborted", "cleared"];
+const MAX_PATH_LENGTH = 4096;
+const MAX_REASON_LENGTH = 1024;
+/**
+ * The exact fields every record kind carries, beside `version`, `record`, `at` and `owner`.
+ *
+ * This table is the schema: a record is refused unless it carries all of its kind's fields and nothing
+ * else. The case that makes it necessary is a `released` record holding only a reservation id, which
+ * would otherwise remove a claim without naming the owner, the file or a reason.
+ */
+const RECORD_FIELDS = {
+  prepared: ["operationId", "reservationId", "operation", "generation", "requestedTarget", "target", "source"],
+  committed: ["reservationId", "generation", "binds", "target"],
+  transferred: ["reservationId", "generation", "target", "released"],
+  released: ["reservationId", "target", "reason"],
+  aborted: ["reservationId", "target", "reason"],
+  cleared: ["clearedOwner", "clearedReservationId", "target", "operator", "reason", "evidence"],
+};
+const COMMON_RECORD_FIELDS = ["version", "record", "at", "owner"];
+const CLAIM_IDENTITY_FIELDS = ["canonicalFile", "device", "inode"];
+// Every path lock before every identity lock, so the order stays total across both kinds.
+const LOCK_KINDS = ["path", "identity"];
+// Re-resolving under the locks can reveal one identity whose lock is not held yet. A file whose inode
+// keeps changing under a held path lock is refused rather than chased forever.
+const LOCK_RESOLUTION_ATTEMPTS = 3;
 const OWNER_FIELDS = ["initialRowId", "runId", "ownerPid", "ownerStartIdentity", "hostId", "bootId"];
 const ABSENT_FILE_CODES = ["ENOENT", "ENOTDIR"];
 // Read in this order, first non-empty wins. `/etc/machine-id` is the standard per-installation id and is
@@ -138,28 +166,54 @@ function sameIdentity(left, right) {
 }
 
 /**
- * The globally defined lock order: lexicographic on the canonicalized path, with aliases collapsed.
+ * One lock in the global order: a path lock, or the `{device, inode}` lock of a file that exists.
+ * @param {string} lockDirectory @param {"path"|"identity"} kind @param {string} subject @param {ClaimIdentity} identity
+ */
+function canonicalLockEntry(lockDirectory, kind, subject, identity) {
+  // The digested subject carries the kind for an identity lock, so an inode key can never hash to the
+  // same lock name as a path.
+  const digest = createHash("sha256").update(kind === "path" ? subject : `inode ${subject}`).digest("hex");
+  return { key: `${kind}:${subject}`, kind, subject, canonicalFile: identity.canonicalFile, identity, path: join(lockDirectory, `${digest}.lock`) };
+}
+
+/**
+ * The globally defined lock order for every path an operation touches.
  *
- * Two owners swapping two files take the same two locks in the same order, so neither can hold one and
- * wait for the other. Exported because it is the order, not an implementation detail: a caller that locks
- * a source and a target itself must use this one.
+ * Each distinct claim contributes a **path** lock, and a file that already exists contributes a
+ * `{device, inode}` **identity** lock as well. Neither replaces the other: the path lock covers a target
+ * that does not exist yet and the replacement of a name, and the identity lock is the only thing that
+ * excludes two *hard links*. `realpath` reports each hard link's own name, so two owners admitting
+ * through two links resolve to two different paths — and, without the identity lock, take two different
+ * locks, read the same unclaimed journal and both win.
+ *
+ * The order is total: every path lock before every identity lock, and lexicographic on the canonicalized
+ * path and on `device:inode` within a kind. Two owners reaching for the same files take the same locks in
+ * the same order, and nothing here ever waits on a lock another owner holds.
+ *
+ * Exported because it is the order, not an implementation detail: a caller that locks a source and a
+ * target itself must use this one.
  * @param {string} lockDirectory @param {readonly string[]} canonicalFiles
- * @returns {Promise<{canonicalFile:string,identity:ClaimIdentity,path:string}[]>}
+ * @returns {Promise<{key:string,kind:"path"|"identity",subject:string,canonicalFile:string,identity:ClaimIdentity,path:string}[]>}
  */
 export async function orderCanonicalLocks(lockDirectory, canonicalFiles) {
   if (typeof lockDirectory !== "string" || !isAbsolute(lockDirectory)) throw new TypeError("The canonical lock directory must be an absolute path");
-  /** @type {{canonicalFile:string,identity:ClaimIdentity,path:string}[]} */
-  const ordered = [];
+  const directory = resolve(lockDirectory);
+  /** @type {{key:string,kind:"path"|"identity",subject:string,canonicalFile:string,identity:ClaimIdentity,path:string}[]} */
+  const entries = [];
+  /** @type {ClaimIdentity[]} */
+  const claims = [];
   for (const file of canonicalFiles) {
     const identity = await resolveClaimIdentity(file);
-    if (ordered.some((entry) => sameIdentity(entry.identity, identity))) continue;
-    ordered.push({
-      canonicalFile: identity.canonicalFile,
-      identity,
-      path: join(resolve(lockDirectory), `${createHash("sha256").update(identity.canonicalFile).digest("hex")}.lock`),
-    });
+    if (claims.some((other) => sameIdentity(other, identity))) continue;
+    claims.push(identity);
+    entries.push(canonicalLockEntry(directory, "path", identity.canonicalFile, identity));
+    if (identity.inode !== null) entries.push(canonicalLockEntry(directory, "identity", `${identity.device}:${identity.inode}`, identity));
   }
-  return ordered.sort((left, right) => (left.canonicalFile < right.canonicalFile ? -1 : left.canonicalFile > right.canonicalFile ? 1 : 0));
+  return entries.sort((left, right) => {
+    const byKind = LOCK_KINDS.indexOf(left.kind) - LOCK_KINDS.indexOf(right.kind);
+    if (byKind !== 0) return byKind;
+    return left.subject < right.subject ? -1 : left.subject > right.subject ? 1 : 0;
+  });
 }
 
 /** @param {unknown} value @param {string} path */
@@ -258,15 +312,92 @@ export async function readLocalHostIdentity({ readFile = fsPromises.readFile, ho
   return { hostId: `${machineId}:${boundedString(hostname(), "hostname", 256)}`, bootId, hostIdSource };
 }
 
-/** @param {unknown} value @param {number} index */
+/** @param {number} index @param {string} detail @param {unknown} [cause] */
+function journalUnrecognized(index, detail, cause) {
+  return new CanonicalReservationError("JOURNAL_UNRECOGNIZED", `journal record ${index} ${detail}`, cause === undefined ? undefined : { cause });
+}
+
+/** One persisted claim identity: an exact absolute path, and a device and inode together or neither. @param {unknown} value @param {string} path */
+function parseClaimIdentity(value, path) {
+  const identity = /** @type {any} */ (value);
+  onlyFields(identity, CLAIM_IDENTITY_FIELDS, path);
+  const missing = CLAIM_IDENTITY_FIELDS.find((field) => !Object.hasOwn(identity, field));
+  if (missing !== undefined) throw new TypeError(`${path}.${missing} is required`);
+  if (!isAbsolute(boundedString(identity.canonicalFile, `${path}.canonicalFile`, MAX_PATH_LENGTH))) {
+    throw new TypeError(`${path}.canonicalFile must be an absolute path`);
+  }
+  if (identity.device === null || identity.inode === null) {
+    if (identity.device !== null || identity.inode !== null) throw new TypeError(`${path} carries one half of a device and inode pair`);
+    return identity;
+  }
+  boundedString(identity.device, `${path}.device`, 64);
+  boundedString(identity.inode, `${path}.inode`, 64);
+  return identity;
+}
+
+/** @param {unknown} value @param {string} path @param {number} minimum */
+function generationOf(value, path, minimum) {
+  if (!Number.isSafeInteger(value) || /** @type {number} */ (value) < minimum) throw new TypeError(`${path} must be a safe integer of at least ${minimum}`);
+  return /** @type {number} */ (value);
+}
+
+/**
+ * Validate one complete record against the exact schema of its kind, or refuse the journal.
+ *
+ * Version and kind are not enough. A record that shares this domain and disagrees about what a record
+ * means is exactly the writer a second owner must not be opened for, so every field of the kind is
+ * required, every unknown field is refused, and the owner and the claim identities are read through the
+ * same strict parsers the admission used. A malformed record is therefore never folded, which means it
+ * can never remove a claim.
+ * @param {unknown} value @param {number} index
+ */
 function parseJournalRecord(value, index) {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new CanonicalReservationError("JOURNAL_UNRECOGNIZED", `journal record ${index} is not an object`);
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw journalUnrecognized(index, "is not an object");
   const record = /** @type {any} */ (value);
   if (record.version !== CANONICAL_JOURNAL_VERSION) {
     throw new CanonicalReservationError("JOURNAL_VERSION_UNSUPPORTED", `journal record ${index} is at schema version ${String(record.version)}, not ${CANONICAL_JOURNAL_VERSION}`);
   }
-  if (!RECORD_KINDS.includes(record.record)) throw new CanonicalReservationError("JOURNAL_UNRECOGNIZED", `journal record ${index} is a ${String(record.record)} record`);
-  return record;
+  const kind = record.record;
+  if (typeof kind !== "string" || !Object.hasOwn(RECORD_FIELDS, kind)) throw journalUnrecognized(index, `is a ${String(kind)} record`);
+  try {
+    onlyFields(record, [...COMMON_RECORD_FIELDS, ...RECORD_FIELDS[/** @type {keyof typeof RECORD_FIELDS} */ (kind)]], `a ${kind} record`);
+    const absent = RECORD_FIELDS[/** @type {keyof typeof RECORD_FIELDS} */ (kind)].find((field) => !Object.hasOwn(record, field));
+    if (absent !== undefined) throw new TypeError(`${kind}.${absent} is required`);
+    if (typeof record.at !== "string" || new Date(record.at).toISOString() !== record.at) throw new TypeError(`${kind}.at must be an ISO 8601 timestamp`);
+    parseOwnerRunIdentity(record.owner);
+    parseClaimIdentity(record.target, `${kind}.target`);
+    if (kind === "cleared") {
+      parseOwnerRunIdentity(record.clearedOwner);
+      boundedString(record.clearedReservationId, "cleared.clearedReservationId");
+      boundedString(record.operator, "cleared.operator", 256);
+      boundedString(record.reason, "cleared.reason", MAX_REASON_LENGTH);
+      boundedString(record.evidence, "cleared.evidence", MAX_REASON_LENGTH);
+      return record;
+    }
+    boundedString(record.reservationId, `${kind}.reservationId`);
+    if (kind === "prepared") {
+      // The shared contract owns what an operation kind, an operation id and an exact target are, so the
+      // persisted record is read back through the same parser the admission was decided by.
+      parseCanonicalOperation({
+        operationId: record.operationId,
+        operation: record.operation,
+        currentBinding: { canonicalFile: undefined, generation: record.generation },
+        resolvedTarget: { canonicalFile: record.requestedTarget },
+      });
+      if (record.source !== null) parseClaimIdentity(record.source, "prepared.source");
+      return record;
+    }
+    if (kind === "released" || kind === "aborted") {
+      boundedString(record.reason, `${kind}.reason`, MAX_REASON_LENGTH);
+      return record;
+    }
+    generationOf(record.generation, `${kind}.generation`, 1);
+    if (kind === "transferred") parseClaimIdentity(record.released, "transferred.released");
+    else if (typeof record.binds !== "boolean") throw new TypeError("committed.binds must be a boolean");
+    return record;
+  } catch (cause) {
+    throw journalUnrecognized(index, `is not a complete ${kind} record: ${cause instanceof Error ? cause.message : String(cause)}`, cause);
+  }
 }
 
 /**
@@ -302,44 +433,66 @@ function claimKeyOf(record) {
 /**
  * Fold the journal into the claims that are still held.
  *
- * A record naming a reservation this fold has never seen means two writers disagree about the journal's
- * history, which is refused rather than skipped.
+ * Three rules make the fold unable to lose a claim. A `prepared` record **adds** a claim and drops
+ * nothing, so this owner re-reserving the file it is already bound to leaves the committed claim beneath
+ * the new reservation — an abort or a crash then removes only the reservation, never the binding. A
+ * superseded same-owner claim on one identity is dropped where the replacement actually becomes
+ * authoritative, in the `committed` or `transferred` record. And every record after a `prepared` must
+ * name the same owner run and the same target the reservation reserved; anything else means two writers
+ * disagree about this journal's history, which is refused rather than skipped.
  * @param {any[]} records @returns {Claim[]}
  */
 function foldClaims(records) {
   /** @type {Claim[]} */
   const claims = [];
   const indexOfKey = (/** @type {string} */ key) => claims.findIndex((claim) => claim.key === key);
-  const drop = (/** @type {ClaimIdentity} */ identity) => {
-    const index = claims.findIndex((claim) => sameIdentity(claim.target, identity));
-    if (index >= 0) claims.splice(index, 1);
+  /** Drop every claim one owner run holds on one identity, except the record's own reservation. */
+  const dropOwned = (/** @type {ClaimIdentity} */ identity, /** @type {OwnerRunIdentity} */ owner, /** @type {string|null} */ exceptKey) => {
+    for (let index = claims.length - 1; index >= 0; index -= 1) {
+      const claim = claims[index];
+      if (claim.key !== exceptKey && sameIdentity(claim.target, identity) && sameOwnerRun(claim.owner, owner)) claims.splice(index, 1);
+    }
   };
   records.forEach((record, index) => {
     if (record.record === "cleared") {
-      // An operator clears another owner run's claim, so this record is keyed by the claim it names.
-      if (claims.findIndex((claim) => sameIdentity(claim.target, record.target)) < 0) {
+      // An operator clears another owner run's claim, so this record names the claim and its owner.
+      if (!claims.some((claim) => sameIdentity(claim.target, record.target) && sameOwnerRun(claim.owner, record.clearedOwner))) {
         throw new CanonicalReservationError("JOURNAL_INCONSISTENT", `journal record ${index} clears a claim this journal does not hold`);
       }
-      drop(record.target);
+      dropOwned(record.target, record.clearedOwner, null);
       return;
     }
     const key = claimKeyOf(record);
     if (record.record === "prepared") {
-      // One identity carries one claim. Admission refuses another owner's, so the claim superseded here
-      // is always this record's own owner, re-reserving the file it is already bound to.
-      drop(record.target);
+      if (indexOfKey(key) >= 0) {
+        throw new CanonicalReservationError("JOURNAL_INCONSISTENT", `journal record ${index} prepares reservation ${record.reservationId} a second time`);
+      }
+      const foreign = claims.find((claim) => sameIdentity(claim.target, record.target) && !sameOwnerRun(claim.owner, record.owner));
+      if (foreign !== undefined) {
+        throw new CanonicalReservationError("JOURNAL_INCONSISTENT", `journal record ${index} reserves ${record.target.canonicalFile} while owner run ${foreign.owner.runId} holds a claim on it`);
+      }
       claims.push({ key, owner: record.owner, reservationId: record.reservationId, operation: record.operation, generation: record.generation, binds: false, state: "prepared", target: record.target });
       return;
     }
-    if (indexOfKey(key) < 0) {
+    const at = indexOfKey(key);
+    if (at < 0) {
       throw new CanonicalReservationError("JOURNAL_INCONSISTENT", `journal record ${index} is a ${record.record} for a reservation this journal never prepared`);
     }
+    const claim = claims[at];
+    if (!sameOwnerRun(claim.owner, record.owner)) {
+      throw new CanonicalReservationError("JOURNAL_INCONSISTENT", `journal record ${index} is a ${record.record} from an owner run that does not hold reservation ${record.reservationId}`);
+    }
+    if (!sameIdentity(claim.target, record.target)) {
+      throw new CanonicalReservationError("JOURNAL_INCONSISTENT", `journal record ${index} is a ${record.record} naming ${record.target.canonicalFile}, which reservation ${record.reservationId} did not reserve`);
+    }
     if (record.record === "committed" || record.record === "transferred") {
-      if (record.record === "transferred") drop(record.released);
-      claims[indexOfKey(key)] = { ...claims[indexOfKey(key)], state: "committed", generation: record.generation, binds: record.record === "transferred" ? true : record.binds === true, target: record.target };
+      claims[at] = { ...claim, state: "committed", generation: record.generation, binds: record.record === "transferred" ? true : record.binds === true, target: record.target };
+      if (record.record === "transferred") dropOwned(record.released, record.owner, key);
+      // Now that this reservation is authoritative, the claim it supersedes on the same identity goes.
+      dropOwned(record.target, record.owner, key);
       return;
     }
-    claims.splice(indexOfKey(key), 1);
+    claims.splice(at, 1);
   });
   return claims;
 }
@@ -347,9 +500,15 @@ function foldClaims(records) {
 /**
  * Open the canonical reservation backend for one owner run.
  *
+ * `sessionDirectory` is the domain's authority and is required: both paths are derived from it, and a
+ * `journalPath` or `lockPath` the caller also supplies must be exactly the derived one. That is what makes
+ * a per-state-root domain unconfigurable — an internally consistent pair under a state root is still
+ * refused, because a second root's equally consistent pair would exclude nothing against it.
+ *
  * @param {{
- *   journalPath: string,
- *   lockPath: string,
+ *   sessionDirectory: string,
+ *   journalPath?: string,
+ *   lockPath?: string,
  *   owner: OwnerRunIdentity,
  *   currentGeneration: () => number,
  *   hostProof?: { proveOwnerAbsence(recorded: OwnerRunIdentity): Promise<OwnerAbsenceVerdict> },
@@ -357,11 +516,17 @@ function foldClaims(records) {
  *   fsOps?: any,
  * }} options
  */
-export async function openCanonicalReservations({ journalPath, lockPath, owner, currentGeneration, hostProof, failpoint = async () => {}, fsOps = fsPromises }) {
-  if (typeof journalPath !== "string" || !isAbsolute(journalPath)) throw new TypeError("journalPath must be an absolute path");
-  if (typeof lockPath !== "string" || !isAbsolute(lockPath)) throw new TypeError("lockPath must be an absolute path");
-  if (dirname(resolve(journalPath)) !== dirname(resolve(lockPath))) {
-    throw new CanonicalReservationError("DOMAIN_SPLIT", "The journal and the lock must share one Pi session directory; two state roots can share one session directory, so a per-root lock excludes nothing");
+export async function openCanonicalReservations({ sessionDirectory, journalPath, lockPath, owner, currentGeneration, hostProof, failpoint = async () => {}, fsOps = fsPromises }) {
+  const domainPaths = canonicalReservationPaths(sessionDirectory);
+  for (const [name, supplied] of /** @type {["journalPath"|"lockPath", unknown][]} */ ([["journalPath", journalPath], ["lockPath", lockPath]])) {
+    if (supplied === undefined) continue;
+    if (typeof supplied !== "string" || !isAbsolute(supplied)) throw new TypeError(`${name} must be an absolute path`);
+    if (resolve(supplied) !== domainPaths[name]) {
+      throw new CanonicalReservationError(
+        "DOMAIN_SPLIT",
+        `${name} ${resolve(supplied)} is not this Pi session directory's ${name} (${domainPaths[name]}); two dashboard state roots can share one session directory, so a pair configured under a state root excludes nothing even when it agrees with itself`,
+      );
+    }
   }
   const ownerRun = parseOwnerRunIdentity(owner);
   if (typeof currentGeneration !== "function") throw new TypeError("currentGeneration must be a function returning the owner's authoritative generation");
@@ -369,9 +534,10 @@ export async function openCanonicalReservations({ journalPath, lockPath, owner, 
   const verifier = hostProof ?? createLocalHostProof({ hostIdentity: await readLocalHostIdentity() });
   if (typeof verifier.proveOwnerAbsence !== "function") throw new TypeError("hostProof must expose proveOwnerAbsence for the recorded host");
 
-  const lockDirectory = resolve(lockPath);
+  const journal = domainPaths.journalPath;
+  const lockDirectory = domainPaths.lockPath;
   await fsPromises.mkdir(lockDirectory, { recursive: true, mode: DOMAIN_MODE });
-  const store = await openDurableAppendStore({ path: resolve(journalPath), maxRecordBytes: MAX_RECORD_BYTES });
+  const store = await openDurableAppendStore({ path: journal, maxRecordBytes: MAX_RECORD_BYTES });
   /** The process holding a lock is this one; the host and boot are the owner run's, which runs here. */
   let holder = null;
   try {
@@ -405,7 +571,7 @@ export async function openCanonicalReservations({ journalPath, lockPath, owner, 
    * refuses on the same failure.
    */
   try {
-    for (const record of await readJournal(resolve(journalPath))) {
+    for (const record of await readJournal(journal)) {
       if (record.record === "cleared" || !sameOwnerRun(record.owner, ownerRun)) continue;
       if (record.record === "prepared") {
         spentOperationIds.add(record.operationId);
@@ -452,7 +618,7 @@ export async function openCanonicalReservations({ journalPath, lockPath, owner, 
   const currentClaims = async () => {
     if (unknownOutcome !== undefined) throw unknownOutcome;
     if (closed) throw new CanonicalReservationError("CLOSED", "These canonical reservations are closed");
-    return foldClaims(await readJournal(resolve(journalPath)));
+    return foldClaims(await readJournal(journal));
   };
 
   /** @param {Claim[]} claims */
@@ -514,14 +680,31 @@ export async function openCanonicalReservations({ journalPath, lockPath, owner, 
 
   /**
    * Hold the locks for every path an operation touches, in the globally defined order.
+   *
+   * The set is computed, taken, and then computed again under what is held: a target that did not exist
+   * at the first resolution has no `{device, inode}` lock in that set, and neither does one whose inode
+   * changed, so the identity that the decision is actually made about could otherwise be unprotected. The
+   * re-resolution repeats until the set is stable, which is what makes the hard-link exclusion sound; a
+   * file whose inode keeps changing under a held path lock is refused rather than chased.
    * @template T @param {readonly string[]} canonicalFiles @param {(claims: Claim[]) => Promise<T>} body
    */
   const withClaimLocks = async (canonicalFiles, body) => {
-    const ordered = await orderCanonicalLocks(lockDirectory, canonicalFiles);
     /** @type {{release(): Promise<boolean>}[]} */
     const held = [];
+    /** @type {Set<string>} */
+    const heldKeys = new Set();
     try {
-      for (const entry of ordered) held.push(await acquireClaimLock(entry));
+      for (let attempt = 1; ; attempt += 1) {
+        const missing = (await orderCanonicalLocks(lockDirectory, canonicalFiles)).filter((entry) => !heldKeys.has(entry.key));
+        if (missing.length === 0) break;
+        if (attempt > LOCK_RESOLUTION_ATTEMPTS) {
+          throw new CanonicalReservationError("IDENTITY_UNSTABLE", `the identity of ${missing[0].canonicalFile} changed under its own lock ${LOCK_RESOLUTION_ATTEMPTS} times, so no claim can be decided about it`);
+        }
+        for (const entry of missing) {
+          held.push(await acquireClaimLock(entry));
+          heldKeys.add(entry.key);
+        }
+      }
       return await body(await currentClaims());
     } finally {
       for (const lock of held.reverse()) await lock.release().catch(() => {});
@@ -594,27 +777,30 @@ export async function openCanonicalReservations({ journalPath, lockPath, owner, 
           return refusal("STALE_BINDING", `this operation's generation ${requested.currentBinding.generation} was superseded before it could be admitted`);
         }
         if (spentOperationIds.has(requested.operationId)) return refusal("DUPLICATE_OPERATION", `operation ${requested.operationId} was already admitted for this owner run`);
-        const existing = claimOn(claims, identity);
+        // Re-resolved under the complete lock set, including the `{device, inode}` lock: the identity read
+        // before the locks is what chose them, and only this one is what a claim is recorded against.
+        const locked = await resolveClaimIdentity(requested.resolvedTarget.canonicalFile);
+        const existing = claimOn(claims, locked);
         if (existing !== undefined && !sameOwnerRun(existing.owner, ownerRun)) {
           const state = await reconcileClaim(existing);
           if (state.state === "live") {
-            return refusal("TARGET_HAS_LIVE_WRITER", `${identity.canonicalFile} is claimed by owner run ${existing.owner.runId}: ${state.reason}. ${RETRY_HINT}`);
+            return refusal("TARGET_HAS_LIVE_WRITER", `${locked.canonicalFile} is claimed by owner run ${existing.owner.runId}: ${state.reason}. ${RETRY_HINT}`);
           }
-          return refusal("TARGET_UNCERTAIN", `${identity.canonicalFile} holds an unresolved claim from owner run ${existing.owner.runId}: ${state.reason}. An operator must clear it with proof from its recorded host`);
+          return refusal("TARGET_UNCERTAIN", `${locked.canonicalFile} holds an unresolved claim from owner run ${existing.owner.runId}: ${state.reason}. An operator must clear it with proof from its recorded host`);
         }
         const reservationId = randomUUID();
-        const source = bound === undefined || sameIdentity(bound.target, identity) ? null : bound.target;
+        const source = bound === undefined || sameIdentity(bound.target, locked) ? null : bound.target;
         await append("prepared", {
           operationId: requested.operationId,
           reservationId,
           operation: requested.operation,
           generation: requested.currentBinding.generation,
           requestedTarget: requested.resolvedTarget.canonicalFile,
-          target: identity,
+          target: locked,
           source,
         });
         spentOperationIds.add(requested.operationId);
-        liveReservations.set(reservationId, { operationId: requested.operationId, operation: requested.operation, identity, source });
+        liveReservations.set(reservationId, { operationId: requested.operationId, operation: requested.operation, identity: locked, source });
         return { reservationId };
       });
     } catch (error) {
@@ -700,7 +886,7 @@ export async function openCanonicalReservations({ journalPath, lockPath, owner, 
   const abortReservation = async (abort) => {
     onlyFields(abort, ["reservationId", "reason"], "abort");
     const reservationId = boundedString(abort.reservationId, "abort.reservationId");
-    const reason = boundedString(abort.reason, "abort.reason", 1024);
+    const reason = boundedString(abort.reason, "abort.reason", MAX_REASON_LENGTH);
     const live = liveReservation(reservationId);
     await withClaimLocks([live.identity.canonicalFile], async (locked) => {
       const claim = reservedClaim(locked, reservationId);
@@ -721,7 +907,7 @@ export async function openCanonicalReservations({ journalPath, lockPath, owner, 
   const releaseCommitted = async (release) => {
     onlyFields(release, ["reservationId", "reason"], "release");
     const reservationId = boundedString(release.reservationId, "release.reservationId");
-    const reason = boundedString(release.reason, "release.reason", 1024);
+    const reason = boundedString(release.reason, "release.reason", MAX_REASON_LENGTH);
     const recorded = reservedClaim(await currentClaims(), reservationId);
     await withClaimLocks([recorded.target.canonicalFile], async (locked) => {
       const claim = reservedClaim(locked, reservationId);
@@ -742,7 +928,7 @@ export async function openCanonicalReservations({ journalPath, lockPath, owner, 
    */
   const reconcile = async (query) => {
     onlyFields(query, ["canonicalFile"], "reconcile");
-    const identity = await resolveClaimIdentity(boundedString(query.canonicalFile, "reconcile.canonicalFile", 4096));
+    const identity = await resolveClaimIdentity(boundedString(query.canonicalFile, "reconcile.canonicalFile", MAX_PATH_LENGTH));
     const claim = claimOn(await currentClaims(), identity);
     if (claim === undefined) return { state: /** @type {const} */ ("released"), absenceProven: false, reason: `no claim is recorded for ${identity.canonicalFile}`, owner: null };
     return await reconcileClaim(claim);
@@ -759,9 +945,9 @@ export async function openCanonicalReservations({ journalPath, lockPath, owner, 
    */
   const clearUncertainClaim = async (request) => {
     onlyFields(request, ["canonicalFile", "operator", "reason"], "clear");
-    const identity = await resolveClaimIdentity(boundedString(request.canonicalFile, "clear.canonicalFile", 4096));
+    const identity = await resolveClaimIdentity(boundedString(request.canonicalFile, "clear.canonicalFile", MAX_PATH_LENGTH));
     const operator = boundedString(request.operator, "clear.operator", 256);
-    const reason = boundedString(request.reason, "clear.reason", 1024);
+    const reason = boundedString(request.reason, "clear.reason", MAX_REASON_LENGTH);
     return await withClaimLocks([identity.canonicalFile], async (claims) => {
       const claim = claimOn(claims, identity);
       if (claim === undefined) throw new CanonicalReservationError("NO_CLAIM", `no claim is recorded for ${identity.canonicalFile}`);
@@ -777,7 +963,7 @@ export async function openCanonicalReservations({ journalPath, lockPath, owner, 
 
   return {
     /** The journal, the lock directory and the owner run this backend actually opened. */
-    domain: { journalPath: resolve(journalPath), lockPath: lockDirectory, owner: ownerRun },
+    domain: { journalPath: journal, lockPath: lockDirectory, owner: ownerRun },
     admit,
     commitBinding,
     transfer,

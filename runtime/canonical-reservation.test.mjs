@@ -655,6 +655,181 @@ describe("durable record validation", () => {
   });
 });
 
+/**
+ * Replay of a history that is schema-valid in every field and still impossible.
+ *
+ * The live API already refuses each of these: `abortReservation` refuses a committed reservation,
+ * `releaseCommitted` refuses an uncommitted one, a commit spends its reservation id, `transfer` only ever
+ * releases the claim this owner is bound to, and a clear names the claim it found. None of that helps on
+ * **replay**, where the records come from whatever wrote this journal. A second writer that disagrees about
+ * this history — or a future version that got one of those preconditions wrong — must not be able to hand a
+ * complete record to the fold and have a committed claim disappear.
+ *
+ * So each case here writes a real journal with the module itself, appends one synthesized record the module
+ * would never have written, and requires the same two things: the journal refuses to be folded with
+ * `JOURNAL_INCONSISTENT`, and admission on the protected file stays unavailable. A thrown untyped error
+ * would not do — the code is what tells a caller this is a disagreeing writer rather than a missing file.
+ */
+describe("durable replay of an impossible history", () => {
+  /** The identity the module records for one real file: its canonicalized path, device and inode. @param {string} file */
+  async function claimIdentityOf(file) {
+    const resolved = await realpath(file);
+    const identity = await stat(resolved, { bigint: true });
+    return { canonicalFile: resolved, device: String(identity.dev), inode: String(identity.ino) };
+  }
+
+  /** Append one complete record of this schema version, exactly as a writer sharing this journal would.
+   * @param {{journalPath:string}} domain @param {Record<string, unknown>} fields */
+  async function appendRecord(domain, fields) {
+    await appendFile(domain.journalPath, `${JSON.stringify({ version: CANONICAL_JOURNAL_VERSION, at: new Date().toISOString(), ...fields })}\n`);
+  }
+
+  /** @param {string} file */
+  async function realFile(file) {
+    await writeFile(file, "{}\n", { mode: 0o600 });
+    return file;
+  }
+
+  /**
+   * One impossible history per case: it authors the real records, appends the impossible one, and names the
+   * file whose claim must survive plus the real records that must still be the journal's prefix.
+   * @type {Record<string, (domain: any) => Promise<{protected:string, real:string[]}>>}
+   */
+  const impossibleHistories = {
+    async "an abort of a claim this journal already committed"(domain) {
+      const target = await realFile(join(domain.session, "abort-after-commit.jsonl"));
+      const host = await openOwner(domain);
+      const reservationId = await bind(host, target, 1);
+      await host.reservations.close();
+      const records = await journalRecords(domain.journalPath);
+      await appendRecord(domain, { record: "aborted", owner: host.owner, reservationId, target: records[1].target, reason: "this operation mutated nothing" });
+      return { protected: target, real: ["prepared", "committed"] };
+    },
+
+    async "a release of a reservation that was never committed"(domain) {
+      const target = await realFile(join(domain.session, "release-before-commit.jsonl"));
+      const host = await openOwner(domain);
+      const admission = await admitting(host, { generation: 1, target });
+      expect(admission).toMatchObject({ reservationId: expect.any(String) });
+      await host.reservations.close();
+      const records = await journalRecords(domain.journalPath);
+      await appendRecord(domain, { record: "released", owner: host.owner, reservationId: admission.reservationId, target: records[0].target, reason: "explicit release" });
+      return { protected: target, real: ["prepared"] };
+    },
+
+    async "a second commit of one reservation, identical to the first"(domain) {
+      const target = await realFile(join(domain.session, "commit-twice.jsonl"));
+      const host = await openOwner(domain);
+      const reservationId = await bind(host, target, 1);
+      await host.reservations.close();
+      const records = await journalRecords(domain.journalPath);
+      await appendRecord(domain, { record: "committed", owner: host.owner, reservationId, generation: records[1].generation, binds: records[1].binds, target: records[1].target });
+      return { protected: target, real: ["prepared", "committed"] };
+    },
+
+    async "a second transfer of one reservation, identical to the first"(domain) {
+      const source = await realFile(join(domain.session, "transfer-twice-source.jsonl"));
+      const moved = await realFile(join(domain.session, "transfer-twice-moved.jsonl"));
+      const host = await openOwner(domain);
+      await bind(host, source, 1);
+      const move = await admitting(host, { generation: 1, target: moved });
+      host.setGeneration(2);
+      await host.reservations.commitBinding({ reservationId: move.reservationId, nextGeneration: 2 });
+      await host.reservations.close();
+      const records = await journalRecords(domain.journalPath);
+      const transferred = records[3];
+      expect(transferred.record).toBe("transferred");
+      await appendRecord(domain, { record: "transferred", owner: host.owner, reservationId: move.reservationId, generation: transferred.generation, target: transferred.target, released: transferred.released });
+      return { protected: moved, real: ["prepared", "committed", "prepared", "transferred"] };
+    },
+
+    async "an operator clear naming a reservation the claimed file does not hold"(domain) {
+      const target = await realFile(join(domain.session, "clear-wrong-reservation.jsonl"));
+      const abandoned = ownerRun({ runId: `run-abandoned-${randomUUID()}` });
+      const host = await openOwner(domain, { owner: abandoned });
+      const admission = await admitting(host, { generation: 1, target });
+      expect(admission).toMatchObject({ reservationId: expect.any(String) });
+      // The owner dies here, leaving one uncertain claim an operator could legitimately clear.
+      await host.reservations.close();
+      const records = await journalRecords(domain.journalPath);
+      await appendRecord(domain, {
+        record: "cleared",
+        owner: ownerRun(),
+        clearedOwner: abandoned,
+        clearedReservationId: `${admission.reservationId}-not-this-one`,
+        target: records[0].target,
+        operator: "operator-1",
+        reason: "stale claim",
+        evidence: "recorded pid is gone on the recorded boot",
+      });
+      return { protected: target, real: ["prepared"] };
+    },
+
+    async "a transfer releasing a file this owner run never bound"(domain) {
+      const source = await realFile(join(domain.session, "transfer-source.jsonl"));
+      const moved = await realFile(join(domain.session, "transfer-moved.jsonl"));
+      const unrelated = await realFile(join(domain.session, "transfer-unrelated.jsonl"));
+      const host = await openOwner(domain);
+      await bind(host, source, 1);
+      const move = await admitting(host, { generation: 1, target: moved });
+      expect(move).toMatchObject({ reservationId: expect.any(String) });
+      await host.reservations.close();
+      const records = await journalRecords(domain.journalPath);
+      // Every field is complete and this owner run does hold a binding — just not on the file named here.
+      await appendRecord(domain, { record: "transferred", owner: host.owner, reservationId: move.reservationId, generation: 2, target: records[2].target, released: await claimIdentityOf(unrelated) });
+      return { protected: source, real: ["prepared", "committed", "prepared"] };
+    },
+  };
+
+  it("refuses every complete but impossible history, frees no claim, and admits nothing", async () => {
+    for (const [history, author] of Object.entries(impossibleHistories)) {
+      const domain = await sessionDirectory();
+      const { protected: guarded, real } = await author(domain);
+
+      // Absence of the recorded owner is proven, so nothing here is merely an unreachable host.
+      const next = await openOwner(domain, { hostProof: absentProof() });
+      await expect(next.reservations.reconcile({ canonicalFile: guarded }), history).rejects.toMatchObject({
+        name: "CanonicalReservationError",
+        code: "JOURNAL_INCONSISTENT",
+      });
+      expect(await admitting(next, { operation: "resume", generation: 1, target: guarded }), history).toMatchObject({
+        refused: true,
+        code: "ADMISSION_UNAVAILABLE",
+      });
+      // The impossible line is evidence and stays; the real records it followed are untouched.
+      expect((await journalRecords(domain.journalPath)).map((record) => record.record), history).toEqual([...real, expect.any(String)]);
+    }
+  });
+
+  it("replays a real bind, transfer, abort and release exactly as they were written", async () => {
+    const domain = await sessionDirectory();
+    const source = await realFile(join(domain.session, "replay-source.jsonl"));
+    const moved = await realFile(join(domain.session, "replay-moved.jsonl"));
+    const scratch = await realFile(join(domain.session, "replay-scratch.jsonl"));
+    const host = await openOwner(domain);
+    await bind(host, source, 1);
+    const move = await admitting(host, { generation: 1, target: moved });
+    host.setGeneration(2);
+    await host.reservations.commitBinding({ reservationId: move.reservationId, nextGeneration: 2 });
+    const selector = await admitting(host, { operation: "rename", generation: 2, target: scratch });
+    await host.reservations.abortReservation({ reservationId: selector.reservationId, reason: "this rename mutated nothing" });
+    await host.reservations.releaseCommitted({ reservationId: move.reservationId, reason: "the owner is done with this file" });
+    await host.reservations.close();
+
+    expect((await journalRecords(domain.journalPath)).map((record) => record.record)).toEqual([
+      "prepared", "committed", "prepared", "transferred", "prepared", "aborted", "released",
+    ]);
+
+    // A fresh owner run folds the whole history: the transfer freed the source, the abort freed the
+    // scratch reservation, the release freed the binding, and all three files admit again.
+    const next = await openOwner(domain);
+    for (const file of [source, moved, scratch]) {
+      expect(await next.reservations.reconcile({ canonicalFile: file }), file).toMatchObject({ state: "released" });
+      expect(await admitting(next, { operation: "resume", generation: 1, target: file }), file).toMatchObject({ reservationId: expect.any(String) });
+    }
+  });
+});
+
 describe("crash at each side effect", () => {
   /** @type {Record<string, (target: string) => Promise<void>>} */
   const sideEffects = {

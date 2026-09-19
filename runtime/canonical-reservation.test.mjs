@@ -97,6 +97,7 @@ const unreachableProof = () => hostProofOf({});
 async function openOwner(domain, { owner = ownerRun(), generation = 1, hostProof = liveProof(), failpoint, fsOps } = {}) {
   let current = generation;
   const reservations = await openCanonicalReservations({
+    sessionDirectory: domain.session,
     journalPath: domain.journalPath,
     lockPath: domain.lockPath,
     owner,
@@ -145,6 +146,33 @@ async function bind(host, target, generation) {
   return admission.reservationId;
 }
 
+/**
+ * Let two admissions reach their journal write before either of them finishes it.
+ *
+ * `before_prepared_append` is the one point where an admission has taken every lock it is going to take
+ * and has written nothing yet, so a participant waiting here is holding its locks. A participant the
+ * exclusion refuses never arrives, which is why the wait is bounded rather than a two-party rendezvous:
+ * the bound is what proves the other side was refused instead of merely slow.
+ * @param {number} participants
+ */
+function admissionBarrier(participants, holdMilliseconds = 500) {
+  let arrived = 0;
+  /** @type {() => void} */
+  let releaseAll = () => {};
+  const everyone = new Promise((resolve) => {
+    releaseAll = () => resolve(undefined);
+  });
+  return async (/** @type {string} */ stage) => {
+    if (stage !== "before_prepared_append") return;
+    arrived += 1;
+    if (arrived >= participants) {
+      releaseAll();
+      return;
+    }
+    await Promise.race([everyone, new Promise((resolve) => setTimeout(resolve, holdMilliseconds))]);
+  };
+}
+
 describe("the canonical lock domain", () => {
   it("puts the journal and the locks in one subdirectory of the Pi session directory, shared by both state roots", async () => {
     const domain = await sessionDirectory();
@@ -156,10 +184,48 @@ describe("the canonical lock domain", () => {
     expect(await readdir(domain.session)).toEqual(["canonical-reservations"]);
   });
 
+  it("takes the Pi session directory as the domain's authority and derives both paths from it", async () => {
+    const domain = await sessionDirectory();
+    const reservations = await openCanonicalReservations({
+      sessionDirectory: domain.session,
+      owner: ownerRun(),
+      currentGeneration: () => 1,
+      hostProof: liveProof(),
+    });
+    opened.push(reservations);
+    expect(reservations.domain).toMatchObject({ journalPath: domain.journalPath, lockPath: domain.lockPath });
+    // Without that authority there is no domain to check a configured pair against, so there is no open.
+    await expect(
+      openCanonicalReservations(/** @type {any} */ ({ journalPath: domain.journalPath, lockPath: domain.lockPath, owner: ownerRun(), currentGeneration: () => 1, hostProof: liveProof() })),
+    ).rejects.toThrow(/session directory/i);
+  });
+
+  it("refuses a journal and lock pair under a dashboard state root, even one that agrees with itself", async () => {
+    const domain = await sessionDirectory();
+    for (const root of ["state-a", "state-b"]) {
+      const perRoot = canonicalReservationPaths(join(domain.root, root));
+      // Each pair is internally consistent — one directory, one journal, one lock — and two of them
+      // exclude nothing against each other, which is exactly why the session directory decides.
+      expect(dirname(perRoot.journalPath)).toBe(dirname(perRoot.lockPath));
+      await expect(
+        openCanonicalReservations({
+          sessionDirectory: domain.session,
+          journalPath: perRoot.journalPath,
+          lockPath: perRoot.lockPath,
+          owner: ownerRun(),
+          currentGeneration: () => 1,
+          hostProof: liveProof(),
+        }),
+        root,
+      ).rejects.toMatchObject({ name: "CanonicalReservationError", code: "DOMAIN_SPLIT" });
+    }
+  });
+
   it("refuses a journal and a lock that do not share one directory, because a per-root lock excludes nothing", async () => {
     const domain = await sessionDirectory();
     await expect(
       openCanonicalReservations({
+        sessionDirectory: domain.session,
         journalPath: join(domain.root, "state-a", "canonical-reservations.jsonl"),
         lockPath: domain.lockPath,
         owner: ownerRun(),
@@ -169,17 +235,24 @@ describe("the canonical lock domain", () => {
     ).rejects.toMatchObject({ name: "CanonicalReservationError", code: "DOMAIN_SPLIT" });
   });
 
-  it("orders source and target locks lexicographically on the canonicalized path, and collapses an alias", async () => {
+  it("orders path locks before identity locks, lexicographically within each kind, and collapses an alias", async () => {
     const domain = await sessionDirectory();
     const first = join(domain.session, "a.jsonl");
     const second = join(domain.session, "b.jsonl");
     await writeFile(first, "", { mode: 0o600 });
+    await writeFile(second, "", { mode: 0o600 });
     await symlink(first, join(domain.session, "alias.jsonl"));
 
     const ordered = await orderCanonicalLocks(domain.lockPath, [second, first]);
-    expect(ordered.map((entry) => entry.canonicalFile)).toEqual([first, second]);
+    expect(ordered.map((entry) => entry.kind)).toEqual(["path", "path", "identity", "identity"]);
+    expect(ordered.filter((entry) => entry.kind === "path").map((entry) => entry.canonicalFile)).toEqual([first, second]);
+    // An existing file carries a `{device, inode}` lock as well, and it is a different lock from its path's.
+    const identities = ordered.filter((entry) => entry.kind === "identity");
+    expect(identities.map((entry) => entry.subject)).toEqual([...identities.map((entry) => entry.subject)].sort());
+    expect(new Set(ordered.map((entry) => entry.path)).size).toBe(4);
+
     const aliased = await orderCanonicalLocks(domain.lockPath, [join(domain.session, "alias.jsonl"), first]);
-    expect(aliased).toHaveLength(1);
+    expect(aliased.map((entry) => entry.kind)).toEqual(["path", "identity"]);
     expect(aliased[0].path).toBe(ordered[0].path);
   });
 
@@ -425,6 +498,160 @@ describe("commit and transfer", () => {
     await expect(host.reservations.abortReservation({ reservationId: admission.reservationId, reason: "late" })).rejects.toMatchObject({
       code: "SPENT_RESERVATION",
     });
+  });
+});
+
+describe("two simultaneous admissions", () => {
+  it("admits exactly one of two owners reaching one file through two hard links at the same time", async () => {
+    const domain = await sessionDirectory();
+    const firstName = join(domain.session, "one.jsonl");
+    const secondName = join(domain.session, "two.jsonl");
+    await writeFile(firstName, "{}\n", { mode: 0o600 });
+    await link(firstName, secondName);
+    const [viaFirst, viaSecond] = [await stat(firstName, { bigint: true }), await stat(secondName, { bigint: true })];
+    expect(`${viaSecond.dev}/${viaSecond.ino}`).toBe(`${viaFirst.dev}/${viaFirst.ino}`);
+    // Two hard links are two canonicalized paths: `realpath` reports each link's own name, so a path lock
+    // alone would let both owners take their own lock, read the same unclaimed journal and both win.
+    expect(await realpath(secondName)).not.toBe(await realpath(firstName));
+
+    const failpoint = admissionBarrier(2);
+    const [first, second] = [await openOwner(domain, { failpoint }), await openOwner(domain, { failpoint })];
+    const decisions = await Promise.all([
+      admitting(first, { operation: "resume", generation: 1, target: firstName }),
+      admitting(second, { operation: "resume", generation: 1, target: secondName }),
+    ]);
+
+    const admitted = decisions.filter((decision) => typeof decision.reservationId === "string");
+    const refused = decisions.filter((decision) => decision.refused === true);
+    expect(admitted).toHaveLength(1);
+    expect(refused).toHaveLength(1);
+    expect(refused[0]).toMatchObject({ code: "ADMISSION_UNAVAILABLE", message: expect.stringMatching(/lock/i) });
+    expect((await journalRecords(domain.journalPath)).map((record) => record.record)).toEqual(["prepared"]);
+    // Retried, the loser is refused on the claim itself rather than on the lock.
+    const loser = decisions.indexOf(refused[0]) === 0 ? { host: first, target: firstName } : { host: second, target: secondName };
+    expect(await admitting(loser.host, { operation: "resume", generation: 1, target: loser.target })).toMatchObject({
+      refused: true,
+      code: "TARGET_HAS_LIVE_WRITER",
+    });
+  });
+});
+
+describe("a same-owner reservation on the file this owner is already bound to", () => {
+  it("keeps the committed claim when the no-mutation reservation is aborted", async () => {
+    const domain = await sessionDirectory();
+    const target = join(domain.session, "bound.jsonl");
+    await writeFile(target, "{}\n", { mode: 0o600 });
+    const host = await openOwner(domain);
+    const committed = await bind(host, target, 1);
+    const again = await admitting(host, { operation: "rename", generation: 1, target });
+    expect(again).toMatchObject({ reservationId: expect.any(String) });
+
+    await host.reservations.abortReservation({ reservationId: again.reservationId, reason: "the rename was cancelled" });
+
+    expect(await host.reservations.reconcile({ canonicalFile: target })).toMatchObject({ state: "live" });
+    const other = await openOwner(domain);
+    expect(await admitting(other, { operation: "resume", generation: 1, target })).toMatchObject({ refused: true, code: "TARGET_HAS_LIVE_WRITER" });
+    // The original claim leaves the way it always did: explicitly, and only then.
+    await host.reservations.releaseCommitted({ reservationId: committed, reason: "session disposed" });
+    expect(await admitting(other, { operation: "resume", generation: 1, target })).toMatchObject({ reservationId: expect.any(String) });
+    expect((await journalRecords(domain.journalPath)).map((record) => record.record)).toEqual(["prepared", "committed", "prepared", "aborted", "released", "prepared"]);
+  });
+
+  it("keeps the committed claim when the owner crashes with the no-mutation reservation open", async () => {
+    const domain = await sessionDirectory();
+    const target = join(domain.session, "crashed.jsonl");
+    await writeFile(target, "{}\n", { mode: 0o600 });
+    const host = await openOwner(domain);
+    await bind(host, target, 1);
+    expect(await admitting(host, { operation: "rename", generation: 1, target })).toMatchObject({ reservationId: expect.any(String) });
+    // The owner dies holding both: no commit, no abort, no release.
+    await host.reservations.close();
+
+    const next = await openOwner(domain, { hostProof: absentProof() });
+    expect(await next.reservations.reconcile({ canonicalFile: target })).toMatchObject({ state: "uncertain", absenceProven: true });
+    expect(await admitting(next, { operation: "resume", generation: 1, target })).toMatchObject({ refused: true, code: "TARGET_UNCERTAIN" });
+    expect((await journalRecords(domain.journalPath)).map((record) => record.record)).toEqual(["prepared", "committed", "prepared"]);
+  });
+
+  it("leaves exactly one claim once the reservation commits, which one explicit release frees", async () => {
+    const domain = await sessionDirectory();
+    const target = join(domain.session, "recommitted.jsonl");
+    await writeFile(target, "{}\n", { mode: 0o600 });
+    const host = await openOwner(domain);
+    await bind(host, target, 1);
+    const again = await admitting(host, { operation: "rename", generation: 1, target });
+
+    await host.reservations.commitBinding({ reservationId: again.reservationId, nextGeneration: 1 });
+
+    expect(await host.reservations.reconcile({ canonicalFile: target })).toMatchObject({ state: "live" });
+    await host.reservations.releaseCommitted({ reservationId: again.reservationId, reason: "session disposed" });
+    // One release frees the file: the claim the commit superseded was not left behind under it.
+    const other = await openOwner(domain);
+    expect(await admitting(other, { operation: "resume", generation: 1, target })).toMatchObject({ reservationId: expect.any(String) });
+  });
+});
+
+describe("durable record validation", () => {
+  /** One owner bound to one real file, and the journal it wrote. @param {{session:string,journalPath:string,lockPath:string}} domain */
+  async function committedJournal(domain) {
+    const target = join(domain.session, "validated.jsonl");
+    await writeFile(target, "{}\n", { mode: 0o600 });
+    const host = await openOwner(domain);
+    const reservationId = await bind(host, target, 1);
+    await host.reservations.close();
+    const records = await journalRecords(domain.journalPath);
+    expect(records.map((record) => record.record)).toEqual(["prepared", "committed"]);
+    return { target, owner: host.owner, reservationId, committed: records[1] };
+  }
+
+  /**
+   * Every way a `released` record can fail to be one, keyed by what is wrong with it.
+   *
+   * A record that removes a claim is the one an incomplete schema is most dangerous for, so each of these
+   * is appended to a journal holding a real committed claim and must leave that claim exactly where it was.
+   * @type {Record<string, (complete: any, owner: any) => Record<string, unknown>>}
+   */
+  const malformedReleases = {
+    "a reservation id and a run id only": (complete, owner) => ({ version: CANONICAL_JOURNAL_VERSION, record: "released", reservationId: complete.reservationId, owner: { runId: owner.runId } }),
+    "no reason": (complete) => ({ version: complete.version, record: complete.record, at: complete.at, owner: complete.owner, reservationId: complete.reservationId, target: complete.target }),
+    "a partial owner": (complete, owner) => ({ ...complete, owner: { runId: owner.runId } }),
+    "an unparseable timestamp": (complete) => ({ ...complete, at: "yesterday" }),
+    "an unknown field": (complete) => ({ ...complete, absent: true }),
+    "an unbounded reason": (complete) => ({ ...complete, reason: "x".repeat(1025) }),
+    "half a device and inode pair": (complete) => ({ ...complete, target: { ...complete.target, inode: null } }),
+    "another file as its target": (complete) => ({ ...complete, target: { canonicalFile: `${complete.target.canonicalFile}.other`, device: null, inode: null } }),
+    "another owner run's identity": (complete, owner) => ({ ...complete, owner: { ...owner, ownerPid: owner.ownerPid + 1 } }),
+  };
+
+  it("refuses every incomplete or mismatched released record, and none of them removes the claim", async () => {
+    for (const [wrong, author] of Object.entries(malformedReleases)) {
+      const domain = await sessionDirectory();
+      const { target, owner, reservationId, committed } = await committedJournal(domain);
+      const complete = { version: CANONICAL_JOURNAL_VERSION, record: "released", at: new Date().toISOString(), owner, reservationId, target: committed.target, reason: "explicit release" };
+      await appendFile(domain.journalPath, `${JSON.stringify(author(complete, owner))}\n`);
+
+      const next = await openOwner(domain, { hostProof: absentProof() });
+      expect(await admitting(next, { operation: "resume", generation: 1, target }), wrong).toMatchObject({ refused: true, code: "ADMISSION_UNAVAILABLE" });
+      await expect(next.reservations.reconcile({ canonicalFile: target }), wrong).rejects.toMatchObject({
+        name: "CanonicalReservationError",
+        code: expect.stringMatching(/^JOURNAL_(UNRECOGNIZED|INCONSISTENT)$/),
+      });
+      // The malformed line is evidence and stays; the claim it named is still the last word on the file.
+      expect((await journalRecords(domain.journalPath)).slice(0, 2).map((record) => record.record), wrong).toEqual(["prepared", "committed"]);
+    }
+  });
+
+  it("accepts the complete released record the module writes itself", async () => {
+    const domain = await sessionDirectory();
+    const { target, owner, reservationId, committed } = await committedJournal(domain);
+    await appendFile(
+      domain.journalPath,
+      `${JSON.stringify({ version: CANONICAL_JOURNAL_VERSION, record: "released", at: new Date().toISOString(), owner, reservationId, target: committed.target, reason: "explicit release" })}\n`,
+    );
+
+    const next = await openOwner(domain);
+    expect(await next.reservations.reconcile({ canonicalFile: target })).toMatchObject({ state: "released" });
+    expect(await admitting(next, { operation: "resume", generation: 1, target })).toMatchObject({ reservationId: expect.any(String) });
   });
 });
 

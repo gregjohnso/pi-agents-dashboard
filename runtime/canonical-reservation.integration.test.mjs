@@ -20,7 +20,7 @@
 
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { chmod, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 
@@ -121,10 +121,11 @@ async function realOwnerProcess() {
   };
 }
 
-/** @param {{journalPath:string,lockPath:string}} domain @param {any} owner @param {number} generation */
+/** @param {{session:string,journalPath:string,lockPath:string}} domain @param {any} owner @param {number} generation */
 async function openFor(domain, owner, generation) {
   let current = generation;
   const reservations = await openCanonicalReservations({
+    sessionDirectory: domain.session,
     journalPath: domain.journalPath,
     lockPath: domain.lockPath,
     owner,
@@ -224,6 +225,33 @@ describe("two state roots, one real session directory", () => {
     });
   });
 
+  it("admits one of two real owners racing for one file through two hard links, with nothing injected", async () => {
+    const domain = await realSessionDirectory();
+    const target = await writeSessionFile(join(domain.session, "2026-01-01T00-00-00-000Z_linked.jsonl"), "linked");
+    const alias = join(domain.session, "2026-01-01T00-00-00-000Z_linked-alias.jsonl");
+    await link(target, alias);
+    expect(await realpath(alias)).not.toBe(await realpath(target));
+    expect(String((await stat(alias, { bigint: true })).ino)).toBe(String((await stat(target, { bigint: true })).ino));
+    const [firstClaimant, secondClaimant] = [await realOwnerProcess(), await realOwnerProcess()];
+    const first = await openFor(domain, firstClaimant.ownerRun("state-a-row"), 1);
+    const second = await openFor(domain, secondClaimant.ownerRun("state-b-row"), 1);
+
+    // No barrier and no injection: two real backends, two real names for one inode, at the same time.
+    const decisions = await Promise.all([
+      admitting(first, { operation: "resume", generation: 1, target }),
+      admitting(second, { operation: "resume", generation: 1, target: alias }),
+    ]);
+
+    expect(decisions.filter((decision) => typeof decision.reservationId === "string")).toHaveLength(1);
+    const refused = decisions.find((decision) => decision.refused === true);
+    expect(refused?.code, JSON.stringify(decisions)).toMatch(/^(ADMISSION_UNAVAILABLE|TARGET_HAS_LIVE_WRITER)$/);
+    expect((await journalRecords(domain.journalPath)).map((record) => record.record)).toEqual(["prepared"]);
+    // Whichever name the winner used, the other name is the same claim.
+    for (const [host, name] of /** @type {[any, string][]} */ ([[first, target], [second, alias]])) {
+      expect(await host.reservations.reconcile({ canonicalFile: name })).toMatchObject({ state: "live" });
+    }
+  });
+
   it("refuses both halves of a swap without deadlocking, and refuses a replay onto a different target", async () => {
     const domain = await realSessionDirectory();
     const left = await writeSessionFile(join(domain.session, "2026-01-01T00-00-00-000Z_left.jsonl"), "left");
@@ -313,11 +341,12 @@ describe.skipIf(!CONSUMER)("the installed seam D hook, backed by this journal", 
    * binding Pi already had — and afterwards is only ever what this host itself committed. That is what
    * makes a later operation carrying a superseded generation refusable: nothing here recomputes it.
    */
-  /** @param {{journalPath:string,lockPath:string}} domain @param {any} ownerRun */
+  /** @param {{session:string,journalPath:string,lockPath:string}} domain @param {any} ownerRun */
   async function hostFor(domain, ownerRun) {
     /** @type {number|undefined} */
     let generation;
     const reservations = await openCanonicalReservations({
+      sessionDirectory: domain.session,
       journalPath: domain.journalPath,
       lockPath: domain.lockPath,
       owner: ownerRun,

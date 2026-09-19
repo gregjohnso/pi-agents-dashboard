@@ -67,80 +67,220 @@ const MOUNT_WAIT_MS = 60_000;
 const STOP_POLICY = { gracefulMs: 3_000, terminateMs: 3_000 };
 
 /**
- * The consumer side of the owner management bridge, extracted exactly as it behaved at ddd796e.
+ * What one owner generation may legitimately send, taken from the producer rather than chosen.
  *
- * This is the behaviour the review found two P1s in, moved behind one seam and changed in no other way, so the
- * regressions beside it fail for the defects themselves rather than for an absent export. The correction
- * follows in the next commit.
+ * `extension/pi-agents-owner.mjs` opens a bridge per `session_start` and, on that connection, calls
+ * `announceBridgeReady()` once, `reportSeams()` at most once (only when it has a record to forward) and
+ * `publishFacts()` once. A receipt is sent from `answerRequest`, once per host request that reached it. So
+ * three of the four frame kinds are bounded at one per generation, and receipts are bounded by the requests
+ * this manager actually sent on that generation — which is why continuing owner work is never capped: a new
+ * request authorises exactly one more receipt.
+ */
+const BRIDGE_FRAME_BUDGET = { "owner-ready": 1, "owner-seams": 1, "owner-facts": 1 };
+/**
+ * How many generation events this manager keeps for inspection.
+ *
+ * Diagnostics are bounded and the current aggregates are not a history: an owner that reconnects in a loop
+ * costs a bounded ring and a counter, not a growing array, a growing status response and a growing final
+ * record. The oldest entries are dropped, and `droppedEvents` says how many.
+ */
+const BRIDGE_DIAGNOSTIC_EVENTS = 64;
+
+/**
+ * The consumer side of the owner management bridge: one active generation, bounded retention.
+ *
+ * Two properties this owes its caller, both of which the previous shape got wrong.
+ *
+ * **One active generation.** A second connection supersedes the first, and the first is closed rather than
+ * left running. Every frame, close callback and request completion is scoped to the generation it belongs
+ * to, so a late event from a superseded owner cannot alter the current one. Current facts are the active
+ * generation's own latest snapshot, replaced wholesale: a fact that generation omits because it could not
+ * read it is absent, and does not survive from an older generation's snapshot.
+ *
+ * **Bounded retention.** Current owner facts are not a lifetime event log. The aggregates below are the
+ * active generation's current state plus counters and a bounded diagnostic ring, so an authenticated peer
+ * cannot grow this process's memory, its log, a status response or the final owner record by sending valid
+ * frames forever. A generation that exceeds its budget, or answers a request nobody made, has *its*
+ * connection closed and the reason recorded — Pi is not stopped and no attachment is touched.
  *
  * @param {{ log: (line: string) => void, maxDiagnosticEvents?: number, now?: () => number }} options
  */
-export function createBridgeConsumer({ log, now = Date.now }) {
-  /** @type {any[]} */
-  const bridgeFrames = [];
-  /** @type {any[]} */
-  const bridgeRequests = [];
+export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOSTIC_EVENTS, now = Date.now }) {
+  let generations = 0;
   /** @type {any} */
-  let bridgeOwner;
+  let active;
+  /** @type {any[]} */
+  const events = [];
+  let droppedEvents = 0;
+  const counts = { frames: 0, refusedGenerations: 0, supersededGenerations: 0 };
+
+  /** @param {Record<string, unknown>} event */
+  const note = (event) => {
+    events.push({ ...event, atHostMs: now() });
+    while (events.length > maxDiagnosticEvents) {
+      events.shift();
+      droppedEvents += 1;
+    }
+  };
+
+  /** Close one generation's connection and record why. The connection is asked once, and never awaited. @param {any} owner @param {string} reason */
+  const refuse = (owner, reason) => {
+    if (owner.refusal !== null) return;
+    owner.refusal = reason;
+    counts.refusedGenerations += 1;
+    note({ type: "bridge-refused", generation: owner.generation, reason });
+    log(`owner bridge generation ${owner.generation} refused: ${reason}`);
+    try {
+      owner.connection.close();
+    } catch (error) {
+      log(`owner bridge generation ${owner.generation} close failed: ${/** @type {Error} */ (error).message}`);
+    }
+  };
+
+  /** @param {any} owner @param {any} frame */
+  const admit = (owner, frame) => {
+    // A frame from a generation that is no longer this manager's owner changes nothing at all.
+    if (owner !== active) {
+      note({ type: "bridge-late-frame", generation: owner.generation, frameType: frame.type });
+      return;
+    }
+    if (owner.refusal !== null) return;
+    counts.frames += 1;
+    owner.seen[frame.type] = (owner.seen[frame.type] ?? 0) + 1;
+    const budget = BRIDGE_FRAME_BUDGET[/** @type {keyof typeof BRIDGE_FRAME_BUDGET} */ (frame.type)];
+    if (budget !== undefined && owner.seen[frame.type] > budget) {
+      refuse(owner, `sent ${owner.seen[frame.type]} ${frame.type} frames and this owner generation may send ${budget}`);
+      return;
+    }
+    if (frame.type === "owner-ready") {
+      owner.readyPhases.push(frame.phase);
+      return;
+    }
+    if (frame.type === "owner-seams") {
+      owner.reportedSeams = frame.reported;
+      return;
+    }
+    if (frame.type === "owner-facts") {
+      // A full snapshot replaces the previous one. Merging would keep a value this snapshot omitted.
+      owner.facts = frame.facts;
+      return;
+    }
+    if (frame.type === "owner-receipt") {
+      const pending = owner.awaiting.get(frame.requestId);
+      if (pending === undefined) {
+        refuse(owner, `answered request ${frame.requestId}, which this manager did not send on generation ${owner.generation}`);
+        return;
+      }
+      owner.awaiting.delete(frame.requestId);
+      owner.receipts.set(frame.requestId, frame);
+      return;
+    }
+    // `validateOwnerFrame` admits no other kind, so reaching here means the two ends disagree about the wire.
+    refuse(owner, `sent an unsolicited ${String(frame.type)} frame`);
+  };
 
   return {
     /** @param {any} connection */
     adopt(connection) {
-      bridgeOwner = connection;
-      const generation = bridgeFrames.filter((frame) => frame.type === "bridge-connected").length + 1;
-      bridgeFrames.push({ type: "bridge-connected", generation, atHostMs: now() });
-      log(`owner bridge generation ${generation} connected`);
-      connection.onFrame((/** @type {any} */ frame) => {
-        bridgeFrames.push({ ...frame, generation, atHostMs: now() });
-        log(`owner bridge ${frame.type}${frame.type === "owner-ready" ? ` phase ${frame.phase}` : ""}`);
-      });
+      const previous = active;
+      generations += 1;
+      const owner = {
+        generation: generations,
+        connection,
+        readyPhases: /** @type {string[]} */ ([]),
+        /** @type {Record<string, unknown>|undefined} */
+        facts: undefined,
+        /** @type {unknown} */
+        reportedSeams: undefined,
+        receipts: new Map(),
+        awaiting: new Map(),
+        requests: /** @type {any[]} */ ([]),
+        seen: /** @type {Record<string, number>} */ ({}),
+        /** @type {string|null} */
+        refusal: null,
+        connectedAtMs: now(),
+        closed: false,
+      };
+      active = owner;
+      note({ type: "bridge-connected", generation: owner.generation });
+      log(`owner bridge generation ${owner.generation} connected`);
+      if (previous !== undefined && !previous.closed) {
+        counts.supersededGenerations += 1;
+        note({ type: "bridge-superseded", generation: previous.generation, by: owner.generation });
+        log(`owner bridge generation ${previous.generation} superseded by ${owner.generation}`);
+        try {
+          previous.connection.close();
+        } catch (error) {
+          log(`owner bridge generation ${previous.generation} close failed: ${/** @type {Error} */ (error).message}`);
+        }
+      }
+      connection.onFrame((/** @type {any} */ frame) => admit(owner, frame));
       void connection.closed.then((/** @type {any} */ outcome) => {
-        bridgeFrames.push({ type: "bridge-closed", generation, refusal: outcome?.refusal ?? null, atHostMs: now() });
-        if (bridgeOwner === connection) bridgeOwner = undefined;
-        log(`owner bridge generation ${generation} closed: ${JSON.stringify(outcome)}`);
+        owner.closed = true;
+        note({ type: "bridge-closed", generation: owner.generation, refusal: outcome?.refusal ?? null });
+        log(`owner bridge generation ${owner.generation} closed: ${JSON.stringify(outcome)}`);
       });
-      return generation;
+      return owner.generation;
     },
 
-    /** @param {"stop"|"abort"} request @param {string} requestId */
+    /**
+     * Ask the current owner to end or abort its own session, and record what it answered.
+     *
+     * The receipt says what was asked and what the session looked like when it was asked. It is **not** a
+     * stop: `ctx.shutdown()` is request-only and idle-deferred, so only this manager observing a reaped exit
+     * and an absent owner ends anything. The request is recorded against the generation it was sent on, which
+     * is what makes a receipt from any other generation unsolicited.
+     * @param {"stop"|"abort"} request @param {string} requestId
+     */
     async request(request, requestId) {
-      const connection = bridgeOwner;
-      if (connection === undefined) {
-        const absent = { request, requestId: null, generation: null, sent: false, reason: "no owner generation is currently connected to the bridge", atHostMs: now() };
-        bridgeRequests.push(absent);
+      const owner = active;
+      if (owner === undefined || owner.closed || owner.refusal !== null) {
+        const absent = { request, requestId: null, generation: owner?.generation ?? null, sent: false, reason: "no owner generation is currently connected to the bridge", atHostMs: now() };
+        note({ type: "bridge-request", request, sent: false, generation: absent.generation });
         return absent;
       }
-      const record = { request, requestId, generation: null, sent: false, reason: /** @type {string|null} */ (null), atHostMs: now() };
+      const record = { request, requestId, generation: owner.generation, sent: false, reason: /** @type {string|null} */ (null), atHostMs: now() };
+      // Recorded before the write, so a receipt that arrives while the write is still settling is expected.
+      owner.awaiting.set(requestId, record);
       try {
-        await (request === "stop" ? connection.requestStop(requestId) : connection.requestAbort(requestId));
+        await (request === "stop" ? owner.connection.requestStop(requestId) : owner.connection.requestAbort(requestId));
         record.sent = true;
       } catch (error) {
+        owner.awaiting.delete(requestId);
         record.reason = /** @type {Error} */ (error).message;
       }
-      bridgeRequests.push(record);
-      log(`owner bridge ${request} request ${requestId}: ${record.sent ? "sent" : `refused (${record.reason})`}`);
+      owner.requests.push(record);
+      note({ type: "bridge-request", request, sent: record.sent, generation: owner.generation });
+      log(`owner bridge ${request} request ${requestId} on generation ${owner.generation}: ${record.sent ? "sent" : `refused (${record.reason})`}`);
       return record;
     },
 
+    /**
+     * The current owner's state, and bounded diagnostics. Never a frame history.
+     *
+     * Everything above `diagnostics` belongs to the one active generation. `readyPhases` therefore holds at
+     * most the single `bridge` phase that generation announced, and a reload does not accumulate a second.
+     */
     status() {
+      const owner = active;
       return {
-        connected: bridgeOwner !== undefined,
-        generation: bridgeFrames.filter((frame) => frame.type === "bridge-connected").length,
-        generations: bridgeFrames.filter((frame) => frame.type === "bridge-connected").length,
-        readyPhases: bridgeFrames.filter((frame) => frame.type === "owner-ready").map((frame) => frame.phase),
-        facts: Object.assign({}, ...bridgeFrames.filter((frame) => frame.type === "owner-facts").map((frame) => frame.facts)),
-        reportedSeams: bridgeFrames.filter((frame) => frame.type === "owner-seams").map((frame) => frame.reported),
-        receipts: bridgeFrames.filter((frame) => frame.type === "owner-receipt"),
-        requests: bridgeRequests,
-        refusal: null,
-        counts: { frames: bridgeFrames.length, refusedGenerations: 0, supersededGenerations: 0, droppedEvents: 0 },
-        diagnostics: bridgeFrames,
-        frames: bridgeFrames,
+        connected: owner !== undefined && !owner.closed && owner.refusal === null,
+        generation: owner?.generation ?? 0,
+        generations,
+        readyPhases: [...(owner?.readyPhases ?? [])],
+        facts: owner?.facts === undefined ? {} : { ...owner.facts },
+        reportedSeams: owner?.reportedSeams === undefined ? [] : [owner.reportedSeams],
+        receipts: [...(owner?.receipts.values() ?? [])],
+        requests: [...(owner?.requests ?? [])],
+        refusal: owner?.refusal ?? null,
+        counts: { ...counts, droppedEvents },
+        diagnostics: [...events],
       };
     },
 
+    /** The active generation's connection, or `undefined`. Exposed for the stop path's own bookkeeping. */
     activeGeneration() {
-      return bridgeOwner === undefined ? undefined : bridgeFrames.filter((frame) => frame.type === "bridge-connected").length;
+      return active === undefined || active.closed || active.refusal !== null ? undefined : active.generation;
     },
   };
 }

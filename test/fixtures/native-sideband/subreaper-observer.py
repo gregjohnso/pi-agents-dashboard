@@ -51,6 +51,7 @@ EXIT_OK = 0
 EXIT_TIMEOUT = 3
 EXIT_SETUP = 4
 HELPER_PID_MARKER = "binder-pid "
+CLEANUP_DEADLINE_SECONDS = 10
 
 alarm_fired = False
 
@@ -92,6 +93,9 @@ def start_disposable_parent(arguments, out_write: int, err_write: int, closable:
     pid = os.fork()
     if pid != 0:
         return pid
+    # Its own process group, whose id is this pid. That is what makes the subtree owned by construction: cleanup
+    # can reach a descendant whose identity was never reported, without discovering pids and without a scan.
+    os.setpgid(0, 0)
     os.dup2(out_write, 1)
     os.dup2(err_write, 2)
     for descriptor in closable:
@@ -105,6 +109,72 @@ def start_disposable_parent(arguments, out_write: int, err_write: int, closable:
         ])
     finally:
         os._exit(EXIT_SETUP)
+
+
+def kill_and_reap_owned(group_pid: int, reaped: dict, reap_ready, wake_read: int) -> dict:
+    """Kill the owned subtree and stay alive to collect it, bounded, then report what really happened.
+
+    Signalling and leaving is what this replaces: a subreaper that exits with descendants unreaped hands them to
+    something else and no status is ever collected. The signal goes to the process GROUP the forked parent leads,
+    so a descendant whose pid was never reported is reached anyway - no pid discovery, no scan of anything this
+    process does not own.
+
+    The wait is the same mechanism the main loop uses: SIGCHLD and SIGALRM arrive as a readable byte on the wakeup
+    pipe, so this blocks in `select` and is woken by events. No sleep and no retry loop. The end condition is
+    `waitpid` reporting no remaining children, which is the kernel's own answer rather than an empty list.
+    """
+    global alarm_fired
+    before = set(reaped)
+    account = {
+        "killedOwnedProcessGroup": False,
+        "killSignal": "SIGKILL",
+        "processGroup": group_pid,
+        "killError": None,
+        "reapedDuringCleanup": [],
+        "noChildrenRemaining": False,
+        "cleanupTimedOut": False,
+        "stillUnreaped": [],
+        "uncertainty": [],
+    }
+    try:
+        os.killpg(group_pid, signal.SIGKILL)
+        account["killedOwnedProcessGroup"] = True
+    except OSError as error:
+        # ESRCH here means the group is already gone, which is a fine outcome rather than a failure to report.
+        account["killError"] = f"{type(error).__name__}: {error}"
+
+    alarm_fired = False
+    signal.alarm(CLEANUP_DEADLINE_SECONDS)
+    selector = selectors.DefaultSelector()
+    selector.register(wake_read, selectors.EVENT_READ, "signal")
+    try:
+        if reap_ready():
+            account["noChildrenRemaining"] = True
+        while not account["noChildrenRemaining"] and not alarm_fired:
+            try:
+                for _key, _mask in selector.select():
+                    try:
+                        os.read(wake_read, 4096)
+                    except (BlockingIOError, OSError):
+                        pass
+            except InterruptedError:
+                pass
+            if reap_ready():
+                account["noChildrenRemaining"] = True
+    finally:
+        signal.alarm(0)
+        selector.close()
+
+    account["cleanupTimedOut"] = alarm_fired and not account["noChildrenRemaining"]
+    account["reapedDuringCleanup"] = [reaped[pid] for pid in sorted(set(reaped) - before)]
+    if not account["noChildrenRemaining"]:
+        # Named uncertainty, because an unreaped child is exactly what must not be claimed away.
+        account["stillUnreaped"] = ["at-least-one-waitable-child-remained"]
+        account["uncertainty"] = [
+            "the cleanup deadline passed with at least one waitable child still unreaped; its terminal status is "
+            "unknown and this process is relinquishing it",
+        ]
+    return account
 
 
 def main() -> int:
@@ -153,20 +223,23 @@ def main() -> int:
     reaped: dict[int, dict] = {}
     helper_pid = None
     killed = False
+    cleanup_requested = False
     open_streams = {"stdout", "stderr"}
 
     def accounted_for() -> bool:
         # Done when the parent this process started and the helper it forked have both been reaped here.
         return parent_pid in reaped and helper_pid is not None and helper_pid in reaped
 
-    def reap_ready() -> None:
+    def reap_ready() -> bool:
+        """Collect everything reapable now. Returns True once no waitable child remains at all."""
         while True:
             try:
                 dead_pid, status = os.waitpid(-1, os.WNOHANG)
             except ChildProcessError:
-                return
+                # Authoritative: this process has no children left, reaped or otherwise.
+                return True
             if dead_pid == 0:
-                return
+                return False
             record = decode(status)
             record["pid"] = dead_pid
             record["role"] = (
@@ -177,7 +250,7 @@ def main() -> int:
             reaped[dead_pid] = record
             emit(f"OBSERVER-REAPED {json.dumps(record)}")
 
-    while not accounted_for() and not alarm_fired:
+    while not accounted_for() and not alarm_fired and not cleanup_requested:
         try:
             events = selector.select()
         except InterruptedError:
@@ -201,6 +274,11 @@ def main() -> int:
                 if not data:
                     selector.unregister(descriptor)
                     continue
+                if b"cleanup" in data:
+                    # The harness asking the owner to tidy up, rather than signalling numbers it parsed from a log.
+                    emit("observer-asked-to-clean-up")
+                    cleanup_requested = True
+                    break
                 if b"kill" in data and not killed:
                     killed = True
                     os.kill(parent_pid, signal.SIGKILL)
@@ -230,25 +308,26 @@ def main() -> int:
 
     signal.alarm(0)
     summary = {
+        "endedBecause": (
+            "accounted-for" if accounted_for()
+            else "cleanup-requested" if cleanup_requested
+            else "deadline"
+        ),
         "observerPid": os.getpid(),
         "disposableParentPid": parent_pid,
         "helperPid": helper_pid,
         "sentSigkillToParent": killed,
         "reapedPids": sorted(reaped),
         "reaped": {str(pid): record for pid, record in reaped.items()},
-        "streamsStillOpen": sorted(open_streams),
+        # As observed when the main loop ended, before any cleanup phase below.
+        "streamsStillOpenAtMainLoopEnd": sorted(open_streams),
         "timedOut": not accounted_for(),
     }
     if not accounted_for():
+        summary["cleanup"] = kill_and_reap_owned(parent_pid, reaped, reap_ready, wake_read)
+        summary["reapedPids"] = sorted(reaped)
+        summary["reaped"] = {str(pid): record for pid, record in reaped.items()}
         emit(f"OBSERVER-TIMEOUT {json.dumps(summary)}")
-        # Owned cleanup only: the one child started here, and the helper it named on its own stdout.
-        for pid in (helper_pid, parent_pid):
-            if pid is None or pid in reaped:
-                continue
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
         return EXIT_TIMEOUT
     emit(f"OBSERVER-DONE {json.dumps(summary)}")
     return EXIT_OK

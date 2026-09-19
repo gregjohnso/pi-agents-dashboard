@@ -31,12 +31,16 @@ afterEach(async () => {
 });
 
 /**
- * Run the registered cleanups now, so a test can assert on what cleanup did rather than on what it will do.
+ * Run one registered cleanup now and take it off the shared stack, so a test can assert on what cleanup did.
  *
- * `afterEach` drains the same list, so anything already run here is not run twice.
+ * Deliberately not a drain of everything: the shared stack also holds the socket root's removal, and running that
+ * early deletes the directory the rest of the case is still using.
+ * @param {() => unknown} entry
  */
-async function runCleanupNow() {
-  for (const close of cleanup.splice(0).reverse()) await close();
+async function runCleanupNow(entry) {
+  const at = cleanup.indexOf(entry);
+  if (at >= 0) cleanup.splice(at, 1);
+  await entry();
 }
 
 /**
@@ -1446,6 +1450,8 @@ async function observedParentLoss(childScript, socketPath, options = {}) {
       serve();
     });
   }
+  // A pipe whose reader has gone raises asynchronously, so it needs a handler rather than a `try` around a write.
+  observer.stdin.on("error", () => {});
   /**
    * Three distinct facts, kept distinct.
    *
@@ -1492,7 +1498,7 @@ async function observedParentLoss(childScript, socketPath, options = {}) {
   const pidFrom = (/** @type {RegExp} */ pattern) => Number(pattern.exec(text)?.[1] ?? 0);
   /** What cleanup actually did, so a test can assert it did not signal a number it no longer owns. */
   const cleanupActions = /** @type {string[]} */ ([]);
-  cleanup.push(async () => {
+  const cleanupEntry = async () => {
     // The observer owns the parent and, through the kernel, every descendant that reparents to it. So cleanup
     // asks the observer and then waits for it - it never signals a recorded pid number, because a reaped pid is
     // free for reuse and that number may already name something else.
@@ -1504,11 +1510,8 @@ async function observedParentLoss(childScript, socketPath, options = {}) {
       // Still running: ask it to clean up on its own terms, and only fall back to the ChildProcess handle this
       // call owns - never to a number parsed out of a log.
       cleanupActions.push("asked-observer-to-clean-up");
-      try {
-        observer.stdin.end("cleanup\n");
-      } catch {
-        cleanupActions.push("observer-stdin-already-closed");
-      }
+      if (observer.stdin.writable) observer.stdin.end("cleanup\n");
+      else cleanupActions.push("observer-stdin-already-closed");
       const settled = await Promise.race([completion.then(() => true), new Promise((resolve) => setTimeout(() => resolve(false), 15_000).unref())]);
       if (!settled) {
         cleanupActions.push("killed-observer-through-its-childprocess-handle");
@@ -1516,7 +1519,8 @@ async function observedParentLoss(childScript, socketPath, options = {}) {
       }
     }
     await completion;
-  });
+  };
+  cleanup.push(cleanupEntry);
 
   await waitFor(/observer-pid \d+/u);
   await waitFor(/observed-parent-pid \d+/u);
@@ -1548,6 +1552,8 @@ async function observedParentLoss(childScript, socketPath, options = {}) {
     observerExited,
     completion,
     cleanupActions: () => [...cleanupActions],
+    /** Run only this harness's cleanup, leaving the socket root and anything else alone. */
+    runCleanup: () => runCleanupNow(cleanupEntry),
     spawnError: () => spawnError,
     text: () => text,
     /** Ask the observer to SIGKILL the one child it started. The test never signals that pid itself. */
@@ -1702,6 +1708,7 @@ it("reaps every owned descendant on its own timeout, including one it was never 
   const timeout = await observed.timedOut();
 
   expect(timeout.summary.timedOut).toBe(true);
+  expect(timeout.summary.endedBecause).toBe("deadline");
   expect(timeout.summary.helperPid).toBe(null);
   // It did not stop at signalling: it killed what it owned and then stayed to collect the statuses.
   expect(timeout.cleanup.killedOwnedProcessGroup).toBe(true);
@@ -1746,6 +1753,22 @@ it("settles instead of hanging when the observer cannot be started at all", asyn
   const missing = join(root, "there-is-no-such-executable-here");
   expect(existsSync(missing)).toBe(false);
 
+  // The precondition, measured on this platform: a failed spawn raises `error` and `close` and never `exit`. That
+  // is exactly why completion built on `exit` alone could not settle, and why it is built on `close` here.
+  const events = await new Promise((resolve) => {
+    const doomed = spawn(missing, [], { stdio: ["pipe", "pipe", "pipe"] });
+    const seen = /** @type {string[]} */ ([]);
+    doomed.on("error", () => seen.push("error"));
+    doomed.on("exit", () => seen.push("exit"));
+    doomed.on("close", () => {
+      seen.push("close");
+      resolve(seen);
+    });
+  });
+  expect(events).toContain("error");
+  expect(events).toContain("close");
+  expect(events).not.toContain("exit");
+
   const started = Date.now();
   const failure = await observedParentLoss(fileURLToPath(fixture("held-handoff-binder.mjs")), socketPath, {
     executable: missing,
@@ -1772,12 +1795,12 @@ it("signals no recorded pid number during cleanup, on the successful path and th
   await succeeded.completion;
 
   // Nothing is left to signal, and cleanup must not pretend otherwise by firing at numbers it no longer owns.
-  await runCleanupNow();
+  await succeeded.runCleanup();
   expect(succeeded.cleanupActions()).toEqual(["observer-had-already-finished"]);
 
   // The failing path: still running, so cleanup asks the owner rather than signalling parsed numbers.
   const running = await observedParentLoss(fileURLToPath(fixture("held-handoff-binder.mjs")), join(root, "still-running"));
-  await runCleanupNow();
+  await running.runCleanup();
   const actions = running.cleanupActions();
   expect(actions[0]).toBe("asked-observer-to-clean-up");
   expect(actions).not.toContain("killed-observer-through-its-childprocess-handle");

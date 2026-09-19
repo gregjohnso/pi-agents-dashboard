@@ -12,7 +12,8 @@
  *      bytes replayed to produce it;
  *   5. a second attachment that sees the same draft and the same UI, and can edit it;
  *   6. one submission, answered deterministically by the labelled fake provider, visible on both screens;
- *   7. an explicit stop that reports the owner's real wait status.
+ *   7. an explicit stop that reports the owner's real wait status, and leaves the owner's own private directory
+ *      behind for inspection because this demo removes no directory at all.
  *
  * Every wait is on an event — a terminal read, a process exit, a socket answer — with a bound that fails the
  * smoke rather than hanging it. Timings are measured, not claimed.
@@ -195,7 +196,7 @@ async function stopIdentifiedProcess(identity, label) {
 async function cleanUpAfterFailure({ root, spawned, owner }) {
   const record = { demoStop: null, owner: null, spawned: [] };
   try {
-    const answer = await demoCommand(["stop", "--root", root, "--keep-root"], { label: "demo stop (cleanup)", spawned });
+    const answer = await demoCommand(["stop", "--root", root], { label: "demo stop (cleanup)", spawned });
     record.demoStop = { exit: answer.exit, output: answer.output.trim().slice(-600) };
   } catch (error) {
     record.demoStop = { error: /** @type {Error} */ (error).message };
@@ -352,7 +353,7 @@ async function driveSmoke({ root, evidenceDir, spawned, recordOwner }) {
   const detachBoth = await demoCommand(["detach", "--root", root], { label: "demo detach (second round)", spawned });
   const exitTwo = await clientTwo.waitForExit();
   const exitOneAgain = await clientOneAgain.waitForExit();
-  const stopArgs = [DEMO, "stop", "--root", root, "--keep-root"];
+  const stopArgs = [DEMO, "stop", "--root", root];
   note("stop", stopArgs);
   const stopFrom = Date.now();
   const stopped = JSON.parse((await demoCommand(stopArgs.slice(1), { label: "demo stop", spawned })).output);

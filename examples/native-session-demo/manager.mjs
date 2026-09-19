@@ -9,7 +9,10 @@
  *
  * What happens, in order:
  *
- * 1. A control socket and seam E's bootstrap sideband are created in a `0700` directory.
+ * 1. A control socket and seam E's bootstrap sideband are created in a `0700` directory. That directory is held
+ *    open from the moment it is created, and every path this process or its child writes to, binds or unlinks
+ *    inside it resolves through that descriptor: a root that is renamed or replaced under a running owner is
+ *    never the thing this process touches. `stop` removes no tree at all and keeps the directory for inspection.
  * 2. One owner pseudo-terminal is opened and the real bundled CLI is launched on it, once, with a replaced
  *    environment: a disposable HOME, a disposable agent and session directory, no discovered extensions and
  *    no credential. The native spawn replaces the inherited environment rather than adding to it, so nothing
@@ -24,7 +27,8 @@
  *    clients attached, because this process still holds the terminal.
  */
 
-import { rm, chmod } from "node:fs/promises";
+import { chmod } from "node:fs/promises";
+import { appendFileSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { ReadStream } from "node:tty";
@@ -35,7 +39,7 @@ import { openOwnerPty } from "../../runtime/pty-mechanism.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "../../runtime/process-signaler.mjs";
 import { startBootstrapSideband } from "./bootstrap-sideband.mjs";
 import { resolveCohort } from "./cohort.mjs";
-import { createRoot, demoPaths, removeOwnedRoot, tokenMatches, writeOwnerRecord } from "./demo-root.mjs";
+import { createRoot, demoPaths, tokenMatches, writeOwnerRecord } from "./demo-root.mjs";
 import { FAKE_MODEL_ID, FAKE_PROVIDER_ID } from "./fake-provider.mjs";
 import { createPendingInputQueue } from "./pending-input.mjs";
 import { createFrameReader, encodeFrame, MAX_BODY_BYTES } from "./protocol.mjs";
@@ -77,12 +81,30 @@ function launchProfile(cols, rows) {
 /**
  * @param {{ root: string, cols?: number, rows?: number, manifestPath?: string, cohortRoot?: string, log: (line: string) => void, onReady: (record: any) => void }} options
  */
-export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROWS, manifestPath, cohortRoot, log, onReady }) {
+export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROWS, manifestPath, cohortRoot, log: echo, onReady }) {
   const startedAtMs = Date.now();
   const cohort = resolveCohort({ manifestPath, cohortRoot });
-  const { paths, token, ownership } = await createRoot(root);
+  const { paths, token, anchor } = await createRoot(root);
+  // Every path this owner writes to, binds or unlinks. `paths` is the operator's spelling, for reporting only.
+  const owned = demoPaths(anchor.anchoredRoot);
   const profile = launchProfile(cols, rows);
-  const ingressLog = path.join(root, "owner-preload.jsonl");
+
+  /**
+   * One line, in this owner's own log file and on the caller's stream.
+   *
+   * The file is appended through the held descriptor, so a replaced root never receives this owner's log. Once
+   * `stop` has released that descriptor the line is still echoed but no longer appended: this owner has let go
+   * of the directory it was writing to, and re-resolving the path to keep logging is the mistake this avoids.
+   */
+  const log = (line) => {
+    const entry = `${new Date().toISOString()} ${line}\n`;
+    try {
+      appendFileSync(owned.log, entry);
+    } catch {
+      // A log that cannot be written must not stop the owner.
+    }
+    echo(line);
+  };
 
   /** Every attachment the manager has ever issued, so an epoch is never reused for an attachment id. */
   const epochs = new Map();
@@ -115,7 +137,7 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
     if (entry.phase === "native-mounted") resolveMounted(entry);
   };
 
-  const sideband = await startBootstrapSideband(paths.bootstrapSocket, {
+  const sideband = await startBootstrapSideband(owned.bootstrapSocket, {
     onFrame: (frame) => {
       if (frame.type === "native-bootstrap") {
         bootstrapHello = frame;
@@ -135,21 +157,21 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
     // A replaced environment, not an augmented one: the native spawn does not inherit, and this is the whole
     // list. No API key, no operator HOME, no operator agent directory, no real session store.
     PATH: "/usr/bin:/bin",
-    HOME: paths.home,
+    HOME: owned.home,
     TERM: profile.term,
     COLUMNS: String(cols),
     LINES: String(rows),
     LANG: "C.UTF-8",
-    PI_CODING_AGENT_DIR: paths.agent,
-    PI_CODING_AGENT_SESSION_DIR: paths.sessions,
+    PI_CODING_AGENT_DIR: owned.agent,
+    PI_CODING_AGENT_SESSION_DIR: owned.sessions,
     PI_OFFLINE: "1",
     PI_SKIP_VERSION_CHECK: "1",
-    PI_NATIVE_BOOTSTRAP_SOCKET: paths.bootstrapSocket,
+    PI_NATIVE_BOOTSTRAP_SOCKET: owned.bootstrapSocket,
     PI_DEMO_TUI_PACKAGE: cohort.tuiPackageRoot,
-    PI_DEMO_CONTROL_SOCKET: paths.controlSocket,
+    PI_DEMO_CONTROL_SOCKET: owned.controlSocket,
     PI_DEMO_TOKEN: token,
     PI_DEMO_PROFILE: JSON.stringify(profile),
-    PI_DEMO_LOG: ingressLog,
+    PI_DEMO_LOG: owned.ingressLog,
   };
   const ownerArgs = [
     "--import",
@@ -171,11 +193,13 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
   const server = net.createServer();
   await new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(paths.controlSocket, () => resolve(undefined));
+    // Bound through the held descriptor, not through `root`: closing this listener unlinks the pathname it bound,
+    // so binding the operator's spelling would hand that unlink to whatever holds the path at teardown.
+    server.listen(owned.controlSocket, () => resolve(undefined));
   });
-  await chmod(paths.controlSocket, 0o600);
+  await chmod(owned.controlSocket, 0o600);
 
-  const handle = await openOwnerPty({ command: process.execPath, args: ownerArgs, env: ownerEnv, cwd: paths.project, cols, rows });
+  const handle = await openOwnerPty({ command: process.execPath, args: ownerArgs, env: ownerEnv, cwd: owned.project, cols, rows });
   // The one place this process takes the master descriptor into a stream. The stream owns its lifetime from
   // here on, so nothing else closes that fd: a second close could land on a descriptor the runtime recycled.
   const ownerOutput = new ReadStream(handle.masterFd);
@@ -361,11 +385,11 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
           } else if (header.type === "stop") {
             send(socket, { type: "stopping" });
             void stop(header.keepRoot === true).then((record) => {
-              // The answer goes out before the listener is closed: a control connection that was torn down
-              // first would leave the operator without the owner's real exit status.
+              // The answer goes out before this process exits: a control connection that was torn down first
+              // would leave the operator without the owner's real exit status. `stop` has already closed the
+              // listener and released the directory descriptor it wrote through.
               send(socket, { type: "stopped", ...record });
-              socket.end();
-              server.close(() => process.exit(0));
+              socket.end(() => process.exit(0));
               setTimeout(() => process.exit(0), 1_000).unref();
             });
           } else {
@@ -423,7 +447,11 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
    * be signalled. The reaped status is read before any signal, because after one it can no longer be told
    * apart from the exit it caused.
    *
-   * @param {boolean} keepRoot
+   * **No tree is removed.** The root is retained for inspection, whatever `keepRoot` says: this demo deletes
+   * nothing recursively, and the two sockets it created are unlinked by closing the listeners that bound them
+   * through the held descriptor. The descriptor is released last, after that unlink has happened.
+   *
+   * @param {boolean} keepRoot accepted for compatibility; the root is kept either way
    */
   async function stop(keepRoot) {
     if (stopping) return { alreadyStopping: true };
@@ -461,23 +489,29 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
     log(`owner ${ownerIdentity.pid} exit: ${JSON.stringify(exitRecord)}`);
 
     const finalStatus = statusRecord();
-    await writeOwnerRecord(root, { ...finalStatus, stopped: true });
+    await writeOwnerRecord(anchor.anchoredRoot, { ...finalStatus, stopped: true });
     // Destroying the read stream closes the master descriptor, which is this process's only claim on the
     // terminal. It happens once, after the owner is gone, and nothing closes that fd again.
     ownerOutput.destroy();
     await sideband.close();
-    // The root is removed only while it is still the one `createRoot` created here. A root that was replaced,
-    // or a `--keep-root` run, keeps its evidence: a failed teardown must not delete someone else's directory.
-    const rootRemoval = keepRoot
-      ? { removed: false, reason: "--keep-root was asked for, so this owner's root and its evidence are kept" }
-      : await removeOwnedRoot(root, ownership);
-    if (!rootRemoval.removed) {
-      await rm(paths.controlSocket, { force: true });
-      log(`stopped; root kept: ${rootRemoval.reason}`);
-    } else {
-      log(`stopped; root removed: ${rootRemoval.reason}`);
-    }
-    return { owner: ownerIdentity, exit: exitRecord, rootKept: !rootRemoval.removed, rootRemoval };
+    if (keepRoot) log("--keep-root was asked for; this demo removes no root at all, so the flag changes nothing");
+    const pathStillNamesCreatedDirectory = await anchor.namesCreatedDirectory();
+    const retention = {
+      root,
+      retained: true,
+      pathStillNamesCreatedDirectory,
+      reason: pathStillNamesCreatedDirectory
+        ? `${root} is this owner's own root and is kept for inspection; remove it yourself when you have read it`
+        : `${root} no longer names the directory this owner created; that directory was written through the descriptor this owner held, and nothing at ${root} was touched`,
+    };
+    log(`stopped; root is retained: ${retention.reason}`);
+    // Closing the listener unlinks the pathname it bound — the anchored one — and it does that as the handle
+    // closes, not when the last connection ends: measured, because the answer above still has to go out on a
+    // live control connection, so its completion callback cannot be awaited here. The descriptor is released
+    // only after that unlink, because an unlink through a closed fd resolves nowhere.
+    server.close();
+    await anchor.close();
+    return { owner: ownerIdentity, exit: exitRecord, rootKept: true, rootRetention: retention };
   }
 
   // `start` returns at `native-mounted`, not at first paint and not at initialization. That is the phase at
@@ -495,11 +529,11 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
     ...statusRecord(),
     controlSocket: paths.controlSocket,
     bootstrapSocket: paths.bootstrapSocket,
-    ingressLog,
+    ingressLog: paths.ingressLog,
     managerPid: process.pid,
     managerLog: paths.log,
   };
-  await writeOwnerRecord(root, record);
+  await writeOwnerRecord(anchor.anchoredRoot, record);
   onReady(record);
 
   // A silent exit of the owner is reported, not hidden: the record keeps the real wait status.
@@ -509,7 +543,7 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
       exitRecord = { ...exit, disposition: "exited-on-its-own" };
       log(`the owner exited on its own: ${JSON.stringify(exit)}`);
       for (const client of [...clients.values()]) detachClient(client, `the owner exited: ${JSON.stringify(exit)}`);
-      await writeOwnerRecord(root, { ...statusRecord(), stopped: false });
+      await writeOwnerRecord(anchor.anchoredRoot, { ...statusRecord(), stopped: false });
     },
     (error) => log(`waiting for the owner failed: ${error.message}`),
   );

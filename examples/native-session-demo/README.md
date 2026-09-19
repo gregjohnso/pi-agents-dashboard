@@ -130,7 +130,7 @@ The digest is a hash of your own prompt. No model was called; no credential exis
 ### 5. Stop
 
 ```bash
-$NODE $DEMO stop --root /tmp/pi-nsd-mine                     # add --keep-root to keep the logs
+$NODE $DEMO stop --root /tmp/pi-nsd-mine                     # the root is kept; read it, then remove it yourself
 ```
 
 `stop` detaches every client, dispatches Pi's own end-of-input as the graceful gesture, and escalates only
@@ -139,11 +139,25 @@ immediately before every signal. It prints the owner's real `wait(2)` status, an
 that status was actually observed: a teardown that timed out without one is reported as unverified rather than
 graceful, and its diagnostics are kept.
 
-What it removes is the root **this owner created**, verified against the ownership marker written at creation:
+**It removes no directory and no tree, ever.** The root is retained for inspection and `rootRetention.reason`
+says so; `--keep-root` is accepted for compatibility and changes nothing. This is a deliberate narrowing of an
+earlier version that deleted its own root:
 
-- `--keep-root` keeps the root and its logs, and says so in `rootRemoval.reason`
-- a root that was replaced after this owner created it is preserved, not deleted, and the reason is printed
-- nothing outside that root is touched, and no directory this demo did not create is ever removed
+- a recursive delete keyed on an operator-supplied path is only as safe as that path still naming the directory
+  the manager created, and nothing the demo can do makes checking that path and deleting it one atomic step
+- an ownership marker inside a directory is provenance for a reader, not identity: anyone can copy the file
+- so the demo does the part it can do exactly. It holds the directory it created open for its whole life, and
+  every write, every bind and every unlink inside it — the manager log, `owner.json`, the in-Pi caller's JSONL,
+  Pi's own `HOME`, both sockets — resolves through that descriptor (`/proc/<manager pid>/fd/<fd>/…`, a literal
+  pid because `/proc/self` inside the Pi child would name the child). Rename the root or replace it mid-run and
+  this owner keeps writing to the directory it opened, while the directory now standing at that path is left
+  exactly as it was found — including its own `s`, which is not unlinked, because the listener closes by the
+  pathname it bound rather than by re-resolving the root
+- the operator-facing commands (`attach`, `detach`, `status`, `stop`) still take the `--root` path, because that
+  is the operator's own spelling of where his owner is
+
+So cleaning up is yours: `rm -rf` the root once you have read its log. Note that `start` refuses an existing
+root, so a retained one is never reused or reset.
 
 ### Watch the manager instead of backgrounding it
 
@@ -173,8 +187,15 @@ it — measured, not assumed. The owner's whole environment is the list in `mana
   up to 64 KiB, decided **before** a span is held: a span that would cross the bound is refused and its
   attachment is detached by name, so it is never delivered later and reconnecting cannot grow that queue
 - the frontend respects backpressure in both directions. A `write()` that answers `false` has already accepted
-  that chunk, so nothing is re-sent; the other side of that direction is paused and resumed on one drain, which
-  is how a slow terminal becomes visible to the manager's 4 MiB bound instead of hiding in a private queue
+  that chunk, so nothing is re-sent; the other side of that direction is paused, **nothing more is written until
+  the destination drains** — later keystrokes, and every further output frame decoded from the same socket read,
+  only join the queue — and one drain listener writes the remainder in arrival order. That is how a slow terminal
+  becomes visible to the manager's 4 MiB bound instead of hiding in a private queue
+- teardown has one order on every path that ends an attachment: both relays are disposed, then the detach frame
+  if that path sends one, then this terminal's mode restoration. Nothing reaches the terminal after the
+  restoration sequence, and bytes the relays were still holding are dropped with a count in a notice — typed
+  input is never delivered late to a session that moved on, and output is never replayed, because a reattachment
+  is a repaint
 
 ## Prove it
 
@@ -182,9 +203,21 @@ it — measured, not assumed. The owner's whole environment is the list in `mana
 # focused cases, no Pi, under a second
 $NODE node_modules/vitest/vitest.mjs run examples/native-session-demo/native-session-demo.test.mjs --no-cache
 
+# the integrated teardown cases: one real manager per case, its root renamed and replaced under it
+PI_NATIVE_DEMO_SMOKE=1 $NODE node_modules/vitest/vitest.mjs run \
+  examples/native-session-demo/native-session-demo.test.mjs --no-cache -t "replaced under it"
+
 # the real user flow: two clients, two real pseudo-terminals, one real bundled CLI
 $NODE examples/native-session-demo/smoke.mjs --root /tmp/pi-nsd-smoke --evidence /tmp/nsd-evidence
 ```
+
+The replaced-root cases need the same prerequisites as the smoke — a real pseudo-terminal and the selected
+cohort — so they run behind the same selector. Each one starts a real owner through `serve`, authenticates a
+control connection, renames the root away, puts another directory in its place (unmarked, and carrying a copied
+ownership marker, and arriving while the stop is already running), then stops through that connection. What they
+assert is that the replacement keeps every name, every byte and its mode, that the manager's own evidence landed
+in the directory it opened, that both its sockets were unlinked there, and that the owner exited with a real
+wait status leaving no process behind.
 
 The smoke drives only the commands above. It types an unsent draft from the first attachment, detaches
 everything, checks the owner's identity is unchanged and unreaped, reattaches, asserts the retained draft came
@@ -222,6 +255,9 @@ recorded, not that a stop was verified. Only runs from this correction onward ca
   is not a durable ledger, it is not a second canonical writer, and it recovers nothing: if the manager dies,
   the pseudo-terminal closes and the owner is hung up. A root left behind by a dead manager is refused by the
   next `start`, not adopted, reset or cleaned up for you.
+- **Nothing is cleaned up for you.** `stop` deletes no directory, so every run leaves its root behind for
+  inspection and you remove it yourself. The demo's own test harness removes only the sandbox it named for its
+  own run, after the processes in it are reaped.
 - **Output produced while detached is not retained.** It is read and discarded, which is why a reattachment is
   a repaint rather than a replay.
 - **One geometry, fixed at launch.** A client whose terminal differs is told so and attaches anyway. There is

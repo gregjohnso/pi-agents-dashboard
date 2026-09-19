@@ -6,17 +6,21 @@
  * seconds. It runs here only when `PI_NATIVE_DEMO_SMOKE` selects it, so the routine suite stays short.
  */
 
-import { chmod, mkdir, mkdtemp, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { chmod, cp, mkdir, mkdtemp, readdir, readFile, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { once } from "node:events";
+import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
 
 import { resolveCohort } from "./cohort.mjs";
-import { createRoot, demoPaths, removeOwnedRoot, tokenMatches } from "./demo-root.mjs";
+import { FRONTEND_MODE_RESTORE, createAttachmentTeardown } from "./client.mjs";
+import { createRoot, demoPaths, readToken, tokenMatches, writeOwnerRecord } from "./demo-root.mjs";
 import { FAKE_REPLY_PREFIX, createFakeStreamSimple, deterministicReply } from "./fake-provider.mjs";
 import { createPausingRelay } from "./pausing-relay.mjs";
 import { createPendingInputQueue } from "./pending-input.mjs";
@@ -34,6 +38,68 @@ async function temporaryDirectory() {
   const directory = await mkdtemp(path.join(tmpdir(), "native-session-demo-"));
   temporaryDirectories.push(directory);
   return directory;
+}
+
+/** What another program's directory looks like when it takes the place of a root this demo created. */
+const REPLACEMENT_SENTINELS = {
+  "owner.json": '{"whose":"not this demo\'s"}\n',
+  "manager.log": "another program's log line\n",
+  s: "not a socket, and not this demo's\n",
+  b: "not a sideband, and not this demo's\n",
+  "notes.txt": "the operator's own notes\n",
+};
+
+/**
+ * Put an unowned directory where a root used to be, optionally carrying a *copy* of this demo's ownership
+ * marker: a copied marker is not directory identity, and a demo that reads one as authority is reading a file
+ * it does not own.
+ *
+ * @param {string} at @param {{ ownershipFrom?: string }} options
+ */
+async function plantReplacement(at, { ownershipFrom } = {}) {
+  await mkdir(at, { mode: 0o755 });
+  for (const [name, content] of Object.entries(REPLACEMENT_SENTINELS)) {
+    await writeFile(path.join(at, name), content, { mode: 0o644 });
+  }
+  if (ownershipFrom !== undefined) await cp(path.join(ownershipFrom, "ownership.json"), path.join(at, "ownership.json"));
+  await chmod(at, 0o755);
+  return snapshotDirectory(at);
+}
+
+/** Every name, every byte and the mode: what must be identical after a stop that touched the real root. */
+async function snapshotDirectory(at) {
+  const entries = (await readdir(at)).sort();
+  const contents = {};
+  for (const name of entries) contents[name] = await readFile(path.join(at, name), "utf8");
+  return { mode: (await stat(at)).mode & 0o777, entries, contents };
+}
+
+/**
+ * Read one stream as the write order it received, without ending it.
+ *
+ * A disposed relay must be able to write nothing more, and a stream that had been ended would report a later
+ * write as an error rather than as the silence these cases are asserting.
+ */
+function collectWrites(stream) {
+  const chunks = [];
+  const waiters = [];
+  const receivedBytes = () => chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+  stream.on("data", (chunk) => {
+    chunks.push(chunk);
+    for (const waiter of [...waiters]) {
+      if (receivedBytes() < waiter.bytes) continue;
+      waiters.splice(waiters.indexOf(waiter), 1);
+      waiter.resolve();
+    }
+  });
+  return {
+    /** Everything written once at least `bytes` have arrived, plus one loop turn for anything that should not. */
+    async settle(bytes) {
+      if (receivedBytes() < bytes) await new Promise((resolve) => waiters.push({ bytes, resolve }));
+      await new Promise((resolve) => setImmediate(resolve));
+      return Buffer.concat(chunks);
+    },
+  };
 }
 
 /** Collect what one reader made of a byte stream, frames and refusal alike. */
@@ -160,7 +226,7 @@ describe("the demo root's ownership", () => {
     expect((await stat(root)).mode & 0o777).toBe(0o755);
   });
 
-  it("refuses a symlinked root, and never follows it when removing", async () => {
+  it("refuses a symlinked root, and leaves the link and its target alone", async () => {
     const parent = await temporaryDirectory();
     const target = path.join(parent, "target");
     await mkdir(target);
@@ -169,13 +235,11 @@ describe("the demo root's ownership", () => {
     await symlink(target, root);
 
     await expect(createRoot(root)).rejects.toThrowError(/already exists/u);
-    const removal = await removeOwnedRoot(root, { ownerId: "a root this process never created" });
-    expect(removal.removed).toBe(false);
     expect(await readlink(root)).toBe(target);
     expect(await readFile(path.join(target, "keep.txt"), "utf8")).toBe("target content\n");
   });
 
-  it("creates a fresh 0700 root it owns, and removes that one on request", async () => {
+  it("creates a fresh 0700 root and holds that directory open", async () => {
     const parent = await temporaryDirectory();
     const root = path.join(parent, "fresh");
     const created = await createRoot(root);
@@ -184,23 +248,28 @@ describe("the demo root's ownership", () => {
     expect((await stat(demoPaths(root).token)).mode & 0o777).toBe(0o600);
     expect(created.token).toMatch(/^[0-9a-f]{64}$/u);
     expect(typeof created.ownership.ownerId).toBe("string");
+    expect(created.anchor.anchoredRoot).toBe(`/proc/${process.pid}/fd/${created.anchor.fd}`);
+    expect(await created.anchor.namesCreatedDirectory()).toBe(true);
+    expect((await stat(created.anchor.anchoredRoot)).ino).toBe((await stat(root)).ino);
 
-    const removal = await removeOwnedRoot(root, created.ownership);
-    expect(removal.removed).toBe(true);
-    expect(existsSync(root)).toBe(false);
+    await created.anchor.close();
   });
 
-  it("preserves a root that was replaced after this process created it", async () => {
+  it("writes through the descriptor it opened, never through a path that was replaced", async () => {
     const parent = await temporaryDirectory();
     const root = path.join(parent, "replaced");
+    const renamed = path.join(parent, "renamed");
     const created = await createRoot(root);
-    await rm(root, { recursive: true, force: true });
-    await mkdir(root);
-    await writeFile(path.join(root, "someone-else.txt"), "later\n");
+    await rename(root, renamed);
+    const planted = await plantReplacement(root, { ownershipFrom: renamed });
 
-    const removal = await removeOwnedRoot(root, created.ownership);
-    expect(removal.removed).toBe(false);
-    expect(await readFile(path.join(root, "someone-else.txt"), "utf8")).toBe("later\n");
+    await writeOwnerRecord(created.anchor.anchoredRoot, { stopped: true });
+
+    expect(await created.anchor.namesCreatedDirectory()).toBe(false);
+    expect(JSON.parse(await readFile(path.join(renamed, "owner.json"), "utf8")).stopped).toBe(true);
+    expect(await snapshotDirectory(root)).toEqual(planted);
+
+    await created.anchor.close();
   });
 });
 
@@ -248,6 +317,11 @@ describe("the frontend's pausing relay", () => {
     return { source, destination, relay: createPausingRelay({ source, destination, canResumeSource }) };
   }
 
+  /** Everything the destination ever took, in write order, read out after the fact. */
+  async function written(destination, bytes) {
+    return (await collectWrites(destination).settle(bytes)).toString("utf8");
+  }
+
   it("queues what the destination refused, pauses the source once and writes nothing more", () => {
     const { source, destination, relay } = relayPair();
     relay.send(Buffer.from("one"), Buffer.from("two"), Buffer.from("three"));
@@ -257,6 +331,41 @@ describe("the frontend's pausing relay", () => {
     expect(source.isPaused()).toBe(true);
     expect(destination.writableLength).toBe(3);
     expect(destination.listenerCount("drain")).toBe(1);
+  });
+
+  it("stays blocked across every later send until the destination drains", () => {
+    const { destination, relay } = relayPair();
+    relay.send(Buffer.from("one"));
+    expect(destination.writableLength).toBe(3);
+    expect(relay.blocked()).toBe(true);
+
+    relay.send(Buffer.from("two"));
+    relay.send(Buffer.from("three"), Buffer.from("four"));
+
+    expect(destination.writableLength).toBe(3);
+    expect(relay.queuedCount()).toBe(3);
+    expect(relay.queuedBytes()).toBe(12);
+    expect(destination.listenerCount("drain")).toBe(1);
+  });
+
+  it("queues every frame decoded from one socket read after the first write was refused", async () => {
+    const { destination, relay } = relayPair();
+    const chunk = Buffer.concat([
+      encodeFrame({ type: "output" }, Buffer.from("aaa")),
+      encodeFrame({ type: "output" }, Buffer.from("bbb")),
+      encodeFrame({ type: "output" }, Buffer.from("ccc")),
+    ]);
+    const reader = createFrameReader(
+      ({ body }) => relay.send(body),
+      (error) => {
+        throw error;
+      },
+    );
+    reader.push(chunk);
+
+    expect(destination.writableLength).toBe(3);
+    expect(relay.queuedCount()).toBe(2);
+    expect(await written(destination, 9)).toBe("aaabbbccc");
   });
 
   it("writes only the unwritten remainder on drain, in order, and resumes the source once", async () => {
@@ -278,22 +387,97 @@ describe("the frontend's pausing relay", () => {
     expect(destination.listenerCount("drain")).toBe(1);
   });
 
-  it("does not resume a source the attachment has finished with", async () => {
+  it("flushes the remainder to a live destination but leaves a source it may not resume paused", async () => {
     const { source, destination, relay } = relayPair(() => false);
     relay.send(Buffer.from("one"), Buffer.from("two"));
     expect(relay.sourcePaused()).toBe(true);
-    const seen = [];
-    const allSeen = new Promise((resolve) => {
-      destination.on("data", (chunk) => {
-        seen.push(chunk.toString("utf8"));
-        if (seen.join("") === "onetwo") resolve(undefined);
-      });
-    });
-    await allSeen;
 
-    expect(seen).toEqual(["one", "two"]);
+    expect(await written(destination, 6)).toBe("onetwo");
     expect(source.isPaused()).toBe(true);
     expect(relay.sourcePaused()).toBe(true);
+  });
+
+  it("writes nothing more once it is disposed, drops what it held by count, and refuses a later send", async () => {
+    const { source, destination, relay } = relayPair();
+    relay.send(Buffer.from("one"), Buffer.from("two"), Buffer.from("three"));
+
+    const disposal = relay.dispose("the attachment ended");
+    expect(disposal).toMatchObject({ reason: "the attachment ended", discardedChunks: 2, discardedBytes: 8 });
+    expect(relay.queuedCount()).toBe(0);
+    expect(destination.listenerCount("drain")).toBe(0);
+    expect(relay.dispose("again")).toMatchObject({ reason: "the attachment ended", discardedChunks: 2 });
+    expect(() => relay.send(Buffer.from("four"))).toThrowError(/disposed/u);
+
+    destination.emit("drain");
+    expect(await written(destination, 3)).toBe("one");
+    expect(source.isPaused()).toBe(true);
+  });
+});
+
+describe("one attachment's teardown", () => {
+  /** The client's own wiring, with a terminal and a socket that each take one byte before saying no. */
+  function frontend() {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough({ highWaterMark: 1 });
+    const socket = new PassThrough({ highWaterMark: 1 });
+    const notices = [];
+    let finished = false;
+    const toTerminal = createPausingRelay({ source: socket, destination: stdout, canResumeSource: () => !finished });
+    const toManager = createPausingRelay({ source: stdin, destination: socket, canResumeSource: () => !finished });
+    const teardown = createAttachmentTeardown({ toManager, toTerminal, stdin, stdout, notice: (text) => notices.push(text) });
+    return { stdin, stdout, socket, notices, toTerminal, toManager, teardown, finish: () => (finished = true) };
+  }
+
+  /** Everything one side ever took, in write order. */
+  async function written(stream, bytes) {
+    return collectWrites(stream).settle(bytes);
+  }
+
+  it("restores this terminal last, and nothing the relay held is written after that", async () => {
+    const { stdout, notices, toTerminal, teardown, finish } = frontend();
+    toTerminal.send(Buffer.from("owner output one"), Buffer.from("owner output two"));
+    finish();
+
+    teardown.restore("the manager closed this attachment");
+    stdout.emit("drain");
+
+    const seen = (await written(stdout, 16 + FRONTEND_MODE_RESTORE.length)).toString("utf8");
+    expect(seen).toBe(`owner output one${FRONTEND_MODE_RESTORE}`);
+    expect(seen.endsWith(FRONTEND_MODE_RESTORE)).toBe(true);
+    expect(notices.join("\n")).toMatch(/16 byte\(s\) of the owner's output were dropped/u);
+  });
+
+  it("keeps the detach frame behind the input the socket already took, and drops the rest by count", async () => {
+    const { socket, notices, toManager, teardown, finish } = frontend();
+    const first = encodeFrame({ type: "input" }, Buffer.from("typed-one"));
+    const second = encodeFrame({ type: "input" }, Buffer.from("typed-two"));
+    const detach = encodeFrame({ type: "detach" });
+    toManager.send(first, second);
+    finish();
+
+    teardown.disposeRelays("this client received SIGTERM");
+    socket.write(detach);
+    teardown.restore("this client received SIGTERM");
+    socket.emit("drain");
+
+    const frames = read([await written(socket, first.byteLength + detach.byteLength)]).frames;
+    expect(frames.map((frame) => frame.header.type)).toEqual(["input", "detach"]);
+    expect(frames[0].body.toString("utf8")).toBe("typed-one");
+    expect(notices.join("\n")).toMatch(/typed byte\(s\) in 1 frame\(s\) had not reached the manager/u);
+  });
+
+  it("does not resume this terminal's stdin after the attachment finished", async () => {
+    const { stdin, socket, toManager, teardown, finish } = frontend();
+    toManager.send(encodeFrame({ type: "input" }, Buffer.from("one")), encodeFrame({ type: "input" }, Buffer.from("two")));
+    expect(stdin.isPaused()).toBe(true);
+    finish();
+
+    teardown.restore("the manager closed this attachment");
+    socket.emit("drain");
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(stdin.isPaused()).toBe(true);
+    expect(() => toManager.send(encodeFrame({ type: "input" }, Buffer.from("three")))).toThrowError(/disposed/u);
   });
 });
 
@@ -342,13 +526,166 @@ describe.runIf(process.env.PI_NATIVE_DEMO_SMOKE === "1")("the native session dem
     async () => {
       const directory = await temporaryDirectory();
       // A fresh root per run: the manager refuses a root it did not create, so a kept one is never reused.
-      const result = await runSmoke({ root: `/tmp/pi-nsd-vitest-${process.pid}-${Date.now()}`, evidenceDir: path.join(directory, "evidence") });
+      const root = `/tmp/pi-nsd-vitest-${process.pid}-${Date.now()}`;
+      const result = await runSmoke({ root, evidenceDir: path.join(directory, "evidence") });
       expect(result.failures).toEqual([]);
       expect(result.passed).toBe(true);
       expect(result.owner.identityAfterDetach.startIdentity).toBe(result.owner.identityAtStart.startIdentity);
       expect(result.owner.absenceAfterStop.gone).toBe(true);
       expect(result.owner.exitAfterStop.observed).toBe(true);
+      // `stop` now retains every root, so this harness removes the one sandbox it named for this run itself,
+      // after its owner is verified gone. It never removes a root an operator passed in.
+      await rm(root, { recursive: true, force: true });
     },
     300_000,
   );
+});
+
+/**
+ * One real manager, started through its own `serve` command, whose root is taken away from under it.
+ *
+ * These need the same prerequisites as the smoke — a real pseudo-terminal and the selected cohort's bundled
+ * CLI — so they run behind the same selector rather than in the routine suite.
+ */
+describe.runIf(process.env.PI_NATIVE_DEMO_SMOKE === "1")("a manager whose root is replaced under it", () => {
+  const DEMO = fileURLToPath(new URL("demo.mjs", import.meta.url));
+
+  /** One manager in its own process, resolved at its own ready record. */
+  async function serveOneOwner(root) {
+    const child = spawn(process.execPath, [DEMO, "serve", "--root", root], { stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    let stdout = "";
+    const ready = await new Promise((resolve, reject) => {
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk;
+        const newline = stdout.indexOf("\n");
+        if (newline !== -1) resolve(JSON.parse(stdout.slice(0, newline)));
+      });
+      child.stdout.on("close", () => reject(new Error(`the manager exited before it was ready: ${stderr.slice(-2000)}`)));
+      child.on("error", reject);
+    });
+    // Both terminal events are awaited on promises made now: a process that is already gone emits neither again.
+    return { child, ready, exited: once(child, "exit"), stderr: () => stderr };
+  }
+
+  /** One authenticated connection, opened while the root path still names the directory the manager created. */
+  async function connectToManager(root, hello) {
+    const token = await readToken(root);
+    const socket = net.connect(demoPaths(root).controlSocket);
+    await once(socket, "connect");
+    const frames = [];
+    const waiters = [];
+    const reader = createFrameReader(
+      (frame) => {
+        frames.push(frame);
+        for (const waiter of [...waiters]) {
+          if (waiter.type !== frame.header.type) continue;
+          waiters.splice(waiters.indexOf(waiter), 1);
+          waiter.resolve(frame.header);
+        }
+      },
+      (error) => {
+        throw error;
+      },
+    );
+    socket.on("data", (chunk) => reader.push(chunk));
+    socket.on("error", () => {});
+    socket.write(encodeFrame({ ...hello, token }));
+    return {
+      socket,
+      closed: once(socket, "close"),
+      send: (frame) => socket.write(encodeFrame(frame)),
+      awaitFrame(type, timeoutMs = 60_000) {
+        const seen = frames.find((frame) => frame.header.type === type);
+        if (seen !== undefined) return Promise.resolve(seen.header);
+        return new Promise((resolve, reject) => {
+          const waiter = { type, resolve };
+          waiters.push(waiter);
+          const timer = setTimeout(() => reject(new Error(`no ${type} frame within ${timeoutMs}ms; saw ${frames.map((frame) => frame.header.type).join(",")}`)), timeoutMs);
+          waiter.resolve = (header) => {
+            clearTimeout(timer);
+            resolve(header);
+          };
+        });
+      },
+    };
+  }
+
+  /**
+   * Start an owner, rename its root away, put another directory in its place and stop it through the control
+   * connection that was authenticated before any of that happened.
+   *
+   * @param {{ ownershipCopied: boolean, replaceAfterStopFrame: boolean }} how
+   */
+  async function driveReplacedStop({ ownershipCopied, replaceAfterStopFrame }) {
+    const sandbox = await temporaryDirectory();
+    const root = path.join(sandbox, "r");
+    const renamed = path.join(sandbox, "renamed");
+    const { ready, exited, stderr } = await serveOneOwner(root);
+    const control = await connectToManager(root, { type: "hello", role: "control" });
+    const client = await connectToManager(root, { type: "hello", role: "client", attachmentId: "client-1" });
+    await client.awaitFrame("welcome");
+
+    const replace = async () => {
+      await rename(root, renamed);
+      return plantReplacement(root, ownershipCopied ? { ownershipFrom: renamed } : {});
+    };
+
+    let planted;
+    if (!replaceAfterStopFrame) planted = await replace();
+    control.send({ type: "stop" });
+    // Near teardown, not before a single check: the manager is already stopping when the root changes.
+    if (replaceAfterStopFrame) planted = await replace();
+
+    const stopped = await control.awaitFrame("stopped");
+    const bye = await client.awaitFrame("bye");
+    await client.closed;
+    const [managerExitCode] = await exited;
+    return { root, renamed, ready, stopped, bye, planted, managerExitCode, stderr };
+  }
+
+  /** The directory that took the root's place: same names, same bytes, same mode. */
+  async function expectReplacementUntouched({ root, planted }) {
+    expect(await snapshotDirectory(root)).toEqual(planted);
+  }
+
+  /** This demo's own owner, gone for real, with its evidence in the directory the manager actually held. */
+  async function expectOwnerStoppedForReal({ renamed, ready, stopped, bye, managerExitCode }) {
+    expect(stopped.exit.waitObserved).toBe(true);
+    expect(Number.isInteger(stopped.exit.status)).toBe(true);
+    expect(stopped.rootKept).toBe(true);
+    expect(stopped.rootRetention.pathStillNamesCreatedDirectory).toBe(false);
+    expect(bye.reason).toMatch(/stopping/u);
+    expect(managerExitCode).toBe(0);
+    expect((await verifyOwnerAbsence(ready.owner.pid, ready.owner.startIdentity)).gone).toBe(true);
+    expect(JSON.parse(await readFile(path.join(renamed, "owner.json"), "utf8")).stopped).toBe(true);
+    expect(await readFile(path.join(renamed, "manager.log"), "utf8")).toMatch(/root is retained/u);
+    // Both sockets were unlinked by the paths the manager bound, which resolve through its own descriptor.
+    expect(existsSync(path.join(renamed, "s"))).toBe(false);
+    expect(existsSync(path.join(renamed, "b"))).toBe(false);
+  }
+
+  it("leaves an unmarked directory that replaced its root exactly as it found it", async () => {
+    const run = await driveReplacedStop({ ownershipCopied: false, replaceAfterStopFrame: false });
+    await expectReplacementUntouched(run);
+    await expectOwnerStoppedForReal(run);
+  });
+
+  it("leaves a directory carrying a copied ownership marker alone: a copied marker is not identity", async () => {
+    const run = await driveReplacedStop({ ownershipCopied: true, replaceAfterStopFrame: false });
+    expect(run.planted.entries).toContain("ownership.json");
+    await expectReplacementUntouched(run);
+    await expectOwnerStoppedForReal(run);
+  });
+
+  it("leaves a marked replacement alone when it arrives while the stop is already running", async () => {
+    const run = await driveReplacedStop({ ownershipCopied: true, replaceAfterStopFrame: true });
+    await expectReplacementUntouched(run);
+    await expectOwnerStoppedForReal(run);
+  });
 });

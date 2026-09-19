@@ -6,13 +6,20 @@
  * record are `0600`: the socket is the only way in, and the token is read from a file rather than passed on
  * a command line where `ps` would publish it.
  *
- * The state under `home/`, `agent/`, `sessions/` and `project/` is disposable by construction. Nothing here
- * reads the operator's real `~/.pi`, and `stop` removes the root this demo created — only that one. The root is
- * created exclusively: an existing path of any kind, directory or symlink, is refused before anything is
- * chmodded, written or deleted, and the ownership marker written at creation is what later authorises removal.
+ * The state under `home/`, `agent/`, `sessions/` and `project/` is disposable by construction, and nothing here
+ * reads the operator's real `~/.pi`. The root is created exclusively: an existing path of any kind, directory or
+ * symlink, is refused before anything is chmodded, written or deleted.
+ *
+ * **This demo removes no root, and no tree, ever.** `stop` reaps the owner and keeps the directory for
+ * inspection. That is a deliberate narrowing: a recursive delete keyed on an operator-supplied path is only as
+ * safe as that path still naming the directory this process created, and a marker file inside a directory is
+ * evidence, not identity — anyone can copy one. What the demo does instead is bind every write and every unlink
+ * it makes to the directory it opened at creation, through `openRootAnchor`, so a renamed or replaced path is
+ * never the thing it touches. Remove a retained root yourself when you have read it.
  */
 
-import { chmod, lstat, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import path from "node:path";
 
@@ -44,10 +51,12 @@ export function demoPaths(root) {
     /** Seam E's core bootstrap sideband, which Pi connects out to from `main()`. */
     bootstrapSocket: path.join(root, "b"),
     token: path.join(root, "token"),
-    /** Written once, at creation: the one fact that says this demo created this exact root. */
+    /** Written once, at creation, as provenance for whoever reads a retained root. It authorises nothing. */
     ownership: path.join(root, "ownership.json"),
     ownerRecord: path.join(root, "owner.json"),
     log: path.join(root, "manager.log"),
+    /** What the in-Pi pre-TUI caller appends its own observations to. */
+    ingressLog: path.join(root, "owner-preload.jsonl"),
     home: path.join(root, "home"),
     agent: path.join(root, "agent"),
     sessions: path.join(root, "sessions"),
@@ -56,7 +65,40 @@ export function demoPaths(root) {
 }
 
 /**
- * Create and own a fresh root. It refuses every path that already exists rather than adopting it.
+ * Hold the created directory open, and hand back paths that resolve through that descriptor.
+ *
+ * `anchoredRoot` is `/proc/<this pid>/fd/<fd>`, so `path.join(anchoredRoot, "s")` names the `s` inside the
+ * directory this process opened — the same inode after a rename, and never a directory that later took that
+ * path's place. It is a literal pid on purpose: the Pi child is handed some of these paths, and `/proc/self`
+ * inside that child would name the child's own descriptors instead.
+ *
+ * `dev`/`ino` are captured for reporting only. The descriptor is what binds the writes; comparing a path's
+ * `lstat` to those numbers says what was true when it was read, which is why `namesCreatedDirectory` is an
+ * observation for a log line and never a permission to mutate a path.
+ *
+ * @param {string} root
+ */
+export async function openRootAnchor(root) {
+  const handle = await open(root, constants.O_RDONLY | constants.O_DIRECTORY);
+  const created = await handle.stat();
+  const anchoredRoot = `/proc/${process.pid}/fd/${handle.fd}`;
+  return {
+    fd: handle.fd,
+    dev: created.dev,
+    ino: created.ino,
+    anchoredRoot,
+    /** Does `root` still name the directory this anchor holds? Reported, never relied on to authorise a write. */
+    async namesCreatedDirectory() {
+      const seen = await lstat(root).catch(() => null);
+      return seen !== null && seen.isDirectory() && seen.dev === created.dev && seen.ino === created.ino;
+    },
+    /** Released only after the last anchored path has been used: an unlink through a closed fd resolves nowhere. */
+    close: () => handle.close(),
+  };
+}
+
+/**
+ * Create and own a fresh root, and hold it open. It refuses every path that already exists rather than adopting it.
  *
  * @param {string} root
  */
@@ -70,41 +112,22 @@ export async function createRoot(root) {
     if (/** @type {NodeJS.ErrnoException} */ (cause).code === "EEXIST") throw new DemoRootExistsError(root, { cause });
     throw cause;
   }
-  await chmod(root, 0o700);
-  for (const directory of [paths.home, paths.agent, paths.sessions, paths.project]) {
+  const anchor = await openRootAnchor(root);
+  const anchored = demoPaths(anchor.anchoredRoot);
+  // From here nothing addresses the root by the caller's path: the mode, the state directories, the token and
+  // the provenance marker are all set through the descriptor this process just opened. A umask that stripped
+  // owner bits from `mkdir` is corrected here, where the correction cannot land on another directory.
+  await chmod(anchor.anchoredRoot, 0o700);
+  for (const directory of [anchored.home, anchored.agent, anchored.sessions, anchored.project]) {
     await mkdir(directory, { recursive: true, mode: 0o700 });
   }
   const token = randomBytes(32).toString("hex");
-  await writeFile(paths.token, `${token}\n`, { mode: 0o600 });
-  await chmod(paths.token, 0o600);
+  await writeFile(anchored.token, `${token}\n`, { mode: 0o600 });
+  await chmod(anchored.token, 0o600);
   const ownership = { ownerId: randomUUID(), createdByPid: process.pid, createdAtMs: Date.now() };
-  await writeFile(paths.ownership, `${JSON.stringify(ownership, null, 2)}\n`, { mode: 0o600 });
-  await chmod(paths.ownership, 0o600);
-  return { paths, token, ownership };
-}
-
-/**
- * Remove a root only while it is still the one this process created.
- *
- * A root that was replaced, or that is no longer a directory, is preserved and named instead of deleted: this
- * function is the only place the demo removes a tree recursively, and it never follows a symlink to do it.
- *
- * @param {string} root @param {{ ownerId: string }} ownership
- */
-export async function removeOwnedRoot(root, ownership) {
-  const entry = await lstat(root).catch(() => null);
-  if (entry === null) return { removed: false, reason: `${root} no longer exists` };
-  if (!entry.isDirectory()) return { removed: false, reason: `${root} is no longer a directory this demo created` };
-  const recorded = await readFile(demoPaths(root).ownership, "utf8").then(
-    (text) => /** @type {{ ownerId?: string }} */ (JSON.parse(text)),
-    () => null,
-  );
-  if (recorded === null) return { removed: false, reason: `${root} carries no ownership record of this demo's making` };
-  if (recorded.ownerId !== ownership.ownerId) {
-    return { removed: false, reason: `${root} is owned by ${recorded.ownerId}, not by this owner` };
-  }
-  await rm(root, { recursive: true, force: true });
-  return { removed: true, reason: `${root} was created by this owner and was removed with it` };
+  await writeFile(anchored.ownership, `${JSON.stringify(ownership, null, 2)}\n`, { mode: 0o600 });
+  await chmod(anchored.ownership, 0o600);
+  return { paths, token, ownership, anchor };
 }
 
 /** @param {string} root */
@@ -125,7 +148,7 @@ export async function readOwnerRecord(root) {
   return JSON.parse(await readFile(demoPaths(root).ownerRecord, "utf8"));
 }
 
-/** @param {string} root @param {Record<string, unknown>} record */
+/** @param {string} root the operator-facing root for a read, or an anchored root for this owner's own write */
 export async function writeOwnerRecord(root, record) {
   const file = demoPaths(root).ownerRecord;
   await writeFile(file, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });

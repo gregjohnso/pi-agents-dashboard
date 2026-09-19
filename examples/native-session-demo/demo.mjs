@@ -6,7 +6,7 @@
  *   attach   join that owner from this terminal; run it in as many terminals as you like
  *   detach   close one attachment, or all of them; the owner keeps running with zero clients
  *   status   the owner's identity, readiness, presentations and attachments
- *   stop     stop that owner and clean up only what this demo created
+ *   stop     stop that owner, and keep only its own private directory behind for inspection
  *   serve    what `start` runs in the background; run it yourself to watch the manager's log on stderr
  *
  * This is a development-only integration demo. It is not a product entry point, it ships in no tarball, and
@@ -14,7 +14,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync } from "node:fs";
+import { existsSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,6 +40,8 @@ const USAGE = `native-session-demo — one persistent native Pi, many attachment
   --root      where the owner keeps its socket, token and disposable state (default ${defaultRoot()})
   --manifest  the verified-cohort manifest that selects which installed Pi runs
               (default ${DEFAULT_MANIFEST})
+  --keep-root accepted for compatibility. \`stop\` removes no directory in any case: it reaps the owner and
+              leaves its root behind, so remove a root yourself once you have read it
 `;
 
 /** @param {string[]} argv */
@@ -142,16 +144,8 @@ async function main() {
   const options = parseArguments(rest);
 
   if (command === "serve") {
-    const paths = demoPaths(options.root);
-    const log = (line) => {
-      const entry = `${new Date().toISOString()} ${line}\n`;
-      try {
-        appendFileSync(paths.log, entry);
-      } catch {
-        // The log directory is created with the root; a failure here must not stop the owner.
-      }
-      process.stderr.write(entry);
-    };
+    // The manager appends its own log inside the root it holds open; this is only where it is echoed.
+    const log = (line) => process.stderr.write(`${new Date().toISOString()} ${line}\n`);
     await runManager({
       ...options,
       log,
@@ -203,7 +197,7 @@ async function main() {
 
   if (command === "stop") {
     const answer = await control(options.root, { type: "stop", keepRoot: options.keepRoot }, "stopped");
-    process.stdout.write(`${JSON.stringify({ owner: answer.owner, exit: answer.exit, rootKept: answer.rootKept, rootRemoval: answer.rootRemoval }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({ owner: answer.owner, exit: answer.exit, rootKept: answer.rootKept, rootRetention: answer.rootRetention }, null, 2)}\n`);
     return;
   }
 

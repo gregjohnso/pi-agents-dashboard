@@ -283,7 +283,7 @@ describe("the owner bridge consumer", () => {
     expect(record).toMatchObject({ request: "stop", requestId: "request-1", sent: true, generation: 1 });
     expect(owner.sent).toEqual([{ request: "stop", requestId: "request-1" }]);
     owner.emit({ type: "owner-receipt", requestId: "request-1", request: "stop", outcome: "requested" });
-    expect(consumer.status().receipts).toEqual([
+    expect(consumer.status().recentReceipts).toEqual([
       { type: "owner-receipt", requestId: "request-1", request: "stop", outcome: "requested" },
     ]);
 
@@ -344,8 +344,8 @@ describe("the owner bridge consumer", () => {
     expect(status.readyPhases).toEqual(["bridge"]);
     expect(status.facts).toEqual({ sessionId: "session-two" });
     // The old generation's receipt did not become the current one's, and its flood did not refuse generation 2.
-    expect(status.receipts).toEqual([]);
-    expect(status.requests).toEqual([]);
+    expect(status.recentReceipts).toEqual([]);
+    expect(status.recentRequests).toEqual([]);
     expect(status.refusal).toBe(null);
     expect(status.connected).toBe(true);
   });
@@ -363,6 +363,114 @@ describe("the owner bridge consumer", () => {
     expect(record).toMatchObject({ sent: false, requestId: null });
     expect(`${record.reason}`).toMatch(/no owner generation is currently connected/u);
     expect(owner.sent).toEqual([]);
+  });
+
+  // Operator-visible failure: authorizing work is not a retention bound. Every authorized request and every
+  // receipt answering one used to be kept for the generation's whole life and serialized into every status
+  // response and the final owner record, so a peer doing nothing but legitimate work regrew exactly the memory,
+  // status and log problem the flood case was supposed to have closed. The flood case only repeated
+  // `owner-facts` and the receipt case sent one request, so neither could see this.
+  it("bounds what it retains across many authorized requests, without refusing any of them", async () => {
+    const { consumer, lines } = consumerFor();
+    const owner = fakeOwnerConnection();
+    consumer.adopt(owner.connection);
+
+    // Sequential, so nothing is ever in flight twice: each answer frees the slot before the next request.
+    for (let index = 0; index < 500; index += 1) {
+      const id = `request-${index}-${"i".repeat(200)}`;
+      const record = await consumer.request("stop", id);
+      expect(record).toMatchObject({ admitted: true, sent: true });
+      owner.emit({ type: "owner-receipt", requestId: id, request: "stop", outcome: "requested", note: "n".repeat(400) });
+    }
+
+    const status = consumer.status();
+    // Every one of the 500 was authorized, sent and answered: nothing was refused and nothing was invented.
+    expect(status.totals).toMatchObject({ requested: 500, sent: 500, receipted: 500, refused: 0, capacityRefusals: 0 });
+    expect(status.refusal).toBe(null);
+    expect(status.connected).toBe(true);
+    // What is retained is bounded by entries and by bytes, and what was dropped is counted rather than hidden.
+    expect(status.recentRequests.length).toBeLessThanOrEqual(16);
+    expect(status.recentReceipts.length).toBeLessThanOrEqual(16);
+    expect(status.totals.droppedRequests).toBeGreaterThan(400);
+    expect(status.totals.droppedReceipts).toBeGreaterThan(400);
+    // The status response and the final owner record are the same shape, so one bound covers both.
+    expect(JSON.stringify(status).length).toBeLessThan(40_000);
+    // And the log does not carry one line per request forever either.
+    expect(lines.join("\n").length).toBeLessThan(40_000);
+  });
+
+  // An entry count alone is not a bound. A request id or an error string may be near the wire's own frame
+  // limit, so a ring of sixteen of them would still be a megabyte in every status response.
+  it("bounds retention by bytes as well as entries when ids are near the wire limit", async () => {
+    const { consumer } = consumerFor();
+    const owner = fakeOwnerConnection();
+    consumer.adopt(owner.connection);
+
+    for (let index = 0; index < 16; index += 1) {
+      const id = `huge-${index}-${"x".repeat(60_000)}`;
+      await consumer.request("stop", id);
+      owner.emit({ type: "owner-receipt", requestId: id, request: "stop", outcome: "requested" });
+    }
+
+    const status = consumer.status();
+    expect(status.totals).toMatchObject({ requested: 16, sent: 16, receipted: 16 });
+    // Sixteen entries would have fitted the count bound; the byte bound is what keeps this small.
+    expect(JSON.stringify(status).length).toBeLessThan(40_000);
+    for (const entry of [...status.recentRequests, ...status.recentReceipts]) {
+      expect(`${entry.requestId}`.length).toBeLessThanOrEqual(256);
+    }
+  });
+
+  // A peer that never answers must not be able to grow the in-flight bookkeeping without limit. The answer is
+  // a named capacity result: still-authorized requests are not evicted, no receipt is fabricated, the owner's
+  // connection is not refused, and work resumes as soon as one answer arrives.
+  it("refuses admission by named capacity when the peer stops answering, and resumes when it answers", async () => {
+    const { consumer } = consumerFor();
+    const owner = fakeOwnerConnection();
+    consumer.adopt(owner.connection);
+
+    /** @type {any[]} */
+    const admitted = [];
+    for (let index = 0; index < 8; index += 1) {
+      admitted.push(await consumer.request("stop", `unanswered-${index}`));
+    }
+    expect(admitted.every((record) => record.admitted === true && record.sent === true)).toBe(true);
+
+    const full = await consumer.request("stop", "one-too-many");
+    expect(full).toMatchObject({ admitted: false, sent: false, requestId: null, inFlight: 8 });
+    expect(`${full.reason}`).toMatch(/in-flight capacity/u);
+    // The generation is refused nothing: it is still connected, still unrefused, and its work still pending.
+    expect(consumer.status()).toMatchObject({ connected: true, refusal: null, inFlightRequests: 8, inFlightCapacity: 8 });
+    expect(consumer.status().totals).toMatchObject({ requested: 9, sent: 8, capacityRefusals: 1 });
+    // Nothing was sent for the refused one, so nothing is owed for it.
+    expect(owner.sent.length).toBe(8);
+
+    // One answer frees one slot, and the next request goes through.
+    owner.emit({ type: "owner-receipt", requestId: "unanswered-0", request: "stop", outcome: "requested" });
+    const afterwards = await consumer.request("stop", "now-there-is-room");
+    expect(afterwards).toMatchObject({ admitted: true, sent: true });
+    expect(consumer.status().inFlightRequests).toBe(8);
+  });
+
+  // Retired bookkeeping goes with its generation: a superseded owner's in-flight work is not the new one's.
+  it("clears retired request bookkeeping when a generation is superseded", async () => {
+    const { consumer } = consumerFor();
+    const first = fakeOwnerConnection();
+    consumer.adopt(first.connection);
+    for (let index = 0; index < 4; index += 1) await consumer.request("stop", `old-${index}`);
+    expect(consumer.status().inFlightRequests).toBe(4);
+
+    const second = fakeOwnerConnection();
+    consumer.adopt(second.connection);
+
+    const status = consumer.status();
+    expect(status.generation).toBe(2);
+    expect(status.inFlightRequests).toBe(0);
+    expect(status.recentRequests).toEqual([]);
+    expect(status.totals).toMatchObject({ requested: 0, sent: 0, receipted: 0 });
+    // A late receipt for the old generation's work changes nothing here.
+    first.emit({ type: "owner-receipt", requestId: "old-0", request: "stop", outcome: "requested" });
+    expect(consumer.status()).toMatchObject({ generation: 2, inFlightRequests: 0, refusal: null });
   });
 
   it("bounds its diagnostic ring across reconnect churn, and says how many entries it dropped", () => {

@@ -1,10 +1,12 @@
 import { existsSync } from "node:fs";
-import { lstat, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { afterEach, expect, it } from "vitest";
+
+import { BINDER_EXIT, SIDEBAND_BINDER_PROTOCOL, runBinder } from "./native-sideband-binder.mjs";
 
 import {
   NATIVE_SIDEBAND_PROTOCOL,
@@ -855,6 +857,283 @@ it("destroys the clients it accepted when it closes", async () => {
   await listener.close();
 
   await expect(owner.closed).resolves.toMatchObject({ refusal: undefined });
+});
+
+/**
+ * The binder's failure matrix, over real forked processes and a real IPC channel.
+ *
+ * What is faked is only the *helper's behaviour*: branches a correct helper never takes - a wrong protocol
+ * version, two handoffs, a handle that is not a server, a process that goes quiet - come from deterministic
+ * fixtures under `test/fixtures/native-sideband/`. The parent's observers, its handle disposal and its exit
+ * accounting are the code under test and are never stubbed. Nothing here stages ordering with a sleep.
+ */
+const FIXTURES = new URL("../test/fixtures/native-sideband/", import.meta.url);
+
+/** @param {string} name */
+function fixture(name) {
+  return new URL(name, FIXTURES);
+}
+
+/**
+ * Is anything still listening at this path?
+ *
+ * The question a leaked handle answers "yes" to. `lstat` cannot tell: the socket file outlives its listener,
+ * because the helper exits without unlinking. Only a connection attempt distinguishes a disposed listener
+ * (refused) from one this parent is still holding open (accepted).
+ * @param {string} socketPath
+ */
+function accepts(socketPath) {
+  return new Promise((resolve) => {
+    const client = net.createConnection(socketPath);
+    client.once("connect", () => {
+      client.destroy();
+      resolve(true);
+    });
+    client.once("error", () => resolve(false));
+  });
+}
+
+/** @param {string} socketPath @param {string} name @param {Record<string, unknown>} [extra] */
+async function attemptWithFixture(socketPath, name, extra = {}) {
+  return await listenForOwnerSideband({ socketPath, token: TOKEN, binderEntry: fixture(name), binderTimeoutMs: 4_000, ...extra })
+    .then((listener) => {
+      cleanup.push(() => listener.close());
+      return { listener, error: undefined };
+    }, (/** @type {unknown} */ error) => ({ listener: undefined, error }));
+}
+
+// Every rejection has to account for three things at once: the code the caller is told, whether a transferred
+// listener was disposed rather than leaked, and that no directory entry was removed on the way out. These are
+// the branches a correct helper never takes, which is exactly why they need a fixture to reach.
+it.each([
+  ["wrong-version.mjs", "SIDEBAND_BINDER_PROTOCOL", false],
+  ["wrong-version-with-handle.mjs", "SIDEBAND_BINDER_PROTOCOL", true],
+  ["unknown-type-with-handle.mjs", "SIDEBAND_BINDER_PROTOCOL", true],
+  ["refusal-with-handle.mjs", "SIDEBAND_BINDER_REFUSED", true],
+  ["bound-without-proof.mjs", "SIDEBAND_BINDER_PROTOCOL", true],
+  ["bound-without-handle.mjs", "SIDEBAND_BINDER_PROTOCOL", true],
+  ["bound-with-wrong-handle.mjs", "SIDEBAND_BINDER_PROTOCOL", true],
+  ["duplicate-handoff.mjs", "SIDEBAND_BINDER_PROTOCOL", true],
+])("refuses %s with %s, disposing any transferred listener and removing nothing", async (name, code, binds) => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+
+  const { listener, error } = await attemptWithFixture(socketPath, name);
+
+  expect(listener, name).toBe(undefined);
+  expect(error, name).toMatchObject({ code });
+  // Nothing was removed: this attempt never completed an ownership proof, so the entry is left as found.
+  expect(`${/** @type {any} */ (error).sidebandCleanup}`, name).toMatch(/no directory entry was removed/u);
+  if (binds) {
+    // The fixture did bind, so the file is there - and nothing may still be listening on it. A handle this
+    // parent refused but kept open would answer here.
+    expect(existsSync(socketPath), name).toBe(true);
+    expect(await accepts(socketPath), name).toBe(false);
+  }
+});
+
+it("reports a spawn failure without waiting for an exit that cannot happen", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+
+  const { error } = await attemptWithFixture(socketPath, "wrong-version.mjs", { execPath: join(root, "no-such-node") });
+
+  expect(error).toMatchObject({ code: "SIDEBAND_BINDER_UNUSABLE" });
+  expect(existsSync(socketPath)).toBe(false);
+});
+
+it("reports a helper that dies before sending anything", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+
+  const { error } = await attemptWithFixture(socketPath, "early-death.mjs");
+
+  expect(error).toMatchObject({ code: "SIDEBAND_BINDER_INCOMPLETE" });
+  expect(`${/** @type {Error} */ (error).message}`).toMatch(/code 7/u);
+});
+
+it("reports a helper that closes its channel before handing anything over", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+
+  const { error } = await attemptWithFixture(socketPath, "disconnect-then-exit.mjs");
+
+  expect(error).toMatchObject({ code: expect.stringMatching(/^SIDEBAND_BINDER_(DISCONNECTED|INCOMPLETE)$/u) });
+});
+
+// The deadline covers the whole process, not the first message. Both sides of that are tested: a helper that
+// never sends, and a helper that hands over a listener and then refuses to leave.
+it("times out a helper that never sends, and ends it", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+
+  const { error } = await attemptWithFixture(socketPath, "silent-then-hang.mjs");
+
+  expect(error).toMatchObject({ code: "SIDEBAND_BINDER_TIMEOUT" });
+});
+
+it("times out a helper that hands over a listener and then will not exit, and disposes that listener", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+
+  const { error } = await attemptWithFixture(socketPath, "handoff-then-hang.mjs");
+
+  expect(error).toMatchObject({ code: "SIDEBAND_BINDER_TIMEOUT" });
+  expect(existsSync(socketPath)).toBe(true);
+  expect(await accepts(socketPath)).toBe(false);
+  expect(`${/** @type {any} */ (error).sidebandCleanup}`).toMatch(/no directory entry was removed/u);
+});
+
+it("refuses a helper that hands over a listener and then dies abruptly", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+
+  const { error } = await attemptWithFixture(socketPath, "handoff-then-abort.mjs");
+
+  expect(error).toMatchObject({ code: "SIDEBAND_BINDER_INCOMPLETE" });
+  expect(await accepts(socketPath)).toBe(false);
+});
+
+// The window the parent found: ownership was captured after the helper exited, so a different socket of the
+// same user and the same mode became the alleged owned inode and was unlinked on close. The proof now travels
+// with the handle, so this replacement is rejected and survives untouched and usable.
+it("rejects a same-user 0600 replacement listener at verification and leaves it usable", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+  const other = await liveReplacement(root);
+  /** @type {any} */
+  let replaced;
+
+  const failure = await listenForOwnerSideband({
+    socketPath,
+    token: TOKEN,
+    failpoint: async (/** @type {string} */ stage) => {
+      if (stage !== "before_verification") return;
+      replaced = await other.replaceOnto(socketPath);
+      // The same user, the same mode, a real listening socket: everything a check without a proof would accept.
+      expect(replaced.isSocket()).toBe(true);
+      expect(replaced.mode & 0o777).toBe(0o600);
+      expect(replaced.uid).toBe(process.getuid?.());
+    },
+  }).then(() => undefined, (/** @type {unknown} */ error) => error);
+
+  expect(failure).toMatchObject({ code: "SIDEBAND_ENDPOINT_UNUSABLE" });
+  expect(`${/** @type {Error} */ (failure).message}`).toMatch(/is not the one this attempt bound/u);
+  // Unchanged and still working: rejection removed nothing.
+  const after = await lstat(socketPath);
+  expect(String(after.ino)).toBe(String(replaced.ino));
+  expect(after.mode & 0o777).toBe(replaced.mode & 0o777);
+  expect(await other.stillAnswers(socketPath)).toBe("alive\n");
+});
+
+// The other window the parent found, in the helper itself: it used to call the ORIGINAL server.close() when the
+// send callback reported an error, on the false inference that a failed handoff meant the path was still its
+// own. A replacement can already be there, and that close would unlink it. Driven through runBinder directly,
+// because the decision under test is the helper's, with a real bind and a real foreign listener.
+it("leaves a replaced endpoint alone when its own handoff fails after a successful bind", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+  await mkdir(dirname(socketPath), { recursive: true, mode: 0o700 });
+  const other = await liveReplacement(root);
+  /** @type {any} */
+  let replaced;
+  /** @type {number|undefined} */
+  let exitCode;
+  /** @type {string[]} */
+  const lines = [];
+
+  await new Promise((resolve) => {
+    runBinder({
+      argv: [String(SIDEBAND_BINDER_PROTOCOL), socketPath],
+      diagnostic: (line) => lines.push(line),
+      // The replacement lands between this helper's bind and its handoff failing, which is the real ordering.
+      send: (_message, _handle, callback) => {
+        void other.replaceOnto(socketPath).then((entry) => {
+          replaced = entry;
+          callback(new Error("the channel refused the handle"));
+        });
+        return false;
+      },
+      exit: (code) => {
+        exitCode = code;
+        resolve(undefined);
+      },
+    });
+  });
+
+  expect(exitCode).toBe(BINDER_EXIT.handoffFailed);
+  expect(lines.join(" ")).toMatch(/left in place/u);
+  // The foreign listener is untouched and still answering: no close, no unlink.
+  const after = await lstat(socketPath);
+  expect(String(after.ino)).toBe(String(replaced.ino));
+  expect(await other.stillAnswers(socketPath)).toBe("alive\n");
+});
+
+// A mismatched request pair is refused before anything is bound, which is the reason the version is an argument.
+it("refuses a protocol version it does not speak before binding anything", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+  await mkdir(dirname(socketPath), { recursive: true, mode: 0o700 });
+  /** @type {any} */
+  let sent;
+  /** @type {number|undefined} */
+  let exitCode;
+
+  await new Promise((resolve) => {
+    runBinder({
+      argv: ["1", socketPath],
+      send: (message, handle, callback) => {
+        sent = { message, handle };
+        callback(null);
+        return true;
+      },
+      exit: (code) => {
+        exitCode = code;
+        resolve(undefined);
+      },
+      umask: () => {
+        throw new Error("a refused request must not reach the umask, let alone a bind");
+      },
+    });
+  });
+
+  expect(exitCode).toBe(BINDER_EXIT.refused);
+  expect(sent.handle).toBe(undefined);
+  expect(sent.message).toMatchObject({ protocol: SIDEBAND_BINDER_PROTOCOL, type: "sideband-binder-refused" });
+  expect(`${sent.message.reason}`).toMatch(/speaks protocol 2 and was asked for "1"/u);
+  expect(existsSync(socketPath)).toBe(false);
+});
+
+// A parent that vanishes after the bind must not make the helper unlink a path it can no longer prove.
+it("leaves the endpoint in place when the parent goes away after the bind", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+  await mkdir(dirname(socketPath), { recursive: true, mode: 0o700 });
+  /** @type {() => void} */
+  let parentGone = () => {};
+  /** @type {number|undefined} */
+  let exitCode;
+
+  await new Promise((resolve) => {
+    runBinder({
+      argv: [String(SIDEBAND_BINDER_PROTOCOL), socketPath],
+      onParentGone: (handler) => {
+        parentGone = handler;
+      },
+      // The bind has happened by the time this is called, so the endpoint exists and is provable.
+      send: () => {
+        parentGone();
+        return false;
+      },
+      exit: (code) => {
+        exitCode = code;
+        resolve(undefined);
+      },
+    });
+  });
+
+  expect(exitCode).toBe(BINDER_EXIT.parentGone);
+  expect((await lstat(socketPath)).isSocket()).toBe(true);
 });
 
 // Operator-visible failure: cleanup that unlinks on any failure would delete the socket of the listener that

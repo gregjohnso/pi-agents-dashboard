@@ -43,11 +43,13 @@ its own live component tree. Nothing is replayed.
 ## Run it
 
 Node must be 22.19 or newer and below 23; this repository's pixi environment supplies one. Everything below is
-copy-pasteable from the repository root.
+copy-pasteable from the repository root, and `$DEMO` is **this** checkout's demo — the one whose six-patch default
+and smoke evidence the sections above describe. A `$DEMO` naming any other checkout would run a different tree's
+code against these instructions, so it is written relative to `$PWD` rather than hard-coded.
 
 ```bash
 NODE=/mnt/main0/home/gjohnson/projects/pi-agents-native-owner-pty-20260918/.pixi/envs/default/bin/node
-DEMO=/mnt/main0/home/gjohnson/projects/pi-agents-native-demo-20260919/examples/native-session-demo/demo.mjs
+DEMO="$PWD/examples/native-session-demo/demo.mjs"
 ```
 
 ### 1. Start one owner

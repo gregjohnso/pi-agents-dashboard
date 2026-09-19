@@ -604,6 +604,54 @@ describe("cohort selection", () => {
   });
 });
 
+// Operator-visible failure: the README's commands are the public way in, and the reviewed six-patch default, the
+// smoke evidence and the launch command all belong to THIS checkout. A `$DEMO` hard-coded to another checkout runs
+// a different tree's code against these instructions, so the documented default is not what the reader executes.
+// This regression fails for exactly that mistake and passes only when the assignment resolves inside this
+// repository - checked by resolving it, never by starting the protected demo.
+describe("the README's runnable command", () => {
+  const readmePath = fileURLToPath(new URL("./README.md", import.meta.url));
+  /** The repository root, which the README documents as the cwd its commands are pasted from. */
+  const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
+
+  /** @param {string} text */
+  const demoAssignment = (text) => /^DEMO=(.*)$/mu.exec(text)?.[1] ?? null;
+
+  it("assigns DEMO inside this checkout and nowhere else", async () => {
+    const readme = await readFile(readmePath, "utf8");
+    const assigned = demoAssignment(readme);
+    expect(assigned).not.toBe(null);
+
+    // Resolved the way a shell would from the documented cwd, with $PWD being the repository root.
+    const expanded = String(assigned).replaceAll("\"", "").replace("$PWD", repositoryRoot.replace(/\/$/u, ""));
+    const resolved = path.resolve(repositoryRoot, expanded);
+    expect(existsSync(resolved)).toBe(true);
+    // The file it names is this repository's own demo entry point, not another tree's copy of it.
+    expect(resolved).toBe(fileURLToPath(new URL("./demo.mjs", import.meta.url)));
+    expect(path.relative(repositoryRoot, resolved)).toBe(path.join("examples", "native-session-demo", "demo.mjs"));
+    // Nothing was executed: this resolves a path and reads a file.
+  });
+
+  // The discriminating half. The exact wrong-checkout assignment the review found must be rejected by the same
+  // rule, so a future edit that reintroduces any foreign checkout cannot pass by naming a real file.
+  it("rejects a DEMO that names a different checkout, even one that exists", () => {
+    const foreign = "/mnt/main0/home/gjohnson/projects/pi-agents-native-demo-20260919/examples/native-session-demo/demo.mjs";
+    const resolvedForeign = path.resolve(repositoryRoot, foreign);
+    expect(resolvedForeign).not.toBe(fileURLToPath(new URL("./demo.mjs", import.meta.url)));
+    expect(resolvedForeign.startsWith(repositoryRoot)).toBe(false);
+    // And it is not merely absent - it is a real other checkout, which is why an existence check alone is not
+    // the test. The rule is that the command has to resolve into THIS repository.
+    expect(foreign).toMatch(/pi-agents-native-demo-20260919/u);
+  });
+
+  it("still documents the six-patch default whose provenance the cohort tests pin", async () => {
+    const readme = await readFile(readmePath, "utf8");
+    expect(readme).toContain("3757199");
+    expect(readme).toContain(CONSUMER_CAPABILITY_PATCH.builtIntoCohort.sha256);
+    expect(readme).toContain(CONSUMER_CAPABILITY_PATCH.currentInThisTree.sha256);
+  });
+});
+
 describe("the labelled fake provider", () => {
   it("answers the same prompt with the same bytes, and a different prompt differently", () => {
     const one = deterministicReply({ messages: [{ role: "user", content: "hello" }] });

@@ -53,19 +53,27 @@ export { loadArtifactsManifest };
  *
  * Two injectable failures, both of them real implementations a renderer does not own:
  * `reassertThrows` makes `reassertNegotiatedModes()` throw, which is the terminal-side failure that must still
- * close an ordered interval; `refuseAbort` makes the ABORT marker's own write throw, which is the case where
- * there is nothing left to close the interval with.
+ * close an ordered interval; `refuseAbort` makes the failed-attempt cleanup write throw, which is the case where
+ * there is nothing left to close the framing with.
+ *
+ * `admitPrefixOf` models the one thing `Terminal.write` never reports: how many bytes a throwing write admitted.
+ * Given a predicate and a length it records that prefix as really written and then throws, so a case can drive
+ * zero, partial and full acceptance before a throw and reconstruct the exact physical stream.
  */
 export class MarkerRecordingTerminal {
 	constructor(columns = 100, rows = 30, { reassertThrows = false, refuseAbort = false } = {}) {
 		this._columns = columns;
 		this._rows = rows;
 		this.writes = [];
+		this.attempts = [];
 		this.reassertCalls = 0;
 		this.abortAttempts = 0;
 		this.negotiatedKittyFlags = 7;
 		this.reassertThrows = reassertThrows;
 		this.refuseAbort = refuseAbort;
+		/** `(data) => number | undefined`: admit that many bytes of this write and then throw. */
+		this.admitPrefixOf = undefined;
+		this.failure = undefined;
 	}
 
 	start(onInput, onResize) {
@@ -82,9 +90,16 @@ export class MarkerRecordingTerminal {
 	async drainInput() {}
 
 	write(data) {
+		this.attempts.push(data);
 		if (this.refuseAbort && typeof data === "string" && data.includes(";A;")) {
 			this.abortAttempts += 1;
-			throw new Error("the output channel refused the ABORT marker");
+			throw new Error("the output channel refused the cleanup write");
+		}
+		const accepted = this.admitPrefixOf?.(data);
+		if (accepted !== undefined) {
+			if (accepted > 0) this.writes.push(data.slice(0, accepted));
+			this.failure = new Error(`the output channel admitted ${accepted} byte(s) and then failed`);
+			throw this.failure;
 		}
 		this.writes.push(data);
 	}

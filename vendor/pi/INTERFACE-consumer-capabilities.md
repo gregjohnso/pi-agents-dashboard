@@ -147,27 +147,62 @@ The wire form, where `ESC \` is the two bytes `0x1b 0x5c`:
 
 `token` is 32 cryptographic random bytes as exactly 43 canonical unpadded base64url characters, minted per
 attempt by the host. `frameId` is the renderer's own 36-character lowercase UUID from the frame receipt. Every
-marker is at most 128 bytes: BEGIN and ABORT are 68, END is 105.
+marker is at most 128 bytes: BEGIN and ABORT are 70, END is 107, and the failed-attempt cleanup write below is
+72.
 
-**Where they are written.** `TuiBase.presentNow` writes BEGIN as the first byte of the interval — before the
-cold reassertion — and END carrying the receipt's `frameId` as the last, on the terminal's own `write` path.
-**Everything after BEGIN is inside one protected region**, the cold reassertion included: if the reassertion
-throws, if the render throws, or if the render produces no complete frame for this request, ABORT closes the
-interval instead of leaving it open, and the bytes already written stay written — only a later complete
-presentation recovers the screen. An interval left open would make every later byte on that terminal look like
-part of this frame to a host that is decoding the markers.
+**Where they are written, and what happens when a write fails.** `TuiBase.presentNow` writes BEGIN as the first
+byte of the interval — before the cold reassertion — and END carrying the receipt's `frameId` as the last, on the
+terminal's own `write` path.
 
-Two failure cases are named rather than papered over. If writing **ABORT itself** fails there is no second
-channel to say so on and nothing to retry — an accepted prefix must never be written twice — so the failure is
-reported as a process warning naming that the interval was left open, no caller is told the marker was
-delivered, and the original failure is still what `presentNow` throws. The host's per-attempt token is not put
-in that message. If writing **END** fails the throw propagates: the frame really was handed over, so ABORT
-would be a lie about it, and a caller that never receives `presented: true` has been told the boundary is not
-closed.
+`Terminal.write` is a synchronous **local admission** call. A normal return means the bytes were admitted, not
+that the OS delivered or the terminal displayed them; a `false` from an underlying `Writable` still admitted
+them; and a throw reports **no accepted-byte count**, so it may have admitted nothing, an arbitrary prefix, or
+all of it. Nothing here assumes `write` is atomic on throw.
 
-Without an `ordering` on the request, **not one marker byte is written**, so Pi's default output is unchanged. An
-unknown ordering version, an unknown codec or a non-canonical token is refused by the preflight, before any
-byte, as `{ presented: false, reason: "unsupported-ordering" }`.
+Every write of an ordered attempt is therefore inside one failure-handling region — BEGIN, the cold reassertion,
+the render, the completeness check and END:
+
+- **No exception from any of them produces `presented: true`.** The original exception, with its identity, is
+  what the caller receives.
+- **A failing BEGIN does not go on** to reassert modes or render: there is no interval to fill.
+- **Nothing admitted is ever rewritten.** No marker, frame byte or accepted prefix is retried, ever.
+- **A failed attempt makes at most ONE cleanup write:** the two-byte DCS string terminator `ESC \` immediately
+  followed by that token's exact ABORT marker. The leading terminator is there because a failed marker write may
+  have left an unterminated candidate in the stream; it ends that candidate before ABORT is read. This is
+  bounded framing cleanup — not a frame replay, not a rollback and not a VT parser.
+- **Pending presentation state is cleared on every exit**, including the paths that never reached the render.
+- A `no-complete-frame-support` refusal is a failed ordered attempt too: it gets the same one cleanup write, and
+  it stays a refusal even if that write fails.
+
+**ABORT means the attempt failed. It does not mean no frame bytes were written, and it undoes nothing.** The
+whole frame, or even END, may already have been admitted before a throw. The cleanup's own leading terminator
+can itself complete an otherwise-finished partial BEGIN or END, so a reader that sees an END must not conclude
+the presentation succeeded — see the success rule below.
+
+**If the cleanup write itself throws**, what it admitted and whether the framing closed are both unknown. It is
+never retried: retrying could write an accepted prefix twice. The uncertainty is reported as a fixed process
+warning that formats no error object and carries no token or marker bytes — a thrown error's message is
+arbitrary text that may itself contain the attempt's token — and it claims neither that the framing stayed open
+nor that it closed.
+
+Without an `ordering` on the request, **not one marker or cleanup byte is written**, so Pi's default output is
+unchanged. An unknown ordering version, an unknown codec or a non-canonical token is refused by the preflight,
+before any byte, as `{ presented: false, reason: "unsupported-ordering" }`, and writes no cleanup either.
+
+### A usable successful ordered presentation needs two things
+
+A consumer may treat an ordered presentation as usable — and issue or accept its recovery acknowledgement — only
+with **both**:
+
+1. the request's own successful presentation result, with matching receipt/frame identity; **and**
+2. the matching BEGIN/END observed on the fresh byte route.
+
+A native local frame-handoff event alone is not success. A throwing, negative or missing control result, an
+ABORT, refused framing or transport loss leaves the attempt failed or uncertain **even if a complete END was
+observed** — which is exactly what a fully admitted END followed by a throwing write, or a partial END completed
+by the cleanup terminator, looks like on the byte route. Retire that token and nonce, stop treating later bytes
+as its fresh frame, and do not replay. A later independent cold presentation with a **new** token may recover;
+it does not retroactively validate the old attempt.
 
 **What the decoder is.** A framing decoder, and deliberately not a VT, key or screen parser. It recognizes
 exactly the markers of the token it is armed with and **reproduces every other byte verbatim**, which is what
@@ -243,6 +278,8 @@ protocol-2 channel, and the reverse, are refused by version with both versions n
 
 ## What this patch does not deliver
 
+- **A marker is a boundary in a byte stream.** No OS flush, terminal parse, display, pixel or client
+  acknowledgement claim follows from one, and an observed END is not on its own a successful presentation.
 - No host, client, transport, fresh-route streaming, queue accounting or acknowledgement. Those are Task 12/17
   and are not touched here. `NATIVE_PRESENT_FRESH_CHUNK_MAX` is declared because a peer needs the bound; this
   patch neither reads nor writes a client transport.

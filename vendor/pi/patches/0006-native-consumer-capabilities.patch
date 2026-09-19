@@ -1202,10 +1202,10 @@ index 47a42591a131278bf2ea67abf04bfbb0a6a0b042..60fe93934c74e2ca3b905aca66ff35cd
  	return registration;
 diff --git a/packages/tui/src/native-present-markers.ts b/packages/tui/src/native-present-markers.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..fdb56e6d861619398c91d77196d3e9a92e25e36c
+index 0000000000000000000000000000000000000000..25c4d4dd192224400eb635c0f2c26d7a55e21f64
 --- /dev/null
 +++ b/packages/tui/src/native-present-markers.ts
-@@ -0,0 +1,313 @@
+@@ -0,0 +1,331 @@
 +/**
 + * `dcs-pi-native-present-v1`: the one framing codec for an explicitly managed ordered presentation.
 + *
@@ -1312,6 +1312,24 @@ index 0000000000000000000000000000000000000000..fdb56e6d861619398c91d77196d3e9a9
 +
 +export function encodeNativePresentAbort(token: string): string {
 +	return `\x1bP=pi-native-present;1;A;${requireToken(token)}\x1b\\`;
++}
++
++/**
++ * The bytes one failed ordered attempt writes, once, to close its framing.
++ *
++ * Package-internal on purpose: it is not re-exported from `index.ts`, because no new public API symbol is
++ * authorized. It lives here anyway so the byte layout stays in the module that owns the framing.
++ *
++ * A DCS string terminator, then this token's exact ABORT marker. The leading terminator is there because
++ * `Terminal.write` reports no accepted-byte count when it throws: the failed attempt may have left an
++ * unterminated marker candidate in the stream, and the terminator ends it before ABORT is read. Both parts are
++ * ordinary stream bytes to any reader that is not armed with this token.
++ *
++ * What it does **not** mean: that no frame bytes were written, that a partial marker was removed, or that the
++ * interval definitely closed. It is a bounded cleanup write, never a rollback and never a replay.
++ */
++export function encodeNativePresentFailedAttemptCleanup(token: string): string {
++	return `\x1b\\${encodeNativePresentAbort(token)}`;
 +}
 +
 +/**
@@ -1623,7 +1641,7 @@ index 9621d1fb7e88ad824669fed40ee6e1eb5013064c..8fe39289132f707c48f92d20b1f3c1a0
  			process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
  		}
 diff --git a/packages/tui/src/tui.ts b/packages/tui/src/tui.ts
-index d7c9e61977b796b65846741b194e7eb54297b0ce..45c9233831cc980ac966ec64e705426fd2f82f5b 100644
+index d7c9e61977b796b65846741b194e7eb54297b0ce..61c4ee6859138e9ea1ace005fd8094048ad2bc42 100644
 --- a/packages/tui/src/tui.ts
 +++ b/packages/tui/src/tui.ts
 @@ -22,6 +22,15 @@ import {
@@ -1631,9 +1649,9 @@ index d7c9e61977b796b65846741b194e7eb54297b0ce..45c9233831cc980ac966ec64e705426f
  	type PresentationUnavailableReason,
  } from "./native-presentation.ts";
 +import {
-+	encodeNativePresentAbort,
 +	encodeNativePresentBegin,
 +	encodeNativePresentEnd,
++	encodeNativePresentFailedAttemptCleanup,
 +	isNativePresentToken,
 +	NATIVE_PRESENT_MARKER_CODEC,
 +	NATIVE_PRESENT_ORDERING_VERSION,
@@ -1642,7 +1660,26 @@ index d7c9e61977b796b65846741b194e7eb54297b0ce..45c9233831cc980ac966ec64e705426f
  import type { Terminal } from "./terminal.ts";
  import {
  	isOsc11BackgroundColorResponse,
-@@ -350,7 +359,9 @@ export abstract class TuiBase extends Container implements TUI {
+@@ -335,6 +344,18 @@ export interface TUI extends Component {
+ 
+ export const VIEWPORT_TUI = Symbol.for("@earendil-works/pi-tui/viewport");
+ 
++/**
++ * The one thing a failed ordered-presentation cleanup write can honestly say.
++ *
++ * Fixed text, by construction. A thrown error's message is arbitrary caller-supplied text that may itself
++ * contain the attempt's token, so nothing from the error is formatted into it, and it claims neither that the
++ * framing stayed open nor that it closed — after a write that threw, neither is known.
++ */
++const ORDERED_PRESENTATION_CLEANUP_UNCERTAIN =
++	"an ordered presentation attempt failed and its single framing cleanup write also failed; whether that " +
++	"cleanup was admitted, and whether the attempt's framing closed, are both unknown. Nothing is retried and " +
++	"no completion is claimed. Retire the attempt and present again with a new token to recover.";
++
+ export interface ViewportTUI extends TUI {
+ 	readonly [VIEWPORT_TUI]: true;
+ 	setLayoutRoot(component: Component | undefined): void;
+@@ -350,7 +371,9 @@ export abstract class TuiBase extends Container implements TUI {
  	private frameListeners = new Set<(receipt: PresentationFrameReceipt) => void>();
  	private frameSequence = 0;
  	private lastFrame: PresentationFrameReceipt | undefined;
@@ -1653,51 +1690,54 @@ index d7c9e61977b796b65846741b194e7eb54297b0ce..45c9233831cc980ac966ec64e705426f
  	private focusedComponent: Component | null = null;
  	private inputListeners = new Set<TuiInputListener>();
  	/** Increments on every cell-size query, so a report for a superseded query is detectable. */
-@@ -400,6 +411,16 @@ export abstract class TuiBase extends Container implements TUI {
+@@ -400,6 +423,17 @@ export abstract class TuiBase extends Container implements TUI {
  	 * Synchronous by construction: the receipt has to name the frame this request produced, so the render
  	 * is forced here rather than requested. A renderer that is stopped or has released the screen presents
  	 * nothing, because whatever now owns the terminal must not be painted over.
 +	 *
 +	 * A request carrying `ordering` is bracketed with `dcs-pi-native-present-v1` markers on the terminal's
 +	 * own write path: BEGIN before the first byte this request writes, END carrying the receipt's `frameId`
-+	 * after the last one, ABORT instead of END when no complete frame was produced. Without `ordering` not
-+	 * one marker byte is written, so Pi's default output is unchanged.
++	 * after the last one. Without `ordering` not one marker byte is written, so Pi's default output is
++	 * unchanged.
 +	 *
-+	 * **Everything after BEGIN is inside one protected region.** The cold reassertion writes terminal and
-+	 * renderer mode bytes of its own, so it belongs inside the interval, and a reassertion that throws must
-+	 * close the interval exactly as a throwing render does. An interval left open would make every later byte
-+	 * on that terminal look like part of this frame to a host that is decoding the markers.
++	 * **Every write of an ordered attempt is inside one failure-handling region**, BEGIN and END included.
++	 * `Terminal.write` is a synchronous local admission call that reports no accepted-byte count when it
++	 * throws, so a throw may have admitted nothing, a prefix, or everything. No exception from any step of an
++	 * ordered attempt produces `presented: true`, nothing accepted is ever rewritten, and a failed attempt
++	 * makes at most one bounded cleanup write. A failing BEGIN does not go on to reassert modes or render.
  	 */
  	presentNow(request: PresentationRequest): PresentationOutcome {
  		if (this.stopped) return { presented: false, reason: "renderer-stopped" };
-@@ -409,22 +430,69 @@ export abstract class TuiBase extends Container implements TUI {
+@@ -409,22 +443,82 @@ export abstract class TuiBase extends Container implements TUI {
  		if (unsupported) return { presented: false, reason: unsupported };
  		const released = this.screenReleasedReason();
  		if (released) return { presented: false, reason: released };
 +		// An ordering this build does not speak is refused by the same preflight: no marker, no mode byte and
 +		// no render. A token that is not canonical is exactly as unusable as an unknown version.
-+		const ordering = request.ordering;
++		const requested = request.ordering;
 +		if (
-+			ordering !== undefined &&
-+			(ordering.version !== NATIVE_PRESENT_ORDERING_VERSION || !isNativePresentToken(ordering.token))
++			requested !== undefined &&
++			(requested.version !== NATIVE_PRESENT_ORDERING_VERSION || !isNativePresentToken(requested.token))
 +		) {
 +			return { presented: false, reason: "unsupported-ordering" };
 +		}
++		// The attempt's own snapshot of the validated ordering. Cleanup has to name the token this attempt
++		// armed, and the caller's object is the caller's to mutate while the render runs.
++		const ordering: NativePresentOrdering | undefined =
++			requested === undefined ? undefined : { version: requested.version, token: requested.token };
  
 -		const cold = request.coldTerminal ? this.reassertPresentation() : undefined;
 -		const before = this.lastFrame;
 -		this.pendingPresentation = { requestId: request.requestId, cold };
-+		// BEGIN opens the armed interval here, so every byte this request writes is inside it and nothing else
-+		// is. From this line on, no path may return or throw without closing the interval.
-+		if (ordering) this.terminal.write(encodeNativePresentBegin(ordering.token));
 +		let receipt: PresentationFrameReceipt | undefined;
  		try {
 -			this.renderNow(true);
--		} finally {
--			this.pendingPresentation = undefined;
-+			// The cold reassertion is inside the protected region, not before it: it writes mode bytes through
-+			// this same terminal, and `Terminal.reassertNegotiatedModes` is an implementation this class does not
-+			// own and cannot assume will return.
++			// BEGIN is inside the region. A BEGIN that throws is a failed attempt that still needs its one
++			// cleanup write, and it must not go on to reassert modes or render: there is no interval to fill.
++			if (ordering) this.terminal.write(encodeNativePresentBegin(ordering.token));
++			// The cold reassertion writes mode bytes through this same terminal, and
++			// `Terminal.reassertNegotiatedModes` is an implementation this class does not own and cannot assume
++			// will return.
 +			const cold = request.coldTerminal ? this.reassertPresentation() : undefined;
 +			const before = this.lastFrame;
 +			this.pendingPresentation = { requestId: request.requestId, cold, ordering };
@@ -1708,47 +1748,56 @@ index d7c9e61977b796b65846741b194e7eb54297b0ce..45c9233831cc980ac966ec64e705426f
 +			}
 +			const rendered = this.lastFrame;
 +			if (rendered && rendered !== before && rendered.requestId === request.requestId) receipt = rendered;
++			// END is inside the region too. A throwing END write does not mean the frame was not handed over and
++			// does not mean END was not admitted — it means this attempt cannot be reported successful, so the
++			// caller gets the throw and a consumer that saw END on the byte route still has no success.
++			if (receipt && ordering) this.terminal.write(encodeNativePresentEnd(ordering.token, receipt.frameId));
 +		} catch (error) {
-+			// Whatever was written stays written: ABORT says the interval closed without a frame, and only a
-+			// later complete presentation recovers the screen. The original failure is what the caller gets.
-+			if (ordering) this.abortOrderedPresentation(ordering.token);
++			// Whatever was admitted stays admitted: cleanup closes this attempt's framing, it does not undo it,
++			// and only a later independent presentation with a new token recovers the screen. The original
++			// failure, with its identity, is what the caller gets.
++			if (ordering) this.closeFailedOrderedAttempt(ordering.token);
 +			throw error;
+ 		} finally {
++			// Cleared on every exit, including the paths that never reached the inner render.
+ 			this.pendingPresentation = undefined;
  		}
 -		const receipt = this.lastFrame;
 -		if (!receipt || receipt === before || receipt.requestId !== request.requestId) {
 +		if (!receipt) {
-+			if (ordering) this.abortOrderedPresentation(ordering.token);
++			// A refusal is still a failed ordered attempt: it gets the same one cleanup write, and it stays a
++			// refusal even if that write fails.
++			if (ordering) this.closeFailedOrderedAttempt(ordering.token);
  			return { presented: false, reason: "no-complete-frame-support" };
  		}
-+		// A throwing END write propagates: the frame really was handed over, so ABORT would be a lie about it,
-+		// and a caller that never receives `presented: true` has been told the boundary is not closed.
-+		if (ordering) this.terminal.write(encodeNativePresentEnd(ordering.token, receipt.frameId));
  		return { presented: true, receipt };
  	}
  
 +	/**
-+	 * Close a failed ordered interval, once.
++	 * Close one failed ordered attempt, with at most one bounded write, and never a retry.
 +	 *
-+	 * If writing ABORT itself fails there is no second channel to say so on, and there is nothing to retry: an
-+	 * accepted prefix must never be written twice. The failure is therefore reported as a process warning —
-+	 * this package has no logger of its own — naming that the interval was left open, and no caller is told the
-+	 * marker was delivered. The token is not in the message: it is the host's own per-attempt secret.
++	 * The write is a DCS string terminator followed by this token's exact ABORT marker. The terminator is there
++	 * because a failed marker write may have left an unterminated candidate in the stream; ABORT then says this
++	 * attempt failed. Neither part claims that no frame bytes were written, and neither undoes any.
++	 *
++	 * If this write itself throws, what was admitted and whether the framing closed are both unknown, and there
++	 * is nothing safe to do about it: retrying could write an accepted prefix twice. The uncertainty is reported
++	 * as a fixed process warning — this package has no logger of its own. The warning formats no error object
++	 * and carries no token or marker bytes, because a thrown error's message is arbitrary text that may itself
++	 * contain the attempt's token, and it does not claim the interval either stayed open or closed.
 +	 */
-+	private abortOrderedPresentation(token: string): void {
++	private closeFailedOrderedAttempt(token: string): void {
 +		try {
-+			this.terminal.write(encodeNativePresentAbort(token));
-+		} catch (error) {
-+			process.emitWarning(
-+				`an ordered presentation interval was left open: writing its ABORT marker failed (${String(error)}). ` +
-+					`The marker is not retried, and no interval close is claimed.`,
-+			);
++			this.terminal.write(encodeNativePresentFailedAttemptCleanup(token));
++		} catch {
++			process.emitWarning(ORDERED_PRESENTATION_CLEANUP_UNCERTAIN);
 +		}
 +	}
 +
  	onFrameHandedToTerminal(listener: (receipt: PresentationFrameReceipt) => void): () => void {
  		this.frameListeners.add(listener);
  		return () => {
-@@ -484,6 +552,13 @@ export abstract class TuiBase extends Container implements TUI {
+@@ -484,6 +578,13 @@ export abstract class TuiBase extends Container implements TUI {
  			rows: frame.rows,
  			byteLength: frame.byteLength,
  			cold: this.pendingPresentation?.cold,
@@ -1764,10 +1813,10 @@ index d7c9e61977b796b65846741b194e7eb54297b0ce..45c9233831cc980ac966ec64e705426f
  		for (const listener of this.frameListeners) listener(receipt);
 diff --git a/packages/tui/test/native-consumer-capabilities.test.ts b/packages/tui/test/native-consumer-capabilities.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..7881b24992d538d72436c8b63caf6d3b13ebdc7a
+index 0000000000000000000000000000000000000000..7a8f1545597bc145c43362beb5f49e3a370b5894
 --- /dev/null
 +++ b/packages/tui/test/native-consumer-capabilities.test.ts
-@@ -0,0 +1,692 @@
+@@ -0,0 +1,697 @@
 +/**
 + * The two consumer capabilities `0006` adds, driven through the real objects rather than through symbols.
 + *
@@ -2338,7 +2387,7 @@ index 0000000000000000000000000000000000000000..7881b24992d538d72436c8b63caf6d3b
 +		}
 +	}
 +
-+	/** A terminal that accepts every write except the ABORT marker, so the marker write itself fails. */
++	/** A terminal that accepts every write except the failed-attempt cleanup, so the cleanup write itself fails. */
 +	class AbortRefusingTerminal extends RecordingTerminal {
 +		abortAttempts = 0;
 +
@@ -2349,7 +2398,7 @@ index 0000000000000000000000000000000000000000..7881b24992d538d72436c8b63caf6d3b
 +		override write(data: string): void {
 +			if (data.includes(";A;")) {
 +				this.abortAttempts += 1;
-+				throw new Error("the output channel refused the ABORT marker");
++				throw new Error("the output channel refused the cleanup write");
 +			}
 +			super.write(data);
 +		}
@@ -2386,7 +2435,7 @@ index 0000000000000000000000000000000000000000..7881b24992d538d72436c8b63caf6d3b
 +		assert.ok(!emitted.includes(";E;"), "no END marker was written");
 +	});
 +
-+	it("reports a failed ABORT write instead of claiming the interval closed, and never retries it", () => {
++	it("reports an uncertain cleanup instead of claiming a framing state, and never retries it", () => {
 +		const token = mintNativePresentToken();
 +		const terminal = new AbortRefusingTerminal();
 +		const tui = new TuiAltScreen(terminal);
@@ -2396,7 +2445,7 @@ index 0000000000000000000000000000000000000000..7881b24992d538d72436c8b63caf6d3b
 +		const onWarning = (warning: Error) => warnings.push(warning.message);
 +		process.on("warning", onWarning);
 +		const before = terminal.writes.length;
-+		// The caller still learns the original failure, not the marker's.
++		// The caller still learns the original failure, not the cleanup write's.
 +		assert.throws(
 +			() =>
 +				tui.presentNow({
@@ -2408,16 +2457,20 @@ index 0000000000000000000000000000000000000000..7881b24992d538d72436c8b63caf6d3b
 +		);
 +		const emitted = terminal.since(before);
 +		tui.stop();
-+		assert.equal(terminal.abortAttempts, 1, "the ABORT marker is attempted once and never retried");
-+		assert.ok(!emitted.includes(";A;"), "nothing claims the ABORT reached the terminal");
++		assert.equal(terminal.abortAttempts, 1, "the cleanup write is attempted once and never retried");
++		assert.ok(!emitted.includes(";A;"), "nothing claims the cleanup reached the terminal");
 +		assert.ok(!emitted.includes(";E;"));
 +		// `process.emitWarning` is asynchronous, so the warning is read on the next turn rather than now.
 +		return new Promise<void>((resolve) => {
 +			setImmediate(() => {
 +				process.off("warning", onWarning);
 +				assert.ok(
-+					warnings.some((message) => message.includes("was left open") && message.includes("not retried")),
-+					`the failure was not reported: ${JSON.stringify(warnings)}`,
++					warnings.some((message) => message.includes("unknown") && message.includes("Nothing is retried")),
++					`the uncertainty was not reported: ${JSON.stringify(warnings)}`,
++				);
++				assert.ok(
++					warnings.every((message) => !/stayed open|definitely closed/.test(message)),
++					"a warning claimed the framing definitely stayed open or definitely closed",
 +				);
 +				assert.ok(
 +					warnings.every((message) => !message.includes(token)),
@@ -2454,9 +2507,503 @@ index 0000000000000000000000000000000000000000..7881b24992d538d72436c8b63caf6d3b
 +		tui.stop();
 +		const decoder = new NativePresentMarkerDecoder();
 +		decoder.arm(token);
++		// The cleanup's leading string terminator is ordinary bytes here, because BEGIN was already complete.
 +		assert.deepEqual(
 +			decoder.decode(Buffer.from(emitted, "latin1")).map((event) => event.kind),
-+			["begin", "abort"],
++			["begin", "bytes", "abort"],
 +		);
++	});
++});
+diff --git a/packages/tui/test/native-marker-failure.test.ts b/packages/tui/test/native-marker-failure.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..3ad6bff7bab116aa4a456cfb919accb23a08791f
+--- /dev/null
++++ b/packages/tui/test/native-marker-failure.test.ts
+@@ -0,0 +1,487 @@
++import assert from "node:assert";
++import { randomUUID } from "node:crypto";
++import { describe, it } from "node:test";
++import { Text } from "../src/components/text.ts";
++import {
++	encodeNativePresentAbort,
++	encodeNativePresentBegin,
++	encodeNativePresentEnd,
++	encodeNativePresentFailedAttemptCleanup,
++	mintNativePresentToken,
++	NATIVE_PRESENT_MARKER_MAX_BYTES,
++	NATIVE_PRESENT_ORDERING_VERSION,
++	NativePresentMarkerDecoder,
++	type NativePresentMarkerEvent,
++} from "../src/native-present-markers.ts";
++import { TuiAltScreen } from "../src/tui-alt-screen.ts";
++import { TuiMainScreen } from "../src/tui-main-screen.ts";
++import { VirtualTerminal } from "./virtual-terminal.ts";
++
++/**
++ * Ordered-presentation marker-write failure, against the contract the parent selected.
++ *
++ * `Terminal.write` is a synchronous local admission call that reports **no accepted-byte count when it throws**.
++ * A throw may therefore have admitted nothing, an arbitrary prefix, or all of it. Every case here drives that
++ * directly: a terminal that admits exactly `n` bytes of a chosen write and then throws, for every `n` across
++ * both markers, and the physical byte stream reconstructed from what was actually admitted.
++ *
++ * Three rules are under test and they are not the same rule:
++ *
++ *   1. no exception from an ordered attempt produces `presented: true`;
++ *   2. nothing admitted is ever rewritten, and a failed attempt makes at most **one** bounded cleanup write of
++ *      `ESC \` followed by that token's exact ABORT marker;
++ *   3. a decoder's event list is not an outcome. A fully admitted END followed by a throwing write decodes as
++ *      `end`, and the attempt still failed, because success needs the control result **and** the observed END.
++ *
++ * What none of these claim: that cleanup removed anything, that the framing definitely closed, or that no frame
++ * bytes reached the terminal. After a write that threw, none of that is knowable from this side.
++ */
++
++/** A terminal that admits a chosen prefix of a chosen write and then throws, recording what it really took. */
++class PrefixAdmittingTerminal extends VirtualTerminal {
++	/** Exactly the bytes this terminal admitted, in order. The physical stream, reconstructed. */
++	readonly admitted: string[] = [];
++	/** Every `write` call's full argument, throwing calls included. */
++	readonly attempts: string[] = [];
++	/**
++	 * Decide one write's fate: `undefined` admits it whole, a number admits that many bytes and then throws.
++	 * The thrown error is this terminal's own, so a test can check the caller received that identity.
++	 */
++	fail: ((data: string) => number | undefined) | undefined;
++	failure: Error | undefined;
++	reassertCalls = 0;
++	reassertThrows = false;
++
++	override write(data: string): void {
++		this.attempts.push(data);
++		const accepted = this.fail?.(data);
++		if (accepted === undefined) {
++			this.admitted.push(data);
++			super.write(data);
++			return;
++		}
++		if (accepted > 0) {
++			const prefix = data.slice(0, accepted);
++			this.admitted.push(prefix);
++			super.write(prefix);
++		}
++		this.failure = new Error(`the output channel admitted ${accepted} byte(s) and then failed`);
++		throw this.failure;
++	}
++
++	reassertNegotiatedModes(): { reemitted: string[]; kittyKeyboard: undefined; modifyOtherKeys: boolean; title: undefined; progress: boolean } {
++		this.reassertCalls += 1;
++		if (this.reassertThrows) throw new Error("reassertNegotiatedModes failed");
++		this.write("\x1b[?2004h");
++		return { reemitted: ["bracketed-paste"], kittyKeyboard: undefined, modifyOtherKeys: false, title: undefined, progress: false };
++	}
++
++	/** The physical stream: what this terminal actually took, with nothing this test invented. */
++	stream(): string {
++		return this.admitted.join("");
++	}
++}
++
++type Renderer = TuiAltScreen | TuiMainScreen;
++
++const renderers: [string, (terminal: PrefixAdmittingTerminal) => Renderer][] = [
++	["TuiAltScreen", (terminal) => new TuiAltScreen(terminal)],
++	["TuiMainScreen", (terminal) => new TuiMainScreen(terminal)],
++];
++
++function mount(make: (terminal: PrefixAdmittingTerminal) => Renderer): { terminal: PrefixAdmittingTerminal; tui: Renderer } {
++	const terminal = new PrefixAdmittingTerminal();
++	const tui = make(terminal);
++	tui.addChild(new Text("current ui", 0, 0));
++	tui.start();
++	return { terminal, tui };
++}
++
++/** Decode a physical stream with one armed decoder and report what a consumer on that route would have seen. */
++function observe(token: string, stream: string): { framing: string[]; events: NativePresentMarkerEvent[]; endFrameIds: string[] } {
++	const decoder = new NativePresentMarkerDecoder();
++	decoder.arm(token);
++	const events = [...decoder.decode(Buffer.from(stream, "latin1")), ...decoder.flush()];
++	return {
++		framing: events.filter((event) => event.kind !== "bytes").map((event) => event.kind),
++		events,
++		endFrameIds: events.flatMap((event) => (event.kind === "end" ? [event.frameId] : [])),
++	};
++}
++
++/** Every write the attempt made after the one that failed. There must be exactly one, and it must be cleanup. */
++function writesAfterFailure(attempts: string[], failedArgument: string): string[] {
++	const index = attempts.lastIndexOf(failedArgument);
++	assert.notEqual(index, -1, "the failing write was never attempted");
++	return attempts.slice(index + 1);
++}
++
++describe("an ordered attempt whose BEGIN write fails", () => {
++	for (const [name, make] of renderers) {
++		it(`${name} makes one bounded cleanup write, renders nothing, and never rewrites the admitted prefix`, () => {
++			const token = mintNativePresentToken();
++			const begin = encodeNativePresentBegin(token);
++			const cleanup = encodeNativePresentFailedAttemptCleanup(token);
++			// Every byte prefix of BEGIN, zero and whole included. These markers are short by design, so the
++			// exhaustive sweep is cheap and there is no "representative prefix" hand-waving.
++			for (let accepted = 0; accepted <= begin.length; accepted += 1) {
++				const { terminal, tui } = mount(make);
++				// Marks taken after `start()`: its own mode bytes are not part of this attempt.
++				const attemptMark = terminal.attempts.length;
++				const streamMark = terminal.admitted.length;
++				terminal.fail = (data) => (data === begin ? accepted : undefined);
++				let thrown: unknown;
++				try {
++					tui.presentNow({
++						requestId: `begin-fails-${accepted}`,
++						coldTerminal: true,
++						ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++					});
++					assert.fail(`a failed BEGIN at ${accepted} byte(s) must not return`);
++				} catch (error) {
++					thrown = error;
++				}
++				terminal.fail = undefined;
++				// Read before `stop()`, which writes its own teardown bytes.
++				const attempts = terminal.attempts.slice(attemptMark);
++				const stream = terminal.admitted.slice(streamMark).join("");
++				const reassertCalls = terminal.reassertCalls;
++				tui.stop();
++
++				// The caller gets the terminal's own error object, not a wrapper and not the cleanup's.
++				assert.equal(thrown, terminal.failure, `prefix ${accepted}: the original failure identity is lost`);
++				// A failing BEGIN opens no interval to fill: no mode reassertion, no render, no END.
++				assert.equal(reassertCalls, 0, `prefix ${accepted}: a failed BEGIN still reasserted modes`);
++				assert.ok(!stream.includes(";E;"), `prefix ${accepted}: a failed BEGIN still wrote an END marker`);
++				// Exactly two write calls, and the second is the one bounded cleanup.
++				assert.deepEqual(attempts, [begin, cleanup], `prefix ${accepted}: not exactly BEGIN then one cleanup`);
++				assert.deepEqual(writesAfterFailure(attempts, begin), [cleanup], `prefix ${accepted}: cleanup was retried`);
++				// Nothing admitted is ever written twice: the physical stream is the prefix, then the cleanup.
++				assert.equal(stream, `${begin.slice(0, accepted)}${cleanup}`, `prefix ${accepted}: the stream was rewritten`);
++				assert.ok(cleanup.length <= 2 + NATIVE_PRESENT_MARKER_MAX_BYTES, "cleanup is bounded");
++
++				// What a consumer on the byte route sees. It never amounts to a frame, whatever the prefix was.
++				const seen = observe(token, stream);
++				assert.deepEqual(seen.endFrameIds, [], `prefix ${accepted}: a failed BEGIN produced an END event`);
++				assert.ok(
++					!seen.framing.includes("end"),
++					`prefix ${accepted}: framing ${JSON.stringify(seen.framing)} contains an end`,
++				);
++			}
++		});
++	}
++
++	it("keeps the whole failed BEGIN out of the interval when the marker was fully admitted before the throw", () => {
++		// The one prefix worth naming on its own: BEGIN was admitted in full and the write still threw, so the
++		// decoder really does open an interval, and cleanup's ABORT really does close it. That is the only
++		// prefix where the cleanup's leading terminator is ordinary bytes rather than a candidate terminator.
++		const token = mintNativePresentToken();
++		const begin = encodeNativePresentBegin(token);
++		const { terminal, tui } = mount(renderers[0]![1]);
++		const streamMark = terminal.admitted.length;
++		terminal.fail = (data) => (data === begin ? data.length : undefined);
++		assert.throws(() =>
++			tui.presentNow({
++				requestId: "begin-fully-admitted",
++				coldTerminal: true,
++				ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++			}),
++		);
++		terminal.fail = undefined;
++		const stream = terminal.admitted.slice(streamMark).join("");
++		tui.stop();
++		const seen = observe(token, stream);
++		assert.deepEqual(seen.framing, ["begin", "abort"]);
++		assert.equal(stream, `${begin}${encodeNativePresentFailedAttemptCleanup(token)}`);
++	});
++});
++
++describe("an ordered attempt whose END write fails", () => {
++	for (const [name, make] of renderers) {
++		it(`${name} keeps the frame, closes the attempt once, and is never a success`, () => {
++			const token = mintNativePresentToken();
++			const begin = encodeNativePresentBegin(token);
++			const cleanup = encodeNativePresentFailedAttemptCleanup(token);
++			// Every byte prefix of END, which is the longer marker.
++			let sawFullyAdmittedEnd = false;
++			let sawCleanupCompletedEnd = false;
++			for (let accepted = 0; ; accepted += 1) {
++				const { terminal, tui } = mount(make);
++				const attemptMark = terminal.attempts.length;
++				const streamMark = terminal.admitted.length;
++				let endArgument: string | undefined;
++				terminal.fail = (data) => {
++					if (!data.startsWith(`\x1bP=pi-native-present;1;E;${token}`)) return undefined;
++					endArgument = data;
++					return Math.min(accepted, data.length);
++				};
++				let thrown: unknown;
++				let outcome: unknown;
++				try {
++					outcome = tui.presentNow({
++						requestId: `end-fails-${accepted}`,
++						coldTerminal: true,
++						ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++					});
++				} catch (error) {
++					thrown = error;
++				}
++				terminal.fail = undefined;
++				const attempts = terminal.attempts.slice(attemptMark);
++				const stream = terminal.admitted.slice(streamMark).join("");
++				tui.stop();
++				assert.ok(endArgument, `prefix ${accepted}: no END write was attempted`);
++
++				// Rule 1: an ordered attempt whose END write threw is never reported successful.
++				assert.equal(outcome, undefined, `prefix ${accepted}: a failed END returned an outcome`);
++				assert.equal(thrown, terminal.failure, `prefix ${accepted}: the original failure identity is lost`);
++				// Rule 2: exactly one cleanup write after the failure, and no retry of the END itself.
++				assert.deepEqual(writesAfterFailure(attempts, endArgument), [cleanup], `prefix ${accepted}: not one cleanup`);
++				assert.equal(
++					attempts.filter((data) => data === endArgument).length,
++					1,
++					`prefix ${accepted}: the END write was retried`,
++				);
++				// The physical stream ends with exactly the admitted END prefix followed by the cleanup, and the
++				// frame bytes before it are untouched: nothing was rolled back and nothing was rewritten.
++				assert.ok(stream.startsWith(begin), `prefix ${accepted}: the interval did not start with BEGIN`);
++				assert.ok(
++					stream.endsWith(`${endArgument.slice(0, Math.min(accepted, endArgument.length))}${cleanup}`),
++					`prefix ${accepted}: the admitted END prefix or the cleanup was rewritten`,
++				);
++
++				// Rule 3: the decoder's events are not the outcome. Two different prefixes produce a matching `end`
++				// on the byte route - the whole marker admitted before the throw, and a marker missing only its
++				// terminator, which the cleanup's own leading terminator then completes. Both attempts failed. Only
++				// the conjunction of a successful control result and an observed matching END is success.
++				const seen = observe(token, stream);
++				const fullyAdmitted = accepted >= endArgument.length;
++				if (seen.endFrameIds.length > 0) {
++					assert.equal(outcome, undefined, `prefix ${accepted}: an observed END came with a returned outcome`);
++					assert.equal(seen.endFrameIds.length, 1, `prefix ${accepted}: more than one END event`);
++					if (fullyAdmitted) sawFullyAdmittedEnd = true;
++					else sawCleanupCompletedEnd = true;
++				}
++				if (fullyAdmitted) {
++					assert.deepEqual(
++						seen.framing,
++						["begin", "end", "refused"],
++						`prefix ${accepted}: ${JSON.stringify(seen.framing)}`,
++					);
++					break;
++				}
++			}
++			assert.ok(sawFullyAdmittedEnd, "the sweep never reached a fully admitted END");
++			// The hazard the contract exists for has to have been exercised, not assumed.
++			assert.ok(sawCleanupCompletedEnd, "no prefix was completed into an END by the cleanup terminator");
++		});
++	}
++});
++
++describe("an ordered attempt whose cleanup write also fails", () => {
++	for (const accepted of [0, 7, "all"] as const) {
++		it(`reports uncertainty without the token when cleanup admits ${accepted} byte(s) and throws`, async () => {
++			const token = mintNativePresentToken();
++			const begin = encodeNativePresentBegin(token);
++			const cleanup = encodeNativePresentFailedAttemptCleanup(token);
++			const { terminal, tui } = mount(renderers[0]![1]);
++			// The first failure is the BEGIN write; the cleanup then fails too, with an error whose message
++			// contains the token - exactly the leak a formatted warning would have published.
++			terminal.fail = (data) => {
++				if (data === begin) return 3;
++				if (data === cleanup) {
++					terminal.failure = new Error(`channel closed while writing cleanup for token ${token}`);
++					throw terminal.failure;
++				}
++				return undefined;
++			};
++			const warnings: string[] = [];
++			const onWarning = (warning: Error) => warnings.push(warning.message);
++			process.on("warning", onWarning);
++			let thrown: unknown;
++			try {
++				tui.presentNow({
++					requestId: `cleanup-fails-${String(accepted)}`,
++					coldTerminal: true,
++					ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++				});
++			} catch (error) {
++				thrown = error;
++			}
++			terminal.fail = undefined;
++			tui.stop();
++
++			// The caller still learns the original BEGIN failure, not the cleanup's.
++			assert.match(String(thrown), /admitted 3 byte\(s\)/, "the cleanup failure replaced the original error");
++			// One cleanup attempt, never a second.
++			assert.equal(terminal.attempts.filter((data) => data === cleanup).length, 1, "cleanup was retried");
++
++			// `process.emitWarning` is asynchronous, so it is read on a later turn.
++			await new Promise<void>((resolve) => setImmediate(resolve));
++			process.off("warning", onWarning);
++			assert.equal(warnings.length, 1, `exactly one warning: ${JSON.stringify(warnings)}`);
++			const [warning] = warnings as [string];
++			// The token, the marker bytes and the arbitrary error text are all absent.
++			assert.ok(!warning.includes(token), "the warning reproduced the attempt's token");
++			assert.ok(!warning.includes("pi-native-present"), "the warning reproduced marker bytes");
++			assert.ok(!warning.includes("channel closed"), "the warning formatted the thrown error's message");
++			// And it claims neither outcome for the framing.
++			assert.ok(/unknown/.test(warning), `the warning does not report uncertainty: ${warning}`);
++			assert.ok(!/stayed open|definitely closed/.test(warning), `the warning claims a framing state: ${warning}`);
++		});
++	}
++
++	it("keeps a no-complete-frame refusal a refusal even when its one cleanup write fails", () => {
++		const token = mintNativePresentToken();
++		const cleanup = encodeNativePresentFailedAttemptCleanup(token);
++		const { terminal, tui } = mount(renderers[0]![1]);
++		// A render that neither throws nor mints a receipt, and a cleanup channel that refuses.
++		const patched = tui as unknown as { renderNow(force?: boolean): void };
++		const real = patched.renderNow.bind(patched);
++		patched.renderNow = () => {};
++		terminal.fail = (data) => {
++			if (data !== cleanup) return undefined;
++			throw new Error("cleanup refused");
++		};
++		const warnings: string[] = [];
++		const onWarning = (warning: Error) => warnings.push(warning.message);
++		process.on("warning", onWarning);
++		const outcome = tui.presentNow({
++			requestId: "refusal-with-failing-cleanup",
++			coldTerminal: false,
++			ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++		});
++		patched.renderNow = real;
++		terminal.fail = undefined;
++		tui.stop();
++		// A failed cleanup does not turn a refusal into a throw or into a success.
++		assert.deepEqual(outcome, { presented: false, reason: "no-complete-frame-support" });
++		assert.equal(terminal.attempts.filter((data) => data === cleanup).length, 1);
++		return new Promise<void>((resolve) => {
++			setImmediate(() => {
++				process.off("warning", onWarning);
++				assert.equal(warnings.length, 1, `exactly one warning: ${JSON.stringify(warnings)}`);
++				resolve();
++			});
++		});
++	});
++});
++
++describe("what survives a failed ordered attempt", () => {
++	it("clears pending presentation state on every failing exit", () => {
++		const token = mintNativePresentToken();
++		const begin = encodeNativePresentBegin(token);
++		const { terminal, tui } = mount(renderers[0]![1]);
++		const inspect = tui as unknown as { pendingPresentation: unknown };
++		terminal.fail = (data) => (data === begin ? 0 : undefined);
++		assert.throws(() =>
++			tui.presentNow({
++				requestId: "pending-cleared",
++				coldTerminal: true,
++				ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++			}),
++		);
++		assert.equal(inspect.pendingPresentation, undefined, "a failed BEGIN left pending presentation state behind");
++		terminal.fail = undefined;
++		terminal.reassertThrows = true;
++		assert.throws(() =>
++			tui.presentNow({
++				requestId: "pending-cleared-reassert",
++				coldTerminal: true,
++				ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token },
++			}),
++		);
++		assert.equal(inspect.pendingPresentation, undefined, "a failed reassertion left pending presentation state behind");
++		terminal.reassertThrows = false;
++		tui.stop();
++	});
++
++	it("presents successfully on a later independent request with a new token", () => {
++		const first = mintNativePresentToken();
++		const second = mintNativePresentToken();
++		const begin = encodeNativePresentBegin(first);
++		const { terminal, tui } = mount(renderers[0]![1]);
++		terminal.fail = (data) => (data === begin ? 11 : undefined);
++		assert.throws(() =>
++			tui.presentNow({
++				requestId: "retired-token",
++				coldTerminal: true,
++				ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token: first },
++			}),
++		);
++		terminal.fail = undefined;
++		const mark = terminal.admitted.length;
++		// A new attempt, a new token. Nothing about it reuses or revalidates the retired one.
++		const outcome = tui.presentNow({
++			requestId: "fresh-token",
++			coldTerminal: true,
++			ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token: second },
++		});
++		const fresh = terminal.admitted.slice(mark).join("");
++		tui.stop();
++		assert.ok(outcome.presented, "a fresh-token attempt on a healthy channel must succeed");
++		if (!outcome.presented) throw new Error("unreachable");
++		const seen = observe(second, fresh);
++		assert.deepEqual(seen.framing, ["begin", "end"]);
++		assert.deepEqual(seen.endFrameIds, [outcome.receipt.frameId]);
++		// The retired token's own decoder sees no frame of its own in the fresh interval.
++		assert.deepEqual(observe(first, fresh).framing, []);
++		assert.ok(!fresh.includes(first), "the fresh interval carries the retired token");
++	});
++
++	it("writes no marker or cleanup byte for an unordered request or a refused ordering", () => {
++		const { terminal, tui } = mount(renderers[0]![1]);
++		const mark = terminal.attempts.length;
++		const plain = tui.presentNow({ requestId: "plain", coldTerminal: true });
++		const refusedVersion = tui.presentNow({
++			requestId: "refused-version",
++			coldTerminal: true,
++			ordering: { version: 99, token: mintNativePresentToken() },
++		});
++		const refusedToken = tui.presentNow({
++			requestId: "refused-token",
++			coldTerminal: true,
++			ordering: { version: NATIVE_PRESENT_ORDERING_VERSION, token: "not-a-token" },
++		});
++		const written = terminal.attempts.slice(mark).join("");
++		tui.stop();
++		assert.ok(plain.presented, "an unordered presentation still presents");
++		assert.deepEqual(refusedVersion, { presented: false, reason: "unsupported-ordering" });
++		assert.deepEqual(refusedToken, { presented: false, reason: "unsupported-ordering" });
++		// Default output is unchanged: no marker, and no cleanup for something that never started.
++		assert.ok(!written.includes("pi-native-present"), "an unordered or refused request wrote framing bytes");
++	});
++});
++
++describe("the cleanup bytes themselves", () => {
++	it("are the string terminator followed by this token's exact ABORT marker, and nothing else", () => {
++		const token = mintNativePresentToken();
++		assert.equal(encodeNativePresentFailedAttemptCleanup(token), `\x1b\\${encodeNativePresentAbort(token)}`);
++		assert.equal(encodeNativePresentFailedAttemptCleanup(token).length, 2 + encodeNativePresentAbort(token).length);
++		// Bounded: the terminator plus one marker, both inside the decoder's candidate bound.
++		assert.ok(encodeNativePresentAbort(token).length <= NATIVE_PRESENT_MARKER_MAX_BYTES);
++	});
++
++	it("terminate an unterminated candidate rather than leaving it to breach the decoder's bound", () => {
++		// The reason the terminator leads. An END body whose own terminator never arrived keeps absorbing bytes
++		// until it finds one, so whatever follows is read as part of that candidate.
++		const token = mintNativePresentToken();
++		const frameId = randomUUID();
++		const end = encodeNativePresentEnd(token, frameId);
++		const truncated = end.slice(0, end.length - 2);
++		const prefix = `${encodeNativePresentBegin(token)}frame${truncated}`;
++		const withCleanup = observe(token, `${prefix}${encodeNativePresentFailedAttemptCleanup(token)}`);
++		// With the leading terminator the truncated END is completed and then the ABORT is read on its own. That
++		// is exactly why an observed END is not by itself a successful presentation: cleanup can finish one.
++		assert.deepEqual(withCleanup.framing, ["begin", "end", "refused"], JSON.stringify(withCleanup.framing));
++		assert.deepEqual(withCleanup.endFrameIds, [frameId]);
++
++		const bareAbort = observe(token, `${prefix}${encodeNativePresentAbort(token)}`);
++		// Without it, the truncated END plus the whole ABORT is a 171-byte candidate that breaches the 128-byte
++		// bound, so it is refused as overlong and the ABORT is only recognized on the rescan behind it. Recorded
++		// as what the decoder really does, not as absorption: either way no frame was presented.
++		assert.deepEqual(bareAbort.framing, ["begin", "refused", "abort"], JSON.stringify(bareAbort.framing));
++		assert.deepEqual(bareAbort.endFrameIds, [], "a bare ABORT after a truncated END must not yield an END");
++		assert.ok(truncated.length + encodeNativePresentAbort(token).length > NATIVE_PRESENT_MARKER_MAX_BYTES);
 +	});
 +});

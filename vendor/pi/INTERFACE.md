@@ -456,7 +456,7 @@ carries its own source tests plus one line of an 0003 test that pinned the whole
 | 3 | `0003-native-presentation-readiness.patch` | `cf7f5ccca6358612f17bb65583f17934fb795b9935c921efe0fbaba1737bdfb9` (serialized; the lane's own diff was `8a483bf73c9b6d6d44cea44eae2289386946e545f1b6fa2b8bd6a5fd88542868`) | `9c40d805754c6cbc5dd161ec4e1c6880b1bc1ef4` |
 | 4 | `0004-native-canonical-admission.patch` | `1f5e78f4ebdeafcc8a161d3b0c02613256902981a12adf540ff2509329bf89d5` (authored at this position; its first form was `66cdeaacf78c3e18e8f7512abf928d7a509691ea776f368d417a60ae0e446dc0`, and the form before the one-use reservation and string-message corrections was `425ac07a02a6d10261f01ad9b8048ee5719ab745f1af6e7ffb2a08e21fc6b9d1`) | `69762c6631d6395b989735cef63f6c97a9511bf9` |
 | 5 | `0005-native-child-handoff.patch` | `18138c0612bf244e3cddb0d9f759b875c6786f1836a84bd082be72071b44bcaa` (taken after 0003 and carried unchanged at this position) | `daa4eb307949768e750c0b5c6c103ef2ccdb3430` |
-| 6 | `0006-native-consumer-capabilities.patch` | `db4d51b8dbfb0c9617e3f9de132eeb5296bbf355c8c1b6fa4fcd5caf55d83bd2` (authored at this position, against the tree positions 1-5 produce; its first form was `4a2647cd4426f7f7e80a6b51cc12b962eb5b9182d9c27273240cc7af0e7383eb`, before the ordered interval's cold-reassertion error path was closed) | `47c732932946858e0f43a4826f921c59d1f05e72` |
+| 6 | `0006-native-consumer-capabilities.patch` | `63f186b735e440751777c70bfd564a0c5df8244ad1ad3bc6a1abef1ad60ea510` (authored at this position, against the tree positions 1-5 produce; its first form was `4a2647cd4426f7f7e80a6b51cc12b962eb5b9182d9c27273240cc7af0e7383eb`, before the ordered interval's cold-reassertion error path was closed, and then `db4d51b8dbfb0c9617e3f9de132eeb5296bbf355c8c1b6fa4fcd5caf55d83bd2`, before the BEGIN and END writes were brought inside that region) | `029408d6f4f4e397b621438a3f80b3fb034f99ab` |
 
 Position 4's tree is the one the reviewed seam D lane prepared (build job `3751264`), because positions 1-4
 are the same bytes in the same order there. Position 5's tree is this composition's own: 0005 applied to that
@@ -521,16 +521,19 @@ record of what it proved. `series` sha256 `56f3234fa623e581a7e3b964dd79145bf5e51
 
 | Field | Value |
 | --- | --- |
-| Build | Slurm job `3756759`, `l40-reserved`, Node `v22.23.2` |
+| Build | Slurm job `3757199`, `l40-reserved`, Node `v22.23.2` |
 | Upstream commit | `bfb004d4418ff05c6f909eaaab856cbe75c1fde0`, tree `562b495c89525fbefb00795d77f34586b69e7068` |
-| Prepared tree | `47c732932946858e0f43a4826f921c59d1f05e72` |
+| Prepared tree | `029408d6f4f4e397b621438a3f80b3fb034f99ab` |
 | Artifact label | `patched: 6 ordered pi-agents source patch(es) applied to the pinned commit.` |
-| Bundled CLI | `192a2262b85f150e23e5fc64a84a6b3384c167c57ac9eae2330472eea471f310` (`dist/bundle/cli.js`, rebuilt from the prepared source) |
+| Bundled CLI | `fd123694ecdb5c728c71b258ab2210214acc61624c218a3fa0ecad2ed5da2f06` (`dist/bundle/cli.js`, rebuilt from the prepared source) |
 
-Superseded, and kept as a record rather than promoted: job `3756157`, prepared tree
-`242c89af869cb8c0630d1ef0a570b27dfa9b8496`, bundled CLI
-`f82d7db25f123f9ccc81aa6f776cb5e4464b973ca14dee91cc33eb471280c1bd`. Its `presentNow` could leave an ordered
-interval open when the cold reassertion threw, so it is the RED target for that regression and nothing else.
+Superseded, and kept as records rather than promoted: job `3756759`, prepared tree
+`47c732932946858e0f43a4826f921c59d1f05e72`, bundled CLI
+`192a2262b85f150e23e5fc64a84a6b3384c167c57ac9eae2330472eea471f310` — its `presentNow` made **no** cleanup write
+when the BEGIN or END write itself threw, so it is the RED target for that regression; and job `3756157`,
+prepared tree `242c89af869cb8c0630d1ef0a570b27dfa9b8496`, bundled CLI
+`f82d7db25f123f9ccc81aa6f776cb5e4464b973ca14dee91cc33eb471280c1bd`, whose `presentNow` could additionally leave
+an interval open when the cold reassertion threw.
 
 Packed cohort, by tarball sha256. The five packages `0006` does not touch carry the same digests as the
 five-patch cohort of 9.0; `pi-tui` and `pi-coding-agent` are the two that changed:
@@ -542,8 +545,8 @@ five-patch cohort of 9.0; `pi-tui` and `pi-coding-agent` are the two that change
 | `@earendil-works/pi-agent-core` | `134b4a6ef03d4632d0454a41ab1f2b4e18dff2196ce1b3316ab5e98ef9852f35` |
 | `@earendil-works/pi-protocol` | `eea8f3235b87924fb368a2361b772b65bbd992e322fb05d554311c98d5ccdafb` |
 | `@earendil-works/pi-client` | `260dcac827d8ede81cb21a99020053fa76b073b5e9be2f12c05ba548f976d46b` |
-| `@earendil-works/pi-tui` | `c4377061bdc04c7247dde12842bd1f41b0383d8dda86701f691f405bf4e0c654` |
-| `@earendil-works/pi-coding-agent` | `ee50101569343fe15b1835d0e48a430c7518809bc51890141939d448fbfb06c2` |
+| `@earendil-works/pi-tui` | `e0c13bcbbc8bc1ad211f6c49752a73e0c8e27df494f0b89fbb2bcf5cc807f3b7` |
+| `@earendil-works/pi-coding-agent` | `4a62191911eaa5faf11c7b7feb55025ce94f94dad041179de4989c70fb64dc16` |
 
 A consumer selects this cohort by its generated manifest, never by a default path. Byte reproducibility is not
 claimed: it is one build, recorded, not re-derived.
@@ -551,9 +554,10 @@ claimed: it is one build, recorded, not re-derived.
 `test/native-consumer-capabilities.test.mjs` is the suite that exists only because of `0006`. Against the
 five-patch cohort of 9.0 it fails 15 of its 18 original cases, including the real blocked-`session_start`
 consumer and the pseudo-terminal marker case; the three that pass in both are the cohort identity case and the
-two that require the default output to carry **no** marker byte. It now carries 24 cases: the added ones cover
-the ordered interval's error paths and feed the decoder the actual arriving reads from a pseudo-terminal, and
-three of them fail against the superseded `3756157` cohort.
+two that require the default output to carry **no** marker byte. It now carries 27 cases: the added ones cover
+the ordered interval's error paths — including a marker write that throws after admitting zero, some or all of
+its bytes — and feed the decoder the actual arriving reads from a pseudo-terminal. Three of them fail against the
+superseded `3756759` cohort, and three others against `3756157`.
 
 ### 9.1 What the composition itself does not deliver
 
@@ -571,6 +575,12 @@ three of them fail against the superseded `3756157` cohort.
   streaming, no queue accounting and no acknowledgement, it changes nothing in Task 11, and a marker is never
   evidence that a client decoded, flushed or displayed anything. `INTERFACE-consumer-capabilities.md` states
   the full limit list, including the recovery-liveness cost the preserved Task 11 contract keeps.
+- **An observed END is not a successful presentation.** `Terminal.write` reports no accepted-byte count when it
+  throws, so a failed ordered attempt may already have admitted the whole frame and even END, and the one
+  bounded `ESC \` + ABORT cleanup write can itself complete a partial marker. A consumer may treat an attempt as
+  usable only with **both** the successful presentation result and the matching observed END; anything else
+  retires that token. If the cleanup write itself fails, what it admitted and whether the framing closed are
+  unknown, are never retried, and are reported as uncertainty rather than as either outcome.
 - **No owner bootstrap and no arbitrary-child terminal parity (Gate 5).** Managed behaviour stays inert
   until an owner process registers a host; with nothing registered every seam is the pinned baseline.
 - **No dependency activation.** The root `package.json` still installs the released Pi; these artifacts are

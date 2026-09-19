@@ -406,8 +406,7 @@ describeCohort("the built cohort brackets an ordered presentation on the termina
 			).toEqual(["begin", "abort"]);
 		});
 	}
-
-	it("reports a failed ABORT write instead of claiming the interval closed, and never retries it", async () => {
+	it("reports an uncertain cleanup instead of claiming a framing state, and never retries it", async () => {
 		const token = tui.mintNativePresentToken();
 		const terminal = new MarkerRecordingTerminal(100, 30, { reassertThrows: true, refuseAbort: true });
 		const renderer = new tui.TuiAltScreen(terminal);
@@ -434,10 +433,123 @@ describeCohort("the built cohort brackets an ordered presentation on the termina
 		await new Promise((resolve) => setImmediate(resolve));
 		process.off("warning", onWarning);
 		expect(
-			warnings.some((message) => message.includes("was left open") && message.includes("not retried")),
-			`no honest report of the failed ABORT write: ${JSON.stringify(warnings)}`,
+			warnings.some((message) => message.includes("unknown") && message.includes("Nothing is retried")),
+			`no honest report of the failed cleanup write: ${JSON.stringify(warnings)}`,
 		).toBe(true);
+		// After a write that threw, neither framing state is knowable, so neither may be claimed.
+		expect(warnings.every((message) => !/stayed open|definitely closed/.test(message))).toBe(true);
 		expect(warnings.every((message) => !message.includes(token))).toBe(true);
+	});
+
+	/**
+	 * The marker-write failure contract, on the installed cohort.
+	 *
+	 * `Terminal.write` reports no accepted-byte count when it throws, so these cases drive the only three shapes
+	 * that exist - nothing admitted, a prefix admitted, everything admitted - and then check the physical stream
+	 * the terminal really took. The source suite sweeps every byte prefix; this proves the installed artifact
+	 * behaves the same way at the boundaries.
+	 */
+	for (const marker of ["BEGIN", "END"]) {
+		it(`makes one bounded cleanup write and no success when the ${marker} write fails`, () => {
+			const token = tui.mintNativePresentToken();
+			const begin = tui.encodeNativePresentBegin(token);
+			const cleanup = `\x1b\\${tui.encodeNativePresentAbort(token)}`;
+			const isMarker = (data) =>
+				marker === "BEGIN" ? data === begin : data.startsWith(`\x1bP=pi-native-present;1;E;${token}`);
+			// Zero, one representative partial, and full acceptance before the throw.
+			for (const share of [0, 0.5, 1]) {
+				const terminal = new MarkerRecordingTerminal();
+				const renderer = new tui.TuiAltScreen(terminal);
+				renderer.addChild(new tui.Text("current ui", 0, 0));
+				renderer.start();
+				let failedArgument;
+				terminal.admitPrefixOf = (data) => {
+					if (!isMarker(data)) return undefined;
+					failedArgument = data;
+					return Math.floor(data.length * share);
+				};
+				const mark = terminal.attempts.length;
+				let thrown;
+				let outcome;
+				try {
+					outcome = renderer.presentNow({
+						requestId: `${marker}-fails-${share}`,
+						coldTerminal: true,
+						ordering: { version: 1, token },
+					});
+				} catch (error) {
+					thrown = error;
+				}
+				terminal.admitPrefixOf = undefined;
+				const attempts = terminal.attempts.slice(mark);
+				const stream = terminal.writes.join("");
+				renderer.stop();
+
+				expect(failedArgument, `${marker} at ${share}: the marker write never happened`).toBeTruthy();
+				// No exception from an ordered attempt is ever a success.
+				expect(outcome, `${marker} at ${share}: a failed write returned an outcome`).toBeUndefined();
+				expect(thrown).toBe(terminal.failure);
+				// Exactly one cleanup write after the failure, and the failed marker is never retried.
+				const after = attempts.slice(attempts.lastIndexOf(failedArgument) + 1);
+				expect(after, `${marker} at ${share}: not exactly one cleanup write`).toEqual([cleanup]);
+				expect(attempts.filter((data) => data === failedArgument)).toHaveLength(1);
+				// The admitted prefix is never rewritten: the stream ends with that prefix then the cleanup.
+				const prefix = failedArgument.slice(0, Math.floor(failedArgument.length * share));
+				expect(stream.endsWith(`${prefix}${cleanup}`)).toBe(true);
+				if (marker === "BEGIN") {
+					// A failing BEGIN opens no interval to fill: no reassertion, no render, no END.
+					expect(terminal.reassertCalls, `BEGIN at ${share}: modes were reasserted anyway`).toBe(0);
+					expect(stream).not.toContain(";E;");
+				}
+
+				const decoder = new tui.NativePresentMarkerDecoder();
+				decoder.arm(token);
+				const events = decoder.decode(Buffer.from(stream, "latin1"));
+				const ends = events.filter((event) => event.kind === "end");
+				if (marker === "END" && share === 1) {
+					// The case the contract exists for: a consumer on the byte route saw a complete matching END,
+					// and the attempt still failed, because there is no successful control result. Events are not
+					// an outcome; only the conjunction of both is success.
+					expect(ends).toHaveLength(1);
+					expect(outcome).toBeUndefined();
+				} else {
+					expect(ends).toHaveLength(0);
+				}
+			}
+		});
+	}
+
+	it("presents successfully on a later independent request with a new token", () => {
+		const retired = tui.mintNativePresentToken();
+		const fresh = tui.mintNativePresentToken();
+		const begin = tui.encodeNativePresentBegin(retired);
+		const terminal = new MarkerRecordingTerminal();
+		const renderer = new tui.TuiAltScreen(terminal);
+		renderer.addChild(new tui.Text("current ui", 0, 0));
+		renderer.start();
+		terminal.admitPrefixOf = (data) => (data === begin ? 9 : undefined);
+		expect(() =>
+			renderer.presentNow({ requestId: "retired", coldTerminal: true, ordering: { version: 1, token: retired } }),
+		).toThrow();
+		terminal.admitPrefixOf = undefined;
+		const mark = terminal.writes.length;
+		// A new attempt with a new token. It does not revalidate the retired one and does not reuse its bytes.
+		const outcome = renderer.presentNow({
+			requestId: "fresh",
+			coldTerminal: true,
+			ordering: { version: 1, token: fresh },
+		});
+		const stream = terminal.writes.slice(mark).join("");
+		renderer.stop();
+		expect(outcome.presented).toBe(true);
+		const decoder = new tui.NativePresentMarkerDecoder();
+		decoder.arm(fresh);
+		const framing = decoder
+			.decode(Buffer.from(stream, "latin1"))
+			.filter((event) => event.kind !== "bytes")
+			.map((event) => event.kind);
+		expect(framing).toEqual(["begin", "end"]);
+		expect(stream).not.toContain(retired);
 	});
 
 	it("keeps untrusted marker-like text byte-identical and refuses ambiguous armed markers", () => {

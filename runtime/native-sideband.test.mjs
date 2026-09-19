@@ -598,7 +598,7 @@ it("refuses when the endpoint it was handed is no longer its own socket, and lea
     socketPath,
     token: TOKEN,
     failpoint: async (/** @type {string} */ stage) => {
-      if (stage !== "after_handoff") return;
+      if (stage !== "before_verification") return;
       await rm(socketPath);
       await writeFile(socketPath, "not a socket\n", { mode: 0o600 });
     },
@@ -606,8 +606,9 @@ it("refuses when the endpoint it was handed is no longer its own socket, and lea
 
   expect(failure).toMatchObject({ code: "SIDEBAND_ENDPOINT_UNUSABLE" });
   expect(`${/** @type {Error} */ (failure).message}`).toMatch(/is not a socket/iu);
-  // The foreign entry is exactly as it was left: this refusal removes nothing it cannot identify.
+  // The foreign entry is exactly as it was left: this refusal removes nothing it cannot identify, and says so.
   expect(await readFile(socketPath, "utf8")).toBe("not a socket\n");
+  expect(`${/** @type {any} */ (failure).sidebandCleanup}`).toMatch(/left exactly as it was found/u);
 });
 
 /**

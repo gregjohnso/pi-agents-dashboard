@@ -500,9 +500,10 @@ function sameEntry(snapshot, metadata) {
  * - The endpoint's identity, type, owner and mode are captured before any application callback exists, so the
  *   snapshot cleanup compares against cannot have been influenced by a connection this listener served.
  *
- * @param {{ socketPath: string, execPath?: string, timeoutMs?: number }} request
+ * @param {{ socketPath: string, execPath?: string, timeoutMs?: number,
+ *   failpoint?: (stage: "before_verification") => Promise<void> }} request
  */
-async function bindThroughHelper({ socketPath, execPath = process.execPath, timeoutMs = BINDER_HANDOFF_TIMEOUT_MS }) {
+async function bindThroughHelper({ socketPath, execPath = process.execPath, timeoutMs = BINDER_HANDOFF_TIMEOUT_MS, failpoint }) {
   const helper = fork(BINDER_ENTRY, [socketPath], {
     execPath,
     // Nothing of this process's own invocation reaches the helper: no inherited V8 or loader flags, no
@@ -513,7 +514,6 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
     stdio: ["ignore", "pipe", "pipe", "ipc"],
     // `fork` never goes through a shell, so there is no shell option to disable here.
     detached: false,
-    windowsHide: true,
   });
 
   /** @type {string[]} */
@@ -529,7 +529,7 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
 
   /** @type {net.Server|undefined} */
   let inherited;
-  /** @type {{ code: string, message: string }|undefined} */
+  /** @type {{ code: any, message: string }|undefined} */
   let refusal;
   let handoffs = 0;
   /** @type {{ code: number|null, signal: string|null }|undefined} */
@@ -616,6 +616,7 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
     if (exited?.code !== 0) {
       throw new NativeSidebandError("SIDEBAND_BINDER_INCOMPLETE", `the socket binder handed over a listener and then exited with code ${exited?.code} signal ${exited?.signal}`);
     }
+    if (failpoint !== undefined) await failpoint("before_verification");
     // Captured before any application callback exists, so nothing this listener serves can influence it.
     const metadata = await lstat(socketPath, { bigint: false });
     if (metadata.isSymbolicLink()) throw new NativeSidebandError("SIDEBAND_ENDPOINT_UNUSABLE", "The owner sideband endpoint must not be a symbolic link");
@@ -627,7 +628,15 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
     }
     return { server: inherited, ownership: ownershipSnapshot(metadata), helperExit: exited };
   } catch (error) {
+    // Nothing here has a verified ownership snapshot, so nothing here removes a directory entry. A refusal that
+    // leaves an entry behind says so, rather than guessing that it was this attempt's to delete.
     await abandon();
+    if (error instanceof NativeSidebandError && error.code === "SIDEBAND_ENDPOINT_UNUSABLE") {
+      Object.defineProperty(error, "sidebandCleanup", {
+        value: "the endpoint was left exactly as it was found: this attempt never proved the entry was its own",
+        enumerable: false,
+      });
+    }
     throw error;
   }
 }
@@ -647,7 +656,7 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
  *
  * @param {{ socketPath: string, token: string, maxFrameBytes?: number, maxQueuedFrames?: number, handshakeTimeoutMs?: number,
  *   binderTimeoutMs?: number, execPath?: string,
- *   failpoint?: (stage: "after_handoff"|"during_close") => Promise<void> }} options
+ *   failpoint?: (stage: "before_verification"|"after_handoff"|"during_close") => Promise<void> }} options
  */
 export async function listenForOwnerSideband(options) {
   const { socketPath, token, maxFrameBytes, maxQueuedFrames, handshakeTimeoutMs } = boundedOptions(options);
@@ -679,6 +688,7 @@ export async function listenForOwnerSideband(options) {
     socketPath,
     execPath: options.execPath,
     timeoutMs: options.binderTimeoutMs,
+    failpoint,
   });
 
   const onConnection = (/** @type {net.Socket} */ socket) => {

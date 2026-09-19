@@ -1643,29 +1643,31 @@ it("reports attachment unavailable from the current publication, not from the pr
   expect(failClosed.ownerAttachmentUnavailable()).toBe(true);
 });
 
-it("stops the fresh route at the queued byte cap instead of buffering the whole frame into a stalled client", async () => {
+it("writes no fresh chunk at all when the client's queue is already past the cap before the frame arrives", async () => {
   if (!withCohort) return;
   const nonce = "bounded-nonce-1";
   const identity = frameId();
-  // This client never finishes writing, for the whole fresh frame: its queue only grows.
+  // This client never finishes writing, and it is never drained: the initialization and the resync burst are
+  // still outstanding when the frame arrives, so the budget is already spent.
   const target = terminalOutputClient({ highWaterMark: 16, stall: true });
   const { created, member } = await armedAttempt({ answer: (/** @type {any} */ command) => orderedResult(command, { frameId: identity, nonce }), client: target, release: false });
   const armed = /** @type {any} */ (await created.presentOrderedTo(member.epoch));
   const token = armed.ordering.token;
   created.broadcastOwnerOutput(bytes(markers.encodeNativePresentBegin(token)));
+  expect(target.queuedBytes()).toBeGreaterThan(1024);
+  const writesBeforeFrame = target.sinkWrites();
 
   const frame = "F".repeat(markers.NATIVE_PRESENT_FRESH_CHUNK_MAX * 3);
   created.broadcastOwnerOutput(bytes(frame));
-  // The cap is 1024 bytes of queue, so one 16384-byte chunk already passes it: the route stops there and the
-  // attempt is retired by the bound rather than by a mislabelled "detached attachment".
+  // Pre-write refusal: with the whole budget outstanding there is nothing to spend, so no fresh chunk is
+  // written at all and the attempt is retired by the bound rather than by a mislabelled detached attachment.
+  expect(target.sinkWrites()).toBe(writesBeforeFrame);
   expect(created.recoveryState()).toBe(null);
-  expect(created.recoveryCounts()).toMatchObject({ retiredBackpressure: 1 });
-  const writesAfterStop = target.sinkWrites();
-  expect(writesAfterStop).toBeLessThanOrEqual(2);
+  expect(created.recoveryCounts()).toMatchObject({ freshChunks: 0, retiredBackpressure: 1 });
 
-  // No further fresh chunk is written after the policy stopped the attempt, and the END cannot revive it.
+  // No fresh chunk follows the stop either, and the END cannot revive the attempt.
   created.broadcastOwnerOutput(bytes(`${frame}${markers.encodeNativePresentEnd(token, identity)}`));
-  expect(target.sinkWrites()).toBe(writesAfterStop);
+  expect(target.sinkWrites()).toBe(writesBeforeFrame);
   expect(created.acknowledgePresentation(member.epoch, nonce)).toMatchObject({ cleared: false, reason: "no-armed-recovery" });
   // The slow member is neither evicted nor disabled: it is still a member and still input-eligible.
   expect(created.attachments()[0]).toMatchObject({ attachmentId: "recovering", state: "resync-required", inputEligible: true });

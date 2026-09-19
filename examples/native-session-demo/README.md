@@ -74,11 +74,14 @@ cohort .../consumer/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli
 frame reaches the terminal. It does not wait for first paint or for initialization, so a blocking startup
 dialog cannot hold your attach command.
 
-Which Pi runs is chosen by manifest, not by whatever npm happens to have installed:
+Which Pi runs is chosen by manifest, not by whatever npm happens to have installed. The default is the
+qualified five-patch composition (seams A, B/C/F, E, D, G; build stage Slurm job `3753895`, prepared tree
+`daa4eb307949768e750c0b5c6c103ef2ccdb3430`). Seam D's canonical admission is in those bytes and inert here:
+it does nothing until a host registers the canonical trio, and this demo registers no canonical host.
 
 ```bash
 $NODE $DEMO start --root /tmp/pi-nsd-mine \
-  --manifest /mnt/main0/home/gjohnson/projects/pi-agents-tool-error-summary/.superpowers/sdd/2026-09-17-native-attachment/merge-tree-wave-6/partial-integration/selected-artifacts-manifest.json
+  --manifest /mnt/main0/home/gjohnson/projects/pi-agents-tool-error-summary/.superpowers/sdd/2026-09-17-native-attachment/runtime-wave-1/canonical-composition/logs/final-artifacts-manifest.json
 ```
 
 ### 2. Attach, from one terminal or several

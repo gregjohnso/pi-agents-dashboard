@@ -4,14 +4,18 @@
  * The demo never resolves `@earendil-works/pi-*` from ambient npm. It reads one manifest that names a
  * verified cohort — the consumer root a build installed, the bundled CLI inside it and the pi-tui package
  * root the pre-TUI caller imports — and refuses to start if any of those three is missing. The default
- * manifest is the wave-6 selection; `--manifest` or `--cohort` override it.
+ * manifest is the qualified five-patch composition (seams A, B/C/F, E, D, G), whose build stage ran as Slurm
+ * job 3753895; `--manifest` or `--cohort` override it.
+ *
+ * Seam D's canonical admission is present in those bytes and inert here: it changes nothing until a host
+ * registers the canonical trio on its `NativeSubmitHost`, and this demo registers no canonical host.
  */
 
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 export const DEFAULT_MANIFEST =
-  "/mnt/main0/home/gjohnson/projects/pi-agents-tool-error-summary/.superpowers/sdd/2026-09-17-native-attachment/merge-tree-wave-6/partial-integration/selected-artifacts-manifest.json";
+  "/mnt/main0/home/gjohnson/projects/pi-agents-tool-error-summary/.superpowers/sdd/2026-09-17-native-attachment/runtime-wave-1/canonical-composition/logs/final-artifacts-manifest.json";
 
 const CODING_AGENT = "node_modules/@earendil-works/pi-coding-agent";
 const TUI = "node_modules/@earendil-works/pi-tui";

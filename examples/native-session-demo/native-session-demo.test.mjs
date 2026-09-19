@@ -7,6 +7,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmod, cp, mkdir, mkdtemp, readdir, readFile, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import net from "node:net";
@@ -21,7 +22,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { inspectProcessIdentity } from "../../runtime/process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "../../runtime/process-signaler.mjs";
 
-import { resolveCohort } from "./cohort.mjs";
+import { DEFAULT_MANIFEST, resolveCohort } from "./cohort.mjs";
 import { FRONTEND_MODE_RESTORE, createAttachmentTeardown } from "./client.mjs";
 import { createRoot, demoPaths, readToken, tokenMatches, writeOwnerRecord } from "./demo-root.mjs";import { FAKE_REPLY_PREFIX, createFakeStreamSimple, deterministicReply } from "./fake-provider.mjs";
 import { createPausingRelay } from "./pausing-relay.mjs";
@@ -183,6 +184,20 @@ describe("cohort selection", () => {
     const manifestPath = path.join(directory, "manifest.json");
     await writeFile(manifestPath, JSON.stringify({ patchedTreeHash: "abc" }));
     expect(() => resolveCohort({ manifestPath })).toThrowError(/names no consumerRoot/u);
+  });
+
+  it("defaults to the installed cohort built from exactly this tree's ordered patch series", async () => {
+    const manifest = JSON.parse(await readFile(DEFAULT_MANIFEST, "utf8"));
+    const series = (await readFile(new URL("../../vendor/pi/patches/series", import.meta.url), "utf8"))
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line !== "" && !line.startsWith("#"));
+    expect(manifest.series).toEqual(series);
+    expect(manifest.appliedPatches.map((applied) => applied.name)).toEqual(series);
+    const cohort = resolveCohort({});
+    expect(cohort.manifestPath).toBe(DEFAULT_MANIFEST);
+    expect(cohort.patchedTreeHash).toBe(manifest.patchedTreeHash);
+    expect(createHash("sha256").update(await readFile(cohort.bundledCli)).digest("hex")).toBe(manifest.bundledCliSha256);
   });
 });
 

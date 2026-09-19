@@ -6,29 +6,43 @@ import { nextAttachmentEpoch } from "../shared/native-contracts.mjs";
 const CAP = 8;
 
 /**
- * A sink that records exactly what it was handed, and reports the queue sizes the case scripts.
+ * A sink that records exactly what it was handed, and reports the queue sizes and write results the case scripts.
  *
  * Deterministic on purpose: the post-write queue size is the one fact backpressure turns on, so it is a
  * script rather than a real socket's timing. Every byte array reaches `writes` by reference, so a copy made
  * anywhere between `broadcast` and the sink would show up as a different object.
  *
- * @param {{ queuedAfterWrite?: number[], writeThrows?: unknown, queuedBytesThrows?: unknown, queuedBytesReturns?: unknown, onDrainThrows?: unknown, log?: string[], label?: string }} [script]
+ * `writeReturns` is scripted **independently** of `queuedAfterWrite`, because the two facts are independent in
+ * Node: `false` from `Writable.write` says the queue passed its own high-water mark, which a socket can report
+ * at a queue size well inside this set's cap. Deriving one from the other leaves a `false` write below the cap
+ * unreachable, and that is exactly the case proving `false` is not a rejection. Every answer is recorded in
+ * `writeResults`, so a case asserts what the sink really returned rather than what it meant to script.
+ *
+ * @param {{ queuedAfterWrite?: number[], writeReturns?: boolean[], writeThrows?: unknown, queuedBytesThrows?: unknown, queuedBytesReturns?: unknown, onDrainThrows?: unknown, log?: string[], label?: string }} [script]
  */
-function deterministicSink({ queuedAfterWrite = [0], writeThrows, queuedBytesThrows, queuedBytesReturns, onDrainThrows, log = [], label = "sink" } = {}) {
+function deterministicSink({ queuedAfterWrite = [0], writeReturns, writeThrows, queuedBytesThrows, queuedBytesReturns, onDrainThrows, log = [], label = "sink" } = {}) {
   /** @type {Uint8Array[]} */
   const writes = [];
+  /** @type {boolean[]} */
+  const writeResults = [];
   /** @type {(() => void)[]} */
   const drainListeners = [];
   let queuedBytesCalls = 0;
   const sink = {
     writes,
+    writeResults,
     drainListeners,
     /** @param {Uint8Array} bytes */
     write(bytes) {
       log.push(`${label}.write:${bytes.byteLength}`);
       if (writeThrows !== undefined) throw writeThrows;
       writes.push(bytes);
-      return queuedAfterWrite[Math.min(writes.length, queuedAfterWrite.length) - 1] <= CAP;
+      // Unscripted, the sink answers the way a socket would: false once its queue is past the cap.
+      const result = writeReturns === undefined
+        ? queuedAfterWrite[Math.min(writes.length, queuedAfterWrite.length) - 1] <= CAP
+        : writeReturns[Math.min(writes.length, writeReturns.length) - 1];
+      writeResults.push(result);
+      return result;
     },
     queuedBytes() {
       queuedBytesCalls += 1;
@@ -58,10 +72,10 @@ function bytes(byteLength, fill) {
   return new Uint8Array(byteLength).fill(fill);
 }
 
-/** @param {{ attachmentId?: string, queuedAfterWrite?: number[] }} [options] */
-function setWithOneAttachment({ attachmentId = "viewer-a", queuedAfterWrite = [0] } = {}) {
+/** @param {{ attachmentId?: string, queuedAfterWrite?: number[], writeReturns?: boolean[] }} [options] */
+function setWithOneAttachment({ attachmentId = "viewer-a", queuedAfterWrite = [0], writeReturns } = {}) {
   const set = createAttachmentSet({ queuedByteCap: CAP });
-  const sink = deterministicSink({ queuedAfterWrite });
+  const sink = deterministicSink({ queuedAfterWrite, writeReturns });
   const epoch = set.add({ attachmentId, epoch: 1 }, sink);
   return { set, sink, epoch };
 }
@@ -78,15 +92,26 @@ it("marks an attachment resync-required on the first broadcast that carries its 
   expect(set.attachments()[0].state).toBe("resync-required");
 });
 
-it("accepts a false write whose queue stays at the cap and keeps broadcasting to it", () => {
-  const { set, sink } = setWithOneAttachment({ queuedAfterWrite: [CAP] });
+// A sink that answers false has already accepted and buffered the bytes, so a second broadcast must still
+// reach it and no accepted prefix may be handed over again. This is the case that fails when someone reads
+// that false as a rejection.
+it("keeps delivering to a sink that answers false while its queue stays within the cap", () => {
+  const { set, sink } = setWithOneAttachment({ queuedAfterWrite: [CAP], writeReturns: [false] });
+  const first = bytes(4, 0x41);
+  const second = bytes(5, 0x42);
 
-  const first = set.broadcast(bytes(4, 0x41));
-  const second = set.broadcast(bytes(4, 0x42));
+  const firstResult = set.broadcast(first);
+  const secondResult = set.broadcast(second);
 
-  expect(sink.write(bytes(1, 0x43))).toBe(true);
-  expect(first.markedResyncRequired).toEqual([]);
-  expect(second.delivered).toEqual([{ attachmentId: "viewer-a", epoch: 1 }]);
+  expect(sink.writeResults).toEqual([false, false]);
+  expect(firstResult.delivered).toEqual([{ attachmentId: "viewer-a", epoch: 1 }]);
+  expect(firstResult.markedResyncRequired).toEqual([]);
+  expect(secondResult.delivered).toEqual([{ attachmentId: "viewer-a", epoch: 1 }]);
+  expect(secondResult.markedResyncRequired).toEqual([]);
+  expect(secondResult.skipped).toEqual([]);
+  expect(sink.writes).toEqual([first, second]);
+  expect(sink.writes[0]).toBe(first);
+  expect(sink.writes[1]).toBe(second);
   expect(set.attachments()[0].state).toBe("live");
 });
 

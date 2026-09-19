@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -373,6 +373,12 @@ function helloLine() {
 // otherwise keep being handed the frames behind it, after the connection has been recorded as failed. The
 // contract is that a recorded failure discards what was buffered; a listener that saw one more fact than the
 // host's own refusal admits has been told something the host does not believe.
+//
+// Each line is written and awaited separately, so this case makes no claim about how the stream is
+// segmented. What it constrains is the subscriber-throw path: the first frame handed over seals the link, so
+// nothing behind it is delivered whether it was queued or still in flight. That frames really are buffered
+// while nothing is subscribed, and that a seal really discards the buffer, are the two cases below — both
+// established without depending on a chunk boundary.
 it("stops delivering the moment a failure is recorded, mid drain of frames already admitted", async () => {
   const socketPath = await socketPathForThisTest();
   const listener = await listenForOwnerSideband({ socketPath, token: TOKEN });
@@ -380,14 +386,10 @@ it("stops delivering the moment a failure is recorded, mid drain of frames alrea
   const arriving = listener.nextOwner();
   const raw = await rawOwner(socketPath);
 
-  // One write, so the hello and both frames reach the host in one chunk and are admitted in one
-  // synchronous pass: by the time `nextOwner` resolves, both frames are queued with no subscriber.
-  await raw.write(
-    helloLine()
-      + line({ protocol: NATIVE_SIDEBAND_PROTOCOL, type: "owner-facts", facts: { mode: "tui" } })
-      + line({ protocol: NATIVE_SIDEBAND_PROTOCOL, type: "owner-facts", facts: { idle: true } }),
-  );
+  await raw.write(helloLine());
   const owner = await arriving;
+  await raw.write(line({ protocol: NATIVE_SIDEBAND_PROTOCOL, type: "owner-facts", facts: { mode: "tui" } }));
+  await raw.write(line({ protocol: NATIVE_SIDEBAND_PROTOCOL, type: "owner-facts", facts: { idle: true } }));
 
   /** @type {any[]} */
   const seen = [];
@@ -399,6 +401,47 @@ it("stops delivering the moment a failure is recorded, mid drain of frames alrea
   expect(seen).toEqual([{ type: "owner-facts", facts: { mode: "tui" } }]);
   await expect(owner.closed).resolves.toEqual({ refusal: "listener-failed" });
   // Nothing may be admitted or subscribed afterwards either.
+  expect(recordFrames(owner)).toEqual([]);
+});
+
+// That unsubscribed frames are *buffered* rather than dropped, proven by the only non-destructive observation
+// of the buffer there is: its cap. Reading the buffer any other way drains it, and a chunk boundary proves
+// nothing, so this counts frames instead. With room for two and nothing subscribed, the third frame overflows,
+// which can only happen if the first two were held.
+it("buffers every admitted frame while nothing is subscribed, and refuses the one past its cap", async () => {
+  const socketPath = await socketPathForThisTest();
+  const listener = await listenForOwnerSideband({ socketPath, token: TOKEN, maxQueuedFrames: 2 });
+  cleanup.push(() => listener.close());
+  const arriving = listener.nextOwner();
+  const raw = await rawOwner(socketPath);
+
+  await raw.write(helloLine());
+  const owner = await arriving;
+  for (const index of [1, 2, 3]) {
+    await raw.write(line({ protocol: NATIVE_SIDEBAND_PROTOCOL, type: "owner-facts", facts: { index } }));
+  }
+
+  await expect(owner.closed).resolves.toEqual({ refusal: "queue-overflow" });
+});
+
+// And that a recorded failure *discards* that buffer. The seal is triggered by a malformed frame rather than a
+// throwing subscriber, so the buffer is never drained on the way to the failure: a subscriber that arrives
+// afterwards is the observation, and it must be handed nothing. Every write is separate and awaited, so no
+// step depends on how the stream was segmented.
+it("discards what it buffered when a failure is recorded without any subscriber", async () => {
+  const socketPath = await socketPathForThisTest();
+  const listener = await listenForOwnerSideband({ socketPath, token: TOKEN, maxQueuedFrames: 8 });
+  cleanup.push(() => listener.close());
+  const arriving = listener.nextOwner();
+  const raw = await rawOwner(socketPath);
+
+  await raw.write(helloLine());
+  const owner = await arriving;
+  await raw.write(line({ protocol: NATIVE_SIDEBAND_PROTOCOL, type: "owner-facts", facts: { mode: "tui" } }));
+  await raw.write(line({ protocol: NATIVE_SIDEBAND_PROTOCOL, type: "owner-facts", facts: { idle: true } }));
+  await raw.write("{ this is not a frame\n");
+
+  await expect(owner.closed).resolves.toEqual({ refusal: "malformed-frame" });
   expect(recordFrames(owner)).toEqual([]);
 });
 
@@ -449,10 +492,37 @@ it("takes the same cleanup path when the real permission narrowing rejects", asy
   }).then(() => undefined, (/** @type {unknown} */ error) => error);
 
   expect(`${/** @type {Error} */ (failure).message}`).toMatch(/not a socket/iu);
-  // Its own endpoint path is cleared, whatever replaced it, exactly as a successful close clears it.
-  await expect(lstat(socketPath)).rejects.toMatchObject({ code: "ENOENT" });
-  const replacement = await listenForOwnerSideband({ socketPath, token: TOKEN });
-  cleanup.push(() => replacement.close());
+  // The entry at this path is no longer the socket this call bound, so it is not this call's to remove:
+  // whoever replaced it owns it. The path is therefore left exactly as the replacement left it.
+  expect(await readFile(socketPath, "utf8")).toBe("not a socket\n");
+});
+
+// Operator-visible failure: the endpoint is identified by a boolean saying "this call bound this path once",
+// not by which directory entry is there now. A replacement that arrived after the bind belongs to whoever
+// made it, and removing it on this call's way out destroys another actor's file. `server.close()` is part of
+// the path under test here, not only the explicit unlink: libuv unlinks the pathname it bound when the
+// listening handle closes, so guarding the manual unlink alone would not preserve anything.
+it("leaves a post-bind replacement of its own endpoint in place, through the whole close path", async () => {
+  const socketPath = await socketPathForThisTest();
+  const foreign = `${socketPath}-foreign`;
+
+  const failure = await listenForOwnerSideband({
+    socketPath,
+    token: TOKEN,
+    failpoint: async (/** @type {string} */ stage) => {
+      if (stage !== "after_bind") return;
+      // Another actor replaces this path with its own live listening socket, then this call fails.
+      await rm(socketPath);
+      const other = await listenForOwnerSideband({ socketPath: foreign, token: TOKEN });
+      cleanup.push(() => other.close());
+      await rename(foreign, socketPath);
+      throw new Error("the endpoint was replaced before this call finished");
+    },
+  }).then(() => undefined, (/** @type {unknown} */ error) => error);
+
+  expect(`${/** @type {Error} */ (failure).message}`).toBe("the endpoint was replaced before this call finished");
+  // The replacement is still there and still a socket: a failed call removed somebody else's endpoint only
+  // if this assertion fails.
   expect((await lstat(socketPath)).isSocket()).toBe(true);
 });
 

@@ -555,6 +555,13 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
   const completion = new Promise((resolve) => {
     settleCompletion = () => resolve(undefined);
   });
+  /** @type {() => void} */
+  let settleDeadline = () => {};
+  // Kept apart from `completion`, which means the helper really finished. Conflating them let the wait below
+  // give up on time and then let `abandon` believe the helper was already gone.
+  const deadline = new Promise((resolve) => {
+    settleDeadline = () => resolve(undefined);
+  });
 
   /** A handle this attempt is not adopting is this attempt's to end. @param {unknown} handle */
   const disposeHandle = (handle) => {
@@ -651,7 +658,7 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
   const timer = setTimeout(() => {
     timedOut = true;
     refuse("SIDEBAND_BINDER_TIMEOUT", `the socket binder did not finish binding, handing over and exiting within ${timeoutMs}ms`);
-    settleCompletion();
+    settleDeadline();
   }, timeoutMs);
   timer.unref();
 
@@ -668,6 +675,8 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
     if (!completed) {
       // This is the process this call forked and holds a handle to, so there is no PID guess here.
       helper.kill("SIGKILL");
+      // The real completion, never the deadline: a caller that has been told this attempt failed must not find
+      // the helper still running and still listening on the endpoint it was handed.
       await completion;
     }
   };
@@ -678,7 +687,7 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
       // The helper must be gone before this listener is usable. An acknowledged send is not that proof, so its
       // real completion is awaited, bounded by the same deadline a stuck helper would otherwise outlast.
       if (helper.connected) helper.disconnect();
-      if (!completed) await completion;
+      if (!completed) await Promise.race([completion, deadline]);
       if (timedOut) throw new NativeSidebandError("SIDEBAND_BINDER_TIMEOUT", `the socket binder handed over a listener and then did not exit within ${timeoutMs}ms`);
       // Re-checked after completion: a duplicate or late message during the wait is a refusal that must land.
       if (refusal !== undefined) throw new NativeSidebandError(refusal.code, refusal.message);

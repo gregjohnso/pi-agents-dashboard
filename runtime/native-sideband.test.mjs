@@ -916,7 +916,6 @@ it.each([
   ["bound-without-proof.mjs", "SIDEBAND_BINDER_PROTOCOL", true],
   ["bound-without-handle.mjs", "SIDEBAND_BINDER_PROTOCOL", true],
   ["bound-with-wrong-handle.mjs", "SIDEBAND_BINDER_PROTOCOL", true],
-  ["duplicate-handoff.mjs", "SIDEBAND_BINDER_PROTOCOL", true],
 ])("refuses %s with %s, disposing any transferred listener and removing nothing", async (name, code, binds) => {
   const root = await socketRoot();
   const socketPath = join(root, "private", "o");
@@ -933,6 +932,24 @@ it.each([
     expect(existsSync(socketPath), name).toBe(true);
     expect(await accepts(socketPath), name).toBe(false);
   }
+});
+
+// One handoff per helper. Node queues a handle send behind its own acknowledgement, so a second handoff can
+// only be written after the parent has adopted the first - and the parent closes the channel on adoption, so
+// there is nowhere for it to land. The fixture reports which happened in its exit code, and a non-zero exit
+// after a handoff fails the attempt rather than yielding a listener from a helper that misbehaved.
+it("gives a second handoff nowhere to land, and fails the attempt of a helper that tries", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "private", "o");
+
+  const { listener, error } = await attemptWithFixture(socketPath, "duplicate-handoff.mjs");
+
+  expect(listener).toBe(undefined);
+  expect(error).toMatchObject({ code: "SIDEBAND_BINDER_INCOMPLETE" });
+  // 9, not 10: the second send was refused by a channel this parent had already closed.
+  expect(`${/** @type {Error} */ (error).message}`).toMatch(/code 9/u);
+  expect(await accepts(socketPath)).toBe(false);
+  expect(`${/** @type {any} */ (error).sidebandCleanup}`).toMatch(/no directory entry was removed/u);
 });
 
 it("reports a spawn failure without waiting for an exit that cannot happen", async () => {

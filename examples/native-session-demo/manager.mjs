@@ -85,6 +85,27 @@ const BRIDGE_FRAME_BUDGET = { "owner-ready": 1, "owner-seams": 1, "owner-facts":
  * record. The oldest entries are dropped, and `droppedEvents` says how many.
  */
 const BRIDGE_DIAGNOSTIC_EVENTS = 64;
+/**
+ * How many requests one generation may have unanswered at once.
+ *
+ * This is in-flight capacity, not a cap on how much work an owner may be asked to do over its lifetime. A peer
+ * that never answers cannot make this manager hold unbounded `awaiting` records, and a peer that does answer
+ * frees a slot immediately, so sequential requests continue indefinitely. When the window is full, admission
+ * returns a named capacity result rather than silently evicting a still-authorized request, fabricating a
+ * receipt, or refusing the owner's connection: Pi and every attachment are untouched by a full window.
+ */
+const BRIDGE_IN_FLIGHT_REQUESTS = 8;
+/**
+ * How much recent request and receipt detail is kept, by entry count and by serialized bytes.
+ *
+ * An entry count alone is not a bound: a request id or an error string may be near the wire's own 64 KiB frame
+ * limit, so sixteen of them would still be a megabyte in every status response and in the final owner record.
+ * Both limits apply, oldest first, and what was dropped is counted rather than hidden.
+ */
+const BRIDGE_RECENT_ENTRIES = 16;
+const BRIDGE_RECENT_BYTES = 8_192;
+/** How much of one stored string is kept. Long enough to identify, short enough that a ring cannot blow up. */
+const BRIDGE_TEXT_LIMIT = 256;
 
 /**
  * The consumer side of the owner management bridge: one active generation, bounded retention.
@@ -105,6 +126,40 @@ const BRIDGE_DIAGNOSTIC_EVENTS = 64;
  *
  * @param {{ log: (line: string) => void, maxDiagnosticEvents?: number, now?: () => number }} options
  */
+/** One stored string, clamped so a value near the wire limit cannot become a megabyte of status. @param {unknown} value */
+function boundedText(value) {
+  return typeof value === "string" ? value.slice(0, BRIDGE_TEXT_LIMIT) : value;
+}
+
+/**
+ * A ring bounded by both entry count and serialized bytes, which reports what it dropped.
+ *
+ * Retention is diagnostics, never authorization: dropping the oldest entry does not cancel work and does not
+ * remove an in-flight request from `awaiting`. `dropped` is what makes the difference visible instead of a
+ * status response that silently shortens.
+ */
+function boundedRing(entries = BRIDGE_RECENT_ENTRIES, bytes = BRIDGE_RECENT_BYTES) {
+  /** @type {{ value: any, size: number }[]} */
+  const held = [];
+  let size = 0;
+  let dropped = 0;
+  return {
+    /** @param {any} value */
+    add(value) {
+      const measured = JSON.stringify(value)?.length ?? 0;
+      held.push({ value, size: measured });
+      size += measured;
+      while (held.length > entries || (size > bytes && held.length > 1)) {
+        const oldest = held.shift();
+        size -= oldest?.size ?? 0;
+        dropped += 1;
+      }
+    },
+    values: () => held.map((entry) => entry.value),
+    dropped: () => dropped,
+  };
+}
+
 export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOSTIC_EVENTS, now = Date.now }) {
   let generations = 0;
   /** @type {any} */
@@ -172,7 +227,8 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
         return;
       }
       owner.awaiting.delete(frame.requestId);
-      owner.receipts.set(frame.requestId, frame);
+      owner.totals.receipted += 1;
+      owner.recentReceipts.add({ ...frame, requestId: boundedText(frame.requestId) });
       return;
     }
     // `validateOwnerFrame` admits no other kind, so reaching here means the two ends disagree about the wire.
@@ -192,9 +248,13 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
         facts: undefined,
         /** @type {unknown} */
         reportedSeams: undefined,
-        receipts: new Map(),
+        // In-flight only: an entry lives here until its receipt arrives or its write fails. It is the one
+        // structure a silent peer could grow, which is why admission is windowed rather than unlimited.
         awaiting: new Map(),
-        requests: /** @type {any[]} */ ([]),
+        recentRequests: boundedRing(),
+        recentReceipts: boundedRing(),
+        // Lifetime counters. These are what stay truthful about how much legitimate work happened.
+        totals: { requested: 0, sent: 0, refused: 0, receipted: 0, capacityRefusals: 0 },
         seen: /** @type {Record<string, number>} */ ({}),
         /** @type {string|null} */
         refusal: null,
@@ -235,23 +295,46 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
     async request(request, requestId) {
       const owner = active;
       if (owner === undefined || owner.closed || owner.refusal !== null) {
-        const absent = { request, requestId: null, generation: owner?.generation ?? null, sent: false, reason: "no owner generation is currently connected to the bridge", atHostMs: now() };
+        const absent = { request, requestId: null, generation: owner?.generation ?? null, admitted: false, sent: false, reason: "no owner generation is currently connected to the bridge", atHostMs: now() };
         note({ type: "bridge-request", request, sent: false, generation: absent.generation });
         return absent;
       }
-      const record = { request, requestId, generation: owner.generation, sent: false, reason: /** @type {string|null} */ (null), atHostMs: now() };
+      owner.totals.requested += 1;
+      if (owner.awaiting.size >= BRIDGE_IN_FLIGHT_REQUESTS) {
+        // A named capacity result, not an eviction and not a fabricated receipt. The requests already in flight
+        // stay authorized and stay answerable; this one was never sent, so nothing is owed for it. Pi and every
+        // attachment are untouched, and the next call succeeds as soon as one answer arrives.
+        owner.totals.capacityRefusals += 1;
+        const full = {
+          request,
+          requestId: null,
+          generation: owner.generation,
+          admitted: false,
+          sent: false,
+          reason: `this owner generation already has ${owner.awaiting.size} unanswered requests, which is its in-flight capacity`,
+          inFlight: owner.awaiting.size,
+          atHostMs: now(),
+        };
+        note({ type: "bridge-request-capacity", request, generation: owner.generation, inFlight: owner.awaiting.size });
+        log(`owner bridge ${request} request refused on generation ${owner.generation}: in-flight capacity ${owner.awaiting.size} reached`);
+        return full;
+      }
+      const record = { request, requestId, generation: owner.generation, admitted: true, sent: false, reason: /** @type {string|null} */ (null), atHostMs: now() };
       // Recorded before the write, so a receipt that arrives while the write is still settling is expected.
       owner.awaiting.set(requestId, record);
       try {
         await (request === "stop" ? owner.connection.requestStop(requestId) : owner.connection.requestAbort(requestId));
         record.sent = true;
+        owner.totals.sent += 1;
       } catch (error) {
+        // A write that failed is not in flight, so its slot is returned rather than held against the peer.
         owner.awaiting.delete(requestId);
-        record.reason = /** @type {Error} */ (error).message;
+        record.reason = boundedText(/** @type {Error} */ (error).message);
+        owner.totals.refused += 1;
       }
-      owner.requests.push(record);
+      owner.recentRequests.add({ ...record, requestId: boundedText(record.requestId) });
       note({ type: "bridge-request", request, sent: record.sent, generation: owner.generation });
-      log(`owner bridge ${request} request ${requestId} on generation ${owner.generation}: ${record.sent ? "sent" : `refused (${record.reason})`}`);
+      log(`owner bridge ${request} request ${String(requestId).slice(0, 64)} on generation ${owner.generation}: ${record.sent ? "sent" : `refused (${record.reason})`}`);
       return record;
     },
 
@@ -270,8 +353,14 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
         readyPhases: [...(owner?.readyPhases ?? [])],
         facts: owner?.facts === undefined ? {} : { ...owner.facts },
         reportedSeams: owner?.reportedSeams === undefined ? [] : [owner.reportedSeams],
-        receipts: [...(owner?.receipts.values() ?? [])],
-        requests: [...(owner?.requests ?? [])],
+        // Bounded recent detail plus lifetime totals. Neither grows with how much legitimate work an owner did.
+        recentReceipts: owner?.recentReceipts.values() ?? [],
+        recentRequests: owner?.recentRequests.values() ?? [],
+        inFlightRequests: owner?.awaiting.size ?? 0,
+        inFlightCapacity: BRIDGE_IN_FLIGHT_REQUESTS,
+        totals: owner === undefined
+          ? { requested: 0, sent: 0, refused: 0, receipted: 0, capacityRefusals: 0, droppedRequests: 0, droppedReceipts: 0 }
+          : { ...owner.totals, droppedRequests: owner.recentRequests.dropped(), droppedReceipts: owner.recentReceipts.dropped() },
         refusal: owner?.refusal ?? null,
         counts: { ...counts, droppedEvents },
         diagnostics: [...events],

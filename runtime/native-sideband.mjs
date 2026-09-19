@@ -5,7 +5,7 @@ import net from "node:net";
 import { dirname, isAbsolute } from "node:path";
 
 import { JsonlFramingError, createJsonlDecoder, createJsonlEncoder } from "./jsonl.mjs";
-import { isBinderMessage } from "./native-sideband-binder.mjs";
+import { SIDEBAND_BINDER_PROTOCOL, isBinderMessage } from "./native-sideband-binder.mjs";
 import { ensurePrivateDirectory } from "./permissions.mjs";
 
 /**
@@ -455,30 +455,27 @@ export function readOwnerSidebandEnvironment(env = process.env) {
   return { socketPath, token };
 }
 
-/** How long the whole bind-and-handoff may take before it is refused. Bounded, and never a poll. */
+/** How long the whole bind, handoff and helper completion may take. Bounded, and never a poll. */
 const BINDER_HANDOFF_TIMEOUT_MS = 10_000;
 /** The mode the binder creates its socket at, verified here rather than narrowed by a later chmod. */
 const PRIVATE_SOCKET_MODE = 0o600;
 const BINDER_ENTRY = new URL("./native-sideband-binder.mjs", import.meta.url);
 
 /**
- * What this attempt's own endpoint looked like the moment it existed.
+ * Does the entry at this path have exactly the identity the helper proved it bound?
  *
- * Cleanup compares against this and removes nothing that no longer matches. Device and inode are the identity;
- * mode and uid are what make it *this* attempt's socket rather than something else that happens to be there.
- * @param {{ dev: bigint|number, ino: bigint|number, mode: number, uid: number }} metadata
+ * Every field is compared, and device and inode are decimal strings on both sides so nothing turns on a
+ * rounded `Number`. This is the check that a same-user, mode-0600 replacement socket cannot pass: it is a
+ * different inode, so it is not the entry this attempt created, however valid it looks on its own.
+ * @param {{ device: string, inode: string, mode: number, uid: number }} proof @param {any} metadata
  */
-function ownershipSnapshot(metadata) {
-  return { device: String(metadata.dev), inode: String(metadata.ino), mode: metadata.mode & 0o777, uid: metadata.uid };
-}
-
-/** @param {ReturnType<typeof ownershipSnapshot>} snapshot @param {any} metadata */
-function sameEntry(snapshot, metadata) {
+function sameEntry(proof, metadata) {
   return metadata.isSocket()
-    && String(metadata.dev) === snapshot.device
-    && String(metadata.ino) === snapshot.inode
-    && (metadata.mode & 0o777) === snapshot.mode
-    && metadata.uid === snapshot.uid;
+    && !metadata.isSymbolicLink()
+    && String(metadata.dev) === proof.device
+    && String(metadata.ino) === proof.inode
+    && Number(metadata.mode & 0o777n) === proof.mode
+    && Number(metadata.uid) === proof.uid;
 }
 
 /**
@@ -486,35 +483,42 @@ function sameEntry(snapshot, metadata) {
  *
  * The helper is the process that binds, and it is gone before this returns. That is the point: a handle
  * received over IPC carries no pathname, so closing it later unlinks nothing and a replacement another actor
- * put at that path survives this attempt's teardown. A handle this process bound itself cannot do that, which
- * is measured rather than assumed.
+ * put at that path survives this attempt's teardown.
  *
- * Ordering this owes its caller, and every part of it is observed rather than inferred:
+ * Four properties this owes its caller, each of which was wrong before and is now the shape of the code:
  *
- * - Lifecycle observers are installed before the helper can finish, so an exit, an error or a disconnect that
- *   happens during the handshake is seen rather than missed.
- * - Exactly one `sideband-bound` message is accepted. A second, a late one, an unknown protocol version, an
- *   unknown type, a missing handle or a handle that is not a server all refuse without publishing a listener.
- * - The helper's **actual exit** is awaited before this resolves. An acknowledged IPC send is not that proof:
- *   the send completing says the runtime took the handle, not that the helper let go of it.
- * - The endpoint's identity, type, owner and mode are captured before any application callback exists, so the
- *   snapshot cleanup compares against cannot have been influenced by a connection this listener served.
+ * - **One terminal outcome.** `outcome` moves from `pending` to `adopted` or `refused` exactly once, and a
+ *   refusal reached after adoption still wins. A duplicate that arrives after a valid handoff but before the
+ *   helper exits therefore fails the attempt rather than being noticed too late to matter.
+ * - **Every transferred handle is disposed unless it is adopted.** That includes a handle riding on the first
+ *   malformed, unknown-version or refusal message, which previously leaked a listening server.
+ * - **The deadline covers the whole process**, not the first message: bind, handoff, and the helper's own
+ *   completion. A spawn failure that emits `error` and `close` without ever emitting `exit` is completion, and
+ *   so is a helper that goes quiet while holding nothing.
+ * - **Ownership is the helper's proof, not this process's guess.** The identity is captured in the helper
+ *   between `listen` and the send; this side compares the path against it. Adopting whichever valid-looking
+ *   socket happened to be at the path is exactly the window that let a foreign 0600 socket be unlinked.
  *
- * @param {{ socketPath: string, execPath?: string, timeoutMs?: number,
+ * @param {{ socketPath: string, execPath?: string, timeoutMs?: number, binderEntry?: URL|string,
  *   failpoint?: (stage: "before_verification") => Promise<void> }} request
  */
-async function bindThroughHelper({ socketPath, execPath = process.execPath, timeoutMs = BINDER_HANDOFF_TIMEOUT_MS, failpoint }) {
-  const helper = fork(BINDER_ENTRY, [socketPath], {
-    execPath,
-    // Nothing of this process's own invocation reaches the helper: no inherited V8 or loader flags, no
-    // NODE_OPTIONS, no preloads, and no credential or provider variable. It gets a PATH-less minimum.
-    execArgv: [],
-    env: { PATH: "/usr/bin:/bin" },
-    // Its stdout and stderr are streams for a human, never a protocol; the handle arrives on the IPC channel.
-    stdio: ["ignore", "pipe", "pipe", "ipc"],
-    // `fork` never goes through a shell, so there is no shell option to disable here.
-    detached: false,
-  });
+async function bindThroughHelper({ socketPath, execPath = process.execPath, timeoutMs = BINDER_HANDOFF_TIMEOUT_MS, binderEntry = BINDER_ENTRY, failpoint }) {
+  /** @type {any} */
+  let helper;
+  try {
+    helper = fork(binderEntry, [String(SIDEBAND_BINDER_PROTOCOL), socketPath], {
+      execPath,
+      // Nothing of this process's own invocation reaches the helper: no inherited V8 or loader flags, no
+      // NODE_OPTIONS, no preloads, and no credential or provider variable. It gets a PATH-less minimum.
+      execArgv: [],
+      env: { PATH: "/usr/bin:/bin" },
+      // Its stdout and stderr are streams for a human, never a protocol; the handle arrives on the IPC channel.
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+      detached: false,
+    });
+  } catch (cause) {
+    throw new NativeSidebandError("SIDEBAND_BINDER_UNUSABLE", `the socket binder could not be started: ${/** @type {Error} */ (cause).message}`, { cause });
+  }
 
   /** @type {string[]} */
   const diagnostics = [];
@@ -527,113 +531,172 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
   helper.stdout?.on("error", () => {});
   helper.stderr?.on("error", () => {});
 
+  /** @type {"pending"|"adopted"|"refused"} */
+  let outcome = "pending";
   /** @type {net.Server|undefined} */
   let inherited;
+  /** @type {{ device: string, inode: string, mode: number, uid: number }|undefined} */
+  let proof;
   /** @type {{ code: any, message: string }|undefined} */
   let refusal;
-  let handoffs = 0;
   /** @type {{ code: number|null, signal: string|null }|undefined} */
   let exited;
+  let completed = false;
   /** @type {() => void} */
-  let settle = () => {};
-  const finished = new Promise((resolve) => {
-    settle = () => resolve(undefined);
+  let settleFirst = () => {};
+  /** @type {() => void} */
+  let settleCompletion = () => {};
+  const answered = new Promise((resolve) => {
+    settleFirst = () => resolve(undefined);
+  });
+  const completion = new Promise((resolve) => {
+    settleCompletion = () => resolve(undefined);
   });
 
-  /** @param {any} code @param {string} message */
+  /** A handle this attempt is not adopting is this attempt's to end. @param {unknown} handle */
+  const disposeHandle = (handle) => {
+    if (handle === undefined || handle === null) return;
+    const closable = /** @type {any} */ (handle);
+    try {
+      if (typeof closable.close === "function") closable.close();
+      else if (typeof closable.destroy === "function") closable.destroy();
+    } catch {
+      // A handle that cannot be closed is recorded by the refusal that accompanies it, not thrown from here.
+    }
+  };
+
+  /** The one terminal refusal. Reached after adoption it still wins. @param {any} code @param {string} message */
   const refuse = (code, message) => {
     if (refusal === undefined) refusal = { code, message };
-    settle();
+    if (outcome !== "refused") outcome = "refused";
+    settleFirst();
+  };
+
+  const noteCompletion = () => {
+    completed = true;
+    settleCompletion();
+    settleFirst();
   };
 
   // Installed before the helper can possibly have finished its bind, so nothing below races a late listener.
-  helper.once("error", (error) => refuse("SIDEBAND_BINDER_UNUSABLE", `the socket binder could not be started: ${error.message}`));
-  helper.once("exit", (code, signal) => {
-    exited = { code, signal };
-    settle();
+  helper.once("error", (/** @type {Error} */ error) => {
+    refuse("SIDEBAND_BINDER_UNUSABLE", `the socket binder could not be started: ${error.message}`);
+    // A spawn failure emits `error` and `close` and may never emit `exit`; `close` below is what completes it.
   });
+  helper.once("exit", (/** @type {number|null} */ code, /** @type {string|null} */ signal) => {
+    exited = { code, signal };
+    noteCompletion();
+  });
+  // `close` is the backstop for a child that never reached `exit`, so nothing here waits for an impossible event.
+  helper.once("close", () => noteCompletion());
   helper.once("disconnect", () => {
-    if (inherited === undefined && refusal === undefined) {
+    if (outcome === "pending") {
       refuse("SIDEBAND_BINDER_DISCONNECTED", "the socket binder's channel closed before it handed over a listener");
     }
   });
-  helper.on("message", (message, handle) => {
-    handoffs += 1;
-    if (handoffs > 1) {
-      // A second message is a helper this parent does not understand. The first answer stands and the extra
-      // handle is destroyed rather than adopted.
-      if (handle !== undefined && typeof (/** @type {any} */ (handle).close) === "function") /** @type {any} */ (handle).close();
-      refuse("SIDEBAND_BINDER_PROTOCOL", "the socket binder sent more than one handoff message");
+  helper.on("message", (/** @type {unknown} */ message, /** @type {unknown} */ handle) => {
+    // Anything arriving once this attempt has an outcome is late. Its handle is still this attempt's to end,
+    // and a late message after a valid handoff fails the attempt rather than being quietly ignored.
+    if (outcome !== "pending") {
+      disposeHandle(handle);
+      refuse("SIDEBAND_BINDER_PROTOCOL", `the socket binder sent another message after its ${outcome === "adopted" ? "handoff" : "refusal"}`);
       return;
     }
     if (!isBinderMessage(message)) {
-      refuse("SIDEBAND_BINDER_PROTOCOL", `the socket binder sent a message this parent does not accept: ${JSON.stringify(message)?.slice(0, 256)}`);
+      disposeHandle(handle);
+      refuse("SIDEBAND_BINDER_PROTOCOL", `the socket binder sent a message this parent does not accept: ${String(JSON.stringify(message)).slice(0, 256)}`);
       return;
     }
     const sent = /** @type {any} */ (message);
     if (sent.type === "sideband-bind-failed") {
+      disposeHandle(handle);
       refuse(sent.code === "EADDRINUSE" ? "EADDRINUSE" : "SIDEBAND_BIND_FAILED", sent.message ?? "the socket binder could not bind the endpoint");
       return;
     }
     if (sent.type === "sideband-binder-refused") {
+      disposeHandle(handle);
       refuse("SIDEBAND_BINDER_REFUSED", `the socket binder refused this request: ${sent.reason}`);
       return;
     }
     if (!(handle instanceof net.Server)) {
+      disposeHandle(handle);
       refuse("SIDEBAND_BINDER_PROTOCOL", "the socket binder reported a bound endpoint without handing over its listener");
       return;
     }
     inherited = handle;
-    settle();
+    proof = { device: sent.proof.device, inode: sent.proof.inode, mode: sent.proof.mode, uid: sent.proof.uid };
+    outcome = "adopted";
+    settleFirst();
   });
 
-  const timer = setTimeout(() => refuse("SIDEBAND_BINDER_TIMEOUT", `the socket binder did not hand over a listener within ${timeoutMs}ms`), timeoutMs);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    refuse("SIDEBAND_BINDER_TIMEOUT", `the socket binder did not finish binding, handing over and exiting within ${timeoutMs}ms`);
+    settleCompletion();
+  }, timeoutMs);
   timer.unref();
 
-  /** Destroy what this attempt holds without unlinking anything: it never bound the pathname. */
+  /**
+   * End what this attempt holds, without unlinking anything.
+   *
+   * It never bound the pathname, so it has nothing to remove: the inherited handle carries no pathname and the
+   * helper's own entry, if it made one, is only removable against a proof this attempt did not complete.
+   */
   const abandon = async () => {
     clearTimeout(timer);
-    if (inherited !== undefined) await new Promise((resolve) => /** @type {net.Server} */ (inherited).close(() => resolve(undefined)));
-    if (exited === undefined) {
-      helper.kill("SIGKILL");
+    disposeHandle(inherited);
+    inherited = undefined;
+    if (!completed) {
       // This is the process this call forked and holds a handle to, so there is no PID guess here.
-      await new Promise((resolve) => helper.once("exit", () => resolve(undefined)));
+      helper.kill("SIGKILL");
+      await completion;
     }
   };
 
   try {
-    await finished;
+    await answered;
+    if (outcome === "adopted") {
+      // The helper must be gone before this listener is usable. An acknowledged send is not that proof, so its
+      // real completion is awaited, bounded by the same deadline a stuck helper would otherwise outlast.
+      helper.disconnect();
+      if (!completed) await completion;
+      if (timedOut) throw new NativeSidebandError("SIDEBAND_BINDER_TIMEOUT", `the socket binder handed over a listener and then did not exit within ${timeoutMs}ms`);
+      // Re-checked after completion: a duplicate or late message during the wait is a refusal that must land.
+      if (refusal !== undefined) throw new NativeSidebandError(refusal.code, refusal.message);
+      if (exited === undefined || exited.code !== 0) {
+        throw new NativeSidebandError("SIDEBAND_BINDER_INCOMPLETE", `the socket binder handed over a listener and then ended with code ${exited?.code ?? "none"} signal ${exited?.signal ?? "none"}`);
+      }
+    }
     clearTimeout(timer);
     if (refusal !== undefined) throw new NativeSidebandError(refusal.code, refusal.message);
-    if (inherited === undefined) {
-      const how = exited === undefined ? "before sending anything" : `after exiting with code ${exited.code} signal ${exited.signal}`;
-      throw new NativeSidebandError("SIDEBAND_BINDER_INCOMPLETE", `the socket binder ended ${how}${diagnostics.length > 0 ? `: ${diagnostics.join(" ").trim()}` : ""}`);
-    }
-    // The handle is here; the helper must be gone before this listener is usable. An acknowledged send is not
-    // that proof, so its real exit is awaited. `disconnect()` ends the channel this parent still holds open.
-    helper.disconnect();
-    if (exited === undefined) await new Promise((resolve) => helper.once("exit", () => resolve(undefined)));
-    if (exited?.code !== 0) {
-      throw new NativeSidebandError("SIDEBAND_BINDER_INCOMPLETE", `the socket binder handed over a listener and then exited with code ${exited?.code} signal ${exited?.signal}`);
+    if (inherited === undefined || proof === undefined) {
+      const how = exited === undefined ? "without sending anything" : `after ending with code ${exited.code} signal ${exited.signal}`;
+      throw new NativeSidebandError("SIDEBAND_BINDER_INCOMPLETE", `the socket binder finished ${how}${diagnostics.length > 0 ? `: ${diagnostics.join(" ").trim()}` : ""}`);
     }
     if (failpoint !== undefined) await failpoint("before_verification");
-    // Captured before any application callback exists, so nothing this listener serves can influence it.
-    const metadata = await lstat(socketPath, { bigint: false });
-    if (metadata.isSymbolicLink()) throw new NativeSidebandError("SIDEBAND_ENDPOINT_UNUSABLE", "The owner sideband endpoint must not be a symbolic link");
-    if (!metadata.isSocket()) throw new NativeSidebandError("SIDEBAND_ENDPOINT_UNUSABLE", "The owner sideband endpoint is not a socket");
-    if (metadata.uid !== process.getuid?.()) throw new NativeSidebandError("SIDEBAND_ENDPOINT_UNUSABLE", "The owner sideband endpoint has the wrong owner");
-    if ((metadata.mode & 0o777) !== PRIVATE_SOCKET_MODE) {
-      // Verified, not narrowed: a `chmod` here would be a write to a pathname that may no longer be ours.
-      throw new NativeSidebandError("SIDEBAND_ENDPOINT_UNUSABLE", `The owner sideband endpoint is mode ${(metadata.mode & 0o777).toString(8)} and must be created 0600`);
+    // Compared against the helper's proof, not adopted from what is there. A different socket of the same user
+    // and the same mode is a different inode, and this is where that is caught.
+    const metadata = await lstat(socketPath, { bigint: true });
+    if (!sameEntry(proof, metadata)) {
+      throw new NativeSidebandError(
+        "SIDEBAND_ENDPOINT_UNUSABLE",
+        `the endpoint at ${socketPath} is not the one this attempt bound: expected device ${proof.device} inode ${proof.inode} mode ${proof.mode.toString(8)} uid ${proof.uid}, found device ${String(metadata.dev)} inode ${String(metadata.ino)} mode ${Number(metadata.mode & 0o777n).toString(8)} uid ${String(metadata.uid)}`,
+      );
     }
-    return { server: inherited, ownership: ownershipSnapshot(metadata), helperExit: exited };
+    if (proof.uid !== process.getuid?.()) throw new NativeSidebandError("SIDEBAND_ENDPOINT_UNUSABLE", "The owner sideband endpoint has the wrong owner");
+    if (proof.mode !== PRIVATE_SOCKET_MODE) {
+      // Verified, not narrowed: a `chmod` here would be a write to a pathname that may no longer be ours.
+      throw new NativeSidebandError("SIDEBAND_ENDPOINT_UNUSABLE", `The owner sideband endpoint is mode ${proof.mode.toString(8)} and must be created 0600`);
+    }
+    return { server: inherited, ownership: proof, helperExit: exited };
   } catch (error) {
-    // Nothing here has a verified ownership snapshot, so nothing here removes a directory entry. A refusal that
+    // Nothing here has completed an ownership proof, so nothing here removes a directory entry. A refusal that
     // leaves an entry behind says so, rather than guessing that it was this attempt's to delete.
     await abandon();
-    if (error instanceof NativeSidebandError && error.code === "SIDEBAND_ENDPOINT_UNUSABLE") {
+    if (error instanceof NativeSidebandError) {
       Object.defineProperty(error, "sidebandCleanup", {
-        value: "the endpoint was left exactly as it was found: this attempt never proved the entry was its own",
+        value: "no directory entry was removed: this attempt did not complete an ownership proof, so whatever is at that path is left as found and is explicit uncertainty",
         enumerable: false,
       });
     }
@@ -655,7 +718,7 @@ async function bindThroughHelper({ socketPath, execPath = process.execPath, time
  * helper is observed to have exited before this resolves.
  *
  * @param {{ socketPath: string, token: string, maxFrameBytes?: number, maxQueuedFrames?: number, handshakeTimeoutMs?: number,
- *   binderTimeoutMs?: number, execPath?: string,
+ *   binderTimeoutMs?: number, execPath?: string, binderEntry?: URL|string,
  *   failpoint?: (stage: "before_verification"|"after_handoff"|"during_close") => Promise<void> }} options
  */
 export async function listenForOwnerSideband(options) {
@@ -688,6 +751,7 @@ export async function listenForOwnerSideband(options) {
     socketPath,
     execPath: options.execPath,
     timeoutMs: options.binderTimeoutMs,
+    binderEntry: options.binderEntry,
     failpoint,
   });
 
@@ -752,7 +816,7 @@ export async function listenForOwnerSideband(options) {
     /** @type {any} */
     let metadata;
     try {
-      metadata = await lstat(socketPath);
+      metadata = await lstat(socketPath, { bigint: true });
     } catch (error) {
       const code = /** @type {any} */ (error).code;
       // Gone already is the one case that needs no decision; anything else is unreadable, so it is retained.

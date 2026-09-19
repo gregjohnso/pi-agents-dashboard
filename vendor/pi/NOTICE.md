@@ -36,26 +36,26 @@ covers the pinned monorepo's own license only.
 
 ## Modifications
 
-[`patches/series`](patches/series) applies **four** ordered source patches, in this order. The numbering skips
-`0004`, which is reserved for the independent canonical-admission sibling this lock does not carry:
+[`patches/series`](patches/series) applies **five** ordered source patches, in this order:
 
 | Patch | Purpose | Regression test |
 | --- | --- | --- |
 | `0001-seam-a-native-submission-barrier.patch` | Seam A: an opt-in native submission barrier. A managed host registered through `setNativeSubmissionHost` (or `pi.setNativeSubmissionHost` from an extension) authorizes every native submission before Pi's first semantic mutation for it and consumes a one-use binding fence with that mutation. With no host registered every entry point behaves exactly as unmodified Pi does. | `packages/coding-agent/test/native-submission-barrier.test.ts` in the patch, and `test/native-submit-barrier.test.mjs` in this repository against the built artifact |
 | `0002-native-ingress-return-profile.patch` | Seams B, C and F: labelled native ingress through `ProcessTerminal.dispatchNativeInput`, return-key authorization for a component that declares the key free, and a launch-fixed virtual terminal profile, all behind `registerNativeAttachmentHost`. With no host registered, input provenance is `null` and negotiation is unmanaged Pi's own. | `test/native-ingress.test.mjs` and `test/native-return.test.mjs` in this repository against the built artifact |
 | `0003-native-presentation-readiness.patch` | Seam E: cold presentation (`presentTerminal`) and the readiness record (`onNativeReadiness`, `nativeReadinessSnapshot`) plus the core bootstrap sideband, all opt-in. Until a host presents or subscribes, every changed path behaves as unmodified 0.84.3 does. | `test/native-presentation.test.mjs` in this repository against the built artifact |
+| `0004-native-canonical-admission.patch` | Seam D: canonical admission on exact names. A seam A host that also carries `admitCanonicalOperation`, `commitBinding` and `abortReservation` admits every `startup`/`new`/`fork`/`resume`/`import`/rename/delete against the exact resolved path before the first side effect, consumes its one-use reservation inside seam A's own synchronous critical section, and fails closed with `PERSISTENCE_UNCERTAIN` while a commit is unresolved. A seam A host without the trio leaves every session-file operation byte-for-byte unmodified. | `packages/coding-agent/test/native-canonical-admission.test.ts` in the patch, and `test/native-canonical.test.mjs` in this repository against the built artifact |
 | `0005-native-child-handoff.patch` | Seam G, partial: an ordered input drain (`ProcessTerminal.drainNativeInput`, one lease, `drainedThrough`), the `handoff-closed` dispatch verdict, and the paired `entering`/`left` phase announcement around Pi's one **recognized** child terminal handoff, its external editor. It is opt-in through `childTerminalHandoff: { version: 1 }` on the seam B/C/F registration; an existing registration without that field keeps Pi's pinned external-editor path. It adds no arbitrary-child parity. | `test/native-child-handoff.test.mjs` in this repository against the built artifact |
 
 Artifacts produced from this lock are therefore **patched**, not baseline, and
-`build-manifest.json.artifactLabel` says so. The delivered interface is **A, B, C, E, F and the recognized
-part of G only**: seam D is not in this series and is not present in the artifacts. A green build is not
-evidence of any other capability, and none of the composed seams is qualified for activation: seam D's public
-binding-commit API remains unwritten, and seam G's arbitrary-child terminal parity (Gate 5) is unproved —
-`INTERFACE-seam-g-child-handoff.md` states that limit in the patch's own words.
+`build-manifest.json.artifactLabel` says so. The delivered interface is **A, B, C, D, E, F and the recognized
+part of G only**. A green build is not evidence of any other capability, and none of the composed seams is
+qualified for activation: seam D has no durable reservation backend and no frozen public binding-commit API,
+and seam G's arbitrary-child terminal parity (Gate 5) is unproved — `INTERFACE-seam-d-canonical.md` and
+`INTERFACE-seam-g-child-handoff.md` state those limits in the patches' own words.
 
-Changed upstream paths: `packages/coding-agent/src/core/{native-submission,native-presentation,native-bootstrap,native-child-handoff}.ts`
+Changed upstream paths: `packages/coding-agent/src/core/{native-submission,native-presentation,native-bootstrap,native-canonical,native-child-handoff}.ts`
 and `packages/tui/src/{native-attachment,native-presentation}.ts` (added),
-`packages/coding-agent/src/{index.ts,main.ts,core/agent-session.ts,core/extensions/{types,loader}.ts,modes/print-mode.ts,modes/interactive/interactive-mode.ts}`,
+`packages/coding-agent/src/{index.ts,main.ts,core/agent-session.ts,core/agent-session-runtime.ts,core/session-manager.ts,core/extensions/{types,loader}.ts,modes/print-mode.ts,modes/interactive/interactive-mode.ts,modes/interactive/components/session-selector.ts}`,
 and `packages/tui/src/{index,terminal,tui,tui-alt-screen,tui-main-screen,stdin-buffer,editor-component,components/editor}.ts`.
 No dependency, lockfile, generated file or `dist` output is touched, and the bundled CLI is rebuilt by the
 pipeline. The patches do not commute; `INTERFACE.md` section 9 records the order, the digests and the

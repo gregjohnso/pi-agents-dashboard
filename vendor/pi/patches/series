@@ -4,18 +4,20 @@
 # in this directory that no line names is drift and fails preparation. Names must look like
 # `NNNN-short-description.patch`.
 #
-# These four patches do not commute: 0002 and 0003 both change `packages/tui/src/{terminal,tui,index}.ts`
-# and 0001 and 0003 both change `packages/coding-agent/src/{index.ts,core/extensions/*,modes/interactive/
-# interactive-mode.ts}`. 0002 and 0003 are the serialized forms regenerated against this order, so
-# preparation applies them with no fuzz and no three-way fallback. Reordering this list breaks the
-# preparation; regenerate the later patches instead.
+# These five patches do not commute: 0002, 0003 and 0005 all change `packages/tui/src/{terminal,tui,index}.ts`,
+# 0001, 0003, 0004 and 0005 all change `packages/coding-agent/src/{index.ts,core/extensions/*,modes/interactive/
+# interactive-mode.ts}`, 0004 also changes seam A's own `core/native-submission.ts`, and 0002 and 0005 both
+# change `packages/tui/src/{native-attachment,stdin-buffer}.ts`. 0002, 0003 and 0004 are the serialized forms
+# regenerated against this order, so preparation applies them with no fuzz and no three-way fallback.
+# Reordering this list breaks the preparation; regenerate the later patches instead.
 #
-# 0005 was taken at this position, directly after 0003, and depends on both: it extends seam B's dispatch
-# admission in `packages/tui/src/{terminal,stdin-buffer,native-attachment,index}.ts` and seam E's recognized
-# external-editor release in `packages/coding-agent/src/modes/interactive/interactive-mode.ts`. The number
-# leaves 0004 free for the independent canonical-admission sibling, which this series does not carry and
-# 0005 does not depend on.
+# 0005 was taken directly after 0003, before 0004 existed in any series, and it still applies here unchanged:
+# its `index.ts` and `interactive-mode.ts` hunks touch neither the export block nor the session and refusal
+# regions 0004 rewrites, so `git apply --check --index --whitespace=error` accepts it at this position with no
+# fuzz. It is therefore carried byte for byte rather than regenerated. 0005 depends on 0002 and 0003 and not on
+# 0004; 0004 depends on 0001 and does not depend on 0005.
 0001-seam-a-native-submission-barrier.patch
 0002-native-ingress-return-profile.patch
 0003-native-presentation-readiness.patch
+0004-native-canonical-admission.patch
 0005-native-child-handoff.patch

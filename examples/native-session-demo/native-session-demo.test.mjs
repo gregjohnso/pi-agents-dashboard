@@ -18,10 +18,12 @@ import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import { inspectProcessIdentity } from "../../runtime/process-identity-linux.mjs";
+import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "../../runtime/process-signaler.mjs";
+
 import { resolveCohort } from "./cohort.mjs";
 import { FRONTEND_MODE_RESTORE, createAttachmentTeardown } from "./client.mjs";
-import { createRoot, demoPaths, readToken, tokenMatches, writeOwnerRecord } from "./demo-root.mjs";
-import { FAKE_REPLY_PREFIX, createFakeStreamSimple, deterministicReply } from "./fake-provider.mjs";
+import { createRoot, demoPaths, readToken, tokenMatches, writeOwnerRecord } from "./demo-root.mjs";import { FAKE_REPLY_PREFIX, createFakeStreamSimple, deterministicReply } from "./fake-provider.mjs";
 import { createPausingRelay } from "./pausing-relay.mjs";
 import { createPendingInputQueue } from "./pending-input.mjs";
 import { MAX_FRAME_BYTES, createFrameReader, encodeFrame } from "./protocol.mjs";
@@ -549,35 +551,72 @@ describe.runIf(process.env.PI_NATIVE_DEMO_SMOKE === "1")("the native session dem
  */
 describe.runIf(process.env.PI_NATIVE_DEMO_SMOKE === "1")("a manager whose root is replaced under it", () => {
   const DEMO = fileURLToPath(new URL("demo.mjs", import.meta.url));
+  /** One budget for a whole case, its failure path included, and the harness timeout just above it. */
+  const CASE_BUDGET_MS = 25_000;
+  const CASE_TIMEOUT_MS = 30_000;
+  /** Only ever applied to a process one case recorded, re-verified by identity immediately before the signal. */
+  const CLEANUP_STOP_POLICY = { gracefulMs: 2_000, terminateMs: 2_000 };
 
-  /** One manager in its own process, resolved at its own ready record. */
-  async function serveOneOwner(root) {
+  /**
+   * Every wait in a case is bounded by what is left of that case's budget.
+   *
+   * Unbounded waits are how the first version of these cases hung: it registered `close` and `exit` listeners
+   * after awaiting the stop, by which time both had already fired. The listeners are registered at spawn and
+   * connect now, and a wait that still cannot finish fails inside the budget so the cleanup below runs.
+   */
+  function caseBudget() {
+    const endsAtMs = Date.now() + CASE_BUDGET_MS;
+    const remainingMs = () => Math.max(1, endsAtMs - Date.now());
+    return {
+      remainingMs,
+      /** @param {Promise<any>} promise @param {string} what */
+      wait(promise, what) {
+        const budgetMs = remainingMs();
+        let timer;
+        return Promise.race([
+          Promise.resolve(promise).finally(() => clearTimeout(timer)),
+          new Promise((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error(`${what} did not happen within the ${budgetMs}ms this case had left`)), budgetMs);
+          }),
+        ]);
+      },
+    };
+  }
+
+  /** One manager in its own process, resolved at its own ready record, with both terminal events bound now. */
+  async function serveOneOwner(root, budget) {
     const child = spawn(process.execPath, [DEMO, "serve", "--root", root], { stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk) => {
       stderr += chunk;
     });
+    // Bound before the first await: a process that is already gone emits neither `exit` nor `close` again.
+    const exited = once(child, "exit");
     let stdout = "";
-    const ready = await new Promise((resolve, reject) => {
-      child.stdout.setEncoding("utf8");
-      child.stdout.on("data", (chunk) => {
-        stdout += chunk;
-        const newline = stdout.indexOf("\n");
-        if (newline !== -1) resolve(JSON.parse(stdout.slice(0, newline)));
-      });
-      child.stdout.on("close", () => reject(new Error(`the manager exited before it was ready: ${stderr.slice(-2000)}`)));
-      child.on("error", reject);
-    });
-    // Both terminal events are awaited on promises made now: a process that is already gone emits neither again.
-    return { child, ready, exited: once(child, "exit"), stderr: () => stderr };
+    const ready = await budget.wait(
+      new Promise((resolve, reject) => {
+        child.stdout.setEncoding("utf8");
+        child.stdout.on("data", (chunk) => {
+          stdout += chunk;
+          const newline = stdout.indexOf("\n");
+          if (newline !== -1) resolve(JSON.parse(stdout.slice(0, newline)));
+        });
+        child.stdout.on("close", () => reject(new Error(`the manager exited before it was ready: ${stderr.slice(-2000)}`)));
+        child.on("error", reject);
+      }),
+      `the manager's ready record for ${root}`,
+    );
+    return { child, ready, exited, stderr: () => stderr };
   }
 
   /** One authenticated connection, opened while the root path still names the directory the manager created. */
-  async function connectToManager(root, hello) {
+  async function connectToManager(root, hello, budget) {
     const token = await readToken(root);
     const socket = net.connect(demoPaths(root).controlSocket);
-    await once(socket, "connect");
+    const closed = once(socket, "close");
+    socket.on("error", () => {});
+    await budget.wait(once(socket, "connect"), `the ${hello.role} connection to ${root}`);
     const frames = [];
     const waiters = [];
     const reader = createFrameReader(
@@ -594,19 +633,22 @@ describe.runIf(process.env.PI_NATIVE_DEMO_SMOKE === "1")("a manager whose root i
       },
     );
     socket.on("data", (chunk) => reader.push(chunk));
-    socket.on("error", () => {});
     socket.write(encodeFrame({ ...hello, token }));
     return {
       socket,
-      closed: once(socket, "close"),
+      closed,
       send: (frame) => socket.write(encodeFrame(frame)),
-      awaitFrame(type, timeoutMs = 60_000) {
+      awaitFrame(type) {
         const seen = frames.find((frame) => frame.header.type === type);
         if (seen !== undefined) return Promise.resolve(seen.header);
+        const budgetMs = budget.remainingMs();
         return new Promise((resolve, reject) => {
           const waiter = { type, resolve };
           waiters.push(waiter);
-          const timer = setTimeout(() => reject(new Error(`no ${type} frame within ${timeoutMs}ms; saw ${frames.map((frame) => frame.header.type).join(",")}`)), timeoutMs);
+          const timer = setTimeout(
+            () => reject(new Error(`no ${type} frame within the ${budgetMs}ms this case had left; saw ${frames.map((frame) => frame.header.type).join(",")}`)),
+            budgetMs,
+          );
           waiter.resolve = (header) => {
             clearTimeout(timer);
             resolve(header);
@@ -620,33 +662,61 @@ describe.runIf(process.env.PI_NATIVE_DEMO_SMOKE === "1")("a manager whose root i
    * Start an owner, rename its root away, put another directory in its place and stop it through the control
    * connection that was authenticated before any of that happened.
    *
+   * Whatever happens, the case ends by reaping exactly the two processes it recorded: its own manager child by
+   * its own pid, and that manager's owner only while the identity the ready record named still matches. Nothing
+   * broader is signalled, and the manager shares this worker's process group, so it is never group-signalled.
+   *
    * @param {{ ownershipCopied: boolean, replaceAfterStopFrame: boolean }} how
    */
   async function driveReplacedStop({ ownershipCopied, replaceAfterStopFrame }) {
+    const budget = caseBudget();
     const sandbox = await temporaryDirectory();
     const root = path.join(sandbox, "r");
     const renamed = path.join(sandbox, "renamed");
-    const { ready, exited, stderr } = await serveOneOwner(root);
-    const control = await connectToManager(root, { type: "hello", role: "control" });
-    const client = await connectToManager(root, { type: "hello", role: "client", attachmentId: "client-1" });
-    await client.awaitFrame("welcome");
+    /** @type {(() => Promise<void>)[]} */
+    const reap = [];
+    try {
+      const { child, ready, exited, stderr } = await serveOneOwner(root, budget);
+      reap.push(async () => {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      });
+      reap.push(async () => {
+        const owner = ready.owner;
+        const found = await inspectProcessIdentity(owner.pid).catch(() => null);
+        if (found === null || found.startIdentity !== owner.startIdentity) return;
+        await stopVerifiedProcessGroup(
+          { pid: owner.pid, processGroupId: owner.processGroupId, startIdentity: owner.startIdentity },
+          { inspect: (pid) => inspectProcessIdentity(pid), requestGraceful: async () => {}, signalProcessGroup, sleep },
+          CLEANUP_STOP_POLICY,
+        );
+      });
+      const control = await connectToManager(root, { type: "hello", role: "control" }, budget);
+      const client = await connectToManager(root, { type: "hello", role: "client", attachmentId: "client-1" }, budget);
+      reap.push(async () => {
+        control.socket.destroy();
+        client.socket.destroy();
+      });
+      await client.awaitFrame("welcome");
 
-    const replace = async () => {
-      await rename(root, renamed);
-      return plantReplacement(root, ownershipCopied ? { ownershipFrom: renamed } : {});
-    };
+      const replace = async () => {
+        await rename(root, renamed);
+        return plantReplacement(root, ownershipCopied ? { ownershipFrom: renamed } : {});
+      };
 
-    let planted;
-    if (!replaceAfterStopFrame) planted = await replace();
-    control.send({ type: "stop" });
-    // Near teardown, not before a single check: the manager is already stopping when the root changes.
-    if (replaceAfterStopFrame) planted = await replace();
+      let planted;
+      if (!replaceAfterStopFrame) planted = await replace();
+      control.send({ type: "stop" });
+      // Near teardown, not before a single check: the manager is already stopping when the root changes.
+      if (replaceAfterStopFrame) planted = await replace();
 
-    const stopped = await control.awaitFrame("stopped");
-    const bye = await client.awaitFrame("bye");
-    await client.closed;
-    const [managerExitCode] = await exited;
-    return { root, renamed, ready, stopped, bye, planted, managerExitCode, stderr };
+      const stopped = await control.awaitFrame("stopped");
+      const bye = await client.awaitFrame("bye");
+      await budget.wait(client.closed, "the client connection closing");
+      const [managerExitCode] = await budget.wait(exited, "the manager process exiting");
+      return { root, renamed, ready, stopped, bye, planted, managerExitCode, stderr };
+    } finally {
+      for (const cleanup of reap.reverse()) await cleanup();
+    }
   }
 
   /** The directory that took the root's place: same names, same bytes, same mode. */
@@ -670,22 +740,34 @@ describe.runIf(process.env.PI_NATIVE_DEMO_SMOKE === "1")("a manager whose root i
     expect(existsSync(path.join(renamed, "b"))).toBe(false);
   }
 
-  it("leaves an unmarked directory that replaced its root exactly as it found it", async () => {
-    const run = await driveReplacedStop({ ownershipCopied: false, replaceAfterStopFrame: false });
-    await expectReplacementUntouched(run);
-    await expectOwnerStoppedForReal(run);
-  });
+  it(
+    "leaves an unmarked directory that replaced its root exactly as it found it",
+    async () => {
+      const run = await driveReplacedStop({ ownershipCopied: false, replaceAfterStopFrame: false });
+      await expectReplacementUntouched(run);
+      await expectOwnerStoppedForReal(run);
+    },
+    CASE_TIMEOUT_MS,
+  );
 
-  it("leaves a directory carrying a copied ownership marker alone: a copied marker is not identity", async () => {
-    const run = await driveReplacedStop({ ownershipCopied: true, replaceAfterStopFrame: false });
-    expect(run.planted.entries).toContain("ownership.json");
-    await expectReplacementUntouched(run);
-    await expectOwnerStoppedForReal(run);
-  });
+  it(
+    "leaves a directory carrying a copied ownership marker alone: a copied marker is not identity",
+    async () => {
+      const run = await driveReplacedStop({ ownershipCopied: true, replaceAfterStopFrame: false });
+      expect(run.planted.entries).toContain("ownership.json");
+      await expectReplacementUntouched(run);
+      await expectOwnerStoppedForReal(run);
+    },
+    CASE_TIMEOUT_MS,
+  );
 
-  it("leaves a marked replacement alone when it arrives while the stop is already running", async () => {
-    const run = await driveReplacedStop({ ownershipCopied: true, replaceAfterStopFrame: true });
-    await expectReplacementUntouched(run);
-    await expectOwnerStoppedForReal(run);
-  });
+  it(
+    "leaves a marked replacement alone when it arrives while the stop is already running",
+    async () => {
+      const run = await driveReplacedStop({ ownershipCopied: true, replaceAfterStopFrame: true });
+      await expectReplacementUntouched(run);
+      await expectOwnerStoppedForReal(run);
+    },
+    CASE_TIMEOUT_MS,
+  );
 });

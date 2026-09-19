@@ -140,8 +140,14 @@ it — measured, not assumed. The owner's whole environment is the list in `mana
 - no `*_API_KEY`, no auth file, no operator `~/.pi`, and `--no-extensions` so nothing of yours is discovered
 - `PI_OFFLINE=1` and `PI_SKIP_VERSION_CHECK=1`
 - tools are disabled (`-nt`): this demo shows attachment, not tool execution
-- the connection token lives in `<root>/token` (`0600`), never in `argv` and never in a log
-- the control socket and the sideband are unix-domain, `0600`, in a `0700` directory. There is no TCP listener
+- **the control socket is token-authenticated**: every client, control and in-Pi ingress connection must present
+  the token in its first frame, and nothing is forwarded before it is accepted with a constant-time comparison.
+  The token lives in `<root>/token` (`0600`), never in `argv` and never in a log
+- **the seam E sideband is not token-authenticated, and is not described as if it were.** It is Pi's own
+  unchanged core bootstrap protocol 1, which carries no credential field; this demo adds none and invents no
+  core protocol field. Its only protection is that it is a unix-domain socket in a `0700` directory owned by
+  the operator who started the owner
+- both sockets are unix-domain and `0600`, in that `0700` directory. There is no TCP listener
 - frames are bounded (256 KiB), a client that falls 4 MiB behind is disconnected **by name** rather than
   silently dropped, and bytes sent before Pi's labelled ingress is ready are held in order and delivered once
 

@@ -9,6 +9,12 @@
  * Reads are bounded the same way Pi bounds its own inbound side: one newline-terminated JSON object of at
  * most `MAX_LINE_BYTES`. A peer that crosses the bound ends the channel instead of being buffered. There is
  * no reconnect logic, because Pi connects once per launch.
+ *
+ * **This channel is not authenticated, and it must not be described as if it were.** Protocol 1 is Pi's own,
+ * unchanged, and it carries no credential field; this demo adds none and invents no core protocol field. The
+ * only thing standing between this listener and another process is filesystem permission: the socket is
+ * unix-domain, `0600`, inside the owner's `0700` root. The demo's *own* control socket in `manager.mjs` is the
+ * one that requires a token. Keep the two straight when reasoning about who can reach what.
  */
 
 import { chmod, rm } from "node:fs/promises";

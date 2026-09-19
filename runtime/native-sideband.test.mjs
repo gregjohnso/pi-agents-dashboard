@@ -1374,6 +1374,230 @@ it("ends the real helper on abrupt parent death, leaving a foreign replacement u
   })}`);
 });
 
+
+/**
+ * The read-only project environment the observer fixture runs in, and the pixi that provides it.
+ *
+ * Recorded as constants because the rule is explicit: no bare `python`, every invocation through frozen pixi with
+ * the inherited manifest unset, and the environment named rather than discovered. Nothing here writes to that
+ * project; it supplies an interpreter and is otherwise untouched.
+ */
+const PIXI = "/mnt/main0/home/gjohnson/.pixi/bin/pixi";
+const PIXI_MANIFEST = "/mnt/main0/home/gjohnson/projects/pi-agents-native-owner-pty-20260918/pixi.toml";
+const OBSERVER_TIMEOUT_SECONDS = 45;
+
+/**
+ * Start a surviving observer that will reap the helper after the disposable parent is killed.
+ *
+ * The chain is observer -> disposable parent -> helper. The observer sets `PR_SET_CHILD_SUBREAPER` before it
+ * starts anything, so when the parent is killed the orphaned helper is reparented to the observer instead of to
+ * pid 1, and the observer can `waitpid` it and report the real wait status. That is the whole point: a dead parent
+ * cannot forward its child's exit, so somebody entitled to reap the helper has to still be alive.
+ *
+ * Every process here is owned by identity. The observer prints its own pid, the parent's pid and the helper's pid;
+ * cleanup signals exactly those, and never a pid found by scanning for a process name.
+ *
+ * @param {string} childScript absolute path to the child the disposable parent forks
+ * @param {string} socketPath
+ */
+async function observedParentLoss(childScript, socketPath) {
+  const observer = spawn(PIXI, [
+    "run", "--manifest-path", PIXI_MANIFEST, "--frozen", "python",
+    fileURLToPath(fixture("subreaper-observer.py")),
+    "--node", process.execPath,
+    "--parent-script", fileURLToPath(fixture("disposable-parent.mjs")),
+    "--child-script", childScript,
+    "--socket", socketPath,
+    "--timeout", String(OBSERVER_TIMEOUT_SECONDS),
+  ], {
+    stdio: ["pipe", "pipe", "pipe"],
+    // The inherited manifest is unset here, not overridden: an inherited value would silently select a different
+    // project than the one named above.
+    env: { PATH: "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp" },
+  });
+  let text = "";
+  /** @type {{ pattern: RegExp, resolve: (seen: string) => void }[]} */
+  let waiters = [];
+  const serve = () => {
+    waiters = waiters.filter((waiter) => {
+      if (!waiter.pattern.test(text)) return true;
+      waiter.resolve(text);
+      return false;
+    });
+  };
+  for (const stream of [observer.stdout, observer.stderr]) {
+    stream.on("data", (chunk) => {
+      text += String(chunk);
+      serve();
+    });
+  }
+  const observerExited = new Promise((resolve) => observer.once("exit", (code, signal) => resolve({ code, signal })));
+
+  /** @param {RegExp} pattern */
+  const waitFor = (pattern) =>
+    new Promise((resolve, reject) => {
+      if (pattern.test(text)) {
+        resolve(text);
+        return;
+      }
+      waiters.push({ pattern, resolve });
+      // Bounded: if the observer dies or reports its own timeout, this stops rather than waiting for the suite's.
+      observerExited.then(() => {
+        if (!pattern.test(text)) reject(new Error(`the observer ended before ${pattern} appeared; it said: ${text.slice(-2_000)}`));
+      });
+    });
+
+  const pidFrom = (/** @type {RegExp} */ pattern) => Number(pattern.exec(text)?.[1] ?? 0);
+  cleanup.push(async () => {
+    // Owned identities only, youngest first, and the wrapper last.
+    for (const pid of [pidFrom(/observed-helper-pid (\d+)/u), pidFrom(/observed-parent-pid (\d+)/u), pidFrom(/observer-pid (\d+)/u), observer.pid ?? 0]) {
+      if (pid === 0) continue;
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // Already gone, which is the expected case.
+      }
+    }
+    await observerExited;
+  });
+
+  await waitFor(/observer-pid \d+/u);
+  await waitFor(/observed-parent-pid \d+/u);
+  // The same three markers the direct harness waits on, relayed verbatim through the observer: the parent exists,
+  // the child bound the real endpoint, and its handoff is written and held. Nothing is racing.
+  await waitFor(/binder-pid \d+/u);
+  await waitFor(/native-sideband-binder: bound .* inode \d+/u);
+  await waitFor(/held-handoff-binder: handoff written and held/u);
+
+  const observerPid = pidFrom(/observer-pid (\d+)/u);
+  const parentPid = pidFrom(/observed-parent-pid (\d+)/u);
+  const helperPid = pidFrom(/binder-pid (\d+)/u);
+  expect(observerPid).toBeGreaterThan(0);
+  expect(parentPid).toBeGreaterThan(0);
+  expect(helperPid).toBeGreaterThan(0);
+  for (const pid of [observerPid, parentPid, helperPid]) expect(pid).not.toBe(process.pid);
+  expect(new Set([observerPid, parentPid, helperPid]).size).toBe(3);
+
+  return {
+    observerPid,
+    parentPid,
+    helperPid,
+    waitFor,
+    observerExited,
+    text: () => text,
+    /** Ask the observer to SIGKILL the one child it started. The test never signals that pid itself. */
+    killTheParent: () => observer.stdin.end("kill\n"),
+    /** The observer's own summary, once it has reaped both processes. @returns {Promise<any>} */
+    async reaped() {
+      await waitFor(/OBSERVER-(DONE|TIMEOUT) /u);
+      const done = /OBSERVER-DONE (\{.*\})/u.exec(text);
+      if (done === null) throw new Error(`the observer did not finish reaping: ${text.slice(-2_000)}`);
+      const summary = JSON.parse(done[1]);
+      return {
+        summary,
+        parent: summary.reaped[String(parentPid)],
+        helper: summary.reaped[String(helperPid)],
+      };
+    },
+  };
+}
+
+// Operator-visible failure: the helper that was holding a bound endpoint when its parent was killed has to have
+// actually left, by the branch that leaves the endpoint alone. A diagnostic says what it meant to do and an unused
+// pid says nobody is there now; neither is a terminal status, and the parent that could have reported one is the
+// process this case kills. An owned observer marked as a child subreaper adopts the orphan and reaps it, so the
+// status below is read from the kernel rather than inferred from intent.
+it("observes the real helper's exact terminal status after its parent is killed, and leaves a foreign replacement usable", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "o");
+  const observed = await observedParentLoss(fileURLToPath(fixture("held-handoff-binder.mjs")), socketPath);
+  const other = await liveReplacement(root);
+
+  // Moved on after the bind, so it is the helper's own endpoint that is displaced: the post-bind replacement case,
+  // with a parent that dies rather than a handoff that fails.
+  const replaced = await other.replaceOnto(socketPath);
+  observed.killTheParent();
+  const { summary, parent, helper } = await observed.reaped();
+
+  // The parent really was killed, read from its wait status rather than from a request having been made.
+  expect(summary.sentSigkillToParent).toBe(true);
+  expect(parent).toMatchObject({ role: "disposable-parent", terminatedBySignal: true, termSignalName: "SIGKILL", exitedNormally: false });
+  // The helper's ACTUAL terminal status: it exited normally, with the parent-gone code, not on a signal.
+  expect(helper).toMatchObject({ role: "helper", exitedNormally: true, terminatedBySignal: false, termSignalName: null });
+  expect(helper.exitCode).toBe(BINDER_EXIT.parentGone);
+  expect(typeof helper.rawWaitStatus).toBe("number");
+  expect(helper.coreDumped).toBe(false);
+  expect(summary.timedOut).toBe(false);
+  expect(summary.reapedPids).toEqual(expect.arrayContaining([observed.parentPid, observed.helperPid]));
+  // The older evidence still holds; it is now corroboration rather than the whole argument.
+  expect(observed.text()).toMatch(/the parent went away after the bind; leaving the endpoint in place/u);
+  expect(gone(observed.parentPid)).toBe(true);
+  expect(gone(observed.helperPid)).toBe(true);
+
+  // Unchanged and still answering: the dying helper removed nothing and closed nothing that was not its own.
+  const after = await lstat(socketPath);
+  expect(String(after.ino)).toBe(String(replaced.ino));
+  expect(after.mode & 0o777).toBe(replaced.mode & 0o777);
+  const reply = await other.stillAnswers(socketPath);
+  expect(reply).toBe("alive\n");
+
+  console.log(`REAL-PARENT-SIGKILL-OBSERVED ${JSON.stringify({
+    observerPid: observed.observerPid,
+    disposableParentPid: observed.parentPid,
+    helperPid: observed.helperPid,
+    pixiManifest: PIXI_MANIFEST,
+    disposableParentTerminatedBy: parent.termSignalName,
+    disposableParentRawWaitStatus: parent.rawWaitStatus,
+    helperRawWaitStatus: helper.rawWaitStatus,
+    helperExitCode: helper.exitCode,
+    helperExitSignal: helper.termSignalName,
+    helperExitedNormally: helper.exitedNormally,
+    helperTerminatedBySignal: helper.terminatedBySignal,
+    reapedPids: summary.reapedPids,
+    observerTimedOut: summary.timedOut,
+    disposableParentGone: gone(observed.parentPid),
+    helperGone: gone(observed.helperPid),
+    helperSaidParentWentAway: /the parent went away after the bind/u.test(observed.text()),
+    foreignInodeBefore: String(replaced.ino),
+    foreignInodeAfter: String(after.ino),
+    foreignModeAfter: (after.mode & 0o777).toString(8),
+    foreignStillAnswers: reply.trim(),
+  })}`);
+});
+
+// The discriminating case, and the reason the observer is not ceremony. This imposter emits the production
+// helper's markers and its exact parent-gone sentence, then exits 0. Every assertion the previous evidence set
+// could make is satisfied here - the diagnostic is present, the pid is afterwards unused - so those assertions
+// cannot distinguish the branch that exits 4 from one that does not. The observed wait status can, and does.
+it("shows that the parent-gone diagnostic and a vanished pid cannot establish an exact terminal status", async () => {
+  const root = await socketRoot();
+  const socketPath = join(root, "o");
+  const observed = await observedParentLoss(fileURLToPath(fixture("parent-gone-imposter.mjs")), socketPath);
+
+  observed.killTheParent();
+  const { parent, helper } = await observed.reaped();
+
+  // Exactly the old evidence set, and all of it passes for a helper that did not take the branch under test.
+  expect(observed.text()).toMatch(/the parent went away after the bind; leaving the endpoint in place/u);
+  expect(gone(observed.helperPid)).toBe(true);
+  expect(parent).toMatchObject({ terminatedBySignal: true, termSignalName: "SIGKILL" });
+
+  // The status the old evidence could not see, and the discrimination it could not make.
+  expect(helper).toMatchObject({ exitedNormally: true, terminatedBySignal: false });
+  expect(helper.exitCode).toBe(0);
+  expect(helper.exitCode).not.toBe(BINDER_EXIT.parentGone);
+
+  console.log(`DISCRIMINATING-IMPOSTER ${JSON.stringify({
+    helperPid: observed.helperPid,
+    helperRawWaitStatus: helper.rawWaitStatus,
+    helperExitCode: helper.exitCode,
+    expectedForProductionBranch: BINDER_EXIT.parentGone,
+    emittedTheSameDiagnostic: /the parent went away after the bind; leaving the endpoint in place/u.test(observed.text()),
+    helperGone: gone(observed.helperPid),
+    conclusion: "diagnostic plus disappearance is satisfied by exit 0, so it cannot establish exit 4",
+  })}`);
+});
+
 // Operator-visible failure: cleanup that unlinks on any failure would delete the socket of the listener that
 // already owns that path, taking a live owner's management channel down with a second listener's failed bind.
 it("leaves an endpoint it did not bind alone when its own bind fails", async () => {

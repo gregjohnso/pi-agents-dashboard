@@ -123,6 +123,9 @@ const BRIDGE_LOG_ENTRIES = 64;
 const BRIDGE_LOG_BYTES = 16_384;
 /** One emitted line, clamped so a single line cannot consume the whole byte budget. */
 const BRIDGE_LOG_LINE = 240;
+/** The one notice written when the budget runs out. Its cost is reserved, so saying so cannot overrun. */
+const BRIDGE_LOG_NOTICE = `owner bridge reached its lifetime log budget of ${BRIDGE_LOG_ENTRIES} entries and ${BRIDGE_LOG_BYTES} bytes; further bridge lines are counted in counts.logDropped and not written`;
+const BRIDGE_LOG_NOTICE_BYTES = Buffer.byteLength(BRIDGE_LOG_NOTICE, "utf8") + 1;
 
 /**
  * The consumer side of the owner management bridge: one active generation, bounded retention.
@@ -204,14 +207,16 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
   const emit = (line) => {
     const text = line.length > BRIDGE_LOG_LINE ? `${line.slice(0, BRIDGE_LOG_LINE)}…` : line;
     const size = Buffer.byteLength(text, "utf8") + 1;
-    if (logEmitted >= BRIDGE_LOG_ENTRIES || logBytes + size > BRIDGE_LOG_BYTES) {
+    // One entry and its bytes are held back for the notice, so the line that says the budget ran out is not
+    // itself what overruns it.
+    const fits = logEmitted + 1 < BRIDGE_LOG_ENTRIES && logBytes + size + BRIDGE_LOG_NOTICE_BYTES <= BRIDGE_LOG_BYTES;
+    if (!fits) {
       logDropped += 1;
       if (logNoticed) return;
       logNoticed = true;
-      const notice = `owner bridge reached its lifetime log budget of ${BRIDGE_LOG_ENTRIES} entries and ${BRIDGE_LOG_BYTES} bytes; further bridge lines are counted in counts.logDropped and not written`;
       logEmitted += 1;
-      logBytes += Buffer.byteLength(notice, "utf8") + 1;
-      log(notice);
+      logBytes += BRIDGE_LOG_NOTICE_BYTES;
+      log(BRIDGE_LOG_NOTICE);
       return;
     }
     logEmitted += 1;

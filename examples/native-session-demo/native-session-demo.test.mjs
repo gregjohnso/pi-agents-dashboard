@@ -407,8 +407,10 @@ describe("the owner bridge consumer", () => {
     // What was not written is counted rather than hidden, and the two counters account for every attempt.
     expect(status.counts.logEmitted).toBe(lines.length);
     expect(status.counts.logDropped).toBeGreaterThan(400);
-    // Exactly one suppression notice, so the notice itself cannot become the unbounded output.
+    // Exactly one suppression notice, counted as one of the emitted entries, so neither the notice nor the
+    // reserve it needs can be what overruns the budget.
     expect(lines.filter((line) => line.includes("lifetime log budget"))).toHaveLength(1);
+    expect(lines[lines.length - 1]).toMatch(/lifetime log budget/u);
   });
 
   // Operator-visible failure: a budget reset per generation is not a lifetime bound. A peer that reconnects,

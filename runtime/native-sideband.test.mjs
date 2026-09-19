@@ -1315,8 +1315,22 @@ it("ends the real helper and keeps the endpoint when its real parent closes the 
 
   // The entry is retained and nothing is listening on it: the descriptors went with the helper. A stale entry is
   // the honest outcome, because nobody left alive can prove it is theirs to remove.
-  expect((await lstat(socketPath)).isSocket()).toBe(true);
+  const entry = await lstat(socketPath);
+  expect(entry.isSocket()).toBe(true);
   expect(await accepts(socketPath)).toBe(false);
+  // Recorded, so acceptance can read the actual identities and outcomes rather than infer them from a pass.
+  console.log(`REAL-PARENT-DISCONNECT ${JSON.stringify({
+    disposableParentPid: parent.parentPid,
+    helperPid: parent.binderPid,
+    helperExitCode: Number(outcome?.[1]),
+    helperExitSignal: outcome?.[2],
+    disposableParentGone: gone(parent.parentPid),
+    helperGone: gone(parent.binderPid),
+    endpointRetained: entry.isSocket(),
+    endpointInode: String(entry.ino),
+    endpointMode: (entry.mode & 0o777).toString(8),
+    anythingStillListening: false,
+  })}`);
 });
 
 // The same question with no opportunity to run any code at all: the parent is killed outright while the handoff
@@ -1344,7 +1358,20 @@ it("ends the real helper on abrupt parent death, leaving a foreign replacement u
   const after = await lstat(socketPath);
   expect(String(after.ino)).toBe(String(replaced.ino));
   expect(after.mode & 0o777).toBe(replaced.mode & 0o777);
-  expect(await other.stillAnswers(socketPath)).toBe("alive\n");
+  const reply = await other.stillAnswers(socketPath);
+  expect(reply).toBe("alive\n");
+  console.log(`REAL-PARENT-SIGKILL ${JSON.stringify({
+    disposableParentPid: parent.parentPid,
+    helperPid: parent.binderPid,
+    disposableParentTerminatedBy: "SIGKILL",
+    disposableParentGone: gone(parent.parentPid),
+    helperGone: gone(parent.binderPid),
+    helperSaidParentWentAway: /the parent went away after the bind/u.test(parent.text()),
+    foreignInodeBefore: String(replaced.ino),
+    foreignInodeAfter: String(after.ino),
+    foreignModeAfter: (after.mode & 0o777).toString(8),
+    foreignStillAnswers: reply.trim(),
+  })}`);
 });
 
 // Operator-visible failure: cleanup that unlinks on any failure would delete the socket of the listener that

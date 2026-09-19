@@ -1723,7 +1723,7 @@ it("reaps every owned descendant on its own timeout, including one it was never 
   expect(timeout.cleanup.cleanupTimedOut).toBe(false);
   // Both the announced parent and the descendant it never named were reaped, with real wait statuses.
   expect(timeout.cleanup.reapedDuringCleanup.length).toBeGreaterThanOrEqual(2);
-  const roles = timeout.cleanup.reapedDuringCleanup.map((entry) => entry.role);
+  const roles = timeout.cleanup.reapedDuringCleanup.map((/** @type {any} */ entry) => entry.role);
   expect(roles).toContain("disposable-parent");
   expect(roles).toContain("unexpected-descendant");
   for (const entry of timeout.cleanup.reapedDuringCleanup) {
@@ -1740,7 +1740,7 @@ it("reaps every owned descendant on its own timeout, including one it was never 
     disposableParentPid: observed.parentPid,
     helperIdentityEverReported: timeout.summary.helperPid !== null,
     killedOwnedProcessGroup: timeout.cleanup.killedOwnedProcessGroup,
-    reapedDuringCleanup: timeout.cleanup.reapedDuringCleanup.map((entry) => ({
+    reapedDuringCleanup: timeout.cleanup.reapedDuringCleanup.map((/** @type {any} */ entry) => ({
       pid: entry.pid, role: entry.role, rawWaitStatus: entry.rawWaitStatus,
       exitCode: entry.exitCode, termSignalName: entry.termSignalName,
     })),
@@ -1823,7 +1823,7 @@ it("asks the owning observer to clean up instead of signalling numbers, when it 
     signalledAnyRecordedPidNumber: false,
     endedBecause: timeout.summary.endedBecause,
     killedOwnedProcessGroup: timeout.cleanup.killedOwnedProcessGroup,
-    reapedDuringCleanup: timeout.cleanup.reapedDuringCleanup.map((entry) => ({
+    reapedDuringCleanup: timeout.cleanup.reapedDuringCleanup.map((/** @type {any} */ entry) => ({
       pid: entry.pid, role: entry.role, rawWaitStatus: entry.rawWaitStatus,
       exitCode: entry.exitCode, termSignalName: entry.termSignalName,
     })),

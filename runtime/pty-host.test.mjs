@@ -32,16 +32,23 @@ function mutateIfAllowed(mutate) {
  * high-water mark, which means accepted. A case sets both, so an initialization written too early shows up as
  * a recorded byte run rather than as a throw that would hide the ordering.
  *
- * @param {{ onDrainThrows?: boolean, writeReturnsFalse?: boolean, queued?: number, onWrite?: () => void }} [options]
+ * `onDrainRegistered` runs inside the transport's own `onDrain`, which is the other place this admission calls
+ * out to the client, and `fireDrain` replays what the transport would do when its queue empties.
+ *
+ * @param {{ onDrainThrows?: boolean, writeReturnsFalse?: boolean, queued?: number, onWrite?: () => void, onDrainRegistered?: () => void }} [options]
  */
-function probeSink({ onDrainThrows = false, writeReturnsFalse = false, queued = 0, onWrite } = {}) {
+function probeSink({ onDrainThrows = false, writeReturnsFalse = false, queued = 0, onWrite, onDrainRegistered } = {}) {
   /** @type {Uint8Array[]} */
   const written = [];
-  let drainRegistrations = 0;
+  /** @type {(() => void)[]} */
+  const listeners = [];
   return {
     written,
     text: () => Buffer.concat(written.map((chunk) => Buffer.from(chunk))).toString("latin1"),
-    drainRegistrations: () => drainRegistrations,
+    drainRegistrations: () => listeners.length,
+    fireDrain: () => {
+      for (const listener of listeners) listener();
+    },
     sink: {
       /** @param {Uint8Array} payload */
       write(payload) {
@@ -50,10 +57,11 @@ function probeSink({ onDrainThrows = false, writeReturnsFalse = false, queued = 
         return writeReturnsFalse ? false : undefined;
       },
       queuedBytes: () => queued,
-      /** @param {() => void} _listener */
-      onDrain(_listener) {
+      /** @param {() => void} listener */
+      onDrain(listener) {
         if (onDrainThrows) throw new Error("this transport cannot register a drain listener");
-        drainRegistrations += 1;
+        listeners.push(listener);
+        if (onDrainRegistered !== undefined) onDrainRegistered();
       },
     },
   };
@@ -675,6 +683,106 @@ it("does not overwrite a newer member admitted from inside its own initializatio
   created.broadcastOwnerOutput(bytes("frame"));
   expect(candidate.written).toHaveLength(1);
   expect(inner.text()).toBe("\u001b[?2004h\u001b[?1002h\u001b[?1006hframe");
+});
+
+it("writes nothing to a candidate already superseded from inside its own drain registration", () => {
+  const { host: created } = host();
+  const inner = probeSink();
+  let reentered = false;
+  // The other place admission calls out to the client: registering the drain listener. A transport that
+  // admits the same id from there makes this candidate superseded before one byte has been written to it.
+  const candidate = probeSink({
+    writeReturnsFalse: true,
+    onDrainRegistered: () => {
+      if (reentered) return;
+      reentered = true;
+      created.attach({ attachmentId: "a", sink: inner.sink, declared: { capabilities: { ...CAPABILITIES } } });
+    },
+  });
+
+  let error;
+  try {
+    created.attach({ attachmentId: "a", sink: candidate.sink, declared: { capabilities: { ...CAPABILITIES } } });
+  } catch (caught) {
+    error = caught;
+  }
+  expect(error).toBeInstanceOf(PtyHostError);
+  expect(/** @type {PtyHostError} */ (error).code).toBe("PTY_HOST_ATTACHMENT_SUPERSEDED");
+  // Supersession was knowable before the write, so the candidate holds no accepted bytes at all.
+  expect(candidate.written).toEqual([]);
+
+  // The connection admitted from inside that registration keeps the id, its epoch and its one initialization.
+  expect(created.attachments()).toEqual([{ attachmentId: "a", epoch: 1, state: "live", inputEligible: true, drains: 0, awaitingPresentationNonce: false }]);
+  expect(inner.text()).toBe("\u001b[?2004h\u001b[?1002h\u001b[?1006h");
+  created.broadcastOwnerOutput(bytes("frame"));
+  expect(candidate.written).toEqual([]);
+  expect(inner.text()).toBe("\u001b[?2004h\u001b[?1002h\u001b[?1006hframe");
+
+  // The refused candidate's listener was registered before it was refused, and it stays inert: the member
+  // that holds the id counts none of its drains.
+  expect(candidate.drainRegistrations()).toBe(1);
+  candidate.fireDrain();
+  expect(created.attachments()).toEqual([{ attachmentId: "a", epoch: 1, state: "live", inputEligible: true, drains: 0, awaitingPresentationNonce: false }]);
+  inner.fireDrain();
+  expect(created.attachments()[0].drains).toBe(1);
+});
+
+it("writes nothing to a replacement already superseded from inside its own drain registration", async () => {
+  const presentation = fakePresentationChannel();
+  const { host: created } = host({ presentation: presentation.channel });
+  const first = attach(created, "a");
+  const pending = created.presentTo(first.result.epoch);
+
+  const inner = probeSink();
+  let reentered = false;
+  const candidate = probeSink({
+    writeReturnsFalse: true,
+    onDrainRegistered: () => {
+      if (reentered) return;
+      reentered = true;
+      created.attach({ attachmentId: "a", sink: inner.sink, declared: { capabilities: { ...CAPABILITIES } } });
+    },
+  });
+
+  let error;
+  try {
+    created.attach({ attachmentId: "a", sink: candidate.sink, declared: { capabilities: { ...CAPABILITIES } } });
+  } catch (caught) {
+    error = caught;
+  }
+  expect(error).toBeInstanceOf(PtyHostError);
+  expect(/** @type {PtyHostError} */ (error).code).toBe("PTY_HOST_ATTACHMENT_SUPERSEDED");
+  expect(candidate.written).toEqual([]);
+
+  // The replacement admitted from inside the registration holds the id at the next epoch, and the refused
+  // candidate is nobody: no broadcast and no drain of its own reaches the member.
+  expect(created.attachments()).toEqual([{ attachmentId: "a", epoch: 2, state: "live", inputEligible: true, drains: 0, awaitingPresentationNonce: false }]);
+  created.broadcastOwnerOutput(bytes("frame"));
+  expect(candidate.written).toEqual([]);
+  expect(inner.text()).toBe("\u001b[?2004h\u001b[?1002h\u001b[?1006hframe");
+  candidate.fireDrain();
+  expect(created.attachments()[0].drains).toBe(0);
+
+  // The first connection's request was retired by the replacement that really took its id, and it is never
+  // answered to whoever holds that id now.
+  presentation.requests[0].settle({
+    presented: true,
+    terminalOwner: "pi",
+    presentationNonce: "frame-1",
+    frame: { frameId: "frame-1", sequence: 1, columns: 100, rows: 30, byteLength: 512 },
+    geometryRevision: 1,
+    attachmentEpoch: first.result.epoch,
+    cold: true,
+  });
+  expect(await pending).toEqual({ presented: false, refusal: "attachment-retired", attachmentEpoch: first.result.epoch });
+  expect(created.attachments()[0].awaitingPresentationNonce).toBe(false);
+
+  // The refused candidate spent no epoch, so the next real replacement is epoch 3.
+  const third = probeSink();
+  expect(created.attach({ attachmentId: "a", sink: third.sink, declared: { capabilities: { ...CAPABILITIES } } })).toMatchObject({
+    attached: true,
+    epoch: { attachmentId: "a", epoch: 3 },
+  });
 });
 
 it("refuses an owner handle whose birth identity is not an exact pid, start identity and process group", () => {

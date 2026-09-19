@@ -210,6 +210,10 @@ function issuedEpoch(issued) {
  * a member forwards nothing for the rest of its life — a refused or superseded connection's drains cannot
  * touch the member that holds its id. Each method keeps the caller's sink as its receiver.
  *
+ * Everything this function does touches the caller's object: reading the three methods can run a getter, and
+ * the registration is a call into the transport. Either can synchronously admit another connection for the
+ * same id, so `attach` re-reads that id's highest issued epoch as soon as this returns and before it writes.
+ *
  * @param {any} sink
  */
 function prepareAttachmentSink(sink) {
@@ -390,9 +394,13 @@ export function createPtyHost({
      * listener all leave the candidate unwritten, the membership untouched, a connection being replaced in
      * place with its own outstanding request, and the epoch this attempt would have used unspent.
      *
-     * A sink callback can admit another connection for this id while the initialization is in flight. That
-     * newer member keeps the id: this attempt refuses rather than overwriting it, and its own prevalidated
-     * epoch is never reused for anybody.
+     * A sink callback can admit another connection for this id, and there are exactly two places in this
+     * method that call out to the client and can do it: registering the drain listener, and the initialization
+     * write. The id's highest issued epoch is therefore re-read after each of them, and a newer member keeps
+     * the id: this attempt refuses rather than overwriting it, and its own prevalidated epoch is reused for
+     * nobody. After the registration the refusal costs the candidate nothing, because it has not been written
+     * to yet; after the write it keeps that one accepted initialization and no membership. Nothing else here
+     * reaches the client — the set's `add` only touches the prepared handoff, so it cannot call back out.
      *
      * @param {{ attachmentId: string, sink: any, declared: any }} request
      */
@@ -403,7 +411,24 @@ export function createPtyHost({
       }
       const superseded = attachmentSet.highestIssuedEpoch(attachmentId);
       const minted = nextAttachmentEpoch(attachmentId, superseded);
+      /**
+       * Refuse if this id has been admitted again since `superseded` was read.
+       *
+       * One comparison against the set's own highest issued epoch, run after each callback into the client.
+       * The number never goes back down, so a connection admitted and removed inside a callback is still seen.
+       *
+       * @param {string} stage
+       */
+      const refuseIfSupersededSince = (stage) => {
+        const admittedSince = attachmentSet.highestIssuedEpoch(attachmentId);
+        if (issuedEpoch(admittedSince) === issuedEpoch(superseded)) return;
+        throw new PtyHostError(
+          `Attachment ${attachmentId} was admitted at epoch ${issuedEpoch(admittedSince)} while this connection was ${stage}, so this connection was not admitted`,
+          { code: "PTY_HOST_ATTACHMENT_SUPERSEDED" },
+        );
+      };
       const prepared = prepareAttachmentSink(sink);
+      refuseIfSupersededSince("registering its drain listener");
       try {
         prepared.write(modeInitialization);
       } catch (cause) {
@@ -412,13 +437,7 @@ export function createPtyHost({
           { code: "PTY_HOST_ATTACHMENT_INITIALIZATION_FAILED", cause },
         );
       }
-      const admittedSince = attachmentSet.highestIssuedEpoch(attachmentId);
-      if (issuedEpoch(admittedSince) !== issuedEpoch(superseded)) {
-        throw new PtyHostError(
-          `Attachment ${attachmentId} was admitted at epoch ${issuedEpoch(admittedSince)} while this connection was being initialized, so this connection was not admitted`,
-          { code: "PTY_HOST_ATTACHMENT_SUPERSEDED" },
-        );
-      }
+      refuseIfSupersededSince("being initialized");
       const epoch = attachmentSet.add(minted, prepared);
       // A connection that is being replaced keeps nothing outstanding: its replacement must never be handed
       // the answer to a request the previous connection made.

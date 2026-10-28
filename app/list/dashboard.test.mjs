@@ -309,6 +309,33 @@ describe("dashboard controller", () => {
         expect(rows.some((line) => line.includes("STARTING"))).toBe(false);
         release();
     });
+    it("keeps the STARTING row while only rows hidden from the view are newer", async () => {
+        const client = new FakeDaemonClient([]);
+        client.launch = vi.fn(() => new Promise(() => {}));
+        const dashboard = controller(client);
+        await dashboard.open();
+        for (const character of "ship it") dashboard.handleInput(character);
+        dashboard.handleInput("\r");
+        await vi.waitFor(() => expect(client.launch).toHaveBeenCalled());
+        // A native session that has not answered yet, and an unreachable older one, are STALE: hidden from the
+        // default view and stamped with the read time, so neither is the launch the operator is waiting for.
+        const now = new Date(Date.now() + 1000).toISOString();
+        dashboard.applySnapshot({ sessions: [session("starting", { processState: "STALE", createdAt: now }), session("unreachable", { processState: "STALE", createdAt: now })] });
+        expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("STARTING") && line.includes("ship it"))).toBe(true);
+    });
+    it("retires the STARTING row once the launched session reports, even while the view hides it", async () => {
+        const client = new FakeDaemonClient([]);
+        client.launch = vi.fn(async () => ({ kind: "launched", sessionId: "native-1" }));
+        const dashboard = controller(client);
+        await dashboard.open();
+        for (const character of "ship it") dashboard.handleInput(character);
+        dashboard.handleInput("\r");
+        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
+        dashboard.applySnapshot({ sessions: [session("native-1", { processState: "STALE", createdAt: timestamp })] });
+        expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("STARTING"))).toBe(true);
+        dashboard.applySnapshot({ sessions: [session("native-1", { processState: "EXITED", taskState: "FAILED", createdAt: timestamp })] });
+        expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("STARTING"))).toBe(false);
+    });
     it("restores the draft and drops the pending row when a launch fails", async () => {
         const client = new FakeDaemonClient([]);
         client.launch = vi.fn(async () => { throw Object.assign(new Error("no worker slots"), { code: "LAUNCH_UNAVAILABLE" }); });

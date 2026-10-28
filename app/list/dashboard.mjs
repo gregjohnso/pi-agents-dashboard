@@ -1066,9 +1066,14 @@ export class DashboardController {
         // The daemon publishes a launching session before it answers the launch call, so retire any
         // placeholder the real record has already replaced. Otherwise a row sits at STARTING forever
         // beside the session it stands for.
-        // Match on creation time, not name: the summary pass renames a session minutes later.
-        this.pendingLaunches = this.pendingLaunches.filter((entry) => !this.sessions.some((session) => session.createdAt >= entry.createdAt));
-        const visible = [...selectDashboardSessions(this.sessions, this.query), ...this.pendingLaunches.map((entry) => pendingSessionRecord(entry))];
+        // Match on creation time, not name: the summary pass renames a session minutes later. Only rows the
+        // view shows count: a native session that has not answered yet is STALE, hidden, and stamped with the
+        // read time, so counting it made the operator's prompt vanish before its session appeared. Once the
+        // launch has named its session, that session reporting any real state also retires the placeholder.
+        const shown = selectDashboardSessions(this.sessions, this.query);
+        this.pendingLaunches = this.pendingLaunches.filter((entry) => !(shown.some((session) => session.createdAt >= entry.createdAt)
+            || (entry.launchedSessionId !== undefined && this.sessions.some((session) => session.sessionId === entry.launchedSessionId && session.processState !== "STALE"))));
+        const visible = [...shown, ...this.pendingLaunches.map((entry) => pendingSessionRecord(entry))];
         this.list.setSessions(visible, { groupBy: this.query.groupBy });
         if (selected !== undefined && visible.some((session) => session.sessionId === selected)) {
             this.list.selectSession(selected);
@@ -1237,7 +1242,11 @@ export class DashboardController {
         this.requestRender?.();
         let failure;
         try {
-            await this.client.launch(request, this.requestId());
+            const launched = await this.client.launch(request, this.requestId());
+            if (typeof launched?.sessionId === "string") {
+                pending.launchedSessionId = launched.sessionId;
+                this.rebuildList();
+            }
         }
         catch (error) {
             // A refusal and a transport failure cost the operator the same thing: his text and the

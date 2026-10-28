@@ -330,7 +330,8 @@ describe("dashboard controller", () => {
         await dashboard.open();
         for (const character of "ship it") dashboard.handleInput(character);
         dashboard.handleInput("\r");
-        await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
+        // The list is usable before the backend answers, so wait for the launch itself to name its session.
+        await vi.waitFor(() => expect(dashboard.pendingLaunches[0]?.launchedSessionId).toBe("native-1"));
         dashboard.applySnapshot({ sessions: [session("native-1", { processState: "STALE", createdAt: timestamp })] });
         expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("STARTING"))).toBe(true);
         dashboard.applySnapshot({ sessions: [session("native-1", { processState: "EXITED", taskState: "FAILED", createdAt: timestamp })] });

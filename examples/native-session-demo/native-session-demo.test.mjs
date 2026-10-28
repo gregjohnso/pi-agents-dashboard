@@ -22,7 +22,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { inspectProcessIdentity } from "../../runtime/process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "../../runtime/process-signaler.mjs";
 
-import { CONSUMER_CAPABILITY_PATCH, DEFAULT_MANIFEST, FIVE_PATCH_MANIFEST, INPUT_LISTENER_PROVENANCE_PATCH, SIX_PATCH_MANIFEST, resolveCohort } from "./cohort.mjs";
+import { DEFAULT_COHORT, DEFAULT_MANIFEST, resolveCohort } from "./cohort.mjs";
 import { widthGuidance } from "./demo.mjs";
 import { FRONTEND_MODE_RESTORE, createAttachmentTeardown } from "./client.mjs";
 import { createRoot, demoPaths, readToken, tokenMatches, writeOwnerRecord } from "./demo-root.mjs";import { FAKE_REPLY_PREFIX, createFakeStreamSimple, deterministicReply } from "./fake-provider.mjs";
@@ -694,7 +694,7 @@ describe("cohort selection", () => {
     expect(() => resolveCohort({ manifestPath })).toThrowError(/digest mismatch/u);
   });
 
-  it("defaults to the seven-patch cohort and tells the truth about which patch bytes built it", async () => {
+  it("defaults to the Pi 1.4.0 cohort and tells the truth about which patch bytes built it", async () => {
     const patches = new URL("../../vendor/pi/patches/", import.meta.url);
     const manifest = JSON.parse(await readFile(DEFAULT_MANIFEST, "utf8"));
     const series = (await readFile(new URL("series", patches), "utf8"))
@@ -702,72 +702,35 @@ describe("cohort selection", () => {
       .map((line) => line.trim())
       .filter((line) => line !== "" && !line.startsWith("#"));
 
-    // The order is this tree's order, and it is seven patches now, ending in the input-listener provenance patch.
     expect(manifest.series).toEqual(series);
-    expect(series).toHaveLength(7);
-    expect(series[5]).toBe(CONSUMER_CAPABILITY_PATCH.name);
-    expect(series[6]).toBe(INPUT_LISTENER_PROVENANCE_PATCH.name);
+    expect(series).toEqual([
+      "0002-native-ingress-return-profile.patch",
+      "0003-native-presentation-readiness.patch",
+      "0005-native-child-handoff.patch",
+      "0007-native-input-listener-provenance.patch",
+    ]);
     expect(manifest.mode).toBe("patched");
 
     /** @param {string} name */
     const digestOf = async (name) => createHash("sha256").update(await readFile(new URL(name, patches))).digest("hex");
     const built = new Map(manifest.appliedPatches.map((/** @type {any} */ entry) => [entry.name, entry]));
-
-    // Every patch in the default cohort is byte-identical to this tree, so nothing here is an inference: the
-    // bytes that ran were produced from the files this repository carries.
+    // Every patch in the default cohort is byte-identical to this tree's, so the bytes that ran came from these files.
     for (const [position, name] of series.entries()) {
       expect(built.get(name)).toEqual({ position: position + 1, name, sha256: await digestOf(name) });
     }
 
-    // Patch 0006's overlay is the sixth patch of THIS cohort, which is the change from the six-patch build.
-    expect(built.get(CONSUMER_CAPABILITY_PATCH.name).sha256).toBe(CONSUMER_CAPABILITY_PATCH.currentInThisTree.sha256);
-    expect(await digestOf(INPUT_LISTENER_PROVENANCE_PATCH.name)).toBe(INPUT_LISTENER_PROVENANCE_PATCH.sha256);
-
     const cohort = resolveCohort({});
     expect(cohort.manifestPath).toBe(DEFAULT_MANIFEST);
-    expect(cohort.buildSlurmJobId).toBe(INPUT_LISTENER_PROVENANCE_PATCH.buildSlurmJobId);
-    expect(cohort.upstreamCommit).toBe(manifest.upstreamCommit);
+    expect(cohort.buildSlurmJobId).toBe(DEFAULT_COHORT.buildSlurmJobId);
+    expect(cohort.upstreamCommit).toBe(DEFAULT_COHORT.upstreamCommit);
     expect(cohort.series).toEqual(series);
-    expect(cohort.patchedTreeHash).toBe(INPUT_LISTENER_PROVENANCE_PATCH.patchedTreeHash);
-    expect(cohort.patchedTreeHash).toBe(manifest.patchedTreeHash);
+    expect(cohort.patchedTreeHash).toBe(DEFAULT_COHORT.patchedTreeHash);
     expect(createHash("sha256").update(await readFile(cohort.bundledCli)).digest("hex")).toBe(manifest.bundledCliSha256);
+    expect(JSON.parse(await readFile(path.join(cohort.tuiPackageRoot, "package.json"), "utf8")).version).toBe(DEFAULT_COHORT.piVersion);
   });
 
-  // The six-patch cohort's own provenance is unchanged by the new build, including the split that made patch
-  // 0006's two identities worth recording separately in the first place.
-  it("leaves the six-patch cohort's bytes and its unbuilt-overlay record exactly as they were", async () => {
-    const patches = new URL("../../vendor/pi/patches/", import.meta.url);
-    const cohort = resolveCohort({ manifestPath: SIX_PATCH_MANIFEST });
-    expect(cohort.manifestPath).toBe(SIX_PATCH_MANIFEST);
-    expect(cohort.series).toHaveLength(6);
-    expect(cohort.series).not.toContain(INPUT_LISTENER_PROVENANCE_PATCH.name);
-    expect(cohort.buildSlurmJobId).toBe("3757199");
-    expect(cohort.patchedTreeHash).toBe(CONSUMER_CAPABILITY_PATCH.builtIntoCohort.patchedTreeHash);
-
-    // Against THIS cohort the overlay was never built, so the two digests still differ and the record stands.
-    const manifest = JSON.parse(await readFile(SIX_PATCH_MANIFEST, "utf8"));
-    const sixth = manifest.appliedPatches.find((/** @type {any} */ entry) => entry.name === CONSUMER_CAPABILITY_PATCH.name);
-    expect(sixth.sha256).toBe(CONSUMER_CAPABILITY_PATCH.builtIntoCohort.sha256);
-    const current = createHash("sha256").update(await readFile(new URL(CONSUMER_CAPABILITY_PATCH.name, patches))).digest("hex");
-    expect(current).toBe(CONSUMER_CAPABILITY_PATCH.currentInThisTree.sha256);
-    expect(current).not.toBe(sixth.sha256);
-  });
-
-  // Patch 0006 ships bootstrap protocol 2. Shipping it is not running it, and the demo says which it uses
-  // rather than leaving a reader to infer authority from the cohort's contents.
-  it("keeps bootstrap protocol 1 as the demo's behaviour even though the cohort carries protocol 2", async () => {
-    const cohort = resolveCohort({});
-    expect(cohort.bootstrapProtocolInUse).toBe(1);
-    expect(cohort.series).toContain(CONSUMER_CAPABILITY_PATCH.name);
-  });
-
-  // The five-patch composition stays selectable, so this intake does not strand the previously accepted cohort.
-  it("still accepts the five-patch composition when it is named explicitly", async () => {
-    const cohort = resolveCohort({ manifestPath: FIVE_PATCH_MANIFEST });
-    expect(cohort.manifestPath).toBe(FIVE_PATCH_MANIFEST);
-    expect(cohort.series).toHaveLength(5);
-    expect(cohort.series).not.toContain(CONSUMER_CAPABILITY_PATCH.name);
-    expect(cohort.patchedTreeHash).not.toBe(CONSUMER_CAPABILITY_PATCH.builtIntoCohort.patchedTreeHash);
+  it("speaks bootstrap protocol 1", () => {
+    expect(resolveCohort({}).bootstrapProtocolInUse).toBe(1);
   });
 });
 
@@ -811,13 +774,11 @@ describe("the README's runnable command", () => {
     expect(foreign).toMatch(/pi-agents-native-demo-20260919/u);
   });
 
-  it("documents the seven-patch default and keeps the six-patch cohort's provenance rows", async () => {
+  it("documents the Pi 1.4.0 default cohort", async () => {
     const readme = await readFile(readmePath, "utf8");
-    expect(readme).toContain(INPUT_LISTENER_PROVENANCE_PATCH.buildSlurmJobId);
-    expect(readme).toContain(INPUT_LISTENER_PROVENANCE_PATCH.patchedTreeHash);
-    expect(readme).toContain("3757199");
-    expect(readme).toContain(CONSUMER_CAPABILITY_PATCH.builtIntoCohort.sha256);
-    expect(readme).toContain(CONSUMER_CAPABILITY_PATCH.currentInThisTree.sha256);
+    expect(readme).toContain(DEFAULT_COHORT.buildSlurmJobId);
+    expect(readme).toContain(DEFAULT_COHORT.patchedTreeHash);
+    expect(readme).toContain(DEFAULT_COHORT.upstreamCommit);
   });
 });
 

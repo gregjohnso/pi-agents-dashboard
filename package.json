@@ -41,8 +41,8 @@
     "pack:check": "npm pack --dry-run --json"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.3",
-    "@earendil-works/pi-tui": "0.84.3"
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-tui": "1.4.0"
   },
   "devDependencies": {
     "@types/node": "22.19.19",

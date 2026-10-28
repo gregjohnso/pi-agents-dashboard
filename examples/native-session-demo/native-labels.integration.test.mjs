@@ -26,8 +26,8 @@ vi.mock("./owner-launch.mjs", async (original) => {
   } };
 });
 
-const COHORT = "/mnt/main0/home/gjohnson/.local/share/pi-agents/releases/0.0.2-native-20260921.2/app";
-const MANIFEST = path.join(COHORT, "runtime/cohort-manifest.json");
+const COHORT = "/mnt/main0/home/gjohnson/projects/pi-agents-pi14-work/cohort-4189339";
+const MANIFEST = path.join(COHORT, "cohort-manifest.json");
 
 async function evidence(entry) {
   if (process.env.PI_AGENTS_LABEL_EVIDENCE_FILE) await appendFile(process.env.PI_AGENTS_LABEL_EVIDENCE_FILE, `${JSON.stringify(entry)}\n`);
@@ -80,9 +80,9 @@ async function launch(requestedName) {
     expect(ownerAfter.status).toBe("ABSENT");
   });
   expect(process.versions.node).toBe("22.23.2");
-  expect(piPackage.version).toBe("0.84.3");
-  expect(manifest.series).toHaveLength(7);
-  expect(manifest.patchedTreeHash).toBe("f0eb2f2d68bd6bf04cc06289f47fe2f195812d10");
+  expect(piPackage.version).toBe("1.4.0");
+  expect(manifest.series).toHaveLength(4);
+  expect(manifest.patchedTreeHash).toBe("b0c4f259cb287cecadbeecf1dc49aac56682462b");
   const backend = () => {
     const client = createNativeBackend({ sessionsHome: base, stateHome });
     cleanup.push(() => client.close());

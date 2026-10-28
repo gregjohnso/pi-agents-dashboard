@@ -48,7 +48,7 @@ async function fixture() {
   const root = await mkdtemp(path.join(tmpdir().length < 60 ? tmpdir() : "/tmp", "pia-ml-"));
   cleanup.push(() => rm(root, { recursive: true, force: true }));
   const manager = await runManager({ root: path.join(root, "runtime"), stateHome: path.join(root, "metadata"),
-    cohortRoot: "/mnt/main0/home/gjohnson/.local/share/pi-agents/releases/0.0.2-native-20260921.2/app", log: () => {}, onReady: () => {} });
+    cohortRoot: "/mnt/main0/home/gjohnson/projects/pi-agents-pi14-work/cohort-4189339", log: () => {}, onReady: () => {} });
   cleanup.push(async () => { controls.finish({ status: 0, code: 0, signal: null, coreDumped: false }); await manager.stop(true); });
   const recordPath = manager.statusRecord().durable.record;
   const read = async () => JSON.parse(await readFile(recordPath, "utf8"));

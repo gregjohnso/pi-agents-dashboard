@@ -1,6 +1,6 @@
 diff --git a/packages/coding-agent/src/core/native-child-handoff.ts b/packages/coding-agent/src/core/native-child-handoff.ts
 new file mode 100644
-index 0000000..4a37ec4
+index 0000000000000000000000000000000000000000..4a37ec41044f958a6ec026da10972b6cf6c35ec6
 --- /dev/null
 +++ b/packages/coding-agent/src/core/native-child-handoff.ts
 @@ -0,0 +1,126 @@
@@ -131,10 +131,10 @@ index 0000000..4a37ec4
 +	return { entered: true, managed: true, childPhaseId, drainedThrough: lease.drainedThrough, outcome };
 +}
 diff --git a/packages/coding-agent/src/index.ts b/packages/coding-agent/src/index.ts
-index b4a9b0f..2c589e5 100644
+index e60b71f96c9a04d7594710752135d8f66b09fc3d..0f56372830d8ba3ce9683dbc6c81f96ca204380b 100644
 --- a/packages/coding-agent/src/index.ts
 +++ b/packages/coding-agent/src/index.ts
-@@ -232,6 +232,14 @@ export {
+@@ -257,6 +257,14 @@ export {
  	startNativeBootstrapChannel,
  	stopNativeBootstrapChannel,
  } from "./core/native-bootstrap.ts";
@@ -150,18 +150,18 @@ index b4a9b0f..2c589e5 100644
  export {
  	type AttachmentEpoch,
 diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
-index 8e28e4a..9868ffd 100644
+index 21cc473be9f2c8efa5353f77271b58fddf621a54..b0cc370354b802b53ca2e253509398177575c8ae 100644
 --- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
 +++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
-@@ -84,6 +84,7 @@ import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/
- import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
+@@ -98,6 +98,7 @@ import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/htt
  import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
- import { createCompactionSummaryMessage } from "../../core/messages.ts";
+ import type { McpHttpServerConfig } from "../../core/mcp-servers.ts";
+ import { createCompactionSummaryMessage, createCustomMessage } from "../../core/messages.ts";
 +import { bracketRecognizedChildTerminal } from "../../core/native-child-handoff.ts";
  import {
  	type NativePresentationProvider,
  	recordNativeReadiness,
-@@ -4613,23 +4614,29 @@ export class InteractiveMode {
+@@ -4629,23 +4630,29 @@ export class InteractiveMode {
  	private async handleOpenExternalEditor(): Promise<void> {
  		const editorCmd = this.settingsManager.getExternalEditorCommand();
  		const content = this.editor.getExpandedText?.() ?? this.editor.getText();
@@ -208,10 +208,10 @@ index 8e28e4a..9868ffd 100644
  
  	// =========================================================================
 diff --git a/packages/tui/src/index.ts b/packages/tui/src/index.ts
-index 18ab400..7ed55b9 100644
+index 64d49d46f52471bb874769bdb602c0b1a1df1eda..57c30abd10f6297fecd39915ad9e0478acac8704 100644
 --- a/packages/tui/src/index.ts
 +++ b/packages/tui/src/index.ts
-@@ -44,21 +44,29 @@ export {
+@@ -78,21 +78,29 @@ export {
  } from "./components/v-stack.ts";
  // Editor component interface (for custom editors)
  export type { EditorComponent } from "./editor-component.ts";
@@ -242,12 +242,13 @@ index 18ab400..7ed55b9 100644
  	type TerminalResponseApplication,
  	type TerminalResponseKind,
  	type VirtualTerminalProfile,
-@@ -114,7 +122,15 @@ export {
+@@ -153,7 +161,16 @@ export {
  	type StdinSequenceOrigin,
  } from "./stdin-buffer.ts";
  // Terminal interface and implementations
--export { type NativeInputDispatch, ProcessTerminal, type Terminal } from "./terminal.ts";
+-export { isAppleTerminalSession, type NativeInputDispatch, ProcessTerminal, type Terminal } from "./terminal.ts";
 +export {
++	isAppleTerminalSession,
 +	type NativeInputDispatch,
 +	type NativeInputDispatchResult,
 +	NativeInputDrainError,
@@ -258,9 +259,9 @@ index 18ab400..7ed55b9 100644
 +} from "./terminal.ts";
  // Terminal colors
  export {
- 	parseOsc11BackgroundColor,
+ 	parseTerminalColorSchemeReport,
 diff --git a/packages/tui/src/native-attachment.ts b/packages/tui/src/native-attachment.ts
-index ade233d..47a4259 100644
+index ade233d43113540f02396eb54e432be0b99c4b1f..47a42591a131278bf2ea67abf04bfbb0a6a0b042 100644
 --- a/packages/tui/src/native-attachment.ts
 +++ b/packages/tui/src/native-attachment.ts
 @@ -1,10 +1,12 @@
@@ -417,10 +418,10 @@ index ade233d..47a4259 100644
  		throw new Error(
  			`the virtual terminal profile is fixed at launch (${state.launchProfile.profileId}); ` +
 diff --git a/packages/tui/src/stdin-buffer.ts b/packages/tui/src/stdin-buffer.ts
-index 282842c..013d94e 100644
+index d292f7272440ce6aa0845a68170df865e8e433b2..16200617587231547b885ae882688f3ef9d2cd1d 100644
 --- a/packages/tui/src/stdin-buffer.ts
 +++ b/packages/tui/src/stdin-buffer.ts
-@@ -586,6 +586,25 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
+@@ -624,6 +624,25 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
  		return sequences;
  	}
  
@@ -447,10 +448,10 @@ index 282842c..013d94e 100644
  		if (this.timeout) {
  			clearTimeout(this.timeout);
 diff --git a/packages/tui/src/terminal.ts b/packages/tui/src/terminal.ts
-index f1e6e98..9621d1f 100644
+index ffe68baa3bb8d7b6ef8a23c7ea22004374c73946..d113f4d654f04bfee0ab3ba03ba98df2583b7f15 100644
 --- a/packages/tui/src/terminal.ts
 +++ b/packages/tui/src/terminal.ts
-@@ -97,6 +97,42 @@ export type NativeInputDispatch = {
+@@ -115,6 +115,42 @@ export type NativeInputDispatch = {
  	binding: { generation: number };
  };
  
@@ -493,7 +494,7 @@ index f1e6e98..9621d1f 100644
  /**
   * Minimal terminal interface for TUI
   */
-@@ -108,7 +144,13 @@ export interface Terminal {
+@@ -126,7 +162,13 @@ export interface Terminal {
  	 * Seam B: admit labelled bytes from one client attachment into the ordered native input path.
  	 * Present only on a terminal a host owns; ordinary stdin needs no dispatch.
  	 */
@@ -508,7 +509,7 @@ index f1e6e98..9621d1f 100644
  
  	// Stop the terminal and restore state
  	stop(): void;
-@@ -201,6 +243,12 @@ export class ProcessTerminal implements Terminal {
+@@ -233,6 +275,12 @@ export class ProcessTerminal implements Terminal {
  	private consumedThrough = 0;
  	private bindingGeneration = 0;
  	private dispatchChain: Promise<void> = Promise.resolve();
@@ -521,7 +522,7 @@ index f1e6e98..9621d1f 100644
  	/**
  	 * One ordered byte queue for every attachment, not one decoder each.
  	 *
-@@ -344,22 +392,30 @@ export class ProcessTerminal implements Terminal {
+@@ -398,22 +446,30 @@ export class ProcessTerminal implements Terminal {
  	 * Dispatches are serialized, so the ordered native path sees byte spans in submission order and the
  	 * returned `consumedThrough` is monotonic. It counts bytes accepted into that path, and the promise
  	 * resolves only once every response authorization those bytes started has settled — that is the
@@ -557,7 +558,7 @@ index f1e6e98..9621d1f 100644
  		}
  		const { attachmentId, epoch } = input.attachmentEpoch;
  		const generation = input.binding.generation;
-@@ -411,12 +467,75 @@ export class ProcessTerminal implements Terminal {
+@@ -465,12 +521,75 @@ export class ProcessTerminal implements Terminal {
  				this.stdinBuffer?.processWithOrigins(decoded.text, decoded.origins);
  			}
  			await settleTerminalResponseAuthorizations();

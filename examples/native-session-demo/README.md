@@ -43,7 +43,7 @@ its own live component tree. Nothing is replayed.
 ## Run it
 
 Node must be 22.19 or newer and below 23; this repository's pixi environment supplies one. Everything below is
-copy-pasteable from the repository root, and `$DEMO` is **this** checkout's demo — the one whose six-patch default
+copy-pasteable from the repository root, and `$DEMO` is **this** checkout's demo — the one whose Pi 1.4.0 default
 and smoke evidence the sections above describe. A `$DEMO` naming any other checkout would run a different tree's
 code against these instructions, so it is written relative to `$PWD` rather than hard-coded.
 
@@ -76,51 +76,18 @@ cohort .../consumer/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli
 frame reaches the terminal. It does not wait for first paint or for initialization, so a blocking startup
 dialog cannot hold your attach command.
 
-Which Pi runs is chosen by manifest, not by whatever npm happens to have installed. The default is the
-qualified **seven**-patch cohort (seams A, B/C/F, E, D, G, native consumer capabilities, plus the input-listener
-provenance patch the return gesture needs; build stage Slurm job `3763110`, built tree
-`f0eb2f2d68bd6bf04cc06289f47fe2f195812d10`, upstream `bfb004d4418ff05c6f909eaaab856cbe75c1fde0`).
-
-Patch `0007-native-input-listener-provenance.patch` is why this cohort exists. `handleTerminalInput` has held
-the parsed sequence's `NativeInputProvenance` since patch 0002, but it was a local parameter: the only public
-carrier was `authorizeReturn`, which fires for a Return key alone. 0007 widens `TuiInputListener` with an
-**optional** second parameter and passes that provenance at the single call site, so a one-argument listener is
-unchanged and no new seam is added. Without it the demo's `f9` cannot tell which attachment pressed it, nor tell
-a single-origin sequence from one native framing assembled out of two attachments' bytes.
-
-The previously qualified **six**-patch cohort (`3757199`, tree `029408d6f4f4e397b621438a3f80b3fb034f99ab`) is
-unchanged, was neither rebuilt nor modified, and is still selectable. `f9` is not attributable against it.
-
-Two things are in those bytes and do **not** run here:
-
-- Seam D's canonical admission does nothing until a host registers the canonical trio, and this demo registers
-  no canonical host. Its presence is not pre-spawn canonical authority.
-- Patch 0006's bootstrap protocol 2, published input target and `dcs-pi-native-present-v1` codec are explicit
-  opt-in. This demo stays on protocol 1, which `resolveCohort` reports as `bootstrapProtocolInUse: 1`.
-
-Patch `0006-native-consumer-capabilities.patch` had two identities, and the seven-patch build resolved them:
-
-| identity | sha256 | tree |
-|---|---|---|
-| built into cohort `3757199` — the six-patch bytes | `63f186b735e440751777c70bfd564a0c5df8244ad1ad3bc6a1abef1ad60ea510` | `029408d6f4f4e397b621438a3f80b3fb034f99ab` |
-| current in this tree — the accepted **test-only** overlay, unbuilt against `3757199` and **built** into `3763110` | `37ddaec09df091fdf30ab3f8c10c32cfdf9820730f714323c6356b80907f548b` | would be `746091b78ce7b505f0170c2cb8866fe786cbb25c` |
-
-All seven patches are byte-identical between this tree and the `3763110` build, so the bytes you run were
-produced from the files this repository carries. Against `3757199` the overlay was never built, which is why
-that row's digests still differ.
+Which Pi runs is chosen by manifest, not by whatever npm happens to have installed. The default is the Pi
+**1.4.0** cohort (upstream `4a080252f06caf63a525d7873c5d94d3c23887e0`, build stage Slurm job `4189339`, built tree
+`b0c4f259cb287cecadbeecf1dc49aac56682462b`). It carries four patches: 0002 (ingress, return and terminal-response
+authorization), 0003 (presentation and readiness), 0005 (child terminal handoff) and 0007 (input-listener
+provenance, which lets `f9` know which attachment pressed it). The 0.84.3 series' 0001, 0004 and 0006 are not
+carried, because nothing this demo runs activated them; `vendor/pi/patches/series` records why. The demo speaks
+bootstrap protocol 1, which `resolveCohort` reports as `bootstrapProtocolInUse: 1`.
 
 ```bash
 # The default, spelled out. Omit --manifest to get exactly this.
 $NODE $DEMO start --root /tmp/pi-nsd-mine \
-  --manifest /mnt/main0/home/gjohnson/projects/pi-agents-tool-error-summary/.superpowers/sdd/2026-09-17-native-attachment/integration-owner/real-native-list-demo/logs/cohort-3763110/final-artifacts-manifest.json
-
-# The previously qualified six-patch cohort is still selectable. `f9` cannot be attributed against it.
-$NODE $DEMO start --root /tmp/pi-nsd-six \
-  --manifest /mnt/main0/home/gjohnson/projects/pi-agents-tool-error-summary/.superpowers/sdd/2026-09-17-native-attachment/native-consumer-seams/marker-failure/qualification/final-3757199/final-artifacts-manifest.json
-
-# The previously accepted five-patch composition is still selectable.
-$NODE $DEMO start --root /tmp/pi-nsd-five \
-  --manifest /mnt/main0/home/gjohnson/projects/pi-agents-tool-error-summary/.superpowers/sdd/2026-09-17-native-attachment/runtime-wave-1/canonical-composition/logs/final-artifacts-manifest.json
+  --manifest /mnt/main0/home/gjohnson/projects/pi-agents-pi14-work/cohort-4189339/cohort-manifest.json
 ```
 
 ### 2. Attach, from one terminal or several

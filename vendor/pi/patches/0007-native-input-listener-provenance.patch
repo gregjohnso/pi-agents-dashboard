@@ -1,8 +1,8 @@
 diff --git a/packages/tui/src/tui.ts b/packages/tui/src/tui.ts
-index 61c4ee6..5a87786 100644
+index b8b660f8e6b4f8a128e46a5994ad5d8504ec3f49..8161df2dbe229ec4f8901102da0b1ccdf7b6cca9 100644
 --- a/packages/tui/src/tui.ts
 +++ b/packages/tui/src/tui.ts
-@@ -72,7 +72,10 @@ export interface Component {
+@@ -160,7 +160,10 @@ export interface Component {
  }
  
  export type TuiInputListenerResult = { consume?: boolean; data?: string } | undefined;
@@ -11,10 +11,10 @@ index 61c4ee6..5a87786 100644
 +	data: string,
 +	provenance?: NativeInputProvenance,
 +) => TuiInputListenerResult;
- type PendingOsc11BackgroundQuery = {
- 	settled: boolean;
- 	resolve: ((rgb: RgbColor | undefined) => void) | undefined;
-@@ -1054,7 +1057,7 @@ export abstract class TuiBase extends Container implements TUI {
+ type PendingTerminalColorQuery = {
+ 	foreground?: RgbColor;
+ 	background?: RgbColor;
+@@ -1210,7 +1213,7 @@ export abstract class TuiBase extends Container implements TUI {
  		if (this.inputListeners.size > 0) {
  			let current = data;
  			for (const listener of this.inputListeners) {

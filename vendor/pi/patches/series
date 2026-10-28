@@ -4,39 +4,22 @@
 # in this directory that no line names is drift and fails preparation. Names must look like
 # `NNNN-short-description.patch`.
 #
-# These six patches do not commute: 0002, 0003 and 0005 all change `packages/tui/src/{terminal,tui,index}.ts`,
-# 0001, 0003, 0004 and 0005 all change `packages/coding-agent/src/{index.ts,core/extensions/*,modes/interactive/
-# interactive-mode.ts}`, 0004 also changes seam A's own `core/native-submission.ts`, and 0002 and 0005 both
-# change `packages/tui/src/{native-attachment,stdin-buffer}.ts`. 0002, 0003 and 0004 are the serialized forms
-# regenerated against this order, so preparation applies them with no fuzz and no three-way fallback.
-# Reordering this list breaks the preparation; regenerate the later patches instead.
+# Pinned to Pi 1.4.0. These are the four seams the shipped native dashboard uses, rebased from the 0.84.3
+# series and regenerated against this order: 0002 (ingress, return and terminal-response authorization),
+# 0003 (presentation and readiness over the bootstrap sideband), 0005 (child terminal handoff) and 0007
+# (input-listener provenance). They keep their 0.84.3 numbers so a reader can follow each one back.
 #
-# 0005 was taken directly after 0003, before 0004 existed in any series, and it still applies here unchanged:
-# its `index.ts` and `interactive-mode.ts` hunks touch neither the export block nor the session and refusal
-# regions 0004 rewrites, so `git apply --check --index --whitespace=error` accepts it at this position with no
-# fuzz. It is therefore carried byte for byte rather than regenerated. 0005 depends on 0002 and 0003 and not on
-# 0004; 0004 depends on 0001 and does not depend on 0005.
+# 0001 (submission barrier), 0004 (canonical admission) and 0006 (bootstrap protocol 2, published input target
+# and presentation markers) are not carried. Nothing shipped activated them: 0001 and 0004 act only once an
+# extension calls `setNativeSubmissionHost`, which neither shipped extension does, and 0006's additions are
+# opt-in through `PI_NATIVE_BOOTSTRAP_PROTOCOL=2`, which the manager never sets, or are used only by
+# `runtime/pty-host.mjs`, which the native dashboard does not load. They remain in git history.
 #
-# 0006 is the native consumer-capability patch: the published input target in `packages/tui/src/{native-attachment,
-# terminal,index}.ts`, the `dcs-pi-native-present-v1` codec in the new `packages/tui/src/native-present-markers.ts`
-# with the ordered bracket in `{native-presentation,tui}.ts`, and bootstrap protocol 2 in
-# `packages/coding-agent/src/core/{native-bootstrap,native-presentation}.ts`. It is generated against the tree
-# 0001-0005 leave behind and applies only at this position; it is last because every file it touches is a file
-# an earlier patch already rewrote.
-#
-# 0007 carries the processed-input provenance to the public input listener, and nothing else. `handleTerminalInput`
-# has held the parsed sequence's `NativeInputProvenance` since 0002, but it was a local parameter: the only public
-# carrier was `authorizeReturn`, which fires for a Return key alone. So an out-of-process host could see the origin
-# of a Return and of nothing else, and a host-recognised gesture on any other key had no way to tell a single-origin
-# sequence from one native framing assembled out of two attachments' bytes. This widens `TuiInputListener` with an
-# OPTIONAL second parameter and passes the provenance already in scope at the single call site. It is additive and
-# backward compatible: a one-argument listener is unchanged, and the type keeps accepting one. It adds no seam, no
-# registration and no new decision point. Generated against the tree 0001-0006 leave behind, and last because
-# `packages/tui/src/tui.ts` is a file 0002, 0003 and 0006 already rewrote.
-0001-seam-a-native-submission-barrier.patch
+# Conflicts resolved against 1.4.0: 0002's terminal-reply authorization keeps upstream's device-attributes
+# accounting and OSC 7501 program-status handling (program-status replies are not host-authorized), and its
+# origin ledger follows upstream's new Alt-prefix split in StdinBuffer. 0003's frame receipt counts the bytes
+# of 1.4.0's chunked main-screen writer. 0005 and 0007 needed only import and anchor updates.
 0002-native-ingress-return-profile.patch
 0003-native-presentation-readiness.patch
-0004-native-canonical-admission.patch
 0005-native-child-handoff.patch
-0006-native-consumer-capabilities.patch
 0007-native-input-listener-provenance.patch

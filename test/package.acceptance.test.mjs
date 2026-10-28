@@ -77,8 +77,11 @@ it("ships one allowlisted standalone tarball without lifecycle, private, or deve
   expect(productFiles.some((path) => /(?:^|\/)(?:\.superpowers|\.vscode|\.cache|diagnostics|sessions|worktrees)(?:\/|$)/u.test(path))).toBe(false);
   expect(productFiles.some((path) => /(?:^|\/)(?:extensions|ui)(?:\/|$)/u.test(path))).toBe(false);
   expect(productFiles.some((path) => /(?:pixi|tsconfig|vitest\.config|package-lock)\b/u.test(path))).toBe(false);
-  expect(listing.some((path) => /(?:^|\/)(?:\.env(?:\.|$)|credentials?|control\.token|\.git|worker\.(?:stdout|stderr)\.log)(?:\/|$)/u.test(path))).toBe(false);
-  expect(listing.some((path) => /package\/node_modules\/(?:typescript|vitest|@types\/node)(?:\/|$)/u.test(path))).toBe(false);
+  // The Anthropic SDK that Pi 1.4.0 bundles ships its credential-provider *code* under lib/credentials/; that is source, not a secret.
+  const sdkCredentialCode = /^package\/node_modules\/@anthropic-ai\/sdk\/(?:src\/)?lib\/credentials\/[^/]+$/u;
+  expect(listing.some((path) => !sdkCredentialCode.test(path) && /(?:^|\/)(?:\.env(?:\.|$)|credentials?|control\.token|\.git|worker\.(?:stdout|stderr)\.log)(?:\/|$)/u.test(path))).toBe(false);
+  // @types/node is not forbidden: Pi 1.4.0's pi-ai -> @google/genai -> protobufjs declares it as a runtime dependency.
+  expect(listing.some((path) => /package\/node_modules\/(?:typescript|vitest)(?:\/|$)/u.test(path))).toBe(false);
 
   const manifestText = (await run("tar", ["-xOf", tarball, "package/package.json"])).stdout;
   const manifest = JSON.parse(manifestText);

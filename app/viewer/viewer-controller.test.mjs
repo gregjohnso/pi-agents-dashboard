@@ -717,7 +717,8 @@ describe("transcript scrolling keys and wheel", () => {
     expect(body()).toContain("line 59");
     expect(body()).not.toContain("line 0\n");
 
-    f.instance.tui.terminal.type("\x1b[H");
+    // Pi 1.4.0 binds tui.altScreen.top/bottom to Ctrl+Home and Ctrl+End; Home and End belong to the editor.
+    f.instance.tui.terminal.type("\x1b[1;5H");
     const top = body();
     expect(top).toContain("line 0");
     expect(top).not.toContain("line 59");
@@ -728,7 +729,7 @@ describe("transcript scrolling keys and wheel", () => {
     expect(body()).toContain("line 0");
     expect(body()).not.toContain("fresh");
 
-    f.instance.tui.terminal.type("\x1b[F");
+    f.instance.tui.terminal.type("\x1b[1;5F");
     expect(f.instance.viewport.isFollowingEnd).toBe(true);
     expect(body()).toContain("fresh");
   });
@@ -738,7 +739,7 @@ describe("transcript scrolling keys and wheel", () => {
 describe("installed Pi behavior the pending block depends on", () => {
   const piSource = (/** @type {string} */ path) => readFile(new URL(`../../node_modules/@earendil-works/pi-coding-agent/dist/${path}`, import.meta.url), "utf8");
 
-  // Canary: Pi 0.84.3 expands a submitted slash before the text becomes a message. `session.prompt`
+  // Canary: Pi 1.4.0 expands a submitted slash before the text becomes a message. `session.prompt`
   // defaults `expandPromptTemplates` to true and RPC mode never overrides it, and `steer` and
   // `followUp` expand skills and prompt templates too, so text starting with "/" can reach the
   // transcript changed or, as an extension command, never reach it at all. That is why notePending
@@ -748,11 +749,15 @@ describe("installed Pi behavior the pending block depends on", () => {
   it("still expands a submitted slash on every path a submission travels", async () => {
     const session = await piSource("core/agent-session.js");
     expect(session).toContain("options?.expandPromptTemplates ?? true");
+    // steer and followUp both delegate to _queueUserInput, which expands before it queues.
     for (const operation of ["steer", "followUp"]) {
-      const opens = `async ${operation}(text, images) {`;
+      const opens = `async ${operation}(text, images, options) {`;
       expect(session).toContain(opens);
-      expect(session.slice(session.indexOf(opens), session.indexOf("await this._queue", session.indexOf(opens)))).toContain("expandPromptTemplate(expandedText");
+      expect(session.slice(session.indexOf(opens), session.indexOf("}", session.indexOf(opens)))).toContain("this._queueUserInput(");
     }
+    const queue = "async _queueUserInput(text, images, behavior, source) {";
+    expect(session).toContain(queue);
+    expect(session.slice(session.indexOf(queue), session.indexOf("await this._queue", session.indexOf(queue)))).toContain("expandPromptTemplate(expandedText");
 
     const rpc = await piSource("modes/rpc/rpc-mode.js");
     expect(rpc).toContain('case "prompt": {');

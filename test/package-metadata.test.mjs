@@ -16,8 +16,8 @@ it("ships only the standalone executable", () => {
   expect(manifest.files).toContain("!**/*.test.mjs");
   expect(manifest.files).not.toContain("extensions");
   expect(manifest.dependencies).toMatchObject({
-    "@earendil-works/pi-coding-agent": "0.84.3",
-    "@earendil-works/pi-tui": "0.84.3",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-tui": "1.4.0",
   });
 });
 

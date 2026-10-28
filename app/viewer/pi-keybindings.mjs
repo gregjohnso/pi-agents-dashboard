@@ -18,9 +18,9 @@ import { PI_ENTRY, importPiModule, piModuleUrl } from "./pi-modules.mjs";
 export const PI_KEYBINDINGS_MODULE = piModuleUrl("keybindings");
 
 /**
- * Pi ships its own copy of pi-tui under its package, so `getKeybindings()` inside Pi's components
- * reads a different singleton than the one this package's own components read. One manager has to be
- * installed in both, or the editor keeps pi-tui's defaults while the overlays follow the operator.
+ * The pi-tui Pi's own components resolve. Pi 0.84.3 nested a second copy under its package, which reads a
+ * different singleton than this package's components; Pi 1.4.0 shares the top-level one. Installing the manager
+ * in both covers either layout, or the editor could keep pi-tui's defaults while the overlays follow the operator.
  */
 export const PI_TUI_MODULE = pathToFileURL(createRequire(PI_ENTRY).resolve("@earendil-works/pi-tui")).href;
 

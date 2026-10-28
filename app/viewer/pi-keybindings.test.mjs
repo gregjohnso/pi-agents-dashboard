@@ -56,19 +56,19 @@ describe("Pi keybindings in the viewer", () => {
     expect(legacy.getKeys("tui.editor.cursorUp")).toEqual(["alt+up"]);
   });
 
-  it("installs one manager in both pi-tui copies, because Pi ships its own", async () => {
+  it("installs one manager in this package's pi-tui and in the pi-tui Pi resolves", async () => {
     const keybindings = createPiKeybindings(await agentDir({ "tui.select.cancel": "ctrl+q" }));
     expect(installPiKeybindings(keybindings)).toBe(keybindings);
     // This package's own Input, SelectList and ScrollView resolve their keys from this singleton.
     expect(getKeybindings()).toBe(keybindings);
     expect(getKeybindings().matches("\x11", "tui.select.cancel")).toBe(true);
-    // Pi's editor and its own components resolve theirs from the copy under Pi's package.
+    // Pi's editor and its own components resolve theirs from the pi-tui Pi resolves. Pi 1.4.0 shares the top-level
+    // copy, where 0.84.3 nested its own; either way that copy must hold the same manager.
     const piTui = await import(PI_TUI_MODULE);
     expect(piTui.getKeybindings()).toBe(keybindings);
-    expect(piTui).not.toBe(await import("@earendil-works/pi-tui"));
   });
 
-  // Canary: Pi 0.84.3 exports only ".", "./rpc-entry" and "./client", so its keybinding table, user
+  // Canary: Pi exports no specifier for its keybinding module, so its keybinding table, user
   // config loader and legacy-name migrations are reachable only next to the package's own entry
   // point. When this fails Pi moved or renamed that module: follow it, or ask for an export. Never
   // restate the table here, because a copy drifts silently from the keys Pi documents.
@@ -79,7 +79,7 @@ describe("Pi keybindings in the viewer", () => {
     expect(module.KEYBINDINGS["app.thinking.toggle"]).toMatchObject({ defaultKeys: "ctrl+t" });
     expect(typeof module.KeybindingsManager.create).toBe("function");
     expect(typeof module.migrateKeybindingsConfig).toBe("function");
-    expect(PI_TUI_MODULE).toMatch(/pi-coding-agent\/node_modules\/@earendil-works\/pi-tui\//u);
+    expect(PI_TUI_MODULE).toMatch(/\/@earendil-works\/pi-tui\/dist\/index\.js$/u);
     expect(typeof (await import(PI_TUI_MODULE)).setKeybindings).toBe("function");
   });
 });

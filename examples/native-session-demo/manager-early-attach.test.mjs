@@ -36,7 +36,7 @@ it("waits for Pi to mount before asking a connected-but-loading Pi to present", 
   const dir = await mkdtemp(path.join(tmpdir().length < 60 ? tmpdir() : "/tmp", "pia-ea-"));
   cleanup.push(() => rm(dir, { recursive: true, force: true }));
   const root = path.join(dir, "runtime");
-  const starting = runManager({ root, cohortRoot: "/mnt/main0/home/gjohnson/.local/share/pi-agents/releases/0.0.2-native-20260921.2/app", log: () => {}, onReady: () => {} });
+  const starting = runManager({ root, cohortRoot: "/mnt/main0/home/gjohnson/projects/pi-agents-pi14-work/cohort-4189339", log: () => {}, onReady: () => {} });
   starting.catch(() => {});
   await expect.poll(() => existsSync(path.join(root, "s")) && controls.onFrame !== undefined).toBe(true);
 

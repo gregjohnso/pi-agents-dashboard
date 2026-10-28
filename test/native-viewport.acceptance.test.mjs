@@ -108,11 +108,11 @@ it("scrolls the transcript with Pi's own viewport keys while the dock stays put"
   expect(promptRow(terminal, "draft")).toEqual(prompt);
   expect(footerRow(terminal)).toEqual(footer);
 
-  terminal.type("\x1b[H");
+  terminal.type("\x1b[1;5H"); // Pi 1.4.0: Ctrl+Home scrolls to the top
   await vi.waitFor(() => expect(terminal.text()).toContain(line(0)), { timeout: 5_000, interval: 20 });
   expect(promptRow(terminal, "draft")).toEqual(prompt);
 
-  terminal.type("\x1b[F");
+  terminal.type("\x1b[1;5F"); // Pi 1.4.0: Ctrl+End scrolls to the bottom
   await vi.waitFor(() => expect(terminal.text()).toContain(line(TRANSCRIPT_LINES - 1)), { timeout: 5_000, interval: 20 });
 
   // One wheel notch up moves the transcript and nothing else.

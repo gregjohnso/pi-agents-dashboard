@@ -25,6 +25,7 @@ export const PI_MODULES = {
   keybindings: "./core/keybindings.js",
   clipboard: "./utils/clipboard.js",
   openBrowser: "./utils/open-browser.js",
+  toolRenderers: "./core/tools/renderers/index.js",
 };
 
 /** The URL one of those modules resolves to. @param {keyof PI_MODULES | string} module */

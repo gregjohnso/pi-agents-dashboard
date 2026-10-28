@@ -20,6 +20,8 @@ export const PI_VIEWER_COMPONENTS = {
   ...await importPiModule("theme"),
 };
 const { AssistantMessageComponent, CustomEditor, ToolExecutionComponent, UserMessageComponent, getMarkdownTheme, initTheme } = PI_VIEWER_COMPONENTS;
+// Pi 1.4.0 no longer attaches its built-in tool renderers inside ToolExecutionComponent; callers pass them, as Pi does.
+const { withBuiltInRenderers } = await importPiModule("toolRenderers");
 
 initTheme(undefined, false);
 
@@ -104,7 +106,7 @@ export function createPiComponentAdapters({ tui, cwd = process.cwd() }) {
       return component;
     },
     tool(tool) {
-      const component = new ToolExecutionComponent(tool.name, tool.id, tool.arguments, { showImages: false }, undefined, tui, cwd);
+      const component = new ToolExecutionComponent(tool.name, tool.id, tool.arguments, { showImages: false }, withBuiltInRenderers(tool.name, undefined), tui, cwd);
       component.setArgsComplete();
       if (tool.state !== "pending") component.markExecutionStarted();
       if (tool.state === "streaming") component.updateResult(toolResult(tool), true);

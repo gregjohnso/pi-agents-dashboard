@@ -24,8 +24,8 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const PINNED_NODE_VERSION = "v22.23.2";
-const PINNED_CLI_SHA256 = "f04aa204d0f94d8b57074814610ac262fe94f65f7dcbd226f410e512f504464f";
-const PINNED_TREE = "f0eb2f2d68bd6bf04cc06289f47fe2f195812d10";
+const PINNED_CLI_SHA256 = "e79626f2dd6f94aa45d30f3fa63cd84319a6eefcd150b353cfaf274366926774";
+const PINNED_TREE = "b0c4f259cb287cecadbeecf1dc49aac56682462b";
 const REQUIRED_APP_PATHS = [
   "bin/pi-agents.mjs",
   "cli/native-main.mjs",

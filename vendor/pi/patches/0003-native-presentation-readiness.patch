@@ -1,8 +1,8 @@
 diff --git a/packages/coding-agent/src/core/extensions/loader.ts b/packages/coding-agent/src/core/extensions/loader.ts
-index 0e738eb081aa85e0b23046598782431d7f004914..91816f916a02cdb27f6e5d634c8919f21863520d 100644
+index cbc1100fc0000a0d44c05d4492cbb36b807d9527..4021796c03a3eedc1d4f4c4a957814c970de1edb 100644
 --- a/packages/coding-agent/src/core/extensions/loader.ts
 +++ b/packages/coding-agent/src/core/extensions/loader.ts
-@@ -28,6 +28,14 @@ import * as _bundledPiCodingAgent from "../../index.ts";
+@@ -14,6 +14,14 @@ import { CONFIG_DIR_NAME, getAgentDir, isBunBinary, isBundledNode } from "../../
  import { resolvePath } from "../../utils/paths.ts";
  import { createEventBus, type EventBus } from "../event-bus.ts";
  import type { ExecOptions } from "../exec.ts";
@@ -15,9 +15,9 @@ index 0e738eb081aa85e0b23046598782431d7f004914..91816f916a02cdb27f6e5d634c8919f2
 +	type ReadinessRecord,
 +} from "../native-presentation.ts";
  import { execCommand } from "../exec.ts";
+ import { type McpServerConfig, McpServerRegistry, mcpNamespace, validateMcpServerConfig } from "../mcp-servers.ts";
  import { readPiManifest } from "../pi-manifest.ts";
- import { type NativeSubmitHost, setNativeSubmissionHost } from "../native-submission.ts";
-@@ -462,6 +470,25 @@ function createExtensionAPI(
+@@ -528,6 +536,25 @@ function createExtensionAPI(
  				return unsubscribe;
  			},
  		},
@@ -44,10 +44,10 @@ index 0e738eb081aa85e0b23046598782431d7f004914..91816f916a02cdb27f6e5d634c8919f2
  
  	return {
 diff --git a/packages/coding-agent/src/core/extensions/types.ts b/packages/coding-agent/src/core/extensions/types.ts
-index 86e97f25e9181e8a84df521b48407f477a224707..6b82fb22a69e7777fdfda22df29b54cbc1bf5085 100644
+index 60388c0eb6ddc8c46fd44191b7d872a14a53decd..bcf3ac8ec328b58f761776557335e665f4f17e80 100644
 --- a/packages/coding-agent/src/core/extensions/types.ts
 +++ b/packages/coding-agent/src/core/extensions/types.ts
-@@ -55,6 +55,11 @@ import type { KeybindingsManager } from "../keybindings.ts";
+@@ -67,6 +67,11 @@ import type { McpServerConfig, McpServerRegistry, RegisteredMcpServer } from "..
  import type { CustomMessage } from "../messages.ts";
  import type { ModelRegistry } from "../model-registry.ts";
  import type { ScopedModel } from "../model-resolver.ts";
@@ -59,9 +59,9 @@ index 86e97f25e9181e8a84df521b48407f477a224707..6b82fb22a69e7777fdfda22df29b54cb
  import type {
  	BranchSummaryEntry,
  	CompactionEntry,
-@@ -1279,6 +1284,28 @@ export interface ExtensionAPI {
- 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): void;
- 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): void;
+@@ -1663,6 +1668,28 @@ export interface ExtensionAPI {
+ 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): () => void;
+ 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): () => void;
  
 +	// =========================================================================
 +	// Native presentation and readiness (seam E)
@@ -950,10 +950,10 @@ index 0000000000000000000000000000000000000000..218fd7474879e6af46911ba3c4a5a1fc
 +	return NATIVE_PRESENTATION_CAPABILITY;
 +}
 diff --git a/packages/coding-agent/src/index.ts b/packages/coding-agent/src/index.ts
-index dd5910bf4ea8dfe22b03287441dbbc188790f2f2..b4a9b0f6b290bd12340ef172f2cdd6f3706d877a 100644
+index 0b8fb1dd209d8064e083585dd862b4d592e45eb8..e60b71f96c9a04d7594710752135d8f66b09fc3d 100644
 --- a/packages/coding-agent/src/index.ts
 +++ b/packages/coding-agent/src/index.ts
-@@ -218,6 +218,44 @@ export type {
+@@ -243,6 +243,44 @@ export type {
  	ResolvedPaths,
  	ResolvedResource,
  } from "./core/package-manager.ts";
@@ -999,10 +999,10 @@ index dd5910bf4ea8dfe22b03287441dbbc188790f2f2..b4a9b0f6b290bd12340ef172f2cdd6f3
  export type { ResourceCollision, ResourceDiagnostic, ResourceLoader } from "./core/resource-loader.ts";
  export { DefaultResourceLoader, loadProjectContextFiles } from "./core/resource-loader.ts";
 diff --git a/packages/coding-agent/src/main.ts b/packages/coding-agent/src/main.ts
-index 23b4d42e2e3d1657d3c5ce55c83f763d90e23086..7b2b4d2aebf0c56c7b60feca7f62a6eabc2071a9 100644
+index 51df447c540ecb34a0c7ab9bf1edef1d337225a1..5fd6936d8abc552b284b420fdc365fc6374da3b4 100644
 --- a/packages/coding-agent/src/main.ts
 +++ b/packages/coding-agent/src/main.ts
-@@ -46,6 +46,7 @@ import type { InlineExtension } from "./core/extensions/types.ts";
+@@ -47,6 +47,7 @@ import type { InlineExtension } from "./core/extensions/types.ts";
  import { applyHttpProxySettings, configureHttpDispatcher } from "./core/http-dispatcher.ts";
  import { resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.ts";
  import { ModelRuntime } from "./core/model-runtime.ts";
@@ -1010,7 +1010,7 @@ index 23b4d42e2e3d1657d3c5ce55c83f763d90e23086..7b2b4d2aebf0c56c7b60feca7f62a6ea
  import { restoreStdout, takeOverStdout } from "./core/output-guard.ts";
  import { type AppMode, resolveProjectTrusted } from "./core/project-trust.ts";
  import type { CreateAgentSessionOptions } from "./core/sdk.ts";
-@@ -581,6 +582,11 @@ export async function main(args: string[], options?: MainOptions) {
+@@ -597,6 +598,11 @@ export async function main(args: string[], options?: MainOptions) {
  	applyHttpProxySettings(bootstrapSettingsManager.getGlobalSettings().httpProxy);
  	configureHttpDispatcher();
  
@@ -1023,21 +1023,21 @@ index 23b4d42e2e3d1657d3c5ce55c83f763d90e23086..7b2b4d2aebf0c56c7b60feca7f62a6ea
  		const exitCode = process.exitCode ?? 0;
  		if (process.platform === "win32" && exitCode === 0 && args[0] === "update") {
 diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
-index 9d088135abb711d9d019472ff4b1c71e22775f22..8e28e4a976efbccfa5849b38b0af870cf8c512fe 100644
+index e24d150be9abfd74dc1fc5c1c74c70d963797b20..21cc473be9f2c8efa5353f77271b58fddf621a54 100644
 --- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
 +++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
-@@ -31,6 +31,7 @@ import {
+@@ -37,6 +37,7 @@ import {
  	fuzzyFilter,
  	getCapabilities,
  	hyperlink,
 +	isNativePresentationTui,
  	Markdown,
  	matchesKey,
- 	ProcessTerminal,
-@@ -83,6 +84,12 @@ import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/
- import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
+ 	Spacer,
+@@ -97,6 +98,12 @@ import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/htt
  import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
- import { createCompactionSummaryMessage } from "../../core/messages.ts";
+ import type { McpHttpServerConfig } from "../../core/mcp-servers.ts";
+ import { createCompactionSummaryMessage, createCustomMessage } from "../../core/messages.ts";
 +import {
 +	type NativePresentationProvider,
 +	recordNativeReadiness,
@@ -1047,7 +1047,7 @@ index 9d088135abb711d9d019472ff4b1c71e22775f22..8e28e4a976efbccfa5849b38b0af870c
  import {
  	defaultModelPerProvider,
  	findExactModelReferenceMatch,
-@@ -439,6 +446,9 @@ export class InteractiveMode {
+@@ -454,6 +461,9 @@ export class InteractiveMode {
  	private runtimeHost: AgentSessionRuntime;
  	private renderer: TuiMainScreen | TuiAltScreen;
  	private ui: TUI;
@@ -1057,7 +1057,7 @@ index 9d088135abb711d9d019472ff4b1c71e22775f22..8e28e4a976efbccfa5849b38b0af870c
  	private mainScreenRenderState: TuiMainScreenRenderState | undefined;
  	private loadedResourcesContainer: Container;
  	private chatContainer: Container;
-@@ -860,6 +870,9 @@ export class InteractiveMode {
+@@ -881,6 +891,9 @@ export class InteractiveMode {
  	}
  
  	private stopInteractiveTui(fullscreenExitOutput: FullscreenExitOutput): void {
@@ -1067,7 +1067,7 @@ index 9d088135abb711d9d019472ff4b1c71e22775f22..8e28e4a976efbccfa5849b38b0af870c
  		if (this.renderer.mode === "fullscreen" && fullscreenExitOutput === "transcript") {
  			while (this.renderer.hasOverlayEntries) this.renderer.hideOverlay();
  			this.switchTuiMode("regular", false, false);
-@@ -978,8 +991,17 @@ export class InteractiveMode {
+@@ -996,8 +1009,17 @@ export class InteractiveMode {
  		this.defaultEditor.onSubmit = (text) => this.handleStartupSubmit(text);
  		this.ui.setFocus(this.editor);
  
@@ -1083,9 +1083,9 @@ index 9d088135abb711d9d019472ff4b1c71e22775f22..8e28e4a976efbccfa5849b38b0af870c
 +		// session_start handler that never resolves cannot hide or delay the mount.
 +		recordNativeReadiness({ phase: "native-mounted" });
  		this.isInitialized = true;
- 
- 		await this.themeController.applyFromSettings();
-@@ -1088,6 +1110,44 @@ export class InteractiveMode {
+ 		this.programStatus.report();
+ 		this.ensurePngTranscoder();
+@@ -1126,6 +1148,44 @@ export class InteractiveMode {
  			this.ui.invalidate();
  			this.ui.requestRender();
  		});
@@ -1130,7 +1130,7 @@ index 9d088135abb711d9d019472ff4b1c71e22775f22..8e28e4a976efbccfa5849b38b0af870c
  	}
  
  	/**
-@@ -4371,11 +4431,14 @@ export class InteractiveMode {
+@@ -4424,11 +4484,14 @@ export class InteractiveMode {
  		process.once("SIGCONT", () => {
  			clearInterval(suspendKeepAlive);
  			process.removeListener("SIGINT", ignoreSigint);
@@ -1145,7 +1145,7 @@ index 9d088135abb711d9d019472ff4b1c71e22775f22..8e28e4a976efbccfa5849b38b0af870c
  			// Stop the TUI (restore terminal to normal mode)
  			this.ui.stop();
  
-@@ -4384,6 +4447,7 @@ export class InteractiveMode {
+@@ -4437,6 +4500,7 @@ export class InteractiveMode {
  		} catch (error) {
  			clearInterval(suspendKeepAlive);
  			process.removeListener("SIGINT", ignoreSigint);
@@ -1153,7 +1153,7 @@ index 9d088135abb711d9d019472ff4b1c71e22775f22..8e28e4a976efbccfa5849b38b0af870c
  			throw error;
  		}
  	}
-@@ -4549,6 +4613,9 @@ export class InteractiveMode {
+@@ -4565,6 +4629,9 @@ export class InteractiveMode {
  	private async handleOpenExternalEditor(): Promise<void> {
  		const editorCmd = this.settingsManager.getExternalEditorCommand();
  		const content = this.editor.getExpandedText?.() ?? this.editor.getText();
@@ -1163,7 +1163,7 @@ index 9d088135abb711d9d019472ff4b1c71e22775f22..8e28e4a976efbccfa5849b38b0af870c
  		this.ui.stop();
  		try {
  			const result = await editInExternalEditor({
-@@ -4559,6 +4626,7 @@ export class InteractiveMode {
+@@ -4575,6 +4642,7 @@ export class InteractiveMode {
  				this.editor.setText(result.content);
  			}
  		} finally {
@@ -1171,6 +1171,21 @@ index 9d088135abb711d9d019472ff4b1c71e22775f22..8e28e4a976efbccfa5849b38b0af870c
  			this.ui.start();
  			this.ui.requestRender(true);
  		}
+diff --git a/packages/coding-agent/test/interactive-mode-suspend.test.ts b/packages/coding-agent/test/interactive-mode-suspend.test.ts
+index 996d2f1abf7929f270d2fa95500204bcfaa36d2c..ac632bb742d4054b4d8faf085f278561142f0789 100644
+--- a/packages/coding-agent/test/interactive-mode-suspend.test.ts
++++ b/packages/coding-agent/test/interactive-mode-suspend.test.ts
+@@ -18,7 +18,9 @@ type InteractiveModePrototypeWithHandleCtrlZ = {
+ };
+ 
+ function callHandleCtrlZ(context: HandleCtrlZThis): void {
+-	(interactiveModePrototype as InteractiveModePrototypeWithHandleCtrlZ).handleCtrlZ.call(context);
++	// Seam E brackets a suspend as a terminal release; this fake holds no presentation state to release.
++	const withRelease = Object.assign(context, { releaseTerminal() {}, reclaimTerminal() {} });
++	(interactiveModePrototype as InteractiveModePrototypeWithHandleCtrlZ).handleCtrlZ.call(withRelease);
+ }
+ 
+ const interactiveModePrototype = InteractiveMode.prototype as unknown;
 diff --git a/packages/coding-agent/test/native-presentation.test.ts b/packages/coding-agent/test/native-presentation.test.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..22f93491429e1e8492d4d98753f9e5f3d40ef48a
@@ -2038,13 +2053,13 @@ index 0000000000000000000000000000000000000000..22f93491429e1e8492d4d98753f9e5f3
 +	});
 +});
 diff --git a/packages/tui/src/index.ts b/packages/tui/src/index.ts
-index d9fa1bd4a7603f3caa661bcb3e8aca5d06f45db5..18ab400082572799768b36c6991c9232a323ca53 100644
+index 8ea9c8a0485be03def5368a3f49cfbfeb1e37e57..64d49d46f52471bb874769bdb602c0b1a1df1eda 100644
 --- a/packages/tui/src/index.ts
 +++ b/packages/tui/src/index.ts
-@@ -93,6 +93,18 @@ export {
- } from "./keys.ts";
- // LaTeX rendering
- export { type RenderLatexOptions, renderLatex } from "./latex.ts";
+@@ -132,6 +132,18 @@ export { getNativeClipboard, type NativeClipboard } from "./native-platform.ts";
+ export { oklabToOkhslLightness } from "./oklab.ts";
+ // Program status reporting (OSC 7501)
+ export { formatProgramStatus, type ProgramStatus } from "./program-status.ts";
 +// Native presentation of a terminal that missed startup (seam E)
 +export {
 +	type ColdReassertion,
@@ -2195,21 +2210,21 @@ index 0000000000000000000000000000000000000000..01e7631b6efd3345dc8a90bdba6008f2
 +	return (candidate as Record<PropertyKey, unknown>)[NATIVE_PRESENTATION_TUI] === true;
 +}
 diff --git a/packages/tui/src/terminal.ts b/packages/tui/src/terminal.ts
-index e57bd83b67ff802599662e6b013cc6e668aa2567..f1e6e98df36f6f2e7ad78a50fb62bbcbbb6729d4 100644
+index cad5d0fc6567ddbff7c72b443b99e2e3ecde5791..ffe68baa3bb8d7b6ef8a23c7ea22004374c73946 100644
 --- a/packages/tui/src/terminal.ts
 +++ b/packages/tui/src/terminal.ts
-@@ -14,6 +14,7 @@ import {
- } from "./native-attachment.ts";
- import { isNativeModifierPressed } from "./native-modifiers.ts";
- import { getNativeModuleCandidates } from "./native-module-path.ts";
+@@ -19,6 +19,7 @@ import {
+ 	PROGRAM_STATUS_QUERY,
+ 	type ProgramStatus,
+ } from "./program-status.ts";
 +import type { ReassertedTerminalModes } from "./native-presentation.ts";
  import { OriginLedger, StdinBuffer, type StdinSequenceOrigin } from "./stdin-buffer.ts";
  
- const cjsRequire = createRequire(import.meta.url);
-@@ -37,6 +38,10 @@ function utf8CodepointLength(leadByte: number): number {
- 	return 1; // continuation or invalid lead: consume one byte and let Node produce U+FFFD
+ const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
+@@ -41,6 +42,10 @@ function utf8CodepointLength(leadByte: number): number {
  }
- const KITTY_KEYBOARD_PROTOCOL_QUERY = `\x1b[>${DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS}u\x1b[?u\x1b[c`;
+ const KITTY_KEYBOARD_PROTOCOL_QUERY = `\x1b[>${DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS}u\x1b[?u`;
+ const DEVICE_ATTRIBUTES_QUERY = "\x1b[c";
 +// `CSI = flags ; 1 u` sets the flags of the entry already on the terminal's keyboard stack. Unlike the
 +// `CSI > flags u` push used during negotiation, re-emitting it leaves that stack balanced against the single
 +// pop at shutdown, which is what makes it safe to reassert for a terminal that attached after startup.
@@ -2217,10 +2232,10 @@ index e57bd83b67ff802599662e6b013cc6e668aa2567..f1e6e98df36f6f2e7ad78a50fb62bbcb
  
  export type KeyboardProtocolNegotiationSequence =
  	| { type: "kitty-flags"; flags: number }
-@@ -143,6 +148,16 @@ export interface Terminal {
- 
- 	// Progress indicator (OSC 9;4)
- 	setProgress(active: boolean): void;
+@@ -173,6 +178,16 @@ export interface Terminal {
+ 	 * status is re-sent when support is confirmed or the terminal restarts.
+ 	 */
+ 	setProgramStatus(status: ProgramStatus): void;
 +
 +	/**
 +	 * Re-emit the modes this terminal already negotiated, for a terminal that missed startup, and report
@@ -2234,20 +2249,25 @@ index e57bd83b67ff802599662e6b013cc6e668aa2567..f1e6e98df36f6f2e7ad78a50fb62bbcb
  }
  
  const DEFAULT_ESCAPE_TIMEOUT_MS = 10;
-@@ -204,6 +219,7 @@ export class ProcessTerminal implements Terminal {
- 	/** Who the queued incomplete bytes belong to, so a transition can be detected. */
- 	private pendingInputOwner: { attachmentId: string; epoch: number; generation: number } | undefined;
- 	private progressInterval?: ReturnType<typeof setInterval>;
+@@ -242,6 +257,8 @@ export class ProcessTerminal implements Terminal {
+ 	private programStatusSupported = false;
+ 	/** The support query was sent and its DA1 sentinel has not arrived yet. */
+ 	private programStatusQueryPending = false;
++	/** Last title written, so a terminal that attached after startup can be given it again. */
 +	private lastTitle?: string;
  	private writeLogPath = (() => {
  		const env = process.env.PI_TUI_WRITE_LOG || "";
  		if (!env) return "";
-@@ -787,9 +803,56 @@ export class ProcessTerminal implements Terminal {
+@@ -863,6 +880,7 @@ export class ProcessTerminal implements Terminal {
  
  	setTitle(title: string): void {
  		// OSC 0;title BEL - set terminal window title
 +		this.lastTitle = title;
  		process.stdout.write(`\x1b]0;${title}\x07`);
+ 	}
+ 
+@@ -877,6 +895,52 @@ export class ProcessTerminal implements Terminal {
+ 		}
  	}
  
 +	/**
@@ -2300,13 +2320,13 @@ index e57bd83b67ff802599662e6b013cc6e668aa2567..f1e6e98df36f6f2e7ad78a50fb62bbcb
  		if (active) {
  			// OSC 9;4;3 - indeterminate progress
 diff --git a/packages/tui/src/tui-alt-screen.ts b/packages/tui/src/tui-alt-screen.ts
-index 855fa0f710cfcf7eea79c9b80d0549321798367a..be0f6df32eddcfa0cbce1f302aa6a5294ded5c0a 100644
+index 5e6d7686454511ccb02babd40078d25ceb458bb6..aea78ce39c962d4c89124545f2eb74c9b46e6220 100644
 --- a/packages/tui/src/tui-alt-screen.ts
 +++ b/packages/tui/src/tui-alt-screen.ts
-@@ -16,6 +16,12 @@ import {
- 	renderLayoutFrame,
+@@ -18,6 +18,12 @@ import {
  	type ScrollbarGeometry,
  } from "./layout.ts";
+ import { getLayoutNode } from "./layout-node.ts";
 +import {
 +	type ColdReassertion,
 +	NATIVE_PRESENTATION_TUI,
@@ -2316,7 +2336,7 @@ index 855fa0f710cfcf7eea79c9b80d0549321798367a..be0f6df32eddcfa0cbce1f302aa6a529
  import type { Terminal } from "./terminal.ts";
  import {
  	deleteAllKittyImages,
-@@ -161,9 +167,10 @@ export interface TuiAltScreenOptions {
+@@ -199,9 +205,10 @@ export interface TuiAltScreenOptions {
  }
  
  /** Alternate-screen TUI with a scrollable, application-owned viewport. */
@@ -2328,9 +2348,9 @@ index 855fa0f710cfcf7eea79c9b80d0549321798367a..be0f6df32eddcfa0cbce1f302aa6a529
  	private previousScreen: string[] = [];
  	private lastDocument: string[] = [];
  	private previousScreenWidth = 0;
-@@ -275,20 +282,59 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
- 		this.pressedUrl = undefined;
- 		this.selectionDragged = false;
+@@ -369,20 +376,59 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
+ 		this.clearComponentMouseGesture();
+ 		this.lastComponentClick = undefined;
  		this.resetRenderState();
 +		this.terminal.write(
 +			`${ENTER_ALT_SCREEN}${DISABLE_AUTOWRAP}${this.mouseEnabled ? this.mouseTrackingSequence() : ""}\x1b[2J\x1b[H\x1b[?25l`,
@@ -2395,7 +2415,7 @@ index 855fa0f710cfcf7eea79c9b80d0549321798367a..be0f6df32eddcfa0cbce1f302aa6a529
  	}
  
  	protected override beforeTerminalStop(_options: TuiStopOptions): void {
-@@ -1316,5 +1362,10 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
+@@ -1793,5 +1839,10 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
  		this.previousScreenWidth = width;
  		this.previousScreenHeight = height;
  		this.currentLayout = nextLayout;
@@ -2407,11 +2427,12 @@ index 855fa0f710cfcf7eea79c9b80d0549321798367a..be0f6df32eddcfa0cbce1f302aa6a529
  	}
  }
 diff --git a/packages/tui/src/tui-main-screen.ts b/packages/tui/src/tui-main-screen.ts
-index bb2d6785d0d6c08177a287f02f7852ccf4ca6506..4798c3c9ed68a67fd3f6c3172e22cd38dd5bd7af 100644
+index c497acdbffd35aa606a1ebe2b0015a8a0a241d57..c7b1905f216b8e5a33ea1bacf01015da12d3937a 100644
 --- a/packages/tui/src/tui-main-screen.ts
 +++ b/packages/tui/src/tui-main-screen.ts
-@@ -1,6 +1,12 @@
+@@ -1,7 +1,13 @@
  import * as fs from "node:fs";
+ import * as os from "node:os";
  import * as path from "node:path";
 -import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
 +import {
@@ -2424,7 +2445,7 @@ index bb2d6785d0d6c08177a287f02f7852ccf4ca6506..4798c3c9ed68a67fd3f6c3172e22cd38
  import { type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
  import { visibleWidth } from "./utils.ts";
  
-@@ -54,8 +60,9 @@ export interface TuiMainScreenRenderState {
+@@ -121,8 +127,9 @@ export interface TuiMainScreenRenderState {
  }
  
  /** TUI implementation that renders into the terminal's main screen and scrollback. */
@@ -2435,7 +2456,7 @@ index bb2d6785d0d6c08177a287f02f7852ccf4ca6506..4798c3c9ed68a67fd3f6c3172e22cd38
  	private previousLines: string[] = [];
  	private previousKittyImageIds = new Set<number>();
  	private previousWidth = 0;
-@@ -88,6 +95,31 @@ export class TuiMainScreen extends TuiBase implements TUI {
+@@ -155,6 +162,31 @@ export class TuiMainScreen extends TuiBase implements TUI {
  		this.previousViewportTop = state.previousViewportTop;
  	}
  
@@ -2467,29 +2488,44 @@ index bb2d6785d0d6c08177a287f02f7852ccf4ca6506..4798c3c9ed68a67fd3f6c3172e22cd38
  	protected override resetRenderState(): void {
  		this.previousLines = [];
  		this.previousWidth = -1;
-@@ -248,6 +280,9 @@ export class TuiMainScreen extends TuiBase implements TUI {
+@@ -277,7 +309,11 @@ export class TuiMainScreen extends TuiBase implements TUI {
+ 		// Helper to clear scrollback and viewport and render all new lines
+ 		const fullRender = (clear: boolean): void => {
+ 			this.fullRedrawCount += 1;
+-			const output = new BoundedTerminalWriter((data) => this.terminal.write(data));
++			let frameBytes = 0;
++			const output = new BoundedTerminalWriter((data) => {
++				frameBytes += Buffer.byteLength(data);
++				this.terminal.write(data);
++			});
+ 			output.append("\x1b[?2026h"); // Begin synchronized output
+ 			if (clear) {
+ 				output.append(this.deleteKittyImages(this.previousKittyImageIds));
+@@ -317,6 +353,9 @@ export class TuiMainScreen extends TuiBase implements TUI {
  			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
  			this.previousWidth = width;
  			this.previousHeight = height;
-+			// One complete frame, handed over in the single `write` above. The incremental paths below write
++			// One complete frame, handed over by the writes above (split only past 1 MiB). The incremental paths below write
 +			// fragments and mint nothing.
-+			this.notifyFrameHandedToTerminal({ columns: width, rows: height, byteLength: Buffer.byteLength(buffer) });
++			this.notifyFrameHandedToTerminal({ columns: width, rows: height, byteLength: frameBytes });
  		};
  
- 		const debugRedraw = process.env.PI_DEBUG_REDRAW === "1";
+ 		const redrawLogDirectory = process.env.PI_TUI_DEBUG_REDRAW === "1" ? this.logDirectory : undefined;
 diff --git a/packages/tui/src/tui.ts b/packages/tui/src/tui.ts
-index 0db21a2adf9407f14e4f4716b0e688cb9df2886c..d7c9e61977b796b65846741b194e7eb54297b0ce 100644
+index f1d1a16646f6e8fe75dcf69bf682ac94027f37fe..b8b660f8e6b4f8a128e46a5994ad5d8504ec3f49 100644
 --- a/packages/tui/src/tui.ts
 +++ b/packages/tui/src/tui.ts
-@@ -2,6 +2,7 @@
+@@ -2,6 +2,9 @@
   * Minimal TUI implementation with differential rendering
   */
  
 +import { randomUUID } from "node:crypto";
- import * as os from "node:os";
- import * as path from "node:path";
++import * as os from "node:os";
++import * as path from "node:path";
  import { performance } from "node:perf_hooks";
-@@ -14,6 +15,13 @@ import {
+ import { isKeyRelease, matchesKey } from "./keys.ts";
+ import {
+@@ -12,6 +15,13 @@ import {
  	type NativeInputProvenance,
  	type ReturnAuthorization,
  } from "./native-attachment.ts";
@@ -2502,8 +2538,8 @@ index 0db21a2adf9407f14e4f4716b0e688cb9df2886c..d7c9e61977b796b65846741b194e7eb5
 +} from "./native-presentation.ts";
  import type { Terminal } from "./terminal.ts";
  import {
- 	isOsc11BackgroundColorResponse,
-@@ -339,6 +347,10 @@ export function isViewportTUI(tui: TUI): tui is ViewportTUI {
+ 	parseOscColorResponse,
+@@ -514,6 +524,10 @@ export function isViewportTUI(tui: TUI): tui is ViewportTUI {
  export abstract class TuiBase extends Container implements TUI {
  	abstract readonly mode: TuiMode;
  	public terminal: Terminal;
@@ -2514,7 +2550,7 @@ index 0db21a2adf9407f14e4f4716b0e688cb9df2886c..d7c9e61977b796b65846741b194e7eb5
  	private focusedComponent: Component | null = null;
  	private inputListeners = new Set<TuiInputListener>();
  	/** Increments on every cell-size query, so a report for a superseded query is detectable. */
-@@ -381,6 +393,102 @@ export abstract class TuiBase extends Container implements TUI {
+@@ -561,6 +575,102 @@ export abstract class TuiBase extends Container implements TUI {
  
  	protected abstract doRender(): void;
  

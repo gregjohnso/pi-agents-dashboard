@@ -47,6 +47,7 @@ it("keeps every deep Pi path in the one module that resolves them", async () => 
     '"./core/keybindings.js"',
     '"./utils/clipboard.js"',
     '"./utils/open-browser.js"',
+    '"./core/tools/renderers/index.js"',
   ]);
   expect(source).not.toMatch(/@earendil-works\/pi-(?:tui|coding-agent)\/(?:dist|src)\//u);
   // One resolution, from the package's own entry point, for all of them.

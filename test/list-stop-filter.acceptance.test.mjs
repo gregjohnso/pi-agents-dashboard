@@ -93,27 +93,24 @@ it("keeps the operator's chosen view when Ctrl+X stops a session", async () => {
   f.controller.selectSession("alpha");
 
   f.type("\x18");
+  expect(f.client.stop).not.toHaveBeenCalled();
+  f.type("\x18");
 
   await vi.waitFor(() => expect(f.client.stop).toHaveBeenCalledWith("alpha", 1, "stop-filter-request"));
   expect(f.controller.query).toMatchObject({ view: "live" });
   expect(f.rows()).not.toContain("gone");
 });
 
-it("abandons the armed clear when the operator moves the selection himself", async () => {
-  let clock = 0;
-  const f = await mountedList([session("alpha"), session("beta")], { now: () => clock });
+it("abandons an armed stop when the operator changes selection, requiring two fresh taps", async () => {
+  const f = await mountedList([session("alpha"), session("beta")]);
   f.controller.selectSession("alpha");
   f.type("\x18");
-  await vi.waitFor(() => expect(f.controller.stopClearArmed).toBe(true));
-  f.client.setSessions([stopped("alpha"), session("beta")]);
-  f.controller.applySnapshot(f.client.snapshot);
-
-  // Explicit navigation, which has always abandoned the gesture.
+  expect(f.paint()).toContain("ctrl+x again to stop alpha");
   f.type("\x1b[B");
-  clock = 200;
   f.type("\x18");
-
+  expect(f.client.stop).not.toHaveBeenCalled();
   expect(f.client.delete).not.toHaveBeenCalled();
+  f.type("\x18");
   await vi.waitFor(() => expect(f.client.stop).toHaveBeenCalledWith("beta", 1, "stop-filter-request"));
 });
 
@@ -133,6 +130,8 @@ it.each([
   f.client.stop = vi.fn(() => new Promise((resolve) => { release = () => resolve(undefined); }));
   f.controller.selectSession("alpha");
   f.type("\x18");
+  expect(f.client.stop).not.toHaveBeenCalled();
+  f.type("\x18");
   await vi.waitFor(() => expect(f.client.stop).toHaveBeenCalledTimes(1));
 
   abandon(f);
@@ -141,7 +140,7 @@ it.each([
 
   // Nothing is armed, and nothing offers to clear a session the operator walked away from.
   expect(f.controller.stopClearArmed).toBe(false);
-  expect(f.paint()).not.toContain("ctrl+x to clear");
+  expect(f.paint()).not.toContain("ctrl+x again");
 });
 
 it("leaves an unanswered stop behind when the frontend closes before the ack", async () => {
@@ -150,6 +149,8 @@ it("leaves an unanswered stop behind when the frontend closes before the ack", a
   const f = await mountedList([session("alpha"), session("beta")]);
   f.client.stop = vi.fn(() => new Promise((resolve) => { release = () => resolve(undefined); }));
   f.controller.selectSession("alpha");
+  f.type("\x18");
+  expect(f.client.stop).not.toHaveBeenCalled();
   f.type("\x18");
   await vi.waitFor(() => expect(f.client.stop).toHaveBeenCalledTimes(1));
 
@@ -176,6 +177,8 @@ it("arms nothing while the stop is still in flight or after it failed", async ()
   f.controller.selectSession("alpha");
 
   f.type("\x18");
+  expect(f.client.stop).not.toHaveBeenCalled();
+  f.type("\x18");
   await vi.waitFor(() => expect(f.client.stop).toHaveBeenCalledTimes(1));
   // In flight: a second press must not remove anything, because nothing has stopped yet.
   f.type("\x18");
@@ -186,10 +189,12 @@ it("arms nothing while the stop is still in flight or after it failed", async ()
   failing.client.stop = vi.fn(async () => { throw Object.assign(new Error("worker refused"), { code: "STOP_FAILED" }); });
   failing.controller.selectSession("gamma");
   failing.type("\x18");
-  await vi.waitFor(() => expect(failing.controller.status).toMatchObject({ kind: "error", code: "STOP_FAILED" }));
-
+  expect(failing.client.stop).not.toHaveBeenCalled();
   failing.type("\x18");
-
+  await vi.waitFor(() => expect(failing.controller.status).toMatchObject({ kind: "error", code: "STOP_FAILED" }));
+  failing.type("\x18");
+  expect(failing.client.stop).toHaveBeenCalledTimes(1);
+  failing.type("\x18");
   expect(failing.client.delete).not.toHaveBeenCalled();
   await vi.waitFor(() => expect(failing.client.stop).toHaveBeenCalledTimes(2));
 });

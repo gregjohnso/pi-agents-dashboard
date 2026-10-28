@@ -98,20 +98,17 @@ it("recovers a crashed previous daemon whose publication still names the previou
   expect(await listSessionsThroughDaemon(root)).toEqual(["alpha", "beta"]);
 });
 
-it("adopts from the executable itself, before any command resolves a state root", async () => {
+it("refuses legacy administration at the native executable without adopting either state root", async () => {
   const { parent, previousRoot, root, env } = await previousStateRoot(["alpha", "beta", "gamma", "delta"]);
 
   const status = await execFileAsync(process.execPath, [executable, "daemon", "status", "--json"], { env: { PATH: process.env.PATH ?? "", ...env }, encoding: "utf8" }).catch((/** @type {any} */ error) => error);
 
-  expect(status.code).toBe(3);
-  // The operator read this line as the failure, because it stood alone on stderr above a real
-  // error and looked exactly like one. Adoption succeeded and the command continued past it.
-  expect(status.stderr.split("\n").find((/** @type {string} */ line) => line.includes("Adopted ")))
-    .toBe(`notice: Adopted ${previousRoot} as ${root}: the directory was renamed in place, keeping every session.`);
-  expect(JSON.parse(status.stdout)).toMatchObject({ result: { kind: "daemon_status", root, status: "ABSENT" } });
-  expect(await readdir(parent)).toEqual(["pi-agents"]);
-  expect((await readdir(join(root, "sessions"))).sort()).toEqual(["alpha.json", "beta.json", "delta.json", "gamma.json"]);
-  await expect(lstat(previousRoot)).rejects.toMatchObject({ code: "ENOENT" });
+  expect(status.code).toBe(2);
+  expect(status.stdout).toBe("");
+  expect(status.stderr).toContain("INVALID_SYNTAX: unsupported argument daemon");
+  expect(await readdir(parent)).toEqual(["pi-dashboard"]);
+  expect((await readdir(join(previousRoot, "sessions"))).sort()).toEqual(["alpha.json", "beta.json", "delta.json", "gamma.json"]);
+  await expect(lstat(root)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 it("still refuses when both roots hold sessions", async () => {

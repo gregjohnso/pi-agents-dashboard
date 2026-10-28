@@ -48,9 +48,25 @@ export async function runViewerTransition({ sessionId, client, controller, creat
     // Detaching is cleanup, not a precondition for drawing the list. The client keeps the promise so
     // a later attach for this session still waits behind it; the operator does not.
     if (attached) void client.detach(sessionId).catch(() => {});
-    if (restoreList && shouldRestore()) { await controller.open(); markTransition("list-reopened", startedAt); }
+    if (restoreList && shouldRestore()) {
+      const reopening = controller.open();
+      const generation = controller.openGeneration;
+      void reopening.then(() => {
+        markTransition("list-reopened", startedAt);
+        if (!shouldRestore() || controller.openGeneration !== generation) return;
+        if (controller.closed) onRestoreClosed?.();
+        else if (failure !== undefined) {
+          controller.setError?.(failure, "VIEWER_OPEN_FAILED");
+          controller.requestRender?.();
+        }
+      }, (error) => {
+        if (!shouldRestore() || controller.openGeneration !== generation) return;
+        controller.setError?.(error, "DASHBOARD_OPEN_FAILED");
+        controller.requestRender?.();
+      });
+    }
     if (shouldRestore()) {
-      if (controller.closed) onRestoreClosed?.();
+      if (controller.closed) { if (!restoreList) onRestoreClosed?.(); }
       else {
         activateList();
         restoreListFocus();
@@ -165,15 +181,34 @@ const importViewerModules = () => Promise.all([
   import("../viewer/viewer-controller.mjs"),
 ]);
 
-/** Open the relocated list and real viewer in one package-root TUI. @param {any} options */
-export async function createStandaloneList({ cwd, frontend, terminal: hostTerminal = new ProcessTerminal(), copySelection = undefined, openUrl = undefined, loadViewerModules = importViewerModules }) {
-  const token = (await fs.readFile(join(frontend.root, "daemon", "control.token"), "utf8")).trim();
-  const client = createDaemonClient({ socketPath: join(frontend.root, "daemon", "control.sock"), token, maxBytes: 1024 * 1024, clientId: frontend.clientId, attachId: frontend.attachId });
+/**
+ * Open the relocated list and real viewer in one package-root TUI.
+ *
+ * Two optional injections exist for the native-session prototype, and both default to today's
+ * behaviour exactly:
+ *
+ * - `client` replaces the daemon client this function otherwise constructs. Passing one does not change
+ *   what the list, composer or navigation do; it changes only where rows and launches come from.
+ * - `openViewer` replaces the reconstructed RPC viewer this function otherwise opens on Right/Enter.
+ *   It is handed `(sessionId, context)` where `context` carries the pieces an opener needs to take and
+ *   give back this terminal: the host `tui`, the `controller`, the injected `client`, and the same
+ *   `runViewerTransition` the default path uses.
+ *
+ * With neither passed, the installed default path is byte-for-byte what it was.
+ * @param {any} options
+ */
+export async function createStandaloneList({ cwd, frontend, terminal: hostTerminal = new ProcessTerminal(), copySelection = undefined, openUrl = undefined, loadViewerModules = importViewerModules, client: injectedClient = undefined, openViewer: injectedOpenViewer = undefined, paintBeforeFirstLoad = false }) {
+  const client = injectedClient ?? await (async () => {
+    const token = (await fs.readFile(join(frontend.root, "daemon", "control.token"), "utf8")).trim();
+    return createDaemonClient({ socketPath: join(frontend.root, "daemon", "control.sock"), token, maxBytes: 1024 * 1024, clientId: frontend.clientId, attachId: frontend.attachId });
+  })();
   const terminal = createWheelInputTap(hostTerminal);
   const tui = createHostTui(terminal, { copySelection, openUrl });
   const viewerState = new Map();
   let resolveClosed;
   let switching = false;
+  /** Set as soon as a quit begins, so a first load still in flight cannot start or repaint the screen after it. */
+  let closingStarted = false;
   let activeViewer;
   let active;
   /** @type {string | undefined} */
@@ -243,18 +278,77 @@ export async function createStandaloneList({ cwd, frontend, terminal: hostTermin
     }
   };
   const controller = new DashboardController({
-    client, openViewer: openRealViewer,
+    client, openViewer: injectedOpenViewer === undefined
+      ? openRealViewer
+      : async (sessionId) => {
+        // The same switching/active bookkeeping the default opener keeps. Without it `onClose` sees no viewer
+        // and no switch in progress, reads the transition's deliberate `controller.close()` as the operator
+        // quitting, and ends the whole frontend - so opening a session printed "left the manager" and the
+        // operator had nothing to come back to.
+        if (switching || activeViewer !== undefined) return;
+        switching = true;
+        try {
+          await injectedOpenViewer(sessionId, {
+            tui, client, controller, runViewerTransition,
+            activateViewer(viewer) {
+              activeViewer = viewer ?? {};
+              active = viewer ?? controller;
+            },
+            activateList() {
+              activeViewer = undefined;
+              active = controller;
+              standaloneHost.setLayout(undefined);
+              if (pendingDashboardAction === "new_session") controller.focusComposer();
+              pendingDashboardAction = undefined;
+            },
+            shouldRestore() { return !shutdown.started; },
+            onRestoreClosed() { tui.stop({ preserveScreen: true }); resolveClosed(); },
+          });
+        } catch (error) {
+          controller.setError?.(error, "VIEWER_OPEN_FAILED");
+          tui.requestRender();
+        } finally {
+          switching = false;
+        }
+      },
     clientId: frontend.clientId, sourceSessionId: `dashboard-${frontend.clientId}`,
     launchDefaults: { cwd }, requestRender: () => tui.requestRender(),
-    onClose: () => { if (!switching && activeViewer === undefined) { tui.stop({ preserveScreen: true }); resolveClosed(); } },
+    onClose: () => {
+      if (!switching && activeViewer === undefined) {
+        // Recorded before the screen goes, so a first load still in flight cannot come back and repaint it.
+        closingStarted = true;
+        tui.stop({ preserveScreen: true });
+        resolveClosed();
+      }
+    },
   });
   const shutdown = createHostShutdown({ currentViewer: () => activeViewer, controller, tui, client, resolveClosed: () => resolveClosed() });
   active = controller;
   standaloneHost = mountStandaloneHost({ tui, getActive: () => active, terminal });
-  await controller.open();
-  startStandaloneTui(tui);
+  if (paintBeforeFirstLoad) {
+    // The first load reads every session, and a wedged owner makes that slow. Awaiting it before starting the
+    // screen is what left a blank terminal with nothing to look at and nothing to quit.
+    //
+    // `controller.open()` sets its status to "loading" synchronously, before its first await, so starting the
+    // screen now paints the EXISTING loading surface - not a blank frame and not an empty list that would read
+    // as "no sessions". Rows appear as the read completes.
+    //
+    // Opt-in, so the daemon-backed default keeps the order it was qualified with.
+    const opening = controller.open();
+    if (!closingStarted) startStandaloneTui(tui);
+    await opening;
+    // A quit during the load already stopped the screen. Retire this open so nothing it scheduled - the summary
+    // refresh included - can repaint a stopped screen or take stdin back.
+    if (closingStarted) await controller.close().catch(() => {});
+  } else {
+    await controller.open();
+    if (!closingStarted) startStandaloneTui(tui);
+  }
   return {
     closed,
-    close() { return shutdown.run(); },
+    close() {
+      closingStarted = true;
+      return shutdown.run();
+    },
   };
 }

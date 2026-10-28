@@ -23,9 +23,20 @@
 # `packages/coding-agent/src/core/{native-bootstrap,native-presentation}.ts`. It is generated against the tree
 # 0001-0005 leave behind and applies only at this position; it is last because every file it touches is a file
 # an earlier patch already rewrote.
+#
+# 0007 carries the processed-input provenance to the public input listener, and nothing else. `handleTerminalInput`
+# has held the parsed sequence's `NativeInputProvenance` since 0002, but it was a local parameter: the only public
+# carrier was `authorizeReturn`, which fires for a Return key alone. So an out-of-process host could see the origin
+# of a Return and of nothing else, and a host-recognised gesture on any other key had no way to tell a single-origin
+# sequence from one native framing assembled out of two attachments' bytes. This widens `TuiInputListener` with an
+# OPTIONAL second parameter and passes the provenance already in scope at the single call site. It is additive and
+# backward compatible: a one-argument listener is unchanged, and the type keeps accepting one. It adds no seam, no
+# registration and no new decision point. Generated against the tree 0001-0006 leave behind, and last because
+# `packages/tui/src/tui.ts` is a file 0002, 0003 and 0006 already rewrote.
 0001-seam-a-native-submission-barrier.patch
 0002-native-ingress-return-profile.patch
 0003-native-presentation-readiness.patch
 0004-native-canonical-admission.patch
 0005-native-child-handoff.patch
 0006-native-consumer-capabilities.patch
+0007-native-input-listener-provenance.patch

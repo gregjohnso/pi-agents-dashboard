@@ -24,7 +24,7 @@
  * uncertainty fails. The standalone run and the Vitest wrapper read that same verdict.
  */
 
-import { cp, mkdir, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { ReadStream } from "node:tty";
 import { fileURLToPath } from "node:url";
@@ -90,6 +90,42 @@ export function describeOwnerExit(exit) {
 }
 
 /** Escape sequences are the transport, not the content: assertions read the text a human would see. */
+/**
+ * Wait until an attachment has been confirmed, reading the attachment's OWN log rather than the screen.
+ *
+ * Every harness here used to wait for the client's `attached as ...` line to appear in the visible screen. That
+ * only worked because the client printed it into the terminal Pi owns - which is the defect being corrected, and
+ * the reason those barriers are now read from `attach-diagnostics.log` instead. The wait is a bounded poll of a
+ * file, not a sleep: it ends as soon as the line is there.
+ *
+ * @param {string} root @param {string} needle @param {number} count @param {string} label @param {number} [timeoutMs]
+ */
+export async function waitForAttachmentDiagnostic(root, needle, count, label, timeoutMs = 120_000) {
+  const logPath = path.join(root, "attach-diagnostics.log");
+  const deadline = Date.now() + timeoutMs;
+  let seen = "";
+  while (Date.now() < deadline) {
+    seen = await readFile(logPath, "utf8").catch(() => "");
+    if (seen.split(needle).length - 1 >= count) return seen;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`${label}: ${needle} appeared fewer than ${count} time(s) in ${logPath} within ${timeoutMs}ms; log was ${JSON.stringify(seen.slice(-800))}`);
+}
+
+/**
+ * Wait until a SPECIFIC attachment epoch has been confirmed, reading the attachment's own log.
+ *
+ * Epoch-scoped on purpose. A plain occurrence count over an append-only log is satisfied by lines an earlier
+ * attachment already wrote, so a "reopened" barrier could pass before the reopen happened. Epochs are issued by
+ * the manager and increase per attachment id, so `epoch N to owner pid` can only be written by the Nth
+ * attachment of that id.
+ *
+ * @param {string} root @param {number} epoch @param {string} label @param {number} [timeoutMs]
+ */
+export async function waitForAttachmentEpoch(root, epoch, label, timeoutMs = 120_000) {
+  return waitForAttachmentDiagnostic(root, `epoch ${epoch} to owner pid`, 1, `${label} (epoch ${epoch})`, timeoutMs);
+}
+
 export function stripSequences(text) {
   return text
     .replace(/\u001b[\]_P^][\s\S]*?(?:\u0007|\u001b\\)/gu, "")
@@ -99,8 +135,10 @@ export function stripSequences(text) {
 }
 
 /** One process on its own pseudo-terminal, with event-driven waits over what it printed. */
-async function openPtyProcess({ args, label, spawned }) {
-  const handle = await openOwnerPty({ command: process.execPath, args, env: CLIENT_ENV, cwd: "/tmp", cols: COLS, rows: ROWS });
+export async function openPtyProcess({ args, label, spawned, env = undefined, cols = COLS, rows = ROWS }) {
+  // `env` is additive and optional: the sanitised CLIENT_ENV is still the whole base, so a caller can
+  // pass a private variable without a test ever inheriting the operator's environment.
+  const handle = await openOwnerPty({ command: process.execPath, args, env: { ...CLIENT_ENV, COLUMNS: String(cols), LINES: String(rows), ...(env ?? {}) }, cwd: "/tmp", cols, rows });
   const stream = new ReadStream(handle.masterFd);
   let raw = "";
   const waiters = [];
@@ -179,7 +217,7 @@ async function openPtyProcess({ args, label, spawned }) {
 }
 
 /** Stop one process this smoke started, and only while its recorded identity still matches. */
-async function stopIdentifiedProcess(identity, label) {
+export async function stopIdentifiedProcess(identity, label) {
   const outcome = await stopVerifiedProcessGroup(
     { pid: identity.pid, processGroupId: identity.processGroupId, startIdentity: identity.startIdentity },
     { inspect: (pid) => inspectProcessIdentity(pid), requestGraceful: async () => {}, signalProcessGroup, sleep },
@@ -212,7 +250,7 @@ async function cleanUpAfterFailure({ root, spawned, owner }) {
 }
 
 /** One demo command, run to completion, with its stdout captured. Exit status is asserted, never ignored. */
-async function demoCommand(args, { label, spawned }) {
+export async function demoCommand(args, { label, spawned }) {
   const process_ = await openPtyProcess({ args: [DEMO, ...args], label, spawned });
   const exit = await process_.waitForExit();
   if (exit.code !== 0) {
@@ -280,7 +318,7 @@ async function driveSmoke({ root, evidenceDir, spawned, recordOwner }) {
   note("attach client-1", attachOneArgs);
   const attachFrom = Date.now();
   const clientOne = await openPtyProcess({ args: attachOneArgs, label: "client-1", spawned });
-  await clientOne.waitFor((visible) => visible.includes("attached as client-1 epoch 1"), "client-1 welcome");
+  await waitForAttachmentDiagnostic(root, "attached as client-1 epoch 1", 1, "client-1 welcome");
   await clientOne.waitFor((visible) => visible.includes("native-session-demo"), "the first cold presentation");
   at("firstAttachToPaintMs", attachFrom);
   steps.push({ step: "attach-client-1-epoch-1", elapsedMs: timings.firstAttachToPaintMs });
@@ -339,7 +377,7 @@ async function driveSmoke({ root, evidenceDir, spawned, recordOwner }) {
   note("reattach client-1", reattachArgs);
   const reattachFrom = Date.now();
   const clientOneAgain = await openPtyProcess({ args: reattachArgs, label: "client-1-epoch-2", spawned });
-  await clientOneAgain.waitFor((visible) => visible.includes("attached as client-1 epoch 2"), "client-1 epoch 2 welcome");
+  await waitForAttachmentDiagnostic(root, "attached as client-1 epoch 2", 1, "client-1 epoch 2 welcome");
   await clientOneAgain.waitFor((visible) => visible.includes(DRAFT), "the retained draft on the repainted screen");
   at("reattachToRetainedDraftMs", reattachFrom);
   steps.push({ step: "reattach-client-1-epoch-2", elapsedMs: timings.reattachToRetainedDraftMs, retainedDraft: DRAFT });
@@ -349,7 +387,7 @@ async function driveSmoke({ root, evidenceDir, spawned, recordOwner }) {
   note("attach client-2", attachTwoArgs);
   const secondFrom = Date.now();
   const clientTwo = await openPtyProcess({ args: attachTwoArgs, label: "client-2", spawned });
-  await clientTwo.waitFor((visible) => visible.includes("attached as client-2 epoch 1"), "client-2 welcome");
+  await waitForAttachmentDiagnostic(root, "attached as client-2 epoch 1", 1, "client-2 welcome");
   await clientTwo.waitFor((visible) => visible.includes(DRAFT), "the shared draft on client-2's own cold presentation");
   at("secondAttachToSharedDraftMs", secondFrom);
 

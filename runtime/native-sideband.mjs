@@ -51,7 +51,30 @@ const MAX_REPORTED_NAME_LENGTH = 64;
 const MAX_FACT_ENTRIES = 32;
 const MAX_FACT_TEXT_LENGTH = 4096;
 const FACT_NAME = /^[a-z][A-Za-z0-9]{0,39}$/u;
-const REQUESTS = ["stop", "abort"];
+const REQUESTS = ["stop", "abort", "rename"];
+/**
+ * `rename` is the one request that carries an argument, so it is the one request whose frame shape differs.
+ *
+ * Compatibility rule, and the reason the shapes are checked per request rather than as one widened frame:
+ * `stop` and `abort` keep their EXACT existing four-field shape, so a peer of either vintage still validates
+ * them identically. `rename` requires its own exact five-field shape with a non-empty validated name. An owner
+ * built before this existed refuses `rename` as `malformed-frame`, and a refusal destroys the link - which is
+ * why the host must never send one speculatively. The manager gates sending on a capability the CURRENT owner
+ * generation advertised, so an older owner is answered locally and never receives the frame at all.
+ */
+const RENAME_REQUEST = "rename";
+const MAX_SESSION_NAME_LENGTH = 128;
+// The same class of characters the dashboard already refuses to render. A name is one line of display text.
+const NAME_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
+
+/** A session display name that is safe to carry, store and render. @param {unknown} value */
+export function isNativeSessionName(value) {
+  return typeof value === "string"
+    && value.trim() === value
+    && value.length > 0
+    && value.length <= MAX_SESSION_NAME_LENGTH
+    && !NAME_CONTROL_CHARACTERS.test(value);
+}
 /**
  * What a receipt may claim. There is deliberately no completed outcome: `ctx.shutdown()` is request-only
  * and idle-deferred, so only the worker observing a reaped exit completes a stop.
@@ -64,10 +87,10 @@ const MISSING_METHODS = ["shutdown", "abort", "isIdle", "hasPendingMessages"];
 /** @typedef {{ type: "owner-ready", phase: "bridge" }} OwnerReadyFrame */
 /** @typedef {{ type: "owner-seams", reported: Record<string, unknown> }} OwnerSeamsFrame */
 /** @typedef {{ type: "owner-facts", facts: Record<string, string|number|boolean> }} OwnerFactsFrame */
-/** @typedef {{ requestId: string, request: "stop"|"abort", outcome: "requested"|"deferred"|"no-run"|"unsupported", idle?: boolean, pendingMessages?: boolean, missing?: string }} OwnerReceipt */
+/** @typedef {{ requestId: string, request: "stop"|"abort"|"rename", outcome: "requested"|"deferred"|"no-run"|"unsupported", idle?: boolean, pendingMessages?: boolean, missing?: string }} OwnerReceipt */
 /** @typedef {OwnerReceipt & { type: "owner-receipt" }} OwnerReceiptFrame */
 /** @typedef {OwnerReadyFrame|OwnerSeamsFrame|OwnerFactsFrame|OwnerReceiptFrame} OwnerFrame */
-/** @typedef {{ type: "owner-request", requestId: string, request: "stop"|"abort" }} HostRequestFrame */
+/** @typedef {{ type: "owner-request", requestId: string, request: "stop"|"abort" }|{ type: "owner-request", requestId: string, request: "rename", name: string }} HostRequestFrame */
 /** @typedef {{ ok: any, refusal?: undefined }|{ ok?: undefined, refusal: SidebandRefusal }} FrameVerdict */
 /** @typedef {{ refusal: SidebandRefusal|undefined }} SidebandClose */
 
@@ -188,9 +211,17 @@ function validateHostFrame(value) {
   const frame = value;
   if (frame.protocol !== NATIVE_SIDEBAND_PROTOCOL) return { refusal: "unknown-protocol" };
   if (frame.type !== "owner-request") return { refusal: "unknown-frame" };
+  if (typeof frame.request !== "string" || !REQUESTS.includes(frame.request)) return { refusal: "malformed-frame" };
+  // Per-request exact shapes: a name belongs to `rename` and nowhere else, so a `stop` carrying one is
+  // malformed and a `rename` missing one is malformed. Neither is a payload bag.
+  if (frame.request === RENAME_REQUEST) {
+    if (!exact(frame, ["protocol", "type", "requestId", "request", "name"])) return { refusal: "malformed-frame" };
+    if (!identifier(frame.requestId)) return { refusal: "malformed-frame" };
+    if (!isNativeSessionName(frame.name)) return { refusal: "malformed-frame" };
+    return { ok: { type: "owner-request", requestId: frame.requestId, request: frame.request, name: frame.name } };
+  }
   if (!exact(frame, ["protocol", "type", "requestId", "request"])) return { refusal: "malformed-frame" };
   if (!identifier(frame.requestId)) return { refusal: "malformed-frame" };
-  if (typeof frame.request !== "string" || !REQUESTS.includes(frame.request)) return { refusal: "malformed-frame" };
   return { ok: { type: "owner-request", requestId: frame.requestId, request: frame.request } };
 }
 
@@ -810,6 +841,10 @@ export async function listenForOwnerSideband(options) {
           requestStop: (requestId) => link.send({ type: "owner-request", requestId, request: "stop" }, validateHostFrame),
           /** @param {string} requestId */
           requestAbort: (requestId) => link.send({ type: "owner-request", requestId, request: "abort" }, validateHostFrame),
+          // `link.send` validates with the same validator the receiver uses, so an invalid name is refused at
+          // the sending boundary and no bytes reach the owner.
+          /** @param {string} requestId @param {string} name */
+          requestRename: (requestId, name) => link.send({ type: "owner-request", requestId, request: RENAME_REQUEST, name }, validateHostFrame),
           close: link.close,
         }),
       },

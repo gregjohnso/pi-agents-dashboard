@@ -1,27 +1,13 @@
 #!/usr/bin/env node
 
-import { initializeRuntimePermissions } from "../runtime/permissions.mjs";
-import { adoptRenamedStateRoot } from "../runtime/state-root-adoption.mjs";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
-initializeRuntimePermissions();
+import { runNativeCli } from "../cli/native-main.mjs";
 
-// Resolve the state root once, before anything else reads it, so the frontend, the daemon it
-// starts, and the workers that daemon spawns all agree on exactly one root for this run.
-async function main() {
-  let adoption;
-  try {
-    adoption = await adoptRenamedStateRoot({ env: process.env });
-  } catch (error) {
-    process.stderr.write(`${/** @type {any} */ (error)?.code ?? "STATE_ROOT_UNUSABLE"}: ${error instanceof Error ? error.message : String(error)}\n`);
-    return 1;
-  }
-  // Marked as a notice because it is one: adoption succeeded and this run continues on the root it
-  // names. Unmarked, it stood alone on stderr above a real error and was read as the failure.
-  if (adoption.message !== undefined) process.stderr.write(`notice: ${adoption.message}\n`);
-  process.env.PI_AGENTS_STATE_DIR = adoption.root;
-
-  const { runCli } = await import(new URL("../cli/main.mjs", import.meta.url).href);
-  return runCli();
+export async function main(argv = process.argv.slice(2), deps = {}) {
+  return runNativeCli(argv, deps);
 }
 
-process.exitCode = await main();
+const isMain = process.argv[1] !== undefined && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+if (isMain) process.exitCode = await main();

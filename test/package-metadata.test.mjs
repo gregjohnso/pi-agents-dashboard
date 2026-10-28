@@ -11,6 +11,8 @@ it("ships only the standalone executable", () => {
   expect(manifest.scripts.preinstall).toBeUndefined();
   expect(manifest.scripts.postinstall).toBeUndefined();
   expect(manifest.files).toContain("app/**/*.mjs");
+  expect(manifest.files).toContain("examples/native-session-demo/**/*.mjs");
+  expect(manifest.files).toContain("examples/native-session-demo/**/*.ts");
   expect(manifest.files).toContain("!**/*.test.mjs");
   expect(manifest.files).not.toContain("extensions");
   expect(manifest.dependencies).toMatchObject({

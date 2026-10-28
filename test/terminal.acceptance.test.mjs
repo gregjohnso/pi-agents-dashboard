@@ -208,11 +208,12 @@ it("drives list navigation, search/filter/sort/group, metadata/help, composer, c
   f.dashboard.handleInput("\x1b[C");
   await vi.waitFor(() => expect(openViewer).toHaveBeenCalledTimes(2));
   // Ctrl+F opens search and the letters type into it; app/list/dashboard.test.mjs owns the
-  // full chord-to-query table for every filter, sort and group facet.
+  // category/value controls for every filter, sort and group facet.
   for (const input of ["\x06", "l", "i", "v", "e", "\r"]) f.dashboard.handleInput(input);
   expect(f.dashboard.query).toMatchObject({ search: "live" });
   f.dashboard.clearFilters();
-  f.dashboard.handleInput("\x05");
+  while (f.dashboard.controlCategory !== "metadata") f.dashboard.handleInput("\x16");
+  f.dashboard.handleInput("\x14");
   expect(f.dashboard.overlay?.kind).toBe("metadata");
   f.dashboard.handleInput("\x07");
   expect(f.dashboard.overlay?.kind).toBe("help");
@@ -224,14 +225,20 @@ it("drives list navigation, search/filter/sort/group, metadata/help, composer, c
   f.dashboard.handleInput("\x1b");
   expect(f.dashboard.focus).toBe("list");
 
-  // Ctrl+X stops on the first press; a second press soon after clears the stopped session.
+  // Stopping and clearing each require a separate double-tap.
   f.dashboard.selectSession("live");
   f.dashboard.handleInput("\x18");
+  expect(f.client.stop).not.toHaveBeenCalled();
+  f.dashboard.handleInput("\x18");
   await vi.waitFor(() => expect(f.client.stop).toHaveBeenCalledWith("live", 4, "terminal-request"));
-  await vi.waitFor(() => expect(f.dashboard.stopClearArmed).toBe(true));
+  await vi.waitFor(() => expect(f.dashboard.stopClearArmed).toBe(false));
   f.client.setSessions([session("live", { revision: 5, processState: "EXITED" }), session("saved", { revision: 7, processState: "EXITED" })]);
   await f.client.notifyListChanged();
+  f.dashboard.setView("all");
+  f.dashboard.selectSession("live");
   f.dashboard.render(80, 24);
+  f.dashboard.handleInput("\x18");
+  expect(f.client.delete).not.toHaveBeenCalled();
   f.dashboard.handleInput("\x18");
   await vi.waitFor(() => expect(f.client.delete).toHaveBeenCalledWith("live", 5, "terminal-request"));
 

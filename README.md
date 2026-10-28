@@ -1,25 +1,18 @@
 # pi-agents
 
-`pi-agents` is a terminal dashboard for installed [Pi](https://github.com/badlogic/pi-mono) sessions. It launches real `pi --mode rpc` processes, keeps them running when the dashboard closes, and opens a viewer that reads like Pi itself. It is a small dashboard over Pi. Pi still runs the agent, tools, models, and session files.
+`pi-agents` is a native terminal dashboard for Pi sessions. It starts persistent native Pi owners, keeps them running when the dashboard closes, and hands the terminal to Pi when a session opens. Pi still owns the agent, tools, model configuration, extensions, authentication, and transcripts.
 
-## Install and open the session list
+## Open the installed native app
 
-You need Node.js 22.19 or newer and below 23, and an installed `pi` executable. That upper bound is the range the suite runs against; nothing above it is tested.
+This private candidate is qualified only for Linux x86-64 with glibc. It is not a public distribution. Its installed release carries the pinned Node 22.23.2 runtime, patched Pi 0.84.3 cohort, native PTY artifact, and third-party notices.
 
-This package is not published. Install it from a checkout:
+Run `pi-agents` from the project directory. Bare invocation uses real mode, preserves that directory as the project cwd, stores dashboard metadata under `~/.pi-agents`, and uses `/tmp/pi-save-default-<uid>` for short-lived owner sockets. Pi continues to resolve its own normal configuration and transcript storage.
 
 ```bash
-npm install -g /absolute/path/to/pi-agents
 pi-agents
 ```
 
-The executable is `pi-agents`. If your shell cannot find it, the global npm prefix is not on your `PATH`; link it somewhere that is, for example `ln -s "$(npm prefix -g)/bin/pi-agents" ~/.local/bin/pi-agents`. With no arguments, it starts or connects to the per-user daemon and opens the session list. New sessions start from the directory where you ran the command.
-
-If `pi` is not on `PATH`, pass its absolute path:
-
-```bash
-pi-agents --pi-bin /absolute/path/to/pi
-```
+Use `--cwd`, `--state`, or `--sessions` for explicit overrides. `--fake --pi-config <private-dir>` is the deterministic no-provider fixture mode used by isolated validation. Legacy daemon and administrative verbs are not accepted by this native entry point.
 
 ## Launch, open, and stop sessions from the list
 
@@ -35,7 +28,9 @@ Type anywhere to compose a prompt in the box at the bottom. The box wraps and gr
 
 Use Up and Down to select a row. Page Up, Page Down, Home, and End move farther. The mouse wheel moves the selection. One click selects a row, and a second click opens it.
 
-Press Ctrl+X on a live session, then confirm to stop its worker and Pi process. After Stop completes, press Ctrl+X again within 500 ms and confirm to clear the dashboard record. For an already stopped session, press Ctrl+X twice within 500 ms, then confirm. Clearing a record does not delete Pi's session file or remove a worktree.
+Ctrl+V selects a filter or display setting; Ctrl+T cycles its values. The selected setting appears below the prompt once either key is used. Clear filters, summary refresh, and session metadata are available through the same pair.
+
+Press Ctrl+X twice within 500 ms to stop a live session. The first tap only shows a hint; it does not stop Pi. Changing selection or pressing another key cancels that first tap. The row updates when its exit is confirmed, without waiting for the rest of the list to refresh. Clearing a stopped entry requires a separate Ctrl+X double-tap within 500 ms. Clearing hides that owner's entry persistently; it does not delete Pi's session file, worktree, runtime directory, or saved owner metadata.
 
 Press `?` with an empty prompt for the full key reference. Ctrl+C clears the prompt; a second Ctrl+C within 500 ms closes the dashboard without stopping sessions.
 
@@ -53,6 +48,10 @@ A slash command in the list changes the next launch only. It does not change a r
 
 Shared-directory launches ask you to type the exact canonical path before launch.
 
+Native owners generate a session name and short dashboard description after two user requests finish. The next completed request refreshes an automatic title or retries a failed attempt, with at most two attempts per owner generation. They use an available Haiku model from Pi's existing registry and authentication, with a 10-second request bound and no fallback to the main model. This costs tokens when Haiku is available. Failures leave the existing name and record the model, stop reason, and validation failure without storing the response text. Fake mode uses only its deterministic label fixture.
+
+An explicit launch `/name` stands. Dashboard `/rename <name>` changes the selected session through Pi's public name API; inside native Pi, `/name <name>` is Pi's built-in command. Both take priority over a pending generated title. Descriptions are saved dashboard metadata tied to the confirmed Pi session, not transcript entries or changing tool activity.
+
 ## Use the viewer like Pi
 
 The viewer shows the normalized Pi transcript and uses Pi's editor components. Enter starts a prompt when Pi is idle or steers it at the next tool boundary when Pi is working. Alt+Enter queues a follow-up until the run finishes. Submitted text is listed as pending until it appears in the transcript.
@@ -67,55 +66,16 @@ Press Escape while a turn is working to interrupt it. After the turn settles, pr
 
 Two of Pi's own interactive features are not available here, because its RPC exposes no command for them: clearing the queue of messages waiting behind a running turn, and editing those queued messages. What the viewer lists as pending is its own record of what it sent, not a read of Pi's queue.
 
-## Run commands without opening the list
+## Command boundary
 
-The operator-facing commands use the same verbs as Claude Code's background sessions.
+This installed entry point opens the native dashboard only. It does not adopt an older state root and does not dispatch the previous daemon administration commands. Unsupported or conflicting arguments are refused before the dashboard, Pi configuration, or an owner is contacted.
 
-| Command | What it does |
-| --- | --- |
-| `pi-agents agents` | Opens the session list. Same as `pi-agents` with no arguments. |
-| `pi-agents agents --json` | Prints every session row as one JSON object and exits. It reads only and does not start the daemon. |
-| `pi-agents attach <full-session-id>` | Opens one session's viewer directly. Returning ends the attachment, not the session. |
-| `pi-agents logs [<full-session-id>]` | Prints a combined 256 KiB tail of that session's newest Pi stderr segment and its worker stderr, newest Pi output first. With no ID it prints the daemon's startup log. Each source's full path precedes its content, so a truncated tail says where to read further. |
-| `pi-agents stop <full-session-id> --revision <n> --yes` | Stops that session's worker and its Pi process. |
-| `pi-agents rm <full-session-id> --revision <n> --yes` | Forgets the dashboard record. It does not delete Pi's session file or remove a worktree. |
-| `pi-agents respawn <full-session-id> --revision <n> --yes` | Restarts that session's worker on the installed release. It refuses while the session is working or waiting on you, rather than interrupting the turn. |
+## Storage and lifetime
 
-An upgraded daemon adopts your running sessions rather than refusing them, and restarts a worker left on older code by itself once Pi settles that session. `respawn` is how you ask for that restart at a moment you choose. A worker newer than the daemon is never downgraded.
+Dashboard metadata under `~/.pi-agents` records owner and Pi session identities and the transcript path Pi reported. It does not contain a copied transcript. Pi chooses transcript storage from its own configuration. The short runtime root contains sockets and owner-local runtime files; changing `--sessions` selects a different runtime namespace. Cleared entries are tracked by version-1, owner-identity-scoped markers under the metadata home's `forgotten/` directory, separate from the manager's saved record.
 
-Session IDs are exact; a prefix does not match. `--revision <n>` is the `revision` in `pi-agents agents --json`, and the command refuses when the row changed underneath it.
+Closing the dashboard does not stop owners. Opening and returning from a session preserves the same owner and its unsubmitted Pi draft. Returning restores cached rows and input before refreshing session status in the background. New owners answer list-status requests without diagnostic histories; oversized detailed status replies fall back to the same compact form. A release-specific owner keeps using the code and pinned dependencies from the release that started it.
 
-`logs` works before a session's worker is ready, which is when a launch is most likely to have failed. It resolves the run directory from the record's own root-relative run hash, so it keeps working after the state root is renamed, and it refuses any source that is not a regular file the operator owns.
+## Platform and notices
 
-One recovery command has no Claude Code equivalent and stays under `session`:
-
-- `pi-agents session cleanup <full-session-id> --revision <n> --yes` removes a stopped session's managed worktree.
-
-A `stop`, `rm` or `respawn` whose answer is lost exits `DELIVERY_UNKNOWN`. There is nothing to settle: read the row with `pi-agents agents --json`, because its revision and process state are written before the answer and say whether the command landed. Reissuing against the revision you were given is refused if it already did. See [docs/command-acceptance.md](docs/command-acceptance.md).
-
-Add `--json` to any command for one machine-readable object on standard output.
-
-## Upgrading
-
-Restart the daemon and every open dashboard after upgrading:
-
-```bash
-pi-agents daemon restart
-```
-
-A running daemon holds the code it loaded at startup while it spawns workers from the code now on disk. If the two disagree, launches fail with `WORKER_PROCESS_EXITED` until the daemon restarts. Live sessions survive a daemon restart; their workers reconnect.
-
-The daemon runs on demand: it exits about 30 seconds after the last dashboard closes, so closing every dashboard and reopening one also picks up the new build. `PI_AGENTS_IDLE_EXIT_MS` changes that window, and `0` keeps the daemon running until you stop it. An exit leaves every session running; the next `pi-agents` starts a daemon that adopts them.
-
-## Troubleshooting
-
-- **`pi` cannot be found or executed:** put the installed executable on `PATH`, or start with `pi-agents --pi-bin /absolute/path/to/pi`. The override must be absolute.
-- **`NOT_GIT_REPOSITORY` or `UNBORN_HEAD`:** a worktree launch needs a Git repository with at least one commit. The dashboard checks the directory first and runs the session in it instead, so these codes mean the directory stopped being a usable repository between that check and the launch. Use `/cwd` to select another directory and launch again.
-- **`UNSUPPORTED_PI_CAPABILITY`:** the installed Pi does not provide an RPC command or event required by this dashboard. Use a compatible Pi executable.
-- **`STATE_ROOTS_SPLIT`:** two state roots both hold sessions. Stop the daemon in each, move the sessions you keep into one root, and remove the other. `pi-agents` will not merge them.
-- **A start message says a live daemon or worker still holds the state root:** the directory cannot be renamed while sessions are running. The dashboard uses the existing root and renames it on the first start after those sessions stop.
-- **`DAEMON_STILL_RUNNING`:** the daemon released its endpoint but its process still matches the identity that was published, so `stop` and `restart` refuse instead of leaving a second daemon on the same state root. Find that process by the PID in the message and end it, then run `pi-agents daemon start`.
-- **`WORKER_PROCESS_EXITED` right after an upgrade:** the daemon is running older code than the workers it spawns. Run `pi-agents daemon restart`.
-- **`DAEMON_FROM_EARLIER_RELEASE`:** the running daemon predates this release's authentication frame and refuses it. Run `pi-agents daemon restart`; it stops and starts the daemon without stopping a session, and the workers reconnect to the new one.
-- **An empty session list right after an upgrade:** the dashboard predates the current protocol. Quit it and start it again.
-- **The daemon does not start:** the error includes captured startup output when available. The same output is stored at `${PI_AGENTS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/pi-agents}/daemon/startup.log`.
+The committed PTY artifact is private Linux x86-64 glibc qualification only. Its notice and inventory ship at `vendor/pty/THIRD-PARTY-NOTICES.md` and `vendor/pty/third-party-inventory.json`. The packaged Pi cohort remains subject to its own licenses and notices; this installation is not a public redistribution approval.

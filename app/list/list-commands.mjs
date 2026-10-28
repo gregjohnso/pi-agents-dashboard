@@ -15,6 +15,7 @@ export const LIST_COMMAND_MENU = [
     { name: "/cwd", argumentHint: "<path>", summary: "working directory for the next session" },
     { name: "/isolation", argumentHint: "[worktree|shared]", summary: "worktree or shared directory" },
     { name: "/name", argumentHint: "[text]", summary: "session name; empty lets the agent name it" },
+    { name: "/rename", argumentHint: "<new name>", summary: "rename the selected session" },
     { name: "/help", argumentHint: "", summary: "the dashboard's keys and commands" },
 ];
 export const LIST_COMMANDS = LIST_COMMAND_MENU.map((command) => command.name);
@@ -22,6 +23,19 @@ export const EMPTY_DRAFT_CHOICES = Object.freeze({ models: Object.freeze([]) });
 
 const ISOLATION_MODES = { worktree: "worktree", shared: "shared_directory", shared_directory: "shared_directory" };
 const MAX_SESSION_NAME = 128;
+/**
+ * Pi's own session commands, which belong to a session and not to this list.
+ *
+ * Reproducing the operator's report against the real launcher showed `/new` and `/resume` work exactly as Pi
+ * intends once a session is open - a new identity, the same Pi process, input still landing in the editor. The
+ * only thing that failed was typing them HERE, where the answer was "Unknown command", which is true and tells
+ * the operator nothing. Naming them is not implementing them: the list still creates and resumes nothing, and
+ * they are deliberately absent from `LIST_COMMAND_MENU` so nothing offers them as if this surface owned them.
+ */
+const PI_SESSION_COMMANDS = ["/new", "/resume"];
+// The same class of characters the row renderer already refuses to print. A name is one line of display text,
+// so a newline or an escape sequence in it is not a name.
+const NAME_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
 
 /** Split one submitted line into its command name and the rest. @param {string} text */
 function split(text) {
@@ -81,10 +95,10 @@ function rejected(code, message) {
 }
 
 /**
- * Resolve one submitted list prompt into a draft edit, a picker, or a refusal.
- * A slash prompt never launches and never touches an existing session.
+ * Resolve one submitted list prompt into a draft edit, a picker, a rename, or a refusal.
+ * A slash prompt never launches. `/rename` is the only one that reaches an existing session.
  * @param {string} text @param {DraftChoices} choices
- * @returns {{kind:"not_a_command"}|{kind:"set_model",model:{provider:string,id:string}}|{kind:"pick_model"}|{kind:"set_cwd",path:string}|{kind:"set_isolation",isolationMode:string}|{kind:"pick_isolation"}|{kind:"set_name",name:string}|{kind:"help"}|{kind:"rejected",code:string,message:string}}
+ * @returns {{kind:"not_a_command"}|{kind:"set_model",model:{provider:string,id:string}}|{kind:"pick_model"}|{kind:"set_cwd",path:string}|{kind:"set_isolation",isolationMode:string}|{kind:"pick_isolation"}|{kind:"set_name",name:string}|{kind:"rename_session",name:string}|{kind:"help"}|{kind:"rejected",code:string,message:string}}
  */
 export function parseListCommand(text, choices) {
     const { name, argument } = split(text);
@@ -122,6 +136,22 @@ export function parseListCommand(text, choices) {
         if (argument.length > MAX_SESSION_NAME) return rejected("SESSION_NAME_TOO_LONG", `Session names are limited to ${MAX_SESSION_NAME} characters`);
         return { kind: "set_name", name: argument };
     }
+    // `/rename` is the one command here that reaches an EXISTING session. It never launches one and never
+    // touches the next launch's name, which is still what `/name` sets. `split` keeps everything after the
+    // command word, so the spaces inside a name survive.
+    if (name === "/rename") {
+        if (argument === "") return rejected("SESSION_RENAME_NAME_REQUIRED", "Type a name: /rename <new name>");
+        if (argument.length > MAX_SESSION_NAME) return rejected("SESSION_NAME_TOO_LONG", `Session names are limited to ${MAX_SESSION_NAME} characters`);
+        if (NAME_CONTROL_CHARACTERS.test(argument)) return rejected("SESSION_NAME_NOT_PRINTABLE", "A session name cannot contain control characters");
+        return { kind: "rename_session", name: argument };
+    }
     if (name === "/help") return { kind: "help" };
+    // Pi's own, and answered with the gesture that reaches them rather than a dead end.
+    if (PI_SESSION_COMMANDS.includes(name)) {
+        return rejected(
+            "PI_SESSION_COMMAND",
+            `${name} is Pi's own command and runs inside a session, not in this list. Open one with Enter or \u2192, then type ${name} there.`,
+        );
+    }
     return rejected("UNKNOWN_LIST_COMMAND", `Unknown command: ${name}. Known: ${LIST_COMMANDS.join(" ")}`);
 }

@@ -1,0 +1,25 @@
+diff --git a/packages/tui/src/tui.ts b/packages/tui/src/tui.ts
+index 61c4ee6..5a87786 100644
+--- a/packages/tui/src/tui.ts
++++ b/packages/tui/src/tui.ts
+@@ -72,7 +72,10 @@ export interface Component {
+ }
+ 
+ export type TuiInputListenerResult = { consume?: boolean; data?: string } | undefined;
+-export type TuiInputListener = (data: string) => TuiInputListenerResult;
++export type TuiInputListener = (
++	data: string,
++	provenance?: NativeInputProvenance,
++) => TuiInputListenerResult;
+ type PendingOsc11BackgroundQuery = {
+ 	settled: boolean;
+ 	resolve: ((rgb: RgbColor | undefined) => void) | undefined;
+@@ -1054,7 +1057,7 @@ export abstract class TuiBase extends Container implements TUI {
+ 		if (this.inputListeners.size > 0) {
+ 			let current = data;
+ 			for (const listener of this.inputListeners) {
+-				const result = listener(current);
++				const result = listener(current, provenance);
+ 				if (result?.consume) {
+ 					return;
+ 				}

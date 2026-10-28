@@ -34,6 +34,15 @@ function defaultQuery() {
     return { view: "live" };
 }
 const TASK_STATES = ["WORKING", "WAITING", "READY", "FAILED", "STOPPED"];
+/**
+ * How long a close waits for an outstanding list read before reporting that it closed.
+ *
+ * It used to wait without a bound, so a read that never answered - one wedged owner is enough - meant the quit
+ * never completed and the frontend could not be left at all. Waiting is only politeness: `beginClose` has already
+ * set `closed`, bumped the open generation and aborted the controller, so `isCurrentOpen` makes every late
+ * continuation a no-op. Proceeding after the grace therefore cannot let a late read repaint or reopen anything.
+ */
+const CLOSE_READ_GRACE_MS = 250;
 const PROCESS_STATES = ["LIVE", "SLEEPING", "EXITED", "STALE"];
 const OUTCOMES = ["NONE", "COMPLETED", "READY_FOR_REVIEW"];
 const SORT_KEYS = ["age", "id", "state", "model", "project", "activity"];
@@ -46,24 +55,26 @@ function cycleValue(values, current) {
 }
 /** Matches StopClearGesture's default window; the hint must vanish exactly when the gesture does. */
 const STOP_CLEAR_WINDOW_MS = 500;
-/**
- * The filter, sort, and group controls: the chord that runs one, and what it does.
- * Ctrl+J carries the line-feed byte, which no terminal distinguishes from Enter, so the project
- * filter answers to Ctrl+W instead.
- */
 // Summaries are background work: entering or leaving a session must never queue behind one, so the
 // refresh waits until the list has been drawn and the operator's first keys have had the socket.
 const SUMMARY_REFRESH_DELAY_MS = 750;
+const CONTROL_CATEGORIES = [
+    { name: "view", activate: (dashboard) => dashboard.cycleView() },
+    { name: "task", activate: (dashboard) => dashboard.setTaskStates(dashboard.singletonCycle(TASK_STATES, dashboard.query.taskStates)) },
+    { name: "process", activate: (dashboard) => dashboard.setProcessStates(dashboard.singletonCycle(PROCESS_STATES, dashboard.query.processStates)) },
+    { name: "outcome", activate: (dashboard) => dashboard.setOutcomes(dashboard.singletonCycle(OUTCOMES, dashboard.query.outcomes)) },
+    { name: "activity", activate: (dashboard) => dashboard.cycleActivityFilter() },
+    { name: "project", activate: (dashboard) => dashboard.setProjectPaths(dashboard.singletonCycle([...new Set(dashboard.sessions.map((session) => session.cwd))], dashboard.query.projectPaths)) },
+    { name: "sort", activate: (dashboard) => dashboard.cycleSort() },
+    { name: "group", activate: (dashboard) => dashboard.setGrouping(cycleValue(GROUPS, dashboard.query.groupBy)) },
+    { name: "clear filters", activate: (dashboard) => dashboard.clearFilters() },
+    { name: "refresh", activate: (dashboard) => dashboard.refreshSummaries() },
+    { name: "metadata", activate: (dashboard) => dashboard.toggleMetadata() },
+];
 const CONTROLS = [
     { key: Key.ctrl("f"), activate: (dashboard) => { dashboard.focus = "search"; } },
-    { key: Key.ctrl("v"), activate: (dashboard) => dashboard.cycleView() },
-    { key: Key.ctrl("t"), activate: (dashboard) => dashboard.setTaskStates(dashboard.singletonCycle(TASK_STATES, dashboard.query.taskStates)) },
-    { key: Key.ctrl("p"), activate: (dashboard) => dashboard.setProcessStates(dashboard.singletonCycle(PROCESS_STATES, dashboard.query.processStates)) },
-    { key: Key.ctrl("o"), activate: (dashboard) => dashboard.setOutcomes(dashboard.singletonCycle(OUTCOMES, dashboard.query.outcomes)) },
-    { key: Key.ctrl("a"), activate: (dashboard) => dashboard.cycleActivityFilter() },
-    { key: Key.ctrl("w"), activate: (dashboard) => dashboard.setProjectPaths(dashboard.singletonCycle([...new Set(dashboard.sessions.map((session) => session.cwd))], dashboard.query.projectPaths)) },
-    { key: Key.ctrl("s"), activate: (dashboard) => dashboard.cycleSort() },
-    { key: Key.ctrl("b"), activate: (dashboard) => dashboard.setGrouping(cycleValue(GROUPS, dashboard.query.groupBy)) },
+    { key: Key.ctrl("v"), activate: (dashboard) => dashboard.cycleControlCategory() },
+    { key: Key.ctrl("t"), activate: (dashboard) => dashboard.activateControlCategory() },
 ];
 function fitLine(line, width) {
     const clipped = truncateToWidth(line.replace(/[\r\n\u2028\u2029]/gu, " "), Math.max(0, width), "");
@@ -170,6 +181,8 @@ export class DashboardController {
     stopRetryLimit;
     clearHintTimer;
     query = defaultQuery();
+    controlCategoryIndex = 0;
+    controlTouched = false;
     focus = "list";
     composerDraft;
     composerCursor = 0;
@@ -503,12 +516,56 @@ export class DashboardController {
             case "help":
                 this.overlay = createHelpOverlay();
                 break;
+            case "rename_session":
+                // The only list command that reaches an existing session. It returns rather than breaking,
+                // because the composer is cleared only once the rename was actually accepted.
+                await this.renameSelectedSession(parsed.name);
+                return;
             case "not_a_command":
                 return;
         }
         this.setComposerPrompt("");
         if (this.status.kind === "error")
             this.status = { kind: "ready" };
+        this.requestRender?.();
+    }
+    /**
+     * Rename the session the operator has selected, through the backend's own authenticated path.
+     *
+     * The target is captured HERE, when the command is submitted, from the row the operator could actually see.
+     * A selection move or a live row reorder while the request travels therefore cannot retarget it at another
+     * session. Nothing is renamed optimistically: the row keeps its existing name until the backend reports the
+     * name the owner confirmed, so a refused or failed rename leaves the old name on screen and an error line
+     * under it.
+     * @param {string} name
+     */
+    async renameSelectedSession(name) {
+        const selected = this.selectedSession();
+        if (selected === undefined) {
+            this.status = { kind: "error", code: "NO_SESSION_SELECTED", message: "Select a session first, then type /rename <new name>" };
+            this.requestRender?.();
+            return;
+        }
+        const target = { sessionId: selected.sessionId, revision: selected.revision };
+        if (typeof this.client.rename !== "function") {
+            this.status = { kind: "error", code: "ACTION_UNSUPPORTED", message: `This list cannot rename ${target.sessionId}: its backend does not implement rename` };
+            this.requestRender?.();
+            return;
+        }
+        try {
+            await this.client.rename(target.sessionId, target.revision, this.requestId(), name);
+        }
+        catch (error) {
+            this.setError(error, "RENAME_FAILED");
+            this.requestRender?.();
+            return;
+        }
+        // Read the list back, so what appears is the name the owner confirmed rather than the one typed here.
+        const snapshot = await this.client.getState().catch(() => undefined);
+        if (snapshot !== undefined)
+            this.applySnapshot(snapshot);
+        this.setComposerPrompt("");
+        this.status = { kind: "ready" };
         this.requestRender?.();
     }
     /** Apply the highlighted value of an open picker to the draft. */
@@ -605,18 +662,10 @@ export class DashboardController {
         this.overlay = undefined;
         await this.launch(prepared.request);
     }
-    /**
-     * Ctrl+X stops a running session. A second press within the gesture window clears it, and a session
-     * that is already stopped needs the same two presses, so one keystroke can never remove anything.
-     */
+    /** First Ctrl+X arms the selected action; a second within the window stops or clears that same session. */
     pressStopClear() {
-        // The armed session, not the selected row: a stop takes its row out of a filtered view and the
-        // selection moves on, so a second press aimed at clearing what was just stopped would
-        // otherwise stop a neighbour. Explicit navigation still cancels the gesture.
-        // One stop at a time: while the daemon has not answered the last one, a second press repeats
-        // a press that is already running. Acting on it would send a second stop at a stale revision,
-        // and once the stopped row has left a filtered view it would land on the neighbour the
-        // selection moved to.
+        // Keep the first tap's target even if a background update moves the selection.
+        // Ignore extra taps while the confirmed stop is still pending.
         if (this.stopClearGesture.pendingSessionId() !== undefined)
             return;
         const armed = this.stopClearGesture.armedSessionId();
@@ -633,19 +682,15 @@ export class DashboardController {
             return;
         }
         const action = destructiveAction(selected);
-        if (action === "stop") {
-            void this.confirmSession({ ...createSessionConfirmation(selected), clearingStopped: false });
+        if (this.stopClearGesture.pressWouldAct(selected.sessionId, action)) {
+            void this.confirmSession({ ...createSessionConfirmation(selected), clearingStopped: action === "delete" });
             return;
         }
-        if (this.stopClearGesture.pressWouldClear(selected.sessionId)) {
-            void this.confirmSession({ ...createSessionConfirmation(selected), clearingStopped: true });
-            return;
-        }
-        this.armClear(selected);
+        this.armSessionAction(selected);
     }
-    /** Arm the clear and repaint once the window lapses, so the hint disappears on its own. */
-    armClear(session) {
-        this.stopClearGesture.armAfterStop(session.sessionId);
+    /** Repaint when the armed action expires so the hint disappears on its own. */
+    armSessionAction(session) {
+        this.stopClearGesture.arm(session.sessionId, destructiveAction(session));
         this.onSessionIntent?.(createSessionIntent(session));
         clearTimeout(this.clearHintTimer);
         this.clearHintTimer = setTimeout(() => this.requestRender?.(), STOP_CLEAR_WINDOW_MS + 1);
@@ -686,9 +731,10 @@ export class DashboardController {
             // A working session's record churns while the request travels, so a revision conflict means
             // "the record moved", not "do not do this". Re-aim at the newest revision and send again.
             let attemptRevision = revision;
+            let result;
             for (let attempt = 1; ; attempt += 1) {
                 try {
-                    await this.client[action](sessionId, attemptRevision, attemptRequestId);
+                    result = await this.client[action](sessionId, attemptRevision, attemptRequestId);
                     break;
                 }
                 catch (error) {
@@ -707,12 +753,10 @@ export class DashboardController {
                     await new Promise((resolve) => setTimeout(resolve, 25));
                 }
             }
-            // Arm only after the stop landed, so a single press can never remove a running session,
-            // and only while this press is still the one the operator is making.
-            if (action === "stop" && this.stopClearGesture.holds(intent)) {
-                const stopped = this.sessions.find((candidate) => candidate.sessionId === sessionId);
-                if (stopped !== undefined)
-                    this.armClear(stopped);
+            if (action === "stop" && result?.session?.sessionId === sessionId) {
+                this.applySnapshot({ sessions: this.sessions.map((session) => session.sessionId === sessionId ? result.session : session) });
+            } else if (action === "delete" && result?.deleted === true) {
+                this.applySnapshot({ sessions: this.sessions.filter((session) => session.sessionId !== sessionId) });
             }
             if (this.status.kind === "pending" && this.status.code === `${action.toUpperCase()}_SENT`)
                 this.status = { kind: "ready" };
@@ -882,16 +926,10 @@ export class DashboardController {
             this.selectBoundary(false);
         else if (matchesKey(data, Key.end))
             this.selectBoundary(true);
-        else if (matchesKey(data, Key.ctrl("e")))
-            this.toggleMetadata();
         else if (matchesKey(data, Key.ctrl("g")))
             this.toggleHelp();
         else if (data === "?" && this.composerDraft.prompt === "")
             this.toggleHelp();
-        else if (matchesKey(data, Key.ctrl("r")))
-            this.refreshSummaries();
-        else if (matchesKey(data, Key.ctrl("l")))
-            this.clearFilters();
         else {
             // Typed and pasted text always composes a prompt, wherever the cursor sits in the list.
             const printable = this.printable(data);
@@ -983,10 +1021,14 @@ export class DashboardController {
                 // The rule closes the prompt box; launch settings and the selected path are context below it.
                 const formRow = layout.dockRows >= 4 ? promptBottom + 2 : promptBottom + 1;
                 if (layout.dockRows >= 4) lines[promptBottom + 1] = sectionFooter(this.width, confirmingSharedLaunch);
-                // An armed clear is the one thing on this row worth interrupting for, and it expires on its own.
+                // Show which action the second tap would perform until the gesture expires.
+                // A load in flight is said on this same line: the list reads every session before it has rows, and
+                // an inert screen with no rows and no word for it is indistinguishable from a hang.
                 lines[formRow] = this.stopClearArmed
-                    ? paintPlainLine(` ctrl+x to clear ${this.sessionLabel(this.stopClearGesture.armedSessionId())}`, this.width, jobwatchTheme.error)
-                    : paintPlainLine(this.status.kind === "error" ? ` ${this.status.code}: ${this.status.message}  ${form}` : form, this.width, this.status.kind === "error" ? jobwatchTheme.error : jobwatchTheme.surface);
+                    ? paintPlainLine(` ctrl+x again to ${this.stopClearGesture.armedAction() === "stop" ? "stop" : "clear"} ${this.sessionLabel(this.stopClearGesture.armedSessionId())}`, this.width, jobwatchTheme.error)
+                    : paintPlainLine(this.status.kind === "error"
+                        ? ` ${this.status.code}: ${this.status.message}  ${form}`
+                        : this.status.kind === "loading" ? ` loading sessions…  ${form}` : form, this.width, this.status.kind === "error" ? jobwatchTheme.error : jobwatchTheme.surface);
                 // Which session the list is pointing at, read last: it describes the selection, not the launch.
                 if (formRow + 1 < lines.length)
                     lines[formRow + 1] = paintPlainLine(this.contextLine(), this.width, jobwatchTheme.keyHints);
@@ -1009,9 +1051,9 @@ export class DashboardController {
     applySnapshot(snapshot) {
         this.sessions = snapshot.sessions;
         this.rebuildList();
-        // An armed clear belongs to the session as it was: if it came back to life, the next press stops it.
+        // A changed action needs a new first tap; metadata-only updates keep the same intent.
         const armedSession = this.sessions.find((session) => this.stopClearGesture.armedFor(session.sessionId));
-        if (armedSession !== undefined && destructiveAction(armedSession) === "stop")
+        if (armedSession !== undefined && destructiveAction(armedSession) !== this.stopClearGesture.armedAction())
             this.stopClearGesture.cancel();
     }
     /** Put a failed launch's text back so the operator does not retype it. */
@@ -1069,6 +1111,20 @@ export class DashboardController {
             this.viewportOffset = row - height + 1;
         this.viewportOffset = Math.max(0, Math.min(this.viewportOffset, maximum));
     }
+    get controlCategory() {
+        return CONTROL_CATEGORIES[this.controlCategoryIndex].name;
+    }
+    cycleControlCategory() {
+        this.controlCategoryIndex = (this.controlCategoryIndex + 1) % CONTROL_CATEGORIES.length;
+        this.controlTouched = true;
+        this.overlay = undefined;
+        this.requestRender?.();
+    }
+    activateControlCategory() {
+        this.controlTouched = true;
+        CONTROL_CATEGORIES[this.controlCategoryIndex].activate(this);
+        this.requestRender?.();
+    }
     cycleView() {
         const next = this.query.view === "live" ? "done" : this.query.view === "done" ? "all" : "live";
         this.setView(next);
@@ -1102,9 +1158,9 @@ export class DashboardController {
         // Name the selected agent, not its worktree: an isolated session's cwd is a bare UUID that
         // tells the operator nothing about which row the line describes.
         const subject = selected === undefined ? "" : (selected.name ?? "").trim() === "" ? selected.sessionId.slice(0, 8) : `${selected.name}`;
-        if (subject === "" && filters === "")
-            return "";
-        return ` ${[subject, filters].filter((segment) => segment !== "").join("  ·  ")}`;
+        const control = this.controlTouched ? `ctrl+t: ${this.controlCategory}` : "";
+        const segments = [control, subject, filters].filter((segment) => segment !== "");
+        return segments.length === 0 ? "" : ` ${segments.join("  ·  ")}`;
     }
     /** Show filter state only once something is filtered; the keys themselves live in the footer and in Help. */
     activeFilterSummary() {
@@ -1319,7 +1375,14 @@ export class DashboardController {
     }
     async finishClose(initialError) {
         let error = initialError;
-        await Promise.allSettled([this.listReads]);
+        // Bounded: a read that never answers must not hold the quit open.
+        await Promise.race([
+            Promise.allSettled([this.listReads]),
+            new Promise((resolve) => {
+                const timer = setTimeout(resolve, CLOSE_READ_GRACE_MS);
+                timer.unref?.();
+            }),
+        ]);
         const result = error === undefined
             ? { kind: "closed" }
             : { kind: "error", code: error.code, message: error.message };

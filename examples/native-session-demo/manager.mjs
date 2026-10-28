@@ -43,11 +43,14 @@ import {
 } from "../../runtime/native-sideband.mjs";
 import { openOwnerPty } from "../../runtime/pty-mechanism.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "../../runtime/process-signaler.mjs";
+import { ATTACH_PROTOCOL } from "./client.mjs";
 import { startBootstrapSideband } from "./bootstrap-sideband.mjs";
 import { resolveCohort } from "./cohort.mjs";
 import { createRoot, demoPaths, tokenMatches, writeOwnerRecord } from "./demo-root.mjs";
+import { createSavedOwnerRecord, writeSavedOwnerSnapshot } from "./saved-owner-record.mjs";
 import { FAKE_MODEL_ID, FAKE_PROVIDER_ID } from "./fake-provider.mjs";
 import { createPendingInputQueue } from "./pending-input.mjs";
+import { ownerLaunchPlan } from "./owner-launch.mjs";
 import { createFrameReader, encodeFrame, MAX_BODY_BYTES } from "./protocol.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -76,7 +79,25 @@ const STOP_POLICY = { gracefulMs: 3_000, terminateMs: 3_000 };
  * this manager actually sent on that generation — which is why continuing owner work is never capped: a new
  * request authorises exactly one more receipt.
  */
-const BRIDGE_FRAME_BUDGET = { "owner-ready": 1, "owner-seams": 1, "owner-facts": 1 };
+/**
+ * How many of each announcement one owner generation may send.
+ *
+ * `owner-ready` and `owner-seams` are announced once by construction. `owner-facts` is a REPLACED SNAPSHOT -
+ * the consumer keeps only the latest - so a generation may publish it repeatedly as the run progresses without
+ * accumulating anything, which is what lets a row follow a session instead of freezing at startup.
+ *
+ * It therefore carries NO lifetime quota. `admit` counts every frame a generation has ever sent and refuses past
+ * the budget, so any number here is a lifetime cut-off, not a rate limit: a budget of one refused the whole
+ * generation the moment a second fact arrived, and a budget of 512 refused the long-running session it was meant
+ * to protect at report 513. What bounds a flood of snapshots is what bounds the payload and what is retained -
+ * the link's per-frame byte and queued-frame limits, `factsRecord`'s entry and text caps, and keeping only the
+ * latest - none of which cares how many times the producer speaks. Readiness and the seam table keep their
+ * budget of one, because a second of either is outside the contract rather than an update.
+ */
+const BRIDGE_FRAME_BUDGET = { "owner-ready": 1, "owner-seams": 1 };
+/** How long a rename waits for the owner's own answer before reporting that it has no confirmation yet. */
+const RENAME_CONFIRM_WAIT_MS = 5_000;
+const RENAME_CONFIRM_POLL_MS = 25;
 /**
  * How many generation events this manager keeps for inspection.
  *
@@ -126,6 +147,30 @@ const BRIDGE_LOG_LINE = 240;
 /** The one notice written when the budget runs out. Its cost is reserved, so saying so cannot overrun. */
 const BRIDGE_LOG_NOTICE = `owner bridge reached its lifetime log budget of ${BRIDGE_LOG_ENTRIES} entries and ${BRIDGE_LOG_BYTES} bytes; further bridge lines are counted in counts.logDropped and not written`;
 const BRIDGE_LOG_NOTICE_BYTES = Buffer.byteLength(BRIDGE_LOG_NOTICE, "utf8") + 1;
+const LIST_STATUS_FIELDS = [
+  "root", "owner", "geometry", "geometryRevision", "attach", "provider", "providerIsFake", "ownerMode", "projectCwd",
+  "ingressReady", "attachments", "reaped", "exit", "ownerAliveWithZeroClients", "atMs",
+];
+
+/** Protocol 1 addition: old callers retain full detail when it fits; list callers omit diagnostic history.
+ * @param {any} status @param {unknown} detail
+ */
+function encodeStatusResponse(status, detail) {
+  if (detail !== "list") {
+    try { return encodeFrame({ type: "status", status }); }
+    catch (error) { if (error.code !== "DEMO_HEADER_TOO_LARGE") throw error; }
+  }
+  const summary = {
+    ...Object.fromEntries(LIST_STATUS_FIELDS.map((key) => [key, status[key]])),
+    bridge: { facts: status.bridge?.facts },
+    durable: status.durable == null ? null : { ownerId: status.durable.ownerId },
+  };
+  try { return encodeFrame({ type: "status", status: summary, detailsOmitted: true }); }
+  catch (error) {
+    if (error.code !== "DEMO_HEADER_TOO_LARGE") throw error;
+    return encodeFrame({ type: "refused", text: "Essential status exceeds the protocol header limit; full diagnostics remain in the owner record" });
+  }
+}
 
 /**
  * The consumer side of the owner management bridge: one active generation, bounded retention.
@@ -180,7 +225,7 @@ function boundedRing(entries = BRIDGE_RECENT_ENTRIES, bytes = BRIDGE_RECENT_BYTE
   };
 }
 
-export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOSTIC_EVENTS, now = Date.now }) {
+export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOSTIC_EVENTS, now = Date.now, onFacts }) {
   let generations = 0;
   /** @type {any} */
   let active;
@@ -273,6 +318,13 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
     if (frame.type === "owner-facts") {
       // A full snapshot replaces the previous one. Merging would keep a value this snapshot omitted.
       owner.facts = frame.facts;
+      // The manager's own cue to persist. Facts arrive here whether or not any frontend is attached, which is what
+      // keeps durable state advancing while every dashboard is closed.
+      try {
+        onFacts?.(owner.facts);
+      } catch {
+        // A persistence hook that throws must not refuse the generation that published the facts.
+      }
       return;
     }
     if (frame.type === "owner-receipt") {
@@ -354,9 +406,15 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
      * stop: `ctx.shutdown()` is request-only and idle-deferred, so only this manager observing a reaped exit
      * and an absent owner ends anything. The request is recorded against the generation it was sent on, which
      * is what makes a receipt from any other generation unsolicited.
-     * @param {"stop"|"abort"} request @param {string} requestId
+     * rename: the one request carrying an argument, and the one that is capability-gated. An owner built
+     * before rename existed validates the frame as `malformed-frame`, and a refusal DESTROYS the link - so a
+     * speculative send would take down the bridge of exactly the session it was trying to rename. The gate is
+     * therefore local and belongs to the generation being written to: the capability must be advertised by the
+     * facts of the CURRENT owner generation, re-read at this boundary rather than cached from a previous owner.
+     *
+     * @param {"stop"|"abort"|"rename"} request @param {string} requestId @param {string} [name]
      */
-    async request(request, requestId) {
+    async request(request, requestId, name) {
       const owner = active;
       if (owner === undefined || owner.closed || owner.refusal !== null) {
         const absent = { request, requestId: null, generation: owner?.generation ?? null, admitted: false, sent: false, reason: "no owner generation is currently connected to the bridge", atHostMs: now() };
@@ -364,6 +422,22 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
         return absent;
       }
       owner.totals.requested += 1;
+      if (request === "rename" && owner.facts?.renameSupported !== true) {
+        // Named locally, nothing sent, nothing torn down. Read from this generation's own latest snapshot, so a
+        // capability a previous owner advertised - or one this owner has since withdrawn - never authorizes it.
+        const unsupported = {
+          request,
+          requestId: null,
+          generation: owner.generation,
+          admitted: false,
+          sent: false,
+          reason: `this owner generation does not advertise rename support, so no rename was sent to it`,
+          atHostMs: now(),
+        };
+        note({ type: "bridge-request-unsupported", request, generation: owner.generation });
+        emit(`owner bridge ${request} request refused on generation ${owner.generation}: rename support is not advertised`);
+        return unsupported;
+      }
       if (owner.awaiting.size >= BRIDGE_IN_FLIGHT_REQUESTS) {
         // A named capacity result, not an eviction and not a fabricated receipt. The requests already in flight
         // stay authorized and stay answerable; this one was never sent, so nothing is owed for it. Pi and every
@@ -387,7 +461,9 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
       // Recorded before the write, so a receipt that arrives while the write is still settling is expected.
       owner.awaiting.set(requestId, record);
       try {
-        await (request === "stop" ? owner.connection.requestStop(requestId) : owner.connection.requestAbort(requestId));
+        if (request === "rename") await owner.connection.requestRename(requestId, name);
+        else if (request === "stop") await owner.connection.requestStop(requestId);
+        else await owner.connection.requestAbort(requestId);
         record.sent = true;
         owner.totals.sent += 1;
       } catch (error) {
@@ -476,13 +552,64 @@ function launchProfile(cols, rows) {
 /**
  * @param {{ root: string, cols?: number, rows?: number, manifestPath?: string, cohortRoot?: string, log: (line: string) => void, onReady: (record: any) => void }} options
  */
-export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROWS, manifestPath, cohortRoot, log: echo, onReady }) {
+export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROWS, manifestPath, cohortRoot, mode = "fake", projectCwd, initialPromptFile, requestedProvider, requestedModel, requestedName, stateHome, piConfigHome, log: echo, onReady }) {
   const startedAtMs = Date.now();
+  const ownerMode = mode;
   const cohort = resolveCohort({ manifestPath, cohortRoot });
   const { paths, token, anchor } = await createRoot(root);
   // Every path this owner writes to, binds or unlinks. `paths` is the operator's spelling, for reporting only.
   const owned = demoPaths(anchor.anchoredRoot);
   const profile = launchProfile(cols, rows);
+
+  /**
+   * This owner's saved record, when the operator asked for a records home.
+   *
+   * Metadata only. Pi owns storage: it selects its own session directory from its own configuration, and this
+   * record simply remembers what Pi reported so a later dashboard can find the session again. Allocated before the
+   * owner is spawned so a dashboard opening immediately cannot see a live owner with no record at all. Absent
+   * `stateHome` nothing here runs and the legacy behaviour is unchanged.
+   */
+  let saved;
+  if (typeof stateHome === "string" && stateHome.trim() !== "") {
+    saved = await createSavedOwnerRecord({ recordsHome: stateHome, sessionId: path.basename(root), runtimeRoot: root });
+  }
+  /** Monotonic, so a late or duplicated snapshot can never replace a newer session or exit snapshot. */
+  let durableSequence = 0;
+  /** Serialized: snapshots are committed in causal order, one at a time. */
+  let durableChain = Promise.resolve();
+  /** @type {string|null} */
+  let durableFailure = null;
+
+  /**
+   * Commit one saved-record snapshot, manager-side.
+   *
+   * Deliberately not driven by any frontend read: the facts arrive on this manager's own bridge and the exit comes
+   * from its own wait, so the record keeps advancing while every dashboard is closed. A failure is recorded and
+   * reported as a named storage failure rather than becoming an empty success or a silent fallback.
+   *
+   * @param {{ exit?: any, stopped?: boolean }} [options]
+   */
+  const commitDurable = (options = {}) => {
+    if (saved === undefined) return durableChain;
+    const sequence = ++durableSequence;
+    const facts = Object.freeze({ ...bridgeConsumer.status().facts });
+    durableChain = durableChain.then(async () => {
+      try {
+        await writeSavedOwnerSnapshot(saved, {
+          sequence,
+          owner: ownerIdentity,
+          cwd: projectCwd,
+          facts,
+          exit: options.exit ?? exitRecord ?? null,
+          stopped: options.stopped === true,
+        });
+      } catch (error) {
+        durableFailure = `${/** @type {any} */ (error).code ?? "OWNER_RECORD_WRITE_FAILED"}: ${/** @type {Error} */ (error).message}`;
+        log(`saved owner record failure: ${durableFailure}`);
+      }
+    });
+    return durableChain;
+  };
 
   /**
    * One line, in this owner's own log file and on the caller's stream.
@@ -507,7 +634,24 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
   const clients = new Map();
   /** @type {net.Socket | undefined} */
   let ingress;
+  /** Ingress callers that have connected but not yet announced readiness. They are never the input path. */
+  const ingressCandidates = new Set();
   let ingressReady = false;
+  /**
+   * The one geometry this session's single Pi terminal is at.
+   *
+   * There is ONE shared Pi terminal, not a layout per client, so this is a single mutable value rather than
+   * anything per attachment. The policy, stated plainly: **the most recent attaching or resizing client sets
+   * the shared size, and every attachment then sees that size.** A second terminal of a different size joining,
+   * or being dragged, moves the shared terminal - the honest consequence of one Pi rendering once.
+   *
+   * The launch-fixed `profile` is deliberately NOT updated: it carries negotiated capabilities, which do not
+   * change, and Pi refuses a differing profile after negotiation. Rows and columns are mutable and live here.
+   */
+  let geometry = { cols, rows };
+  let geometryRevision = 1;
+  /** Refused resize attempts, bounded, so a rejection is visible rather than silent. */
+  const geometryRefusals = [];
   /** Bytes a client sent before the in-Pi caller was ready: bounded before admission, drained in order. */
   const pendingInput = createPendingInputQueue(PENDING_INPUT_LIMIT_BYTES);
   let inputSequence = 0;
@@ -517,7 +661,22 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
   const presentations = [];
   /** @type {any[]} */
   const childPhases = [];
+  /** Every in-Pi return gesture the manager acted on: which terminal asked, and when. Owner untouched. */
+  const returns = [];
   let bootstrapHello;
+  /**
+   * The owner's identity, promised to the bootstrap sideband before Pi exists.
+   *
+   * This listener has to be up before Pi is spawned, and `openOwnerPty` only names the owner after it has
+   * spawned it and read its birth proc snapshot - so a hello can arrive while this is still unresolved. The
+   * sideband holds such a claim rather than granting or discarding it, which is why a promise is handed over
+   * instead of a getter that would read `undefined` and have to guess.
+   */
+  let identifyOwnerForSideband;
+  /** @type {Promise<number>} */
+  const ownerIdentifiedForSideband = new Promise((resolve) => {
+    identifyOwnerForSideband = resolve;
+  });
   let stopping = false;
   /** @type {any} */
   let exitRecord = null;
@@ -546,6 +705,11 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
       }
     },
     onError: (error) => log(`sideband transport: ${error.message}`),
+    // Only the owner's own hello may take the channel, which is what stops a spawned tool that inherited this
+    // socket's path from displacing it and leaving a running session unable to repaint. The trust boundary is
+    // still filesystem permission - a 0600 socket inside a 0700 root - and a claimed pid is not a credential;
+    // it is what separates the owner from its own descendants on the far side of that boundary.
+    whenOwnerPid: ownerIdentifiedForSideband,
   });
 
   /**
@@ -557,7 +721,7 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
    * come from seam E's core bootstrap above, and the only phase this channel reports is `bridge`.
    */
   const bridgeToken = randomBytes(32).toString("hex");
-  const bridgeConsumer = createBridgeConsumer({ log });
+  const bridgeConsumer = createBridgeConsumer({ log, onFacts: () => commitDurable() });
   const bridge = await listenForOwnerSideband({ socketPath: owned.sidebandSocket, token: bridgeToken });
   log(`owner bridge listening at ${owned.sidebandSocket}`);
 
@@ -575,51 +739,64 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
   };
   void acceptBridgeOwners();
 
-  /** @param {"stop"|"abort"} request */
-  const requestThroughBridge = (request) => bridgeConsumer.request(request, randomUUID());
+  /** @param {"stop"|"abort"|"rename"} request @param {string} [name] */
+  const requestThroughBridge = (request, name) => bridgeConsumer.request(request, randomUUID(), name);
 
-  const ownerEnv = {
-    // A replaced environment, not an augmented one: the native spawn does not inherit, and this is the whole
-    // list. No API key, no operator HOME, no operator agent directory, no real session store.
-    PATH: "/usr/bin:/bin",
-    HOME: owned.home,
-    TERM: profile.term,
-    COLUMNS: String(cols),
-    LINES: String(rows),
-    LANG: "C.UTF-8",
-    PI_CODING_AGENT_DIR: owned.agent,
-    PI_CODING_AGENT_SESSION_DIR: owned.sessions,
-    PI_OFFLINE: "1",
-    PI_SKIP_VERSION_CHECK: "1",
-    PI_NATIVE_BOOTSTRAP_SOCKET: owned.bootstrapSocket,
-    // The management bridge the in-Pi extension connects out to. Its own token, not the control socket's: the
-    // control token authenticates operators and clients, and one credential for two channels would hand a
-    // bridge peer the operator's channel. Pi's own children inherit this environment, so the token bounds
-    // reachability to this user's processes rather than proving which process connected.
-    [OWNER_SIDEBAND_SOCKET_ENV]: owned.sidebandSocket,
-    [OWNER_SIDEBAND_TOKEN_ENV]: bridgeToken,
-    PI_DEMO_TUI_PACKAGE: cohort.tuiPackageRoot,
-    PI_DEMO_CONTROL_SOCKET: owned.controlSocket,
-    PI_DEMO_TOKEN: token,
-    PI_DEMO_PROFILE: JSON.stringify(profile),
-    PI_DEMO_LOG: owned.ingressLog,
+  /**
+   * Ask the owner to rename itself, then report the name the owner CONFIRMED.
+   *
+   * The send resolving only means the frame was written. The owner republishes its facts from Pi's own
+   * `getSessionName` before it answers, so this waits for that generation's receipt and then reads the facts.
+   * A wait that times out reports no confirmed name rather than echoing the requested one back as if it landed.
+   * @param {unknown} name
+   */
+  const renameThroughBridge = async (name) => {
+    const requested = typeof name === "string" ? name : null;
+    const record = await requestThroughBridge("rename", typeof name === "string" ? name : undefined);
+    const answered = () => bridgeConsumer.status().receipts.some((receipt) => receipt.requestId === record.requestId);
+    if (record.sent === true) {
+      for (let waited = 0; waited < RENAME_CONFIRM_WAIT_MS && !answered(); waited += RENAME_CONFIRM_POLL_MS) {
+        await new Promise((resolve) => setTimeout(resolve, RENAME_CONFIRM_POLL_MS));
+      }
+    }
+    const facts = bridgeConsumer.status().facts ?? {};
+    return {
+      sent: record.sent === true,
+      answered: answered(),
+      reason: record.reason ?? null,
+      requestedName: requested,
+      confirmedName: typeof facts.sessionName === "string" ? facts.sessionName : null,
+      renameError: typeof facts.renameError === "string" ? facts.renameError : null,
+    };
   };
-  const ownerArgs = [
-    "--import",
-    PRELOAD,
-    cohort.bundledCli,
-    "--tui-mode",
-    "regular",
-    "--no-extensions",
-    "-e",
-    EXTENSION,
-    "--provider",
-    FAKE_PROVIDER_ID,
-    "--model",
-    FAKE_MODEL_ID,
-    // The fake provider answers text only. Tool execution is not part of what this demo shows.
-    "-nt",
-  ];
+
+  const launch = ownerLaunchPlan({
+    mode: ownerMode,
+    preload: PRELOAD,
+    extension: EXTENSION,
+    bundledCli: cohort.bundledCli,
+    tuiPackageRoot: cohort.tuiPackageRoot,
+    profile,
+    cols,
+    rows,
+    owned,
+    token,
+    bridgeToken,
+    // Pi owns storage and selects its own session directory. The demo supplies only a private Pi CONFIGURATION
+    // home for fake automation, which is test configuration of Pi rather than a transcript-store convention.
+    piConfigHome,
+    sidebandSocketEnv: OWNER_SIDEBAND_SOCKET_ENV,
+    sidebandTokenEnv: OWNER_SIDEBAND_TOKEN_ENV,
+    fakeProviderId: FAKE_PROVIDER_ID,
+    fakeModelId: FAKE_MODEL_ID,
+    cwd: projectCwd,
+    initialPromptFile,
+    requestedProvider,
+    requestedModel,
+    requestedName,
+  });
+  const ownerEnv = launch.env;
+  const ownerArgs = launch.args;
 
   const server = net.createServer();
   await new Promise((resolve, reject) => {
@@ -630,13 +807,16 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
   });
   await chmod(owned.controlSocket, 0o600);
 
-  const handle = await openOwnerPty({ command: process.execPath, args: ownerArgs, env: ownerEnv, cwd: owned.project, cols, rows });
+  // `launch.cwd` and not `owned.project`: the isolation mode decided where this session's agent runs, and
+  // hardcoding the sealed project directory here silently discarded that decision.
+  const handle = await openOwnerPty({ command: process.execPath, args: ownerArgs, env: ownerEnv, cwd: launch.cwd, cols, rows });
   // The one place this process takes the master descriptor into a stream. The stream owns its lifetime from
   // here on, so nothing else closes that fd: a second close could land on a descriptor the runtime recycled.
   const ownerOutput = new ReadStream(handle.masterFd);
   ownerOutput.on("error", (error) => log(`owner terminal read: ${error.message}`));
 
   const ownerIdentity = { ...handle.owner, launchedAtMs: startedAtMs };
+  identifyOwnerForSideband(handle.owner.pid);
   log(`owner pid ${ownerIdentity.pid}, startIdentity ${ownerIdentity.startIdentity}, session ${ownerIdentity.sessionId}, geometry ${cols}x${rows}`);
 
   const send = (socket, header, body) => {
@@ -683,6 +863,49 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
     resumeOwnerOutputIfDrained();
   }
 
+  /** @param {unknown} value */
+  const usableDimension = (value) => Number.isInteger(value) && value >= 2 && value <= 1000;
+
+  /**
+   * Apply one client's requested size to the shared terminal.
+   *
+   * The resize reaches the owner through the PTY master (`TIOCSWINSZ` in `openOwnerPty.resize`), which is what
+   * makes Pi redraw: the owner and every child share that one size and Pi reacts to `SIGWINCH` as it would in
+   * any terminal. This is not a banner and not a spawn-time environment value.
+   *
+   * @param {{ id: string, epoch: number, socket: net.Socket }} client @param {any} header
+   */
+  function applyResize(client, header) {
+    const refuseResize = (reason) => {
+      geometryRefusals.push({ attachmentId: client.id, epoch: header.epoch ?? null, cols: header.cols ?? null, rows: header.rows ?? null, reason, atMs: Date.now() });
+      if (geometryRefusals.length > 32) geometryRefusals.splice(0, geometryRefusals.length - 32);
+      log(`refused a resize from ${client.id}: ${reason}`);
+      send(client.socket, { type: "notice", text: `resize refused: ${reason}` });
+    };
+    // The epoch the attachment actually holds, so a stale or invented one cannot move the shared terminal.
+    if (header.epoch !== undefined && header.epoch !== client.epoch) {
+      refuseResize(`epoch ${JSON.stringify(header.epoch)} is not this attachment's epoch ${client.epoch}`);
+      return;
+    }
+    if (!usableDimension(header.cols) || !usableDimension(header.rows)) {
+      refuseResize(`${JSON.stringify(header.cols)}x${JSON.stringify(header.rows)} is not a usable terminal size`);
+      return;
+    }
+    if (header.cols === geometry.cols && header.rows === geometry.rows) return;
+    try {
+      handle.resize(header.cols, header.rows);
+    } catch (error) {
+      refuseResize(`the owner's terminal refused the resize: ${/** @type {Error} */ (error).message}`);
+      return;
+    }
+    geometry = { cols: header.cols, rows: header.rows };
+    geometryRevision += 1;
+    log(`shared terminal resized to ${geometry.cols}x${geometry.rows} by ${client.id} epoch ${client.epoch} (revision ${geometryRevision})`);
+    for (const attached of clients.values()) {
+      send(attached.socket, { type: "geometry", cols: geometry.cols, rows: geometry.rows, geometryRevision, setBy: client.id });
+    }
+  }
+
   function forwardInput(entry) {
     inputSequence += 1;
     send(ingress, { type: "input", sequence: inputSequence, attachmentId: entry.attachmentId, epoch: entry.epoch, generation: entry.generation }, entry.bytes);
@@ -692,37 +915,119 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
     for (const entry of pendingInput.drain()) forwardInput(entry);
   }
 
+  /**
+   * Ask Pi to repaint the whole screen for one attachment, and say plainly whether it did.
+   *
+   * This is the ONLY thing that makes a reattachment's screen correct. Pi renders incrementally, so an
+   * attachment that opens without a cold presentation inherits whatever was on the terminal and an editor whose
+   * believed cursor is not the real one. Attaching anyway is what produced "my text ends up in the wrong place",
+   * so the answer here decides whether the attachment is allowed to proceed at all.
+   *
+   * @returns {Promise<{ presented: true }|{ presented: false, reason: string }>}
+   */
   async function presentTo(client) {
+    // Pi connects this socket from `main()` while it is still loading, before its renderer exists. A present
+    // request then waits behind that loading and is refused, so an early attachment waits for `native-mounted`.
+    await Promise.race([mounted, sleep(MOUNT_WAIT_MS)]);
     if (!sideband.connected()) {
-      send(client.socket, { type: "notice", text: "Pi has not connected to the bootstrap sideband yet, so no cold presentation was requested" });
-      return;
+      const reason = "Pi is not connected to the bootstrap sideband, so no cold presentation could be requested";
+      presentations.push({ attachmentId: client.id, epoch: client.epoch, requestedAtMs: Date.now(), error: reason });
+      log(`cold presentation for ${client.id} refused: ${reason}`);
+      return { presented: false, reason };
     }
     const requestedAtMs = Date.now();
     try {
-      const result = await sideband.present({ attachmentId: client.id, epoch: client.epoch, geometryRevision: 1 });
+      const result = await sideband.present({ attachmentId: client.id, epoch: client.epoch, geometryRevision });
       const record = { attachmentId: client.id, epoch: client.epoch, requestedAtMs, elapsedMs: Date.now() - requestedAtMs, result };
       presentations.push(record);
       log(`cold presentation for ${client.id} epoch ${client.epoch}: ${JSON.stringify(result)} in ${record.elapsedMs}ms`);
+      // Pi answering is not Pi presenting. Its own result says which, and only `presented` is a usable screen.
+      if (result?.presented !== true) {
+        return { presented: false, reason: `Pi answered the presentation request without presenting: ${JSON.stringify(result)}` };
+      }
+      // The confirmation the frontend requires before it accepts the welcome. Additive, and scoped to THIS
+      // attachment and THIS epoch so a stale one cannot be reused by a later attachment.
+      return {
+        presented: true,
+        confirmation: {
+          attachProtocol: ATTACH_PROTOCOL,
+          presented: true,
+          attachmentId: client.id,
+          epoch: client.epoch,
+          geometryRevision,
+          presentationNonce: typeof result.presentationNonce === "string" ? result.presentationNonce : null,
+        },
+      };
     } catch (error) {
       presentations.push({ attachmentId: client.id, epoch: client.epoch, requestedAtMs, error: /** @type {Error} */ (error).message });
       log(`cold presentation for ${client.id} failed: ${/** @type {Error} */ (error).message}`);
-      send(client.socket, { type: "notice", text: `cold presentation failed: ${/** @type {Error} */ (error).message}` });
+      return { presented: false, reason: `cold presentation failed: ${/** @type {Error} */ (error).message}` };
     }
+  }
+
+  /**
+   * Welcome one client whose cold presentation already succeeded.
+   *
+   * Separated from the handshake so the ordering is visible: the presentation is awaited first, and only a
+   * presented screen is ever welcomed.
+   * @param {any} client @param {any} header @param {any} coldPresentation
+   */
+  function welcomeClient(client, header, coldPresentation) {
+    log(`attached ${client.id} epoch ${client.epoch}, ${clients.size} client(s) now attached`);
+    send(client.socket, {
+      type: "welcome",
+      attachmentId: client.id,
+      epoch: client.epoch,
+      geometry: { ...geometry },
+      geometryRevision,
+      owner: ownerIdentity,
+      // The provider this owner was ACTUALLY launched with. Hardcoding the fake label here told every `--real`
+      // attachment it was talking to a fake model while Pi's own footer said otherwise.
+      provider: launch.describesProvider.label,
+      providerIsFake: launch.describesProvider.isFake,
+      ingressReady,
+      // Additive: older frontends ignore it, current ones require it. No existing field is renamed or dropped.
+      coldPresentation,
+    });
+    void header;
   }
 
   function statusRecord() {
     return {
       root,
       owner: ownerIdentity,
-      geometry: { cols, rows },
+      geometry: { ...geometry },
+      geometryRevision,
+      geometryRefusals: [...geometryRefusals],
       profileId: profile.profileId,
-      provider: `${FAKE_PROVIDER_ID}/${FAKE_MODEL_ID}`,
-      providerIsFake: true,
+      // What this manager can do for an attaching frontend. Advertised positively so a list can tell a manager it
+      // can open from one it cannot, WITHOUT guessing: a manager that predates this field is simply unreported,
+      // which is not the same as incompatible.
+      attach: { protocol: ATTACH_PROTOCOL },
+      provider: launch.describesProvider.label,
+      providerIsFake: launch.describesProvider.isFake,
+      ownerMode,
       cohort: { consumerRoot: cohort.consumerRoot, bundledCli: cohort.bundledCli, manifest: cohort.manifestPath, buildSlurmJobId: cohort.buildSlurmJobId, patchedTreeHash: cohort.patchedTreeHash },
       bootstrapPid: bootstrapHello?.pid ?? null,
+      /**
+       * The saved owner record, when the operator configured a records home. `null` everywhere when they did not,
+       * which keeps the legacy record shape and every legacy reader unchanged. Note what is absent: no transcript
+       * directory, because Pi owns that and reports it in its own facts.
+       */
+      durable: saved === undefined
+        ? null
+        : {
+          recordsHome: saved.paths.recordsHome,
+          ownerId: saved.ownerId,
+          ownerRoot: saved.paths.ownerRoot,
+          record: saved.paths.record,
+          committedSequence: saved.committedSequence(),
+          failure: durableFailure,
+        },
       readiness,
       presentations,
       childPhases,
+      returns,
       /**
        * What the owner management bridge reported, for the **current** owner generation only.
        *
@@ -767,8 +1072,16 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
           }
           role = header.role;
           if (role === "ingress") {
-            ingress = socket;
-            log(`in-Pi ingress caller connected from pid ${header.pid}`);
+            // A newly connected ingress caller is a CANDIDATE, not a replacement. It becomes the input path
+            // only when it reports `ingress-ready` for itself.
+            //
+            // This is the operator-visible defect it fixes. A second in-process registration connected and
+            // immediately went away; because arrival alone used to install it as `ingress`, its departure
+            // cleared `ingressReady` and every later keystroke was held forever while output kept flowing -
+            // "I can get in, but I can't type". A caller that never announced itself can no longer take the
+            // working one down with it.
+            ingressCandidates.add(socket);
+            log(`in-Pi ingress caller connected from pid ${header.pid} (${ingressReady ? "a ready caller is already serving input" : "no ready caller yet"})`);
             return;
           }
           if (role === "control") {
@@ -785,22 +1098,37 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
           if (superseded) detachClient(superseded, "superseded by a newer epoch of the same attachment id");
           client = { id, epoch, socket, notices: [] };
           clients.set(id, client);
-          log(`attached ${id} epoch ${epoch}, ${clients.size} client(s) now attached`);
-          send(socket, {
-            type: "welcome",
-            attachmentId: id,
-            epoch,
-            geometry: { cols, rows },
-            owner: ownerIdentity,
-            provider: `${FAKE_PROVIDER_ID}/${FAKE_MODEL_ID} (FAKE: deterministic, no model is called)`,
-            ingressReady,
-          });
-          void presentTo(client);
+          // The joining terminal's own size becomes the shared size, so the operator's window is what Pi
+          // renders at instead of whatever the owner happened to be launched with. Refused sizes are recorded
+          // and the previous geometry stands.
+          if (header.cols !== undefined || header.rows !== undefined) applyResize(client, { cols: header.cols, rows: header.rows, epoch });
+          // A fresh native presentation is a PRECONDITION of this attachment, not a courtesy after it. Pi renders
+          // incrementally, so a client welcomed without one inherits a stale screen and an editor whose believed
+          // cursor is not the real one - which is exactly the state an operator reported typing into. Asking
+          // first means a session that cannot repaint is refused with its reason instead of opening a broken
+          // view. Nothing is signalled to the owner on this path: it keeps running, and the frontend goes back
+          // to the list, so a refusal costs the operator a message rather than a session.
+          void (async () => {
+            const presentation = await presentTo(client);
+            if (presentation.presented !== true) {
+              log(`refusing ${id} epoch ${epoch}: ${presentation.reason}`);
+              clients.delete(id);
+              send(socket, { type: "refused", text: `${presentation.reason}. The session is still running and was not touched; nothing was changed.` });
+              socket.end();
+              return;
+            }
+            welcomeClient(client, header, presentation.confirmation);
+          })();
           return;
         }
 
+
         if (role === "ingress") {
           if (header.type === "ingress-ready") {
+            // Adopt the caller that announced itself, whichever connection it arrived on. A reconnecting
+            // caller therefore restores input rather than leaving the session permanently mute.
+            ingress = socket;
+            ingressCandidates.delete(socket);
             ingressReady = true;
             log(`labelled ingress ready in Pi pid ${header.pid}, tui mode ${header.tuiMode}; flushing ${pendingInput.length()} held frame(s)`);
             flushPendingInput();
@@ -811,6 +1139,19 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
               log(`Pi refused input sequence ${header.sequence}: ${header.reason}`);
               for (const attached of clients.values()) send(attached.socket, { type: "notice", text: `Pi refused a labelled input span: ${header.reason}` });
             }
+          } else if (header.type === "return-request") {
+            // One terminal, named by the attachment id AND the epoch the gesture was dispatched under. A stale
+            // epoch is refused rather than resolved to whatever now holds that id, and the owner is untouched:
+            // returning to the list is a detachment, never a shutdown.
+            const target = clients.get(header.attachmentId);
+            if (target === undefined) {
+              log(`return requested for ${header.attachmentId}, which is not attached; nothing detached`);
+            } else if (target.epoch !== header.epoch) {
+              log(`return requested for ${header.attachmentId} epoch ${header.epoch}, but epoch ${target.epoch} is attached; nothing detached`);
+            } else {
+              returns.push({ attachmentId: target.id, epoch: target.epoch, atMs: Date.now() });
+              detachClient(target, "returned to the session list from inside Pi");
+            }
           } else if (header.type === "child-terminal-phase") {
             childPhases.push({ ...header.phase, atHostMs: Date.now() });
             log(`child terminal ${header.phase.phase} ${header.phase.childPhaseId} ${header.phase.reason}`);
@@ -820,11 +1161,19 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
 
         if (role === "control") {
           if (header.type === "status") {
-            send(socket, { type: "status", status: statusRecord() });
+            if (!socket.destroyed) socket.write(encodeStatusResponse(statusRecord(), header.detail));
           } else if (header.type === "detach") {
             const targets = header.attachmentId ? [clients.get(header.attachmentId)].filter(Boolean) : [...clients.values()];
             for (const target of targets) detachClient(target, "operator detach");
             send(socket, { type: "detached", attachments: targets.map((target) => ({ attachmentId: target.id, epoch: target.epoch })), remaining: clients.size, owner: ownerIdentity, ownerReaped: handle.reapIfExited() });
+          } else if (header.type === "rename") {
+            // Renaming asks the owner and then reports what the owner CONFIRMED. The request record says only
+            // whether the ask was sent; the confirmed name comes from the facts the owner republished, so a
+            // request that was accepted but did not apply is never reported as a rename.
+            void renameThroughBridge(header.name).then(
+              (answer) => send(socket, { type: "renamed", ...answer }),
+              (error) => send(socket, { type: "renamed", sent: false, reason: String(error?.message ?? error), requestedName: null, confirmedName: null, renameError: null }),
+            );
           } else if (header.type === "stop") {
             send(socket, { type: "stopping" });
             void stop(header.keepRoot === true).then((record) => {
@@ -854,6 +1203,8 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
               // Refusing the attachment is honest; silently discarding an operator's keystrokes is not.
               detachClient(client, `the in-Pi labelled ingress was not ready and ${admission.reason}`);
             }
+          } else if (header.type === "resize") {
+            applyResize(client, header);
           } else if (header.type === "detach") {
             detachClient(client, "client requested detach");
           }
@@ -873,10 +1224,16 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
         log(`attachment ${client.id} epoch ${client.epoch} closed its connection, ${clients.size} client(s) remain`);
         resumeOwnerOutputIfDrained();
       }
-      if (role === "ingress" && ingress === socket) {
-        ingress = undefined;
-        ingressReady = false;
-        log("the in-Pi ingress caller disconnected");
+      if (role === "ingress") {
+        ingressCandidates.delete(socket);
+        if (ingress === socket) {
+          ingress = undefined;
+          ingressReady = false;
+          log("the ready in-Pi ingress caller disconnected; input is held until one announces itself again");
+        } else {
+          // A caller that never became ready takes nothing with it.
+          log(`an in-Pi ingress caller that never announced readiness disconnected; input is unaffected (ingressReady ${ingressReady})`);
+        }
       }
     });
   });
@@ -936,6 +1293,10 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
 
     const finalStatus = statusRecord();
     await writeOwnerRecord(anchor.anchoredRoot, { ...finalStatus, stopped: true });
+    // The last durable snapshot, committed and awaited BEFORE the descriptors go: it carries this stop's own
+    // observed wait status, so a frontend restarted afterwards reads the real exit instead of guessing one.
+    await commitDurable({ exit: exitRecord, stopped: true });
+    saved?.close().catch(() => {});
     // Destroying the read stream closes the master descriptor, which is this process's only claim on the
     // terminal. It happens once, after the owner is gone, and nothing closes that fd again.
     ownerOutput.destroy();
@@ -982,6 +1343,9 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
     managerLog: paths.log,
   };
   await writeOwnerRecord(anchor.anchoredRoot, record);
+  // The first durable snapshot is committed before readiness is announced, so a dashboard that opens immediately
+  // cannot see a live owner with no saved record at all.
+  await commitDurable();
   onReady(record);
 
   // A silent exit of the owner is reported, not hidden: the record keeps the real wait status.
@@ -992,6 +1356,8 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
       log(`the owner exited on its own: ${JSON.stringify(exit)}`);
       for (const client of [...clients.values()]) detachClient(client, `the owner exited: ${JSON.stringify(exit)}`);
       await writeOwnerRecord(anchor.anchoredRoot, { ...statusRecord(), stopped: false });
+      // A real observed wait status, so this is the one thing that may record an exit durably.
+      await commitDurable({ exit: exitRecord, stopped: false });
     },
     (error) => log(`waiting for the owner failed: ${error.message}`),
   );

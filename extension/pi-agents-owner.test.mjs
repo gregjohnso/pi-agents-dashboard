@@ -165,10 +165,25 @@ function createFakeCtx({ drop = [], tuiId = "tui-1", tuiMode = true, ...fields }
   return { ctx: recorder(target, reads), tui, calls, widget, reads, uiReads, sessionManagerReads };
 }
 
-it("registers for session start and session shutdown, and for nothing else", () => {
+/**
+ * The gate is "nothing undeclared", not a fixed count: every name here has to be one Pi publishes and one this
+ * extension has a stated reason to follow. The list grew as the row learned to follow a run - the agent-loop
+ * boundaries and `model_select` for live status, `session_info_changed` for a name Pi confirmed - and an entry
+ * appearing here without a reason is the failure this case is for.
+ */
+it("registers only for the Pi events it has a reason to follow", () => {
   const fake = createFakePi();
   registerOwnerExtension(fake.pi, { env: {} });
-  expect(fake.events()).toEqual(["session_shutdown", "session_start"]);
+  expect(fake.events()).toEqual([
+    // Live status: Pi's own agent-loop boundaries, kept distinct because `agent_end` is not `agent_settled`.
+    "agent_end", "agent_settled", "agent_start", "before_agent_start",
+    // The model Pi confirmed, rather than the one a launch asked for.
+    "model_select",
+    // The session name Pi confirmed, including a rename this manager asked for.
+    "session_info_changed",
+    // The session's own lifetime.
+    "session_shutdown", "session_start",
+  ]);
   expect(typeof ownerExtension).toBe("function");
 });
 

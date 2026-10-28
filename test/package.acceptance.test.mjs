@@ -64,6 +64,10 @@ it("ships one allowlisted standalone tarball without lifecycle, private, or deve
   // The owner pseudo-terminal is one module and one committed native artifact. Shipping the module without
   // the artifact would fail at the first launch on an operator's machine, not here.
   expect(listing).toContain("package/runtime/pty-mechanism.mjs");
+  expect(listing).toContain("package/examples/native-session-demo/manager-demo.mjs");
+  expect(listing).toContain("package/examples/native-session-demo/demo.mjs");
+  expect(listing).toContain("package/examples/native-session-demo/owner-preload.mjs");
+  expect(listing).toContain("package/examples/native-session-demo/owner-extension.ts");
   expect(listing).toContain("package/vendor/pty/pi-agents-owner-pty-linux-x64-gnu.node");
   // The artifact is a Rust cdylib: the crates and the Rust standard library compiled into it are shipped
   // here too, so their inventory and licence texts travel with the binary rather than staying in the repo.
@@ -83,6 +87,8 @@ it("ships one allowlisted standalone tarball without lifecycle, private, or deve
   // The owner-local management extension is allowlisted before it exists, because the release that adds it
   // must not also have to change what ships.
   expect(manifest.files).toContain("extension/*.mjs");
+  expect(manifest.files).toContain("examples/native-session-demo/**/*.mjs");
+  expect(manifest.files).toContain("examples/native-session-demo/**/*.ts");
   expect(manifest.files).toContain("vendor/pty/*.node");
   expect(manifest.files).toContain("vendor/pty/THIRD-PARTY-NOTICES.md");
   expect(manifest.files).toContain("vendor/pty/third-party-inventory.json");
@@ -105,9 +111,9 @@ it("starts package-relative code from a local install, a global install, and off
     run(npx, ["--yes", "--offline", "--cache", offlineNpx.cache, "--package", tarball, "pi-agents", "--help"], offlineNpx),
   ]);
   expect(localResult.stdout).toContain("Usage: pi-agents");
-  expect(globalResult.stdout).toContain("With no arguments");
-  expect(npxResult.stdout).toContain("pi-agents attach <full-session-id>");
-  expect(localResult.stdout).toContain("pi-agents logs [<full-session-id>]");
+  expect(globalResult.stdout).toContain("Open the native Pi session dashboard");
+  expect(npxResult.stdout).toContain("--sessions <dir>");
+  expect(localResult.stdout).not.toContain("pi-agents daemon");
   await Promise.all([local, global, offlineNpx].map(({ state }) => expect(access(state)).rejects.toMatchObject({ code: "ENOENT" })));
 }, 120_000);
 

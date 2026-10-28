@@ -153,11 +153,10 @@ describe("dashboard controller", () => {
         expect(dashboard.status).toEqual({ kind: "ready" });
         expect(client.refreshSummaries).not.toHaveBeenCalled();
         await vi.waitFor(() => expect(client.refreshSummaries).toHaveBeenCalledTimes(1), { timeout: 5_000 });
-        dashboard.handleInput("\x12");
+        dashboard.refreshSummaries();
         await vi.waitFor(() => expect(client.refreshSummaries).toHaveBeenCalledTimes(2));
     });
-    // Ctrl+X on a live session is a Stop; only a second press inside the window clears it, and
-    // both presses confirm. app/list/stop-clear-gesture.test.mjs owns the window's exact edges.
+    // A confirmed double-tap hands the stop off without blocking input.
     it("hands a destructive request off in the background and never wedges input behind it", async () => {
         let release = () => {};
         const client = new FakeDaemonClient([session("a", { processState: "LIVE" })]);
@@ -166,7 +165,8 @@ describe("dashboard controller", () => {
         await dashboard.open();
         dashboard.selectSession("a");
         dashboard.handleInput("\x18");
-        dashboard.handleInput("y");
+        expect(client.stop).not.toHaveBeenCalled();
+        dashboard.handleInput("\x18");
         // The stop travels in the background: the operator gets the list back without waiting for the daemon.
         expect(dashboard.overlay).toBeUndefined();
         expect(client.stop).toHaveBeenCalledWith("a", 1, expect.any(String));
@@ -228,6 +228,8 @@ describe("dashboard controller", () => {
         // The retry re-reads from the daemon, so the newest revision comes from there.
         client.getState = vi.fn(async () => ({ sessions: [session("a", { processState: "LIVE", revision: 9 })], cursor: nextCoverage() }));
         dashboard.handleInput("\x18");
+        expect(client.stop).not.toHaveBeenCalled();
+        dashboard.handleInput("\x18");
         await vi.waitFor(() => expect(client.stop).toHaveBeenCalledWith("a", 9, expect.any(String)));
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
         // The journal keys a command by request ID and refuses the same ID with a changed payload,
@@ -241,7 +243,8 @@ describe("dashboard controller", () => {
         await dashboard.open();
         dashboard.selectSession("a");
         dashboard.handleInput("\x18");
-        dashboard.handleInput("y");
+        expect(client.stop).not.toHaveBeenCalled();
+        dashboard.handleInput("\x18");
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "error", code: "REVISION_CONFLICT" }));
         expect(client.stop).toHaveBeenCalledTimes(3);
     });
@@ -268,26 +271,6 @@ describe("dashboard controller", () => {
         expect(client.launch).toHaveBeenCalledTimes(1);
         release();
         await vi.waitFor(() => expect(dashboard.status).toMatchObject({ kind: "ready" }));
-    });
-    it("stops on the first Ctrl+X and clears only on a second press inside the window", async () => {
-        let clock = 0;
-        const client = new FakeDaemonClient([session("a", { processState: "LIVE" })]);
-        const dashboard = controller(client, { now: () => clock });
-        await dashboard.open();
-        dashboard.selectSession("a");
-
-        // One press stops, with no prompt to confirm.
-        dashboard.handleInput("\x18");
-        await vi.waitFor(() => expect(client.stop).toHaveBeenCalledWith("a", 1, expect.any(String)));
-        expect(dashboard.overlay).toBeUndefined();
-        expect(client.delete).not.toHaveBeenCalled();
-
-        // The clear arms only once the stop has landed.
-        await vi.waitFor(() => expect(dashboard.stopClearArmed).toBe(true));
-        dashboard.applySnapshot({ sessions: [session("a", { taskState: "STOPPED", processState: "EXITED", revision: 2 })] });
-        clock = 400;
-        dashboard.handleInput("\x18");
-        await vi.waitFor(() => expect(client.delete).toHaveBeenCalledWith("a", 2, expect.any(String)));
     });
     // Operator-visible failure: each save fsynced the file and its directory, about 70 ms on a
     // network home, so a burst that saved per change stalled the list while an agent streamed. The
@@ -511,7 +494,7 @@ describe("dashboard controller", () => {
         expect(dashboard.sessions.map((record) => record.sessionId)).toEqual(["a"]);
         expect(client.unsubscribed).toBe(1);
     });
-    it("cycles every filter, sort, and grouping from its own chord", async () => {
+    it("cycles filters, sort, and grouping through the category/value pair", async () => {
         const dashboard = controller(new FakeDaemonClient([
             session("a", { taskState: "WORKING", processState: "LIVE", outcome: "NONE", activity: { kind: "approval", summary: "waiting", updatedAt: timestamp } }),
             session("b"),
@@ -520,12 +503,10 @@ describe("dashboard controller", () => {
         dashboard.handleInput("\x06");
         dashboard.handleInput("w");
         dashboard.handleInput("\r");
-        dashboard.handleInput("\x14");
-        dashboard.handleInput("\x10");
-        dashboard.handleInput("\x0f");
-        dashboard.handleInput("\x01");
-        dashboard.handleInput("\x13");
-        dashboard.handleInput("\x02");
+        for (const category of ["task", "process", "outcome", "activity", "sort", "group"]) {
+            while (dashboard.controlCategory !== category) dashboard.handleInput("\x16");
+            dashboard.handleInput("\x14");
+        }
         expect(dashboard.query).toMatchObject({ search: "w", taskStates: ["WORKING"], processStates: ["LIVE"], outcomes: ["NONE"], activityKinds: ["approval"], sort: { key: "age", direction: "asc" }, groupBy: "taskState" });
         expect(dashboard.selectedSessionId).toBe("a");
         expect(dashboard.render(80, 14).join("\n")).toContain("a");

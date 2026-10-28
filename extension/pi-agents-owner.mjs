@@ -1,4 +1,6 @@
 import { connectOwnerSideband, readOwnerSidebandEnvironment } from "../runtime/native-sideband.mjs";
+import { generateNativeLabel } from "../runtime/native-labels.mjs";
+import { summarizePromptInput } from "../runtime/summaries.mjs";
 
 /**
  * The owner-local management extension. One job: give the worker that launched this Pi a structured,
@@ -42,7 +44,7 @@ const MAX_FACT_TEXT_LENGTH = 4096;
 /** A widget for a session that has already been replaced: it renders nothing and captures nothing. */
 const EMPTY_WIDGET = { render: () => [], invalidate: () => {} };
 
-/** @typedef {{ generation: number, disposed: boolean, tui: unknown, link: any }} OwnerSession */
+/** @typedef {{ generation: number, disposed: boolean, tui: unknown, link: any, pi?: any, agentPhase?: string, renameError?: string, labelFacts?: any, labelController?: AbortController, labelWork?: Promise<void>, labelPrompts?: string[], labelMessages?: any[], pendingRequests?: number, completedRequests?: number, labelAttempts?: number, labelRunning?: boolean, automaticName?: string, automaticNameEvents?: string[], nameChanged?: boolean }} OwnerSession */
 
 /** @param {unknown} value */
 function isRecord(value) {
@@ -89,10 +91,23 @@ function failureCode(error) {
 }
 
 /** @param {any} event @param {any} ctx @param {OwnerSession} session */
-function collectFacts(event, ctx, session) {
+function collectFacts(event, ctx, session, agentPhase) {
   const sessionManager = ctx.sessionManager;
   const model = isRecord(ctx.model) ? ctx.model : undefined;
+  const pi = session.pi;
   return omitUnknown({
+    // Advertised so the manager can refuse a rename LOCALLY against an owner that cannot do it, instead of
+    // writing a frame an older owner refuses as malformed - which would destroy its bridge. Present only when
+    // Pi actually offers the public mutator, so this is a capability rather than an intention.
+    renameSupported: typeof pi?.setSessionName === "function" ? true : undefined,
+    // The name Pi CONFIRMED, read back through its own public getter. A merely requested name never appears
+    // here, so a row cannot show a rename that did not take effect.
+    sessionName: text(readThrough(pi, "getSessionName")),
+    renameError: text(session.renameError),
+    ...session.labelFacts,
+    // Which of Pi's own agent-loop events was last seen: "start", "end" or "settled". It is the event's own
+    // name and nothing inferred - Pi's `agent_end` carries no error, so no failure is ever read from it.
+    agentPhase: text(agentPhase),
     sessionReason: text(isRecord(event) ? event.reason : undefined),
     mode: text(ctx.mode),
     hasUi: typeof ctx.hasUI === "boolean" ? ctx.hasUI : undefined,
@@ -106,6 +121,34 @@ function collectFacts(event, ctx, session) {
     modelId: text(model?.id),
     thinkingLevel: text(ctx.thinkingLevel),
   });
+}
+
+/**
+ * Rename this session through Pi's own public `setSessionName`, and report only what Pi confirms.
+ *
+ * Nothing here writes a session file, injects a keystroke or keeps a display alias: Pi owns the metadata, so Pi
+ * is the only writer. A mutator this Pi does not offer is answered `unsupported`; one that throws leaves the
+ * previous name in place and records why.
+ *
+ * @param {any} request @param {OwnerSession} session
+ */
+function renameReceipt(request, session) {
+  const base = { requestId: request.requestId, request: "rename" };
+  const setSessionName = session.pi?.setSessionName;
+  if (typeof setSessionName !== "function") {
+    session.renameError = "this Pi does not offer setSessionName, so the session was not renamed";
+    return { ...base, outcome: "unsupported" };
+  }
+  try {
+    session.nameChanged = true;
+    session.pi.setSessionName(request.name);
+    session.renameError = undefined;
+    return { ...base, outcome: "requested" };
+  } catch (error) {
+    // The old name stands. `no-run` is the existing outcome for a request that did not run.
+    session.renameError = `setSessionName failed, so the previous name is unchanged: ${error instanceof Error ? error.message : String(error)}`.slice(0, 400);
+    return { ...base, outcome: "no-run" };
+  }
 }
 
 /** @param {any} ctx @param {string} requestId */
@@ -160,10 +203,23 @@ function captureTui(ctx, session, onFailure) {
 /** @param {any} request @param {any} ctx @param {OwnerSession} session @param {any} link @param {(failure: { code: string, generation: number }) => void} onFailure */
 async function answerRequest(request, ctx, session, link, onFailure) {
   if (session.disposed || session.link !== link) return;
-  const receipt = request.request === "stop"
-    ? stopReceipt(ctx, request.requestId)
-    : abortReceipt(ctx, request.requestId);
+  if (request.request === "stop") session.labelController?.abort();
+  const receipt = request.request === "rename"
+    ? renameReceipt(request, session)
+    : request.request === "stop"
+      ? stopReceipt(ctx, request.requestId)
+      : abortReceipt(ctx, request.requestId);
   if (session.disposed || session.link !== link) return;
+  // The confirmed name is published BEFORE the receipt, so nothing can read "requested" and still find the old
+  // name on the row. A receipt is an answer, not evidence the rename applied; the published fact is evidence.
+  if (request.request === "rename") {
+    try {
+      await link.publishFacts(collectFacts(undefined, ctx, session, session.agentPhase));
+    } catch (error) {
+      onFailure({ code: failureCode(error), generation: session.generation });
+    }
+    if (session.disposed || session.link !== link) return;
+  }
   try {
     await link.sendReceipt(receipt);
   } catch (error) {
@@ -212,7 +268,7 @@ async function openBridge(session, event, ctx, settings) {
  *
  * @param {{ on: (event: string, handler: (event: any, ctx: any) => unknown) => unknown }} pi
  * @param {{ env?: Record<string, string|undefined>, connect?: (target: { socketPath: string, token: string }) => Promise<any>,
- *   readReportedSeams?: () => unknown, onFailure?: (failure: { code: string, generation: number }) => void }} [options]
+ *   readReportedSeams?: () => unknown, onFailure?: (failure: { code: string, generation: number }) => void, labelTimeoutMs?: number }} [options]
  */
 export function registerOwnerExtension(pi, options = {}) {
   const settings = {
@@ -231,6 +287,7 @@ export function registerOwnerExtension(pi, options = {}) {
   const dispose = (session) => {
     if (session === undefined || session.disposed) return;
     session.disposed = true;
+    session.labelController?.abort();
     session.tui = undefined;
     const link = session.link;
     session.link = undefined;
@@ -240,11 +297,123 @@ export function registerOwnerExtension(pi, options = {}) {
   pi.on("session_start", (event, ctx) => {
     dispose(current);
     /** @type {OwnerSession} */
-    const session = { generation: generation + 1, disposed: false, tui: undefined, link: undefined };
+    const session = { generation: generation + 1, disposed: false, tui: undefined, link: undefined, pi };
     generation = session.generation;
     current = session;
     captureTui(ctx, session, settings.onFailure);
     settled = openBridge(session, event, ctx, settings);
+  });
+
+  /**
+   * Republish this session's facts, so a row can follow the run instead of freezing at startup.
+   *
+   * This reuses the bridge's existing `publishFacts` and Pi's own lifecycle events. It adds no channel and no
+   * schedule: a publish happens only when Pi says something changed, which is what keeps the manager's status
+   * a push and stops a read from causing the next read.
+   *
+   * @param {string} agentPhase @param {any} event @param {any} ctx
+   */
+  const republish = (agentPhase, event, ctx) => {
+    const session = current;
+    if (session === undefined || session.disposed) return;
+    // A model change is not an agent-loop transition, so it refreshes the observed model while leaving the
+    // phase exactly as Pi last reported it. Overwriting it would lose the fact that a run is still going.
+    if (agentPhase !== undefined) session.agentPhase = agentPhase;
+    // Chained onto the bridge's own work rather than gated on it. A fast run can start and settle before the
+    // bridge has finished connecting, and dropping those phases lost the whole state of a short task; the link
+    // is read when the publish actually runs, so the phase survives the wait.
+    settled = settled
+      .then(() => session.disposed ? undefined : session.link?.publishFacts(collectFacts(event, ctx, session, session.agentPhase)))
+      .catch((error) => settings.onFailure({ code: failureCode(error), generation: session.generation }));
+  };
+
+  // Two attempts per generation: after two completed requests, then a refresh or retry on the next request.
+  /** @param {OwnerSession} session @param {any} ctx @param {string} transcript */
+  const label = (session, ctx, transcript) => {
+    const controller = session.labelController;
+    if (controller === undefined) return;
+    session.labelWork = (session.labelWork ?? Promise.resolve()).then(async () => {
+      if (session.disposed || controller.signal.aborted) return;
+      session.labelFacts = { ...session.labelFacts, labelVersion: 1, labelStatus: "pending", labelFailureReason: undefined, labelStopReason: undefined };
+      republish(undefined, undefined, ctx);
+      const result = await generateNativeLabel(ctx.modelRegistry, transcript, {
+        signal: controller.signal, timeoutMs: options.labelTimeoutMs, fakeMode: settings.env.PI_DEMO_FAKE_PROVIDER === "1",
+      });
+      if (session.disposed || controller.signal.aborted) return;
+      session.labelFacts = {
+        ...session.labelFacts, labelVersion: 1, labelStatus: result.status,
+        labelFailureReason: result.failureReason, labelStopReason: result.stopReason,
+        labelModelProvider: result.modelProvider, labelModelId: result.modelId,
+        ...(result.description === undefined ? {} : { labelDescription: result.description }),
+      };
+      const publicPi = session.pi;
+      if (result.name !== undefined && !session.nameChanged && typeof publicPi?.getSessionName === "function" && typeof publicPi?.setSessionName === "function") {
+        try {
+          const currentName = publicPi.getSessionName();
+          if (!currentName || currentName === session.automaticName) {
+            session.automaticNameEvents = [...(session.automaticNameEvents ?? []), result.name];
+            publicPi.setSessionName(result.name);
+            session.automaticName = publicPi.getSessionName();
+          }
+        } catch {
+          session.labelFacts.labelStatus = "error";
+          session.labelFacts.labelFailureReason = "rename-failed";
+        }
+      }
+      republish(undefined, undefined, ctx);
+    }).catch(() => {
+      if (session.disposed || controller.signal.aborted) return;
+      session.labelFacts = { ...session.labelFacts, labelVersion: 1, labelStatus: "error", labelFailureReason: "request-failed" };
+      republish(undefined, undefined, ctx);
+    }).finally(() => { session.labelRunning = false; });
+  };
+
+  pi.on("before_agent_start", (event, ctx) => {
+    const session = current;
+    if (session === undefined || session.disposed || (session.labelAttempts ?? 0) >= 2 || readOwnerSidebandEnvironment(settings.env) === undefined || event.messageType === "custom" || typeof event.prompt !== "string" || !event.prompt.trim()) return;
+    session.labelController ??= new AbortController();
+    session.pendingRequests = (session.pendingRequests ?? 0) + 1;
+    session.labelPrompts = [...(session.labelPrompts ?? []), event.prompt.slice(0, 1800)].slice(-3);
+  });
+
+  // Pi's own agent-loop boundaries. `agent_settled` is the only one that means no retry, compaction or queued
+  // continuation will run, so it is kept distinct from `agent_end`.
+  pi.on("agent_start", (event, ctx) => republish("start", event, ctx));
+  pi.on("agent_end", (event, ctx) => {
+    if (current?.labelController && (current.labelAttempts ?? 0) < 2) {
+      current.labelMessages = (event.messages ?? []).slice(-40).filter((message) => message.role === "assistant" || message.role === "user").map((message) => ({
+        kind: message.role === "user" ? "user_message" : "assistant_message",
+        content: (typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content ?? []).slice(-4).filter((part) => part.type === "text").map((part) => ({ type: "text", text: part.text.slice(0, 6000) })),
+      }));
+    }
+    republish("end", event, ctx);
+  });
+  pi.on("agent_settled", (event, ctx) => {
+    republish("settled", event, ctx);
+    const session = current;
+    if (session === undefined || session.disposed || !session.pendingRequests) return;
+    session.completedRequests = (session.completedRequests ?? 0) + session.pendingRequests;
+    session.pendingRequests = 0;
+    if (session.completedRequests < 2 || session.labelRunning || (session.labelAttempts ?? 0) >= 2) return;
+    session.labelAttempts = (session.labelAttempts ?? 0) + 1;
+    session.labelRunning = true;
+    const prompts = (session.labelPrompts ?? []).map((prompt) => `User: ${prompt}`).join("\n");
+    const excerpt = summarizePromptInput(session.labelMessages ?? []).slice(-500);
+    label(session, ctx, `${prompts}\n${excerpt}`);
+    session.labelMessages = undefined;
+  });
+  // Pi owns `/model`. Observing its selection back is how a row shows the model Pi confirmed rather than the
+  // one a launch asked for.
+  pi.on("model_select", (event, ctx) => republish(undefined, event, ctx));
+  // Pi's own name-change event, so a name Pi applied for any reason - a rename asked for here, or Pi's own
+  // naming - reaches the row without this extension polling for it.
+  pi.on("session_info_changed", (event, ctx) => {
+    if (current !== undefined) {
+      // Earlier extensions can defer delivery of our own name-change event until after the setter returns.
+      if (current.automaticNameEvents?.length && current.automaticNameEvents[0] === event.name) current.automaticNameEvents.shift();
+      else current.nameChanged = true;
+    }
+    republish(undefined, event, ctx);
   });
 
   pi.on("session_shutdown", () => {

@@ -16,7 +16,7 @@ const PROMPT = [
 ].join(" ");
 
 /** @param {string} text */
-function parseSummaryReply(text) {
+export function parseSummaryReply(text) {
   const lines = text.split(/\r?\n/u).map((line) => line.trim()).filter((line) => line.length > 0);
   const titleLine = lines.find((line) => /^title:/iu.test(line));
   const summaryLine = lines.find((line) => /^summary:/iu.test(line)) ?? lines.find((line) => line !== titleLine);
@@ -26,6 +26,11 @@ function parseSummaryReply(text) {
     name: name === undefined || name.length === 0 ? undefined : name.slice(0, MAX_NAME_CHARS),
     text: summary.length === 0 ? undefined : summary.slice(0, MAX_SUMMARY_CHARS),
   };
+}
+
+/** The same bounded dashboard instruction for print mode and owner-local completions. @param {string} transcript */
+export function summaryPrompt(transcript) {
+  return `${PROMPT}\n\n${transcript.slice(-MAX_TRANSCRIPT_CHARS)}`;
 }
 
 /** Read and write the daemon's opt-in summary settings. @param {{ directory: string, fsOps?: any }} options */
@@ -74,7 +79,7 @@ export function summarizePromptInput(items) {
  */
 export async function summarizeWithPi({ executable, model, transcript, env = process.env, spawnImpl = spawn, timeoutMs = SUMMARY_TIMEOUT_MS }) {
   if (transcript.trim().length === 0) return undefined;
-  const child = spawnImpl(executable, ["--print", "--no-session", "--no-tools", "--provider", model.provider, "--model", model.id, "--", `${PROMPT}\n\n${transcript}`], { env, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawnImpl(executable, ["--print", "--no-session", "--no-tools", "--provider", model.provider, "--model", model.id, "--", summaryPrompt(transcript)], { env, shell: false, stdio: ["ignore", "pipe", "pipe"] });
   return new Promise((resolve) => {
     /** @type {Buffer[]} */
     const chunks = [];

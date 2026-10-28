@@ -16,5 +16,10 @@ export function displaySessionState(session) {
   if (session.processState === "STALE") return "STALE";
   if (session.processState === "SLEEPING") return "SLEEPING";
   if (session.processState === "EXITED") return ["launching", "replacing"].includes(session.activity.kind) ? "STARTING" : "EXITED";
+  // A producer that explicitly says it has no state to report gets an honest cell rather than the neutral
+  // contract value dressed as READY. This is additive and optional: `stateReported` absent or true behaves
+  // exactly as before, so every record that does not set it - the daemon's included - is unchanged, and no
+  // durable process-boundary enum is widened or renamed.
+  if (session.stateReported === false) return "UNKNOWN";
   return session.taskState === "WORKING" || session.taskState === "WAITING" ? session.taskState : "READY";
 }

@@ -18,6 +18,14 @@ import { createHash } from "node:crypto";
 
 export const FAKE_PROVIDER_ID = "native-session-demo-fake";
 export const FAKE_MODEL_ID = "deterministic-echo";
+/**
+ * A second labelled fixture model, so model selection is observable without a real provider.
+ *
+ * Both answer with the same deterministic reply: the point is two distinct identities the picker can offer and
+ * the owner can be told to use, not two behaviours.
+ */
+export const FAKE_MODEL_ID_ALT = "deterministic-echo-alt";
+export const FAKE_LABEL_MODEL_ID = "deterministic-haiku-labels";
 export const FAKE_MODEL_NAME = "Deterministic Echo (demo fake, no model is called)";
 export const FAKE_REPLY_PREFIX = "DEMO-FAKE-REPLY";
 
@@ -46,6 +54,12 @@ export function deterministicReply(context) {
   return `${FAKE_REPLY_PREFIX} ${digest} :: ${echo}`;
 }
 
+/** The model entries Pi registers for the fake provider. Zero cost, because nothing is spent. */
+export function fakeModelConfigs() {
+  return [fakeModelConfig(), { ...fakeModelConfig(), id: FAKE_MODEL_ID_ALT, name: `${FAKE_MODEL_NAME} (alt)` },
+    { ...fakeModelConfig(), id: FAKE_LABEL_MODEL_ID, name: "Deterministic labels (demo fake, no model is called)" }];
+}
+
 /** The model entry Pi registers for the fake provider. Zero cost, because nothing is spent. */
 export function fakeModelConfig() {
   return {
@@ -72,7 +86,9 @@ export function fakeModelConfig() {
 export function createFakeStreamSimple({ createStream }) {
   return function streamFakeProvider(/** @type {any} */ model, /** @type {any} */ context, /** @type {any} */ options) {
     const stream = createStream();
-    const reply = deterministicReply(context);
+    const reply = model.id === FAKE_LABEL_MODEL_ID
+      ? "Title: Demo fake task\nSummary: Exercises native session labels with a deterministic fake provider"
+      : deterministicReply(context);
     const output = {
       role: "assistant",
       content: /** @type {any[]} */ ([]),
@@ -102,12 +118,24 @@ export function createFakeStreamSimple({ createStream }) {
     output.content.push({ type: "text", text: "" });
     const contentIndex = output.content.length - 1;
     stream.push({ type: "text_start", contentIndex, partial: output });
-    output.content[contentIndex].text = reply;
-    stream.push({ type: "text_delta", contentIndex, delta: reply, partial: output });
-    stream.push({ type: "text_end", contentIndex, content: reply, partial: output });
-    output.stopReason = "stop";
-    stream.push({ type: "done", reason: "stop", message: output });
-    stream.end();
+    /**
+     * Finish the answer. Split out so a fixture can hold the turn open.
+     *
+     * `PI_DEMO_FAKE_DELAY_MS` exists for one reason: a reply that lands in under a millisecond means a test can
+     * never catch the session in its WORKING state, and a test that cannot see WORKING must not claim it did.
+     * It slows the FIXTURE, never the demo: unset, this is the same immediate answer as before.
+     */
+    const finish = () => {
+      output.content[contentIndex].text = reply;
+      stream.push({ type: "text_delta", contentIndex, delta: reply, partial: output });
+      stream.push({ type: "text_end", contentIndex, content: reply, partial: output });
+      output.stopReason = "stop";
+      stream.push({ type: "done", reason: "stop", message: output });
+      stream.end();
+    };
+    const holdMs = Number(process.env.PI_DEMO_FAKE_DELAY_MS ?? "0");
+    if (Number.isFinite(holdMs) && holdMs > 0) setTimeout(finish, Math.min(holdMs, 60_000));
+    else finish();
     return stream;
   };
 }

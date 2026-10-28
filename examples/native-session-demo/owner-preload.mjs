@@ -31,6 +31,7 @@ import net from "node:net";
 import path from "node:path";
 
 import { createFrameReader, encodeFrame } from "./protocol.mjs";
+import { provideReturnRequest } from "./return-channel.mjs";
 import { awaitTui } from "./tui-handover.mjs";
 
 const logPath = process.env.PI_DEMO_LOG;
@@ -66,9 +67,11 @@ const registration = tui.registerNativeAttachmentHost({
   // Seam G, explicitly and by version: this caller has a drain boundary to act on and a phase listener.
   childTerminalHandoff: { version: tui.SUPPORTED_CHILD_TERMINAL_HANDOFF_VERSION },
   authorizeReturn: (/** @type {any} */ request) => {
-    // The default editor owns the return key, so Pi does not ask. A host that answered anything but
-    // "native" here would be claiming a gesture it was never offered; the demo's detach is the manager's
-    // explicit control command instead.
+    // Seam C is not this demo's return path, and cannot be: it fires only for a Return key the focused
+    // component has declared free, and nothing in the shipped Pi declares one — the editor owns Enter for
+    // submit and shift+Enter for newline. Claiming it would take a key the operator needs. The demo's return
+    // gesture is a distinct shortcut Pi recognises through public extension API instead, so the honest answer
+    // here stays "native": this host claims no gesture it was not offered.
     record({ event: "authorizeReturn", sequenceId: request.sequenceId, origin: request.origin, decision: "native" });
     return "native";
   },
@@ -129,8 +132,13 @@ const reader = createFrameReader(
         send({ type: "input-result", sequence: header.sequence, admitted: false, reason: "ingress-not-ready" });
         return;
       }
+      const attachmentEpoch = { attachmentId: header.attachmentId, epoch: header.epoch };
+      // Nothing is tracked here for attribution. Pi computes the parsed sequence's origin itself, including
+      // whether native framing assembled it from more than one attachment or generation, and the extension
+      // reads that through the public input listener. Raw spans cannot answer the question: one span can
+      // carry half an escape sequence, and two spans can carry halves from different attachments.
       const dispatch = terminal.dispatchNativeInput({
-        attachmentEpoch: { attachmentId: header.attachmentId, epoch: header.epoch },
+        attachmentEpoch,
         bytes: new Uint8Array(body),
         binding: { generation: header.generation },
       });
@@ -156,6 +164,12 @@ connection.on("data", (chunk) => reader.push(chunk));
 
 connection.on("connect", () => {
   send({ type: "hello", role: "ingress", token, pid: process.pid });
+  // The manager owns detachment, so the gesture's whole job is to name the terminal that asked. This is the
+  // only thing published to the extension: it cannot detach anything else, and it ends no session.
+  provideReturnRequest((origin) => {
+    record({ event: "returnRequested", ...origin });
+    send({ type: "return-request", attachmentId: origin.attachmentId, epoch: origin.epoch });
+  });
   void awaitTui().then((publicTui) => {
     terminal = publicTui.terminal;
     const hasDispatch = typeof terminal?.dispatchNativeInput === "function";

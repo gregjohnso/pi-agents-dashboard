@@ -86,6 +86,18 @@ export class DashboardGestureEditor {
     set onSubmit(handler) { this.submitHandler = handler; }
     get onChange() { return this.changeHandler; }
     set onChange(handler) { this.changeHandler = handler; }
+    // Pi duck-types this map before wiring callbacks that follow its active interrupt/shortcut handlers.
+    get actionHandlers() { return this.base.actionHandlers; }
+    set actionHandlers(handlers) { this.base.actionHandlers = handlers; }
+    onAction(action, handler) { this.base.onAction(action, handler); }
+    get onEscape() { return this.base.onEscape; }
+    set onEscape(handler) { this.base.onEscape = handler; }
+    get onCtrlD() { return this.base.onCtrlD; }
+    set onCtrlD(handler) { this.base.onCtrlD = handler; }
+    get onPasteImage() { return this.base.onPasteImage; }
+    set onPasteImage(handler) { this.base.onPasteImage = handler; }
+    get onExtensionShortcut() { return this.base.onExtensionShortcut; }
+    set onExtensionShortcut(handler) { this.base.onExtensionShortcut = handler; }
     get borderColor() { return this.base.borderColor; }
     set borderColor(value) { this.base.borderColor = value; }
     get focused() { return this.base.focused; }

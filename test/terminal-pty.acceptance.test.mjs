@@ -84,8 +84,7 @@ it("navigates to New Session, clears the prompt with Ctrl+C, quits on a second p
     transcript = await readFile(transcriptPath);
   } finally {
     clearTimeout(timeout);
-    // Through the installed executable, because that is the path an operator takes and the only one
-    // that proves this entry point still stops a daemon it started under a real terminal.
+    // The native entry point starts no legacy daemon. Its old administration verb is refused by name.
     stopped = spawnSync("node", ["./bin/pi-agents.mjs", "daemon", "stop"], {
       cwd: process.cwd(), env, encoding: "utf8", timeout: 10_000,
     });
@@ -93,7 +92,8 @@ it("navigates to New Session, clears the prompt with Ctrl+C, quits on a second p
 
   expect(stage).toBe("quitting");
   expect(result).toEqual({ code: 0, signal: null });
-  expect(stopped.status).toBe(0);
+  expect(stopped.status).toBe(2);
+  expect(stopped.stderr).toContain("INVALID_SYNTAX: unsupported argument daemon");
   expect(transcript.includes(ENTER_ALT_SCREEN)).toBe(true);
   expect(transcript.includes(EXIT_ALT_SCREEN)).toBe(true);
   expect(transcript.includes(SHOW_CURSOR)).toBe(true);

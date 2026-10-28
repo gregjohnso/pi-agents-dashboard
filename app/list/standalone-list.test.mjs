@@ -94,6 +94,37 @@ it("detaches and reopens the same list when viewer construction fails", async ()
   expect(client.command).not.toHaveBeenCalled();
 });
 
+it("restores cached rows and input without waiting for a slow owner refresh", async () => {
+  let finishRefresh;
+  const refresh = new Promise((resolve) => { finishRefresh = resolve; });
+  const order = [];
+  const controller = { closed: true, async close() {}, open() { this.closed = false; order.push("refresh"); return refresh; } };
+  const transition = runViewerTransition({
+    sessionId: "s", client: { async attach() {}, async detach() {} }, controller,
+    createViewer: () => ({ async open() {}, closed: Promise.resolve(), async close() {} }),
+    activateViewer() {}, activateList() { order.push("list"); }, restoreListFocus() { order.push("input"); }, shouldRestore: () => true,
+  });
+  try {
+    await vi.waitFor(() => expect(order).toContain("input"));
+    await expect(transition).resolves.toEqual({ kind: "returned" });
+    expect(order).toEqual(["refresh", "list", "input"]);
+  } finally { finishRefresh(); }
+});
+
+it("handles a background refresh rejection without losing the restored list", async () => {
+  const error = new Error("owner refresh failed");
+  const controller = { closed: false, async close() {}, async open() { throw error; }, setError: vi.fn(), requestRender: vi.fn() };
+  const activateList = vi.fn();
+  await expect(runViewerTransition({
+    sessionId: "s", client: { async attach() {}, async detach() {} }, controller,
+    createViewer: () => ({ async open() {}, closed: Promise.resolve(), async close() {} }),
+    activateViewer() {}, activateList, restoreListFocus() {}, shouldRestore: () => true,
+  })).resolves.toEqual({ kind: "returned" });
+  await vi.waitFor(() => expect(controller.setError).toHaveBeenCalledWith(error, "DASHBOARD_OPEN_FAILED"));
+  expect(activateList).toHaveBeenCalledOnce();
+  expect(controller.requestRender).toHaveBeenCalled();
+});
+
 describe("viewer transition failures", () => {
   it("reports a refused viewer attach on the list instead of doing nothing", async () => {
       // A refused attach used to be dropped, so Enter and Right looked like dead keys.

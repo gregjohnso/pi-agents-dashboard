@@ -104,9 +104,65 @@ export function createAttachmentTeardown({ toManager, toTerminal, stdin, stdout,
 }
 
 /**
+ * The attach handshake version this frontend understands.
+ *
+ * Version 2 adds ONE additive field to `welcome` - `coldPresentation` - and renames nothing. An older frontend
+ * ignores it, so a current manager still serves old clients unchanged; a current frontend requires it, so an
+ * older manager is refused rather than silently opening a session that will never repaint.
+ */
+export const ATTACH_PROTOCOL = 2;
+
+/**
+ * Decide whether a `welcome` may be accepted, from the welcome alone.
+ *
+ * This is the frontend's half of the redraw precondition, and it is the half that matters for the operator's
+ * RUNNING session: their manager is older code, so a manager-side check alone would still have let a new frontend
+ * open that owner with no repaint. The confirmation has to name THIS attachment and THIS epoch, so a stale
+ * confirmation from an earlier epoch cannot be reused.
+ *
+ * Refusing is not repairing. A refused attachment leaves the owner running and its terminal untouched; the lost
+ * bootstrap sideband of an already-damaged session is not recovered by anything here.
+ *
+ * @param {any} header
+ * @returns {{ accepted: true }|{ accepted: false, code: string, message: string }}
+ */
+export function evaluateWelcome(header) {
+  const confirmation = header?.coldPresentation;
+  const unusable = (code, message) => ({ accepted: false, code, message });
+  // Messages are short on purpose: they are read on one status line, so the named code and the fact that the
+  // session is still running have to survive truncation.
+  if (confirmation === undefined || confirmation === null || typeof confirmation !== "object") {
+    return unusable(
+      "ATTACH_PRESENTATION_UNSUPPORTED",
+      "this manager is older than this list and confirms no screen repaint. The session is still running; relaunch it to attach.",
+    );
+  }
+  if (confirmation.attachProtocol !== ATTACH_PROTOCOL) {
+    return unusable(
+      "ATTACH_PRESENTATION_UNSUPPORTED",
+      `this manager confirms attach protocol ${JSON.stringify(confirmation.attachProtocol)} and this list speaks ${ATTACH_PROTOCOL}. The session is still running.`,
+    );
+  }
+  if (confirmation.presented !== true) {
+    return unusable(
+      "ATTACH_PRESENTATION_UNCONFIRMED",
+      "this manager answered the repaint request without repainting. The session is still running.",
+    );
+  }
+  if (confirmation.attachmentId !== header.attachmentId || confirmation.epoch !== header.epoch) {
+    return unusable(
+      "ATTACH_PRESENTATION_UNCONFIRMED",
+      `the repaint confirmed is for ${JSON.stringify(confirmation.attachmentId)} epoch ${JSON.stringify(confirmation.epoch)}, not this attachment `
+        + `${JSON.stringify(header.attachmentId)} epoch ${JSON.stringify(header.epoch)}. The session is still running.`,
+    );
+  }
+  return { accepted: true };
+}
+
+/**
  * @param {{ root: string, attachmentId?: string }} options
  */
-export async function attach({ root, attachmentId }) {
+export async function attach({ root, attachmentId, diagnostics }) {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error("attach needs a real terminal on stdin and stdout; run it from a terminal, not a pipe");
   }
@@ -114,6 +170,30 @@ export async function attach({ root, attachmentId }) {
   const token = await readToken(root);
   const notices = [];
   let welcome;
+
+  // Every diagnostic this attachment produces, in order. Never the terminal: while this attachment lives, the
+  // terminal belongs to Pi's renderer.
+  /** Set when this frontend itself refused the attachment, so the caller gets the named reason. */
+  let refusalCode;
+  /** @type {string[]} */
+  const diagnosticLines = [];
+  const diagnose = (text) => {
+    diagnosticLines.push(text);
+    notices.push(text);
+    try {
+      diagnostics?.(text);
+    } catch {
+      // A diagnostics sink that fails must not take the attachment down with it.
+    }
+  };
+
+  // The echo window, closed before anything can be typed into it. The list gives the terminal up and this
+  // attachment is a separate process, so between `tui.stop()` and the manager's `welcome` the tty had echo ON -
+  // and a keypress in that window was echoed as literal bytes into Pi's display (the `^[[C` an operator saw is
+  // the Right arrow that opened the session). Raw mode is asserted here, before the socket is even opened, so no
+  // keystroke is ever echoed; stdin stays PAUSED, so those bytes wait in the tty buffer for the input relay
+  // rather than being read and dropped.
+  if (process.stdin.isTTY) process.stdin.setRawMode(true);
 
   const socket = net.connect(paths.controlSocket);
   let finished = false;
@@ -144,20 +224,51 @@ export async function attach({ root, attachmentId }) {
         // Frames coalesced into one read are still decoded after a `bye` or a refusal ends this attachment.
         if (finished) return;
         if (header.type === "welcome") {
+          // The redraw precondition, checked HERE and not only by the manager: an older manager's welcome is
+          // refused before this terminal is handed to Pi and before a single keystroke is forwarded.
+          const verdict = evaluateWelcome(header);
+          if (!verdict.accepted) {
+            diagnose(`${verdict.code}: ${verdict.message}`);
+            refusalCode = verdict.code;
+            // The reason travels BARE; the code travels beside it, so the list prefixes it exactly once.
+            finish({ reason: verdict.message, notices, welcome: undefined });
+            socket.destroy();
+            return;
+          }
           welcome = header;
-          process.stderr.write(
+          // RECORDED, never written to this terminal. Pi owns the screen from here, and a line printed into its
+          // live display moves the real cursor out from under its renderer: the editor then paints where Pi
+          // believes the cursor is while the operator's keystrokes appear where it actually is. Diagnostics go
+          // to the attachment's own log and to the caller's status surface instead.
+          diagnose(
             `attached as ${header.attachmentId} epoch ${header.epoch} to owner pid ${header.owner.pid} ` +
               `(startIdentity ${header.owner.startIdentity}), geometry ${header.geometry.cols}x${header.geometry.rows}, ` +
-              `provider ${header.provider}\r\n`,
+              `provider ${header.provider}`,
           );
           if (process.stdout.columns !== header.geometry.cols || process.stdout.rows !== header.geometry.rows) {
-            process.stderr.write(
-              `note: this terminal is ${process.stdout.columns}x${process.stdout.rows} and the owner's one shared geometry is ` +
-                `${header.geometry.cols}x${header.geometry.rows}; the session is not resized per client\r\n`,
+            // The owner did not take this terminal's size. That is a real condition worth naming: an owner
+            // started before resize support existed cannot take it, and this demo does not replace it.
+            diagnose(
+              `note: this terminal is ${process.stdout.columns}x${process.stdout.rows} but the session's shared ` +
+                `terminal is ${header.geometry.cols}x${header.geometry.rows}. There is one Pi terminal for the ` +
+                "session, and this owner did not adopt this size - an owner started before resize support cannot. " +
+                "It is left running as it is rather than replaced.",
             );
           }
-          process.stdin.setRawMode(true);
+          // Raw mode was already asserted before this socket was opened, so this only confirms it for the case
+          // where something else touched the terminal in between.
+          if (process.stdin.isTTY) process.stdin.setRawMode(true);
           process.stdin.resume();
+          // Forward this terminal's own resizes down the authenticated socket, labelled with the epoch the
+          // manager issued, so a stale attachment cannot move the shared terminal.
+          const forwardResize = () => {
+            if (finished) return;
+            toManager.send(encodeFrame({
+              type: "resize", cols: process.stdout.columns, rows: process.stdout.rows,
+              epoch: header.epoch,
+            }));
+          };
+          process.stdout.on("resize", forwardResize);
           process.stdin.on("data", (chunk) => {
             if (finished) return;
             const frames = [];
@@ -174,6 +285,12 @@ export async function attach({ root, attachmentId }) {
         }
         if (header.type === "notice") {
           notices.push(header.text);
+          return;
+        }
+        if (header.type === "geometry") {
+          // The shared terminal moved. Recorded rather than acted on: Pi repaints through the owner's own
+          // renderer, and this frontend writes the bytes it is given.
+          notices.push(`shared terminal is now ${header.cols}x${header.rows} (revision ${header.geometryRevision}, set by ${header.setBy})`);
           return;
         }
         if (header.type === "bye") {
@@ -193,7 +310,12 @@ export async function attach({ root, attachmentId }) {
     );
 
     socket.on("connect", () => {
-      socket.write(encodeFrame({ type: "hello", role: "client", token, attachmentId }));
+      // The size this terminal actually is. There is one shared Pi terminal, so attaching asks for it at this
+      // size rather than accepting whatever the owner was launched at.
+      socket.write(encodeFrame({
+        type: "hello", role: "client", token, attachmentId,
+        cols: process.stdout.columns, rows: process.stdout.rows,
+      }));
     });
     socket.on("data", (chunk) => {
       if (!finished) reader.push(chunk);
@@ -218,7 +340,8 @@ export async function attach({ root, attachmentId }) {
   });
 
   const outcome = await done;
-  process.stderr.write(`detached: ${outcome.reason}\r\n`);
-  for (const notice of outcome.notices) process.stderr.write(`notice: ${notice}\r\n`);
-  return outcome;
+  diagnose(`detached: ${outcome.reason}`);
+  // Returned for the caller's own status surface. Nothing is printed here: this terminal is about to belong to
+  // the list again, and the list repaints it.
+  return { ...outcome, diagnostics: diagnosticLines, refusalCode };
 }

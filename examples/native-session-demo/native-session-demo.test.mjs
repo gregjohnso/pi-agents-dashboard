@@ -22,7 +22,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { inspectProcessIdentity } from "../../runtime/process-identity-linux.mjs";
 import { signalProcessGroup, sleep, stopVerifiedProcessGroup } from "../../runtime/process-signaler.mjs";
 
-import { CONSUMER_CAPABILITY_PATCH, DEFAULT_MANIFEST, FIVE_PATCH_MANIFEST, resolveCohort } from "./cohort.mjs";
+import { CONSUMER_CAPABILITY_PATCH, DEFAULT_MANIFEST, FIVE_PATCH_MANIFEST, INPUT_LISTENER_PROVENANCE_PATCH, SIX_PATCH_MANIFEST, resolveCohort } from "./cohort.mjs";
+import { widthGuidance } from "./demo.mjs";
 import { FRONTEND_MODE_RESTORE, createAttachmentTeardown } from "./client.mjs";
 import { createRoot, demoPaths, readToken, tokenMatches, writeOwnerRecord } from "./demo-root.mjs";import { FAKE_REPLY_PREFIX, createFakeStreamSimple, deterministicReply } from "./fake-provider.mjs";
 import { createBridgeConsumer } from "./manager.mjs";
@@ -236,11 +237,15 @@ describe("the owner bridge consumer", () => {
   const FACTS = (facts) => ({ type: "owner-facts", facts });
 
   // Operator-visible failure: an authenticated peer - which, as the manager itself discloses, includes any Pi
-  // descendant that inherited the token - can send valid frames forever. Retaining each one grew this
-  // process's memory, its log, every status response and the final owner record without bound. The producer
-  // announces readiness once, forwards at most one seam table and publishes one fact snapshot per generation,
-  // so a second of any of them is already outside the contract and that connection is refused, not absorbed.
-  it("refuses a generation that floods valid frames, and keeps neither its record nor its log unbounded", () => {
+  // descendant that inherited the token - can send valid frames forever, and retaining each one grew this
+  // process's memory, its log, every status response and the final owner record without bound.
+  //
+  // The protection is a bound on what is RETAINED, not a lifetime quota on how many times a producer may speak.
+  // `owner-facts` is a replaced snapshot, so a live session legitimately republishes it on every phase of every
+  // turn; a lifetime quota therefore killed the bridge of exactly the long session it was meant to protect.
+  // Readiness and the seam table are still announced once each, because a second of either is outside the
+  // contract rather than an update.
+  it("absorbs a flood of replaced snapshots without growing its record, its log or its status", () => {
     const { consumer, lines } = consumerFor();
     const owner = fakeOwnerConnection();
     consumer.adopt(owner.connection);
@@ -253,12 +258,47 @@ describe("the owner bridge consumer", () => {
     expect(JSON.stringify(status).length).toBeLessThan(20_000);
     expect(status.diagnostics.length).toBeLessThanOrEqual(64);
     expect(lines.length).toBeLessThan(20);
-    // Admission stopped at the refusal instead of absorbing the whole flood.
-    expect(status.counts.frames).toBeLessThan(10);
-    // And the offending generation is the one that paid for it.
-    expect(String(status.refusal)).toMatch(/owner-facts frames and this owner generation may send 1/u);
+    // The generation is still the operator's session, and the latest snapshot is the one on screen.
+    expect(status.connected).toBe(true);
+    expect(status.refusal).toBeNull();
+    expect(status.facts).toEqual({ index: 4_999 });
+    expect(owner.closes()).toBe(0);
+  });
+
+  // A second readiness announcement is still outside the contract, and still costs the generation.
+  it("still refuses a second readiness announcement", () => {
+    const { consumer } = consumerFor();
+    const owner = fakeOwnerConnection();
+    consumer.adopt(owner.connection);
+
+    owner.emit(READY);
+    owner.emit(READY);
+
+    expect(String(consumer.status().refusal)).toMatch(/owner-ready frames and this owner generation may send 1/u);
     expect(owner.closes()).toBe(1);
-    expect(status.connected).toBe(false);
+  });
+
+  // The exact cut-off the correction removes: report 513 used to refuse and close the bridge, so a persistent
+  // session lost its status updates as a matter of course rather than through any misbehaviour.
+  it("keeps one generation connected across more than 512 legitimate replacements", () => {
+    const { consumer, lines } = consumerFor();
+    const owner = fakeOwnerConnection();
+    consumer.adopt(owner.connection);
+
+    owner.emit(READY);
+    for (let index = 0; index < 600; index += 1) {
+      owner.emit(FACTS({ agentPhase: index % 2 === 0 ? "start" : "settled", turn: index }));
+    }
+
+    const status = consumer.status();
+    expect(status.connected).toBe(true);
+    expect(status.refusal).toBeNull();
+    expect(status.generation).toBe(1);
+    expect(owner.closes()).toBe(0);
+    // The latest snapshot is visible, and only the latest is retained.
+    expect(status.facts).toEqual({ agentPhase: "settled", turn: 599 });
+    expect(JSON.stringify(status).length).toBeLessThan(20_000);
+    expect(lines.length).toBeLessThan(20);
   });
 
   it("refuses a receipt for a request this manager never sent", () => {
@@ -526,6 +566,81 @@ describe("the owner bridge consumer", () => {
   });
 });
 
+// The owner's geometry is fixed once at launch and shared by every attachment, so the width chosen at `start` is
+// the width all typing is laid out at. Two owner widths were captured on a text screen: at 100 an 82-character
+// draft occupied one row, at 60 the same draft wrapped after 59 columns with the last cell of the pre-wrap row
+// left blank. That blank cell is a line-break pad in the rendered row, which is a display observation: submitted
+// text was confirmed byte-exact at 100 from the provider's own prompt digest, and is untested at 60 because no
+// post-submit stream was retained. A reader of a long line sees the spacing, and 60 is the only narrow width
+// measured. `start` therefore says
+// so instead of launching a below-default width silently. It is guidance, not a fix, not a refusal, not a resize.
+describe("the owner width guidance at start", () => {
+  it("says nothing for the tested default or anything wider", () => {
+    expect(widthGuidance(100)).toBe(null);
+    expect(widthGuidance(120)).toBe(null);
+    // Absent or unusable input is the manager's default, so there is nothing to warn about.
+    expect(widthGuidance(undefined)).toBe(null);
+    expect(widthGuidance(Number.NaN)).toBe(null);
+  });
+
+  it("warns for a below-default width, naming the measurement and refusing to call 100 a threshold", () => {
+    const guidance = widthGuidance(60);
+    expect(guidance).not.toBe(null);
+    expect(guidance).toContain("--cols 60");
+    expect(guidance).toContain("tested default of 100");
+    // The mechanism the operator needs: one launch-fixed geometry shared by every attachment.
+    expect(guidance).toMatch(/fixed at launch and shared by every attachment/u);
+    // The measurement, stated as what it is.
+    expect(guidance).toMatch(/wrapping after 59 columns/u);
+    expect(guidance).toMatch(/a line-break pad in the rendered row/u);
+    // It must separate display from input: the pad is what was seen, and integrity at that width is untested.
+    expect(guidance).toMatch(/display observation only/u);
+    expect(guidance).toMatch(/whether typed text is submitted unchanged at this width has not been checked here/u);
+    // And the limits: a reference point, not a threshold, and no minimum claimed.
+    expect(guidance).toMatch(/not a proven threshold/u);
+    expect(guidance).toMatch(/no safe minimum has been measured/u);
+    // It warns and continues. It must not promise a fix or announce a refusal or a resize.
+    expect(guidance).toContain("Starting anyway.");
+    expect(guidance).not.toMatch(/refus|reject|clamp|resiz|corrupt|fixed the|now correct/iu);
+  });
+
+  it("warns just below the default and not at it, without inventing a minimum in between", () => {
+    expect(widthGuidance(99)).not.toBe(null);
+    expect(widthGuidance(80)).not.toBe(null);
+    expect(widthGuidance(100)).toBe(null);
+    // No 80-column safe minimum is asserted anywhere: 80 is warned about exactly like 60.
+    expect(widthGuidance(80)).toBe(widthGuidance(60).replace("--cols 60", "--cols 80"));
+  });
+});
+
+// The attach note used to frame the CLIENT's size as the concern. The geometry cases showed the owner renders once
+// at its launch size and every attachment receives those same bytes, so the note now states that mechanism and
+// stops there: it does not claim a narrower client is harmless, because the cursor question is unresolved and only
+// one ASCII sample was measured.
+describe("the attach note about geometry", () => {
+  const clientSource = readFile(fileURLToPath(new URL("./client.mjs", import.meta.url)), "utf8");
+
+  /**
+   * Updated for the adaptive-sizing increment, which replaced the launch-fixed wording. The gate's point is
+   * unchanged: the note must state the single shared terminal, and it must say plainly when this owner did not
+   * take this terminal's size rather than leaving the operator to guess.
+   */
+  it("states the single shared terminal and names an owner that did not adopt this size", async () => {
+    const source = await clientSource;
+    expect(source).toMatch(/There is one Pi terminal for the/u);
+    expect(source).toMatch(/this owner did not adopt this size/u);
+    expect(source).toMatch(/an owner started before resize support cannot/u);
+    // And it says what happens to that owner: nothing.
+    expect(source).toMatch(/left running as it is rather than replaced/u);
+  });
+
+  it("claims nothing about how a differently sized terminal looks", async () => {
+    const source = await clientSource;
+    // The specific overclaim to stay out of: that a narrower client is fine.
+    expect(source).not.toMatch(/harmless|safe to attach|renders correctly at any size/iu);
+  });
+});
+
 describe("cohort selection", () => {
   it("refuses a manifest whose consumer root is not installed", async () => {
     const directory = await temporaryDirectory();
@@ -541,7 +656,45 @@ describe("cohort selection", () => {
     expect(() => resolveCohort({ manifestPath })).toThrowError(/names no consumerRoot/u);
   });
 
-  it("defaults to the six-patch cohort and tells the truth about which patch bytes built it", async () => {
+  it("resolves packaged cohort paths from the manifest rather than the caller's cwd", async () => {
+    const directory = await temporaryDirectory();
+    const consumerRoot = path.join(directory, "consumer");
+    const bundledCli = path.join(consumerRoot, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js");
+    const tuiPackageRoot = path.join(consumerRoot, "node_modules/@earendil-works/pi-tui");
+    await Promise.all([
+      mkdir(path.dirname(bundledCli), { recursive: true }),
+      mkdir(tuiPackageRoot, { recursive: true }),
+    ]);
+    await writeFile(bundledCli, "packaged cli\n");
+    const manifestPath = path.join(directory, "cohort-manifest.json");
+    await writeFile(manifestPath, JSON.stringify({
+      consumerRoot: "consumer",
+      bundledCliPath: "consumer/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+      bundledCliSha256: createHash("sha256").update("packaged cli\n").digest("hex"),
+    }));
+
+    const cohort = resolveCohort({ manifestPath });
+    expect(cohort.consumerRoot).toBe(consumerRoot);
+    expect(cohort.bundledCli).toBe(bundledCli);
+    expect(cohort.tuiPackageRoot).toBe(tuiPackageRoot);
+  });
+
+  it("refuses packaged Pi bytes that do not match the manifest digest", async () => {
+    const directory = await temporaryDirectory();
+    const consumerRoot = path.join(directory, "consumer");
+    const bundledCli = path.join(consumerRoot, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js");
+    await Promise.all([
+      mkdir(path.dirname(bundledCli), { recursive: true }),
+      mkdir(path.join(consumerRoot, "node_modules/@earendil-works/pi-tui"), { recursive: true }),
+    ]);
+    await writeFile(bundledCli, "changed cli\n");
+    const manifestPath = path.join(directory, "cohort-manifest.json");
+    await writeFile(manifestPath, JSON.stringify({ consumerRoot: "consumer", bundledCliSha256: "0".repeat(64) }));
+
+    expect(() => resolveCohort({ manifestPath })).toThrowError(/digest mismatch/u);
+  });
+
+  it("defaults to the seven-patch cohort and tells the truth about which patch bytes built it", async () => {
     const patches = new URL("../../vendor/pi/patches/", import.meta.url);
     const manifest = JSON.parse(await readFile(DEFAULT_MANIFEST, "utf8"));
     const series = (await readFile(new URL("series", patches), "utf8"))
@@ -549,41 +702,55 @@ describe("cohort selection", () => {
       .map((line) => line.trim())
       .filter((line) => line !== "" && !line.startsWith("#"));
 
-    // The order is this tree's order, and it is six patches now, ending in the consumer-capability patch.
+    // The order is this tree's order, and it is seven patches now, ending in the input-listener provenance patch.
     expect(manifest.series).toEqual(series);
-    expect(series).toHaveLength(6);
+    expect(series).toHaveLength(7);
     expect(series[5]).toBe(CONSUMER_CAPABILITY_PATCH.name);
+    expect(series[6]).toBe(INPUT_LISTENER_PROVENANCE_PATCH.name);
     expect(manifest.mode).toBe("patched");
 
     /** @param {string} name */
     const digestOf = async (name) => createHash("sha256").update(await readFile(new URL(name, patches))).digest("hex");
     const built = new Map(manifest.appliedPatches.map((/** @type {any} */ entry) => [entry.name, entry]));
 
-    // The first five are byte-identical between this tree and the build, so the whole difference below is
-    // isolated to one patch rather than being a general drift between source and artifacts.
-    for (const [position, name] of series.slice(0, 5).entries()) {
+    // Every patch in the default cohort is byte-identical to this tree, so nothing here is an inference: the
+    // bytes that ran were produced from the files this repository carries.
+    for (const [position, name] of series.entries()) {
       expect(built.get(name)).toEqual({ position: position + 1, name, sha256: await digestOf(name) });
     }
 
-    // Patch 0006 is where the two identities part, and both are checked against their real sources.
-    const sixth = built.get(CONSUMER_CAPABILITY_PATCH.name);
-    expect(sixth.position).toBe(6);
-    expect(sixth.sha256).toBe(CONSUMER_CAPABILITY_PATCH.builtIntoCohort.sha256);
-    expect(await digestOf(CONSUMER_CAPABILITY_PATCH.name)).toBe(CONSUMER_CAPABILITY_PATCH.currentInThisTree.sha256);
-    // Deliberately unequal: this tree carries an accepted test-only overlay that was never built into the
-    // cohort. A test that demanded they match would force one of the two records to be relabelled.
-    expect(CONSUMER_CAPABILITY_PATCH.currentInThisTree.sha256).not.toBe(CONSUMER_CAPABILITY_PATCH.builtIntoCohort.sha256);
-    expect(CONSUMER_CAPABILITY_PATCH.currentInThisTree.wouldProduceTreeHash).not.toBe(CONSUMER_CAPABILITY_PATCH.builtIntoCohort.patchedTreeHash);
+    // Patch 0006's overlay is the sixth patch of THIS cohort, which is the change from the six-patch build.
+    expect(built.get(CONSUMER_CAPABILITY_PATCH.name).sha256).toBe(CONSUMER_CAPABILITY_PATCH.currentInThisTree.sha256);
+    expect(await digestOf(INPUT_LISTENER_PROVENANCE_PATCH.name)).toBe(INPUT_LISTENER_PROVENANCE_PATCH.sha256);
 
     const cohort = resolveCohort({});
     expect(cohort.manifestPath).toBe(DEFAULT_MANIFEST);
-    expect(cohort.buildSlurmJobId).toBe("3757199");
+    expect(cohort.buildSlurmJobId).toBe(INPUT_LISTENER_PROVENANCE_PATCH.buildSlurmJobId);
     expect(cohort.upstreamCommit).toBe(manifest.upstreamCommit);
     expect(cohort.series).toEqual(series);
-    // What executes is described by the BUILT tree hash, never by the overlay's.
-    expect(cohort.patchedTreeHash).toBe(CONSUMER_CAPABILITY_PATCH.builtIntoCohort.patchedTreeHash);
+    expect(cohort.patchedTreeHash).toBe(INPUT_LISTENER_PROVENANCE_PATCH.patchedTreeHash);
     expect(cohort.patchedTreeHash).toBe(manifest.patchedTreeHash);
     expect(createHash("sha256").update(await readFile(cohort.bundledCli)).digest("hex")).toBe(manifest.bundledCliSha256);
+  });
+
+  // The six-patch cohort's own provenance is unchanged by the new build, including the split that made patch
+  // 0006's two identities worth recording separately in the first place.
+  it("leaves the six-patch cohort's bytes and its unbuilt-overlay record exactly as they were", async () => {
+    const patches = new URL("../../vendor/pi/patches/", import.meta.url);
+    const cohort = resolveCohort({ manifestPath: SIX_PATCH_MANIFEST });
+    expect(cohort.manifestPath).toBe(SIX_PATCH_MANIFEST);
+    expect(cohort.series).toHaveLength(6);
+    expect(cohort.series).not.toContain(INPUT_LISTENER_PROVENANCE_PATCH.name);
+    expect(cohort.buildSlurmJobId).toBe("3757199");
+    expect(cohort.patchedTreeHash).toBe(CONSUMER_CAPABILITY_PATCH.builtIntoCohort.patchedTreeHash);
+
+    // Against THIS cohort the overlay was never built, so the two digests still differ and the record stands.
+    const manifest = JSON.parse(await readFile(SIX_PATCH_MANIFEST, "utf8"));
+    const sixth = manifest.appliedPatches.find((/** @type {any} */ entry) => entry.name === CONSUMER_CAPABILITY_PATCH.name);
+    expect(sixth.sha256).toBe(CONSUMER_CAPABILITY_PATCH.builtIntoCohort.sha256);
+    const current = createHash("sha256").update(await readFile(new URL(CONSUMER_CAPABILITY_PATCH.name, patches))).digest("hex");
+    expect(current).toBe(CONSUMER_CAPABILITY_PATCH.currentInThisTree.sha256);
+    expect(current).not.toBe(sixth.sha256);
   });
 
   // Patch 0006 ships bootstrap protocol 2. Shipping it is not running it, and the demo says which it uses
@@ -644,8 +811,10 @@ describe("the README's runnable command", () => {
     expect(foreign).toMatch(/pi-agents-native-demo-20260919/u);
   });
 
-  it("still documents the six-patch default whose provenance the cohort tests pin", async () => {
+  it("documents the seven-patch default and keeps the six-patch cohort's provenance rows", async () => {
     const readme = await readFile(readmePath, "utf8");
+    expect(readme).toContain(INPUT_LISTENER_PROVENANCE_PATCH.buildSlurmJobId);
+    expect(readme).toContain(INPUT_LISTENER_PROVENANCE_PATCH.patchedTreeHash);
     expect(readme).toContain("3757199");
     expect(readme).toContain(CONSUMER_CAPABILITY_PATCH.builtIntoCohort.sha256);
     expect(readme).toContain(CONSUMER_CAPABILITY_PATCH.currentInThisTree.sha256);

@@ -13,6 +13,8 @@
     "bin/*.mjs",
     "cli/*.mjs",
     "extension/*.mjs",
+    "examples/native-session-demo/**/*.mjs",
+    "examples/native-session-demo/**/*.ts",
     "runtime/*.mjs",
     "shared/*.mjs",
     "isolation/*.mjs",

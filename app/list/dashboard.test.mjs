@@ -337,6 +337,36 @@ describe("dashboard controller", () => {
         dashboard.applySnapshot({ sessions: [session("native-1", { processState: "EXITED", taskState: "FAILED", createdAt: timestamp })] });
         expect(dashboard.render(100, 24).map(stripVTControlCharacters).some((line) => line.includes("STARTING"))).toBe(false);
     });
+    it("toggles grouping between state and working directory with Ctrl+S, and reports each choice", async () => {
+        const saved = [];
+        const client = new FakeDaemonClient([session("a", { cwd: "/repo/x" }), session("b", { cwd: "/repo/y", taskState: "WORKING" })]);
+        const dashboard = controller(client, { initialGroupBy: "taskState", onGroupingChanged: (groupBy) => saved.push(groupBy) });
+        await dashboard.open();
+        expect(dashboard.query.groupBy).toBe("taskState");
+        const headers = () => dashboard.render(100, 24).map(stripVTControlCharacters).filter((line) => line.startsWith("── "));
+        expect(headers().map((line) => line.split(" (")[0])).toEqual(["── WORKING", "── READY"]);
+        dashboard.handleInput("\x13");
+        expect(dashboard.query.groupBy).toBe("cwd");
+        expect(headers().map((line) => line.split(" (")[0])).toEqual(["── /repo/x", "── /repo/y"]);
+        dashboard.handleInput("\x13");
+        expect(dashboard.query.groupBy).toBe("taskState");
+        expect(saved).toEqual(["cwd", "taskState"]);
+    });
+    it("keeps a STARTING row inside its own group rather than under the last one", async () => {
+        const client = new FakeDaemonClient([session("a", { taskState: "WORKING" }), session("b")]);
+        client.launch = vi.fn(() => new Promise(() => {}));
+        const dashboard = controller(client, { initialGroupBy: "taskState" });
+        await dashboard.open();
+        for (const character of "ship it") dashboard.handleInput(character);
+        dashboard.handleInput("\r");
+        await vi.waitFor(() => expect(client.launch).toHaveBeenCalled());
+        const rows = dashboard.render(100, 24).map(stripVTControlCharacters);
+        const starting = rows.findIndex((line) => line.startsWith("── STARTING"));
+        const ready = rows.findIndex((line) => line.startsWith("── READY"));
+        expect(starting).toBeGreaterThan(-1);
+        expect(rows[starting + 1]).toContain("ship it");
+        expect(starting).toBeLessThan(ready);
+    });
     it("restores the draft and drops the pending row when a launch fails", async () => {
         const client = new FakeDaemonClient([]);
         client.launch = vi.fn(async () => { throw Object.assign(new Error("no worker slots"), { code: "LAUNCH_UNAVAILABLE" }); });

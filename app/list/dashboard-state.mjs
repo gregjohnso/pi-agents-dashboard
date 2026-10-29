@@ -64,15 +64,19 @@ function compareValues(left, right) {
     }
     return compareText(String(left), String(right));
 }
+/** Group order by the state the STATE column shows: sessions with work in hand first, finished ones last. */
+const GROUP_STATE_ORDER = ["WORKING", "WAITING", "STARTING", "READY", "UNKNOWN", "SLEEPING", "STALE", "FAILED", "STOPPED", "EXITED"];
 /** Return the canonical identity used to coalesce dashboard group rows. */
 export function dashboardGroupIdentity(session, groupBy) {
     return groupBy === "taskState"
-        ? session.taskState
+        ? displaySessionState(session)
         : canonicalPath(session.cwd).toLowerCase();
 }
-function compareGroups(left, right, groupBy) {
+/** Order two sessions by their group alone; rows within a group keep their order. */
+export function compareDashboardGroups(left, right, groupBy) {
     if (groupBy === "taskState") {
-        return TASK_STATE_ORDER[left.taskState] - TASK_STATE_ORDER[right.taskState];
+        const rank = (session) => { const index = GROUP_STATE_ORDER.indexOf(displaySessionState(session)); return index === -1 ? GROUP_STATE_ORDER.length : index; };
+        return rank(left) - rank(right);
     }
     return compareText(dashboardGroupIdentity(left, groupBy), dashboardGroupIdentity(right, groupBy));
 }
@@ -101,7 +105,7 @@ export function selectDashboardSessions(sessions, query) {
         .map((session, index) => ({ session, index }))
         .sort((left, right) => {
         if (query.groupBy !== undefined) {
-            const grouped = compareGroups(left.session, right.session, query.groupBy);
+            const grouped = compareDashboardGroups(left.session, right.session, query.groupBy);
             if (grouped !== 0)
                 return grouped;
         }

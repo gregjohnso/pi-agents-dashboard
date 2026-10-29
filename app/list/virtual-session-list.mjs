@@ -1,14 +1,18 @@
-import { basename } from "node:path";
+import { homedir } from "node:os";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { dashboardGroupIdentity, } from "./dashboard-state.mjs";
 import { createDashboardLayout, renderGroupHeader, renderSessionRow, } from "./dashboard-layout.mjs";
+import { displaySessionState } from "./session-state.mjs";
+const HOME = homedir();
 function sessionSignature(session) {
     return JSON.stringify(session);
 }
 function groupLabel(session, groupBy) {
     if (groupBy === "taskState")
-        return session.taskState;
-    return basename(session.cwd) || session.cwd || "—";
+        return displaySessionState(session);
+    const cwd = session.cwd || "—";
+    // The whole path, because two projects can share a last directory name.
+    return cwd === HOME || cwd.startsWith(`${HOME}/`) ? `~${cwd.slice(HOME.length)}` : cwd;
 }
 function buildRows(sessions, groupBy) {
     if (groupBy === undefined) {

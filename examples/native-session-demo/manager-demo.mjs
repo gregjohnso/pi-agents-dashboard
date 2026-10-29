@@ -40,6 +40,7 @@ import { spawn } from "node:child_process";
 
 import { createNativeBackend } from "../../app/list/native-backend.mjs";
 import { createStandaloneList } from "../../app/list/standalone-list.mjs";
+import { readViewPreferences, writeViewPreferences } from "../../app/list/view-preferences.mjs";
 
 const DEMO = fileURLToPath(new URL("./demo.mjs", import.meta.url));
 
@@ -236,7 +237,11 @@ export async function runNativeManager(options) {
   });
   const attachmentId = `manager-${process.pid}`;
 
+  // The grouping the operator chose last, written only when he changes it.
+  const viewPreferences = await readViewPreferences(stateHome);
   const list = await createStandaloneList({
+    initialGroupBy: viewPreferences.groupBy,
+    onGroupingChanged: (groupBy) => { void writeViewPreferences(stateHome, { groupBy }).catch(() => {}); },
     cwd: projectCwd,
     // This list reads every session directory over a control socket, so its first load is only as fast as the
     // slowest owner. Paint the loading surface first: a wedged owner then costs a row its detail instead of

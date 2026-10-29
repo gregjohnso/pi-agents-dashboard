@@ -83,7 +83,8 @@ it("retires the old filter chords without inserting control bytes or changing qu
   dashboard.setTaskStates(["READY"]);
   dashboard.setComposerPrompt("draft");
   const before = structuredClone(dashboard.query);
-  for (const key of ["\x10", "\x0f", "\x01", "\x17", "\x13", "\x02", "\x0c", "\x12", "\x05"]) dashboard.handleInput(key);
+  // Ctrl+S is not among them: it is Claude Code's state/directory grouping switch, tested on its own.
+  for (const key of ["\x10", "\x0f", "\x01", "\x17", "\x02", "\x0c", "\x12", "\x05"]) dashboard.handleInput(key);
   expect(dashboard.query).toEqual(before);
   expect(dashboard.composerDraft.prompt).toBe("draft");
   expect(dashboard.overlay).toBeUndefined();
@@ -93,5 +94,7 @@ it("retires the old filter chords without inserting control bytes or changing qu
 it("shows only the consolidated pair rather than the old shortcut matrix in help", () => {
   const bindings = createHelpOverlay().bindings;
   expect(bindings.find((binding) => binding.keys === "Ctrl+V / Ctrl+T")).toBeDefined();
-  expect(bindings.some((binding) => /Ctrl\+[POAWSBLRE]/u.test(binding.keys))).toBe(false);
+  expect(bindings.some((binding) => /Ctrl\+[POAWBLRE]/u.test(binding.keys))).toBe(false);
+  // The one grouping key, matching Claude Code's agent view.
+  expect(bindings.filter((binding) => binding.keys.startsWith("Ctrl+S"))).toEqual([{ keys: "Ctrl+S", action: "group by state or by working directory" }]);
 });

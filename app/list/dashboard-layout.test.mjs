@@ -92,6 +92,16 @@ describe("responsive dashboard layout", () => {
         expect(lines[0]).toContain(JOBWATCH_ANSI.cyan);
         expect(lines[1]).toContain(JOBWATCH_ANSI.sky);
     });
+    it("draws a group header as a full-width divider naming the group and its size", () => {
+        const layout = createDashboardLayout(60, 20);
+        const line = stripVTControlCharacters(renderGroupHeader("WORKING", 2, layout));
+        expect(line).toBe(`── WORKING (2) ${"─".repeat(60 - "── WORKING (2) ".length)}`);
+        expect(visibleWidth(line)).toBe(60);
+        const long = stripVTControlCharacters(renderGroupHeader("~/projects/a/very/deep/working/directory/that/cannot/fit/here", 7, layout));
+        expect(visibleWidth(long)).toBe(60);
+        // The end of a path is what tells two directories apart, so it is kept and the start is elided.
+        expect(long).toMatch(/^── …[^ ]*\/cannot\/fit\/here \(7\) ─+$/u);
+    });
 });
 
 it("reads a worker replacement as a start in progress, with the reason in the activity column", () => {

@@ -73,6 +73,7 @@ export function createHelpOverlay() {
             { keys: "↑ ↓ PgUp PgDn Home End", action: "move the selection" },
             { keys: "Ctrl+X ×2", action: "within 500 ms: stop a running session or clear a stopped entry" },
             { keys: "Ctrl+F", action: "search" },
+            { keys: "Ctrl+S", action: "group by state or by working directory" },
             { keys: "Ctrl+V / Ctrl+T", action: "choose a setting / cycle its value" },
             { keys: "/model", action: "set the next session's model" },
             { keys: "/cwd /isolation /name", action: "set its directory, isolation, and name" },

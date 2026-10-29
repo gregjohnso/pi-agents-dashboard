@@ -1,3 +1,5 @@
+import { homedir } from "node:os";
+
 import { describe, expect, it, vi } from "vitest";
 import { VirtualSessionList } from "./virtual-session-list.mjs";
 const timestamp = "2026-08-25T12:00:00.000Z";
@@ -56,5 +58,14 @@ describe("VirtualSessionList", () => {
         list.moveSelection(1);
         expect(list.selectedSessionId).toBe("session-00001");
         expect(list.selectedRowIndex).toBe(4);
+    });
+    it("labels a directory group with its whole path, home shortened to ~", () => {
+        const home = homedir();
+        const list = new VirtualSessionList([session(0, { cwd: `${home}/projects/a` }), session(1, { cwd: "/srv/b" })], { groupBy: "cwd", renderRow: (row) => label(row) });
+        expect(list.rows.filter((row) => row.kind === "group").map((row) => row.label)).toEqual(["~/projects/a", "/srv/b"]);
+    });
+    it("groups by the state the STATE column shows", () => {
+        const list = new VirtualSessionList([session(0, { taskState: "READY", stateReported: false })], { groupBy: "taskState", renderRow: (row) => label(row) });
+        expect(list.rows[0]).toMatchObject({ kind: "group", label: "UNKNOWN" });
     });
 });

@@ -211,7 +211,21 @@ export function renderSessionRow(session, layout, options) {
         return jobwatchTheme.text(text, selected, background);
     }, (text) => jobwatchTheme.separator(text, selected, background));
 }
-/** Render an unselectable group row that occupies one virtual list position. */
+/** The end of `text` that fits `width` cells: for a path, the part that tells two directories apart. */
+function keepEnd(text, width) {
+    let kept = "";
+    for (const character of [...text].reverse()) {
+        if (visibleWidth(character + kept) > width) break;
+        kept = character + kept;
+    }
+    return kept;
+}
+/** Render an unselectable group row: a full-width divider naming the group and how many rows it holds. */
 export function renderGroupHeader(label, count, layout) {
-    return jobwatchTheme.group(fit(`── ${plainText(label)} (${count}) `, layout.width));
+    const suffix = ` (${count}) `;
+    const room = Math.max(1, layout.width - visibleWidth("── ") - visibleWidth(suffix) - 1);
+    const text = plainText(label);
+    const shown = visibleWidth(text) > room ? `…${keepEnd(text, room - 1)}` : text;
+    const head = `── ${shown}${suffix}`;
+    return jobwatchTheme.group(fit(head + "─".repeat(Math.max(0, layout.width - visibleWidth(head))), layout.width));
 }

@@ -7,7 +7,7 @@ import { ClearQuitGesture } from "../clear-quit-gesture.mjs";
 import { pastedText } from "./dashboard-input.mjs";
 import { sessionNameFromPrompt } from "../../runtime/session-name.mjs";
 import { createSpinnerClock } from "../spinner.mjs";
-import { countDashboardSessions, selectDashboardSessions, } from "./dashboard-state.mjs";
+import { compareDashboardGroups, countDashboardSessions, selectDashboardSessions, } from "./dashboard-state.mjs";
 import { createDashboardLayout, renderColumnHeader, wrapPromptDraft, } from "./dashboard-layout.mjs";
 import { JOBWATCH_ANSI, jobwatchTheme } from "./dashboard-theme.mjs";
 import { displaySessionState } from "./session-state.mjs";
@@ -74,6 +74,7 @@ const CONTROL_CATEGORIES = [
 const CONTROLS = [
     { key: Key.ctrl("f"), activate: (dashboard) => { dashboard.focus = "search"; } },
     { key: Key.ctrl("v"), activate: (dashboard) => dashboard.cycleControlCategory() },
+    { key: Key.ctrl("s"), activate: (dashboard) => dashboard.toggleGrouping() },
     { key: Key.ctrl("t"), activate: (dashboard) => dashboard.activateControlCategory() },
 ];
 function fitLine(line, width) {
@@ -221,6 +222,10 @@ export class DashboardController {
         this.stopClearGesture = new StopClearGesture({ now: options.now });
         this.clearQuitGesture = new ClearQuitGesture({ now: options.now });
         this.launchDefaults = options.launchDefaults ?? {};
+        // Claude Code's agent view opens grouped and remembers the operator's last grouping; the caller supplies both.
+        if (options.initialGroupBy !== undefined)
+            this.query = { ...this.query, groupBy: options.initialGroupBy };
+        this.onGroupingChanged = options.onGroupingChanged;
         this.isDirectory = options.isDirectory ?? existingDirectory;
         this.worktreeCapability = options.worktreeCapability ?? probeWorktreeCapability;
         this.suggestDirectories = options.suggestDirectories ?? suggestDirectories;
@@ -311,7 +316,14 @@ export class DashboardController {
         this.setQuery({ ...this.query, projectPaths });
     }
     setGrouping(groupBy) {
+        const changed = groupBy !== this.query.groupBy;
         this.setQuery({ ...this.query, groupBy });
+        if (changed)
+            this.onGroupingChanged?.(groupBy);
+    }
+    /** Claude Code's Ctrl+S: switch between grouping by state and by working directory. */
+    toggleGrouping() {
+        this.setGrouping(this.query.groupBy === "cwd" ? "taskState" : "cwd");
     }
     setSort(key, direction) {
         this.setQuery({ ...this.query, sort: { key, direction } });
@@ -1073,7 +1085,12 @@ export class DashboardController {
         const shown = selectDashboardSessions(this.sessions, this.query);
         this.pendingLaunches = this.pendingLaunches.filter((entry) => !(shown.some((session) => session.createdAt >= entry.createdAt)
             || (entry.launchedSessionId !== undefined && this.sessions.some((session) => session.sessionId === entry.launchedSessionId && session.processState !== "STALE"))));
-        const visible = [...shown, ...this.pendingLaunches.map((entry) => pendingSessionRecord(entry))];
+        // A STARTING row belongs to its own group: appended after the list, it sat under the last group's divider.
+        const all = [...shown, ...this.pendingLaunches.map((entry) => pendingSessionRecord(entry))];
+        const groupBy = this.query.groupBy;
+        const visible = groupBy === undefined ? all : all.map((session, index) => ({ session, index }))
+            .sort((left, right) => compareDashboardGroups(left.session, right.session, groupBy) || left.index - right.index)
+            .map(({ session }) => session);
         this.list.setSessions(visible, { groupBy: this.query.groupBy });
         if (selected !== undefined && visible.some((session) => session.sessionId === selected)) {
             this.list.selectSession(selected);
@@ -1178,7 +1195,6 @@ export class DashboardController {
             this.query.activityKinds === undefined ? undefined : `activity:${this.query.activityKinds.join(",")}`,
             this.query.projectPaths === undefined ? undefined : `project:${this.query.projectPaths.join(",")}`,
             this.query.sort === undefined ? undefined : `sort:${this.query.sort.key}/${this.query.sort.direction}`,
-            this.query.groupBy === undefined ? undefined : `group:${this.query.groupBy}`,
         ].filter((segment) => segment !== undefined);
         return active.length === 0 ? "" : ` ${active.join("  ")}`;
     }

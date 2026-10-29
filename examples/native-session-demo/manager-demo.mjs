@@ -41,6 +41,7 @@ import { spawn } from "node:child_process";
 import { createNativeBackend } from "../../app/list/native-backend.mjs";
 import { createStandaloneList } from "../../app/list/standalone-list.mjs";
 import { readViewPreferences, writeViewPreferences } from "../../app/list/view-preferences.mjs";
+import { readLaunchSettings } from "../../app/list/launch-settings.mjs";
 
 const DEMO = fileURLToPath(new URL("./demo.mjs", import.meta.url));
 
@@ -239,8 +240,11 @@ export async function runNativeManager(options) {
 
   // The grouping the operator chose last, written only when he changes it.
   const viewPreferences = await readViewPreferences(stateHome);
+  // The operator's pi-agents default model. Fake mode serves its own fixture models, so it never applies there.
+  const launchSettings = mode === "real" ? await readLaunchSettings(stateHome) : { model: undefined };
   const list = await createStandaloneList({
     initialGroupBy: viewPreferences.groupBy,
+    launchModel: launchSettings.model,
     onGroupingChanged: (groupBy) => { void writeViewPreferences(stateHome, { groupBy }).catch(() => {}); },
     cwd: projectCwd,
     // This list reads every session directory over a control socket, so its first load is only as fast as the

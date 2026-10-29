@@ -5,11 +5,13 @@ import { atomicWriteJson } from "../../runtime/atomic-file.mjs";
 
 /** The dashboard's remembered view, beside its other metadata. Written only when the operator changes it. */
 const FILE = "dashboard-view.json";
+/** @typedef {{ groupBy: "taskState" | "cwd" | undefined }} ViewPreferences */
+/** @type {readonly ("taskState" | "cwd")[]} */
 const GROUPINGS = ["taskState", "cwd"];
-/** Claude Code's agent view opens grouped by state. */
+/** Claude Code's agent view opens grouped by state. @type {ViewPreferences} */
 const DEFAULT = { groupBy: "taskState" };
 
-/** @param {string} stateHome @returns {Promise<{ groupBy: "taskState" | "cwd" | undefined }>} */
+/** @param {string} stateHome @returns {Promise<ViewPreferences>} */
 export async function readViewPreferences(stateHome) {
   try {
     const saved = JSON.parse(await readFile(path.join(stateHome, FILE), "utf8"));

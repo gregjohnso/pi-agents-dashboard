@@ -64,6 +64,13 @@ export const STATUS_PROBE_MS = 2_000;
  */
 export const MUTATION_ANSWER_MS = 25_000;
 const MAX_REFUSAL_REASON = 400;
+/**
+ * A re-read on a timer, only as a backstop: state changes arrive through the owner-record watch. It catches a missed
+ * filesystem event, and owners that publish no record.
+ */
+export const SAFETY_REFRESH_MS = 10_000;
+/** How long a burst of owner-record writes settles before the list is read once. */
+const RECORD_SETTLE_MS = 100;
 const DEMO = fileURLToPath(new URL("../../examples/native-session-demo/demo.mjs", import.meta.url));
 /** The demo's own owner extension, which registers its labelled fixture provider for fake mode. */
 const FIXTURE_EXTENSION = fileURLToPath(new URL("../../examples/native-session-demo/owner-extension.ts", import.meta.url));
@@ -559,6 +566,7 @@ function recordWithExit(record, exit) {
  *   cols?: number, rows?: number, traceFile?: string,
  *   piConfigRoot?: string,
  *   statusTimeoutMs?: number,
+ *   safetyRefreshMs?: number,
  *   stateHome?: string,
  *   piConfigHome?: string,
  *   manifestPath?: string,
@@ -568,7 +576,7 @@ function recordWithExit(record, exit) {
  *   askControl?: (root: string, frame: any, expected: string) => Promise<any>,
  * }} options
  */
-export function createNativeBackend({ sessionsHome, node = process.execPath, mode = "fake", cols, rows, traceFile, piConfigRoot, runDemo: injectedRunDemo, listModels: injectedListModels, askControl: injectedAskControl, statusTimeoutMs = STATUS_PROBE_MS, stateHome, piConfigHome, manifestPath, cohortRoot }) {
+export function createNativeBackend({ sessionsHome, node = process.execPath, mode = "fake", cols, rows, traceFile, piConfigRoot, runDemo: injectedRunDemo, listModels: injectedListModels, askControl: injectedAskControl, statusTimeoutMs = STATUS_PROBE_MS, stateHome, piConfigHome, manifestPath, cohortRoot, safetyRefreshMs = SAFETY_REFRESH_MS }) {
   /**
    * Attach refusals this list has actually received, per session, stamped with the owner that refused.
    *
@@ -599,6 +607,12 @@ export function createNativeBackend({ sessionsHome, node = process.execPath, mod
   let watcher;
   /** @type {import("node:fs").FSWatcher | undefined} */
   let forgottenWatcher;
+  /** @type {import("node:fs").FSWatcher | undefined} */
+  let recordsWatcher;
+  /** @type {NodeJS.Timeout | undefined} */
+  let recordsSettle;
+  /** @type {NodeJS.Timeout | undefined} */
+  let safetyTimer;
   /** The session ids the last invalidation was decided against. */
   let knownIds;
   /** @type {NodeJS.Timeout | undefined} */
@@ -905,6 +919,26 @@ export function createNativeBackend({ sessionsHome, node = process.execPath, mod
         forgottenWatcher = watch(forgottenDirectory, notify);
         forgottenWatcher.on("error", (error) => onError?.(error));
       }
+      // A manager rewrites its owner record on every fact Pi publishes (agent start, end, settled, model, name), and
+      // only managers write there, so a change in this tree is a state change and never this list's own read.
+      if (stateHome !== undefined && recordsWatcher === undefined) {
+        const ownersDirectory = path.join(stateHome, "owners");
+        await mkdir(ownersDirectory, { recursive: true, mode: 0o700 });
+        try {
+          recordsWatcher = watch(ownersDirectory, { recursive: true }, () => {
+            if (recordsSettle !== undefined) return;
+            recordsSettle = setTimeout(() => { recordsSettle = undefined; notify(); }, RECORD_SETTLE_MS);
+            recordsSettle.unref?.();
+          });
+          recordsWatcher.on("error", (error) => onError?.(error));
+        } catch (error) {
+          onError?.(error);
+        }
+      }
+      if (safetyTimer === undefined && safetyRefreshMs > 0) {
+        safetyTimer = setInterval(notify, safetyRefreshMs);
+        safetyTimer.unref?.();
+      }
       knownIds ??= (await readSessionIds()).join("\u0000");
       if (watcher === undefined) {
         try {
@@ -936,6 +970,12 @@ export function createNativeBackend({ sessionsHome, node = process.execPath, mod
           watcher = undefined;
           forgottenWatcher?.close();
           forgottenWatcher = undefined;
+          recordsWatcher?.close();
+          recordsWatcher = undefined;
+          if (recordsSettle !== undefined) clearTimeout(recordsSettle);
+          recordsSettle = undefined;
+          if (safetyTimer !== undefined) clearInterval(safetyTimer);
+          safetyTimer = undefined;
           if (settle !== undefined) clearTimeout(settle);
           settle = undefined;
         }
@@ -1198,6 +1238,12 @@ export function createNativeBackend({ sessionsHome, node = process.execPath, mod
       watcher = undefined;
       forgottenWatcher?.close();
       forgottenWatcher = undefined;
+      recordsWatcher?.close();
+      recordsWatcher = undefined;
+      if (recordsSettle !== undefined) clearTimeout(recordsSettle);
+      recordsSettle = undefined;
+      if (safetyTimer !== undefined) clearInterval(safetyTimer);
+      safetyTimer = undefined;
       if (settle !== undefined) clearTimeout(settle);
       settle = undefined;
       listeners.clear();

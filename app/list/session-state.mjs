@@ -7,8 +7,8 @@
  * A worker being replaced across a release boundary is starting, not finished: the row would
  * otherwise read as a dead session for the whole time Pi takes to restart and resume.
  *
- * @param {import("../../shared/contracts.mjs").SessionRecord} session
- * @returns {"WORKING"|"WAITING"|"READY"|"SLEEPING"|"STARTING"|"EXITED"|"STOPPED"|"FAILED"|"STALE"}
+ * @param {import("../../shared/contracts.mjs").SessionRecord & { needsReview?: boolean }} session
+ * @returns {"WORKING"|"WAITING"|"NEEDS INPUT"|"READY"|"SLEEPING"|"STARTING"|"EXITED"|"STOPPED"|"FAILED"|"STALE"}
  */
 export function displaySessionState(session) {
   if (session.taskState === "FAILED") return "FAILED";

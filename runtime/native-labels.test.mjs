@@ -38,11 +38,12 @@ it("keeps safe failure diagnostics in saved labels and ignores unsupported versi
 
 it("prefers the ChatGPT subscription's small model over Haiku, with low reasoning and room to answer", async () => {
   const luna = { provider: "openai-codex", id: "gpt-6-luna", cost: { output: 0.5 } };
+  /** @type {any[]} */
   const calls = [];
   await generateNativeLabel({
     getAvailable: () => [{ ...MODEL, cost: { output: 0.1 } }, { provider: "openai-codex", id: "gpt-6.1-sol", cost: { output: 30 } }, luna],
     getProviderAuthStatus: () => ({ source: "stored" }),
-    complete: async (/** @type {any} */ model, _context, /** @type {any} */ options) => { calls.push({ model, options }); return REPLY; },
+    complete: async (/** @type {any} */ model, /** @type {any} */ _context, /** @type {any} */ options) => { calls.push({ model, options }); return REPLY; },
   }, "task", { signal: new AbortController().signal });
   expect(calls[0].model).toBe(luna);
   expect(calls[0].options).toMatchObject({ reasoning: "low", maxTokens: 2048 });

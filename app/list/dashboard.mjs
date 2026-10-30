@@ -33,7 +33,7 @@ const COMPLETION_DEBOUNCE_MS = 60;
 function defaultQuery() {
     return { view: "live" };
 }
-const TASK_STATES = ["WORKING", "WAITING", "READY", "FAILED", "STOPPED"];
+const TASK_STATES = ["WORKING", "WAITING", "NEEDS INPUT", "READY", "FAILED", "STOPPED"];
 /**
  * How long a close waits for an outstanding list read before reporting that it closed.
  *

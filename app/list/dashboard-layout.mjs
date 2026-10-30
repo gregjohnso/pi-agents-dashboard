@@ -97,8 +97,8 @@ function columnsForWidth(width) {
         return [
             { key: "spinner", width: 1 },
             { key: "name", width: width >= 100 ? 32 : 26 },
-            { key: "state", width: 9 },
-            { key: "activity", width: width - (width >= 100 ? 54 : 48) - MODEL_WIDTH - 1 },
+            { key: "state", width: width >= 100 ? 11 : 9 },
+            { key: "activity", width: width - (width >= 100 ? 56 : 48) - MODEL_WIDTH - 1 },
             { key: "model", width: MODEL_WIDTH },
             { key: "age", width: 7 },
         ];

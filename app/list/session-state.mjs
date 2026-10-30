@@ -21,5 +21,7 @@ export function displaySessionState(session) {
   // exactly as before, so every record that does not set it - the daemon's included - is unchanged, and no
   // durable process-boundary enum is widened or renamed.
   if (session.stateReported === false) return "UNKNOWN";
-  return session.taskState === "WORKING" || session.taskState === "WAITING" ? session.taskState : "READY";
+  if (session.taskState === "WORKING" || session.taskState === "WAITING") return session.taskState;
+  // A finished turn the operator has not looked at yet.
+  return session.needsReview === true ? "NEEDS INPUT" : "READY";
 }

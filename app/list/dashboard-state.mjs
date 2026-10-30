@@ -65,7 +65,7 @@ function compareValues(left, right) {
     return compareText(String(left), String(right));
 }
 /** Group order by the state the STATE column shows: sessions with work in hand first, finished ones last. */
-const GROUP_STATE_ORDER = ["WORKING", "WAITING", "STARTING", "READY", "UNKNOWN", "SLEEPING", "STALE", "FAILED", "STOPPED", "EXITED"];
+const GROUP_STATE_ORDER = ["NEEDS INPUT", "WORKING", "WAITING", "STARTING", "READY", "UNKNOWN", "SLEEPING", "STALE", "FAILED", "STOPPED", "EXITED"];
 /** Return the canonical identity used to coalesce dashboard group rows. */
 export function dashboardGroupIdentity(session, groupBy) {
     return groupBy === "taskState"

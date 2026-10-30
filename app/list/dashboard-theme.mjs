@@ -43,6 +43,7 @@ function stateColor(session) {
         case "WORKING":
             return JOBWATCH_ANSI.green;
         case "WAITING":
+        case "NEEDS INPUT":
             return JOBWATCH_ANSI.amber;
         case "STARTING":
             return JOBWATCH_ANSI.cyan;

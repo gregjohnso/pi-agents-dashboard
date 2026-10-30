@@ -18,7 +18,7 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, watch } from "node:fs";
-import { mkdir, readdir, readFile, appendFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, appendFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import net from "node:net";
 import path from "node:path";
@@ -634,6 +634,11 @@ export function createNativeBackend({ sessionsHome, node = process.execPath, mod
   let lastRows = new Map();
   const forgottenKeys = new Set();
   const forgottenDirectory = stateHome === undefined ? undefined : path.join(stateHome, "forgotten");
+  /** One file per session whose finished turn the operator has not looked at, shared by every window. */
+  const reviewDirectory = stateHome === undefined ? undefined : path.join(stateHome, "needs-review");
+  const localReviewMarks = new Set();
+  /** Reviewed in this window; hidden even if its mark file has not been removed yet. */
+  const reviewedHere = new Set();
   /** The owner identity each session last reported, so an attach refusal can be stamped with who refused it. */
   const lastOwnerIdentity = new Map();
   /** The control channel, injectable so a case can drive the answer shapes without an owner. */
@@ -656,6 +661,18 @@ export function createNativeBackend({ sessionsHome, node = process.execPath, mod
 
   const notify = () => {
     for (const listener of [...listeners]) listener();
+  };
+
+  const readReviewMarks = async () => {
+    const names = reviewDirectory === undefined ? [...localReviewMarks].map((id) => `${id}.json`) : await readdir(reviewDirectory).catch(() => []);
+    return new Set(names.filter((name) => name.endsWith(".json")).map((name) => name.slice(0, -5)).filter((id) => !reviewedHere.has(id)));
+  };
+  const markForReview = async (sessionId) => {
+    reviewedHere.delete(sessionId);
+    localReviewMarks.add(sessionId);
+    if (reviewDirectory === undefined) return;
+    await mkdir(reviewDirectory, { recursive: true, mode: 0o700 });
+    await atomicWriteJson(path.join(reviewDirectory, `${sessionId}.json`), { version: 1, sessionId, markedAt: new Date().toISOString() });
   };
 
   /** Hide a row by its owner key, persistently when there is a state home. Never touches files or processes. */
@@ -940,6 +957,17 @@ export function createNativeBackend({ sessionsHome, node = process.execPath, mod
           return exit === undefined ? row : recordWithExit(row, exit);
         });
         current.sort((left, right) => left.sessionId.localeCompare(right.sessionId));
+        // A live session seen working on the previous read and ready now has a finished turn to review.
+        const reviewMarks = await readReviewMarks();
+        for (const row of current) {
+          const previous = lastRows.get(row.sessionId);
+          const wasBusy = previous?.processState === "LIVE" && (previous.taskState === "WORKING" || previous.taskState === "WAITING");
+          if (wasBusy && row.processState === "LIVE" && row.taskState === "READY" && !reviewMarks.has(row.sessionId)) {
+            await markForReview(row.sessionId);
+            reviewMarks.add(row.sessionId);
+          }
+          if (reviewMarks.has(row.sessionId)) row.needsReview = true;
+        }
         lastRows = new Map(current.map((row) => [row.sessionId, row]));
         trace(`getState -> ${current.length} row(s): ${current.map((row) => `${row.sessionId}:${row.processState}`).join(",")}`);
         return { sessions: current, cursor: { daemonEpoch: "native", sequence: String(current.length) } };
@@ -1309,7 +1337,14 @@ export function createNativeBackend({ sessionsHome, node = process.execPath, mod
      * owner exactly as it was.
      */
     async attach() {},
-    async detach() {},
+    /** Leaving a session is reviewing it: whatever it finished while open, or before, no longer needs input. */
+    async detach(sessionId) {
+      reviewedHere.add(sessionId);
+      localReviewMarks.delete(sessionId);
+      const previous = lastRows.get(sessionId);
+      if (previous !== undefined) lastRows.set(sessionId, { ...previous, taskState: "READY", needsReview: false });
+      if (reviewDirectory !== undefined) await rm(path.join(reviewDirectory, `${sessionId}.json`), { force: true });
+    },
     close() {
       watcher?.close();
       watcher = undefined;

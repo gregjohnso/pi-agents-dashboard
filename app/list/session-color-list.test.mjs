@@ -63,6 +63,13 @@ it("asks the session to change colour, and reports only the colour it confirmed"
   await expect(unconfirmed.client.setColor("session-1700000000041", 1, "req", "green")).rejects.toMatchObject({ code: "COLOR_UNCONFIRMED" });
 });
 
+it("keeps an idle session WORKING while one of its background subagents runs", async () => {
+  const { client } = await backend(live({ subagentsRunning: 2 }), () => ({}));
+  const [row] = (await client.getState()).sessions;
+  expect(row.taskState).toBe("WORKING");
+  expect(row.activity.summary).toContain("2 subagents running");
+});
+
 it("keeps an idle session WORKING while one of its monitors runs", async () => {
   const { client } = await backend(live({ monitorsRunning: 1 }), () => ({}));
   const row = (await client.getState()).sessions[0];

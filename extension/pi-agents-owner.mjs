@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { connectOwnerSideband, isNativeSessionColor, isNativeSessionName, readOwnerSidebandEnvironment } from "../runtime/native-sideband.mjs";
 import { generateNativeLabel } from "../runtime/native-labels.mjs";
 import { summarizePromptInput } from "../runtime/summaries.mjs";
@@ -44,7 +45,7 @@ const MAX_FACT_TEXT_LENGTH = 4096;
 /** A widget for a session that has already been replaced: it renders nothing and captures nothing. */
 const EMPTY_WIDGET = { render: () => [], invalidate: () => {} };
 
-/** @typedef {{ generation: number, disposed: boolean, tui: unknown, link: any, pi?: any, agentPhase?: string, renameError?: string, labelFacts?: any, labelController?: AbortController, labelWork?: Promise<void>, labelPrompts?: string[], labelMessages?: any[], pendingRequests?: number, completedRequests?: number, labelAttempts?: number, labelRunning?: boolean, automaticName?: string, automaticNameEvents?: string[], nameChanged?: boolean, sessionColor?: string, monitorsRunning?: number }} OwnerSession */
+/** @typedef {{ generation: number, disposed: boolean, tui: unknown, link: any, pi?: any, agentPhase?: string, renameError?: string, labelFacts?: any, labelController?: AbortController, labelWork?: Promise<void>, labelPrompts?: string[], labelMessages?: any[], pendingRequests?: number, completedRequests?: number, labelAttempts?: number, labelRunning?: boolean, automaticName?: string, automaticNameEvents?: string[], nameChanged?: boolean, sessionColor?: string, monitorsRunning?: number, subagentsRunning?: number }} OwnerSession */
 
 /** @param {unknown} value */
 function isRecord(value) {
@@ -109,6 +110,8 @@ function collectFacts(event, ctx, session, agentPhase) {
     colorSupported: session.sessionColor !== undefined ? true : undefined,
     // pi-monitor announces its running monitors; a running one is work in progress even with the model idle.
     monitorsRunning: session.monitorsRunning,
+    // pi-subagents' count of this session's active runs; a background one is work in progress too.
+    subagentsRunning: session.subagentsRunning,
     ...session.labelFacts,
     // Which of Pi's own agent-loop events was last seen: "start", "end" or "settled". It is the event's own
     // name and nothing inferred - Pi's `agent_end` carries no error, so no failure is ever read from it.
@@ -460,6 +463,43 @@ export function registerOwnerExtension(pi, options = {}) {
     current.monitorsRunning = data.count;
     republish(undefined, undefined, currentCtx);
   });
+
+  // pi-subagents says only that its jobs changed, so ask its status RPC for the count; one question at a time.
+  let subagentQueryInFlight = false;
+  let subagentQueryAgain = false;
+  const askSubagents = () => {
+    if (typeof pi.events?.emit !== "function" || typeof pi.events?.on !== "function") return;
+    if (subagentQueryInFlight) {
+      subagentQueryAgain = true;
+      return;
+    }
+    subagentQueryInFlight = true;
+    const requestId = `pi-agents-${randomUUID()}`;
+    /** @type {any} */
+    let unsubscribe;
+    const finish = () => {
+      clearTimeout(timer);
+      if (typeof unsubscribe === "function") unsubscribe();
+      subagentQueryInFlight = false;
+      if (subagentQueryAgain) {
+        subagentQueryAgain = false;
+        askSubagents();
+      }
+    };
+    const timer = setTimeout(finish, 5_000);
+    timer.unref?.();
+    unsubscribe = pi.events.on(`subagents:rpc:v1:reply:${requestId}`, (/** @type {any} */ reply) => {
+      const total = reply?.success === true ? reply.data?.fleet?.totalActive : undefined;
+      if (Number.isSafeInteger(total) && total >= 0 && current !== undefined && !current.disposed && current.subagentsRunning !== total) {
+        current.subagentsRunning = total;
+        republish(undefined, undefined, currentCtx);
+      }
+      finish();
+    });
+    pi.events.emit("subagents:rpc:v1:request", { version: 1, requestId, method: "status", params: {}, source: { extension: "pi-agents" } });
+  };
+  pi.events?.on?.("subagent:jobs-changed", askSubagents);
+  pi.events?.on?.("subagents:rpc:v1:ready", askSubagents);
 
   // The list's /rename, inside the session too: Pi's own setter, the same one Pi's /name uses.
   if (typeof pi.registerCommand === "function") {

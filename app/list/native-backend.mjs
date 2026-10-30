@@ -217,7 +217,8 @@ export function rowStateFromStatus(status, context = {}) {
   // overriding the state. WAITING is reserved for the condition actually observed - the loop is not running
   // and Pi says messages are pending. Nothing here infers background idleness or tool-approval state.
   const monitorsRunning = Number.isSafeInteger(facts.monitorsRunning) ? facts.monitorsRunning : 0;
-  const loopBusy = agentPhase === "start" || idle === false || monitorsRunning > 0;
+  const subagentsRunning = Number.isSafeInteger(facts.subagentsRunning) ? facts.subagentsRunning : 0;
+  const loopBusy = agentPhase === "start" || idle === false || monitorsRunning > 0 || subagentsRunning > 0;
   let taskState;
   if (loopBusy) taskState = "WORKING";
   else if (pendingMessages === true) taskState = "WAITING";
@@ -234,6 +235,7 @@ export function rowStateFromStatus(status, context = {}) {
     idle,
     pendingMessages,
     monitorsRunning,
+    subagentsRunning,
     // Nothing published tells this backend about work outside Pi's loop, so it claims nothing and counts nothing.
     backgroundWorkKnown: false,
     model,
@@ -309,6 +311,7 @@ export function describeOwnerActivity(row) {
   else if (row.agentPhase === "settled") parts.push("run settled");
   if (row.pendingMessages === true) parts.push("work queued");
   if (row.monitorsRunning > 0) parts.push(`${row.monitorsRunning} monitor${row.monitorsRunning === 1 ? "" : "s"} running`);
+  if (row.subagentsRunning > 0) parts.push(`${row.subagentsRunning} subagent${row.subagentsRunning === 1 ? "" : "s"} running`);
   if (row.idle === true) parts.push("model loop idle");
   else if (row.idle === false) parts.push("model loop busy");
   if (!row.stateIsKnown) parts.push("state not reported yet");

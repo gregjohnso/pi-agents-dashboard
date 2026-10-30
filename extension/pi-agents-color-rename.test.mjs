@@ -112,3 +112,21 @@ it("publishes how many monitors pi-monitor says are running", async () => {
   await registration.whenBridgeSettled();
   expect(bridge.facts.at(-1)).toMatchObject({ monitorsRunning: 0 });
 });
+
+it("publishes how many subagent runs pi-subagents reports active, re-asking whenever its jobs change", async () => {
+  const { fake, bridge, registration } = await started();
+  let active = 1;
+  const asked = [];
+  fake.pi.events.on("subagents:rpc:v1:request", (request) => {
+    asked.push(request.method);
+    fake.pi.events.emit(`subagents:rpc:v1:reply:${request.requestId}`, { version: 1, requestId: request.requestId, method: "status", success: true, data: { fleet: { totalActive: active } } });
+  });
+  fake.pi.events.emit("subagent:jobs-changed", { version: 1 });
+  await registration.whenBridgeSettled();
+  expect(bridge.facts.at(-1)).toMatchObject({ subagentsRunning: 1 });
+  active = 0;
+  fake.pi.events.emit("subagent:jobs-changed", { version: 1 });
+  await registration.whenBridgeSettled();
+  expect(bridge.facts.at(-1)).toMatchObject({ subagentsRunning: 0 });
+  expect(asked.every((method) => method === "status")).toBe(true);
+});

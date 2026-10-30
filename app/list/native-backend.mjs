@@ -552,6 +552,36 @@ async function unreportedOwner(root, records) {
   return { record, owner: creation.owner };
 }
 
+/**
+ * A root whose launch died before writing its creation record, known only from its provenance file and the pids it
+ * names: the creating manager, and every owner the in-Pi preload registered.
+ */
+async function unrecordedRoot(root) {
+  const paths = demoPaths(root);
+  const ownership = JSON.parse(await readFile(paths.ownership, "utf8"));
+  if (typeof ownership?.ownerId !== "string" || !Number.isSafeInteger(ownership.createdByPid) || !Number.isSafeInteger(ownership.createdAtMs)) return undefined;
+  const ownerPids = (await readFile(paths.ingressLog, "utf8").catch(() => "")).split("\n").flatMap((line) => {
+    try {
+      const event = JSON.parse(line);
+      return event?.event === "registered" && Number.isSafeInteger(event.pid) ? [event.pid] : [];
+    } catch {
+      return [];
+    }
+  });
+  const key = createHash("sha256").update(JSON.stringify(["unrecorded-root", root, ownership.ownerId, ownership.createdByPid, ownership.createdAtMs])).digest("hex");
+  return { key, pids: [ownership.createdByPid, ...ownerPids] };
+}
+
+/** Only ESRCH proves a pid is unused; a reused pid makes a clear refuse, never succeed. */
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
 function forgottenOwnerKey(root, owner, ownerId) {
   if (!Number.isSafeInteger(owner?.pid) || typeof owner?.startIdentity !== "string" || !Number.isSafeInteger(owner?.processGroupId)) return undefined;
   return createHash("sha256").update(JSON.stringify([root ?? null, ownerId ?? null, owner.pid, owner.startIdentity, owner.processGroupId])).digest("hex");
@@ -626,6 +656,16 @@ export function createNativeBackend({ sessionsHome, node = process.execPath, mod
 
   const notify = () => {
     for (const listener of [...listeners]) listener();
+  };
+
+  /** Hide a row by its owner key, persistently when there is a state home. Never touches files or processes. */
+  const forget = async (key) => {
+    if (forgottenDirectory !== undefined) {
+      await mkdir(forgottenDirectory, { recursive: true, mode: 0o700 });
+      await atomicWriteJson(path.join(forgottenDirectory, `${key}.json`), { version: 1, key });
+    }
+    forgottenKeys.add(key);
+    notify();
   };
 
   /**
@@ -842,7 +882,9 @@ export function createNativeBackend({ sessionsHome, node = process.execPath, mod
         const rows = await Promise.all(
           roots.map(async (root) => {
             const creation = await readOwnerRecord(root).catch(() => undefined);
-            const key = creation?.root === root ? forgottenOwnerKey(root, creation.owner, creation.durable?.ownerId) : undefined;
+            const key = creation?.root === root
+              ? forgottenOwnerKey(root, creation.owner, creation.durable?.ownerId)
+              : creation === undefined ? (await unrecordedRoot(root).catch(() => undefined))?.key : undefined;
             rowKeys.set(path.basename(root), key);
             if (await isForgotten(key)) return undefined;
             // Bounded, and bounded per row: a wedged owner costs this one row its detail, not the whole list.
@@ -1242,6 +1284,14 @@ export function createNativeBackend({ sessionsHome, node = process.execPath, mod
       const saved = records.find((record) => ownerId === undefined
         ? record.runtimeRoot === root && creation?.root === root && record.ownerId === creation?.durable?.ownerId && sameOwnerIdentity(record.owner, creation.owner)
         : record.ownerId === ownerId);
+      const unrecorded = saved === undefined && root !== undefined && creation === undefined ? await unrecordedRoot(root).catch(() => undefined) : undefined;
+      if (unrecorded !== undefined) {
+        if (revision !== undefined && revision !== 1) throw Object.assign(new Error("The session record changed before clear"), { code: "REVISION_CONFLICT" });
+        const probe = unrecorded.pids.some(processExists) ? undefined : await control(root, { type: "status", detail: "list" }, "status", { timeoutMs: statusTimeoutMs });
+        if (probe === undefined || probe.reachable) throw Object.assign(new Error("This session may still be running; stop it before clearing"), { code: "SESSION_LIVE" });
+        await forget(unrecorded.key);
+        return { sessionId, deleted: true };
+      }
       if (saved === undefined) throw Object.assign(new Error(`delete has no verified dashboard record for ${sessionId}; nothing was changed`), { code: "ACTION_UNSUPPORTED" });
       const expectedRevision = ownerId === undefined ? 1 : savedRecordFor(saved).revision;
       if (revision !== undefined && revision !== expectedRevision) throw Object.assign(new Error("The session record changed before clear"), { code: "REVISION_CONFLICT" });
@@ -1249,12 +1299,7 @@ export function createNativeBackend({ sessionsHome, node = process.execPath, mod
       if (state !== "gone") throw Object.assign(new Error(state === "live" ? "This session is still running; stop it before clearing" : "Could not confirm this session has stopped; nothing was cleared"), { code: state === "live" ? "SESSION_LIVE" : "SESSION_STATE_UNKNOWN" });
       const key = forgottenOwnerKey(saved.runtimeRoot, saved.owner, saved.ownerId);
       if (key === undefined) throw Object.assign(new Error("This session's owner identity is incomplete; nothing was cleared"), { code: "SESSION_STATE_UNKNOWN" });
-      if (forgottenDirectory !== undefined) {
-        await mkdir(forgottenDirectory, { recursive: true, mode: 0o700 });
-        await atomicWriteJson(path.join(forgottenDirectory, `${key}.json`), { version: 1, key });
-      }
-      forgottenKeys.add(key);
-      notify();
+      await forget(key);
       return { sessionId, deleted: true };
     },
 

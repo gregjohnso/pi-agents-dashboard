@@ -85,6 +85,7 @@ function fakeOwnerConnection() {
       requestStop: async (requestId) => void sent.push({ request: "stop", requestId }),
       requestAbort: async (requestId) => void sent.push({ request: "abort", requestId }),
       requestRename: async (requestId, name) => void sent.push({ request: "rename", requestId, name }),
+      requestColor: async (requestId, color) => void sent.push({ request: "color", requestId, color }),
       close() {
         closes += 1;
       },
@@ -456,5 +457,30 @@ describe("the controller renames the row the operator selected", () => {
     controller.setComposerPrompt("/rename alpha renamed");
     await controller.runListCommand();
     expect(controller.composerDraft.prompt).toBe("");
+  });
+});
+
+describe("a color asked for from the list", () => {
+  it("carries one of session-color's names to the owner, and refuses anything else at the sending boundary", async () => {
+    const { host, ownerLink } = await linkPair();
+    const arriving = nextRequest(ownerLink);
+    await host.requestColor("color-1", "red");
+    expect(await arriving).toMatchObject({ type: "owner-request", requestId: "color-1", request: "color", color: "red" });
+    await expect(host.requestColor("color-2", "magenta")).rejects.toThrow();
+  });
+
+  it("is sent only to an owner generation that advertises color support", async () => {
+    const { consumer } = consumerFor();
+    const owner = fakeOwnerConnection();
+    consumer.adopt(owner.connection);
+    owner.emit(READY);
+    owner.emit(FACTS({ agentPhase: "settled" }));
+    const refused = await consumer.request("color", "req-c1", "red");
+    expect(refused).toMatchObject({ sent: false });
+    expect(owner.sent).toEqual([]);
+    expect(owner.closes()).toBe(0);
+    owner.emit(FACTS({ colorSupported: true }));
+    expect((await consumer.request("color", "req-c2", "red")).sent).toBe(true);
+    expect(owner.sent).toEqual([{ request: "color", requestId: "req-c2", color: "red" }]);
   });
 });

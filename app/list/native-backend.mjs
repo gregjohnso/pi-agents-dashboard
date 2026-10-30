@@ -29,7 +29,7 @@ import { execFile } from "node:child_process";
 import { parseModelCatalogue } from "./native-model-catalogue.mjs";
 import { nativeLabelsFromFacts, readNativeLabels } from "../../runtime/native-labels.mjs";
 import { sessionNameFromPrompt } from "../../runtime/session-name.mjs";
-import { isNativeSessionName } from "../../runtime/native-sideband.mjs";
+import { isNativeSessionColor, isNativeSessionName } from "../../runtime/native-sideband.mjs";
 import { ATTACH_PROTOCOL } from "../../examples/native-session-demo/client.mjs";
 import { resolveCohort } from "../../examples/native-session-demo/cohort.mjs";
 import { readSavedOwnerRecords } from "../../examples/native-session-demo/saved-owner-record.mjs";
@@ -455,6 +455,8 @@ function recordFor(root, status, launchedPrompt, requestedModel, observedExit, a
   const confirmedName = typeof status?.bridge?.facts?.sessionName === "string" ? status.bridge.facts.sessionName : undefined;
   const name = confirmedName ?? (verifiedOwner === undefined ? undefined : durableRecord?.sessionName) ?? sessionNameFromPrompt(launchedPrompt ?? "") ?? directoryName;
   const labels = nativeLabelsFromFacts(status?.bridge?.facts, durableRecord?.labels);
+  const sessionColor = status?.bridge?.facts?.sessionColor;
+  const color = isNativeSessionColor(sessionColor) && sessionColor !== "default" ? sessionColor : undefined;
   const labelStatusSuffix = labels?.status && !["ready", "pending"].includes(labels.status) ? `; labels ${labels.status}` : "";
   const alive = state.processState === "LIVE";
   return {
@@ -470,6 +472,7 @@ function recordFor(root, status, launchedPrompt, requestedModel, observedExit, a
     canonicalSessionFile: liveSessionFile ?? durableRecord?.sessionFile ?? path.join(root, "session.jsonl"),
     cwd: status?.projectCwd ?? durableRecord?.cwd ?? root,
     name,
+    ...(color === undefined ? {} : { color }),
     // Agent state comes from published facts; process state may also use an exact procfs identity match.
     taskState: state.taskState,
     processState: state.processState,
@@ -1163,6 +1166,32 @@ export function createNativeBackend({ sessionsHome, node = process.execPath, mod
      *
      * @param {string} sessionId @param {number} revision @param {string} [requestId] @param {string} [name]
      */
+    /**
+     * Ask a session to change colour through its own /color, and report the colour it confirmed.
+     * @param {string} sessionId @param {number} revision @param {string} [requestId] @param {string} [color]
+     */
+    async setColor(sessionId, revision, requestId, color) {
+      if (savedRowOwnerId(sessionId) !== undefined) refuseSavedRowAction(sessionId, "/color");
+      if (!isNativeSessionColor(color)) throw Object.assign(new Error(`${color} is not a session color`), { code: "COLOR_UNKNOWN" });
+      const root = path.join(sessionsHome, sessionId);
+      // An older manager does not know the frame and would never answer it, so ask only one that says it can.
+      const status = await control(root, { type: "status", detail: "list" }, "status", { timeoutMs: statusTimeoutMs });
+      if (!status.reachable) throw Object.assign(new Error(`could not reach ${sessionId}: ${status.reason}`), { code: "COLOR_UNREACHABLE" });
+      if (status.answer.status?.bridge?.facts?.colorSupported !== true) {
+        throw Object.assign(new Error("this session cannot be colored from the list; open it and use /color there"), { code: "COLOR_UNSUPPORTED" });
+      }
+      const probe = await control(root, { type: "color", color }, "colored", { timeoutMs: MUTATION_ANSWER_MS });
+      if (!probe.reachable) throw Object.assign(new Error(`could not reach ${sessionId} to color it: ${probe.reason}`), { code: "COLOR_UNREACHABLE" });
+      if (probe.answer.sent !== true) {
+        throw Object.assign(new Error(`${sessionId} was not colored: ${probe.answer.reason ?? "its owner did not accept a color"}`), { code: "COLOR_UNSUPPORTED" });
+      }
+      if (probe.answer.confirmedColor !== color) {
+        throw Object.assign(new Error(`${sessionId} did not confirm ${color}; it reports ${probe.answer.confirmedColor ?? "no color"}`), { code: "COLOR_UNCONFIRMED" });
+      }
+      notify();
+      return { sessionId, color, confirmed: true };
+    },
+
     async rename(sessionId, revision, requestId, name) {
       if (savedRowOwnerId(sessionId) !== undefined) refuseSavedRowAction(sessionId, "rename");
       const root = path.join(sessionsHome, sessionId);

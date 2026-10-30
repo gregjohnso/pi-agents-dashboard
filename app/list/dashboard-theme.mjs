@@ -19,8 +19,15 @@ export const JOBWATCH_ANSI = {
     gray: "\x1b[38;2;136;136;136m",
     black: "\x1b[38;2;0;0;0m",
 };
-/** Turn a palette foreground into the matching background fill. */
+/** session-color's names, as the xterm-256 hues it paints the editor border with. */
+const SESSION_TINTS = {
+    red: "255;95;95", blue: "95;175;255", green: "95;215;135", yellow: "215;175;95",
+    purple: "175;135;255", orange: "215;135;95", pink: "255;135;215", cyan: "95;215;215",
+};
+/** Turn a palette foreground, or a session-color name, into the matching background fill. */
 function backgroundFor(color) {
+    if (Object.hasOwn(SESSION_TINTS, color))
+        return `\x1b[48;2;${SESSION_TINTS[color]}m`;
     return JOBWATCH_ANSI[color].replace("[38;2;", "[48;2;");
 }
 function paint(text, foreground, selected, background = JOBWATCH_ANSI.blackBackground) {

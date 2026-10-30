@@ -528,6 +528,9 @@ export class DashboardController {
             case "help":
                 this.overlay = createHelpOverlay();
                 break;
+            case "color_session":
+                await this.colorSelectedSession(parsed.color);
+                return;
             case "rename_session":
                 // The only list command that reaches an existing session. It returns rather than breaking,
                 // because the composer is cleared only once the rename was actually accepted.
@@ -573,6 +576,34 @@ export class DashboardController {
             return;
         }
         // Read the list back, so what appears is the name the owner confirmed rather than the one typed here.
+        const snapshot = await this.client.getState().catch(() => undefined);
+        if (snapshot !== undefined)
+            this.applySnapshot(snapshot);
+        this.setComposerPrompt("");
+        this.status = { kind: "ready" };
+        this.requestRender?.();
+    }
+    /** The list's /color: ask the selected session to change colour, and show the colour it confirmed. @param {string} color */
+    async colorSelectedSession(color) {
+        const selected = this.selectedSession();
+        if (selected === undefined) {
+            this.status = { kind: "error", code: "NO_SESSION_SELECTED", message: "Select a session first, then type /color <color>" };
+            this.requestRender?.();
+            return;
+        }
+        if (typeof this.client.setColor !== "function") {
+            this.status = { kind: "error", code: "ACTION_UNSUPPORTED", message: `This list cannot color ${selected.sessionId}` };
+            this.requestRender?.();
+            return;
+        }
+        try {
+            await this.client.setColor(selected.sessionId, selected.revision, this.requestId(), color);
+        }
+        catch (error) {
+            this.setError(error, "COLOR_FAILED");
+            this.requestRender?.();
+            return;
+        }
         const snapshot = await this.client.getState().catch(() => undefined);
         if (snapshot !== undefined)
             this.applySnapshot(snapshot);

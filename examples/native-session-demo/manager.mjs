@@ -412,7 +412,7 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
      * therefore local and belongs to the generation being written to: the capability must be advertised by the
      * facts of the CURRENT owner generation, re-read at this boundary rather than cached from a previous owner.
      *
-     * @param {"stop"|"abort"|"rename"} request @param {string} requestId @param {string} [name]
+     * @param {"stop"|"abort"|"rename"|"color"} request @param {string} requestId @param {string} [name]
      */
     async request(request, requestId, name) {
       const owner = active;
@@ -422,7 +422,8 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
         return absent;
       }
       owner.totals.requested += 1;
-      if (request === "rename" && owner.facts?.renameSupported !== true) {
+      const capability = request === "rename" ? "renameSupported" : request === "color" ? "colorSupported" : undefined;
+      if (capability !== undefined && owner.facts?.[capability] !== true) {
         // Named locally, nothing sent, nothing torn down. Read from this generation's own latest snapshot, so a
         // capability a previous owner advertised - or one this owner has since withdrawn - never authorizes it.
         const unsupported = {
@@ -431,11 +432,11 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
           generation: owner.generation,
           admitted: false,
           sent: false,
-          reason: `this owner generation does not advertise rename support, so no rename was sent to it`,
+          reason: `this owner generation does not advertise ${request} support, so no ${request} was sent to it`,
           atHostMs: now(),
         };
         note({ type: "bridge-request-unsupported", request, generation: owner.generation });
-        emit(`owner bridge ${request} request refused on generation ${owner.generation}: rename support is not advertised`);
+        emit(`owner bridge ${request} request refused on generation ${owner.generation}: ${request} support is not advertised`);
         return unsupported;
       }
       if (owner.awaiting.size >= BRIDGE_IN_FLIGHT_REQUESTS) {
@@ -462,6 +463,7 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
       owner.awaiting.set(requestId, record);
       try {
         if (request === "rename") await owner.connection.requestRename(requestId, name);
+        else if (request === "color") await owner.connection.requestColor(requestId, name);
         else if (request === "stop") await owner.connection.requestStop(requestId);
         else await owner.connection.requestAbort(requestId);
         record.sent = true;
@@ -739,7 +741,7 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
   };
   void acceptBridgeOwners();
 
-  /** @param {"stop"|"abort"|"rename"} request @param {string} [name] */
+  /** @param {"stop"|"abort"|"rename"|"color"} request @param {string} [name] */
   const requestThroughBridge = (request, name) => bridgeConsumer.request(request, randomUUID(), name);
 
   /**
@@ -768,6 +770,23 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
       confirmedName: typeof facts.sessionName === "string" ? facts.sessionName : null,
       renameError: typeof facts.renameError === "string" ? facts.renameError : null,
     };
+  };
+
+  /**
+   * Ask the owner to change its colour through session-color, then report the colour the owner CONFIRMED in its
+   * republished facts, exactly as `renameThroughBridge` does for a name. @param {unknown} color
+   */
+  const colorThroughBridge = async (color) => {
+    const record = await requestThroughBridge("color", typeof color === "string" ? color : undefined);
+    const answered = () => bridgeConsumer.status().receipts.some((receipt) => receipt.requestId === record.requestId);
+    if (record.sent === true) {
+      for (let waited = 0; waited < RENAME_CONFIRM_WAIT_MS && !answered(); waited += RENAME_CONFIRM_POLL_MS) {
+        await new Promise((resolve) => setTimeout(resolve, RENAME_CONFIRM_POLL_MS));
+      }
+    }
+    const facts = bridgeConsumer.status().facts ?? {};
+    return { sent: record.sent === true, answered: answered(), reason: record.reason ?? null,
+      confirmedColor: typeof facts.sessionColor === "string" ? facts.sessionColor : null };
   };
 
   const launch = ownerLaunchPlan({
@@ -1173,6 +1192,11 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
             void renameThroughBridge(header.name).then(
               (answer) => send(socket, { type: "renamed", ...answer }),
               (error) => send(socket, { type: "renamed", sent: false, reason: String(error?.message ?? error), requestedName: null, confirmedName: null, renameError: null }),
+            );
+          } else if (header.type === "color") {
+            void colorThroughBridge(header.color).then(
+              (answer) => send(socket, { type: "colored", ...answer }),
+              (error) => send(socket, { type: "colored", sent: false, reason: String(error?.message ?? error), confirmedColor: null }),
             );
           } else if (header.type === "stop") {
             send(socket, { type: "stopping" });

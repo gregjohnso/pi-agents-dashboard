@@ -1,4 +1,4 @@
-import { connectOwnerSideband, readOwnerSidebandEnvironment } from "../runtime/native-sideband.mjs";
+import { connectOwnerSideband, isNativeSessionColor, isNativeSessionName, readOwnerSidebandEnvironment } from "../runtime/native-sideband.mjs";
 import { generateNativeLabel } from "../runtime/native-labels.mjs";
 import { summarizePromptInput } from "../runtime/summaries.mjs";
 
@@ -44,7 +44,7 @@ const MAX_FACT_TEXT_LENGTH = 4096;
 /** A widget for a session that has already been replaced: it renders nothing and captures nothing. */
 const EMPTY_WIDGET = { render: () => [], invalidate: () => {} };
 
-/** @typedef {{ generation: number, disposed: boolean, tui: unknown, link: any, pi?: any, agentPhase?: string, renameError?: string, labelFacts?: any, labelController?: AbortController, labelWork?: Promise<void>, labelPrompts?: string[], labelMessages?: any[], pendingRequests?: number, completedRequests?: number, labelAttempts?: number, labelRunning?: boolean, automaticName?: string, automaticNameEvents?: string[], nameChanged?: boolean }} OwnerSession */
+/** @typedef {{ generation: number, disposed: boolean, tui: unknown, link: any, pi?: any, agentPhase?: string, renameError?: string, labelFacts?: any, labelController?: AbortController, labelWork?: Promise<void>, labelPrompts?: string[], labelMessages?: any[], pendingRequests?: number, completedRequests?: number, labelAttempts?: number, labelRunning?: boolean, automaticName?: string, automaticNameEvents?: string[], nameChanged?: boolean, sessionColor?: string }} OwnerSession */
 
 /** @param {unknown} value */
 function isRecord(value) {
@@ -104,6 +104,9 @@ function collectFacts(event, ctx, session, agentPhase) {
     // here, so a row cannot show a rename that did not take effect.
     sessionName: text(readThrough(pi, "getSessionName")),
     renameError: text(session.renameError),
+    // The user's session-color extension announces its colour on Pi's event bus; present only once it has.
+    sessionColor: text(session.sessionColor),
+    colorSupported: session.sessionColor !== undefined ? true : undefined,
     ...session.labelFacts,
     // Which of Pi's own agent-loop events was last seen: "start", "end" or "settled". It is the event's own
     // name and nothing inferred - Pi's `agent_end` carries no error, so no failure is ever read from it.
@@ -149,6 +152,18 @@ function renameReceipt(request, session) {
     session.renameError = `setSessionName failed, so the previous name is unchanged: ${error instanceof Error ? error.message : String(error)}`.slice(0, 400);
     return { ...base, outcome: "no-run" };
   }
+}
+
+/**
+ * Change the colour through session-color, which owns `/color`, and report whether it took. session-color answers
+ * synchronously on the bus, so a colour it did not echo back was not applied. @param {any} request @param {OwnerSession} session
+ */
+function colorReceipt(request, session) {
+  const base = { requestId: request.requestId, request: "color" };
+  const events = session.pi?.events;
+  if (typeof events?.emit !== "function" || session.sessionColor === undefined) return { ...base, outcome: "unsupported" };
+  events.emit("session-color:set", { color: request.color });
+  return { ...base, outcome: session.sessionColor === request.color ? "requested" : "no-run" };
 }
 
 /** @param {any} ctx @param {string} requestId */
@@ -206,13 +221,15 @@ async function answerRequest(request, ctx, session, link, onFailure) {
   if (request.request === "stop") session.labelController?.abort();
   const receipt = request.request === "rename"
     ? renameReceipt(request, session)
+    : request.request === "color"
+    ? colorReceipt(request, session)
     : request.request === "stop"
       ? stopReceipt(ctx, request.requestId)
       : abortReceipt(ctx, request.requestId);
   if (session.disposed || session.link !== link) return;
   // The confirmed name is published BEFORE the receipt, so nothing can read "requested" and still find the old
   // name on the row. A receipt is an answer, not evidence the rename applied; the published fact is evidence.
-  if (request.request === "rename") {
+  if (request.request === "rename" || request.request === "color") {
     try {
       await link.publishFacts(collectFacts(undefined, ctx, session, session.agentPhase));
     } catch (error) {
@@ -282,6 +299,10 @@ export function registerOwnerExtension(pi, options = {}) {
   let current;
   /** @type {Promise<void>} */
   let settled = Promise.resolve();
+  /** The colour session-color last announced, which can arrive before this extension's own session_start. */
+  let announcedColor;
+  /** The context of the current session, for publishes that no Pi event hands one to. */
+  let currentCtx;
 
   /** @param {OwnerSession|undefined} session */
   const dispose = (session) => {
@@ -299,7 +320,9 @@ export function registerOwnerExtension(pi, options = {}) {
     /** @type {OwnerSession} */
     const session = { generation: generation + 1, disposed: false, tui: undefined, link: undefined, pi };
     generation = session.generation;
+    session.sessionColor = announcedColor;
     current = session;
+    currentCtx = ctx;
     captureTui(ctx, session, settings.onFailure);
     settled = openBridge(session, event, ctx, settings);
   });
@@ -415,6 +438,32 @@ export function registerOwnerExtension(pi, options = {}) {
     }
     republish(undefined, event, ctx);
   });
+
+  // session-color owns /color; it announces every change, including one asked for from the list.
+  pi.events?.on?.("session-color:changed", (/** @type {any} */ data) => {
+    if (!isNativeSessionColor(data?.color)) return;
+    announcedColor = data.color;
+    if (current === undefined || current.disposed) return;
+    current.sessionColor = data.color;
+    republish(undefined, undefined, currentCtx);
+  });
+
+  // The list's /rename, inside the session too: Pi's own setter, the same one Pi's /name uses.
+  if (typeof pi.registerCommand === "function") {
+    pi.registerCommand("rename", {
+      description: "Rename this session",
+      handler: async (/** @type {string} */ args, /** @type {any} */ ctx) => {
+        const name = (args ?? "").trim();
+        if (!isNativeSessionName(name) || typeof pi.setSessionName !== "function") {
+          ctx?.ui?.notify?.("Usage: /rename <name>", "warning");
+          return;
+        }
+        if (current !== undefined) current.nameChanged = true;
+        pi.setSessionName(name);
+        ctx?.ui?.notify?.(`Session renamed to ${name}`, "info");
+      },
+    });
+  }
 
   pi.on("session_shutdown", () => {
     dispose(current);

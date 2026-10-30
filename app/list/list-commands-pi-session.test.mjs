@@ -47,7 +47,7 @@ describe("Pi's own session commands are refused with somewhere to go", () => {
   });
 
   it("adds no manager semantics: the composer's own command set is unchanged", () => {
-    expect(LIST_COMMANDS).toEqual(["/model", "/cwd", "/isolation", "/name", "/rename", "/help"]);
+    expect(LIST_COMMANDS).toEqual(["/model", "/cwd", "/isolation", "/name", "/rename", "/color", "/help"]);
     expect(LIST_COMMAND_MENU.map((entry) => entry.name)).not.toContain("/new");
     expect(LIST_COMMAND_MENU.map((entry) => entry.name)).not.toContain("/resume");
     // The commands that do work are untouched.

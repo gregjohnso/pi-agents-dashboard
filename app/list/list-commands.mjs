@@ -1,3 +1,4 @@
+import { SESSION_COLOR_NAMES } from "../../runtime/native-sideband.mjs";
 /** @typedef {{models:string[],modelsUnavailable?:{code:string,message:string}}} DraftChoices */
 /** @typedef {{name:string,argumentHint:string,summary:string}} ListCommand */
 
@@ -16,6 +17,7 @@ export const LIST_COMMAND_MENU = [
     { name: "/isolation", argumentHint: "[worktree|shared]", summary: "worktree or shared directory" },
     { name: "/name", argumentHint: "[text]", summary: "session name; empty lets the agent name it" },
     { name: "/rename", argumentHint: "<new name>", summary: "rename the selected session" },
+    { name: "/color", argumentHint: "<color>", summary: "color the selected session" },
     { name: "/help", argumentHint: "", summary: "the dashboard's keys and commands" },
 ];
 export const LIST_COMMANDS = LIST_COMMAND_MENU.map((command) => command.name);
@@ -144,6 +146,12 @@ export function parseListCommand(text, choices) {
         if (argument.length > MAX_SESSION_NAME) return rejected("SESSION_NAME_TOO_LONG", `Session names are limited to ${MAX_SESSION_NAME} characters`);
         if (NAME_CONTROL_CHARACTERS.test(argument)) return rejected("SESSION_NAME_NOT_PRINTABLE", "A session name cannot contain control characters");
         return { kind: "rename_session", name: argument };
+    }
+    if (name === "/color") {
+        const color = argument.toLowerCase();
+        if (color === "") return rejected("SESSION_COLOR_REQUIRED", `Type a color: /color <${SESSION_COLOR_NAMES.join("|")}>`);
+        if (!SESSION_COLOR_NAMES.includes(color)) return rejected("SESSION_COLOR_UNKNOWN", `Unknown color ${argument}. Use ${SESSION_COLOR_NAMES.join(", ")}.`);
+        return { kind: "color_session", color };
     }
     if (name === "/help") return { kind: "help" };
     // Pi's own, and answered with the gesture that reaches them rather than a dead end.

@@ -362,7 +362,8 @@ export async function prepareCandidateRelease({
   })).stdout);
   if (!Array.isArray(packed) || packed.length !== 1) throw new Error(`npm pack produced ${packed.length} artifacts`);
   const tarball = path.join(attemptRoot, packed[0].filename);
-  await run("tar", ["-xzf", tarball, "--strip-components=1", "-C", appRoot], { cwd: sourceRoot });
+  // 15k files; measured at 466 s on a slow shared filesystem, past run()'s 300 s default.
+  await run("tar", ["-xzf", tarball, "--strip-components=1", "-C", appRoot], { cwd: sourceRoot, timeout: 1_800_000 });
   await rm(path.join(appRoot, "node_modules"), { recursive: true, force: true });
   await cp(path.join(cohortRoot, "node_modules"), path.join(appRoot, "node_modules"), {
     recursive: true,

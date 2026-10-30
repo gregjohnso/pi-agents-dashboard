@@ -100,7 +100,7 @@ function rejected(code, message) {
  * Resolve one submitted list prompt into a draft edit, a picker, a rename, or a refusal.
  * A slash prompt never launches. `/rename` is the only one that reaches an existing session.
  * @param {string} text @param {DraftChoices} choices
- * @returns {{kind:"not_a_command"}|{kind:"set_model",model:{provider:string,id:string}}|{kind:"pick_model"}|{kind:"set_cwd",path:string}|{kind:"set_isolation",isolationMode:string}|{kind:"pick_isolation"}|{kind:"set_name",name:string}|{kind:"rename_session",name:string}|{kind:"help"}|{kind:"rejected",code:string,message:string}}
+ * @returns {{kind:"not_a_command"}|{kind:"set_model",model:{provider:string,id:string}}|{kind:"pick_model"}|{kind:"set_cwd",path:string}|{kind:"set_isolation",isolationMode:string}|{kind:"pick_isolation"}|{kind:"set_name",name:string}|{kind:"rename_session",name:string}|{kind:"color_session",color:string}|{kind:"help"}|{kind:"rejected",code:string,message:string}}
  */
 export function parseListCommand(text, choices) {
     const { name, argument } = split(text);

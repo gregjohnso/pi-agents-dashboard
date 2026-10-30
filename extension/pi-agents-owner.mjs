@@ -44,7 +44,7 @@ const MAX_FACT_TEXT_LENGTH = 4096;
 /** A widget for a session that has already been replaced: it renders nothing and captures nothing. */
 const EMPTY_WIDGET = { render: () => [], invalidate: () => {} };
 
-/** @typedef {{ generation: number, disposed: boolean, tui: unknown, link: any, pi?: any, agentPhase?: string, renameError?: string, labelFacts?: any, labelController?: AbortController, labelWork?: Promise<void>, labelPrompts?: string[], labelMessages?: any[], pendingRequests?: number, completedRequests?: number, labelAttempts?: number, labelRunning?: boolean, automaticName?: string, automaticNameEvents?: string[], nameChanged?: boolean, sessionColor?: string }} OwnerSession */
+/** @typedef {{ generation: number, disposed: boolean, tui: unknown, link: any, pi?: any, agentPhase?: string, renameError?: string, labelFacts?: any, labelController?: AbortController, labelWork?: Promise<void>, labelPrompts?: string[], labelMessages?: any[], pendingRequests?: number, completedRequests?: number, labelAttempts?: number, labelRunning?: boolean, automaticName?: string, automaticNameEvents?: string[], nameChanged?: boolean, sessionColor?: string, monitorsRunning?: number }} OwnerSession */
 
 /** @param {unknown} value */
 function isRecord(value) {
@@ -107,6 +107,8 @@ function collectFacts(event, ctx, session, agentPhase) {
     // The user's session-color extension announces its colour on Pi's event bus; present only once it has.
     sessionColor: text(session.sessionColor),
     colorSupported: session.sessionColor !== undefined ? true : undefined,
+    // pi-monitor announces its running monitors; a running one is work in progress even with the model idle.
+    monitorsRunning: session.monitorsRunning,
     ...session.labelFacts,
     // Which of Pi's own agent-loop events was last seen: "start", "end" or "settled". It is the event's own
     // name and nothing inferred - Pi's `agent_end` carries no error, so no failure is ever read from it.
@@ -301,6 +303,8 @@ export function registerOwnerExtension(pi, options = {}) {
   let settled = Promise.resolve();
   /** The colour session-color last announced, which can arrive before this extension's own session_start. */
   let announcedColor;
+  /** How many monitors pi-monitor last said are running. */
+  let announcedMonitors;
   /** The context of the current session, for publishes that no Pi event hands one to. */
   let currentCtx;
 
@@ -321,6 +325,7 @@ export function registerOwnerExtension(pi, options = {}) {
     const session = { generation: generation + 1, disposed: false, tui: undefined, link: undefined, pi };
     generation = session.generation;
     session.sessionColor = announcedColor;
+    session.monitorsRunning = announcedMonitors;
     current = session;
     currentCtx = ctx;
     captureTui(ctx, session, settings.onFailure);
@@ -445,6 +450,14 @@ export function registerOwnerExtension(pi, options = {}) {
     announcedColor = data.color;
     if (current === undefined || current.disposed) return;
     current.sessionColor = data.color;
+    republish(undefined, undefined, currentCtx);
+  });
+
+  pi.events?.on?.("pi-monitor:running", (/** @type {any} */ data) => {
+    if (!Number.isSafeInteger(data?.count) || data.count < 0) return;
+    announcedMonitors = data.count;
+    if (current === undefined || current.disposed) return;
+    current.monitorsRunning = data.count;
     republish(undefined, undefined, currentCtx);
   });
 

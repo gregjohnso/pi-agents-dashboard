@@ -102,3 +102,13 @@ it("registers /rename inside the session, setting Pi's own session name", async 
   expect(fake.pi.getSessionName()).toBe("Probe Session");
   expect(notices.at(-1)).toMatch(/Usage: \/rename <name>/u);
 });
+
+it("publishes how many monitors pi-monitor says are running", async () => {
+  const { fake, bridge, registration } = await started();
+  fake.pi.events.emit("pi-monitor:running", { count: 2 });
+  await registration.whenBridgeSettled();
+  expect(bridge.facts.at(-1)).toMatchObject({ monitorsRunning: 2 });
+  fake.pi.events.emit("pi-monitor:running", { count: 0 });
+  await registration.whenBridgeSettled();
+  expect(bridge.facts.at(-1)).toMatchObject({ monitorsRunning: 0 });
+});

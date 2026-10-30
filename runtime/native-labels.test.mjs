@@ -35,3 +35,24 @@ it("keeps safe failure diagnostics in saved labels and ignores unsupported versi
   expect(nativeLabelsFromFacts(facts)).toMatchObject({ status: "malformed", failureReason: "stop-reason", stopReason: "length" });
   expect(nativeLabelsFromFacts({ ...facts, labelVersion: 99 })).toBeUndefined();
 });
+
+it("prefers the ChatGPT subscription's small model over Haiku, with low reasoning and room to answer", async () => {
+  const luna = { provider: "openai-codex", id: "gpt-6-luna", cost: { output: 0.5 } };
+  const calls = [];
+  await generateNativeLabel({
+    getAvailable: () => [{ ...MODEL, cost: { output: 0.1 } }, { provider: "openai-codex", id: "gpt-6.1-sol", cost: { output: 30 } }, luna],
+    getProviderAuthStatus: () => ({ source: "stored" }),
+    complete: async (/** @type {any} */ model, _context, /** @type {any} */ options) => { calls.push({ model, options }); return REPLY; },
+  }, "task", { signal: new AbortController().signal });
+  expect(calls[0].model).toBe(luna);
+  expect(calls[0].options).toMatchObject({ reasoning: "low", maxTokens: 2048 });
+});
+
+it("falls back to Haiku when no ChatGPT small model is available", async () => {
+  let selected;
+  await generateNativeLabel({
+    getAvailable: () => [{ provider: "openai-codex", id: "gpt-6.1-sol", cost: { output: 30 } }, MODEL],
+    complete: async (/** @type {any} */ model) => { selected = model; return REPLY; },
+  }, "task", { signal: new AbortController().signal });
+  expect(selected).toBe(MODEL);
+});

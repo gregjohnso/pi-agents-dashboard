@@ -77,7 +77,7 @@ it("waits for two completed user requests and includes both prompts in the gener
   expect(context.messages[0].content).toContain("User: hi");
   expect(context.messages[0].content).toContain("Repair native session labels");
   expect(context.tools).toBeUndefined();
-  expect(options).toMatchObject({ maxTokens: 512, maxRetries: 0, cacheRetention: "none" });
+  expect(options).toMatchObject({ maxTokens: 2048, maxRetries: 0, cacheRetention: "none" });
   expect(o.facts().sessionName).toBe(o.pi.getSessionName());
   await o.emit("agent_settled");
   expect(o.registryCalls).toHaveLength(1);

@@ -52,11 +52,13 @@ export async function generateNativeLabel(registry, transcript, { signal, timeou
   const timer = setTimeout(cancel, timeoutMs);
   let modelFacts = {};
   try {
-    const small = (/** @type {any} */ model) => /haiku/iu.test(model.id) && (!fakeMode || model.provider === "native-session-demo-fake");
+    // The ChatGPT subscription's small model first: Haiku truncated bio transcripts at the token cap.
+    const chatgptSmall = (/** @type {any} */ model) => !fakeMode && model.provider === "openai-codex" && /luna/iu.test(model.id);
+    const small = (/** @type {any} */ model) => chatgptSmall(model) || (/haiku/iu.test(model.id) && (!fakeMode || model.provider === "native-session-demo-fake"));
     const explicitAuth = (/** @type {any} */ model) =>
       ["stored", "runtime", "models_json_key", "models_json_command"].includes(registry?.getProviderAuthStatus?.(model.provider)?.source) ? 0 : 1;
     const models = (registry?.getAvailable?.() ?? []).filter(small).sort((/** @type {any} */ a, /** @type {any} */ b) =>
-      explicitAuth(a) - explicitAuth(b) || (a.cost?.output ?? Infinity) - (b.cost?.output ?? Infinity) || `${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`));
+      Number(!chatgptSmall(a)) - Number(!chatgptSmall(b)) || explicitAuth(a) - explicitAuth(b) || (a.cost?.output ?? Infinity) - (b.cost?.output ?? Infinity) || `${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`));
     const model = models[0];
     if (model === undefined) return { status: (registry?.getAll?.() ?? []).some(small) ? "unavailable-auth" : "unavailable-model" };
     modelFacts = { modelProvider: model.provider, modelId: model.id };
@@ -67,7 +69,7 @@ export async function generateNativeLabel(registry, transcript, { signal, timeou
     const response = await Promise.race([aborted, Promise.resolve().then(() => {
       controller.signal.throwIfAborted();
       return registry.complete(model, { messages: [{ role: "user", content: summaryPrompt(transcript), timestamp: Date.now() }] },
-        { signal: controller.signal, timeoutMs, maxTokens: 512, maxRetries: 0, cacheRetention: "none" });
+        { signal: controller.signal, timeoutMs, maxTokens: 2048, ...(chatgptSmall(model) ? { reasoning: "low" } : {}), maxRetries: 0, cacheRetention: "none" });
     })]);
     if (controller.signal.aborted) return { ...modelFacts, status: "timeout", failureReason: "timeout" };
     const stopReason = STOP_REASONS.includes(response?.stopReason) ? response.stopReason : "unknown";

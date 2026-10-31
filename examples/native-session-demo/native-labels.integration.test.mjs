@@ -89,7 +89,8 @@ async function launch(requestedName) {
     return client;
   };
   await expect.poll(() => manager.statusRecord().bridge.facts.agentPhase, { timeout: 15_000 }).toBe("settled");
-  expect(manager.statusRecord().bridge.facts.labelStatus).toBeUndefined();
+  // One request summarizes the turn but does not title the session.
+  expect(manager.statusRecord().bridge.facts.sessionName).toBe(requestedName);
   const socket = net.connect(demoPaths(manager.statusRecord().root).controlSocket);
   cleanup.push(() => socket.destroy());
   let welcome;
@@ -98,14 +99,13 @@ async function launch(requestedName) {
   socket.write(encodeFrame({ type: "hello", role: "client", token: await readToken(manager.statusRecord().root), attachmentId: "second-request", cols: 100, rows: 30 }));
   await expect.poll(() => welcome, { timeout: 10_000 }).toMatchObject({ type: "welcome" });
   socket.write(encodeFrame({ type: "input", epoch: welcome.epoch }, Buffer.from("Make the session title informative\r")));
-  await expect.poll(() => manager.statusRecord().bridge.facts.labelStatus, { timeout: 15_000 }).toBe("pending");
+  await expect.poll(() => manager.statusRecord().bridge.facts.agentPhase, { timeout: 15_000 }).toBe("start");
   socket.destroy();
   return { manager, backend, facts: () => manager.statusRecord().bridge.facts };
 }
 
 it("native Pi confirms and persists a generated title while a detached dashboard keeps the short description", async () => {
   const f = await launch();
-  await expect.poll(() => f.facts().labelStatus, { timeout: 15_000 }).toBe("pending");
   const initial = f.backend();
   initial.close();
   await expect.poll(() => f.facts().sessionName, { timeout: 15_000 }).toBe("Demo fake task");
@@ -121,7 +121,6 @@ it("native Pi confirms and persists a generated title while a detached dashboard
 
 it("native Pi's built-in /name wins over automatic labelling", async () => {
   const f = await launch();
-  await expect.poll(() => f.facts().labelStatus, { timeout: 15_000 }).toBe("pending");
   const root = f.manager.statusRecord().root;
   const socket = net.connect(demoPaths(root).controlSocket);
   cleanup.push(() => socket.destroy());
@@ -143,7 +142,6 @@ it("native Pi's built-in /name wins over automatic labelling", async () => {
 
 it("an explicit launch name and the real dashboard /rename beat a pending native label completion", async () => {
   const f = await launch("Explicit launch name");
-  await expect.poll(() => f.facts().labelStatus, { timeout: 15_000 }).toBe("pending");
   expect(f.facts().sessionName).toBe("Explicit launch name");
   const client = f.backend();
   const controller = new DashboardController({ client, openViewer: async () => {}, clientId: "labels-fixture", sourceSessionId: "labels-fixture",
@@ -157,7 +155,7 @@ it("an explicit launch name and the real dashboard /rename beat a pending native
   expect(controller.status.kind).not.toBe("error");
   await controller.close();
   client.close();
-  await expect.poll(() => f.facts().labelStatus, { timeout: 15_000 }).toBe("ready");
+  await expect.poll(() => f.facts().labelDescription ?? "", { timeout: 15_000 }).toContain("deterministic fake provider");
   expect(f.facts().sessionName).toBe("User priority wins");
   const row = (await f.backend().getState()).sessions.find((session) => session.sessionId === "session-1");
   expect(row.name).toBe("User priority wins");

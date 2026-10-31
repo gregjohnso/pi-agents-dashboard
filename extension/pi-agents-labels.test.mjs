@@ -100,6 +100,17 @@ it("summarizes a turn a custom message started, such as a monitor event", async 
   expect(o.pi.getSessionName()).toBeUndefined();
 });
 
+it("keeps a newer turn's description when an earlier turn's summary lands late", async () => {
+  let answer;
+  const o = await owner({ complete: () => new Promise((resolve) => { answer = resolve; }) });
+  await o.finish("first");
+  await expect.poll(() => o.registryCalls.length).toBe(1);
+  await o.emit("before_agent_start", { prompt: "Second task now running", messageType: "user" });
+  answer(REPLY);
+  await expect.poll(() => o.facts().labelStatus).toBe("ready");
+  expect(o.facts().labelDescription).toBe("Second task now running");
+});
+
 it("writes one summary at a time, queueing the latest turn that ends meanwhile", async () => {
   const answers = [];
   const o = await owner({ complete: () => new Promise((resolve) => { answers.push(resolve); }) });

@@ -45,7 +45,7 @@ const MAX_FACT_TEXT_LENGTH = 4096;
 /** A widget for a session that has already been replaced: it renders nothing and captures nothing. */
 const EMPTY_WIDGET = { render: () => [], invalidate: () => {} };
 
-/** @typedef {{ generation: number, disposed: boolean, tui: unknown, link: any, pi?: any, agentPhase?: string, renameError?: string, labelFacts?: any, labelController?: AbortController, labelWork?: Promise<void>, labelPrompts?: string[], labelMessages?: any[], pendingRequests?: number, completedRequests?: number, labelAttempts?: number, labelRunning?: boolean, automaticName?: string, automaticNameEvents?: string[], nameChanged?: boolean, sessionColor?: string, monitorsRunning?: number, subagentsRunning?: number, turnRan?: boolean, labelQueued?: { ctx: any, transcript: string, naming: boolean } }} OwnerSession */
+/** @typedef {{ generation: number, disposed: boolean, tui: unknown, link: any, pi?: any, agentPhase?: string, renameError?: string, labelFacts?: any, labelController?: AbortController, labelWork?: Promise<void>, labelPrompts?: string[], labelMessages?: any[], pendingRequests?: number, completedRequests?: number, labelAttempts?: number, labelRunning?: boolean, automaticName?: string, automaticNameEvents?: string[], nameChanged?: boolean, sessionColor?: string, monitorsRunning?: number, subagentsRunning?: number, turnRan?: boolean, turnSeq?: number, labelQueued?: { ctx: any, transcript: string, naming: boolean, turn: number } }} OwnerSession */
 
 /** @param {unknown} value */
 function isRecord(value) {
@@ -360,12 +360,12 @@ export function registerOwnerExtension(pi, options = {}) {
 
   // The description follows every finished turn. The title takes two attempts per generation: after two completed
   // requests, then a refresh or retry on the next one. One completion at a time; a turn that ends meanwhile queues one.
-  /** @param {OwnerSession} session @param {any} ctx @param {string} transcript @param {boolean} naming */
-  const label = (session, ctx, transcript, naming) => {
+  /** @param {OwnerSession} session @param {any} ctx @param {string} transcript @param {boolean} naming @param {number} turn */
+  const label = (session, ctx, transcript, naming, turn) => {
     const controller = session.labelController;
     if (controller === undefined) return;
     if (session.labelRunning) {
-      session.labelQueued = { ctx, transcript, naming: naming || session.labelQueued?.naming === true };
+      session.labelQueued = { ctx, transcript, naming: naming || session.labelQueued?.naming === true, turn };
       return;
     }
     session.labelRunning = true;
@@ -382,7 +382,8 @@ export function registerOwnerExtension(pi, options = {}) {
         ...session.labelFacts, labelVersion: 1, labelStatus: result.status,
         labelFailureReason: result.failureReason, labelStopReason: result.stopReason,
         labelModelProvider: result.modelProvider, labelModelId: result.modelId,
-        ...(result.description === undefined ? {} : { labelDescription: result.description }),
+        // A turn that started since this one ended owns the description now.
+        ...(result.description === undefined || session.turnSeq !== turn ? {} : { labelDescription: result.description }),
       };
       const publicPi = session.pi;
       if (naming && result.name !== undefined && !session.nameChanged && typeof publicPi?.getSessionName === "function" && typeof publicPi?.setSessionName === "function") {
@@ -407,7 +408,7 @@ export function registerOwnerExtension(pi, options = {}) {
       session.labelRunning = false;
       const queued = session.labelQueued;
       session.labelQueued = undefined;
-      if (queued !== undefined && !session.disposed && !controller.signal.aborted) label(session, queued.ctx, queued.transcript, queued.naming);
+      if (queued !== undefined && !session.disposed && !controller.signal.aborted) label(session, queued.ctx, queued.transcript, queued.naming, queued.turn);
     });
   };
 
@@ -416,6 +417,7 @@ export function registerOwnerExtension(pi, options = {}) {
     if (session === undefined || session.disposed || readOwnerSidebandEnvironment(settings.env) === undefined) return;
     session.labelController ??= new AbortController();
     session.turnRan = true;
+    session.turnSeq = (session.turnSeq ?? 0) + 1;
     if (event.messageType === "custom" || typeof event.prompt !== "string" || !event.prompt.trim()) return;
     session.pendingRequests = (session.pendingRequests ?? 0) + 1;
     session.labelPrompts = [...(session.labelPrompts ?? []), event.prompt.slice(0, 1800)].slice(-3);
@@ -447,7 +449,7 @@ export function registerOwnerExtension(pi, options = {}) {
     if (naming) session.labelAttempts = (session.labelAttempts ?? 0) + 1;
     const prompts = (session.labelPrompts ?? []).map((prompt) => `User: ${prompt}`).join("\n");
     const excerpt = summarizePromptInput(session.labelMessages ?? []).slice(-500);
-    label(session, ctx, `${prompts}\n${excerpt}`, naming);
+    label(session, ctx, `${prompts}\n${excerpt}`, naming, session.turnSeq ?? 0);
     session.labelMessages = undefined;
   });
   // Pi owns `/model`. Observing its selection back is how a row shows the model Pi confirmed rather than the

@@ -45,7 +45,7 @@ const MAX_FACT_TEXT_LENGTH = 4096;
 /** A widget for a session that has already been replaced: it renders nothing and captures nothing. */
 const EMPTY_WIDGET = { render: () => [], invalidate: () => {} };
 
-/** @typedef {{ generation: number, disposed: boolean, tui: unknown, link: any, pi?: any, agentPhase?: string, renameError?: string, labelFacts?: any, labelController?: AbortController, labelWork?: Promise<void>, labelPrompts?: string[], labelMessages?: any[], pendingRequests?: number, completedRequests?: number, labelAttempts?: number, labelRunning?: boolean, automaticName?: string, automaticNameEvents?: string[], nameChanged?: boolean, sessionColor?: string, monitorsRunning?: number, subagentsRunning?: number, turnRan?: boolean, turnSeq?: number, labelQueued?: { ctx: any, transcript: string, naming: boolean, turn: number } }} OwnerSession */
+/** @typedef {{ generation: number, disposed: boolean, tui: unknown, link: any, pi?: any, agentPhase?: string, renameError?: string, labelFacts?: any, labelController?: AbortController, labelWork?: Promise<void>, labelPrompts?: string[], labelMessages?: any[], userMessages?: number, labelAttempts?: number, labelRunning?: boolean, automaticName?: string, automaticNameEvents?: string[], nameChanged?: boolean, sessionColor?: string, monitorsRunning?: number, subagentsRunning?: number, turnRan?: boolean, turnSeq?: number, labelQueued?: { ctx: any, transcript: string, naming: boolean, turn: number } }} OwnerSession */
 
 /** @param {unknown} value */
 function isRecord(value) {
@@ -419,11 +419,21 @@ export function registerOwnerExtension(pi, options = {}) {
     session.turnRan = true;
     session.turnSeq = (session.turnSeq ?? 0) + 1;
     if (event.messageType === "custom" || typeof event.prompt !== "string" || !event.prompt.trim()) return;
-    session.pendingRequests = (session.pendingRequests ?? 0) + 1;
-    session.labelPrompts = [...(session.labelPrompts ?? []), event.prompt.slice(0, 1800)].slice(-3);
     // Until this turn's summary lands, the row says what the session was just asked.
     session.labelFacts = { ...session.labelFacts, labelVersion: 1, labelStatus: session.labelFacts?.labelStatus ?? "pending", labelDescription: event.prompt.replace(/\s+/gu, " ").trim().slice(0, 200) };
     republish(undefined, undefined, ctx);
+  });
+
+  // Every user message, including one sent while a turn runs: Pi folds those into the running turn, so
+  // `before_agent_start` never sees them.
+  pi.on("message_end", (event) => {
+    const session = current;
+    if (session === undefined || session.disposed || session.labelController === undefined || event?.message?.role !== "user") return;
+    const content = event.message.content;
+    const text = (typeof content === "string" ? content : Array.isArray(content) ? content.filter((part) => part?.type === "text").map((part) => part.text).join("\n") : "").trim();
+    if (!text) return;
+    session.userMessages = (session.userMessages ?? 0) + 1;
+    session.labelPrompts = [...(session.labelPrompts ?? []), text.slice(0, 1800)].slice(-3);
   });
 
   // Pi's own agent-loop boundaries. `agent_settled` is the only one that means no retry, compaction or queued
@@ -443,9 +453,7 @@ export function registerOwnerExtension(pi, options = {}) {
     const session = current;
     if (session === undefined || session.disposed || !session.turnRan) return;
     session.turnRan = false;
-    session.completedRequests = (session.completedRequests ?? 0) + (session.pendingRequests ?? 0);
-    session.pendingRequests = 0;
-    const naming = session.completedRequests >= 2 && (session.labelAttempts ?? 0) < 2;
+    const naming = (session.userMessages ?? 0) >= 2 && (session.labelAttempts ?? 0) < 2;
     if (naming) session.labelAttempts = (session.labelAttempts ?? 0) + 1;
     const prompts = (session.labelPrompts ?? []).map((prompt) => `User: ${prompt}`).join("\n");
     const excerpt = summarizePromptInput(session.labelMessages ?? []).slice(-500);

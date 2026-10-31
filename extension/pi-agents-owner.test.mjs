@@ -177,6 +177,8 @@ it("registers only for the Pi events it has a reason to follow", () => {
   expect(fake.events()).toEqual([
     // Live status: Pi's own agent-loop boundaries, kept distinct because `agent_end` is not `agent_settled`.
     "agent_end", "agent_settled", "agent_start", "before_agent_start",
+    // Every user message, including one sent mid-turn, for the automatic title.
+    "message_end",
     // The model Pi confirmed, rather than the one a launch asked for.
     "model_select",
     // The session name Pi confirmed, including a rename this manager asked for.

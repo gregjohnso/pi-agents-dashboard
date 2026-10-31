@@ -52,6 +52,7 @@ async function owner({ name, complete = async () => REPLY, models = [HAIKU], ava
   });
   const finish = async (prompt) => {
     await emit("before_agent_start", { prompt, messageType: "user" });
+    await emit("message_end", { message: { role: "user", content: [{ type: "text", text: prompt }] } });
     await emit("agent_end", { messages: [{ role: "assistant", content: [{ type: "text", text: "Completed the request" }] }] });
     await emit("agent_settled");
   };
@@ -69,6 +70,7 @@ it("summarizes every finished turn, and titles only after two user requests with
   expect(o.registryCalls).toHaveLength(1);
   expect(o.pi.getSessionName()).toBeUndefined();
   await o.emit("before_agent_start", { prompt: "Repair native session labels", messageType: "user" });
+  await o.emit("message_end", { message: { role: "user", content: "Repair native session labels" } });
   expect(o.registryCalls).toHaveLength(1);
   await o.emit("agent_end", { messages: [] });
   await o.emit("agent_settled");
@@ -83,6 +85,20 @@ it("summarizes every finished turn, and titles only after two user requests with
   expect(o.facts().sessionName).toBe(o.pi.getSessionName());
   await o.emit("agent_settled");
   expect(o.registryCalls).toHaveLength(2);
+});
+
+it("counts messages sent while a turn runs toward the title, with their text in its context", async () => {
+  const o = await owner();
+  await o.emit("before_agent_start", { prompt: "Regenerate lac-operon genes", messageType: "user" });
+  for (const text of ["Regenerate lac-operon genes", "put it in a notebook", "use the 6b 1m context model"]) {
+    await o.emit("message_end", { message: { role: "user", content: [{ type: "text", text }] } });
+  }
+  await o.emit("message_end", { message: { role: "custom", content: "[monitor] not a user request" } });
+  await o.emit("agent_end", { messages: [] });
+  await o.emit("agent_settled");
+  await expect.poll(() => o.pi.getSessionName()).toBe("Repair native labels");
+  expect(o.registryCalls[0][1].messages[0].content).toContain("use the 6b 1m context model");
+  expect(o.registryCalls[0][1].messages[0].content).not.toContain("not a user request");
 });
 
 it("shows what the session was just asked while its turn runs", async () => {

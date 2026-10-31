@@ -563,7 +563,7 @@ describe("dashboard controller", () => {
         dashboard.handleInput("\r");
         for (const category of ["task", "process", "outcome", "activity", "sort", "group"]) {
             while (dashboard.controlCategory !== category) dashboard.handleInput("\x16");
-            dashboard.handleInput("\x14");
+            dashboard.handleInput("\x0e");
         }
         expect(dashboard.query).toMatchObject({ search: "w", taskStates: ["WORKING"], processStates: ["LIVE"], outcomes: ["NONE"], activityKinds: ["approval"], sort: { key: "age", direction: "asc" }, groupBy: "taskState" });
         expect(dashboard.selectedSessionId).toBe("a");

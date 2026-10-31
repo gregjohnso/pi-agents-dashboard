@@ -23,6 +23,24 @@ export async function readViewPreferences(stateHome) {
   }
 }
 
+/** Claude Code keeps pins in its own file; so does this, keyed by durable owner id. */
+const PINS_FILE = "pins.json";
+
+/** @param {string} stateHome @returns {Promise<string[]>} */
+export async function readPins(stateHome) {
+  try {
+    const saved = JSON.parse(await readFile(path.join(stateHome, PINS_FILE), "utf8"));
+    return saved?.version === 1 && Array.isArray(saved.pins) ? saved.pins.filter((/** @type {unknown} */ key) => typeof key === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** @param {string} stateHome @param {string[]} pins */
+export async function writePins(stateHome, pins) {
+  await atomicWriteJson(path.join(stateHome, PINS_FILE), { version: 1, pins });
+}
+
 /** @param {string} stateHome @param {{ groupBy: string | undefined }} preferences */
 export async function writeViewPreferences(stateHome, { groupBy }) {
   await atomicWriteJson(path.join(stateHome, FILE), { version: 1, groupBy: groupBy ?? null });

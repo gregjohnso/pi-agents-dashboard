@@ -68,12 +68,18 @@ function compareValues(left, right) {
 const GROUP_STATE_ORDER = ["NEEDS INPUT", "WORKING", "WAITING", "STARTING", "READY", "UNKNOWN", "SLEEPING", "STALE", "FAILED", "STOPPED", "EXITED"];
 /** Return the canonical identity used to coalesce dashboard group rows. */
 export function dashboardGroupIdentity(session, groupBy) {
+    if (session.pinned === true)
+        return "PINNED";
     return groupBy === "taskState"
         ? displaySessionState(session)
         : canonicalPath(session.cwd).toLowerCase();
 }
 /** Order two sessions by their group alone; rows within a group keep their order. */
 export function compareDashboardGroups(left, right, groupBy) {
+    // Pinned sessions sit in their own group at the top, under either grouping, as in Claude Code.
+    const pinned = Number(right.pinned === true) - Number(left.pinned === true);
+    if (pinned !== 0)
+        return pinned;
     if (groupBy === "taskState") {
         const rank = (session) => { const index = GROUP_STATE_ORDER.indexOf(displaySessionState(session)); return index === -1 ? GROUP_STATE_ORDER.length : index; };
         return rank(left) - rank(right);

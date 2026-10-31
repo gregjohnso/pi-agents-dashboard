@@ -213,7 +213,7 @@ it("drives list navigation, search/filter/sort/group, metadata/help, composer, c
   expect(f.dashboard.query).toMatchObject({ search: "live" });
   f.dashboard.clearFilters();
   while (f.dashboard.controlCategory !== "metadata") f.dashboard.handleInput("\x16");
-  f.dashboard.handleInput("\x14");
+  f.dashboard.handleInput("\x0e");
   expect(f.dashboard.overlay?.kind).toBe("metadata");
   f.dashboard.handleInput("\x07");
   expect(f.dashboard.overlay?.kind).toBe("help");

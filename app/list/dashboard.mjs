@@ -75,8 +75,13 @@ const CONTROLS = [
     { key: Key.ctrl("f"), activate: (dashboard) => { dashboard.focus = "search"; } },
     { key: Key.ctrl("v"), activate: (dashboard) => dashboard.cycleControlCategory() },
     { key: Key.ctrl("s"), activate: (dashboard) => dashboard.toggleGrouping() },
-    { key: Key.ctrl("t"), activate: (dashboard) => dashboard.activateControlCategory() },
+    { key: Key.ctrl("t"), activate: (dashboard) => dashboard.togglePin() },
+    { key: Key.ctrl("n"), activate: (dashboard) => dashboard.activateControlCategory() },
 ];
+/** A pin follows the session's durable owner, so it survives the row changing from live to saved. */
+function pinKey(session) {
+    return session.durable?.ownerId ?? session.sessionId;
+}
 function fitLine(line, width) {
     const clipped = truncateToWidth(line.replace(/[\r\n\u2028\u2029]/gu, " "), Math.max(0, width), "");
     return clipped + " ".repeat(Math.max(0, width - visibleWidth(clipped)));
@@ -226,6 +231,9 @@ export class DashboardController {
         if (options.initialGroupBy !== undefined)
             this.query = { ...this.query, groupBy: options.initialGroupBy };
         this.onGroupingChanged = options.onGroupingChanged;
+        /** Durable owner ids of pinned sessions; the caller saves them. */
+        this.pins = new Set(options.initialPins ?? []);
+        this.onPinsChanged = options.onPinsChanged;
         this.isDirectory = options.isDirectory ?? existingDirectory;
         this.worktreeCapability = options.worktreeCapability ?? probeWorktreeCapability;
         this.suggestDirectories = options.suggestDirectories ?? suggestDirectories;
@@ -320,6 +328,18 @@ export class DashboardController {
         this.setQuery({ ...this.query, groupBy });
         if (changed)
             this.onGroupingChanged?.(groupBy);
+    }
+    /** Claude Code's Ctrl+T: pin the selected session to the top, or unpin it. */
+    togglePin() {
+        const session = this.selectedSession();
+        if (session === undefined)
+            return;
+        const key = pinKey(session);
+        if (!this.pins.delete(key))
+            this.pins.add(key);
+        this.onPinsChanged?.([...this.pins]);
+        this.preferredSelectionId = session.sessionId;
+        this.rebuildList();
     }
     /** Claude Code's Ctrl+S: switch between grouping by state and by working directory. */
     toggleGrouping() {
@@ -1113,7 +1133,8 @@ export class DashboardController {
         // view shows count: a native session that has not answered yet is STALE, hidden, and stamped with the
         // read time, so counting it made the operator's prompt vanish before its session appeared. Once the
         // launch has named its session, that session reporting any real state also retires the placeholder.
-        const shown = selectDashboardSessions(this.sessions, this.query);
+        const sessions = this.pins.size === 0 ? this.sessions : this.sessions.map((session) => this.pins.has(pinKey(session)) ? { ...session, pinned: true } : session);
+        const shown = selectDashboardSessions(sessions, this.query);
         this.pendingLaunches = this.pendingLaunches.filter((entry) => !(shown.some((session) => session.createdAt >= entry.createdAt)
             || (entry.launchedSessionId !== undefined && this.sessions.some((session) => session.sessionId === entry.launchedSessionId && session.processState !== "STALE"))));
         // A STARTING row belongs to its own group: appended after the list, it sat under the last group's divider.
@@ -1211,7 +1232,7 @@ export class DashboardController {
         // Name the selected agent, not its worktree: an isolated session's cwd is a bare UUID that
         // tells the operator nothing about which row the line describes.
         const subject = selected === undefined ? "" : (selected.name ?? "").trim() === "" ? selected.sessionId.slice(0, 8) : `${selected.name}`;
-        const control = this.controlTouched ? `ctrl+t: ${this.controlCategory}` : "";
+        const control = this.controlTouched ? `ctrl+n: ${this.controlCategory}` : "";
         const segments = [control, subject, filters].filter((segment) => segment !== "");
         return segments.length === 0 ? "" : ` ${segments.join("  ·  ")}`;
     }

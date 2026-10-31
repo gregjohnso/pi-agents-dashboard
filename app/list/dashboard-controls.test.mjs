@@ -33,16 +33,16 @@ it("Ctrl+V chooses a category without changing filters or the draft", async () =
   expect(dashboard.controlCategory).toBe("task");
   expect(dashboard.query).toEqual(before);
   expect(dashboard.composerDraft.prompt).toBe("keep this draft");
-  expect(dashboard.render(100, 24).map(stripVTControlCharacters).join("\n")).toContain("ctrl+t: task");
+  expect(dashboard.render(100, 24).map(stripVTControlCharacters).join("\n")).toContain("ctrl+n: task");
 });
 
-it("Ctrl+T cycles the selected view's values", async () => {
+it("Ctrl+N cycles the selected view's values", async () => {
   const { dashboard } = await fixture();
-  dashboard.handleInput("\x14");
+  dashboard.handleInput("\x0e");
   expect(dashboard.query.view).toBe("done");
-  dashboard.handleInput("\x14");
+  dashboard.handleInput("\x0e");
   expect(dashboard.query.view).toBe("all");
-  dashboard.handleInput("\x14");
+  dashboard.handleInput("\x0e");
   expect(dashboard.query.view).toBe("live");
 });
 
@@ -57,7 +57,7 @@ it.each([
 ])("uses the same two keys for %s", async (category, expected) => {
   const { dashboard } = await fixture();
   select(dashboard, category);
-  dashboard.handleInput("\x14");
+  dashboard.handleInput("\x0e");
   expect(dashboard.query).toMatchObject(expected);
 });
 
@@ -65,13 +65,13 @@ it("keeps clear, refresh and metadata available through the same pair", async ()
   const { dashboard, client } = await fixture();
   dashboard.setTaskStates(["WORKING"]);
   select(dashboard, "clear filters");
-  dashboard.handleInput("\x14");
+  dashboard.handleInput("\x0e");
   expect(dashboard.query.taskStates).toBeUndefined();
   select(dashboard, "refresh");
-  dashboard.handleInput("\x14");
+  dashboard.handleInput("\x0e");
   expect(client.refreshSummaries).toHaveBeenCalledTimes(1);
   select(dashboard, "metadata");
-  dashboard.handleInput("\x14");
+  dashboard.handleInput("\x0e");
   expect(dashboard.overlay?.kind).toBe("metadata");
   dashboard.handleInput("\x16");
   expect(dashboard.overlay).toBeUndefined();
@@ -93,7 +93,7 @@ it("retires the old filter chords without inserting control bytes or changing qu
 
 it("shows only the consolidated pair rather than the old shortcut matrix in help", () => {
   const bindings = createHelpOverlay().bindings;
-  expect(bindings.find((binding) => binding.keys === "Ctrl+V / Ctrl+T")).toBeDefined();
+  expect(bindings.find((binding) => binding.keys === "Ctrl+V / Ctrl+N")).toBeDefined();
   expect(bindings.some((binding) => /Ctrl\+[POAWBLRE]/u.test(binding.keys))).toBe(false);
   // The one grouping key, matching Claude Code's agent view.
   expect(bindings.filter((binding) => binding.keys.startsWith("Ctrl+S"))).toEqual([{ keys: "Ctrl+S", action: "group by state or by working directory" }]);

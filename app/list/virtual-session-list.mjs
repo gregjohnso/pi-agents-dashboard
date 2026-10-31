@@ -8,6 +8,8 @@ function sessionSignature(session) {
     return JSON.stringify(session);
 }
 function groupLabel(session, groupBy) {
+    if (session.pinned === true)
+        return "PINNED";
     if (groupBy === "taskState")
         return displaySessionState(session);
     const cwd = session.cwd || "—";

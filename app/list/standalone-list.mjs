@@ -197,7 +197,7 @@ const importViewerModules = () => Promise.all([
  * With neither passed, the installed default path is byte-for-byte what it was.
  * @param {any} options
  */
-export async function createStandaloneList({ cwd, frontend, terminal: hostTerminal = new ProcessTerminal(), copySelection = undefined, openUrl = undefined, loadViewerModules = importViewerModules, client: injectedClient = undefined, openViewer: injectedOpenViewer = undefined, paintBeforeFirstLoad = false, initialGroupBy = undefined, onGroupingChanged = undefined }) {
+export async function createStandaloneList({ cwd, frontend, terminal: hostTerminal = new ProcessTerminal(), copySelection = undefined, openUrl = undefined, loadViewerModules = importViewerModules, client: injectedClient = undefined, openViewer: injectedOpenViewer = undefined, paintBeforeFirstLoad = false, initialGroupBy = undefined, onGroupingChanged = undefined, initialPins = undefined, onPinsChanged = undefined }) {
   const client = injectedClient ?? await (async () => {
     const token = (await fs.readFile(join(frontend.root, "daemon", "control.token"), "utf8")).trim();
     return createDaemonClient({ socketPath: join(frontend.root, "daemon", "control.sock"), token, maxBytes: 1024 * 1024, clientId: frontend.clientId, attachId: frontend.attachId });
@@ -312,7 +312,7 @@ export async function createStandaloneList({ cwd, frontend, terminal: hostTermin
         }
       },
     clientId: frontend.clientId, sourceSessionId: `dashboard-${frontend.clientId}`,
-    launchDefaults: { cwd }, requestRender: () => tui.requestRender(), initialGroupBy, onGroupingChanged,
+    launchDefaults: { cwd }, requestRender: () => tui.requestRender(), initialGroupBy, onGroupingChanged, initialPins, onPinsChanged,
     onClose: () => {
       if (!switching && activeViewer === undefined) {
         // Recorded before the screen goes, so a first load still in flight cannot come back and repaint it.

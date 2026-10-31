@@ -67,10 +67,10 @@ if (!process.env.PI_CLOSE_APP_ROOT) {
       dashboard.handleInput("\x16");
       expect(dashboard.controlCategory).toBe("task");
       expect(dashboard.query).toEqual({ view: "live" });
-      dashboard.handleInput("\x14");
+      dashboard.handleInput("\x0e");
       expect(dashboard.query.taskStates).toEqual(["WORKING"]);
       while (dashboard.controlCategory !== "clear filters") dashboard.handleInput("\x16");
-      dashboard.handleInput("\x14");
+      dashboard.handleInput("\x0e");
       expect(dashboard.query.taskStates).toBeUndefined();
       dashboard.setView("all");
       const row = dashboard.sessions[0];

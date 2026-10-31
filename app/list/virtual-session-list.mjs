@@ -35,6 +35,9 @@ function buildRows(sessions, groupBy) {
             && dashboardGroupIdentity(sessions[end], groupBy) === identity) {
             end += 1;
         }
+        // One blank line between sections.
+        if (rows.length > 0)
+            rows.push({ kind: "gap", key: `gap:${groupBy}:${identity}:${index}`, selectable: false });
         rows.push({
             kind: "group",
             key: `group:${groupBy}:${identity}:${index}`,
@@ -138,12 +141,18 @@ export class VirtualSessionList {
                 invalidated += 1;
             }
         }
+        const previous = this.sessions;
         this.sessions = sessions;
         if (options !== undefined)
             this.groupBy = options.groupBy;
         this.virtualRows = buildRows(sessions, this.groupBy);
         if (this.selectedId === undefined || !nextById.has(this.selectedId)) {
-            this.selectedId = firstSessionId(this.virtualRows);
+            // Keep the cursor where it was: the row below moves up into the gap, or the row above takes it at the end.
+            const at = previous.findIndex((session) => session.sessionId === this.selectedId);
+            const neighbour = at < 0 ? undefined
+                : previous.slice(at + 1).find((session) => nextById.has(session.sessionId))
+                    ?? previous.slice(0, at).reverse().find((session) => nextById.has(session.sessionId));
+            this.selectedId = neighbour?.sessionId ?? firstSessionId(this.virtualRows);
         }
         return { invalidated };
     }
@@ -191,6 +200,8 @@ export class VirtualSessionList {
         return truncateToWidth(line, width, "");
     }
     renderDefault(row, width, selected) {
+        if (row.kind === "gap")
+            return "";
         const layout = createDashboardLayout(width, 1);
         return row.kind === "group"
             ? renderGroupHeader(row.label, row.count, layout)

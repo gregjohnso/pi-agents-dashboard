@@ -22,7 +22,7 @@ async function fixture(options = {}) {
   cleanup.push(() => dashboard.close());
   await dashboard.open();
   /** Group labels and session ids in screen order. */
-  const order = () => dashboard.list.rows.map((entry) => entry.kind === "group" ? `[${entry.label}]` : entry.session.sessionId);
+  const order = () => dashboard.list.rows.filter((entry) => entry.kind !== "gap").map((entry) => entry.kind === "group" ? `[${entry.label}]` : entry.session.sessionId);
   return { dashboard, changes, order };
 }
 

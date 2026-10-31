@@ -23,7 +23,7 @@ function session(index, overrides = {}) {
     };
 }
 function label(row) {
-    return row.kind === "group" ? `[${row.label}]` : row.session.sessionId;
+    return row.kind === "gap" ? "" : row.kind === "group" ? `[${row.label}]` : row.session.sessionId;
 }
 describe("VirtualSessionList", () => {
     it("bounds ten thousand sessions to the requested viewport slice", () => {
@@ -49,6 +49,7 @@ describe("VirtualSessionList", () => {
             { kind: "group", selectable: false, label: "[WORKING]" },
             { kind: "session", selectable: true, label: "session-00000" },
             { kind: "session", selectable: true, label: "session-00002" },
+            { kind: "gap", selectable: false, label: "" },
             { kind: "group", selectable: false, label: "[READY]" },
             { kind: "session", selectable: true, label: "session-00001" },
         ]);
@@ -57,7 +58,7 @@ describe("VirtualSessionList", () => {
         expect(list.selectedSessionId).toBe("session-00002");
         list.moveSelection(1);
         expect(list.selectedSessionId).toBe("session-00001");
-        expect(list.selectedRowIndex).toBe(4);
+        expect(list.selectedRowIndex).toBe(5);
     });
     it("labels a directory group with its whole path, home shortened to ~", () => {
         const home = homedir();
@@ -67,5 +68,24 @@ describe("VirtualSessionList", () => {
     it("groups by the state the STATE column shows", () => {
         const list = new VirtualSessionList([session(0, { taskState: "READY", stateReported: false })], { groupBy: "taskState", renderRow: (row) => label(row) });
         expect(list.rows[0]).toMatchObject({ kind: "group", label: "UNKNOWN" });
+    });
+    it("separates groups with one blank line, and never selects it", () => {
+        const list = new VirtualSessionList([session(0), session(2), session(1)], { groupBy: "taskState" });
+        expect(list.rows.map((row) => row.kind)).toEqual(["group", "session", "session", "gap", "group", "session"]);
+        expect(list.rows[3].selectable).toBe(false);
+        expect(list.renderViewport({ offset: 0, height: 6, width: 80 })[3].line.trim()).toBe("");
+        list.selectSession("session-00002");
+        list.moveSelection(1);
+        expect(list.selectedSessionId).toBe("session-00001");
+    });
+    it("keeps the cursor in place when the selected session leaves the list", () => {
+        const sessions = [session(0), session(1), session(2), session(3)];
+        const list = new VirtualSessionList(sessions, { renderRow: (row) => label(row) });
+        list.selectSession("session-00001");
+        list.setSessions([session(0), session(2), session(3)]);
+        expect(list.selectedSessionId).toBe("session-00002");
+        list.selectSession("session-00003");
+        list.setSessions([session(0), session(2)]);
+        expect(list.selectedSessionId).toBe("session-00002");
     });
 });

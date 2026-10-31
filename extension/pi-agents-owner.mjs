@@ -45,7 +45,7 @@ const MAX_FACT_TEXT_LENGTH = 4096;
 /** A widget for a session that has already been replaced: it renders nothing and captures nothing. */
 const EMPTY_WIDGET = { render: () => [], invalidate: () => {} };
 
-/** @typedef {{ generation: number, disposed: boolean, tui: unknown, link: any, pi?: any, agentPhase?: string, renameError?: string, labelFacts?: any, labelController?: AbortController, labelWork?: Promise<void>, labelPrompts?: string[], labelMessages?: any[], pendingRequests?: number, completedRequests?: number, labelAttempts?: number, labelRunning?: boolean, automaticName?: string, automaticNameEvents?: string[], nameChanged?: boolean, sessionColor?: string, monitorsRunning?: number, subagentsRunning?: number }} OwnerSession */
+/** @typedef {{ generation: number, disposed: boolean, tui: unknown, link: any, pi?: any, agentPhase?: string, renameError?: string, labelFacts?: any, labelController?: AbortController, labelWork?: Promise<void>, labelPrompts?: string[], labelMessages?: any[], pendingRequests?: number, completedRequests?: number, labelAttempts?: number, labelRunning?: boolean, automaticName?: string, automaticNameEvents?: string[], nameChanged?: boolean, sessionColor?: string, monitorsRunning?: number, subagentsRunning?: number, turnRan?: boolean, labelQueued?: { ctx: any, transcript: string, naming: boolean } }} OwnerSession */
 
 /** @param {unknown} value */
 function isRecord(value) {
@@ -358,14 +358,21 @@ export function registerOwnerExtension(pi, options = {}) {
       .catch((error) => settings.onFailure({ code: failureCode(error), generation: session.generation }));
   };
 
-  // Two attempts per generation: after two completed requests, then a refresh or retry on the next request.
-  /** @param {OwnerSession} session @param {any} ctx @param {string} transcript */
-  const label = (session, ctx, transcript) => {
+  // The description follows every finished turn. The title takes two attempts per generation: after two completed
+  // requests, then a refresh or retry on the next one. One completion at a time; a turn that ends meanwhile queues one.
+  /** @param {OwnerSession} session @param {any} ctx @param {string} transcript @param {boolean} naming */
+  const label = (session, ctx, transcript, naming) => {
     const controller = session.labelController;
     if (controller === undefined) return;
+    if (session.labelRunning) {
+      session.labelQueued = { ctx, transcript, naming: naming || session.labelQueued?.naming === true };
+      return;
+    }
+    session.labelRunning = true;
     session.labelWork = (session.labelWork ?? Promise.resolve()).then(async () => {
       if (session.disposed || controller.signal.aborted) return;
-      session.labelFacts = { ...session.labelFacts, labelVersion: 1, labelStatus: "pending", labelFailureReason: undefined, labelStopReason: undefined };
+      // Only a first label reads as pending; a refresh keeps the row's last status until the new one lands.
+      session.labelFacts = { ...session.labelFacts, labelVersion: 1, labelStatus: session.labelFacts?.labelStatus ?? "pending", labelFailureReason: undefined, labelStopReason: undefined };
       republish(undefined, undefined, ctx);
       const result = await generateNativeLabel(ctx.modelRegistry, transcript, {
         signal: controller.signal, timeoutMs: options.labelTimeoutMs, fakeMode: settings.env.PI_DEMO_FAKE_PROVIDER === "1",
@@ -378,7 +385,7 @@ export function registerOwnerExtension(pi, options = {}) {
         ...(result.description === undefined ? {} : { labelDescription: result.description }),
       };
       const publicPi = session.pi;
-      if (result.name !== undefined && !session.nameChanged && typeof publicPi?.getSessionName === "function" && typeof publicPi?.setSessionName === "function") {
+      if (naming && result.name !== undefined && !session.nameChanged && typeof publicPi?.getSessionName === "function" && typeof publicPi?.setSessionName === "function") {
         try {
           const currentName = publicPi.getSessionName();
           if (!currentName || currentName === session.automaticName) {
@@ -396,22 +403,32 @@ export function registerOwnerExtension(pi, options = {}) {
       if (session.disposed || controller.signal.aborted) return;
       session.labelFacts = { ...session.labelFacts, labelVersion: 1, labelStatus: "error", labelFailureReason: "request-failed" };
       republish(undefined, undefined, ctx);
-    }).finally(() => { session.labelRunning = false; });
+    }).finally(() => {
+      session.labelRunning = false;
+      const queued = session.labelQueued;
+      session.labelQueued = undefined;
+      if (queued !== undefined && !session.disposed && !controller.signal.aborted) label(session, queued.ctx, queued.transcript, queued.naming);
+    });
   };
 
   pi.on("before_agent_start", (event, ctx) => {
     const session = current;
-    if (session === undefined || session.disposed || (session.labelAttempts ?? 0) >= 2 || readOwnerSidebandEnvironment(settings.env) === undefined || event.messageType === "custom" || typeof event.prompt !== "string" || !event.prompt.trim()) return;
+    if (session === undefined || session.disposed || readOwnerSidebandEnvironment(settings.env) === undefined) return;
     session.labelController ??= new AbortController();
+    session.turnRan = true;
+    if (event.messageType === "custom" || typeof event.prompt !== "string" || !event.prompt.trim()) return;
     session.pendingRequests = (session.pendingRequests ?? 0) + 1;
     session.labelPrompts = [...(session.labelPrompts ?? []), event.prompt.slice(0, 1800)].slice(-3);
+    // Until this turn's summary lands, the row says what the session was just asked.
+    session.labelFacts = { ...session.labelFacts, labelVersion: 1, labelStatus: session.labelFacts?.labelStatus ?? "pending", labelDescription: event.prompt.replace(/\s+/gu, " ").trim().slice(0, 200) };
+    republish(undefined, undefined, ctx);
   });
 
   // Pi's own agent-loop boundaries. `agent_settled` is the only one that means no retry, compaction or queued
   // continuation will run, so it is kept distinct from `agent_end`.
   pi.on("agent_start", (event, ctx) => republish("start", event, ctx));
   pi.on("agent_end", (event, ctx) => {
-    if (current?.labelController && (current.labelAttempts ?? 0) < 2) {
+    if (current?.labelController) {
       current.labelMessages = (event.messages ?? []).slice(-40).filter((message) => message.role === "assistant" || message.role === "user").map((message) => ({
         kind: message.role === "user" ? "user_message" : "assistant_message",
         content: (typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content ?? []).slice(-4).filter((part) => part.type === "text").map((part) => ({ type: "text", text: part.text.slice(0, 6000) })),
@@ -422,15 +439,15 @@ export function registerOwnerExtension(pi, options = {}) {
   pi.on("agent_settled", (event, ctx) => {
     republish("settled", event, ctx);
     const session = current;
-    if (session === undefined || session.disposed || !session.pendingRequests) return;
-    session.completedRequests = (session.completedRequests ?? 0) + session.pendingRequests;
+    if (session === undefined || session.disposed || !session.turnRan) return;
+    session.turnRan = false;
+    session.completedRequests = (session.completedRequests ?? 0) + (session.pendingRequests ?? 0);
     session.pendingRequests = 0;
-    if (session.completedRequests < 2 || session.labelRunning || (session.labelAttempts ?? 0) >= 2) return;
-    session.labelAttempts = (session.labelAttempts ?? 0) + 1;
-    session.labelRunning = true;
+    const naming = session.completedRequests >= 2 && (session.labelAttempts ?? 0) < 2;
+    if (naming) session.labelAttempts = (session.labelAttempts ?? 0) + 1;
     const prompts = (session.labelPrompts ?? []).map((prompt) => `User: ${prompt}`).join("\n");
     const excerpt = summarizePromptInput(session.labelMessages ?? []).slice(-500);
-    label(session, ctx, `${prompts}\n${excerpt}`);
+    label(session, ctx, `${prompts}\n${excerpt}`, naming);
     session.labelMessages = undefined;
   });
   // Pi owns `/model`. Observing its selection back is how a row shows the model Pi confirmed rather than the

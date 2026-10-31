@@ -62,17 +62,19 @@ async function owner({ name, complete = async () => REPLY, models = [HAIKU], ava
   return { emit, finish, twoRequests, pi, ctx, calls, registryCalls, snapshots, facts: () => snapshots.at(-1), request: (value) => request(value) };
 }
 
-it("waits for two completed user requests and includes both prompts in the generated title context", async () => {
+it("summarizes every finished turn, and titles only after two user requests with both prompts in context", async () => {
   const o = await owner();
   await o.finish("hi");
-  expect(o.registryCalls).toHaveLength(0);
+  await expect.poll(() => o.facts().labelStatus).toBe("ready");
+  expect(o.registryCalls).toHaveLength(1);
+  expect(o.pi.getSessionName()).toBeUndefined();
   await o.emit("before_agent_start", { prompt: "Repair native session labels", messageType: "user" });
-  expect(o.registryCalls).toHaveLength(0);
+  expect(o.registryCalls).toHaveLength(1);
   await o.emit("agent_end", { messages: [] });
   await o.emit("agent_settled");
   await expect.poll(() => o.pi.getSessionName()).toBe("Repair native labels");
   await expect.poll(() => o.facts().labelDescription).toBe("Describes the task without changing user names");
-  const [model, context, options] = o.registryCalls[0];
+  const [model, context, options] = o.registryCalls[1];
   expect(model).toBe(HAIKU);
   expect(context.messages[0].content).toContain("User: hi");
   expect(context.messages[0].content).toContain("Repair native session labels");
@@ -80,19 +82,51 @@ it("waits for two completed user requests and includes both prompts in the gener
   expect(options).toMatchObject({ maxTokens: 2048, maxRetries: 0, cacheRetention: "none" });
   expect(o.facts().sessionName).toBe(o.pi.getSessionName());
   await o.emit("agent_settled");
-  expect(o.registryCalls).toHaveLength(1);
+  expect(o.registryCalls).toHaveLength(2);
+});
+
+it("shows what the session was just asked while its turn runs", async () => {
+  const o = await owner();
+  await o.emit("before_agent_start", { prompt: "Compare zero-shot\n  BRCA1 results", messageType: "user" });
+  expect(o.facts()).toMatchObject({ labelVersion: 1, labelDescription: "Compare zero-shot BRCA1 results" });
+});
+
+it("summarizes a turn a custom message started, such as a monitor event", async () => {
+  const o = await owner();
+  await o.emit("before_agent_start", { prompt: "[monitor ▸ sweep] 64 COMPLETED", messageType: "custom" });
+  await o.emit("agent_end", { messages: [{ role: "assistant", content: [{ type: "text", text: "All 64 tasks finished" }] }] });
+  await o.emit("agent_settled");
+  await expect.poll(() => o.facts().labelDescription).toBe("Describes the task without changing user names");
+  expect(o.pi.getSessionName()).toBeUndefined();
+});
+
+it("writes one summary at a time, queueing the latest turn that ends meanwhile", async () => {
+  const answers = [];
+  const o = await owner({ complete: () => new Promise((resolve) => { answers.push(resolve); }) });
+  await o.finish("first");
+  await o.finish("second");
+  await o.finish("third");
+  await expect.poll(() => o.registryCalls.length).toBe(1);
+  answers[0](REPLY);
+  await expect.poll(() => o.registryCalls.length).toBe(2);
+  expect(o.registryCalls[1][1].messages[0].content).toContain("third");
+  answers[1](REPLY);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(o.registryCalls).toHaveLength(2);
 });
 
 it.each([false, true])("refreshes an automatic title once, including deferred name events: %j", async (deferNameEvents) => {
   let count = 0;
-  const o = await owner({ deferNameEvents, complete: async () => ({ ...REPLY, content: [{ type: "text", text: ++count === 1 ? "Title: First title\nSummary: Starting task" : "Title: Better title\nSummary: Finished task" }] }) });
+  const titles = ["Title: Greeting\nSummary: Said hello", "Title: First title\nSummary: Starting task", "Title: Better title\nSummary: Finished task", "Title: Churned title\nSummary: Later work"];
+  const o = await owner({ deferNameEvents, complete: async () => ({ ...REPLY, content: [{ type: "text", text: titles[count++] }] }) });
   await o.twoRequests();
   await expect.poll(() => o.pi.getSessionName()).toBe("First title");
   await o.finish("More informative task details");
   await expect.poll(() => o.pi.getSessionName()).toBe("Better title");
   await expect.poll(() => o.facts().labelDescription).toBe("Finished task");
   await o.finish("Fourth request");
-  expect(o.registryCalls).toHaveLength(2);
+  await expect.poll(() => o.registryCalls.length).toBe(4);
+  expect(o.pi.getSessionName()).toBe("Better title");
 });
 
 it.each(["Chosen by user", ""])("does not overwrite an explicit name or deliberate clear: %j", async (name) => {
@@ -113,24 +147,25 @@ it("dashboard rename and an explicit launch name beat the initial and refresh co
   expect(o.pi.getSessionName()).toBe("Launch name");
   o.request({ request: "rename", name: "User wins", requestId: "fixture-rename" });
   await o.finish("next task");
-  await expect.poll(() => o.registryCalls.length).toBe(2);
+  await expect.poll(() => o.registryCalls.length).toBe(3);
   expect(o.pi.getSessionName()).toBe("User wins");
 });
 
 it("retries a failed title once on the next completed request, without a request loop", async () => {
   let count = 0;
-  const o = await owner({ complete: async () => ++count === 1 ? { ...REPLY, stopReason: "length" } : REPLY });
+  const o = await owner({ complete: async () => ++count === 2 ? { ...REPLY, stopReason: "length" } : REPLY });
   await o.twoRequests();
   await expect.poll(() => o.facts().labelStatus).toBe("malformed");
   expect(o.facts()).toMatchObject({ labelFailureReason: "stop-reason", labelStopReason: "length", labelModelId: HAIKU.id });
+  expect(o.pi.getSessionName()).toBeUndefined();
   await o.emit("agent_settled");
-  expect(o.registryCalls).toHaveLength(1);
+  expect(o.registryCalls).toHaveLength(2);
   await o.finish("Clarify the implementation");
   await expect.poll(() => o.pi.getSessionName()).toBe("Repair native labels");
   await expect.poll(() => o.facts().labelStatus).toBe("ready");
   expect(o.facts().labelFailureReason).toBeUndefined();
   await o.finish("Fourth request");
-  expect(o.registryCalls).toHaveLength(2);
+  await expect.poll(() => o.registryCalls.length).toBe(4);
 });
 
 it.each([
@@ -161,12 +196,11 @@ it.each(["reload", "new", "stop"])("drops pending label effects after %s", async
   expect(o.registryCalls[0][2].signal.aborted).toBe(true);
 });
 
-it("ignores custom turns and never calls real Haiku in sealed fake mode", async () => {
+it("never calls real Haiku in sealed fake mode", async () => {
   const o = await owner({ env: { PI_DEMO_FAKE_PROVIDER: "1" } });
   await o.emit("before_agent_start", { prompt: "custom", messageType: "custom" });
   await o.emit("agent_settled");
   await o.finish("first user request");
-  expect(o.facts().labelStatus).toBeUndefined();
   await o.finish("second user request");
   await expect.poll(() => o.facts().labelStatus).toBe("unavailable-model");
   expect(o.registryCalls).toHaveLength(0);

@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import { afterEach, expect, it, vi } from "vitest";
 
-import { openSettingsStore, summarizePromptInput, summarizeWithPi } from "./summaries.mjs";
+import { openSettingsStore, parseSummaryReply, summarizePromptInput, summarizeWithPi, summaryPrompt } from "./summaries.mjs";
 
 /** @type {string[]} */
 const directories = [];
@@ -73,4 +73,14 @@ it.each([
 ])("returns no summary for %s", async (_label, behavior) => {
   const pi = fakePi(behavior);
   await expect(summarizeWithPi({ executable: "/installed/pi", model: { provider: "anthropic", id: "haiku" }, transcript: "User: hi", spawnImpl: pi.spawnImpl, env: {} })).resolves.toBeUndefined();
+});
+
+it("asks for a one-sentence summary short enough for the dashboard's activity column", () => {
+  const prompt = summaryPrompt("User: fix the parser");
+  expect(prompt).toMatch(/one sentence/iu);
+  expect(prompt).toMatch(/at most 10 words/iu);
+});
+
+it("keeps only the first sentence of a summary, without splitting version numbers", () => {
+  expect(parseSummaryReply("Title: Parser fix\nSummary: Fixes the v1.4.0 parser. Then adds tests for it.").text).toBe("Fixes the v1.4.0 parser.");
 });

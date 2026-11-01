@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { main } from "../bin/pi-agents.mjs";
+import { runNativeCli } from "./native-main.mjs";
 
 const execFileAsync = promisify(execFile);
 const PUBLIC_ENTRY = new URL("../bin/pi-agents.mjs", import.meta.url);
@@ -132,4 +133,33 @@ it.each([
   expect(result.stdout).toContain(expected);
   expect(await readFile(path.join(legacy, "legacy-marker"), "utf8")).toBe("legacy\n");
   expect(await readFile(path.join(destination, "destination-marker"), "utf8")).toBe("destination\n");
+});
+
+it("new starts one session through the dashboard's own launch call and prints its id", async () => {
+  const output = capture();
+  const launched = [];
+  const closed = [];
+  const createBackend = (options) => ({
+    launch: async (request) => { launched.push({ options, request }); return { sessionId: "session-42", isolation: { mode: "shared_directory" } }; },
+    close: () => closed.push(true),
+  });
+  const code = await runNativeCli(["new", "--cwd", "proj", "--name", "Probe task", "--model", "openai-codex/gpt-6-luna", "summarize", "the README"],
+    { ...output.streams, cwd: "/work", homeDir: "/home/me", uid: 7, createBackend });
+  expect(code).toBe(0);
+  expect(launched).toHaveLength(1);
+  expect(launched[0].options).toMatchObject({ mode: "real", sessionsHome: "/tmp/pi-save-default-7", stateHome: "/home/me/.pi-agents" });
+  expect(launched[0].request).toEqual({
+    prompt: "summarize the README", cwd: "/work/proj", name: "Probe task", model: { provider: "openai-codex", id: "gpt-6-luna" },
+    isolation: { mode: "shared_directory", confirmedCwd: "/work/proj" },
+  });
+  expect(output.stdout.join("")).toBe("session-42\n");
+  expect(closed).toEqual([true]);
+});
+
+it("new refuses a model without a provider and launches nothing", async () => {
+  const output = capture();
+  const createBackend = () => ({ launch: async () => { throw new Error("must not launch"); }, close: () => {} });
+  const code = await runNativeCli(["new", "--model", "gpt-6-luna", "task"], { ...output.streams, cwd: "/work", homeDir: "/home/me", uid: 7, createBackend });
+  expect(code).toBe(2);
+  expect(output.stderr.join("")).toMatch(/provider\/id/u);
 });

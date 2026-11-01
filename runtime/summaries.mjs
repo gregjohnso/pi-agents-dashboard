@@ -12,7 +12,7 @@ const PROMPT = [
   "Describe this coding session for a dashboard.",
   "Reply with exactly two lines and nothing else:",
   "Title: <at most 5 words naming the task>",
-  "Summary: <one line under 20 words, present tense, no quotes>",
+  "Summary: <one sentence of at most 10 words (about 70 characters) saying what the session is doing now, present tense, no quotes>",
 ].join(" ");
 
 /** @param {string} text */
@@ -21,7 +21,8 @@ export function parseSummaryReply(text) {
   const titleLine = lines.find((line) => /^title:/iu.test(line));
   const summaryLine = lines.find((line) => /^summary:/iu.test(line)) ?? lines.find((line) => line !== titleLine);
   const name = titleLine?.replace(/^title:\s*/iu, "").replace(/^["'`]|["'`]$/gu, "").trim();
-  const summary = (summaryLine ?? "").replace(/^summary:\s*/iu, "").trim();
+  // The first sentence only: the dashboard's activity column has room for one.
+  const summary = (summaryLine ?? "").replace(/^summary:\s*/iu, "").trim().split(/(?<=[.!?])\s+(?=[A-Z])/u)[0];
   return {
     name: name === undefined || name.length === 0 ? undefined : name.slice(0, MAX_NAME_CHARS),
     text: summary.length === 0 ? undefined : summary.slice(0, MAX_SUMMARY_CHARS),

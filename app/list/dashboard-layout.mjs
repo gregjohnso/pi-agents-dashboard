@@ -9,6 +9,7 @@ const COLUMN_LABELS = {
     spinner: "",
     state: "STATE",
     activity: "ACTIVITY",
+    id: "ID",
     model: "MODEL",
     age: "AGE",
 };
@@ -33,6 +34,8 @@ function densityForWidth(width) {
 }
 /** Wide enough for a model id such as claude-opus-5 or gpt-5.6-sol. */
 const MODEL_WIDTH = 16;
+/** Six characters: the random end of Pi's UUIDv7 session id, enough that two sessions do not share one. */
+const ID_WIDTH = 6;
 /** The prompt marker, and the column its continuation rows line up under. */
 const PROMPT_MARKER = " \u276f ";
 
@@ -98,7 +101,9 @@ function columnsForWidth(width) {
             { key: "spinner", width: 1 },
             { key: "name", width: width >= 100 ? 32 : 26 },
             { key: "state", width: width >= 100 ? 11 : 9 },
-            { key: "activity", width: width - (width >= 100 ? 56 : 48) - MODEL_WIDTH - 1 },
+            // The ID only where the activity keeps its room; a narrow window keeps the activity.
+            { key: "activity", width: width - (width >= 100 ? 56 + ID_WIDTH + 1 : 48) - MODEL_WIDTH - 1 },
+            ...(width >= 100 ? [{ key: "id", width: ID_WIDTH }] : []),
             { key: "model", width: MODEL_WIDTH },
             { key: "age", width: 7 },
         ];
@@ -191,6 +196,7 @@ function sessionValues(session, now) {
         age: age(session.createdAt, now),
         activity: (session.summary?.text ?? session.activity.summary).trim() || "—",
         model: session.model?.id ?? "—",
+        id: (session.durable?.piSessionId || session.sessionId).slice(-ID_WIDTH),
     };
 }
 /** Render one dense session row without allocating a component per session. */
@@ -201,7 +207,7 @@ export function renderSessionRow(session, layout, options) {
     return joinCells(layout, values, (key, text) => {
         if (key === "state")
             return jobwatchTheme.state(session, text, selected, background);
-        if (key === "age")
+        if (key === "age" || key === "id")
             return jobwatchTheme.muted(text, selected, background);
         if (key === "name") {
             // A colour marks the name, not the column: fill behind the text and leave the padding alone.

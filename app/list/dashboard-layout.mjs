@@ -9,9 +9,9 @@ const COLUMN_LABELS = {
     spinner: "",
     state: "STATE",
     activity: "ACTIVITY",
-    id: "ID",
     model: "MODEL",
     age: "AGE",
+    id: "ID",
 };
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu;
 function plainText(value) {
@@ -103,9 +103,9 @@ function columnsForWidth(width) {
             { key: "state", width: width >= 100 ? 11 : 9 },
             // The ID only where the activity keeps its room; a narrow window keeps the activity.
             { key: "activity", width: width - (width >= 100 ? 56 + ID_WIDTH + 1 : 48) - MODEL_WIDTH - 1 },
-            ...(width >= 100 ? [{ key: "id", width: ID_WIDTH }] : []),
             { key: "model", width: MODEL_WIDTH },
             { key: "age", width: 7 },
+            ...(width >= 100 ? [{ key: "id", width: ID_WIDTH }] : []),
         ];
     }
     if (width >= 52) {

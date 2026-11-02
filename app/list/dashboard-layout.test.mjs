@@ -69,11 +69,11 @@ describe("responsive dashboard layout", () => {
         expect(row).not.toContain("Pi assistant streaming");
     });
 
-    it("shows a short ID after the activity: the end of Pi's session id, else the dashboard's", () => {
+    it("shows a short ID as the last column: the end of Pi's session id, else the dashboard's", () => {
         const layout = createDashboardLayout(149, 40);
-        expect(stripVTControlCharacters(renderColumnHeader(layout))).toMatch(/ACTIVITY +ID +MODEL/u);
+        expect(stripVTControlCharacters(renderColumnHeader(layout))).toMatch(/ACTIVITY +MODEL +AGE +ID *$/u);
         const pi = stripVTControlCharacters(renderSessionRow(session("session-1793401671901", { durable: { piSessionId: "01a18f11-d577-7607-9611-6d83e02293b8" } }), layout, { now }));
-        expect(pi).toContain(" 2293b8 ");
+        expect(pi.trimEnd()).toMatch(/ 2293b8$/u);
         const dashboardOnly = stripVTControlCharacters(renderSessionRow(session("session-1793401671901"), layout, { now }));
         expect(dashboardOnly).toContain("671901");
         expect(visibleWidth(pi)).toBeLessThanOrEqual(149);

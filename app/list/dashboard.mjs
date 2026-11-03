@@ -294,8 +294,10 @@ export class DashboardController {
         return this.stopClearGesture.armedSessionId() !== undefined;
     }
     selectSession(sessionId) {
-        if (sessionId !== this.list.selectedSessionId)
+        if (sessionId !== this.list.selectedSessionId) {
             this.stopClearGesture.cancel();
+            this.cwdOverride = undefined;
+        }
         this.preferredSelectionId = sessionId;
         const selected = this.list.selectSession(sessionId);
         this.ensureSelectionVisible();
@@ -530,6 +532,8 @@ export class DashboardController {
                 break;
             case "set_cwd":
                 this.composerDraft = { ...this.composerDraft, cwd: parsed.path };
+                // Chosen by hand: it holds until the cursor moves to another session.
+                this.cwdOverride = parsed.path;
                 break;
             case "set_isolation":
                 this.composerDraft = { ...this.composerDraft, isolationMode: parsed.isolationMode };
@@ -668,14 +672,21 @@ export class DashboardController {
         this.focus = "list";
         this.requestRender?.();
     }
+    /** Where Enter launches: a /cwd typed since the cursor last moved, else the selected session's directory. */
+    launchCwd() {
+        return this.cwdOverride ?? this.selectedSession()?.cwd ?? this.composerDraft.cwd;
+    }
     async submitComposer() {
-        const submitted = { ...this.composerDraft, model: { ...this.composerDraft.model } };
-        const prompt = submitted.prompt;
+        const prompt = this.composerDraft.prompt;
         if (prompt.trim().length === 0)
             return;
         // A slash prompt configures the next launch. It never starts a session, mistyped or not.
         if (prompt.trim().startsWith("/"))
             return this.runListCommand();
+        // A session's directory can be gone by now; the launch default is the fallback, never a failed launch.
+        const followed = this.launchCwd();
+        const cwd = followed === this.composerDraft.cwd || await this.isDirectory(followed) ? followed : this.composerDraft.cwd;
+        const submitted = { ...this.composerDraft, cwd, model: { ...this.composerDraft.model } };
         // Clear the draft on the keystroke that sent it: a prompt still sitting in the box invites a
         // second Enter, which launches the same work twice while the daemon is still starting the first.
         this.composerDraft = { ...this.composerDraft, prompt: "" };
@@ -1080,7 +1091,7 @@ export class DashboardController {
                     });
                 }
                 const promptBottom = dockTop + layout.promptRows;
-                const form = layout.listTop >= 4 ? this.draftModelSummary() : ` cwd:${this.composerDraft.cwd} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} name:${this.composerDraft.name}`;
+                const form = layout.listTop >= 4 ? this.draftModelSummary() : ` cwd:${this.launchCwd()} isolation:${this.composerDraft.isolationMode} model:${this.composerDraft.model.provider}/${this.composerDraft.model.id} name:${this.composerDraft.name}`;
                 // The rule closes the prompt box; launch settings and the selected path are context below it.
                 const formRow = layout.dockRows >= 4 ? promptBottom + 2 : promptBottom + 1;
                 if (layout.dockRows >= 4) lines[promptBottom + 1] = sectionFooter(this.width, confirmingSharedLaunch);
@@ -1156,6 +1167,7 @@ export class DashboardController {
     }
     moveSelection(delta) {
         this.stopClearGesture.cancel();
+        this.cwdOverride = undefined;
         this.list.moveSelection(delta);
         this.preferredSelectionId = this.list.selectedSessionId;
         this.ensureSelectionVisible();
@@ -1207,7 +1219,7 @@ export class DashboardController {
     launchSettingRows() {
         // Only the working directory earns a row: the MODEL column reports each session's own model,
         // and the rest are set through the slash menu when they matter.
-        return [["cwd", this.composerDraft.cwd]];
+        return [["cwd", this.launchCwd()]];
     }
     /**
      * The model the next launch will ask for, named only when the draft carries one. A draft

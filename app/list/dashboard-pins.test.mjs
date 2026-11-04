@@ -52,3 +52,15 @@ it("restores pins saved by an earlier dashboard", async () => {
   const { order } = await fixture({ initialPins: await readPins(dir) });
   expect(order()).toEqual(["[PINNED]", "busy", "[READY]", "idle"]);
 });
+
+it("orders each directory group by state, like the state grouping, unless a sort is chosen", async () => {
+  const sessions = [row("a-ready", "READY", "/repo/a"), row("a-working", "WORKING", "/repo/a"), { ...row("a-review", "READY", "/repo/a"), needsReview: true }, row("b-ready", "READY", "/repo/b")];
+  const client = { getState: async () => ({ sessions, cursor: { daemonEpoch: "test", sequence: "1" } }), subscribeListChanges: async () => () => {} };
+  const dashboard = new DashboardController({ client, clientId: "cwd-state", openViewer: async () => {}, requestRender: () => {}, launchDefaults: { cwd: "/repo" }, initialGroupBy: "cwd" });
+  cleanup.push(() => dashboard.close());
+  await dashboard.open();
+  const order = () => dashboard.list.rows.filter((entry) => entry.kind === "session").map((entry) => entry.session.sessionId);
+  expect(order()).toEqual(["a-review", "a-working", "a-ready", "b-ready"]);
+  dashboard.setSort("id", "asc");
+  expect(order()).toEqual(["a-ready", "a-review", "a-working", "b-ready"]);
+});

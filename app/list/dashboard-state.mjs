@@ -75,15 +75,14 @@ export function dashboardGroupIdentity(session, groupBy) {
         : canonicalPath(session.cwd).toLowerCase();
 }
 /** Order two sessions by their group alone; rows within a group keep their order. */
+const stateRank = (session) => { const index = GROUP_STATE_ORDER.indexOf(displaySessionState(session)); return index === -1 ? GROUP_STATE_ORDER.length : index; };
 export function compareDashboardGroups(left, right, groupBy) {
     // Pinned sessions sit in their own group at the top, under either grouping, as in Claude Code.
     const pinned = Number(right.pinned === true) - Number(left.pinned === true);
     if (pinned !== 0)
         return pinned;
-    if (groupBy === "taskState") {
-        const rank = (session) => { const index = GROUP_STATE_ORDER.indexOf(displaySessionState(session)); return index === -1 ? GROUP_STATE_ORDER.length : index; };
-        return rank(left) - rank(right);
-    }
+    if (groupBy === "taskState")
+        return stateRank(left) - stateRank(right);
     return compareText(dashboardGroupIdentity(left, groupBy), dashboardGroupIdentity(right, groupBy));
 }
 /** Filter, sort, and group a dashboard snapshot without reading external state. */
@@ -114,6 +113,9 @@ export function selectDashboardSessions(sessions, query) {
             const grouped = compareDashboardGroups(left.session, right.session, query.groupBy);
             if (grouped !== 0)
                 return grouped;
+            // Within a directory, the state grouping's order until the operator picks a sort.
+            if (query.groupBy === "cwd" && query.sort === undefined && stateRank(left.session) !== stateRank(right.session))
+                return stateRank(left.session) - stateRank(right.session);
         }
         if (query.sort !== undefined) {
             const sorted = compareValues(sortValue(left.session, query.sort.key), sortValue(right.session, query.sort.key));

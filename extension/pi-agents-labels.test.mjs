@@ -232,3 +232,20 @@ it("never calls real Haiku in sealed fake mode", async () => {
   await expect.poll(() => o.facts().labelStatus).toBe("unavailable-model");
   expect(o.registryCalls).toHaveLength(0);
 });
+
+it("keeps the first request as the goal in every summary's context, however long the session runs", async () => {
+  const o = await owner();
+  for (const prompt of ["Compare BRCA1 zero-shot results", "second", "third", "fourth", "fifth"]) await o.finish(prompt);
+  await expect.poll(() => o.registryCalls.at(-1)?.[1].messages[0].content ?? "").toContain("fifth");
+  const context = o.registryCalls.at(-1)[1].messages[0].content;
+  expect(context).toContain("Compare BRCA1 zero-shot results");
+  expect(context).toContain("fifth");
+});
+
+it("shows the goal from the last summary beside a new request while its turn runs", async () => {
+  const o = await owner({ complete: async () => ({ ...REPLY, content: [{ type: "text", text: "Title: BRCA1 eval\nSummary: BRCA1 zero-shot eval: scoring the 6B model" }] }) });
+  await o.finish("start the eval");
+  await expect.poll(() => o.facts().labelDescription).toBe("BRCA1 zero-shot eval: scoring the 6B model");
+  await o.emit("before_agent_start", { prompt: "now plot the AUROC", messageType: "user" });
+  expect(o.facts().labelDescription).toBe("BRCA1 zero-shot eval: now plot the AUROC");
+});

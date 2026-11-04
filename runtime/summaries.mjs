@@ -12,7 +12,9 @@ const PROMPT = [
   "Describe this coding session for a dashboard.",
   "Reply with exactly two lines and nothing else:",
   "Title: <at most 5 words naming the task>",
-  "Summary: <one sentence of at most 10 words (about 70 characters) saying what the session is doing now, present tense, no quotes>",
+  "Summary: <goal in 2-4 words>: <what it is doing now>, one sentence of at most 9 words and under 60 characters in total, present tense, no quotes.",
+  "The goal names the task's subject, usually from the first request, not a verb; the rest is the current step.",
+  "Example: Summary: BRCA1 zero-shot eval: scoring wildtype-context runs",
 ].join(" ");
 
 /** @param {string} text */

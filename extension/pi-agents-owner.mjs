@@ -45,7 +45,7 @@ const MAX_FACT_TEXT_LENGTH = 4096;
 /** A widget for a session that has already been replaced: it renders nothing and captures nothing. */
 const EMPTY_WIDGET = { render: () => [], invalidate: () => {} };
 
-/** @typedef {{ generation: number, disposed: boolean, tui: unknown, link: any, pi?: any, agentPhase?: string, renameError?: string, labelFacts?: any, labelController?: AbortController, labelWork?: Promise<void>, labelPrompts?: string[], labelMessages?: any[], userMessages?: number, labelAttempts?: number, labelRunning?: boolean, automaticName?: string, automaticNameEvents?: string[], nameChanged?: boolean, sessionColor?: string, monitorsRunning?: number, subagentsRunning?: number, turnRan?: boolean, turnSeq?: number, labelQueued?: { ctx: any, transcript: string, naming: boolean, turn: number } }} OwnerSession */
+/** @typedef {{ generation: number, disposed: boolean, tui: unknown, link: any, pi?: any, agentPhase?: string, renameError?: string, labelFacts?: any, labelController?: AbortController, labelWork?: Promise<void>, labelPrompts?: string[], labelMessages?: any[], userMessages?: number, firstPrompt?: string, labelAttempts?: number, labelRunning?: boolean, automaticName?: string, automaticNameEvents?: string[], nameChanged?: boolean, sessionColor?: string, monitorsRunning?: number, subagentsRunning?: number, turnRan?: boolean, turnSeq?: number, labelQueued?: { ctx: any, transcript: string, naming: boolean, turn: number } }} OwnerSession */
 
 /** @param {unknown} value */
 function isRecord(value) {
@@ -445,8 +445,11 @@ export function registerOwnerExtension(pi, options = {}) {
     session.turnRan = true;
     session.turnSeq = (session.turnSeq ?? 0) + 1;
     if (event.messageType === "custom" || typeof event.prompt !== "string" || !event.prompt.trim()) return;
-    // Until this turn's summary lands, the row says what the session was just asked.
-    session.labelFacts = { ...session.labelFacts, labelVersion: 1, labelStatus: session.labelFacts?.labelStatus ?? "pending", labelDescription: event.prompt.replace(/\s+/gu, " ").trim().slice(0, 200) };
+    // Until this turn's summary lands, the row says what the session was just asked, beside the goal the last
+    // summary named ("<goal>: <current step>").
+    const asked = event.prompt.replace(/\s+/gu, " ").trim();
+    const goal = /^([^:]{1,60}): \S/u.exec(session.labelFacts?.labelDescription ?? "")?.[1];
+    session.labelFacts = { ...session.labelFacts, labelVersion: 1, labelStatus: session.labelFacts?.labelStatus ?? "pending", labelDescription: (goal === undefined ? asked : `${goal}: ${asked}`).slice(0, 200) };
     republish(undefined, undefined, ctx);
   });
 
@@ -459,6 +462,8 @@ export function registerOwnerExtension(pi, options = {}) {
     const text = (typeof content === "string" ? content : Array.isArray(content) ? content.filter((part) => part?.type === "text").map((part) => part.text).join("\n") : "").trim();
     if (!text) return;
     session.userMessages = (session.userMessages ?? 0) + 1;
+    // The goal: the first request, kept for every later summary after the recent prompts have moved on.
+    session.firstPrompt ??= text.slice(0, 1800);
     session.labelPrompts = [...(session.labelPrompts ?? []), text.slice(0, 1800)].slice(-3);
   });
 
@@ -481,7 +486,9 @@ export function registerOwnerExtension(pi, options = {}) {
     session.turnRan = false;
     const naming = (session.userMessages ?? 0) >= 2 && (session.labelAttempts ?? 0) < 2;
     if (naming) session.labelAttempts = (session.labelAttempts ?? 0) + 1;
-    const prompts = (session.labelPrompts ?? []).map((prompt) => `User: ${prompt}`).join("\n");
+    const recent = session.labelPrompts ?? [];
+    const goal = session.firstPrompt !== undefined && !recent.includes(session.firstPrompt) ? [`User (first request, the goal): ${session.firstPrompt}`] : [];
+    const prompts = [...goal, ...recent.map((prompt) => `User: ${prompt}`)].join("\n");
     const excerpt = summarizePromptInput(session.labelMessages ?? []).slice(-500);
     label(session, ctx, `${prompts}\n${excerpt}`, naming, session.turnSeq ?? 0);
     session.labelMessages = undefined;

@@ -78,7 +78,7 @@ it.each([
 it("asks for a one-sentence summary short enough for the dashboard's activity column", () => {
   const prompt = summaryPrompt("User: fix the parser");
   expect(prompt).toMatch(/one sentence/iu);
-  expect(prompt).toMatch(/at most 10 words/iu);
+  expect(prompt).toMatch(/<goal[^>]*>: <[^>]*doing now/iu);
 });
 
 it("keeps only the first sentence of a summary, without splitting version numbers", () => {

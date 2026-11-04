@@ -155,19 +155,19 @@ export async function runNativeCli(argv = process.argv.slice(2), deps = {}) {
       try {
         const { sessions } = await backend.getState();
         if (argv[0] === "list") {
-          const rows = sessions.filter((row) => row.processState === "LIVE").map((row) => ({ id: shortId(row), sessionId: row.sessionId, state: displaySessionState(row), name: row.name ?? "", cwd: row.cwd ?? "" }));
+          const rows = sessions.filter((/** @type {any} */ row) => row.processState === "LIVE").map((/** @type {any} */ row) => ({ id: shortId(row), sessionId: row.sessionId, state: displaySessionState(row), name: row.name ?? "", cwd: row.cwd ?? "" }));
           if (json) stdout.write(`${JSON.stringify(rows, null, 2)}\n`);
           else {
-            const nameWidth = Math.max(4, ...rows.map((row) => row.name.length));
+            const nameWidth = Math.max(4, ...rows.map((/** @type {any} */ row) => row.name.length));
             const home = (/** @type {string} */ cwd) => cwd === homeDir || cwd.startsWith(`${homeDir}/`) ? `~${cwd.slice(homeDir.length)}` : cwd;
             const line = (/** @type {string[]} */ cells) => `${cells[0].padEnd(8)}${cells[1].padEnd(13)}${cells[2].padEnd(nameWidth + 2)}${cells[3]}`.trimEnd();
-            stdout.write(`${[line(["ID", "STATE", "NAME", "CWD"]), ...rows.map((row) => line([row.id, row.state, row.name, home(row.cwd)]))].join("\n")}\n`);
+            stdout.write(`${[line(["ID", "STATE", "NAME", "CWD"]), ...rows.map((/** @type {any} */ row) => line([row.id, row.state, row.name, home(row.cwd)]))].join("\n")}\n`);
           }
           return 0;
         }
         const target = resolveTarget(sessions, words[0]);
         const from = env.PI_AGENTS_SESSION_ID ?? "";
-        const sender = sessions.find((row) => row.sessionId === from);
+        const sender = sessions.find((/** @type {any} */ row) => row.sessionId === from);
         await backend.sendMessage(target.sessionId, { text: words.slice(1).join(" "), from, fromName: sender?.name ?? "", interrupt });
         stdout.write(`sent to ${target.name ?? target.sessionId} (${shortId(target)})\n`);
         return 0;

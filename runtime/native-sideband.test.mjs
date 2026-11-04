@@ -142,7 +142,7 @@ function line(frame) {
 it("exposes one server, one client, one environment reader and its own protocol version", async () => {
   expect(Object.keys(await import("./native-sideband.mjs")).sort()).toEqual([
     "NATIVE_SIDEBAND_PROTOCOL", "NativeSidebandError", "OWNER_SIDEBAND_SOCKET_ENV", "OWNER_SIDEBAND_TOKEN_ENV", "SESSION_COLOR_NAMES",
-    "connectOwnerSideband", "createOwnerFrameLink", "isNativeSessionColor", "isNativeSessionName", "listenForOwnerSideband", "readOwnerSidebandEnvironment",
+    "connectOwnerSideband", "createOwnerFrameLink", "isNativeMessage", "isNativeSessionColor", "isNativeSessionName", "listenForOwnerSideband", "readOwnerSidebandEnvironment",
   ]);
   expect(NATIVE_SIDEBAND_PROTOCOL).toBe(1);
 });

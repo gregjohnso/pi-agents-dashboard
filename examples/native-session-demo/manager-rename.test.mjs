@@ -58,6 +58,31 @@ function nextRequest(ownerLink) {
   return new Promise((resolve) => ownerLink.onRequest(resolve));
 }
 
+describe("a message sent to a session", () => {
+  const MESSAGE = { text: "the fold job finished", from: "session-1700000000001", fromName: "sae steering", interrupt: false };
+  it("carries the text and sender to the owner, and refuses an empty or oversized text at the sending boundary", async () => {
+    const { host, ownerLink } = await linkPair();
+    const arriving = nextRequest(ownerLink);
+    await host.requestMessage("msg-1", MESSAGE);
+    expect(await arriving).toMatchObject({ type: "owner-request", requestId: "msg-1", request: "message", ...MESSAGE });
+    await expect(host.requestMessage("msg-2", { ...MESSAGE, text: "" })).rejects.toThrow();
+    await expect(host.requestMessage("msg-3", { ...MESSAGE, text: "x".repeat(20_000) })).rejects.toThrow();
+  });
+
+  it("is sent only to an owner generation that advertises message support", async () => {
+    const { consumer } = consumerFor();
+    const owner = fakeOwnerConnection();
+    consumer.adopt(owner.connection);
+    owner.emit(READY);
+    owner.emit(FACTS({ agentPhase: "settled" }));
+    expect(await consumer.request("message", "req-m1", MESSAGE)).toMatchObject({ sent: false });
+    expect(owner.sent).toEqual([]);
+    owner.emit(FACTS({ messageSupported: true }));
+    expect((await consumer.request("message", "req-m2", MESSAGE)).sent).toBe(true);
+    expect(owner.sent).toEqual([{ request: "message", requestId: "req-m2", ...MESSAGE }]);
+  });
+});
+
 function consumerFor() {
   /** @type {string[]} */
   const lines = [];
@@ -86,6 +111,7 @@ function fakeOwnerConnection() {
       requestAbort: async (requestId) => void sent.push({ request: "abort", requestId }),
       requestRename: async (requestId, name) => void sent.push({ request: "rename", requestId, name }),
       requestColor: async (requestId, color) => void sent.push({ request: "color", requestId, color }),
+      requestMessage: async (requestId, message) => void sent.push({ request: "message", requestId, ...message }),
       close() {
         closes += 1;
       },

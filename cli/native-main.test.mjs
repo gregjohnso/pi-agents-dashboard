@@ -163,3 +163,50 @@ it("new refuses a model without a provider and launches nothing", async () => {
   expect(code).toBe(2);
   expect(output.stderr.join("")).toMatch(/provider\/id/u);
 });
+
+function fakeSessions() {
+  const row = (sessionId, name, piSessionId, processState = "LIVE") => ({ sessionId, name, cwd: "/repo", processState, taskState: "READY", durable: { piSessionId } });
+  return [row("session-1", "sae steering", "01a18f11-aaaa-bbbb-cccc-0000001111aa"), row("session-2", "evo2 icl", "01a18f11-aaaa-bbbb-cccc-0000002222bb"), row("session-3", "evo2 icl", "01a18f11-aaaa-bbbb-cccc-0000003333cc", "EXITED")];
+}
+
+function messagingBackend(sent) {
+  return () => ({
+    getState: async () => ({ sessions: fakeSessions() }),
+    sendMessage: async (sessionId, message) => { sent.push({ sessionId, message }); return { sessionId, delivered: true }; },
+    close() {},
+  });
+}
+
+it("send delivers to a session named by its short ID or unique live name, as the session it runs in", async () => {
+  const output = capture();
+  const sent = [];
+  const deps = { ...output.streams, cwd: "/work", homeDir: "/home/me", uid: 7, env: { PI_AGENTS_SESSION_ID: "session-1" }, createBackend: messagingBackend(sent) };
+  expect(await runNativeCli(["send", "2222bb", "the", "fold", "job", "finished"], deps)).toBe(0);
+  expect(await runNativeCli(["send", "--interrupt", "evo2 icl", "check the logs"], deps)).toBe(0);
+  expect(sent).toEqual([
+    { sessionId: "session-2", message: { text: "the fold job finished", from: "session-1", fromName: "sae steering", interrupt: false } },
+    { sessionId: "session-2", message: { text: "check the logs", from: "session-1", fromName: "sae steering", interrupt: true } },
+  ]);
+  expect(output.stdout.join("")).toContain("sent to evo2 icl (2222bb)");
+});
+
+it("send refuses an unknown or ambiguous target and sends nothing", async () => {
+  const output = capture();
+  const sent = [];
+  const deps = { ...output.streams, cwd: "/work", homeDir: "/home/me", uid: 7, env: {}, createBackend: messagingBackend(sent) };
+  expect(await runNativeCli(["send", "nobody", "hi"], deps)).toBe(1);
+  expect(await runNativeCli(["send", "aaaa", "hi"], deps)).toBe(1);
+  expect(await runNativeCli(["send", "2222bb"], deps)).toBe(2);
+  expect(sent).toEqual([]);
+  expect(output.stderr.join("")).toMatch(/no live session/u);
+  expect(output.stderr.join("")).toMatch(/matches 2 live sessions/u);
+});
+
+it("list prints every live session with the short ID send takes", async () => {
+  const output = capture();
+  expect(await runNativeCli(["list"], { ...output.streams, cwd: "/work", homeDir: "/home/me", uid: 7, env: {}, createBackend: messagingBackend([]) })).toBe(0);
+  const lines = output.stdout.join("").trim().split("\n");
+  expect(lines).toHaveLength(3);
+  expect(lines[1]).toMatch(/^1111aa +READY +sae steering +\/repo$/u);
+  expect(output.stdout.join("")).not.toContain("3333cc");
+});

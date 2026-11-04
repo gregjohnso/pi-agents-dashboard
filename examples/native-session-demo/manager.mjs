@@ -39,6 +39,7 @@ import { inspectProcessIdentity } from "../../runtime/process-identity-linux.mjs
 import {
   OWNER_SIDEBAND_SOCKET_ENV,
   OWNER_SIDEBAND_TOKEN_ENV,
+  isNativeMessage,
   listenForOwnerSideband,
 } from "../../runtime/native-sideband.mjs";
 import { openOwnerPty } from "../../runtime/pty-mechanism.mjs";
@@ -422,7 +423,7 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
         return absent;
       }
       owner.totals.requested += 1;
-      const capability = request === "rename" ? "renameSupported" : request === "color" ? "colorSupported" : undefined;
+      const capability = request === "rename" ? "renameSupported" : request === "color" ? "colorSupported" : request === "message" ? "messageSupported" : undefined;
       if (capability !== undefined && owner.facts?.[capability] !== true) {
         // Named locally, nothing sent, nothing torn down. Read from this generation's own latest snapshot, so a
         // capability a previous owner advertised - or one this owner has since withdrawn - never authorizes it.
@@ -464,6 +465,7 @@ export function createBridgeConsumer({ log, maxDiagnosticEvents = BRIDGE_DIAGNOS
       try {
         if (request === "rename") await owner.connection.requestRename(requestId, name);
         else if (request === "color") await owner.connection.requestColor(requestId, name);
+        else if (request === "message") await owner.connection.requestMessage(requestId, name);
         else if (request === "stop") await owner.connection.requestStop(requestId);
         else await owner.connection.requestAbort(requestId);
         record.sent = true;
@@ -789,7 +791,23 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
       confirmedColor: typeof facts.sessionColor === "string" ? facts.sessionColor : null };
   };
 
+  /**
+   * Hand another session's message to the owner, and report the owner's own receipt: `requested` means Pi took it.
+   * @param {unknown} message
+   */
+  const messageThroughBridge = async (message) => {
+    const record = await requestThroughBridge("message", message);
+    const receipt = () => bridgeConsumer.status().receipts.find((candidate) => candidate.requestId === record.requestId);
+    if (record.sent === true) {
+      for (let waited = 0; waited < RENAME_CONFIRM_WAIT_MS && receipt() === undefined; waited += RENAME_CONFIRM_POLL_MS) {
+        await new Promise((resolve) => setTimeout(resolve, RENAME_CONFIRM_POLL_MS));
+      }
+    }
+    return { sent: record.sent === true, answered: receipt() !== undefined, outcome: receipt()?.outcome ?? null, reason: record.reason ?? null };
+  };
+
   const launch = ownerLaunchPlan({
+    sessionId: path.basename(root),
     mode: ownerMode,
     preload: PRELOAD,
     extension: EXTENSION,
@@ -1192,6 +1210,13 @@ export async function runManager({ root, cols = DEFAULT_COLS, rows = DEFAULT_ROW
             void renameThroughBridge(header.name).then(
               (answer) => send(socket, { type: "renamed", ...answer }),
               (error) => send(socket, { type: "renamed", sent: false, reason: String(error?.message ?? error), requestedName: null, confirmedName: null, renameError: null }),
+            );
+          } else if (header.type === "message") {
+            const message = { text: header.text, from: header.from, fromName: header.fromName, interrupt: header.interrupt };
+            if (!isNativeMessage(message)) send(socket, { type: "messaged", sent: false, answered: false, outcome: null, reason: "malformed message" });
+            else void messageThroughBridge(message).then(
+              (answer) => send(socket, { type: "messaged", ...answer }),
+              (error) => send(socket, { type: "messaged", sent: false, answered: false, outcome: null, reason: String(error?.message ?? error) }),
             );
           } else if (header.type === "color") {
             void colorThroughBridge(header.color).then(

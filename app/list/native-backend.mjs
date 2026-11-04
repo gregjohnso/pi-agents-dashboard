@@ -29,7 +29,7 @@ import { execFile } from "node:child_process";
 import { parseModelCatalogue } from "./native-model-catalogue.mjs";
 import { nativeLabelsFromFacts, readNativeLabels } from "../../runtime/native-labels.mjs";
 import { sessionNameFromPrompt } from "../../runtime/session-name.mjs";
-import { isNativeSessionColor, isNativeSessionName } from "../../runtime/native-sideband.mjs";
+import { isNativeMessage, isNativeSessionColor, isNativeSessionName } from "../../runtime/native-sideband.mjs";
 import { ATTACH_PROTOCOL } from "../../examples/native-session-demo/client.mjs";
 import { resolveCohort } from "../../examples/native-session-demo/cohort.mjs";
 import { readSavedOwnerRecords } from "../../examples/native-session-demo/saved-owner-record.mjs";
@@ -1266,6 +1266,29 @@ export function createNativeBackend({ sessionsHome, node = process.execPath, mod
       }
       notify();
       return { sessionId, color, confirmed: true };
+    },
+
+    /**
+     * Deliver another session's message, through the same gated owner request as `/color`. Refused, never queued,
+     * when the session cannot take it now: the sender learns that at once instead of hoping.
+     * @param {string} sessionId @param {{ text: string, from: string, fromName: string, interrupt: boolean }} message
+     */
+    async sendMessage(sessionId, message) {
+      if (savedRowOwnerId(sessionId) !== undefined) refuseSavedRowAction(sessionId, "send");
+      if (!isNativeMessage(message)) throw Object.assign(new Error("a message needs non-empty text of at most 12000 characters"), { code: "MESSAGE_INVALID" });
+      const root = path.join(sessionsHome, sessionId);
+      const status = await control(root, { type: "status", detail: "list" }, "status", { timeoutMs: statusTimeoutMs });
+      if (!status.reachable) throw Object.assign(new Error(`could not reach ${sessionId}: ${status.reason}`), { code: "MESSAGE_UNREACHABLE" });
+      if (status.answer.status?.bridge?.facts?.messageSupported !== true) {
+        throw Object.assign(new Error(`${sessionId} started on a release that cannot receive messages; restart it to enable them`), { code: "MESSAGE_UNSUPPORTED" });
+      }
+      const probe = await control(root, { type: "message", ...message }, "messaged", { timeoutMs: MUTATION_ANSWER_MS });
+      if (!probe.reachable) throw Object.assign(new Error(`could not reach ${sessionId} to deliver the message: ${probe.reason}`), { code: "MESSAGE_UNREACHABLE" });
+      if (probe.answer.sent !== true) throw Object.assign(new Error(`${sessionId} was not sent the message: ${probe.answer.reason ?? "its owner did not accept it"}`), { code: "MESSAGE_UNSUPPORTED" });
+      if (probe.answer.outcome !== "requested") {
+        throw Object.assign(new Error(`${sessionId} did not take the message (${probe.answer.outcome ?? "no answer"})`), { code: "MESSAGE_NOT_DELIVERED" });
+      }
+      return { sessionId, delivered: true };
     },
 
     async rename(sessionId, revision, requestId, name) {

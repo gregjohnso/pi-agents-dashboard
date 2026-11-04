@@ -36,7 +36,7 @@ async function backend(status, answer) {
     askControl: async (_root, frame) => {
       frames.push(frame);
       if (frame.type === "status") return { reachable: true, answer: { status } };
-      if (frame.type === "color") return { reachable: true, answer: answer(frame) };
+      if (frame.type === "color" || frame.type === "message") return { reachable: true, answer: answer(frame) };
       throw new Error(`unexpected ${frame.type}`);
     },
   });
@@ -77,4 +77,15 @@ it("keeps an idle session WORKING while one of its monitors runs", async () => {
   expect(row.activity.summary).toContain("1 monitor running");
   const idle = await backend(live({ monitorsRunning: 0 }), () => ({}));
   expect((await idle.client.getState()).sessions[0].taskState).toBe("READY");
+});
+
+it("sends a message only to a session that says it can receive one, and reports a refused one", async () => {
+  const message = { text: "hello", from: "session-1700000000001", fromName: "probe", interrupt: false };
+  const old = await backend(live({}), () => ({}));
+  await expect(old.client.sendMessage("session-1700000000041", message)).rejects.toMatchObject({ code: "MESSAGE_UNSUPPORTED" });
+  const { client, frames } = await backend(live({ messageSupported: true }), () => ({ sent: true, answered: true, outcome: "requested" }));
+  await expect(client.sendMessage("session-1700000000041", message)).resolves.toMatchObject({ sessionId: "session-1700000000041", delivered: true });
+  expect(frames.at(-1)).toEqual({ type: "message", ...message });
+  const refused = await backend(live({ messageSupported: true }), () => ({ sent: true, answered: true, outcome: "unsupported" }));
+  await expect(refused.client.sendMessage("session-1700000000041", message)).rejects.toMatchObject({ code: "MESSAGE_NOT_DELIVERED" });
 });

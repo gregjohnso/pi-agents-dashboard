@@ -63,6 +63,13 @@ const OPERATOR_SETTING = "/home/operator/my-own-histories";
 const OLD_DEMO_TRANSIENT = "/proc/12345/fd/20/sessions";
 
 describe("real mode: Pi's own storage decision, applied to the final environment", () => {
+  it("names the dashboard session in Pi's environment, so its tools can send as it", () => {
+    for (const mode of ["real", "fake"]) {
+      const plan = ownerLaunchPlan(planInput({ mode, sessionId: "session-1700000000042", inheritedEnv: { HOME: "/home/operator", PI_AGENTS_SESSION_ID: "session-parent" } }));
+      expect(plan.env.PI_AGENTS_SESSION_ID).toBe("session-1700000000042");
+    }
+  });
+
   it("omits the session directory entirely when nothing set one", () => {
     const plan = ownerLaunchPlan(planInput({ mode: "real", inheritedEnv: { HOME: "/home/operator", PATH: "/usr/bin" } }));
     // An omitted override must actually stay omitted, so Pi falls back to its own configuration.

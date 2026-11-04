@@ -101,6 +101,8 @@ function collectFacts(event, ctx, session, agentPhase) {
     // writing a frame an older owner refuses as malformed - which would destroy its bridge. Present only when
     // Pi actually offers the public mutator, so this is a capability rather than an intention.
     renameSupported: typeof pi?.setSessionName === "function" ? true : undefined,
+    // Another session's `pi-agents send` reaches this one only when Pi can add a message to it.
+    messageSupported: typeof pi?.sendMessage === "function" ? true : undefined,
     // The name Pi CONFIRMED, read back through its own public getter. A merely requested name never appears
     // here, so a row cannot show a rename that did not take effect.
     sessionName: text(readThrough(pi, "getSessionName")),
@@ -171,6 +173,28 @@ function colorReceipt(request, session) {
   return { ...base, outcome: session.sessionColor === request.color ? "requested" : "no-run" };
 }
 
+/**
+ * Add another session's message to this one as a visible turn, saying who sent it and how to answer.
+ * A follow-up waits for a running turn to end; `interrupt` steers the running turn instead.
+ * @param {any} request @param {OwnerSession} session
+ */
+function messageReceipt(request, session) {
+  const base = { requestId: request.requestId, request: "message" };
+  if (typeof session.pi?.sendMessage !== "function") return { ...base, outcome: "unsupported" };
+  const named = request.fromName !== "" && request.fromName !== request.from;
+  const sender = named && request.from ? `${request.fromName} (${request.from})` : request.from || request.fromName || "the operator";
+  const reply = request.from ? `\n\n(reply with: pi-agents send ${request.from} "<message>")` : "";
+  try {
+    session.pi.sendMessage(
+      { customType: "pi-agents-message", content: `[message from ${sender}]\n${request.text}${reply}`, display: true, details: { from: request.from, fromName: request.fromName } },
+      { deliverAs: request.interrupt ? "steer" : "followUp", triggerTurn: true },
+    );
+    return { ...base, outcome: "requested" };
+  } catch {
+    return { ...base, outcome: "no-run" };
+  }
+}
+
 /** @param {any} ctx @param {string} requestId */
 function stopReceipt(ctx, requestId) {
   if (typeof ctx.shutdown !== "function") {
@@ -228,6 +252,8 @@ async function answerRequest(request, ctx, session, link, onFailure) {
     ? renameReceipt(request, session)
     : request.request === "color"
     ? colorReceipt(request, session)
+    : request.request === "message"
+    ? messageReceipt(request, session)
     : request.request === "stop"
       ? stopReceipt(ctx, request.requestId)
       : abortReceipt(ctx, request.requestId);

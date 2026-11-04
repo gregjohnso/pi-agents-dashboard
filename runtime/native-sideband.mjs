@@ -51,7 +51,7 @@ const MAX_REPORTED_NAME_LENGTH = 64;
 const MAX_FACT_ENTRIES = 32;
 const MAX_FACT_TEXT_LENGTH = 4096;
 const FACT_NAME = /^[a-z][A-Za-z0-9]{0,39}$/u;
-const REQUESTS = ["stop", "abort", "rename", "color"];
+const REQUESTS = ["stop", "abort", "rename", "color", "message"];
 /**
  * `rename` is the one request that carries an argument, so it is the one request whose frame shape differs.
  *
@@ -65,6 +65,19 @@ const REQUESTS = ["stop", "abort", "rename", "color"];
 const RENAME_REQUEST = "rename";
 /** `color` carries one of session-color's names and is gated exactly as `rename` is, on an advertised capability. */
 const COLOR_REQUEST = "color";
+/** `message` carries another session's text to this one, gated on an advertised capability like `rename`. */
+const MESSAGE_REQUEST = "message";
+/** A message fits one frame however it is escaped; longer work belongs in a file the message points to. */
+const MAX_MESSAGE_TEXT_LENGTH = 12_000;
+/** The sender: a dashboard session id, or empty when the operator sent it from a shell. */
+const MESSAGE_SENDER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+/** @param {any} message */
+export function isNativeMessage(message) {
+  return typeof message?.text === "string" && message.text.trim() !== "" && message.text.length <= MAX_MESSAGE_TEXT_LENGTH
+    && typeof message.from === "string" && (message.from === "" || MESSAGE_SENDER.test(message.from))
+    && typeof message.fromName === "string" && (message.fromName === "" || isNativeSessionName(message.fromName))
+    && typeof message.interrupt === "boolean";
+}
 /** The names the user's session-color extension accepts, `default` clearing the tint. */
 export const SESSION_COLOR_NAMES = ["default", "red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan"];
 /** @param {unknown} value */
@@ -95,7 +108,7 @@ const MISSING_METHODS = ["shutdown", "abort", "isIdle", "hasPendingMessages"];
 /** @typedef {{ type: "owner-ready", phase: "bridge" }} OwnerReadyFrame */
 /** @typedef {{ type: "owner-seams", reported: Record<string, unknown> }} OwnerSeamsFrame */
 /** @typedef {{ type: "owner-facts", facts: Record<string, string|number|boolean> }} OwnerFactsFrame */
-/** @typedef {{ requestId: string, request: "stop"|"abort"|"rename"|"color", outcome: "requested"|"deferred"|"no-run"|"unsupported", idle?: boolean, pendingMessages?: boolean, missing?: string }} OwnerReceipt */
+/** @typedef {{ requestId: string, request: "stop"|"abort"|"rename"|"color"|"message", outcome: "requested"|"deferred"|"no-run"|"unsupported", idle?: boolean, pendingMessages?: boolean, missing?: string }} OwnerReceipt */
 /** @typedef {OwnerReceipt & { type: "owner-receipt" }} OwnerReceiptFrame */
 /** @typedef {OwnerReadyFrame|OwnerSeamsFrame|OwnerFactsFrame|OwnerReceiptFrame} OwnerFrame */
 /** @typedef {{ type: "owner-request", requestId: string, request: "stop"|"abort" }|{ type: "owner-request", requestId: string, request: "rename", name: string }|{ type: "owner-request", requestId: string, request: "color", color: string }} HostRequestFrame */
@@ -227,6 +240,11 @@ function validateHostFrame(value) {
     if (!identifier(frame.requestId)) return { refusal: "malformed-frame" };
     if (!isNativeSessionName(frame.name)) return { refusal: "malformed-frame" };
     return { ok: { type: "owner-request", requestId: frame.requestId, request: frame.request, name: frame.name } };
+  }
+  if (frame.request === MESSAGE_REQUEST) {
+    if (!exact(frame, ["protocol", "type", "requestId", "request", "text", "from", "fromName", "interrupt"])) return { refusal: "malformed-frame" };
+    if (!identifier(frame.requestId) || !isNativeMessage(frame)) return { refusal: "malformed-frame" };
+    return { ok: { type: "owner-request", requestId: frame.requestId, request: frame.request, text: frame.text, from: frame.from, fromName: frame.fromName, interrupt: frame.interrupt } };
   }
   if (frame.request === COLOR_REQUEST) {
     if (!exact(frame, ["protocol", "type", "requestId", "request", "color"])) return { refusal: "malformed-frame" };
@@ -861,6 +879,9 @@ export async function listenForOwnerSideband(options) {
           requestRename: (requestId, name) => link.send({ type: "owner-request", requestId, request: RENAME_REQUEST, name }, validateHostFrame),
           /** @param {string} requestId @param {string} color */
           requestColor: (requestId, color) => link.send({ type: "owner-request", requestId, request: COLOR_REQUEST, color }, validateHostFrame),
+          /** @param {string} requestId @param {{ text: string, from: string, fromName: string, interrupt: boolean }} message */
+          requestMessage: (requestId, message) => link.send({ type: "owner-request", requestId, request: MESSAGE_REQUEST,
+            text: message.text, from: message.from, fromName: message.fromName, interrupt: message.interrupt }, validateHostFrame),
           close: link.close,
         }),
       },

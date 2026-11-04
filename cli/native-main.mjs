@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { displaySessionState } from "../app/list/session-state.mjs";
 
 const HELP = `Usage: pi-agents [options]
 
@@ -20,6 +21,13 @@ Options:
 
 Start one session in the background, as the dashboard's prompt does, and print its id.
 It runs in --cwd (default: invoking directory) and appears in the dashboard.
+
+       pi-agents list [--json]
+       pi-agents send [--interrupt] <session> <message...>
+
+List live sessions, or add a message to one. <session> is the short ID from list, a full session id, or a
+unique name. Run from inside a session, the message names that session as the sender, so the receiver can
+reply with send. A message waits for the receiver's running turn to end; --interrupt steers it instead.
 `;
 const VERSION = "pi-agents 0.0.2";
 const VALUE_FLAGS = new Set(["--cwd", "--state", "--sessions", "--pi-config"]);
@@ -101,6 +109,28 @@ export function resolveNewOptions({ argv, cwd, homeDir, uid }) {
   };
 }
 
+/** The ID `list` shows and `send` takes: the end of Pi's session id, else the dashboard's. @param {any} row */
+function shortId(row) {
+  return (row.durable?.piSessionId || row.sessionId).slice(-6);
+}
+
+/**
+ * The one live session `target` names: exactly by id, short id or name, else by a part of an id.
+ * @param {any[]} rows @param {string} target
+ */
+function resolveTarget(rows, target) {
+  const live = rows.filter((row) => row.processState === "LIVE");
+  const lower = target.toLowerCase();
+  const exactMatches = live.filter((row) => row.sessionId === target || shortId(row) === target || row.durable?.piSessionId === target || (row.name ?? "").toLowerCase() === lower);
+  const matches = exactMatches.length > 0 || target.length < 4 ? exactMatches
+    : live.filter((row) => row.sessionId.includes(target) || (row.durable?.piSessionId ?? "").includes(target));
+  if (matches.length === 1) return matches[0];
+  const reason = matches.length === 0
+    ? `no live session matches ${target}; run pi-agents list`
+    : `${target} matches ${matches.length} live sessions (${matches.map(shortId).join(", ")}); use its short ID`;
+  throw Object.assign(new Error(reason), { code: matches.length === 0 ? "SESSION_NOT_FOUND" : "SESSION_AMBIGUOUS" });
+}
+
 /** @param {any} options */
 async function defaultCreateBackend(options) {
   const { createNativeBackend } = await import(new URL("../app/list/native-backend.mjs", import.meta.url).href);
@@ -111,6 +141,45 @@ async function defaultCreateBackend(options) {
 export async function runNativeCli(argv = process.argv.slice(2), deps = {}) {
   const stdout = deps.stdout ?? process.stdout;
   const stderr = deps.stderr ?? process.stderr;
+  if (argv[0] === "list" || argv[0] === "send") {
+    const env = deps.env ?? process.env;
+    try {
+      const rest = argv.slice(1);
+      const json = argv[0] === "list" && rest.includes("--json");
+      const interrupt = argv[0] === "send" && rest[0] === "--interrupt";
+      const words = interrupt ? rest.slice(1) : rest;
+      if (argv[0] === "list" && rest.some((word) => word !== "--json")) throw syntax("list takes only --json");
+      if (argv[0] === "send" && (words.length < 2 || words[1] === "")) throw syntax("send needs a session and a message: pi-agents send [--interrupt] <session> <message...>");
+      const homeDir = deps.homeDir ?? homedir();
+      const backend = await (deps.createBackend ?? defaultCreateBackend)({ mode: "real", sessionsHome: path.join("/tmp", `pi-save-default-${deps.uid ?? process.getuid?.() ?? 0}`), stateHome: path.join(homeDir, ".pi-agents") });
+      try {
+        const { sessions } = await backend.getState();
+        if (argv[0] === "list") {
+          const rows = sessions.filter((row) => row.processState === "LIVE").map((row) => ({ id: shortId(row), sessionId: row.sessionId, state: displaySessionState(row), name: row.name ?? "", cwd: row.cwd ?? "" }));
+          if (json) stdout.write(`${JSON.stringify(rows, null, 2)}\n`);
+          else {
+            const nameWidth = Math.max(4, ...rows.map((row) => row.name.length));
+            const home = (/** @type {string} */ cwd) => cwd === homeDir || cwd.startsWith(`${homeDir}/`) ? `~${cwd.slice(homeDir.length)}` : cwd;
+            const line = (/** @type {string[]} */ cells) => `${cells[0].padEnd(8)}${cells[1].padEnd(13)}${cells[2].padEnd(nameWidth + 2)}${cells[3]}`.trimEnd();
+            stdout.write(`${[line(["ID", "STATE", "NAME", "CWD"]), ...rows.map((row) => line([row.id, row.state, row.name, home(row.cwd)]))].join("\n")}\n`);
+          }
+          return 0;
+        }
+        const target = resolveTarget(sessions, words[0]);
+        const from = env.PI_AGENTS_SESSION_ID ?? "";
+        const sender = sessions.find((row) => row.sessionId === from);
+        await backend.sendMessage(target.sessionId, { text: words.slice(1).join(" "), from, fromName: sender?.name ?? "", interrupt });
+        stdout.write(`sent to ${target.name ?? target.sessionId} (${shortId(target)})\n`);
+        return 0;
+      } finally {
+        backend.close();
+      }
+    } catch (error) {
+      const failure = /** @type {any} */ (error);
+      stderr.write(`${failure?.code ?? "SEND_FAILED"}: ${error instanceof Error ? error.message : String(error)}\n`);
+      return failure?.code === "INVALID_SYNTAX" ? 2 : 1;
+    }
+  }
   if (argv[0] === "new") {
     try {
       const { backend: options, request } = resolveNewOptions({ argv: argv.slice(1), cwd: deps.cwd ?? process.cwd(), homeDir: deps.homeDir ?? homedir(), uid: deps.uid ?? process.getuid?.() ?? 0 });

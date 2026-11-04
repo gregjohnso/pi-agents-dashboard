@@ -149,6 +149,9 @@ export function ownerLaunchPlan(options) {
     PI_DEMO_TOKEN: token,
     PI_DEMO_PROFILE: JSON.stringify({ ...profile }),
     PI_DEMO_LOG: owned.ingressLog,
+    // The dashboard session this Pi is, so `pi-agents send` run from its tools names the right sender. Always set
+    // or cleared here: a session launched from inside another must not inherit its parent's identity.
+    PI_AGENTS_SESSION_ID: typeof options.sessionId === "string" ? options.sessionId : "",
     // Present only when the launch carried a task. Absent means "open an empty session", which is what
     // the bare `start` command still does.
     ...(typeof options.initialPromptFile === "string" && options.initialPromptFile !== ""

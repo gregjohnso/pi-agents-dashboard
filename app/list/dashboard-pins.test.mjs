@@ -64,3 +64,18 @@ it("orders each directory group by state, like the state grouping, unless a sort
   dashboard.setSort("id", "asc");
   expect(order()).toEqual(["a-ready", "a-review", "a-working", "b-ready"]);
 });
+
+it("puts the most recent state change first within each state, unless a sort is chosen", async () => {
+  const stamp = (session, minutes) => ({ ...session, stateChangedAt: new Date(Date.parse(AT) + minutes * 60_000).toISOString() });
+  const sessions = [stamp(row("old-ready", "READY", "/repo/a"), 1), stamp(row("new-ready", "READY", "/repo/a"), 5), stamp(row("working", "WORKING", "/repo/b"), 2)];
+  const client = { getState: async () => ({ sessions, cursor: { daemonEpoch: "test", sequence: "1" } }), subscribeListChanges: async () => () => {} };
+  const dashboard = new DashboardController({ client, clientId: "recent", openViewer: async () => {}, requestRender: () => {}, launchDefaults: { cwd: "/repo" }, initialGroupBy: "taskState" });
+  cleanup.push(() => dashboard.close());
+  await dashboard.open();
+  const order = () => dashboard.list.rows.filter((entry) => entry.kind === "session").map((entry) => entry.session.sessionId);
+  expect(order()).toEqual(["working", "new-ready", "old-ready"]);
+  dashboard.setGrouping("cwd");
+  expect(order()).toEqual(["new-ready", "old-ready", "working"]);
+  dashboard.setSort("id", "desc");
+  expect(order()).toEqual(["old-ready", "new-ready", "working"]);
+});

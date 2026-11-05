@@ -113,9 +113,15 @@ export function selectDashboardSessions(sessions, query) {
             const grouped = compareDashboardGroups(left.session, right.session, query.groupBy);
             if (grouped !== 0)
                 return grouped;
-            // Within a directory, the state grouping's order until the operator picks a sort.
-            if (query.groupBy === "cwd" && query.sort === undefined && stateRank(left.session) !== stateRank(right.session))
-                return stateRank(left.session) - stateRank(right.session);
+            // Until the operator picks a sort: a directory orders by state, and within a state the most recent
+            // change comes first.
+            if (query.sort === undefined) {
+                if (query.groupBy === "cwd" && stateRank(left.session) !== stateRank(right.session))
+                    return stateRank(left.session) - stateRank(right.session);
+                const recent = (Date.parse(right.session.stateChangedAt ?? "") || 0) - (Date.parse(left.session.stateChangedAt ?? "") || 0);
+                if (recent !== 0)
+                    return recent;
+            }
         }
         if (query.sort !== undefined) {
             const sorted = compareValues(sortValue(left.session, query.sort.key), sortValue(right.session, query.sort.key));

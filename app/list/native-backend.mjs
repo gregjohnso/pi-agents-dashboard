@@ -30,6 +30,7 @@ import { parseModelCatalogue } from "./native-model-catalogue.mjs";
 import { nativeLabelsFromFacts, readNativeLabels } from "../../runtime/native-labels.mjs";
 import { sessionNameFromPrompt } from "../../runtime/session-name.mjs";
 import { isNativeMessage, isNativeSessionColor, isNativeSessionName } from "../../runtime/native-sideband.mjs";
+import { displaySessionState } from "./session-state.mjs";
 import { ATTACH_PROTOCOL } from "../../examples/native-session-demo/client.mjs";
 import { resolveCohort } from "../../examples/native-session-demo/cohort.mjs";
 import { readSavedOwnerRecords } from "../../examples/native-session-demo/saved-owner-record.mjs";
@@ -404,6 +405,7 @@ function savedRecordFor(saved) {
       piSessionId: saved.sessionId ?? null,
       sessionFile: saved.sessionFile ?? null,
       sequence: saved.sequence ?? null,
+      updatedAtMs: saved.updatedAtMs ?? null,
       savedOnly: true,
     },
   };
@@ -499,6 +501,7 @@ function recordFor(root, status, launchedPrompt, requestedModel, observedExit, a
         piSessionId: durableRecord.sessionId ?? null,
         sessionFile: durableRecord.sessionFile ?? null,
         sequence: durableRecord.sequence ?? null,
+        updatedAtMs: durableRecord.updatedAtMs ?? null,
         savedOnly: false,
       },
     }),
@@ -642,6 +645,8 @@ export function createNativeBackend({ sessionsHome, node = process.execPath, mod
   const localReviewMarks = new Set();
   /** Reviewed in this window; hidden even if its mark file has not been removed yet. */
   const reviewedHere = new Set();
+  /** Each session's shown state and when this backend first saw it, so a list can put recent changes first. */
+  const stateSince = new Map();
   /** The owner identity each session last reported, so an attach refusal can be stamped with who refused it. */
   const lastOwnerIdentity = new Map();
   /** The control channel, injectable so a case can drive the answer shapes without an owner. */
@@ -970,6 +975,15 @@ export function createNativeBackend({ sessionsHome, node = process.execPath, mod
             reviewMarks.add(row.sessionId);
           }
           if (reviewMarks.has(row.sessionId)) row.needsReview = true;
+          // A state this backend saw change is stamped now; one it meets for the first time takes the owner
+          // record's last write, the closest durable record of when that session last moved.
+          const shown = displaySessionState(row);
+          const seen = stateSince.get(row.sessionId);
+          if (seen?.state !== shown) {
+            const first = row.durable?.updatedAtMs ?? Date.parse(row.createdAt);
+            stateSince.set(row.sessionId, { state: shown, at: seen === undefined && Number.isFinite(first) ? first : Date.now() });
+          }
+          row.stateChangedAt = new Date(stateSince.get(row.sessionId).at).toISOString();
         }
         lastRows = new Map(current.map((row) => [row.sessionId, row]));
         trace(`getState -> ${current.length} row(s): ${current.map((row) => `${row.sessionId}:${row.processState}`).join(",")}`);

@@ -87,3 +87,19 @@ it("does not ask for review of a session that was never seen working", async () 
   f.session.facts = READY;
   expect(await f.state(f.client())).toBe("READY");
 });
+
+it("stamps when each session's shown state last changed, including leaving NEEDS INPUT for READY", async () => {
+  const f = await fixture();
+  const backend = f.client();
+  const at = async () => Date.parse((await backend.getState()).sessions[0].stateChangedAt);
+  const first = await at();
+  expect(Number.isFinite(first)).toBe(true);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  expect(await at()).toBe(first);
+  f.session.facts = READY;
+  const needsInput = await at();
+  expect(needsInput).toBeGreaterThan(first);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await backend.detach(f.sessionId);
+  expect(await at()).toBeGreaterThan(needsInput);
+});

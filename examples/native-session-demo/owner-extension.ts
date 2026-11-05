@@ -80,8 +80,6 @@ export default function (pi: ExtensionAPI) {
   // The management bridge first, so a session_start replacement disposes the previous generation before this
   // file's own widget handler re-captures the TUI for the new one.
   registerOwnerExtension(pi);
-  // /color and the coloured border, which the owner bridge publishes and the dashboard's /color sets.
-  sessionColorExtension(pi, { bundled: true });
 
   if (FAKE_PROVIDER_REQUESTED) {
     pi.registerProvider(FAKE_PROVIDER_ID, {
@@ -155,4 +153,9 @@ export default function (pi: ExtensionAPI) {
     // After the widget is mounted, so the session is ready to show the turn this starts.
     void submitInitialPrompt(pi);
   });
+
+  // /color and the coloured border. Registered after the return editor above, because session-color wraps
+  // whatever editor is installed when its own session_start runs; registered first, the return editor
+  // replaced the wrapper and the border never took the colour.
+  sessionColorExtension(pi, { bundled: true });
 }

@@ -67,6 +67,7 @@ describe("real mode: Pi's own storage decision, applied to the final environment
     for (const mode of ["real", "fake"]) {
       const plan = ownerLaunchPlan(planInput({ mode, sessionId: "session-1700000000042", inheritedEnv: { HOME: "/home/operator", PI_AGENTS_SESSION_ID: "session-parent" } }));
       expect(plan.env.PI_AGENTS_SESSION_ID).toBe("session-1700000000042");
+      expect(plan.env.PI_AGENTS_BUNDLES_SESSION_COLOR).toBe("1");
     }
   });
 

@@ -152,6 +152,8 @@ export function ownerLaunchPlan(options) {
     // The dashboard session this Pi is, so `pi-agents send` run from its tools names the right sender. Always set
     // or cleared here: a session launched from inside another must not inherit its parent's identity.
     PI_AGENTS_SESSION_ID: typeof options.sessionId === "string" ? options.sessionId : "",
+    // This release loads its own session-color, so an operator's global copy of it steps aside.
+    PI_AGENTS_BUNDLES_SESSION_COLOR: "1",
     // Present only when the launch carried a task. Absent means "open an empty session", which is what
     // the bare `start` command still does.
     ...(typeof options.initialPromptFile === "string" && options.initialPromptFile !== ""

@@ -27,6 +27,7 @@ import { readFile, rename } from "node:fs/promises";
 // @ts-expect-error -- the bridge is plain JavaScript with JSDoc types; `extension/**` is outside this
 // project's checked program, which the intake records as a disclosed limitation rather than widening here.
 import { registerOwnerExtension } from "../../extension/pi-agents-owner.mjs";
+import sessionColorExtension from "../../extension/session-color.ts";
 // @ts-expect-error -- the dashboard's existing Left-gesture helper, plain JavaScript with JSDoc types.
 import { DashboardGestureEditor } from "../../app/list/key-gesture.mjs";
 import { FAKE_MODEL_ID, FAKE_PROVIDER_ID, createFakeStreamSimple, fakeModelConfigs } from "./fake-provider.mjs";
@@ -79,6 +80,8 @@ export default function (pi: ExtensionAPI) {
   // The management bridge first, so a session_start replacement disposes the previous generation before this
   // file's own widget handler re-captures the TUI for the new one.
   registerOwnerExtension(pi);
+  // /color and the coloured border, which the owner bridge publishes and the dashboard's /color sets.
+  sessionColorExtension(pi, { bundled: true });
 
   if (FAKE_PROVIDER_REQUESTED) {
     pi.registerProvider(FAKE_PROVIDER_ID, {

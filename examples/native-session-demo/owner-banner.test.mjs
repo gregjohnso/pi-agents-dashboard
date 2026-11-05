@@ -24,6 +24,7 @@ async function start(fake) {
   const ctx = { mode: "tui", ui: {
     setWidget(key, content) { widgets.set(key, typeof content === "function" ? content(tui) : content); },
     setEditorComponent(factory) { editorFactory = factory; },
+    getEditorComponent() { return editorFactory; },
   } };
   for (const handler of extension.handlers.get("session_start")) await handler({}, ctx);
   cleanup.push(async () => { for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({}, ctx); });
